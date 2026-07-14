@@ -89,10 +89,7 @@ impl SessionMachine {
                 let stream_id = self.next_stream_id();
                 (
                     StartingVideo,
-                    vec![
-                        SessionAction::BeginStream { stream_id },
-                        SessionAction::StartVideo,
-                    ],
+                    vec![SessionAction::BeginStream { stream_id }],
                 )
             }
             (StartingVideo, SessionEvent::StartVideo) => {

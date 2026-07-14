@@ -137,6 +137,12 @@ fn reconnect_negotiation_gets_a_fresh_stream_id() {
     machine.apply(SessionEvent::RelayConnected).unwrap();
     machine.apply(SessionEvent::HandshakeComplete).unwrap();
     let first = machine.apply(SessionEvent::CapabilitiesNegotiated).unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(
+        !first
+            .iter()
+            .any(|action| matches!(action, SessionAction::StartVideo))
+    );
     let first_id = first
         .iter()
         .find_map(|action| match action {
@@ -150,6 +156,12 @@ fn reconnect_negotiation_gets_a_fresh_stream_id() {
     machine.apply(SessionEvent::RelayConnected).unwrap();
     machine.apply(SessionEvent::HandshakeComplete).unwrap();
     let second = machine.apply(SessionEvent::CapabilitiesNegotiated).unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(
+        !second
+            .iter()
+            .any(|action| matches!(action, SessionAction::StartVideo))
+    );
     let second_id = second
         .iter()
         .find_map(|action| match action {
