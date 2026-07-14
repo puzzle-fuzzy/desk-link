@@ -36,6 +36,8 @@ pub enum JoinRejectCode {
     AuthenticationMismatch = 5,
     RoleMismatch = 6,
     Internal = 7,
+    ConnectionLimit = 8,
+    SessionLimit = 9,
 }
 
 impl JoinRejectCode {
@@ -47,6 +49,8 @@ impl JoinRejectCode {
             4 => Self::SessionOccupied,
             5 => Self::AuthenticationMismatch,
             6 => Self::RoleMismatch,
+            8 => Self::ConnectionLimit,
+            9 => Self::SessionLimit,
             _ => Self::Internal,
         }
     }
@@ -248,5 +252,29 @@ impl QuicClientConfig {
         self.keep_alive = keep_alive;
         self.dead_timeout = dead_timeout;
         self
+    }
+
+    pub fn try_with_timeouts(
+        self,
+        keep_alive: Duration,
+        dead_timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        let config = self.with_timeouts(keep_alive, dead_timeout);
+        config.validate_timeouts()?;
+        Ok(config)
+    }
+
+    pub(crate) fn validate_timeouts(&self) -> Result<(), TransportError> {
+        if self.keep_alive.is_zero() || self.dead_timeout.is_zero() {
+            return Err(TransportError::InvalidConfig(
+                "keepalive and dead timeout must be nonzero".to_owned(),
+            ));
+        }
+        if self.keep_alive >= self.dead_timeout {
+            return Err(TransportError::InvalidConfig(
+                "keepalive must be shorter than dead timeout".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

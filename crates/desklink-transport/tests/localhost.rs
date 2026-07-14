@@ -3,8 +3,9 @@ use std::{sync::Arc, time::Duration};
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
-    JOIN_ENVELOPE_BYTES, JoinRejectCode, MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES,
-    QuicClient, QuicClientConfig, RelayJoin, TransportError, TransportEvent,
+    DEAD_TIMEOUT, JOIN_ENVELOPE_BYTES, JoinRejectCode, MAX_DATAGRAM_BYTES,
+    MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig, RelayJoin, TransportError,
+    TransportEvent, decode_relay_join,
 };
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -129,6 +130,164 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
     }
 }
 
+async fn spawn_stalled_control_relay() -> MockRelay {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_der = certificate.cert.der().to_vec();
+    let key_der = certificate.key_pair.serialize_der();
+    let mut server_config = ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate_der.clone())],
+        PrivateKeyDer::Pkcs8(key_der.into()),
+    )
+    .unwrap();
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(quinn::VarInt::from_u32(1));
+    server_config.transport_config(Arc::new(transport));
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(certificate_der.clone()))
+        .unwrap();
+    let client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let Some(connecting) = endpoint.accept().await else {
+            return;
+        };
+        let Ok(connection) = connecting.await else {
+            return;
+        };
+        let Ok((mut join_send, mut join_recv)) = connection.accept_bi().await else {
+            return;
+        };
+        let mut length = [0; 4];
+        if join_recv.read_exact(&mut length).await.is_err()
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+        {
+            return;
+        }
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        if join_recv.read_exact(&mut join_bytes).await.is_err()
+            || decode_relay_join(&join_bytes).is_err()
+        {
+            return;
+        }
+        let _ = join_send.write_all(&[0]).await;
+        let _ = join_send.finish();
+
+        let mut held_control_streams = Vec::new();
+        loop {
+            tokio::select! {
+                accepted = connection.accept_bi() => {
+                    let Ok((_send, mut receive)) = accepted else { break; };
+                    let mut channel = [0; 1];
+                    if receive.read_exact(&mut channel).await.is_err() {
+                        continue;
+                    }
+                    if channel[0] == 1 {
+                        held_control_streams.push(receive);
+                        continue;
+                    }
+                    if channel[0] != 2 {
+                        continue;
+                    }
+                    let connection = connection.clone();
+                    tokio::spawn(async move {
+                        let mut length = [0; 4];
+                        receive.read_exact(&mut length).await.unwrap();
+                        let length = u32::from_be_bytes(length) as usize;
+                        let mut message = vec![0; length];
+                        receive.read_exact(&mut message).await.unwrap();
+                        let Ok((mut send, _receive)) = connection.open_bi().await else {
+                            return;
+                        };
+                        if send.write_all(&[2]).await.is_err()
+                            || send.write_all(&(length as u32).to_be_bytes()).await.is_err()
+                            || send.write_all(&message).await.is_err()
+                        {
+                            return;
+                        }
+                        let _ = send.finish();
+                    });
+                }
+                _ = connection.closed() => break,
+            }
+        }
+        drop(held_control_streams);
+    });
+
+    MockRelay {
+        address,
+        client_config,
+        task,
+    }
+}
+
+async fn spawn_malformed_peer_relay() -> MockRelay {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_der = certificate.cert.der().to_vec();
+    let key_der = certificate.key_pair.serialize_der();
+    let server_config = ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate_der.clone())],
+        PrivateKeyDer::Pkcs8(key_der.into()),
+    )
+    .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(certificate_der)).unwrap();
+    let client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let Some(connecting) = endpoint.accept().await else {
+            return;
+        };
+        let Ok(connection) = connecting.await else {
+            return;
+        };
+        let Ok((mut join_send, mut join_recv)) = connection.accept_bi().await else {
+            return;
+        };
+        let mut length = [0; 4];
+        if join_recv.read_exact(&mut length).await.is_err()
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+        {
+            return;
+        }
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        if join_recv.read_exact(&mut join_bytes).await.is_err()
+            || decode_relay_join(&join_bytes).is_err()
+        {
+            return;
+        }
+        let _ = join_send.write_all(&[0]).await;
+        let _ = join_send.finish();
+
+        let Ok((mut send, _receive)) = connection.open_bi().await else {
+            return;
+        };
+        let _ = send.write_all(&[1]).await;
+        let _ = send.write_all(&1u32.to_be_bytes()).await;
+        let _ = send.finish();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    MockRelay {
+        address,
+        client_config,
+        task,
+    }
+}
+
 fn config(relay: &MockRelay) -> QuicClientConfig {
     QuicClientConfig::with_client_config(
         relay.address,
@@ -178,6 +337,76 @@ async fn localhost_client_keeps_reliable_channels_separate_and_forwards_datagram
     assert!(events.contains(&TransportEvent::VideoConfig(vec![6, 7, 8, 253])));
     assert!(events.contains(&TransportEvent::VideoDatagram(vec![9, 10, 11, 252])));
     assert!(events.contains(&TransportEvent::CursorDatagram(vec![12, 13, 14, 251])));
+}
+
+#[tokio::test]
+async fn stalled_control_channel_does_not_block_input_channel() {
+    let relay = spawn_stalled_control_relay().await;
+    let client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
+    client
+        .join(RelayJoin::new(
+            SessionId::from_bytes([7; 16]),
+            DeviceRole::Controller,
+            [3; 32],
+        ))
+        .await
+        .unwrap();
+
+    let mut stalled_control = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            client
+                .send_control(vec![0; MAX_RELIABLE_MESSAGE_BYTES])
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut stalled_control)
+            .await
+            .is_err(),
+        "control send should remain blocked by the stalled peer"
+    );
+
+    let input = tokio::time::timeout(Duration::from_millis(250), client.send_input(vec![1, 2, 3]))
+        .await
+        .expect("input channel made no progress while control was stalled");
+    input.unwrap();
+    stalled_control.abort();
+    relay.task.abort();
+}
+
+#[tokio::test]
+async fn client_rejects_invalid_timeout_overrides_before_connecting() {
+    let relay = spawn_mock_relay(false).await;
+    let invalid_zero = config(&relay).with_timeouts(Duration::ZERO, DEAD_TIMEOUT);
+    assert!(matches!(
+        QuicClient::connect(invalid_zero).await,
+        Err(TransportError::InvalidConfig(_))
+    ));
+
+    let invalid_order = config(&relay).with_timeouts(DEAD_TIMEOUT, DEAD_TIMEOUT);
+    assert!(matches!(
+        QuicClient::connect(invalid_order).await,
+        Err(TransportError::InvalidConfig(_))
+    ));
+    relay.task.abort();
+}
+
+#[tokio::test]
+async fn malformed_peer_stream_emits_closed_without_panicking() {
+    let relay = spawn_malformed_peer_relay().await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .unwrap(),
+        Ok(TransportEvent::Closed {
+            reason: "malformed reliable message".to_owned()
+        })
+    );
 }
 
 #[tokio::test]

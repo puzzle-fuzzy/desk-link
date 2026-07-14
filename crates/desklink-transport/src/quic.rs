@@ -20,15 +20,10 @@ struct ClientInner {
     connection: quinn::Connection,
     joined: AtomicBool,
     join_lock: Mutex<()>,
-    streams: Mutex<OutboundStreams>,
+    control: Mutex<Option<quinn::SendStream>>,
+    input: Mutex<Option<quinn::SendStream>>,
+    video_config: Mutex<Option<quinn::SendStream>>,
     events: Mutex<mpsc::Receiver<TransportEvent>>,
-}
-
-#[derive(Default)]
-struct OutboundStreams {
-    control: Option<quinn::SendStream>,
-    input: Option<quinn::SendStream>,
-    video_config: Option<quinn::SendStream>,
 }
 
 impl QuicClient {
@@ -38,6 +33,7 @@ impl QuicClient {
                 "server name must not be empty".to_owned(),
             ));
         }
+        config.validate_timeouts()?;
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
         let mut transport = quinn::TransportConfig::default();
@@ -63,7 +59,9 @@ impl QuicClient {
             connection: connection.clone(),
             joined: AtomicBool::new(false),
             join_lock: Mutex::new(()),
-            streams: Mutex::new(OutboundStreams::default()),
+            control: Mutex::new(None),
+            input: Mutex::new(None),
+            video_config: Mutex::new(None),
             events: Mutex::new(event_receiver),
         });
         tokio::spawn(read_connection(connection, event_sender));
@@ -145,15 +143,15 @@ impl QuicClient {
             });
         }
         self.ensure_joined()?;
-        let mut streams = self.inner.streams.lock().await;
-        let stream = match channel {
-            ChannelKind::Control => &mut streams.control,
-            ChannelKind::Input => &mut streams.input,
-            ChannelKind::VideoConfig => &mut streams.video_config,
+        let stream_lock = match channel {
+            ChannelKind::Control => &self.inner.control,
+            ChannelKind::Input => &self.inner.input,
+            ChannelKind::VideoConfig => &self.inner.video_config,
             ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => {
                 return Err(TransportError::Malformed);
             }
         };
+        let mut stream = stream_lock.lock().await;
         if stream.is_none() {
             let (mut send, _receive) = self
                 .inner
@@ -166,14 +164,16 @@ impl QuicClient {
                 .map_err(|error| TransportError::Stream(error.to_string()))?;
             *stream = Some(send);
         }
-        let Some(stream) = stream.as_mut() else {
+        let Some(outbound) = stream.as_mut() else {
             return Err(TransportError::Closed);
         };
         let length = (bytes.len() as u32).to_be_bytes();
-        if let Err(error) = stream.write_all(&length).await {
+        if let Err(error) = outbound.write_all(&length).await {
+            *stream = None;
             return Err(TransportError::Stream(error.to_string()));
         }
-        if let Err(error) = stream.write_all(&bytes).await {
+        if let Err(error) = outbound.write_all(&bytes).await {
+            *stream = None;
             return Err(TransportError::Stream(error.to_string()));
         }
         Ok(())
@@ -209,56 +209,100 @@ async fn read_connection(connection: quinn::Connection, events: mpsc::Sender<Tra
     loop {
         tokio::select! {
             accepted = connection.accept_bi() => {
-                let Ok((_send, receive)) = accepted else { break; };
+                let Ok((_send, receive)) = accepted else {
+                    emit_closed(&events, "reliable stream accept failed".to_owned()).await;
+                    break;
+                };
                 let events = events.clone();
-                tokio::spawn(read_reliable_stream(receive, events));
+                tokio::spawn(read_reliable_stream(connection.clone(), receive, events));
             }
             datagram = connection.read_datagram() => {
-                let Ok(datagram) = datagram else { break; };
-                if let Some(event) = decode_datagram(datagram.as_ref()) {
-                    if events.send(event).await.is_err() { break; }
+                let Ok(datagram) = datagram else {
+                    emit_closed(&events, "datagram receive failed".to_owned()).await;
+                    break;
+                };
+                match decode_datagram(datagram.as_ref()) {
+                    Ok(event) => {
+                        if events.send(event).await.is_err() { break; }
+                    }
+                    Err(()) => {
+                        connection.close(quinn::VarInt::from_u32(3), b"malformed datagram");
+                        emit_closed(&events, "malformed datagram".to_owned()).await;
+                        break;
+                    }
                 }
             }
             closed = connection.closed() => {
-                let _ = events.send(TransportEvent::Closed { reason: closed.to_string() }).await;
+                emit_closed(&events, closed.to_string()).await;
                 break;
             }
         }
     }
 }
 
+async fn emit_closed(events: &mpsc::Sender<TransportEvent>, reason: String) {
+    let _ = events.send(TransportEvent::Closed { reason }).await;
+}
+
 async fn read_reliable_stream(
+    connection: quinn::Connection,
     mut receive: quinn::RecvStream,
     events: mpsc::Sender<TransportEvent>,
 ) {
     let mut channel = [0; 1];
-    if receive.read_exact(&mut channel).await.is_err() {
-        return;
+    match receive.read_exact(&mut channel).await {
+        Ok(()) => {}
+        Err(quinn::ReadExactError::FinishedEarly(0)) => return,
+        Err(_) => {
+            let _ = receive.stop(quinn::VarInt::from_u32(1));
+            emit_closed(&events, "malformed reliable stream".to_owned()).await;
+            return;
+        }
     }
     let Ok(channel) = ChannelKind::try_from(channel[0]) else {
+        let _ = receive.stop(quinn::VarInt::from_u32(1));
+        connection.close(quinn::VarInt::from_u32(3), b"unknown reliable channel");
+        emit_closed(&events, "unknown reliable channel".to_owned()).await;
         return;
     };
     if !channel.is_reliable() {
+        let _ = receive.stop(quinn::VarInt::from_u32(1));
+        connection.close(quinn::VarInt::from_u32(3), b"invalid reliable channel");
+        emit_closed(&events, "invalid reliable channel".to_owned()).await;
         return;
     }
     loop {
         let mut length = [0; 4];
-        if receive.read_exact(&mut length).await.is_err() {
-            return;
+        match receive.read_exact(&mut length).await {
+            Ok(()) => {}
+            Err(quinn::ReadExactError::FinishedEarly(0)) => return,
+            Err(_) => {
+                let _ = receive.stop(quinn::VarInt::from_u32(1));
+                emit_closed(&events, "malformed reliable message".to_owned()).await;
+                return;
+            }
         }
         let length = u32::from_be_bytes(length) as usize;
         if length > MAX_RELIABLE_MESSAGE_BYTES {
+            let _ = receive.stop(quinn::VarInt::from_u32(1));
+            connection.close(quinn::VarInt::from_u32(3), b"reliable message too large");
+            emit_closed(&events, "reliable message too large".to_owned()).await;
             return;
         }
         let mut bytes = vec![0; length];
-        if receive.read_exact(&mut bytes).await.is_err() {
-            return;
+        match receive.read_exact(&mut bytes).await {
+            Ok(()) => {}
+            Err(_) => {
+                let _ = receive.stop(quinn::VarInt::from_u32(1));
+                emit_closed(&events, "malformed reliable message".to_owned()).await;
+                return;
+            }
         }
         let event = match channel {
             ChannelKind::Control => TransportEvent::Control(bytes),
             ChannelKind::Input => TransportEvent::Input(bytes),
             ChannelKind::VideoConfig => TransportEvent::VideoConfig(bytes),
-            ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => return,
+            ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => unreachable!(),
         };
         if events.send(event).await.is_err() {
             return;
@@ -266,14 +310,14 @@ async fn read_reliable_stream(
     }
 }
 
-fn decode_datagram(bytes: &[u8]) -> Option<TransportEvent> {
+fn decode_datagram(bytes: &[u8]) -> Result<TransportEvent, ()> {
     if bytes.is_empty() || bytes.len() - 1 > MAX_DATAGRAM_BYTES {
-        return None;
+        return Err(());
     }
     let payload = bytes[1..].to_vec();
     match ChannelKind::try_from(bytes[0]) {
-        Ok(ChannelKind::VideoDatagram) => Some(TransportEvent::VideoDatagram(payload)),
-        Ok(ChannelKind::CursorDatagram) => Some(TransportEvent::CursorDatagram(payload)),
-        _ => None,
+        Ok(ChannelKind::VideoDatagram) => Ok(TransportEvent::VideoDatagram(payload)),
+        Ok(ChannelKind::CursorDatagram) => Ok(TransportEvent::CursorDatagram(payload)),
+        _ => Err(()),
     }
 }

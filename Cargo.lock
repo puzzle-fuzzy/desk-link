@@ -302,6 +302,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "subtle",
  "thiserror",
  "tokio",
 ]

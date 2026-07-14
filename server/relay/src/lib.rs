@@ -14,6 +14,7 @@ use desklink_transport::{
     ChannelKind, DEAD_TIMEOUT, JOIN_ENVELOPE_BYTES, JoinRejectCode, KEEPALIVE_INTERVAL,
     MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, RelayJoin, decode_relay_join,
 };
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -22,6 +23,8 @@ pub struct RelayConfig {
     pub sweep_interval: Duration,
     pub keep_alive: Duration,
     pub dead_timeout: Duration,
+    pub max_connections: usize,
+    pub max_sessions: usize,
 }
 
 impl Default for RelayConfig {
@@ -31,6 +34,8 @@ impl Default for RelayConfig {
             sweep_interval: Duration::from_secs(1),
             keep_alive: KEEPALIVE_INTERVAL,
             dead_timeout: DEAD_TIMEOUT,
+            max_connections: 1024,
+            max_sessions: 1024,
         }
     }
 }
@@ -61,6 +66,10 @@ pub enum RelayError {
     InvalidConfig(String),
     #[error("relay transport error: {0}")]
     Transport(String),
+    #[error("connection admission limit reached")]
+    ConnectionLimitReached,
+    #[error("session admission limit reached")]
+    SessionLimitReached,
 }
 
 #[derive(Clone)]
@@ -164,13 +173,26 @@ impl RelaySessionTable {
     }
 
     pub fn sweep(&self, now: Instant) -> Vec<SessionId> {
+        self.sweep_expired(now)
+            .into_iter()
+            .map(|expired| expired.session_id)
+            .collect()
+    }
+
+    pub fn sweep_expired(&self, now: Instant) -> Vec<ExpiredSession> {
         let mut sessions = self.lock_sessions();
         let expired = sessions
             .iter()
-            .filter_map(|(session_id, session)| (session.expires_at <= now).then_some(*session_id))
+            .filter_map(|(session_id, session)| {
+                (session.expires_at <= now).then_some(ExpiredSession {
+                    session_id: *session_id,
+                    host: session.host,
+                    controller: session.controller,
+                })
+            })
             .collect::<Vec<_>>();
-        for session_id in &expired {
-            sessions.remove(session_id);
+        for expired_session in &expired {
+            sessions.remove(&expired_session.session_id);
         }
         expired
     }
@@ -216,20 +238,30 @@ impl RelaySessionTable {
         let mut sessions = self.lock_sessions();
         sessions.retain(|_, session| session.expires_at > now);
 
-        if let std::collections::hash_map::Entry::Vacant(entry) = sessions.entry(session_id) {
+        if !sessions.contains_key(&session_id) {
             if role == DeviceRole::Controller {
                 return Err(RelayError::SessionNotFound);
             }
-            entry.insert(SessionRecord {
-                created_at: now,
-                expires_at: now + self.config.session_ttl,
-                authentication,
-                host: Some(connection_id),
-                controller: None,
-            });
+            if sessions.len() >= self.config.max_sessions {
+                return Err(RelayError::SessionLimitReached);
+            }
+            if active_connection_count(&sessions) >= self.config.max_connections {
+                return Err(RelayError::ConnectionLimitReached);
+            }
+            sessions.insert(
+                session_id,
+                SessionRecord {
+                    created_at: now,
+                    expires_at: now + self.config.session_ttl,
+                    authentication,
+                    host: Some(connection_id),
+                    controller: None,
+                },
+            );
             return Ok(());
         }
 
+        let current_connections = active_connection_count(&sessions);
         let Some(session) = sessions.get_mut(&session_id) else {
             return Err(RelayError::SessionNotFound);
         };
@@ -239,6 +271,9 @@ impl RelaySessionTable {
                 if session.host.is_some() {
                     Err(RelayError::SessionOccupied)
                 } else {
+                    if current_connections >= self.config.max_connections {
+                        return Err(RelayError::ConnectionLimitReached);
+                    }
                     session.host = Some(connection_id);
                     Ok(())
                 }
@@ -250,6 +285,9 @@ impl RelaySessionTable {
                 if session.controller.is_some() {
                     Err(RelayError::SessionOccupied)
                 } else {
+                    if current_connections >= self.config.max_connections {
+                        return Err(RelayError::ConnectionLimitReached);
+                    }
                     session.controller = Some(connection_id);
                     Ok(())
                 }
@@ -265,12 +303,42 @@ impl RelaySessionTable {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpiredSession {
+    session_id: SessionId,
+    host: Option<u64>,
+    controller: Option<u64>,
+}
+
+impl ExpiredSession {
+    pub fn session_id(self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn host_connection_id(self) -> Option<u64> {
+        self.host
+    }
+
+    pub fn controller_connection_id(self) -> Option<u64> {
+        self.controller
+    }
+}
+
+fn active_connection_count(sessions: &HashMap<SessionId, SessionRecord>) -> usize {
+    sessions
+        .values()
+        .map(|session| {
+            usize::from(session.host.is_some()) + usize::from(session.controller.is_some())
+        })
+        .sum()
+}
+
 fn apply_authentication(
     expected: &mut Option<[u8; 32]>,
     actual: Option<[u8; 32]>,
 ) -> Result<(), RelayError> {
-    match (*expected, actual) {
-        (Some(expected), Some(actual)) if expected != actual => {
+    match (expected.as_ref(), actual) {
+        (Some(expected), Some(actual)) if expected.ct_eq(&actual).unwrap_u8() == 0 => {
             Err(RelayError::AuthenticationMismatch)
         }
         (Some(_), None) => Err(RelayError::AuthenticationMismatch),
@@ -283,14 +351,15 @@ fn apply_authentication(
 }
 
 struct Participant {
-    session_id: SessionId,
     connection: quinn::Connection,
 }
 
 struct RelayState {
     sessions: RelaySessionTable,
+    membership: Mutex<()>,
     participants: Mutex<HashMap<u64, Participant>>,
     next_connection_id: AtomicU64,
+    active_connections: std::sync::atomic::AtomicUsize,
 }
 
 impl RelayState {
@@ -310,6 +379,54 @@ impl RelayState {
         }
     }
 
+    fn lock_membership(&self) -> MutexGuard<'_, ()> {
+        match self.membership.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn try_reserve_connection(&self) -> bool {
+        let maximum = self.sessions.config.max_connections;
+        let mut current = self.active_connections.load(Ordering::Acquire);
+        loop {
+            if current >= maximum {
+                return false;
+            }
+            match self.active_connections.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release_connection(&self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn attach_participant(
+        &self,
+        join: &RelayJoin,
+        connection_id: u64,
+        connection: quinn::Connection,
+    ) -> Result<(), RelayError> {
+        let _membership = self.lock_membership();
+        self.sessions.attach_with_auth(
+            join.session_id(),
+            join.role(),
+            *join.authentication(),
+            connection_id,
+        )?;
+        self.lock_participants()
+            .insert(connection_id, Participant { connection });
+        Ok(())
+    }
+
     fn peer(
         &self,
         session_id: SessionId,
@@ -325,25 +442,27 @@ impl RelayState {
     }
 
     fn remove_connection(&self, session_id: SessionId, connection_id: u64) {
+        let _membership = self.lock_membership();
         self.sessions.detach(session_id, connection_id);
         self.lock_participants().remove(&connection_id);
     }
 
-    fn remove_expired(&self, expired: &[SessionId]) {
-        if expired.is_empty() {
-            return;
-        }
+    fn sweep_expired(&self, now: Instant) {
+        let _membership = self.lock_membership();
+        let expired = self.sessions.sweep_expired(now);
         let mut participants = self.lock_participants();
-        participants.retain(|_, participant| {
-            if expired.contains(&participant.session_id) {
-                participant
-                    .connection
-                    .close(quinn::VarInt::from_u32(2), b"session expired");
-                false
-            } else {
-                true
+        for expired_session in expired {
+            for connection_id in [expired_session.host, expired_session.controller]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(participant) = participants.remove(&connection_id) {
+                    participant
+                        .connection
+                        .close(quinn::VarInt::from_u32(2), b"session expired");
+                }
             }
-        });
+        }
     }
 }
 
@@ -364,6 +483,16 @@ impl RelayServer {
                 "keepalive and dead timeout must be nonzero".to_owned(),
             ));
         }
+        if config.keep_alive >= config.dead_timeout {
+            return Err(RelayError::InvalidConfig(
+                "keepalive must be shorter than dead timeout".to_owned(),
+            ));
+        }
+        if config.max_connections == 0 || config.max_sessions == 0 {
+            return Err(RelayError::InvalidConfig(
+                "admission limits must be nonzero".to_owned(),
+            ));
+        }
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
         let mut transport = quinn::TransportConfig::default();
@@ -375,8 +504,10 @@ impl RelayServer {
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         let state = Arc::new(RelayState {
             sessions: RelaySessionTable::new(config.clone()),
+            membership: Mutex::new(()),
             participants: Mutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
+            active_connections: std::sync::atomic::AtomicUsize::new(0),
         });
         Ok(Self {
             endpoint,
@@ -413,16 +544,20 @@ impl RelayServer {
                 incoming = self.endpoint.accept() => {
                     let Some(incoming) = incoming else { return Ok(()); };
                     let state = self.state.clone();
+                    if !state.try_reserve_connection() {
+                        incoming.refuse();
+                        continue;
+                    }
                     let connection_id = state.next_connection_id();
                     tokio::spawn(async move {
                         if let Ok(connection) = incoming.await {
-                            handle_connection(connection, state, connection_id).await;
+                            handle_connection(connection, state.clone(), connection_id).await;
                         }
+                        state.release_connection();
                     });
                 }
                 _ = sweep.tick() => {
-                    let expired = self.state.sessions.sweep(Instant::now());
-                    self.state.remove_expired(&expired);
+                    self.state.sweep_expired(Instant::now());
                 }
             }
         }
@@ -451,13 +586,7 @@ async fn handle_connection(
             return;
         }
     };
-    let attach = state.sessions.attach_with_auth(
-        join.session_id(),
-        join.role(),
-        *join.authentication(),
-        connection_id,
-    );
-    if let Err(error) = attach {
+    if let Err(error) = state.attach_participant(&join, connection_id, connection.clone()) {
         if join_send
             .write_all(&[relay_error_code(&error)])
             .await
@@ -470,13 +599,6 @@ async fn handle_connection(
     }
     let session_id = join.session_id();
     let role = join.role();
-    state.lock_participants().insert(
-        connection_id,
-        Participant {
-            session_id,
-            connection: connection.clone(),
-        },
-    );
     if join_send.write_all(&[0]).await.is_err() || join_send.finish().is_err() {
         state.remove_connection(session_id, connection_id);
         return;
@@ -645,6 +767,8 @@ impl From<&RelayError> for JoinRejectCode {
             RelayError::SessionOccupied => Self::SessionOccupied,
             RelayError::AuthenticationMismatch => Self::AuthenticationMismatch,
             RelayError::RoleMismatch => Self::RoleMismatch,
+            RelayError::ConnectionLimitReached => Self::ConnectionLimit,
+            RelayError::SessionLimitReached => Self::SessionLimit,
             _ => Self::Internal,
         }
     }

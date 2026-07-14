@@ -25,6 +25,10 @@ impl Drop for TestRelay {
 }
 
 async fn spawn_test_relay() -> TestRelay {
+    spawn_test_relay_with_config(RelayConfig::default()).await
+}
+
+async fn spawn_test_relay_with_config(config: RelayConfig) -> TestRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
@@ -42,13 +46,9 @@ async fn spawn_test_relay() -> TestRelay {
     let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
     let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
     let relay = Arc::new(
-        RelayServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            server_config,
-            RelayConfig::default(),
-        )
-        .await
-        .unwrap(),
+        RelayServer::bind("127.0.0.1:0".parse().unwrap(), server_config, config)
+            .await
+            .unwrap(),
     );
     let address = relay.local_addr().unwrap();
     let task_relay = relay.clone();
@@ -60,6 +60,18 @@ async fn spawn_test_relay() -> TestRelay {
         client_config,
         task,
     }
+}
+
+fn server_config_for_bind_test() -> ServerConfig {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_der = certificate.cert.der().to_vec();
+    let key_der = certificate.key_pair.serialize_der();
+    ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate_der)],
+        PrivateKeyDer::Pkcs8(key_der.into()),
+    )
+    .unwrap()
 }
 
 fn config(relay: &TestRelay) -> QuicClientConfig {
@@ -184,6 +196,40 @@ async fn second_controller_is_rejected() {
     );
 }
 
+#[tokio::test]
+async fn relay_enforces_connection_and_session_admission_caps() {
+    let connection_limited = spawn_test_relay_with_config(RelayConfig {
+        max_connections: 1,
+        max_sessions: 4,
+        ..RelayConfig::default()
+    })
+    .await;
+    let first = QuicClient::connect(config(&connection_limited))
+        .await
+        .unwrap();
+    first.join(host(session(16), [4; 32])).await.unwrap();
+    assert!(matches!(
+        QuicClient::connect(config(&connection_limited)).await,
+        Err(TransportError::Connection(_))
+    ));
+
+    let session_limited = spawn_test_relay_with_config(RelayConfig {
+        max_connections: 4,
+        max_sessions: 1,
+        ..RelayConfig::default()
+    })
+    .await;
+    let first = QuicClient::connect(config(&session_limited)).await.unwrap();
+    first.join(host(session(17), [4; 32])).await.unwrap();
+    let second = QuicClient::connect(config(&session_limited)).await.unwrap();
+    assert_eq!(
+        second.join(host(session(18), [4; 32])).await,
+        Err(TransportError::JoinRejected(
+            desklink_transport::JoinRejectCode::SessionLimit
+        ))
+    );
+}
+
 #[test]
 fn second_controller_is_rejected_by_the_session_table() {
     let table = RelaySessionTable::new(RelayConfig::default());
@@ -212,6 +258,82 @@ fn session_expiry_and_precise_detach_are_deterministic() {
     let expired = table.sweep(Instant::now() + Duration::from_secs(11));
     assert_eq!(expired, vec![session_id]);
     assert!(!table.has_connection(session_id, connection(11)));
+}
+
+#[test]
+fn expiry_returns_exact_connections_before_immediate_reattach() {
+    let table = RelaySessionTable::new(RelayConfig {
+        session_ttl: Duration::from_secs(1),
+        ..RelayConfig::default()
+    });
+    let session_id = session(12);
+    table.attach_host(session_id, connection(101)).unwrap();
+    table
+        .attach_controller(session_id, connection(202))
+        .unwrap();
+
+    let expired = table.sweep_expired(Instant::now() + Duration::from_secs(2));
+    table.attach_host(session_id, connection(303)).unwrap();
+
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].session_id(), session_id);
+    assert_eq!(expired[0].host_connection_id(), Some(connection(101)));
+    assert_eq!(expired[0].controller_connection_id(), Some(connection(202)));
+    assert!(table.has_connection(session_id, connection(303)));
+}
+
+#[test]
+fn admission_caps_are_atomic_and_stable() {
+    let table = RelaySessionTable::new(RelayConfig {
+        max_connections: 1,
+        max_sessions: 4,
+        ..RelayConfig::default()
+    });
+    table.attach_host(session(13), connection(1)).unwrap();
+    assert_eq!(
+        table.attach_controller(session(13), connection(2)),
+        Err(RelayError::ConnectionLimitReached)
+    );
+
+    let table = RelaySessionTable::new(RelayConfig {
+        max_connections: 4,
+        max_sessions: 1,
+        ..RelayConfig::default()
+    });
+    table.attach_host(session(14), connection(3)).unwrap();
+    assert_eq!(
+        table.attach_host(session(15), connection(4)),
+        Err(RelayError::SessionLimitReached)
+    );
+}
+
+#[tokio::test]
+async fn relay_rejects_invalid_timeout_and_admission_configuration() {
+    assert!(matches!(
+        RelayServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_for_bind_test(),
+            RelayConfig {
+                keep_alive: Duration::from_secs(15),
+                dead_timeout: Duration::from_secs(15),
+                ..RelayConfig::default()
+            }
+        )
+        .await,
+        Err(RelayError::InvalidConfig(_))
+    ));
+    assert!(matches!(
+        RelayServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config_for_bind_test(),
+            RelayConfig {
+                max_connections: 0,
+                ..RelayConfig::default()
+            }
+        )
+        .await,
+        Err(RelayError::InvalidConfig(_))
+    ));
 }
 
 #[tokio::test]
