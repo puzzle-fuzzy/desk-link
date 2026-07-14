@@ -1,6 +1,8 @@
 [package]
 name = "desklink-crypto"
 version = "0.1.0"
+# This internal crate relies on audited local crypto patches and must not be published.
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
