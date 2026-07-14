@@ -7,6 +7,7 @@ members = [
   "crates/desklink-crypto",
   "crates/desklink-transport",
   "crates/desklink-ffi",
+  "apps/windows",
   "server/relay",
 ]
 exclude = [
