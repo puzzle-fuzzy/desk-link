@@ -9,6 +9,10 @@ members = [
   "crates/desklink-ffi",
   "server/relay",
 ]
+exclude = [
+  "vendor/blake2-0.10.6",
+  "vendor/snow-0.9.6",
+]
 
 [workspace.package]
 edition = "2024"

@@ -83,8 +83,8 @@ impl fmt::Debug for EncryptedMessage {
 pub struct SessionKey(Zeroizing<[u8; SESSION_KEY_BYTES]>);
 
 impl SessionKey {
-    fn new(bytes: [u8; SESSION_KEY_BYTES]) -> Self {
-        Self(Zeroizing::new(bytes))
+    fn new(bytes: Zeroizing<[u8; SESSION_KEY_BYTES]>) -> Self {
+        Self(bytes)
     }
 
     fn as_bytes(&self) -> &[u8; SESSION_KEY_BYTES] {
@@ -120,9 +120,9 @@ impl NoiseInitiator {
         expected_peer: VerifyingKey,
     ) -> Result<(Self, Vec<u8>), CryptoError> {
         let state = build_handshake_state(true)?;
-        let mut session_key = [0; SESSION_KEY_BYTES];
+        let mut session_key = Zeroizing::new([0; SESSION_KEY_BYTES]);
         OsRng
-            .try_fill_bytes(&mut session_key)
+            .try_fill_bytes(&mut session_key[..])
             .map_err(|_| CryptoError::BackendFailure)?;
         let mut initiator = Self {
             state: Some(state),
@@ -131,7 +131,6 @@ impl NoiseInitiator {
             peer_verify_key: None,
             session_key: Some(SessionKey::new(session_key)),
         };
-        session_key.zeroize();
         let message_1 = initiator.write_message(&[])?;
         Ok((initiator, message_1))
     }
@@ -238,7 +237,7 @@ impl NoiseResponder {
         }
 
         let transcript = state.get_handshake_hash().to_vec();
-        let payload = Zeroizing::new(read_handshake_message(state, message)?);
+        let payload = read_handshake_message(state, message)?;
         if payload.len() != INITIATOR_PAYLOAD_BYTES {
             return Err(CryptoError::MalformedHandshake);
         }
@@ -251,10 +250,9 @@ impl NoiseResponder {
             &transcript,
             &signature,
         )?;
-        let mut session_key = [0; SESSION_KEY_BYTES];
+        let mut session_key = Zeroizing::new([0; SESSION_KEY_BYTES]);
         session_key.copy_from_slice(key_payload);
         self.session_key = Some(SessionKey::new(session_key));
-        session_key.zeroize();
         self.peer_verify_key = Some(peer_verify_key);
         Ok(Vec::new())
     }
@@ -336,7 +334,7 @@ fn build_handshake_state(initiator: bool) -> Result<HandshakeState, CryptoError>
     let keypair = builder
         .generate_keypair()
         .map_err(|_| CryptoError::BackendFailure)?;
-    let private_key = Zeroizing::new(keypair.private);
+    let private_key = keypair.private;
     let builder = builder.local_private_key(private_key.as_slice());
     if initiator {
         builder
@@ -366,9 +364,9 @@ fn write_handshake_message(
 fn read_handshake_message(
     state: &mut HandshakeState,
     message: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     ensure_bounded(message.len(), MAX_ENCRYPTED_MESSAGE_BYTES)?;
-    let mut payload = vec![0; message.len()];
+    let mut payload = Zeroizing::new(vec![0; message.len()]);
     let read = state
         .read_message(message, &mut payload)
         .map_err(map_handshake_error)?;

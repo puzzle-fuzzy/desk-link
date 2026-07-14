@@ -6,7 +6,7 @@ use desklink_crypto::{
     NoiseResponder, PairingError, PairingOffer, SessionId,
 };
 use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
+use rand_core::{CryptoRng, RngCore, SeedableRng};
 
 #[test]
 fn identity_signature_verifies_only_for_original_payload() {
@@ -130,6 +130,51 @@ fn pairing_ttl_must_be_between_one_and_ten_minutes() {
         PairingOffer::new_with_rng(session, 1_000, MAX_PAIRING_TTL_S + 1, &mut rng),
         Err(PairingError::InvalidTtl)
     ));
+}
+
+#[test]
+fn invalid_pairing_ttl_does_not_consume_randomness() {
+    #[derive(Default)]
+    struct CountingRng {
+        bytes_requested: usize,
+    }
+
+    impl RngCore for CountingRng {
+        fn next_u32(&mut self) -> u32 {
+            self.bytes_requested += 4;
+            0
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.bytes_requested += 8;
+            0
+        }
+
+        fn fill_bytes(&mut self, destination: &mut [u8]) {
+            self.bytes_requested += destination.len();
+            destination.fill(0);
+        }
+
+        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(destination);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for CountingRng {}
+
+    let mut rng = CountingRng::default();
+    let session = SessionId::from_bytes([8; 16]);
+
+    assert!(matches!(
+        PairingOffer::new_with_rng(session, 1_000, 0, &mut rng),
+        Err(PairingError::InvalidTtl)
+    ));
+    assert!(matches!(
+        PairingOffer::new_with_rng(session, 1_000, MAX_PAIRING_TTL_S + 1, &mut rng),
+        Err(PairingError::InvalidTtl)
+    ));
+    assert_eq!(rng.bytes_requested, 0);
 }
 
 #[test]

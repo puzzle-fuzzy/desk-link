@@ -1,4 +1,10 @@
-use blake2::{Blake2s256, Digest};
+use blake2::{
+    Blake2sVarCore,
+    digest::{
+        Output,
+        core_api::{Buffer, UpdateCore, VariableOutputCore},
+    },
+};
 use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{AeadInPlace, generic_array::GenericArray},
@@ -228,16 +234,46 @@ impl Cipher for ZeroizingChaChaPoly {
     }
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct ZeroizingBlake2s {
-    input: Vec<u8>,
+    core: Blake2sVarCore,
+    buffer: ZeroizingBlake2sBuffer,
+    input_bytes: usize,
 }
 
 impl Default for ZeroizingBlake2s {
     fn default() -> Self {
         Self {
-            input: Vec::with_capacity(MAX_HASH_INPUT_BYTES),
+            core: Blake2sVarCore::new(BLAKE2S_HASH_BYTES)
+                .expect("BLAKE2s accepts its standard 32-byte output"),
+            buffer: ZeroizingBlake2sBuffer::default(),
+            input_bytes: 0,
         }
+    }
+}
+
+impl Drop for ZeroizingBlake2s {
+    fn drop(&mut self) {
+        self.input_bytes.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ZeroizingBlake2s {}
+
+#[derive(Default)]
+struct ZeroizingBlake2sBuffer(Buffer<Blake2sVarCore>);
+
+impl Drop for ZeroizingBlake2sBuffer {
+    fn drop(&mut self) {
+        self.0.pad_with_zeros().as_mut_slice().zeroize();
+    }
+}
+
+#[derive(Default)]
+struct ZeroizingBlake2sDigest(Output<Blake2sVarCore>);
+
+impl Drop for ZeroizingBlake2sDigest {
+    fn drop(&mut self) {
+        self.0.as_mut_slice().zeroize();
     }
 }
 
@@ -255,27 +291,34 @@ impl Hash for ZeroizingBlake2s {
     }
 
     fn reset(&mut self) {
-        self.input.zeroize();
+        self.core = Blake2sVarCore::new(BLAKE2S_HASH_BYTES)
+            .expect("BLAKE2s accepts its standard 32-byte output");
+        self.buffer = ZeroizingBlake2sBuffer::default();
+        self.input_bytes = 0;
     }
 
     fn input(&mut self, data: &[u8]) {
         let new_length = self
-            .input
-            .len()
+            .input_bytes
             .checked_add(data.len())
             .expect("BLAKE2s input length overflow");
         assert!(
             new_length <= MAX_HASH_INPUT_BYTES,
             "Noise hash input is too large"
         );
-        self.input.extend_from_slice(data);
+        let Self { core, buffer, .. } = self;
+        buffer
+            .0
+            .digest_blocks(data, |blocks| core.update_blocks(blocks));
+        self.input_bytes = new_length;
     }
 
     fn result(&mut self, output: &mut [u8]) {
         assert!(output.len() >= BLAKE2S_HASH_BYTES);
-        let mut digest = Blake2s256::digest(&self.input);
-        output[..BLAKE2S_HASH_BYTES].copy_from_slice(&digest);
-        digest.as_mut_slice().zeroize();
+        let mut digest = ZeroizingBlake2sDigest::default();
+        self.core
+            .finalize_variable_core(&mut self.buffer.0, &mut digest.0);
+        output[..BLAKE2S_HASH_BYTES].copy_from_slice(&digest.0);
         self.reset();
     }
 
@@ -355,6 +398,18 @@ mod tests {
     }
 
     #[test]
+    fn patched_crypto_dependencies_are_selected() {
+        assert_eq!(
+            snow::DESKLINK_ZEROIZE_PATCH,
+            "snow-0.9.6-desklink-zeroize-v1"
+        );
+        assert_eq!(
+            blake2::DESKLINK_ZEROIZE_PATCH,
+            "blake2-0.10.6-desklink-zeroize-v1"
+        );
+    }
+
+    #[test]
     fn resolver_exposes_only_the_exact_noise_primitives() {
         let resolver = DesklinkResolver;
 
@@ -425,6 +480,26 @@ mod tests {
     }
 
     #[test]
+    fn chachapoly_adapter_matches_independent_aead_vector() {
+        let mut cipher = ZeroizingChaChaPoly::default();
+        let key: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let mut ciphertext = [0; 64];
+        cipher.set(&key);
+
+        let written = cipher.encrypt(
+            7,
+            b"Desklink Noise AAD",
+            b"Desklink vector payload",
+            &mut ciphertext,
+        );
+
+        assert_eq!(
+            hex::encode(&ciphertext[..written]),
+            "b56af7234e8114e242402b5088e762ba42fcdb2d9e8c6d726612ec6e6c60d4a79b54effd12f00d"
+        );
+    }
+
+    #[test]
     fn zeroizing_blake2s_adapter_matches_known_digest() {
         let mut hash = ZeroizingBlake2s::default();
         let mut output = [0; 32];
@@ -438,16 +513,120 @@ mod tests {
     }
 
     #[test]
-    fn blake2s_retained_buffer_never_reallocates_at_noise_maximum() {
+    fn blake2s_hmac_matches_independent_vector() {
         let mut hash = ZeroizingBlake2s::default();
-        let allocation = hash.input.as_ptr();
+        let key: [u8; BLAKE2S_HASH_BYTES] = std::array::from_fn(|index| index as u8);
+        let mut output = [0; BLAKE2S_HASH_BYTES];
+
+        hash.hmac(&key, b"Desklink Noise HMAC vector", &mut output);
+
+        assert_eq!(
+            hex::encode(output),
+            "35d0c48e5b6d1852c38ccbe6f4b15f633b87adc833204378d4eb1991eb996ad2"
+        );
+    }
+
+    #[test]
+    fn blake2s_noise_hkdf_matches_independent_vectors() {
+        let mut hash = ZeroizingBlake2s::default();
+        let chaining_key: [u8; BLAKE2S_HASH_BYTES] = std::array::from_fn(|index| index as u8);
+        let input_key_material: [u8; BLAKE2S_HASH_BYTES] =
+            std::array::from_fn(|index| (index + 32) as u8);
+        let mut output_1 = [0; BLAKE2S_HASH_BYTES];
+        let mut output_2 = [0; BLAKE2S_HASH_BYTES];
+        let mut output_3 = [0; BLAKE2S_HASH_BYTES];
+
+        hash.hkdf(
+            &chaining_key,
+            &input_key_material,
+            3,
+            &mut output_1,
+            &mut output_2,
+            &mut output_3,
+        );
+
+        assert_eq!(
+            hex::encode(output_1),
+            "6a96444e20e8d4c1cee974416acae1c10b3c92886010e54ed94dafb2c3b80ea0"
+        );
+        assert_eq!(
+            hex::encode(output_2),
+            "57af120b0de7acbe7907ec149c5ae870a2dbb74232b65777ba4123f1f7f888f5"
+        );
+        assert_eq!(
+            hex::encode(output_3),
+            "0926c7caabb6e8d73beda759e6f4f0d324ce5b5000bcf8cd784b26db3049faa9"
+        );
+    }
+
+    #[test]
+    fn patched_snow_matches_unpatched_noise_xx_transcript() {
+        let params: snow::params::NoiseParams =
+            "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let initiator_static = [1; 32];
+        let initiator_ephemeral = [2; 32];
+        let responder_static = [3; 32];
+        let responder_ephemeral = [4; 32];
+        let mut initiator =
+            snow::Builder::with_resolver(params.clone(), Box::new(DesklinkResolver))
+                .local_private_key(&initiator_static)
+                .fixed_ephemeral_key_for_testing_only(&initiator_ephemeral)
+                .build_initiator()
+                .unwrap();
+        let mut responder = snow::Builder::with_resolver(params, Box::new(DesklinkResolver))
+            .local_private_key(&responder_static)
+            .fixed_ephemeral_key_for_testing_only(&responder_ephemeral)
+            .build_responder()
+            .unwrap();
+        let mut message_1 = [0; 256];
+        let mut message_2 = [0; 256];
+        let mut message_3 = [0; 256];
+        let mut payload = [0; 256];
+
+        let len_1 = initiator.write_message(&[], &mut message_1).unwrap();
+        responder
+            .read_message(&message_1[..len_1], &mut payload)
+            .unwrap();
+        let len_2 = responder.write_message(&[], &mut message_2).unwrap();
+        initiator
+            .read_message(&message_2[..len_2], &mut payload)
+            .unwrap();
+        let len_3 = initiator.write_message(&[], &mut message_3).unwrap();
+        responder
+            .read_message(&message_3[..len_3], &mut payload)
+            .unwrap();
+
+        assert_eq!(
+            hex::encode(&message_1[..len_1]),
+            "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59"
+        );
+        assert_eq!(
+            hex::encode(&message_2[..len_2]),
+            "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10bd79d2e51b86962d5759770fd5394c7a3d176a38a7f9c9cb2967adadd5eace0b401c4468873d51f63b9f2ef702df4a22cbf70e734f856f6f8dc58b38b9516c22a"
+        );
+        assert_eq!(
+            hex::encode(&message_3[..len_3]),
+            "951423d8da4503430f19aa0ec8b533fddf9d0688be87c3486e53fd6916eb862749042703beeaf85a476b6a556569cd05158b25680e6be412a41511c9d536965a"
+        );
+    }
+
+    #[test]
+    fn blake2s_streams_chunked_noise_maximum_without_retaining_a_message() {
+        let mut hash = ZeroizingBlake2s::default();
         let prefix = [0; BLAKE2S_HASH_BYTES];
         let maximum_message = vec![0; MAX_HASH_INPUT_BYTES - prefix.len()];
+        let mut chunked = [0; BLAKE2S_HASH_BYTES];
+        let mut contiguous = [0; BLAKE2S_HASH_BYTES];
 
         hash.input(&prefix);
         hash.input(&maximum_message);
+        hash.result(&mut chunked);
 
-        assert_eq!(hash.input.capacity(), MAX_HASH_INPUT_BYTES);
-        assert_eq!(hash.input.as_ptr(), allocation);
+        let mut second = ZeroizingBlake2s::default();
+        second.input(&vec![0; MAX_HASH_INPUT_BYTES]);
+        second.result(&mut contiguous);
+
+        assert_eq!(chunked, contiguous);
+        assert_eq!(hash.input_bytes, 0);
     }
 }

@@ -3,7 +3,7 @@ use std::fmt;
 use rand_core::{CryptoRngCore, OsRng};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -29,13 +29,12 @@ pub struct PairingCode {
 
 impl PairingCode {
     fn generate(rng: &mut impl CryptoRngCore) -> Self {
-        let mut random = [0; PAIRING_CODE_LENGTH];
-        rng.fill_bytes(&mut random);
+        let mut random = Zeroizing::new([0; PAIRING_CODE_LENGTH]);
+        rng.fill_bytes(&mut random[..]);
         let mut bytes = [0; PAIRING_CODE_LENGTH];
-        for (output, random_byte) in bytes.iter_mut().zip(random) {
+        for (output, random_byte) in bytes.iter_mut().zip(random.iter().copied()) {
             *output = PAIRING_CODE_ALPHABET[usize::from(random_byte & 31)];
         }
-        random.zeroize();
         Self { bytes }
     }
 
