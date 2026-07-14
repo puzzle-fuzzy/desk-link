@@ -4,3 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+snow = "0.9.6"
+subtle = "2.6"
+thiserror.workspace = true
+zeroize = "1.8"
+
+[dev-dependencies]
+rand_chacha = "0.3"
