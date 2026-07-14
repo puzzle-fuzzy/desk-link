@@ -149,6 +149,38 @@ fn smaller_stream_rollover_clears_state_and_rejects_delayed_old_packets() {
 }
 
 #[test]
+fn retired_stream_id_cannot_be_reactivated_after_rollover() {
+    let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
+    assert!(assembler.begin_stream(10));
+
+    let mut old_packet = packet(1, 0, 2);
+    old_packet.header.stream_id = 10;
+    assert_eq!(
+        assembler.push(instant(0), old_packet),
+        AssembleResult::Pending
+    );
+
+    assert!(assembler.begin_stream(2));
+    assert!(!assembler.begin_stream(10));
+
+    let mut delayed_old_packet = packet(1, 1, 2);
+    delayed_old_packet.header.stream_id = 10;
+    assert_eq!(
+        assembler.push(instant(1), delayed_old_packet),
+        AssembleResult::Dropped(DropReason::Stale)
+    );
+
+    let mut current_packet = packet(7, 0, 1);
+    current_packet.header.stream_id = 2;
+    let mut expected = frame(7);
+    expected.stream_id = 2;
+    assert_eq!(
+        assembler.push(instant(2), current_packet),
+        AssembleResult::Complete(expected)
+    );
+}
+
+#[test]
 fn push_expires_overdue_partials_before_accepting_new_packet() {
     let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
     assert_eq!(

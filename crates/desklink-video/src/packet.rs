@@ -1,5 +1,5 @@
 use desklink_protocol::{FrameFlags, MAX_VIDEO_CHUNKS, VideoPacket};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +41,7 @@ pub struct FrameAssembler {
     frames: BTreeMap<(u64, u64), PartialFrame>,
     last_presented: Option<(u64, u64)>,
     active_stream: Option<u64>,
+    retired_streams: BTreeSet<u64>,
 }
 
 impl FrameAssembler {
@@ -52,6 +53,7 @@ impl FrameAssembler {
             frames: BTreeMap::new(),
             last_presented: None,
             active_stream: None,
+            retired_streams: BTreeSet::new(),
         }
     }
 
@@ -174,8 +176,11 @@ impl FrameAssembler {
     }
 
     pub fn begin_stream(&mut self, stream_id: u64) -> bool {
-        if self.active_stream == Some(stream_id) {
+        if self.active_stream == Some(stream_id) || self.retired_streams.contains(&stream_id) {
             return false;
+        }
+        if let Some(active_stream) = self.active_stream {
+            self.retired_streams.insert(active_stream);
         }
         self.active_stream = Some(stream_id);
         self.frames.clear();

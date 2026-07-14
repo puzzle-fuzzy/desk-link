@@ -58,3 +58,30 @@ Remaining concerns:
 
 - `begin_stream` returns `false` when asked to begin the already-active stream; callers should treat rollover as an explicit transition to a different stream ID.
 - Expiry and capacity eviction are counted by `expire`/capacity behavior but are not individually returned as `AssembleResult` values; this is intentional after removing misleading public variants and keeps the current interface focused.
+
+## Remaining review issue: retired stream IDs
+
+Change:
+
+- Added `FrameAssembler::retired_streams: BTreeSet<u64>`.
+- `begin_stream` now rejects the active ID and every retired ID; when switching, it retires the prior active ID before clearing partial/presentation state.
+- First stream initialization remains allowed because no ID is retired initially.
+- Added `retired_stream_id_cannot_be_reactivated_after_rollover`, covering 10 → 2 → 10 and rejection of a delayed packet from the original stream 10 while stream 2 remains current.
+
+Exact verification evidence:
+
+- `cargo test -p desklink-video --test ordering retired_stream_id_cannot_be_reactivated_after_rollover`: failed before the fix at `assert!(!assembler.begin_stream(10))`; passed after the fix.
+- `cargo test -p desklink-video --test ordering`: `9 passed, 0 failed`.
+- `cargo test --workspace`: completed successfully; video ordering `9 passed, 0 failed`, protocol round-trip `14 passed, 0 failed`, all other unit/doc test targets passed.
+- `./scripts/verify.sh`: completed successfully; clippy/check and workspace test stages passed.
+- `git diff --check`: passed.
+
+Self-review:
+
+- Reviewed the final diff against the requested lifecycle: first initialization succeeds, active ID is rejected, rollover retires the old ID, retired IDs cannot be reused, delayed old packets are rejected, and the current stream continues accepting packets.
+- Only `crates/desklink-video/src/packet.rs`, `crates/desklink-video/tests/ordering.rs`, and this report are changed for this fix. The pre-existing untracked root `Cargo.lock` remains untouched and is not included.
+
+Concerns:
+
+- Retired stream IDs are retained for the assembler lifetime as required; an assembler that processes an unbounded number of stream IDs will grow the set accordingly.
+- `begin_stream` continues to return `false` for the active ID and now also returns `false` for retired IDs; callers must treat stream rollover as one-way.
