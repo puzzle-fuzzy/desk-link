@@ -13,6 +13,8 @@ pub const MAX_DATAGRAM_BYTES: usize = 1200;
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEAD_TIMEOUT: Duration = Duration::from_secs(15);
 pub const JOIN_ENVELOPE_BYTES: usize = 4 + 1 + 1 + 16 + 32;
+/// Application close code used when the relay cannot admit another QUIC connection.
+pub const RELAY_CONNECTION_LIMIT_CLOSE_CODE: u32 = 0x444c_0001;
 
 const JOIN_MAGIC: [u8; 4] = *b"DLJ1";
 const JOIN_VERSION: u8 = 1;
@@ -212,6 +214,9 @@ pub enum TransportError {
     InvalidConfig(String),
     #[error("transport connection failed: {0}")]
     Connection(String),
+    /// The relay rejected this connection because its hard admission cap is full.
+    #[error("relay connection admission limit reached")]
+    ConnectionLimit,
     #[error("transport stream failed: {0}")]
     Stream(String),
     #[error("transport datagram failed: {0}")]

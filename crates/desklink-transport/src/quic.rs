@@ -8,8 +8,14 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     ChannelKind, JOIN_ENVELOPE_BYTES, JoinRejectCode, MAX_DATAGRAM_BYTES,
-    MAX_RELIABLE_MESSAGE_BYTES, QuicClientConfig, RelayJoin, TransportError, TransportEvent,
+    MAX_RELIABLE_MESSAGE_BYTES, QuicClientConfig, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayJoin,
+    TransportError, TransportEvent,
 };
+
+const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
+const INBOUND_DATAGRAM_QUEUE_CAPACITY: usize = 128;
+const INBOUND_CLOSED_QUEUE_CAPACITY: usize = 8;
+const INBOUND_QUEUE_COUNT: usize = 6;
 
 pub struct QuicClient {
     _endpoint: quinn::Endpoint,
@@ -23,7 +29,198 @@ struct ClientInner {
     control: Mutex<Option<quinn::SendStream>>,
     input: Mutex<Option<quinn::SendStream>>,
     video_config: Mutex<Option<quinn::SendStream>>,
-    events: Mutex<mpsc::Receiver<TransportEvent>>,
+    events: Mutex<InboundReceivers>,
+}
+
+#[derive(Clone)]
+struct InboundSenders {
+    control: mpsc::Sender<TransportEvent>,
+    input: mpsc::Sender<TransportEvent>,
+    video_config: mpsc::Sender<TransportEvent>,
+    video_datagram: mpsc::Sender<TransportEvent>,
+    cursor_datagram: mpsc::Sender<TransportEvent>,
+    closed: mpsc::Sender<TransportEvent>,
+}
+
+struct InboundReceivers {
+    control: mpsc::Receiver<TransportEvent>,
+    input: mpsc::Receiver<TransportEvent>,
+    video_config: mpsc::Receiver<TransportEvent>,
+    video_datagram: mpsc::Receiver<TransportEvent>,
+    cursor_datagram: mpsc::Receiver<TransportEvent>,
+    closed: mpsc::Receiver<TransportEvent>,
+    control_open: bool,
+    input_open: bool,
+    video_config_open: bool,
+    video_datagram_open: bool,
+    cursor_datagram_open: bool,
+    closed_open: bool,
+    next_queue: usize,
+}
+
+enum QueuePoll {
+    Event(TransportEvent),
+    Empty,
+    Disconnected,
+}
+
+impl InboundReceivers {
+    fn new(
+        control: mpsc::Receiver<TransportEvent>,
+        input: mpsc::Receiver<TransportEvent>,
+        video_config: mpsc::Receiver<TransportEvent>,
+        video_datagram: mpsc::Receiver<TransportEvent>,
+        cursor_datagram: mpsc::Receiver<TransportEvent>,
+        closed: mpsc::Receiver<TransportEvent>,
+    ) -> Self {
+        Self {
+            control,
+            input,
+            video_config,
+            video_datagram,
+            cursor_datagram,
+            closed,
+            control_open: true,
+            input_open: true,
+            video_config_open: true,
+            video_datagram_open: true,
+            cursor_datagram_open: true,
+            closed_open: true,
+            next_queue: 0,
+        }
+    }
+
+    fn has_open_queue(&self) -> bool {
+        self.control_open
+            || self.input_open
+            || self.video_config_open
+            || self.video_datagram_open
+            || self.cursor_datagram_open
+            || self.closed_open
+    }
+
+    fn poll_queue(&mut self, queue: usize) -> QueuePoll {
+        let result = match queue {
+            0 => self.control.try_recv(),
+            1 => self.input.try_recv(),
+            2 => self.video_config.try_recv(),
+            3 => self.video_datagram.try_recv(),
+            4 => self.cursor_datagram.try_recv(),
+            5 => self.closed.try_recv(),
+            _ => unreachable!("invalid inbound queue index"),
+        };
+        match result {
+            Ok(event) => {
+                self.next_queue = (queue + 1) % INBOUND_QUEUE_COUNT;
+                QueuePoll::Event(event)
+            }
+            Err(mpsc::error::TryRecvError::Empty) => QueuePoll::Empty,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                match queue {
+                    0 => self.control_open = false,
+                    1 => self.input_open = false,
+                    2 => self.video_config_open = false,
+                    3 => self.video_datagram_open = false,
+                    4 => self.cursor_datagram_open = false,
+                    5 => self.closed_open = false,
+                    _ => unreachable!("invalid inbound queue index"),
+                }
+                QueuePoll::Disconnected
+            }
+        }
+    }
+
+    fn poll_ready(&mut self) -> Option<TransportEvent> {
+        for offset in 0..INBOUND_QUEUE_COUNT {
+            let queue = (self.next_queue + offset) % INBOUND_QUEUE_COUNT;
+            if !self.queue_open(queue) {
+                continue;
+            }
+            if let QueuePoll::Event(event) = self.poll_queue(queue) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    fn queue_open(&self, queue: usize) -> bool {
+        match queue {
+            0 => self.control_open,
+            1 => self.input_open,
+            2 => self.video_config_open,
+            3 => self.video_datagram_open,
+            4 => self.cursor_datagram_open,
+            5 => self.closed_open,
+            _ => unreachable!("invalid inbound queue index"),
+        }
+    }
+
+    async fn next(&mut self) -> Result<TransportEvent, TransportError> {
+        loop {
+            if let Some(event) = self.poll_ready() {
+                return Ok(event);
+            }
+            if !self.has_open_queue() {
+                return Err(TransportError::Closed);
+            }
+            tokio::select! {
+                event = self.control.recv(), if self.control_open => {
+                    match event {
+                        Some(event) => {
+                            self.next_queue = 1;
+                            return Ok(event);
+                        }
+                        None => self.control_open = false,
+                    }
+                }
+                event = self.input.recv(), if self.input_open => {
+                    match event {
+                        Some(event) => {
+                            self.next_queue = 2;
+                            return Ok(event);
+                        }
+                        None => self.input_open = false,
+                    }
+                }
+                event = self.video_config.recv(), if self.video_config_open => {
+                    match event {
+                        Some(event) => {
+                            self.next_queue = 3;
+                            return Ok(event);
+                        }
+                        None => self.video_config_open = false,
+                    }
+                }
+                event = self.video_datagram.recv(), if self.video_datagram_open => {
+                    match event {
+                        Some(event) => {
+                            self.next_queue = 4;
+                            return Ok(event);
+                        }
+                        None => self.video_datagram_open = false,
+                    }
+                }
+                event = self.cursor_datagram.recv(), if self.cursor_datagram_open => {
+                    match event {
+                        Some(event) => {
+                            self.next_queue = 5;
+                            return Ok(event);
+                        }
+                        None => self.cursor_datagram_open = false,
+                    }
+                }
+                event = self.closed.recv(), if self.closed_open => {
+                    match event {
+                        Some(event) => {
+                            self.next_queue = 0;
+                            return Ok(event);
+                        }
+                        None => self.closed_open = false,
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl QuicClient {
@@ -52,9 +249,25 @@ impl QuicClient {
             .connect(config.relay_addr, &config.server_name)
             .map_err(|error| TransportError::Connection(error.to_string()))?
             .await
-            .map_err(|error| TransportError::Connection(error.to_string()))?;
+            .map_err(map_connection_error)?;
 
-        let (event_sender, event_receiver) = mpsc::channel(128);
+        let (control_sender, control_receiver) = mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
+        let (input_sender, input_receiver) = mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
+        let (video_config_sender, video_config_receiver) =
+            mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
+        let (video_datagram_sender, video_datagram_receiver) =
+            mpsc::channel(INBOUND_DATAGRAM_QUEUE_CAPACITY);
+        let (cursor_datagram_sender, cursor_datagram_receiver) =
+            mpsc::channel(INBOUND_DATAGRAM_QUEUE_CAPACITY);
+        let (closed_sender, closed_receiver) = mpsc::channel(INBOUND_CLOSED_QUEUE_CAPACITY);
+        let inbound_senders = InboundSenders {
+            control: control_sender,
+            input: input_sender,
+            video_config: video_config_sender,
+            video_datagram: video_datagram_sender,
+            cursor_datagram: cursor_datagram_sender,
+            closed: closed_sender,
+        };
         let inner = Arc::new(ClientInner {
             connection: connection.clone(),
             joined: AtomicBool::new(false),
@@ -62,9 +275,16 @@ impl QuicClient {
             control: Mutex::new(None),
             input: Mutex::new(None),
             video_config: Mutex::new(None),
-            events: Mutex::new(event_receiver),
+            events: Mutex::new(InboundReceivers::new(
+                control_receiver,
+                input_receiver,
+                video_config_receiver,
+                video_datagram_receiver,
+                cursor_datagram_receiver,
+                closed_receiver,
+            )),
         });
-        tokio::spawn(read_connection(connection, event_sender));
+        tokio::spawn(read_connection(connection, inbound_senders));
         Ok(Self {
             _endpoint: endpoint,
             inner,
@@ -81,14 +301,12 @@ impl QuicClient {
             .connection
             .open_bi()
             .await
-            .map_err(|error| TransportError::Connection(error.to_string()))?;
+            .map_err(map_connection_error)?;
         let envelope = join.encode();
         send.write_all(&(JOIN_ENVELOPE_BYTES as u32).to_be_bytes())
             .await
-            .map_err(|error| TransportError::Stream(error.to_string()))?;
-        send.write_all(&envelope)
-            .await
-            .map_err(|error| TransportError::Stream(error.to_string()))?;
+            .map_err(map_write_error)?;
+        send.write_all(&envelope).await.map_err(map_write_error)?;
         send.finish()
             .map_err(|error| TransportError::Stream(error.to_string()))?;
 
@@ -96,7 +314,7 @@ impl QuicClient {
         receive
             .read_exact(&mut response)
             .await
-            .map_err(|error| TransportError::Connection(error.to_string()))?;
+            .map_err(map_read_exact_error)?;
         if response[0] != 0 {
             return Err(TransportError::JoinRejected(JoinRejectCode::from_byte(
                 response[0],
@@ -128,7 +346,7 @@ impl QuicClient {
 
     pub async fn next_event(&self) -> Result<TransportEvent, TransportError> {
         let mut events = self.inner.events.lock().await;
-        events.recv().await.ok_or(TransportError::Closed)
+        events.next().await
     }
 
     async fn send_reliable(
@@ -158,10 +376,10 @@ impl QuicClient {
                 .connection
                 .open_bi()
                 .await
-                .map_err(|error| TransportError::Connection(error.to_string()))?;
+                .map_err(map_connection_error)?;
             send.write_all(&[channel as u8])
                 .await
-                .map_err(|error| TransportError::Stream(error.to_string()))?;
+                .map_err(map_write_error)?;
             *stream = Some(send);
         }
         let Some(outbound) = stream.as_mut() else {
@@ -170,11 +388,11 @@ impl QuicClient {
         let length = (bytes.len() as u32).to_be_bytes();
         if let Err(error) = outbound.write_all(&length).await {
             *stream = None;
-            return Err(TransportError::Stream(error.to_string()));
+            return Err(map_write_error(error));
         }
         if let Err(error) = outbound.write_all(&bytes).await {
             *stream = None;
-            return Err(TransportError::Stream(error.to_string()));
+            return Err(map_write_error(error));
         }
         Ok(())
     }
@@ -193,7 +411,7 @@ impl QuicClient {
         self.inner
             .connection
             .send_datagram(Bytes::from(frame))
-            .map_err(|error| TransportError::Datagram(error.to_string()))
+            .map_err(map_datagram_error)
     }
 
     fn ensure_joined(&self) -> Result<(), TransportError> {
@@ -205,12 +423,47 @@ impl QuicClient {
     }
 }
 
-async fn read_connection(connection: quinn::Connection, events: mpsc::Sender<TransportEvent>) {
+fn map_connection_error(error: quinn::ConnectionError) -> TransportError {
+    if matches!(
+        &error,
+        quinn::ConnectionError::ApplicationClosed(close)
+            if close.error_code == quinn::VarInt::from_u32(RELAY_CONNECTION_LIMIT_CLOSE_CODE)
+    ) {
+        TransportError::ConnectionLimit
+    } else {
+        TransportError::Connection(error.to_string())
+    }
+}
+
+fn map_read_exact_error(error: quinn::ReadExactError) -> TransportError {
+    match error {
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(error)) => {
+            map_connection_error(error)
+        }
+        error => TransportError::Connection(error.to_string()),
+    }
+}
+
+fn map_write_error(error: quinn::WriteError) -> TransportError {
+    match error {
+        quinn::WriteError::ConnectionLost(error) => map_connection_error(error),
+        error => TransportError::Stream(error.to_string()),
+    }
+}
+
+fn map_datagram_error(error: quinn::SendDatagramError) -> TransportError {
+    match error {
+        quinn::SendDatagramError::ConnectionLost(error) => map_connection_error(error),
+        error => TransportError::Datagram(error.to_string()),
+    }
+}
+
+async fn read_connection(connection: quinn::Connection, events: InboundSenders) {
     loop {
         tokio::select! {
             accepted = connection.accept_bi() => {
                 let Ok((_send, receive)) = accepted else {
-                    emit_closed(&events, "reliable stream accept failed".to_owned()).await;
+                    emit_closed(&events.closed, "reliable stream accept failed");
                     break;
                 };
                 let events = events.clone();
@@ -218,67 +471,88 @@ async fn read_connection(connection: quinn::Connection, events: mpsc::Sender<Tra
             }
             datagram = connection.read_datagram() => {
                 let Ok(datagram) = datagram else {
-                    emit_closed(&events, "datagram receive failed".to_owned()).await;
+                    emit_closed(&events.closed, "datagram receive failed");
                     break;
                 };
                 match decode_datagram(datagram.as_ref()) {
                     Ok(event) => {
-                        if events.send(event).await.is_err() { break; }
+                        let sender = match &event {
+                            TransportEvent::VideoDatagram(_) => &events.video_datagram,
+                            TransportEvent::CursorDatagram(_) => &events.cursor_datagram,
+                            _ => unreachable!(),
+                        };
+                        // Datagram delivery is intentionally lossy at this bounded boundary:
+                        // drop the newest packet when its channel is saturated, while reliable
+                        // channels retain backpressure only within their own queue.
+                        let _ = sender.try_send(event);
                     }
                     Err(()) => {
                         connection.close(quinn::VarInt::from_u32(3), b"malformed datagram");
-                        emit_closed(&events, "malformed datagram".to_owned()).await;
+                        emit_closed(&events.closed, "malformed datagram");
                         break;
                     }
                 }
             }
             closed = connection.closed() => {
-                emit_closed(&events, closed.to_string()).await;
+                emit_closed(&events.closed, closed.to_string());
                 break;
             }
         }
     }
 }
 
-async fn emit_closed(events: &mpsc::Sender<TransportEvent>, reason: String) {
-    let _ = events.send(TransportEvent::Closed { reason }).await;
+fn emit_closed(events: &mpsc::Sender<TransportEvent>, reason: impl Into<String>) {
+    let _ = events.try_send(TransportEvent::Closed {
+        reason: reason.into(),
+    });
 }
 
 async fn read_reliable_stream(
     connection: quinn::Connection,
     mut receive: quinn::RecvStream,
-    events: mpsc::Sender<TransportEvent>,
+    events: InboundSenders,
 ) {
     let mut channel = [0; 1];
     match receive.read_exact(&mut channel).await {
         Ok(()) => {}
-        Err(quinn::ReadExactError::FinishedEarly(0)) => return,
+        Err(quinn::ReadExactError::FinishedEarly(0)) => {
+            let _ = receive.stop(quinn::VarInt::from_u32(1));
+            emit_closed(&events.closed, "empty reliable stream");
+            return;
+        }
         Err(_) => {
             let _ = receive.stop(quinn::VarInt::from_u32(1));
-            emit_closed(&events, "malformed reliable stream".to_owned()).await;
+            emit_closed(&events.closed, "malformed reliable stream");
             return;
         }
     }
     let Ok(channel) = ChannelKind::try_from(channel[0]) else {
         let _ = receive.stop(quinn::VarInt::from_u32(1));
         connection.close(quinn::VarInt::from_u32(3), b"unknown reliable channel");
-        emit_closed(&events, "unknown reliable channel".to_owned()).await;
+        emit_closed(&events.closed, "unknown reliable channel");
         return;
     };
     if !channel.is_reliable() {
         let _ = receive.stop(quinn::VarInt::from_u32(1));
         connection.close(quinn::VarInt::from_u32(3), b"invalid reliable channel");
-        emit_closed(&events, "invalid reliable channel".to_owned()).await;
+        emit_closed(&events.closed, "invalid reliable channel");
         return;
     }
+    let sender = match channel {
+        ChannelKind::Control => events.control,
+        ChannelKind::Input => events.input,
+        ChannelKind::VideoConfig => events.video_config,
+        ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => unreachable!(),
+    };
+    let mut message_seen = false;
     loop {
         let mut length = [0; 4];
         match receive.read_exact(&mut length).await {
             Ok(()) => {}
-            Err(quinn::ReadExactError::FinishedEarly(0)) => return,
+            Err(quinn::ReadExactError::FinishedEarly(0)) if message_seen => return,
             Err(_) => {
                 let _ = receive.stop(quinn::VarInt::from_u32(1));
-                emit_closed(&events, "malformed reliable message".to_owned()).await;
+                emit_closed(&events.closed, "malformed reliable message");
                 return;
             }
         }
@@ -286,7 +560,7 @@ async fn read_reliable_stream(
         if length > MAX_RELIABLE_MESSAGE_BYTES {
             let _ = receive.stop(quinn::VarInt::from_u32(1));
             connection.close(quinn::VarInt::from_u32(3), b"reliable message too large");
-            emit_closed(&events, "reliable message too large".to_owned()).await;
+            emit_closed(&events.closed, "reliable message too large");
             return;
         }
         let mut bytes = vec![0; length];
@@ -294,7 +568,7 @@ async fn read_reliable_stream(
             Ok(()) => {}
             Err(_) => {
                 let _ = receive.stop(quinn::VarInt::from_u32(1));
-                emit_closed(&events, "malformed reliable message".to_owned()).await;
+                emit_closed(&events.closed, "malformed reliable message");
                 return;
             }
         }
@@ -304,9 +578,10 @@ async fn read_reliable_stream(
             ChannelKind::VideoConfig => TransportEvent::VideoConfig(bytes),
             ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => unreachable!(),
         };
-        if events.send(event).await.is_err() {
+        if sender.send(event).await.is_err() {
             return;
         }
+        message_seen = true;
     }
 }
 

@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
@@ -229,6 +230,10 @@ async fn spawn_stalled_control_relay() -> MockRelay {
 }
 
 async fn spawn_malformed_peer_relay() -> MockRelay {
+    spawn_peer_relay_with_reliable_prefix(vec![1, 0, 0, 0, 1]).await
+}
+
+async fn spawn_peer_relay_with_reliable_prefix(prefix: Vec<u8>) -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
@@ -275,10 +280,163 @@ async fn spawn_malformed_peer_relay() -> MockRelay {
         let Ok((mut send, _receive)) = connection.open_bi().await else {
             return;
         };
-        let _ = send.write_all(&[1]).await;
-        let _ = send.write_all(&1u32.to_be_bytes()).await;
+        let _ = send.write_all(&prefix).await;
         let _ = send.finish();
         tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    MockRelay {
+        address,
+        client_config,
+        task,
+    }
+}
+
+async fn spawn_video_flood_relay() -> MockRelay {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_der = certificate.cert.der().to_vec();
+    let key_der = certificate.key_pair.serialize_der();
+    let server_config = ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate_der.clone())],
+        PrivateKeyDer::Pkcs8(key_der.into()),
+    )
+    .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(certificate_der)).unwrap();
+    let client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let Some(connecting) = endpoint.accept().await else {
+            return;
+        };
+        let Ok(connection) = connecting.await else {
+            return;
+        };
+        let Ok((mut join_send, mut join_recv)) = connection.accept_bi().await else {
+            return;
+        };
+        let mut length = [0; 4];
+        if join_recv.read_exact(&mut length).await.is_err()
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+        {
+            return;
+        }
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        if join_recv.read_exact(&mut join_bytes).await.is_err()
+            || decode_relay_join(&join_bytes).is_err()
+        {
+            return;
+        }
+        let _ = join_send.write_all(&[0]).await;
+        let _ = join_send.finish();
+
+        let Ok((_send, mut receive)) = connection.accept_bi().await else {
+            return;
+        };
+        let mut channel = [0; 1];
+        if receive.read_exact(&mut channel).await.is_err() || channel[0] != 2 {
+            return;
+        }
+        if receive.read_exact(&mut length).await.is_err() {
+            return;
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        let mut message = vec![0; length];
+        if receive.read_exact(&mut message).await.is_err() {
+            return;
+        }
+        for _ in 0..256 {
+            let _ = connection.send_datagram(Bytes::from_static(&[4, 0xaa]));
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let Ok((mut send, _receive)) = connection.open_bi().await else {
+            return;
+        };
+        let _ = send.write_all(&channel).await;
+        let _ = send.write_all(&(length as u32).to_be_bytes()).await;
+        let _ = send.write_all(&message).await;
+        let _ = send.finish();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    MockRelay {
+        address,
+        client_config,
+        task,
+    }
+}
+
+async fn spawn_input_flood_with_control_relay() -> MockRelay {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_der = certificate.cert.der().to_vec();
+    let key_der = certificate.key_pair.serialize_der();
+    let server_config = ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate_der.clone())],
+        PrivateKeyDer::Pkcs8(key_der.into()),
+    )
+    .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(certificate_der)).unwrap();
+    let client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let Some(connecting) = endpoint.accept().await else {
+            return;
+        };
+        let Ok(connection) = connecting.await else {
+            return;
+        };
+        let Ok((mut join_send, mut join_recv)) = connection.accept_bi().await else {
+            return;
+        };
+        let mut length = [0; 4];
+        if join_recv.read_exact(&mut length).await.is_err()
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+        {
+            return;
+        }
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        if join_recv.read_exact(&mut join_bytes).await.is_err()
+            || decode_relay_join(&join_bytes).is_err()
+        {
+            return;
+        }
+        let _ = join_send.write_all(&[0]).await;
+        let _ = join_send.finish();
+
+        let Ok((mut input_send, _receive)) = connection.open_bi().await else {
+            return;
+        };
+        let input = [0xaa];
+        let _ = input_send.write_all(&[2]).await;
+        for sequence in 0..256u16 {
+            let _ = input_send.write_all(&1u32.to_be_bytes()).await;
+            let _ = input_send.write_all(&[sequence as u8]).await;
+        }
+        let _ = input_send.finish();
+
+        let Ok((mut control_send, _receive)) = connection.open_bi().await else {
+            return;
+        };
+        let _ = control_send.write_all(&[1]).await;
+        let _ = control_send.write_all(&1u32.to_be_bytes()).await;
+        let _ = control_send.write_all(&input).await;
+        let _ = control_send.finish();
+        tokio::time::sleep(Duration::from_millis(100)).await;
     });
 
     MockRelay {
@@ -396,6 +554,81 @@ async fn client_rejects_invalid_timeout_overrides_before_connecting() {
 #[tokio::test]
 async fn malformed_peer_stream_emits_closed_without_panicking() {
     let relay = spawn_malformed_peer_relay().await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .unwrap(),
+        Ok(TransportEvent::Closed {
+            reason: "malformed reliable message".to_owned()
+        })
+    );
+}
+
+#[tokio::test]
+async fn video_datagram_flood_does_not_block_input_delivery() {
+    let relay = spawn_video_flood_relay().await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    let input = vec![7, 6, 5, 4];
+    client.send_input(input.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut saw_input = false;
+    for _ in 0..256 {
+        let event = tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        if event == TransportEvent::Input(input.clone()) {
+            saw_input = true;
+            break;
+        }
+    }
+    assert!(saw_input, "input was blocked behind the video flood");
+}
+
+#[tokio::test]
+async fn input_flood_does_not_starve_control_delivery() {
+    let relay = spawn_input_flood_with_control_relay().await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+
+    let mut saw_control = false;
+    for _ in 0..8 {
+        let event = tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        if event == TransportEvent::Control(vec![0xaa]) {
+            saw_control = true;
+            break;
+        }
+    }
+    assert!(saw_control, "control was starved by the input flood");
+}
+
+#[tokio::test]
+async fn empty_reliable_stream_emits_a_closed_event() {
+    let relay = spawn_peer_relay_with_reliable_prefix(Vec::new()).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .unwrap(),
+        Ok(TransportEvent::Closed {
+            reason: "empty reliable stream".to_owned()
+        })
+    );
+}
+
+#[tokio::test]
+async fn channel_only_reliable_stream_emits_a_closed_event() {
+    let relay = spawn_peer_relay_with_reliable_prefix(vec![1]).await;
     let client = QuicClient::connect(config(&relay)).await.unwrap();
     client.join(join(DeviceRole::Host)).await.unwrap();
 

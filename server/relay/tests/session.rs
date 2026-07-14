@@ -6,8 +6,8 @@ use std::{
 use desklink_crypto::SessionId;
 use desklink_relay::{RelayConfig, RelayError, RelayServer, RelaySessionTable};
 use desklink_transport::{
-    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig, RelayJoin,
-    TransportError, TransportEvent,
+    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
+    RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayJoin, TransportError, TransportEvent,
 };
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -208,10 +208,15 @@ async fn relay_enforces_connection_and_session_admission_caps() {
         .await
         .unwrap();
     first.join(host(session(16), [4; 32])).await.unwrap();
-    assert!(matches!(
-        QuicClient::connect(config(&connection_limited)).await,
-        Err(TransportError::Connection(_))
-    ));
+    let second = QuicClient::connect(config(&connection_limited))
+        .await
+        .unwrap();
+    let error = second
+        .join(host(session(18), [4; 32]))
+        .await
+        .expect_err("connection cap should reject the second connection");
+    assert_eq!(error, TransportError::ConnectionLimit);
+    assert_eq!(RELAY_CONNECTION_LIMIT_CLOSE_CODE, 0x444c_0001);
 
     let session_limited = spawn_test_relay_with_config(RelayConfig {
         max_connections: 4,

@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -12,7 +12,8 @@ use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
     ChannelKind, DEAD_TIMEOUT, JOIN_ENVELOPE_BYTES, JoinRejectCode, KEEPALIVE_INTERVAL,
-    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, RelayJoin, decode_relay_join,
+    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayJoin,
+    decode_relay_join,
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -360,6 +361,7 @@ struct RelayState {
     participants: Mutex<HashMap<u64, Participant>>,
     next_connection_id: AtomicU64,
     active_connections: std::sync::atomic::AtomicUsize,
+    rejecting_connection: AtomicBool,
 }
 
 impl RelayState {
@@ -407,6 +409,16 @@ impl RelayState {
 
     fn release_connection(&self) {
         self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn try_reserve_rejection(&self) -> bool {
+        self.rejecting_connection
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn release_rejection(&self) {
+        self.rejecting_connection.store(false, Ordering::Release);
     }
 
     fn attach_participant(
@@ -508,6 +520,7 @@ impl RelayServer {
             participants: Mutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
             active_connections: std::sync::atomic::AtomicUsize::new(0),
+            rejecting_connection: AtomicBool::new(false),
         });
         Ok(Self {
             endpoint,
@@ -545,7 +558,22 @@ impl RelayServer {
                     let Some(incoming) = incoming else { return Ok(()); };
                     let state = self.state.clone();
                     if !state.try_reserve_connection() {
-                        incoming.refuse();
+                        if state.try_reserve_rejection() {
+                            tokio::spawn(async move {
+                                if let Ok(connection) = incoming.await {
+                                    connection.close(
+                                        quinn::VarInt::from_u32(
+                                            RELAY_CONNECTION_LIMIT_CLOSE_CODE,
+                                        ),
+                                        b"connection admission limit reached",
+                                    );
+                                    let _ = connection.closed().await;
+                                }
+                                state.release_rejection();
+                            });
+                        } else {
+                            incoming.refuse();
+                        }
                         continue;
                     }
                     let connection_id = state.next_connection_id();

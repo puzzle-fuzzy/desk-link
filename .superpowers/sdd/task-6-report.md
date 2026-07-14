@@ -118,6 +118,8 @@ passed
 
 git diff --check
 passed
+
+The two flood regressions and the connection-cap regression each passed in three consecutive single-test repeat runs.
 ```
 
 ### Review-fix design decisions
@@ -142,3 +144,61 @@ passed
 
 - The global admission cap is intentionally process-local, matching the existing process-local session table; multi-instance coordination remains outside Task 6.
 - The relay still uses the existing local self-signed certificate entrypoint and does not add application-level rate limiting because active TLS/session admission is explicitly bounded here.
+
+## Task 6 remediation
+
+Date: 2026-07-15
+
+### Remediation scope
+
+- Inbound delivery now uses independent bounded queues for control, input, video configuration, video datagrams, cursor datagrams, and close notifications. Reliable stream readers can backpressure only their own channel queue; datagram readers use non-blocking `try_send` and drop the newest datagram when that queue is full. `next_event` drains the queues with a round-robin cursor so a continuously ready input queue cannot starve control or configuration events. The total queue capacities remain fixed and bounded.
+- Relay admission still reserves `max_connections` with the existing atomic compare-and-exchange loop. An over-cap connection receives one bounded post-handshake application close using `RELAY_CONNECTION_LIMIT_CLOSE_CODE` (`0x444c_0001`); the client maps that exact close code to the dedicated `TransportError::ConnectionLimit`. The cap is not bypassed by the rejection path.
+- Empty reliable streams and channel-only/truncated reliable streams are reset and reported through `TransportEvent::Closed`; normal EOF after complete messages remains a normal stream completion.
+
+### RED evidence
+
+The new regressions fail against the partial remediation before the final hardening:
+
+```text
+cargo test -p desklink-transport --test localhost
+  input_flood_does_not_starve_control_delivery ... FAILED
+  control was starved by the input flood
+
+cargo test -p desklink-relay --test session relay_enforces_connection_and_session_admission_caps
+  assertion failed: left Connection("connection lost") right ConnectionLimit
+```
+
+The empty and channel-only stream tests also add deterministic coverage for the previously untested EOF classifications.
+
+### GREEN evidence
+
+```text
+cargo test -p desklink-transport --test localhost
+10 passed, 0 failed
+
+cargo test -p desklink-relay --test session
+13 passed, 0 failed
+
+cargo test --workspace
+all workspace tests and doc-tests passed
+
+cargo fmt --all -- --check
+passed
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+finished successfully
+
+./scripts/verify.sh
+finished successfully
+
+git diff --check
+passed
+```
+
+### Remediation files
+
+- `crates/desklink-transport/src/lib.rs`
+- `crates/desklink-transport/src/quic.rs`
+- `crates/desklink-transport/tests/localhost.rs`
+- `server/relay/src/lib.rs`
+- `server/relay/tests/session.rs`
