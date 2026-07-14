@@ -1,0 +1,17 @@
+[package]
+name = "desklink-end-to-end"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+desklink-crypto.workspace = true
+desklink-protocol.workspace = true
+desklink-session.workspace = true
+desklink-transport.workspace = true
+desklink-video.workspace = true
+
+[[bin]]
+name = "desklink-end-to-end"
+path = "src/main.rs"

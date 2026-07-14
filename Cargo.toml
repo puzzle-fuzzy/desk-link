@@ -8,6 +8,7 @@ members = [
   "crates/desklink-transport",
   "crates/desklink-ffi",
   "apps/windows",
+  "tests/end-to-end",
   "server/relay",
 ]
 exclude = [
