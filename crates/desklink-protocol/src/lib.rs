@@ -87,7 +87,6 @@ pub enum ControlMessage {
         role: DeviceRole,
     },
     Capabilities(DeviceCapabilities),
-    InputEnvelope(InputEnvelope),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceCapabilities {
@@ -158,16 +157,4 @@ pub struct InputEnvelope {
     pub sequence: u64,
     pub timestamp_us: u64,
     pub event: InputEvent,
-}
-pub fn validate_input_timestamp(
-    envelope: &InputEnvelope,
-    now_us: u64,
-    window_us: u64,
-) -> Result<(), codec::ProtocolError> {
-    if envelope.timestamp_us < now_us.saturating_sub(window_us)
-        || envelope.timestamp_us > now_us.saturating_add(window_us)
-    {
-        return Err(codec::ProtocolError::TimestampOutsideWindow);
-    }
-    Ok(())
 }

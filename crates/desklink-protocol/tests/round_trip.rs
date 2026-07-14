@@ -4,7 +4,6 @@ use desklink_protocol::{
     MAX_INPUT_FUTURE_SKEW_US, PROTOCOL_VERSION, Platform, ProtocolError, VideoFrameHeader,
     VideoPacket, decode_control, decode_input, decode_video_header, decode_video_packet,
     encode_control, encode_input, encode_video_header, encode_video_packet,
-    validate_input_timestamp,
 };
 
 #[test]
@@ -129,15 +128,17 @@ fn invalid_capabilities_are_rejected() {
 fn input_timestamp_window_rejects_stale_and_future_values() {
     let envelope = InputEnvelope {
         sequence: 1,
-        timestamp_us: 900,
+        timestamp_us: 10,
         event: InputEvent::MouseMove { x: 1, y: 1 },
     };
-    assert!(validate_input_timestamp(&envelope, 2_000, 500).is_err());
+    let stale_bytes = encode_input(&envelope).expect("encode");
+    assert!(decode_input(&stale_bytes, 10 + MAX_INPUT_AGE_US + 1).is_err());
     let future = InputEnvelope {
-        timestamp_us: 2_501,
+        timestamp_us: 10 + MAX_INPUT_FUTURE_SKEW_US + 1,
         ..envelope
     };
-    assert!(validate_input_timestamp(&future, 2_000, 500).is_err());
+    let future_bytes = encode_input(&future).expect("encode");
+    assert!(decode_input(&future_bytes, 10).is_err());
 }
 
 #[test]
@@ -161,6 +162,24 @@ fn input_wire_decode_rejects_stale_and_future_values() {
         decode_input(&bytes, 10),
         Err(ProtocolError::TimestampOutsideWindow)
     ));
+}
+
+#[test]
+fn control_channel_has_no_input_bypass() {
+    let input = InputEnvelope {
+        sequence: 1,
+        timestamp_us: 10,
+        event: InputEvent::MouseMove { x: 1, y: 1 },
+    };
+    let bytes = encode_input(&input).expect("encode input");
+    assert!(matches!(
+        decode_control(&bytes),
+        Err(ProtocolError::Malformed)
+    ));
+    assert_eq!(
+        decode_input(&bytes, 10).expect("separate input channel"),
+        input
+    );
 }
 
 #[test]
