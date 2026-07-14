@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/desklink-protocol",
+  "crates/desklink-video",
+  "crates/desklink-session",
+  "crates/desklink-crypto",
+  "crates/desklink-transport",
+  "crates/desklink-ffi",
+  "server/relay",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+desklink-protocol = { path = "crates/desklink-protocol" }
+desklink-video = { path = "crates/desklink-video" }
+desklink-session = { path = "crates/desklink-session" }
+desklink-crypto = { path = "crates/desklink-crypto" }
+desklink-transport = { path = "crates/desklink-transport" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
