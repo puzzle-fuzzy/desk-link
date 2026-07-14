@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_DATAGRAM_PAYLOAD_BYTES: u32 = 1200;
+pub const MAX_MVP_WIDTH: u16 = 1920;
+pub const MAX_MVP_HEIGHT: u16 = 1080;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Platform {
@@ -30,6 +32,7 @@ impl FrameFlags {
     pub const KEYFRAME: Self = Self(1 << 0);
     pub const CONFIG: Self = Self(1 << 1);
     pub const VIDEO_ALIVE: Self = Self(1 << 2);
+    pub const KNOWN_BITS: u16 = Self::KEYFRAME.0 | Self::CONFIG.0 | Self::VIDEO_ALIVE.0;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -48,6 +51,30 @@ pub struct VideoFrameHeader {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VideoPacket {
+    pub header: VideoFrameHeader,
+    pub payload: Vec<u8>,
+}
+impl VideoPacket {
+    pub fn new(header: VideoFrameHeader, payload: Vec<u8>) -> Result<Self, codec::ProtocolError> {
+        if payload.len() > MAX_DATAGRAM_PAYLOAD_BYTES as usize {
+            return Err(codec::ProtocolError::MessageTooLarge {
+                actual: payload.len(),
+                maximum: MAX_DATAGRAM_PAYLOAD_BYTES as usize,
+            });
+        }
+        codec::validate_video_header(&header)?;
+        if header.payload_length as usize != payload.len() {
+            return Err(codec::ProtocolError::PayloadLengthMismatch {
+                declared: header.payload_length,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self { header, payload })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     RequestKeyframe {
         stream_id: u64,
@@ -58,6 +85,7 @@ pub enum ControlMessage {
     },
     Capabilities(DeviceCapabilities),
     Input(InputEvent),
+    InputEnvelope(InputEnvelope),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceCapabilities {
@@ -66,6 +94,25 @@ pub struct DeviceCapabilities {
     pub codecs: Vec<Codec>,
     pub width: u16,
     pub height: u16,
+}
+impl DeviceCapabilities {
+    pub fn validate(&self) -> Result<(), codec::ProtocolError> {
+        if self.width > MAX_MVP_WIDTH
+            || self.height > MAX_MVP_HEIGHT
+            || !self.codecs.iter().all(|codec| matches!(codec, Codec::H264))
+        {
+            return Err(codec::ProtocolError::InvalidCapabilities);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ErrorCode {
+    InvalidMessage,
+    UnsupportedVersion,
+    Unauthorized,
+    UnsupportedCodec,
+    Internal,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MouseButton {
@@ -102,4 +149,22 @@ pub enum InputEvent {
         pressed: bool,
         modifiers: Modifiers,
     },
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InputEnvelope {
+    pub sequence: u64,
+    pub timestamp_us: u64,
+    pub event: InputEvent,
+}
+pub fn validate_input_timestamp(
+    envelope: &InputEnvelope,
+    now_us: u64,
+    window_us: u64,
+) -> Result<(), codec::ProtocolError> {
+    if envelope.timestamp_us < now_us.saturating_sub(window_us)
+        || envelope.timestamp_us > now_us.saturating_add(window_us)
+    {
+        return Err(codec::ProtocolError::TimestampOutsideWindow);
+    }
+    Ok(())
 }
