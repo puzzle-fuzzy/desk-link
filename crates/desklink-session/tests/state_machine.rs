@@ -184,6 +184,7 @@ fn start_video_is_only_valid_after_capability_gate() {
         machine.apply(SessionEvent::StartVideo).unwrap(),
         vec![SessionAction::StartVideo]
     );
+    assert_eq!(machine.apply(SessionEvent::StartVideo).unwrap(), Vec::new());
 }
 
 #[test]

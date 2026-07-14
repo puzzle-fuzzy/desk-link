@@ -54,6 +54,7 @@ pub struct SessionMachine {
     role: DeviceRole,
     state: SessionState,
     next_stream_id: u64,
+    video_start_requested: bool,
 }
 impl SessionMachine {
     pub fn new(role: DeviceRole) -> Self {
@@ -61,6 +62,7 @@ impl SessionMachine {
             role,
             state: SessionState::Idle,
             next_stream_id: 0,
+            video_start_requested: false,
         }
     }
     pub fn state(&self) -> SessionState {
@@ -87,13 +89,19 @@ impl SessionMachine {
             (WaitingForApproval, HostAccepted) => (NegotiatingCapabilities, vec![]),
             (NegotiatingCapabilities, CapabilitiesNegotiated) => {
                 let stream_id = self.next_stream_id();
+                self.video_start_requested = false;
                 (
                     StartingVideo,
                     vec![SessionAction::BeginStream { stream_id }],
                 )
             }
             (StartingVideo, SessionEvent::StartVideo) => {
-                (StartingVideo, vec![SessionAction::StartVideo])
+                if self.video_start_requested {
+                    (StartingVideo, vec![])
+                } else {
+                    self.video_start_requested = true;
+                    (StartingVideo, vec![SessionAction::StartVideo])
+                }
             }
             (StartingVideo, VideoStarted) => (Connected, vec![]),
             (Connected, VideoProbeTimeout) | (Connected, DecoderStalled) => {
