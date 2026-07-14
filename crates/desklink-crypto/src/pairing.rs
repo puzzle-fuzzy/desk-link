@@ -7,6 +7,7 @@ use zeroize::Zeroize;
 
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+pub const MAX_PAIRING_TTL_S: u64 = 600;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionId([u8; 16]);
@@ -70,6 +71,8 @@ pub enum PairingError {
     AlreadyConsumed,
     #[error("pairing code is invalid")]
     InvalidCode,
+    #[error("pairing TTL must be between 1 and 600 seconds")]
+    InvalidTtl,
 }
 
 pub struct PairingOffer {
@@ -80,7 +83,7 @@ pub struct PairingOffer {
 }
 
 impl PairingOffer {
-    pub fn new(session_id: SessionId, now_unix_s: u64, ttl_s: u64) -> Self {
+    pub fn new(session_id: SessionId, now_unix_s: u64, ttl_s: u64) -> Result<Self, PairingError> {
         Self::new_with_rng(session_id, now_unix_s, ttl_s, &mut OsRng)
     }
 
@@ -89,13 +92,16 @@ impl PairingOffer {
         now_unix_s: u64,
         ttl_s: u64,
         rng: &mut impl CryptoRngCore,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, PairingError> {
+        if !(1..=MAX_PAIRING_TTL_S).contains(&ttl_s) {
+            return Err(PairingError::InvalidTtl);
+        }
+        Ok(Self {
             session_id,
             code: PairingCode::generate(rng),
             expires_at_unix_s: now_unix_s.saturating_add(ttl_s),
             consumed: false,
-        }
+        })
     }
 
     pub fn session_id(&self) -> SessionId {

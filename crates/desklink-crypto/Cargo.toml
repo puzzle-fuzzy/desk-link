@@ -6,12 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+blake2 = "0.10.6"
+chacha20poly1305 = "0.10.1"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-snow = "0.9.6"
+snow = { version = "0.9.6", default-features = false }
 subtle = "2.6"
 thiserror.workspace = true
-zeroize = "1.8"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
+hex = "0.4"
 rand_chacha = "0.3"

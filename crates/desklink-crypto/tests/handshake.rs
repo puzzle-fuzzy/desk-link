@@ -2,7 +2,8 @@ use std::{cell::RefCell, convert::Infallible};
 
 use desklink_crypto::{
     CryptoError, DeviceIdentity, EncryptedMessage, IdentityStore, MAX_ENCRYPTED_MESSAGE_BYTES,
-    MAX_PLAINTEXT_BYTES, NoiseInitiator, NoiseResponder, PairingError, PairingOffer, SessionId,
+    MAX_HANDSHAKE_PAYLOAD_BYTES, MAX_PAIRING_TTL_S, MAX_PLAINTEXT_BYTES, NoiseInitiator,
+    NoiseResponder, PairingError, PairingOffer, SessionId,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
@@ -54,8 +55,13 @@ fn identity_store_can_persist_and_restore_key_material() {
 #[test]
 fn pairing_code_expires_and_cannot_be_reused() {
     let mut rng = ChaCha20Rng::from_seed([11; 32]);
-    let mut offer =
-        PairingOffer::new_with_rng(SessionId::from_bytes([1; 16]), 1_000, 600, &mut rng);
+    let mut offer = PairingOffer::new_with_rng(
+        SessionId::from_bytes([1; 16]),
+        1_000,
+        MAX_PAIRING_TTL_S,
+        &mut rng,
+    )
+    .unwrap();
     let code = offer.code().to_string();
 
     assert!(offer.validate_code(&code, 1_599).is_ok());
@@ -77,7 +83,8 @@ fn pairing_code_expires_and_cannot_be_reused() {
 #[test]
 fn pairing_code_is_fixed_length_unambiguous_and_checked_before_consuming() {
     let mut rng = ChaCha20Rng::from_seed([12; 32]);
-    let mut offer = PairingOffer::new_with_rng(SessionId::from_bytes([2; 16]), 100, 30, &mut rng);
+    let mut offer =
+        PairingOffer::new_with_rng(SessionId::from_bytes([2; 16]), 100, 30, &mut rng).unwrap();
     let code = offer.code().to_string();
 
     assert_eq!(code.len(), 8);
@@ -98,7 +105,8 @@ fn pairing_code_is_fixed_length_unambiguous_and_checked_before_consuming() {
 fn pairing_expiry_saturates_instead_of_wrapping() {
     let mut rng = ChaCha20Rng::from_seed([13; 32]);
     let offer =
-        PairingOffer::new_with_rng(SessionId::from_bytes([3; 16]), u64::MAX - 5, 10, &mut rng);
+        PairingOffer::new_with_rng(SessionId::from_bytes([3; 16]), u64::MAX - 5, 10, &mut rng)
+            .unwrap();
 
     assert_eq!(offer.expires_at_unix_s(), u64::MAX);
     assert!(
@@ -109,9 +117,31 @@ fn pairing_expiry_saturates_instead_of_wrapping() {
 }
 
 #[test]
+fn pairing_ttl_must_be_between_one_and_ten_minutes() {
+    let mut rng = ChaCha20Rng::from_seed([14; 32]);
+    let session = SessionId::from_bytes([4; 16]);
+
+    assert!(matches!(
+        PairingOffer::new_with_rng(session, 1_000, 0, &mut rng),
+        Err(PairingError::InvalidTtl)
+    ));
+    assert!(PairingOffer::new_with_rng(session, 1_000, MAX_PAIRING_TTL_S, &mut rng).is_ok());
+    assert!(matches!(
+        PairingOffer::new_with_rng(session, 1_000, MAX_PAIRING_TTL_S + 1, &mut rng),
+        Err(PairingError::InvalidTtl)
+    ));
+}
+
+#[test]
 fn noise_initiator_and_responder_produce_same_session_key() {
-    let (mut initiator, message_1) = NoiseInitiator::start().unwrap();
-    let (mut responder, message_2) = NoiseResponder::accept(&message_1).unwrap();
+    let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([19; 32]));
+    let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([20; 32]));
+    let initiator_verify_key = initiator_identity.verify_key();
+    let responder_verify_key = responder_identity.verify_key();
+    let (mut initiator, message_1) =
+        NoiseInitiator::start(initiator_identity, responder_verify_key).unwrap();
+    let (mut responder, message_2) =
+        NoiseResponder::accept(&message_1, responder_identity, initiator_verify_key).unwrap();
     let message_3 = initiator.receive(&message_2).unwrap();
     responder.receive(&message_3).unwrap();
 
@@ -129,14 +159,9 @@ fn authenticated_noise_handshake_binds_both_device_identities() {
     let responder_verify_key = responder_identity.verify_key();
 
     let (mut initiator, message_1) =
-        NoiseInitiator::start_authenticated(initiator_identity, Some(responder_verify_key))
-            .unwrap();
-    let (mut responder, message_2) = NoiseResponder::accept_authenticated(
-        &message_1,
-        responder_identity,
-        Some(initiator_verify_key),
-    )
-    .unwrap();
+        NoiseInitiator::start(initiator_identity, responder_verify_key).unwrap();
+    let (mut responder, message_2) =
+        NoiseResponder::accept(&message_1, responder_identity, initiator_verify_key).unwrap();
     let message_3 = initiator.receive(&message_2).unwrap();
     responder.receive(&message_3).unwrap();
 
@@ -185,28 +210,110 @@ fn noise_transport_rejects_tampering_and_oversized_payloads() {
 }
 
 #[test]
-fn noise_handshake_returns_stable_errors_for_bad_state_messages_and_identity() {
-    let (initiator, _) = NoiseInitiator::start().unwrap();
-    assert!(matches!(initiator.finish(), Err(CryptoError::InvalidState)));
+fn noise_transport_accepts_exact_maximum_plaintext_and_ciphertext() {
+    let (mut initiator, mut responder) = connected_transport();
+    let plaintext = vec![0x5a; MAX_PLAINTEXT_BYTES];
+
+    let ciphertext = initiator.encrypt(&plaintext).unwrap();
+
+    assert_eq!(ciphertext.len(), MAX_ENCRYPTED_MESSAGE_BYTES);
+    assert_eq!(responder.decrypt(&ciphertext).unwrap(), plaintext);
+    assert!(EncryptedMessage::try_from(vec![0; MAX_ENCRYPTED_MESSAGE_BYTES]).is_ok());
+}
+
+#[test]
+fn handshake_receive_paths_reject_over_max_and_process_exact_max() {
+    let (mut initiator, mut responder, _) = connected_handshake_states(51, 52);
+    let oversized = vec![0; MAX_ENCRYPTED_MESSAGE_BYTES + 1];
+
     assert!(matches!(
-        NoiseResponder::accept(&[1, 2, 3]),
-        Err(CryptoError::MalformedHandshake)
+        initiator.receive(&oversized),
+        Err(CryptoError::MessageTooLarge {
+            actual,
+            maximum: MAX_ENCRYPTED_MESSAGE_BYTES
+        }) if actual == MAX_ENCRYPTED_MESSAGE_BYTES + 1
     ));
     assert!(matches!(
-        NoiseResponder::accept(&vec![0; MAX_ENCRYPTED_MESSAGE_BYTES + 1]),
+        responder.receive(&oversized),
+        Err(CryptoError::MessageTooLarge {
+            actual,
+            maximum: MAX_ENCRYPTED_MESSAGE_BYTES
+        }) if actual == MAX_ENCRYPTED_MESSAGE_BYTES + 1
+    ));
+
+    let exact_maximum = vec![0; MAX_ENCRYPTED_MESSAGE_BYTES];
+    assert_eq!(
+        initiator.receive(&exact_maximum).unwrap_err(),
+        CryptoError::MalformedHandshake
+    );
+    assert_eq!(
+        responder.receive(&exact_maximum).unwrap_err(),
+        CryptoError::AuthenticationFailed
+    );
+}
+
+#[test]
+fn public_handshake_writes_enforce_payload_boundary_before_state() {
+    let (mut initiator, mut responder, _) = connected_handshake_states(53, 54);
+    let oversized = vec![0; MAX_HANDSHAKE_PAYLOAD_BYTES + 1];
+
+    assert!(matches!(
+        initiator.write_message(&oversized),
+        Err(CryptoError::MessageTooLarge {
+            actual,
+            maximum: MAX_HANDSHAKE_PAYLOAD_BYTES
+        }) if actual == MAX_HANDSHAKE_PAYLOAD_BYTES + 1
+    ));
+    assert!(matches!(
+        responder.write_message(&oversized),
+        Err(CryptoError::MessageTooLarge {
+            actual,
+            maximum: MAX_HANDSHAKE_PAYLOAD_BYTES
+        }) if actual == MAX_HANDSHAKE_PAYLOAD_BYTES + 1
+    ));
+
+    let exact_maximum = vec![0; MAX_HANDSHAKE_PAYLOAD_BYTES];
+    assert!(matches!(
+        initiator.write_message(&exact_maximum),
+        Err(CryptoError::InvalidState)
+    ));
+    assert!(matches!(
+        responder.write_message(&exact_maximum),
+        Err(CryptoError::InvalidState)
+    ));
+}
+
+#[test]
+fn noise_handshake_returns_stable_errors_for_bad_state_messages_and_identity() {
+    let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([27; 32]));
+    let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([28; 32]));
+    let initiator_verify_key = initiator_identity.verify_key();
+    let responder_verify_key = responder_identity.verify_key();
+    let (initiator, _) = NoiseInitiator::start(initiator_identity, responder_verify_key).unwrap();
+    assert!(matches!(initiator.finish(), Err(CryptoError::InvalidState)));
+    assert!(matches!(
+        NoiseResponder::accept(&[1, 2, 3], responder_identity, initiator_verify_key),
+        Err(CryptoError::MalformedHandshake)
+    ));
+    let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([29; 32]));
+    let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([30; 32]));
+    assert!(matches!(
+        NoiseResponder::accept(
+            &vec![0; MAX_ENCRYPTED_MESSAGE_BYTES + 1],
+            responder_identity,
+            initiator_identity.verify_key()
+        ),
         Err(CryptoError::MessageTooLarge { .. })
     ));
 
     let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([31; 32]));
     let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([32; 32]));
     let unexpected_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([33; 32]));
-    let (mut initiator, message_1) = NoiseInitiator::start_authenticated(
-        initiator_identity,
-        Some(unexpected_identity.verify_key()),
-    )
-    .unwrap();
+    let initiator_verify_key = initiator_identity.verify_key();
+    let (mut initiator, message_1) =
+        NoiseInitiator::start(initiator_identity, unexpected_identity.verify_key()).unwrap();
     let (_, message_2) =
-        NoiseResponder::accept_authenticated(&message_1, responder_identity, None).unwrap();
+        NoiseResponder::accept(&message_1, responder_identity, initiator_verify_key).unwrap();
     assert!(matches!(
         initiator.receive(&message_2),
         Err(CryptoError::InvalidSignature)
@@ -217,9 +324,25 @@ fn connected_transport() -> (
     desklink_crypto::TransportCipher,
     desklink_crypto::TransportCipher,
 ) {
-    let (mut initiator, message_1) = NoiseInitiator::start().unwrap();
-    let (mut responder, message_2) = NoiseResponder::accept(&message_1).unwrap();
+    let (mut initiator, mut responder, message_2) = connected_handshake_states(41, 42);
     let message_3 = initiator.receive(&message_2).unwrap();
     responder.receive(&message_3).unwrap();
     (initiator.finish().unwrap(), responder.finish().unwrap())
+}
+
+fn connected_handshake_states(
+    initiator_seed: u8,
+    responder_seed: u8,
+) -> (NoiseInitiator, NoiseResponder, Vec<u8>) {
+    let initiator_identity =
+        DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([initiator_seed; 32]));
+    let responder_identity =
+        DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([responder_seed; 32]));
+    let initiator_verify_key = initiator_identity.verify_key();
+    let responder_verify_key = responder_identity.verify_key();
+    let (initiator, message_1) =
+        NoiseInitiator::start(initiator_identity, responder_verify_key).unwrap();
+    let (responder, message_2) =
+        NoiseResponder::accept(&message_1, responder_identity, initiator_verify_key).unwrap();
+    (initiator, responder, message_2)
 }

@@ -8,6 +8,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::identity::DeviceIdentity;
+use crate::resolver::DesklinkResolver;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const AUTH_PAYLOAD_BYTES: usize = 32 + 64;
@@ -19,6 +20,8 @@ const INITIATOR_SIGNATURE_DOMAIN: &[u8] = b"desklink-noise-xx-initiator-v1";
 
 pub const MAX_ENCRYPTED_MESSAGE_BYTES: usize = 65_535;
 pub const MAX_PLAINTEXT_BYTES: usize = MAX_ENCRYPTED_MESSAGE_BYTES - 16;
+pub const MAX_HANDSHAKE_PAYLOAD_BYTES: usize =
+    MAX_ENCRYPTED_MESSAGE_BYTES - HANDSHAKE_OUTPUT_OVERHEAD;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CryptoError {
@@ -106,24 +109,15 @@ impl fmt::Debug for SessionKey {
 pub struct NoiseInitiator {
     state: Option<HandshakeState>,
     identity: Option<DeviceIdentity>,
-    expected_peer: Option<VerifyingKey>,
+    expected_peer: VerifyingKey,
     peer_verify_key: Option<VerifyingKey>,
     session_key: Option<SessionKey>,
 }
 
 impl NoiseInitiator {
-    /// Starts a self-authenticated handshake with a temporary identity.
-    ///
-    /// Production callers should use [`Self::start_authenticated`] with a
-    /// persisted identity and the expected peer key learned during pairing.
-    pub fn start() -> Result<(Self, Vec<u8>), CryptoError> {
-        let identity = DeviceIdentity::generate(&mut OsRng);
-        Self::start_authenticated(identity, None)
-    }
-
-    pub fn start_authenticated(
+    pub fn start(
         identity: DeviceIdentity,
-        expected_peer: Option<VerifyingKey>,
+        expected_peer: VerifyingKey,
     ) -> Result<(Self, Vec<u8>), CryptoError> {
         let state = build_handshake_state(true)?;
         let mut session_key = [0; SESSION_KEY_BYTES];
@@ -159,7 +153,7 @@ impl NoiseInitiator {
         let (peer_verify_key, signature) = decode_auth_payload(&payload)?;
         verify_peer(
             &peer_verify_key,
-            self.expected_peer.as_ref(),
+            &self.expected_peer,
             RESPONDER_SIGNATURE_DOMAIN,
             &transcript,
             &signature,
@@ -192,25 +186,16 @@ impl NoiseInitiator {
 
 pub struct NoiseResponder {
     state: Option<HandshakeState>,
-    expected_peer: Option<VerifyingKey>,
+    expected_peer: VerifyingKey,
     peer_verify_key: Option<VerifyingKey>,
     session_key: Option<SessionKey>,
 }
 
 impl NoiseResponder {
-    /// Accepts a self-authenticated handshake with a temporary identity.
-    ///
-    /// Production callers should use [`Self::accept_authenticated`] with a
-    /// persisted identity and the expected peer key learned during pairing.
-    pub fn accept(message_1: &[u8]) -> Result<(Self, Vec<u8>), CryptoError> {
-        let identity = DeviceIdentity::generate(&mut OsRng);
-        Self::accept_authenticated(message_1, identity, None)
-    }
-
-    pub fn accept_authenticated(
+    pub fn accept(
         message_1: &[u8],
         identity: DeviceIdentity,
-        expected_peer: Option<VerifyingKey>,
+        expected_peer: VerifyingKey,
     ) -> Result<(Self, Vec<u8>), CryptoError> {
         ensure_bounded(message_1.len(), MAX_ENCRYPTED_MESSAGE_BYTES)?;
         let mut state = build_handshake_state(false)?;
@@ -261,7 +246,7 @@ impl NoiseResponder {
         let (peer_verify_key, signature) = decode_auth_payload(auth_payload)?;
         verify_peer(
             &peer_verify_key,
-            self.expected_peer.as_ref(),
+            &self.expected_peer,
             INITIATOR_SIGNATURE_DOMAIN,
             &transcript,
             &signature,
@@ -347,7 +332,7 @@ fn build_handshake_state(initiator: bool) -> Result<HandshakeState, CryptoError>
     let params: NoiseParams = NOISE_PATTERN
         .parse()
         .map_err(|_| CryptoError::BackendFailure)?;
-    let builder = Builder::new(params);
+    let builder = Builder::with_resolver(params, Box::new(DesklinkResolver));
     let keypair = builder
         .generate_keypair()
         .map_err(|_| CryptoError::BackendFailure)?;
@@ -368,13 +353,8 @@ fn write_handshake_message(
     state: &mut HandshakeState,
     payload: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let output_len = payload.len().checked_add(HANDSHAKE_OUTPUT_OVERHEAD).ok_or(
-        CryptoError::MessageTooLarge {
-            actual: payload.len(),
-            maximum: MAX_PLAINTEXT_BYTES,
-        },
-    )?;
-    ensure_bounded(output_len, MAX_ENCRYPTED_MESSAGE_BYTES)?;
+    ensure_bounded(payload.len(), MAX_HANDSHAKE_PAYLOAD_BYTES)?;
+    let output_len = payload.len() + HANDSHAKE_OUTPUT_OVERHEAD;
     let mut output = vec![0; output_len];
     let written = state
         .write_message(payload, &mut output)
@@ -413,12 +393,12 @@ fn decode_auth_payload(payload: &[u8]) -> Result<(VerifyingKey, Signature), Cryp
 
 fn verify_peer(
     peer: &VerifyingKey,
-    expected_peer: Option<&VerifyingKey>,
+    expected_peer: &VerifyingKey,
     domain: &[u8],
     transcript: &[u8],
     signature: &Signature,
 ) -> Result<(), CryptoError> {
-    if expected_peer.is_some_and(|expected| expected != peer)
+    if expected_peer != peer
         || peer
             .verify_strict(&signature_input(domain, transcript), signature)
             .is_err()
