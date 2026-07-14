@@ -27,6 +27,7 @@ desklink-session = { path = "crates/desklink-session" }
 desklink-crypto = { path = "crates/desklink-crypto" }
 desklink-transport = { path = "crates/desklink-transport" }
 quinn = "0.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }

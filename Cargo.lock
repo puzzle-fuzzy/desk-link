@@ -281,6 +281,12 @@ dependencies = [
 [[package]]
 name = "desklink-ffi"
 version = "0.1.0"
+dependencies = [
+ "desklink-crypto",
+ "desklink-protocol",
+ "desklink-session",
+ "rand_core 0.6.4",
+]
 
 [[package]]
 name = "desklink-protocol"
