@@ -11,6 +11,9 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_DATAGRAM_PAYLOAD_BYTES: u32 = 1200;
 pub const MAX_MVP_WIDTH: u16 = 1920;
 pub const MAX_MVP_HEIGHT: u16 = 1080;
+/// Maximum H.264 datagrams in one frame; bounds per-frame assembly memory while
+/// allowing roughly 5 MiB of encoded data at the 1200-byte MVP payload size.
+pub const MAX_VIDEO_CHUNKS: u16 = 4096;
 pub const MAX_INPUT_AGE_US: u64 = 5_000_000;
 pub const MAX_INPUT_FUTURE_SKEW_US: u64 = 1_000_000;
 

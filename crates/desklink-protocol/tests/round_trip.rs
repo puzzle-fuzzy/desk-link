@@ -1,9 +1,9 @@
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, InputEnvelope, InputEvent,
     MAX_CONTROL_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US,
-    MAX_INPUT_FUTURE_SKEW_US, PROTOCOL_VERSION, Platform, ProtocolError, VideoFrameHeader,
-    VideoPacket, decode_control, decode_input, decode_video_header, decode_video_packet,
-    encode_control, encode_input, encode_video_header, encode_video_packet,
+    MAX_INPUT_FUTURE_SKEW_US, MAX_VIDEO_CHUNKS, PROTOCOL_VERSION, Platform, ProtocolError,
+    VideoFrameHeader, VideoPacket, decode_control, decode_input, decode_video_header,
+    decode_video_packet, encode_control, encode_input, encode_video_header, encode_video_packet,
 };
 
 #[test]
@@ -76,6 +76,11 @@ fn invalid_chunks_are_rejected() {
     ));
     value.chunk_count = 2;
     value.chunk_index = 2;
+    assert!(matches!(
+        encode_video_header(&value),
+        Err(ProtocolError::InvalidFrame)
+    ));
+    value.chunk_count = MAX_VIDEO_CHUNKS + 1;
     assert!(matches!(
         encode_video_header(&value),
         Err(ProtocolError::InvalidFrame)

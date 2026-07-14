@@ -1,4 +1,4 @@
-use desklink_protocol::{FrameFlags, VideoFrameHeader, VideoPacket, PROTOCOL_VERSION};
+use desklink_protocol::{FrameFlags, PROTOCOL_VERSION, VideoFrameHeader, VideoPacket};
 use desklink_video::{AssembleResult, DropReason, EncodedFrame, FrameAssembler, LatestFrameQueue};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -54,14 +54,21 @@ fn queue_evicts_oldest_when_full() {
 #[test]
 fn incomplete_frame_expires_without_blocking_new_frame() {
     let mut assembler = FrameAssembler::new(3, Duration::from_millis(120));
-    assert_eq!(assembler.push(instant(0), packet(10, 0, 2)), AssembleResult::Pending);
-    assert_eq!(assembler.push(instant(121), packet(11, 0, 1)), AssembleResult::Complete(frame(11)));
-    assert_eq!(assembler.expire(instant(121)), 1);
+    assert_eq!(
+        assembler.push(instant(0), packet(10, 0, 2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(121), packet(11, 0, 1)),
+        AssembleResult::Complete(frame(11))
+    );
+    assert_eq!(assembler.expire(instant(121)), 0);
 }
 
 #[test]
 fn older_frame_cannot_be_presented() {
     let mut assembler = FrameAssembler::new(3, Duration::from_millis(120));
+    assert!(assembler.begin_stream(1));
     assert!(assembler.accept_for_present(frame(20)));
     assert!(!assembler.accept_for_present(frame(19)));
 }
@@ -69,27 +76,91 @@ fn older_frame_cannot_be_presented() {
 #[test]
 fn duplicate_chunk_and_mismatched_metadata_are_dropped() {
     let mut assembler = FrameAssembler::new(3, Duration::from_millis(120));
-    assert_eq!(assembler.push(instant(0), packet(30, 0, 2)), AssembleResult::Pending);
-    assert_eq!(assembler.push(instant(1), packet(30, 0, 2)), AssembleResult::Dropped(DropReason::DuplicateChunk));
+    assert_eq!(
+        assembler.push(instant(0), packet(30, 0, 2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(1), packet(30, 0, 2)),
+        AssembleResult::Dropped(DropReason::DuplicateChunk)
+    );
     let mut mismatched = packet(30, 1, 2);
     mismatched.header.width = 800;
-    assert_eq!(assembler.push(instant(2), mismatched), AssembleResult::Dropped(DropReason::MetadataMismatch));
+    assert_eq!(
+        assembler.push(instant(2), mismatched),
+        AssembleResult::Dropped(DropReason::MetadataMismatch)
+    );
 }
 
 #[test]
 fn assembler_evicts_oldest_incomplete_frame_at_capacity() {
     let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
-    assert_eq!(assembler.push(instant(0), packet(1, 0, 2)), AssembleResult::Pending);
-    assert_eq!(assembler.push(instant(1), packet(2, 0, 2)), AssembleResult::Pending);
-    assert_eq!(assembler.push(instant(2), packet(3, 0, 1)), AssembleResult::Complete(frame(3)));
-    assert_eq!(assembler.push(instant(3), packet(1, 1, 2)), AssembleResult::Pending);
+    assert_eq!(
+        assembler.push(instant(0), packet(1, 0, 2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(1), packet(2, 0, 2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(2), packet(3, 0, 1)),
+        AssembleResult::Complete(frame(3))
+    );
+    assert_eq!(
+        assembler.push(instant(3), packet(1, 1, 2)),
+        AssembleResult::Pending
+    );
 }
 
 #[test]
 fn presentation_order_includes_stream_id() {
     let mut assembler = FrameAssembler::new(1, Duration::from_millis(120));
+    assert!(assembler.begin_stream(2));
     let mut next_stream = frame(1);
     next_stream.stream_id = 2;
     assert!(assembler.accept_for_present(next_stream));
     assert!(!assembler.accept_for_present(frame(99)));
+}
+
+#[test]
+fn smaller_stream_rollover_clears_state_and_rejects_delayed_old_packets() {
+    let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
+    assert!(assembler.begin_stream(10));
+    let mut old_packet = packet(1, 0, 2);
+    old_packet.header.stream_id = 10;
+    assert_eq!(
+        assembler.push(instant(0), old_packet),
+        AssembleResult::Pending
+    );
+    assert!(assembler.begin_stream(2));
+    let mut new_packet = packet(7, 0, 1);
+    new_packet.header.stream_id = 2;
+    let mut expected = frame(7);
+    expected.stream_id = 2;
+    assert_eq!(
+        assembler.push(instant(1), new_packet),
+        AssembleResult::Complete(expected)
+    );
+    assert_eq!(
+        assembler.push(instant(2), packet(1, 1, 2)),
+        AssembleResult::Dropped(DropReason::Stale)
+    );
+}
+
+#[test]
+fn push_expires_overdue_partials_before_accepting_new_packet() {
+    let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
+    assert_eq!(
+        assembler.push(instant(0), packet(10, 0, 2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(121), packet(11, 0, 1)),
+        AssembleResult::Complete(frame(11))
+    );
+    assert_eq!(
+        assembler.push(instant(122), packet(10, 1, 2)),
+        AssembleResult::Pending
+    );
 }

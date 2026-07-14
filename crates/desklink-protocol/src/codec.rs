@@ -1,7 +1,7 @@
 use crate::{
     ControlMessage, FrameFlags, InputEnvelope, MAX_CONTROL_MESSAGE_BYTES,
     MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_MVP_HEIGHT,
-    MAX_MVP_WIDTH, PROTOCOL_VERSION, VideoFrameHeader, VideoPacket,
+    MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, PROTOCOL_VERSION, VideoFrameHeader, VideoPacket,
 };
 use thiserror::Error;
 
@@ -104,6 +104,7 @@ fn ensure(bytes: &[u8], maximum: usize) -> Result<(), ProtocolError> {
 pub(crate) fn validate_video_header(header: &VideoFrameHeader) -> Result<(), ProtocolError> {
     if header.protocol_version != PROTOCOL_VERSION
         || header.chunk_count == 0
+        || header.chunk_count > MAX_VIDEO_CHUNKS
         || header.chunk_index >= header.chunk_count
         || header.width > MAX_MVP_WIDTH
         || header.height > MAX_MVP_HEIGHT
