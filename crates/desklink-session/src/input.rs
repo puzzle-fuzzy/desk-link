@@ -54,7 +54,7 @@ impl InputSequencer {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn next(&mut self) -> u64 {
+    pub fn next_sequence(&mut self) -> u64 {
         next_input_sequence(&mut self.next)
     }
 }
@@ -76,6 +76,24 @@ impl PressedInputState {
                 pressed: true,
                 modifiers,
             } if !self.keys.iter().any(|(k, _)| k == code) => self.keys.push((*code, *modifiers)),
+            _ => {}
+        }
+    }
+    pub fn release(&mut self, event: &InputEvent) {
+        match event {
+            InputEvent::MouseButton {
+                button,
+                pressed: false,
+            } => {
+                self.buttons.retain(|held| held != button);
+            }
+            InputEvent::Key {
+                code,
+                pressed: false,
+                ..
+            } => {
+                self.keys.retain(|(held, _)| held != code);
+            }
             _ => {}
         }
     }

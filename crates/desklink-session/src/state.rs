@@ -34,6 +34,7 @@ pub enum SessionEvent {
 pub enum SessionAction {
     SendControl(ControlMessage),
     StartVideo,
+    BeginStream { stream_id: u64 },
     RebuildDecoder,
     RequestKeyframe,
     Reconnect,
@@ -52,16 +53,25 @@ pub enum SessionError {
 pub struct SessionMachine {
     role: DeviceRole,
     state: SessionState,
+    next_stream_id: u64,
 }
 impl SessionMachine {
     pub fn new(role: DeviceRole) -> Self {
         Self {
             role,
             state: SessionState::Idle,
+            next_stream_id: 0,
         }
     }
     pub fn state(&self) -> SessionState {
         self.state
+    }
+    fn next_stream_id(&mut self) -> u64 {
+        self.next_stream_id = self.next_stream_id.wrapping_add(1);
+        if self.next_stream_id == 0 {
+            self.next_stream_id = 1;
+        }
+        self.next_stream_id
     }
     pub fn apply(&mut self, event: SessionEvent) -> Result<Vec<SessionAction>, SessionError> {
         use SessionAction::*;
@@ -69,13 +79,23 @@ impl SessionMachine {
         use SessionState::*;
         let old = self.state;
         let (state, actions) = match (old, event) {
-            (Idle, RelayConnected) => (SecureHandshake, vec![]),
+            (Idle, RelayConnected) | (Reconnecting, RelayConnected) => (SecureHandshake, vec![]),
             (SecureHandshake, HandshakeComplete) if self.role == DeviceRole::Host => {
                 (WaitingForApproval, vec![])
             }
             (SecureHandshake, HandshakeComplete) => (NegotiatingCapabilities, vec![]),
             (WaitingForApproval, HostAccepted) => (NegotiatingCapabilities, vec![]),
             (NegotiatingCapabilities, CapabilitiesNegotiated) => {
+                let stream_id = self.next_stream_id();
+                (
+                    StartingVideo,
+                    vec![
+                        SessionAction::BeginStream { stream_id },
+                        SessionAction::StartVideo,
+                    ],
+                )
+            }
+            (StartingVideo, SessionEvent::StartVideo) => {
                 (StartingVideo, vec![SessionAction::StartVideo])
             }
             (StartingVideo, VideoStarted) => (Connected, vec![]),
