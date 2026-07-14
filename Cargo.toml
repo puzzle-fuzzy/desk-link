@@ -20,10 +20,15 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
+bytes = "1"
 desklink-protocol = { path = "crates/desklink-protocol" }
 desklink-video = { path = "crates/desklink-video" }
 desklink-session = { path = "crates/desklink-session" }
 desklink-crypto = { path = "crates/desklink-crypto" }
 desklink-transport = { path = "crates/desklink-transport" }
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

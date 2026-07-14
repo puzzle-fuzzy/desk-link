@@ -4,3 +4,17 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+desklink-crypto.workspace = true
+desklink-protocol.workspace = true
+desklink-transport.workspace = true
+rcgen.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
