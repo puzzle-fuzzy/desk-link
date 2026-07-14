@@ -1,8 +1,10 @@
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, InputEnvelope, InputEvent,
-    MAX_CONTROL_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES, PROTOCOL_VERSION, Platform,
-    ProtocolError, VideoFrameHeader, VideoPacket, decode_control, decode_video_header,
-    encode_control, encode_video_header, validate_input_timestamp,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US,
+    MAX_INPUT_FUTURE_SKEW_US, PROTOCOL_VERSION, Platform, ProtocolError, VideoFrameHeader,
+    VideoPacket, decode_control, decode_input, decode_video_header, decode_video_packet,
+    encode_control, encode_input, encode_video_header, encode_video_packet,
+    validate_input_timestamp,
 };
 
 #[test]
@@ -136,4 +138,67 @@ fn input_timestamp_window_rejects_stale_and_future_values() {
         ..envelope
     };
     assert!(validate_input_timestamp(&future, 2_000, 500).is_err());
+}
+
+#[test]
+fn input_wire_decode_rejects_stale_and_future_values() {
+    let stale = InputEnvelope {
+        sequence: 1,
+        timestamp_us: 10,
+        event: InputEvent::MouseMove { x: 1, y: 1 },
+    };
+    let bytes = encode_input(&stale).expect("encode");
+    assert!(matches!(
+        decode_input(&bytes, 10 + MAX_INPUT_AGE_US + 1),
+        Err(ProtocolError::TimestampOutsideWindow)
+    ));
+    let future = InputEnvelope {
+        timestamp_us: 10 + MAX_INPUT_FUTURE_SKEW_US + 1,
+        ..stale
+    };
+    let bytes = encode_input(&future).expect("encode");
+    assert!(matches!(
+        decode_input(&bytes, 10),
+        Err(ProtocolError::TimestampOutsideWindow)
+    ));
+}
+
+#[test]
+fn capabilities_require_nonempty_h264_list() {
+    for codecs in [vec![], vec![Codec::H264]] {
+        let mut value = DeviceCapabilities {
+            platform: Platform::IOS,
+            role: DeviceRole::Host,
+            codecs,
+            width: 1920,
+            height: 1080,
+        };
+        if value.codecs.is_empty() {
+            assert!(matches!(
+                value.validate(),
+                Err(ProtocolError::InvalidCapabilities)
+            ));
+        }
+        value.codecs = vec![];
+        assert!(matches!(
+            value.validate(),
+            Err(ProtocolError::InvalidCapabilities)
+        ));
+    }
+}
+
+#[test]
+fn raw_video_packet_wire_round_trip_and_rejection() {
+    let mut header = header();
+    header.payload_length = 3;
+    let packet = VideoPacket::new(header, vec![1, 2, 3]).expect("packet");
+    let bytes = encode_video_packet(&packet).expect("encode");
+    assert_eq!(decode_video_packet(&bytes).expect("decode"), packet);
+    let mut raw = packet.clone();
+    raw.header.payload_length = 2;
+    let bytes = postcard::to_allocvec(&raw).expect("raw encode");
+    assert!(matches!(
+        decode_video_packet(&bytes),
+        Err(ProtocolError::PayloadLengthMismatch { .. })
+    ));
 }

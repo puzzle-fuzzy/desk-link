@@ -1,7 +1,8 @@
 mod codec;
 
 pub use codec::{
-    ProtocolError, decode_control, decode_video_header, encode_control, encode_video_header,
+    ProtocolError, decode_control, decode_input, decode_video_header, decode_video_packet,
+    encode_control, encode_input, encode_video_header, encode_video_packet,
 };
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,8 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_DATAGRAM_PAYLOAD_BYTES: u32 = 1200;
 pub const MAX_MVP_WIDTH: u16 = 1920;
 pub const MAX_MVP_HEIGHT: u16 = 1080;
+pub const MAX_INPUT_AGE_US: u64 = 5_000_000;
+pub const MAX_INPUT_FUTURE_SKEW_US: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Platform {
@@ -84,7 +87,6 @@ pub enum ControlMessage {
         role: DeviceRole,
     },
     Capabilities(DeviceCapabilities),
-    Input(InputEvent),
     InputEnvelope(InputEnvelope),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,6 +101,7 @@ impl DeviceCapabilities {
     pub fn validate(&self) -> Result<(), codec::ProtocolError> {
         if self.width > MAX_MVP_WIDTH
             || self.height > MAX_MVP_HEIGHT
+            || self.codecs.is_empty()
             || !self.codecs.iter().all(|codec| matches!(codec, Codec::H264))
         {
             return Err(codec::ProtocolError::InvalidCapabilities);
