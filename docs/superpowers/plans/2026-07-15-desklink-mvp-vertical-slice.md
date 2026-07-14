@@ -606,6 +606,7 @@ fn pairing_code_expires_and_cannot_be_reused() {
         offer.validate_code(&offer.code().to_string(), 1_600),
         Err(PairingError::Expired)
     ));
+    offer.consume(1_599).unwrap();
     assert!(matches!(offer.consume(1_599), Err(PairingError::AlreadyConsumed)));
 }
 
