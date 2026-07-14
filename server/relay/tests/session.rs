@@ -235,6 +235,34 @@ async fn relay_enforces_connection_and_session_admission_caps() {
     );
 }
 
+#[tokio::test]
+async fn every_concurrent_connection_over_cap_gets_a_stable_limit_error() {
+    let relay = spawn_test_relay_with_config(RelayConfig {
+        max_connections: 1,
+        ..RelayConfig::default()
+    })
+    .await;
+    let first = QuicClient::connect(config(&relay)).await.unwrap();
+    first.join(host(session(19), [4; 32])).await.unwrap();
+
+    async fn connect_or_join_limit(relay: &TestRelay, session_id: u8) -> TransportError {
+        match QuicClient::connect(config(relay)).await {
+            Err(error) => error,
+            Ok(client) => client
+                .join(host(session(session_id), [4; 32]))
+                .await
+                .expect_err("an over-cap connection must be rejected"),
+        }
+    }
+
+    let (second, third) = tokio::join!(
+        connect_or_join_limit(&relay, 20),
+        connect_or_join_limit(&relay, 21),
+    );
+    assert_eq!(second, TransportError::ConnectionLimit);
+    assert_eq!(third, TransportError::ConnectionLimit);
+}
+
 #[test]
 fn second_controller_is_rejected_by_the_session_table() {
     let table = RelaySessionTable::new(RelayConfig::default());

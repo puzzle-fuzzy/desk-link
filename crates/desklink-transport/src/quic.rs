@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use crate::{
 const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
 const INBOUND_DATAGRAM_QUEUE_CAPACITY: usize = 128;
 const INBOUND_CLOSED_QUEUE_CAPACITY: usize = 8;
-const INBOUND_QUEUE_COUNT: usize = 6;
+const INBOUND_LANE_COUNT: usize = 6;
 
 pub struct QuicClient {
     _endpoint: quinn::Endpoint,
@@ -29,7 +29,7 @@ struct ClientInner {
     control: Mutex<Option<quinn::SendStream>>,
     input: Mutex<Option<quinn::SendStream>>,
     video_config: Mutex<Option<quinn::SendStream>>,
-    events: Mutex<InboundReceivers>,
+    events: InboundReceivers,
 }
 
 #[derive(Clone)]
@@ -43,25 +43,26 @@ struct InboundSenders {
 }
 
 struct InboundReceivers {
-    control: mpsc::Receiver<TransportEvent>,
-    input: mpsc::Receiver<TransportEvent>,
-    video_config: mpsc::Receiver<TransportEvent>,
-    video_datagram: mpsc::Receiver<TransportEvent>,
-    cursor_datagram: mpsc::Receiver<TransportEvent>,
-    closed: mpsc::Receiver<TransportEvent>,
-    control_open: bool,
-    input_open: bool,
-    video_config_open: bool,
-    video_datagram_open: bool,
-    cursor_datagram_open: bool,
-    closed_open: bool,
-    next_queue: usize,
+    control: Mutex<mpsc::Receiver<TransportEvent>>,
+    input: Mutex<mpsc::Receiver<TransportEvent>>,
+    video_config: Mutex<mpsc::Receiver<TransportEvent>>,
+    video_datagram: Mutex<mpsc::Receiver<TransportEvent>>,
+    cursor_datagram: Mutex<mpsc::Receiver<TransportEvent>>,
+    closed: Mutex<mpsc::Receiver<TransportEvent>>,
+    control_open: AtomicBool,
+    input_open: AtomicBool,
+    video_config_open: AtomicBool,
+    video_datagram_open: AtomicBool,
+    cursor_datagram_open: AtomicBool,
+    closed_open: AtomicBool,
+    next_lane: AtomicUsize,
 }
 
-enum QueuePoll {
+enum LanePoll {
     Event(TransportEvent),
     Empty,
-    Disconnected,
+    Closed,
+    Locked,
 }
 
 impl InboundReceivers {
@@ -74,152 +75,81 @@ impl InboundReceivers {
         closed: mpsc::Receiver<TransportEvent>,
     ) -> Self {
         Self {
-            control,
-            input,
-            video_config,
-            video_datagram,
-            cursor_datagram,
-            closed,
-            control_open: true,
-            input_open: true,
-            video_config_open: true,
-            video_datagram_open: true,
-            cursor_datagram_open: true,
-            closed_open: true,
-            next_queue: 0,
+            control: Mutex::new(control),
+            input: Mutex::new(input),
+            video_config: Mutex::new(video_config),
+            video_datagram: Mutex::new(video_datagram),
+            cursor_datagram: Mutex::new(cursor_datagram),
+            closed: Mutex::new(closed),
+            control_open: AtomicBool::new(true),
+            input_open: AtomicBool::new(true),
+            video_config_open: AtomicBool::new(true),
+            video_datagram_open: AtomicBool::new(true),
+            cursor_datagram_open: AtomicBool::new(true),
+            closed_open: AtomicBool::new(true),
+            next_lane: AtomicUsize::new(0),
         }
     }
 
-    fn has_open_queue(&self) -> bool {
-        self.control_open
-            || self.input_open
-            || self.video_config_open
-            || self.video_datagram_open
-            || self.cursor_datagram_open
-            || self.closed_open
+    fn has_open_lane(&self) -> bool {
+        self.control_open.load(Ordering::Acquire)
+            || self.input_open.load(Ordering::Acquire)
+            || self.video_config_open.load(Ordering::Acquire)
+            || self.video_datagram_open.load(Ordering::Acquire)
+            || self.cursor_datagram_open.load(Ordering::Acquire)
+            || self.closed_open.load(Ordering::Acquire)
     }
 
-    fn poll_queue(&mut self, queue: usize) -> QueuePoll {
-        let result = match queue {
-            0 => self.control.try_recv(),
-            1 => self.input.try_recv(),
-            2 => self.video_config.try_recv(),
-            3 => self.video_datagram.try_recv(),
-            4 => self.cursor_datagram.try_recv(),
-            5 => self.closed.try_recv(),
-            _ => unreachable!("invalid inbound queue index"),
+    fn lane_open(&self, lane: usize) -> bool {
+        match lane {
+            0 => self.control_open.load(Ordering::Acquire),
+            1 => self.input_open.load(Ordering::Acquire),
+            2 => self.video_config_open.load(Ordering::Acquire),
+            3 => self.video_datagram_open.load(Ordering::Acquire),
+            4 => self.cursor_datagram_open.load(Ordering::Acquire),
+            5 => self.closed_open.load(Ordering::Acquire),
+            _ => unreachable!("invalid inbound lane index"),
+        }
+    }
+
+    fn receiver(&self, lane: usize) -> &Mutex<mpsc::Receiver<TransportEvent>> {
+        match lane {
+            0 => &self.control,
+            1 => &self.input,
+            2 => &self.video_config,
+            3 => &self.video_datagram,
+            4 => &self.cursor_datagram,
+            5 => &self.closed,
+            _ => unreachable!("invalid inbound lane index"),
+        }
+    }
+
+    fn try_recv_lane(&self, lane: usize) -> LanePoll {
+        let Ok(mut receiver) = self.receiver(lane).try_lock() else {
+            return LanePoll::Locked;
         };
-        match result {
-            Ok(event) => {
-                self.next_queue = (queue + 1) % INBOUND_QUEUE_COUNT;
-                QueuePoll::Event(event)
-            }
-            Err(mpsc::error::TryRecvError::Empty) => QueuePoll::Empty,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                match queue {
-                    0 => self.control_open = false,
-                    1 => self.input_open = false,
-                    2 => self.video_config_open = false,
-                    3 => self.video_datagram_open = false,
-                    4 => self.cursor_datagram_open = false,
-                    5 => self.closed_open = false,
-                    _ => unreachable!("invalid inbound queue index"),
-                }
-                QueuePoll::Disconnected
-            }
+        match receiver.try_recv() {
+            Ok(event) => LanePoll::Event(event),
+            Err(mpsc::error::TryRecvError::Empty) => LanePoll::Empty,
+            Err(mpsc::error::TryRecvError::Disconnected) => LanePoll::Closed,
         }
     }
 
-    fn poll_ready(&mut self) -> Option<TransportEvent> {
-        for offset in 0..INBOUND_QUEUE_COUNT {
-            let queue = (self.next_queue + offset) % INBOUND_QUEUE_COUNT;
-            if !self.queue_open(queue) {
-                continue;
-            }
-            if let QueuePoll::Event(event) = self.poll_queue(queue) {
-                return Some(event);
-            }
-        }
-        None
-    }
-
-    fn queue_open(&self, queue: usize) -> bool {
-        match queue {
-            0 => self.control_open,
-            1 => self.input_open,
-            2 => self.video_config_open,
-            3 => self.video_datagram_open,
-            4 => self.cursor_datagram_open,
-            5 => self.closed_open,
-            _ => unreachable!("invalid inbound queue index"),
+    fn close_lane(&self, lane: usize) {
+        match lane {
+            0 => self.control_open.store(false, Ordering::Release),
+            1 => self.input_open.store(false, Ordering::Release),
+            2 => self.video_config_open.store(false, Ordering::Release),
+            3 => self.video_datagram_open.store(false, Ordering::Release),
+            4 => self.cursor_datagram_open.store(false, Ordering::Release),
+            5 => self.closed_open.store(false, Ordering::Release),
+            _ => unreachable!("invalid inbound lane index"),
         }
     }
 
-    async fn next(&mut self) -> Result<TransportEvent, TransportError> {
-        loop {
-            if let Some(event) = self.poll_ready() {
-                return Ok(event);
-            }
-            if !self.has_open_queue() {
-                return Err(TransportError::Closed);
-            }
-            tokio::select! {
-                event = self.control.recv(), if self.control_open => {
-                    match event {
-                        Some(event) => {
-                            self.next_queue = 1;
-                            return Ok(event);
-                        }
-                        None => self.control_open = false,
-                    }
-                }
-                event = self.input.recv(), if self.input_open => {
-                    match event {
-                        Some(event) => {
-                            self.next_queue = 2;
-                            return Ok(event);
-                        }
-                        None => self.input_open = false,
-                    }
-                }
-                event = self.video_config.recv(), if self.video_config_open => {
-                    match event {
-                        Some(event) => {
-                            self.next_queue = 3;
-                            return Ok(event);
-                        }
-                        None => self.video_config_open = false,
-                    }
-                }
-                event = self.video_datagram.recv(), if self.video_datagram_open => {
-                    match event {
-                        Some(event) => {
-                            self.next_queue = 4;
-                            return Ok(event);
-                        }
-                        None => self.video_datagram_open = false,
-                    }
-                }
-                event = self.cursor_datagram.recv(), if self.cursor_datagram_open => {
-                    match event {
-                        Some(event) => {
-                            self.next_queue = 5;
-                            return Ok(event);
-                        }
-                        None => self.cursor_datagram_open = false,
-                    }
-                }
-                event = self.closed.recv(), if self.closed_open => {
-                    match event {
-                        Some(event) => {
-                            self.next_queue = 0;
-                            return Ok(event);
-                        }
-                        None => self.closed_open = false,
-                    }
-                }
-            }
-        }
+    fn set_next_lane(&self, lane: usize) {
+        self.next_lane
+            .store((lane + 1) % INBOUND_LANE_COUNT, Ordering::Release);
     }
 }
 
@@ -275,14 +205,14 @@ impl QuicClient {
             control: Mutex::new(None),
             input: Mutex::new(None),
             video_config: Mutex::new(None),
-            events: Mutex::new(InboundReceivers::new(
+            events: InboundReceivers::new(
                 control_receiver,
                 input_receiver,
                 video_config_receiver,
                 video_datagram_receiver,
                 cursor_datagram_receiver,
                 closed_receiver,
-            )),
+            ),
         });
         tokio::spawn(read_connection(connection, inbound_senders));
         Ok(Self {
@@ -314,7 +244,7 @@ impl QuicClient {
         receive
             .read_exact(&mut response)
             .await
-            .map_err(map_read_exact_error)?;
+            .map_err(|error| map_read_exact_error(&self.inner.connection, error))?;
         if response[0] != 0 {
             return Err(TransportError::JoinRejected(JoinRejectCode::from_byte(
                 response[0],
@@ -345,8 +275,111 @@ impl QuicClient {
     }
 
     pub async fn next_event(&self) -> Result<TransportEvent, TransportError> {
-        let mut events = self.inner.events.lock().await;
-        events.next().await
+        loop {
+            let start = self.inner.events.next_lane.load(Ordering::Acquire);
+            for offset in 0..INBOUND_LANE_COUNT {
+                let lane = (start + offset) % INBOUND_LANE_COUNT;
+                if !self.inner.events.lane_open(lane) {
+                    continue;
+                }
+                match self.inner.events.try_recv_lane(lane) {
+                    LanePoll::Event(event) => {
+                        self.inner.events.set_next_lane(lane);
+                        return Ok(event);
+                    }
+                    LanePoll::Closed => self.inner.events.close_lane(lane),
+                    LanePoll::Empty | LanePoll::Locked => {}
+                }
+            }
+            if !self.inner.events.has_open_lane() {
+                return Err(TransportError::Closed);
+            }
+
+            tokio::select! {
+                event = recv_lane(&self.inner.events.input), if self.inner.events.input_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(1);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(1);
+                }
+                event = recv_lane(&self.inner.events.control), if self.inner.events.control_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(0);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(0);
+                }
+                event = recv_lane(&self.inner.events.video_config), if self.inner.events.video_config_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(2);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(2);
+                }
+                event = recv_lane(&self.inner.events.video_datagram), if self.inner.events.video_datagram_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(3);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(3);
+                }
+                event = recv_lane(&self.inner.events.cursor_datagram), if self.inner.events.cursor_datagram_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(4);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(4);
+                }
+                event = recv_lane(&self.inner.events.closed), if self.inner.events.closed_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(5);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(5);
+                }
+            }
+        }
+    }
+
+    pub async fn next_control(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(&self.inner.events.control, |event| match event {
+            TransportEvent::Control(bytes) => Some(bytes),
+            _ => None,
+        })
+        .await
+    }
+
+    pub async fn next_input(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(&self.inner.events.input, |event| match event {
+            TransportEvent::Input(bytes) => Some(bytes),
+            _ => None,
+        })
+        .await
+    }
+
+    pub async fn next_video_config(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(&self.inner.events.video_config, |event| match event {
+            TransportEvent::VideoConfig(bytes) => Some(bytes),
+            _ => None,
+        })
+        .await
+    }
+
+    pub async fn next_video_datagram(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(&self.inner.events.video_datagram, |event| match event {
+            TransportEvent::VideoDatagram(bytes) => Some(bytes),
+            _ => None,
+        })
+        .await
+    }
+
+    pub async fn next_cursor_datagram(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(&self.inner.events.cursor_datagram, |event| match event {
+            TransportEvent::CursorDatagram(bytes) => Some(bytes),
+            _ => None,
+        })
+        .await
     }
 
     async fn send_reliable(
@@ -424,22 +457,35 @@ impl QuicClient {
 }
 
 fn map_connection_error(error: quinn::ConnectionError) -> TransportError {
-    if matches!(
-        &error,
+    match error {
         quinn::ConnectionError::ApplicationClosed(close)
-            if close.error_code == quinn::VarInt::from_u32(RELAY_CONNECTION_LIMIT_CLOSE_CODE)
-    ) {
-        TransportError::ConnectionLimit
-    } else {
-        TransportError::Connection(error.to_string())
+            if close.error_code == quinn::VarInt::from_u32(RELAY_CONNECTION_LIMIT_CLOSE_CODE) =>
+        {
+            TransportError::ConnectionLimit
+        }
+        quinn::ConnectionError::ConnectionClosed(close)
+            if u64::from(close.error_code) == u64::from(RELAY_CONNECTION_LIMIT_CLOSE_CODE) =>
+        {
+            TransportError::ConnectionLimit
+        }
+        error => TransportError::Connection(error.to_string()),
     }
 }
 
-fn map_read_exact_error(error: quinn::ReadExactError) -> TransportError {
+fn map_read_exact_error(
+    connection: &quinn::Connection,
+    error: quinn::ReadExactError,
+) -> TransportError {
     match error {
         quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(error)) => {
             map_connection_error(error)
         }
+        quinn::ReadExactError::FinishedEarly(read) => connection
+            .close_reason()
+            .map(map_connection_error)
+            .unwrap_or_else(|| {
+                TransportError::Connection(format!("stream finished early ({read} bytes read)"))
+            }),
         error => TransportError::Connection(error.to_string()),
     }
 }
@@ -455,6 +501,20 @@ fn map_datagram_error(error: quinn::SendDatagramError) -> TransportError {
     match error {
         quinn::SendDatagramError::ConnectionLost(error) => map_connection_error(error),
         error => TransportError::Datagram(error.to_string()),
+    }
+}
+
+async fn recv_lane(receiver: &Mutex<mpsc::Receiver<TransportEvent>>) -> Option<TransportEvent> {
+    receiver.lock().await.recv().await
+}
+
+async fn receive_payload(
+    receiver: &Mutex<mpsc::Receiver<TransportEvent>>,
+    project: fn(TransportEvent) -> Option<Vec<u8>>,
+) -> Result<Vec<u8>, TransportError> {
+    match recv_lane(receiver).await {
+        Some(event) => project(event).ok_or(TransportError::Malformed),
+        None => Err(TransportError::Closed),
     }
 }
 

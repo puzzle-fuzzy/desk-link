@@ -591,6 +591,23 @@ async fn video_datagram_flood_does_not_block_input_delivery() {
 }
 
 #[tokio::test]
+async fn dedicated_input_receiver_is_not_blocked_by_video_flood() {
+    let relay = spawn_video_flood_relay().await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    let input = vec![8, 7, 6, 5];
+    client.send_input(input.clone()).await.unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(250), client.next_input())
+            .await
+            .unwrap()
+            .unwrap(),
+        input
+    );
+}
+
+#[tokio::test]
 async fn input_flood_does_not_starve_control_delivery() {
     let relay = spawn_input_flood_with_control_relay().await;
     let client = QuicClient::connect(config(&relay)).await.unwrap();

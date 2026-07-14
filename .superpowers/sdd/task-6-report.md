@@ -202,3 +202,42 @@ passed
 - `crates/desklink-transport/tests/localhost.rs`
 - `server/relay/src/lib.rs`
 - `server/relay/tests/session.rs`
+
+## Task 6 final follow-up
+
+Date: 2026-07-15
+
+The review found that separate producer queues were still exposed through one
+receiver lock, so a consumer interested in input could not opt out of a video
+or control flood. Each inbound lane now owns its own receiver mutex, and
+`QuicClient` exposes `next_control`, `next_input`, `next_video_config`,
+`next_video_datagram`, and `next_cursor_datagram`. The compatibility
+`next_event` method uses the same bounded lane queues with a round-robin cursor;
+dedicated consumers no longer contend with it.
+
+The relay previously serialized application-close rejection through one slot
+and called `Incoming::refuse()` for additional over-cap connections. Those
+connections had no stable reason. Every over-cap incoming connection now gets a
+post-handshake application close with `RELAY_CONNECTION_LIMIT_CLOSE_CODE`, and
+the client maps both application-level and transport-level close forms of that
+code to `TransportError::ConnectionLimit`. Join response EOF also consults the
+connection close reason before falling back to a generic stream error.
+
+Regression coverage:
+
+```text
+cargo test -p desklink-transport --test localhost
+11 passed, 0 failed
+
+cargo test -p desklink-relay --test session
+14 passed, 0 failed
+
+cargo test --workspace
+all workspace tests and doc-tests passed
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+passed
+
+./scripts/verify.sh
+passed
+```
