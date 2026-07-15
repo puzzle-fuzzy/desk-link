@@ -87,15 +87,27 @@ fn released_inputs_are_not_released_again() {
 }
 
 #[test]
+fn unicode_text_is_not_tracked_as_a_held_key() {
+    let mut state = PressedInputState::default();
+    state.press(&InputEvent::Key {
+        code: KeyCode::Character('中'),
+        pressed: true,
+        modifiers: Modifiers(0),
+    });
+
+    assert!(state.release_events().is_empty());
+}
+
+#[test]
 fn release_all_is_ordered_and_clears_multiple_inputs() {
     let mut state = PressedInputState::default();
     state.press(&InputEvent::Key {
-        code: KeyCode::Character('a'),
+        code: KeyCode::Enter,
         pressed: true,
         modifiers: Modifiers(1),
     });
     state.press(&InputEvent::Key {
-        code: KeyCode::Character('b'),
+        code: KeyCode::Escape,
         pressed: true,
         modifiers: Modifiers(2),
     });
@@ -111,12 +123,12 @@ fn release_all_is_ordered_and_clears_multiple_inputs() {
         state.release_all(),
         vec![
             InputEvent::Key {
-                code: KeyCode::Character('b'),
+                code: KeyCode::Escape,
                 pressed: false,
                 modifiers: Modifiers(2)
             },
             InputEvent::Key {
-                code: KeyCode::Character('a'),
+                code: KeyCode::Enter,
                 pressed: false,
                 modifiers: Modifiers(1)
             },

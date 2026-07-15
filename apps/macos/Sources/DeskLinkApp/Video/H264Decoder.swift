@@ -13,9 +13,11 @@ private final class SendablePixelBuffer: @unchecked Sendable {
 
 @MainActor
 final class H264Decoder {
+    static let decodeFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
+
     var onFrame: ((CVPixelBuffer) -> Void)?
 
-    private var decompressionSession: VTDecompressionSession?
+    nonisolated(unsafe) private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
     private(set) var latestPixelBuffer: CVPixelBuffer?
     private(set) var lastFrameID: UInt64 = 0
@@ -27,6 +29,7 @@ final class H264Decoder {
 
     deinit {
         if let decompressionSession {
+            VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
             VTDecompressionSessionInvalidate(decompressionSession)
         }
     }
@@ -188,13 +191,10 @@ final class H264Decoder {
             return false
         }
 
-        // Use the stable CF_OPTIONS bit instead of an SDK-specific Swift enum spelling.
-        // kVTDecodeFrame_EnableAsynchronousDecompression has raw value 1 << 0.
-        let asynchronousDecode = VTDecodeFrameFlags(rawValue: 1 << 0)
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
-            flags: asynchronousDecode,
+            flags: Self.decodeFlags,
             frameRefcon: nil,
             infoFlagsOut: nil
         )
@@ -239,7 +239,9 @@ final class H264Decoder {
     }
 
     private func accept(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
-        guard frameID >= lastFrameID else { return }
+        // Asynchronous callbacks can arrive after a newer access unit was accepted.
+        // Displaying only the current frame prevents old decoded output from regressing video.
+        guard frameID == lastFrameID else { return }
         latestPixelBuffer = pixelBuffer
         onFrame?(pixelBuffer)
     }

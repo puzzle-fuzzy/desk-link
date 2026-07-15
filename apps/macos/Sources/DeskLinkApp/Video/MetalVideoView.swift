@@ -32,13 +32,24 @@ struct MetalVideoView: NSViewRepresentable {
         private var commandQueue: MTLCommandQueue?
 
         func draw(in view: MTKView) {
-            guard let drawable = view.currentDrawable,
-                  let pixelBuffer
-            else { return }
+            guard let drawable = view.currentDrawable else { return }
             if commandQueue == nil {
                 commandQueue = drawable.texture.device.makeCommandQueue()
             }
             guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
+            guard let pixelBuffer else {
+                let target = CGRect(origin: .zero, size: view.drawableSize)
+                context.render(
+                    CIImage(color: .black).cropped(to: target),
+                    to: drawable.texture,
+                    commandBuffer: commandBuffer,
+                    bounds: target,
+                    colorSpace: CGColorSpaceCreateDeviceRGB()
+                )
+                commandBuffer.present(drawable)
+                commandBuffer.commit()
+                return
+            }
             let image = CIImage(cvPixelBuffer: pixelBuffer)
             let target = CGRect(origin: .zero, size: view.drawableSize)
             let fitted = VideoGeometry.aspectFit(source: image.extent.size, in: target)

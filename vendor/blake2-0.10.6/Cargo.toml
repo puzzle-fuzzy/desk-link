@@ -53,3 +53,5 @@ simd_asm = ["simd_opt"]
 simd_opt = ["simd"]
 size_opt = []
 std = ["digest/std"]
+
+[workspace]

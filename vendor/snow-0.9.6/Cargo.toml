@@ -168,3 +168,5 @@ xchachapoly = [
 [badges.travis-ci]
 branch = "master"
 repository = "mcginty/snow"
+
+[workspace]
