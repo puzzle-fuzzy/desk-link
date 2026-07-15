@@ -36,5 +36,5 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     file "$APP/Contents/MacOS/DeskLinkApp" | grep -q 'arm64'
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" | grep -qx 'com.desklink.desktop'
     /usr/libexec/PlistBuddy -c 'Print :NSScreenCaptureUsageDescription' "$APP/Contents/Info.plist" >/dev/null
-    /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" | grep -q '^13'
+    /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" | grep -qx '13.0'
 fi
