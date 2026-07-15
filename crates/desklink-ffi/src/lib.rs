@@ -698,6 +698,7 @@ pub unsafe extern "C" fn desklink_connect_with_code(
     let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
         return DesklinkResult::InvalidArgument;
     };
+    clear_saved_material(&runtime.saved_host_material);
     if code.is_null() {
         return DesklinkResult::InvalidArgument;
     }
@@ -772,6 +773,11 @@ pub unsafe extern "C" fn desklink_connect_secure(
         host_verify_key: config.host_verify_key,
         server_name: server_name.clone(),
     };
+    let Ok(mut material) = runtime.saved_host_material.lock() else {
+        return DesklinkResult::InternalError;
+    };
+    *material = Some(saved);
+    drop(material);
     let result = start_secure_worker(
         runtime,
         SecureConnectionConfigOwned {
@@ -784,11 +790,8 @@ pub unsafe extern "C" fn desklink_connect_secure(
             expires_at_unix_s: None,
         },
     );
-    if result == DesklinkResult::Ok {
-        let Ok(mut material) = runtime.saved_host_material.lock() else {
-            return DesklinkResult::InternalError;
-        };
-        *material = Some(saved);
+    if result != DesklinkResult::Ok {
+        clear_saved_material(&runtime.saved_host_material);
     }
     result
 }
@@ -849,6 +852,11 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
         host_verify_key,
         server_name: server_name.clone(),
     };
+    let Ok(mut material) = runtime.saved_host_material.lock() else {
+        return DesklinkResult::InternalError;
+    };
+    *material = Some(saved);
+    drop(material);
     let result = start_secure_worker(
         runtime,
         SecureConnectionConfigOwned {
@@ -861,11 +869,8 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
             expires_at_unix_s: Some(invite.expires_at_unix_s()),
         },
     );
-    if result == DesklinkResult::Ok {
-        let Ok(mut material) = runtime.saved_host_material.lock() else {
-            return DesklinkResult::InternalError;
-        };
-        *material = Some(saved);
+    if result != DesklinkResult::Ok {
+        clear_saved_material(&runtime.saved_host_material);
     }
     result
 }
@@ -1477,7 +1482,6 @@ pub unsafe extern "C" fn desklink_host_destroy(handle: *mut DesklinkHostHandle) 
         .lock()
         .ok()
         .and_then(|mut runtime| runtime.take());
-    handle.callback.clear();
     if on_callback_thread {
         let _ = thread::Builder::new()
             .name("desklink-host-destroy".into())
@@ -1493,6 +1497,7 @@ pub unsafe extern "C" fn desklink_host_destroy(handle: *mut DesklinkHostHandle) 
             });
         return;
     }
+    handle.callback.clear();
     if let Some(thread) = event_thread {
         let _ = thread.join();
     }
