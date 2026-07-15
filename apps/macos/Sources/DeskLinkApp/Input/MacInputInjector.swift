@@ -116,12 +116,15 @@ final class SystemCGEventBackend: CGEventBackend {
 final class MacInputInjector {
     private let backend: any CGEventBackend
     private let displayFrame: CGRect
+    private let lock = NSLock()
     private var pointer: CGPoint
     private var pressedKeys = Set<UInt32>()
     private var pressedButtons = Set<MouseButton>()
 
     var pressedInputs: Set<PressedInput> {
-        Set(pressedKeys.map(PressedInput.key)).union(pressedButtons.map(PressedInput.button))
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(pressedKeys.map(PressedInput.key)).union(pressedButtons.map(PressedInput.button))
     }
 
     init(
@@ -134,6 +137,8 @@ final class MacInputInjector {
     }
 
     func inject(_ command: MacInputCommand) throws {
+        lock.lock()
+        defer { lock.unlock() }
         switch command {
         case let .move(normalizedX, normalizedY):
             guard normalizedX.isFinite, normalizedY.isFinite,
@@ -163,6 +168,8 @@ final class MacInputInjector {
 
     @discardableResult
     func releaseAll() -> [MacInputInjectorError] {
+        lock.lock()
+        defer { lock.unlock() }
         let keys = pressedKeys.sorted()
         let buttons = pressedButtons.sorted()
         var failures: [MacInputInjectorError] = []

@@ -110,6 +110,7 @@ final class MacH264Encoder: @unchecked Sendable {
     typealias ErrorHandler = @Sendable (MacH264EncoderError) -> Void
 
     private let eventQueue = DispatchQueue(label: "com.desklink.encoder.events", qos: .userInitiated)
+    private let sessionOperationLock = NSLock()
     private let lock = NSLock()
     private var compressionSession: VTCompressionSession?
     private var callbackContext: MacH264EncoderCallbackContext?
@@ -133,7 +134,9 @@ final class MacH264Encoder: @unchecked Sendable {
               let encodedHeight = UInt16(exactly: height),
               encodedWidth > 0, encodedHeight > 0
         else { throw MacH264EncoderError.invalidDimensions }
-        stop()
+        sessionOperationLock.lock()
+        defer { sessionOperationLock.unlock() }
+        stopLocked()
         lock.lock()
         nextGeneration &+= 1
         if nextGeneration == 0 { nextGeneration = 1 }
@@ -187,6 +190,8 @@ final class MacH264Encoder: @unchecked Sendable {
     }
 
     func encode(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
+        sessionOperationLock.lock()
+        defer { sessionOperationLock.unlock() }
         lock.lock()
         guard let session = compressionSession, let generation = activeGeneration else {
             lock.unlock()
@@ -219,6 +224,12 @@ final class MacH264Encoder: @unchecked Sendable {
     }
 
     func stop() {
+        sessionOperationLock.lock()
+        defer { sessionOperationLock.unlock() }
+        stopLocked()
+    }
+
+    private func stopLocked() {
         lock.lock()
         let session = compressionSession
         let callbackContext = self.callbackContext

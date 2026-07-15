@@ -128,8 +128,10 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         delivery.begin(stream: stream, handler: onFrame)
         do {
             try await stream.startCapture()
+            try Task.checkCancellation()
         } catch {
             delivery.end(stream: stream)
+            try? await stream.stopCapture()
             self.stream = nil
             selectedStreamID = 0
             capturedDisplayFrame = .zero
@@ -167,7 +169,14 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             guard let self,
                   self.stream.map({ ObjectIdentifier($0) }) == streamIdentifier
             else { return }
-            stopHandler?(ScreenCaptureSourceError.streamStopped(message))
+            let currentStream = self.stream
+            let handler = self.stopHandler
+            self.stream = nil
+            self.selectedStreamID = 0
+            self.capturedDisplayFrame = .zero
+            self.stopHandler = nil
+            self.delivery.end(stream: currentStream)
+            handler?(ScreenCaptureSourceError.streamStopped(message))
         }
     }
 }
