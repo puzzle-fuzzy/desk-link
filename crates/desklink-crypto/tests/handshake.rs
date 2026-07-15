@@ -3,7 +3,8 @@ use std::{cell::RefCell, convert::Infallible};
 use desklink_crypto::{
     CryptoError, DeviceIdentity, EncryptedMessage, IdentityStore, MAX_ENCRYPTED_MESSAGE_BYTES,
     MAX_HANDSHAKE_PAYLOAD_BYTES, MAX_PAIRING_TTL_S, MAX_PLAINTEXT_BYTES, NoiseInitiator,
-    NoiseResponder, PairingError, PairingOffer, SessionId,
+    NoiseResponder, PAIRING_INVITE_BYTES, PairingError, PairingInvite, PairingOffer, SecureLane,
+    SecureRole, SessionId,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
@@ -178,6 +179,90 @@ fn invalid_pairing_ttl_does_not_consume_randomness() {
 }
 
 #[test]
+fn pairing_invite_round_trips_fixed_credentials_and_redacts_debug_output() {
+    let host = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([15; 32]));
+    let mut invite_rng = ChaCha20Rng::from_seed([16; 32]);
+    let invite = PairingInvite::new_with_rng(&host, 1_000, 300, &mut invite_rng).unwrap();
+    let encoded = invite.encode().unwrap();
+
+    assert_eq!(encoded.as_bytes().len(), PAIRING_INVITE_BYTES);
+    let decoded = PairingInvite::decode(encoded.as_bytes(), 1_001).unwrap();
+    assert_eq!(decoded.session_id(), invite.session_id());
+    assert_eq!(
+        decoded.relay_authentication(),
+        invite.relay_authentication()
+    );
+    assert_eq!(decoded.host_device_id(), host.device_id);
+    assert_eq!(decoded.host_verify_key(), host.verify_key());
+    assert_eq!(decoded.created_at_unix_s(), 1_000);
+    assert_eq!(decoded.expires_at_unix_s(), 1_300);
+    assert!(PairingInvite::decode(encoded.as_bytes(), 999).is_ok());
+
+    let debug = format!("{invite:?} {encoded:?}");
+    assert!(!debug.contains(&hex::encode(invite.relay_authentication())));
+    assert!(debug.contains("[REDACTED]"));
+}
+
+#[test]
+fn pairing_invite_rejects_tampering_wrong_size_and_expiry() {
+    let host = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([17; 32]));
+    let invite =
+        PairingInvite::new_with_rng(&host, 2_000, 60, &mut ChaCha20Rng::from_seed([18; 32]))
+            .unwrap();
+    let encoded = invite.encode().unwrap();
+    let original = encoded.as_bytes();
+
+    for index in [0, 4, 8, 24, 56, 72, 104, 112, PAIRING_INVITE_BYTES - 1] {
+        let mut tampered = original.to_vec();
+        tampered[index] ^= 1;
+        assert!(matches!(
+            PairingInvite::decode(&tampered, 2_001),
+            Err(PairingError::InvalidInvite)
+        ));
+    }
+    assert!(matches!(
+        PairingInvite::decode(&original[..PAIRING_INVITE_BYTES - 1], 2_001),
+        Err(PairingError::InvalidInvite)
+    ));
+    let mut extended = original.to_vec();
+    extended.push(0);
+    assert!(matches!(
+        PairingInvite::decode(&extended, 2_001),
+        Err(PairingError::InvalidInvite)
+    ));
+    assert!(matches!(
+        PairingInvite::decode(original, 2_060),
+        Err(PairingError::Expired)
+    ));
+}
+
+#[test]
+fn pairing_invite_consumption_is_one_time_and_has_independent_relay_entropy() {
+    let host = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([23; 32]));
+    let mut rng = ChaCha20Rng::from_seed([24; 32]);
+    let offer =
+        PairingOffer::new_with_rng(SessionId::from_bytes([1; 16]), 3_000, 60, &mut rng).unwrap();
+    let mut invite = PairingInvite::new_with_rng(&host, 3_000, 60, &mut rng).unwrap();
+
+    assert_eq!(offer.code().as_bytes().len(), 8);
+    assert_eq!(invite.relay_authentication().len(), 32);
+    assert_ne!(
+        &invite.relay_authentication()[..8],
+        offer.code().as_bytes(),
+        "the display code must not be reused as relay authentication"
+    );
+    invite.consume(3_001).unwrap();
+    assert!(matches!(
+        invite.consume(3_001),
+        Err(PairingError::AlreadyConsumed)
+    ));
+    assert!(matches!(
+        invite.encode(),
+        Err(PairingError::AlreadyConsumed)
+    ));
+}
+
+#[test]
 fn noise_initiator_and_responder_produce_same_session_key() {
     let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([19; 32]));
     let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([20; 32]));
@@ -200,6 +285,8 @@ fn noise_initiator_and_responder_produce_same_session_key() {
 fn authenticated_noise_handshake_binds_both_device_identities() {
     let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([21; 32]));
     let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([22; 32]));
+    let initiator_device_id = initiator_identity.device_id;
+    let responder_device_id = responder_identity.device_id;
     let initiator_verify_key = initiator_identity.verify_key();
     let responder_verify_key = responder_identity.verify_key();
 
@@ -214,7 +301,27 @@ fn authenticated_noise_handshake_binds_both_device_identities() {
     let responder = responder.finish().unwrap();
     assert_eq!(initiator.peer_verify_key(), responder_verify_key);
     assert_eq!(responder.peer_verify_key(), initiator_verify_key);
+    assert_eq!(initiator.peer_identity().device_id(), responder_device_id);
+    assert_eq!(responder.peer_identity().device_id(), initiator_device_id);
     assert_eq!(initiator.session_key(), responder.session_key());
+}
+
+#[test]
+fn pairing_noise_accepts_an_unknown_self_authenticated_controller() {
+    let controller = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([25; 32]));
+    let host = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([26; 32]));
+    let controller_device_id = controller.device_id;
+    let controller_verify_key = controller.verify_key();
+    let host_verify_key = host.verify_key();
+
+    let (mut initiator, message_1) = NoiseInitiator::start(controller, host_verify_key).unwrap();
+    let (mut responder, message_2) = NoiseResponder::accept_pairing(&message_1, host).unwrap();
+    let message_3 = initiator.receive(&message_2).unwrap();
+    responder.receive(&message_3).unwrap();
+
+    let responder = responder.finish().unwrap();
+    assert_eq!(responder.peer_verify_key(), controller_verify_key);
+    assert_eq!(responder.peer_identity().device_id(), controller_device_id);
 }
 
 #[test]
@@ -264,6 +371,60 @@ fn noise_transport_accepts_exact_maximum_plaintext_and_ciphertext() {
     assert_eq!(ciphertext.len(), MAX_ENCRYPTED_MESSAGE_BYTES);
     assert_eq!(responder.decrypt(&ciphertext).unwrap(), plaintext);
     assert!(EncryptedMessage::try_from(vec![0; MAX_ENCRYPTED_MESSAGE_BYTES]).is_ok());
+}
+
+#[test]
+fn secure_session_isolates_lanes_and_accepts_datagram_reordering() {
+    let (initiator, responder) = connected_transport();
+    let mut initiator = initiator.into_secure_session(SecureRole::Initiator);
+    let mut responder = responder.into_secure_session(SecureRole::Responder);
+
+    let first = initiator.seal(SecureLane::VideoDatagram, b"first").unwrap();
+    let second = initiator
+        .seal(SecureLane::VideoDatagram, b"second")
+        .unwrap();
+    let control = initiator.seal(SecureLane::Control, b"control").unwrap();
+
+    assert_eq!(
+        responder.open(SecureLane::VideoDatagram, &second).unwrap(),
+        b"second"
+    );
+    assert_eq!(
+        responder.open(SecureLane::VideoDatagram, &first).unwrap(),
+        b"first"
+    );
+    assert_eq!(
+        responder.open(SecureLane::Control, &control).unwrap(),
+        b"control"
+    );
+}
+
+#[test]
+fn secure_session_rejects_replay_tampering_and_wrong_lane() {
+    let (initiator, responder) = connected_transport();
+    let mut initiator = initiator.into_secure_session(SecureRole::Initiator);
+    let mut responder = responder.into_secure_session(SecureRole::Responder);
+    let packet = initiator.seal(SecureLane::Input, b"input").unwrap();
+
+    assert!(matches!(
+        responder.open(SecureLane::Control, &packet),
+        Err(CryptoError::AuthenticationFailed)
+    ));
+    assert_eq!(
+        responder.open(SecureLane::Input, &packet).unwrap(),
+        b"input"
+    );
+    assert!(matches!(
+        responder.open(SecureLane::Input, &packet),
+        Err(CryptoError::ReplayRejected)
+    ));
+
+    let mut tampered = initiator.seal(SecureLane::Input, b"next").unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        responder.open(SecureLane::Input, &tampered),
+        Err(CryptoError::AuthenticationFailed)
+    ));
 }
 
 #[test]

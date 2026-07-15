@@ -11,6 +11,11 @@ desklink-protocol.workspace = true
 desklink-session.workspace = true
 desklink-transport.workspace = true
 desklink-video.workspace = true
+desklink-relay = { path = "../../server/relay" }
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio.workspace = true
 
 [[bin]]
 name = "desklink-end-to-end"

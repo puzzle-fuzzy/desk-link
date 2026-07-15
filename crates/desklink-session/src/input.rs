@@ -32,9 +32,11 @@ impl DesktopRect {
 pub fn map_to_desktop(point: NormalizedPoint, desktop: DesktopRect) -> (i32, i32) {
     let x = point.x.clamp(0.0, 1.0);
     let y = point.y.clamp(0.0, 1.0);
+    let width = desktop.width.saturating_sub(1);
+    let height = desktop.height.saturating_sub(1);
     (
-        desktop.left + (x * desktop.width as f32).floor() as i32,
-        desktop.top + (y * desktop.height as f32).floor() as i32,
+        desktop.left + (x * width as f32).floor() as i32,
+        desktop.top + (y * height as f32).floor() as i32,
     )
 }
 
@@ -98,17 +100,23 @@ impl PressedInputState {
         }
     }
     pub fn release_all(&mut self) -> Vec<InputEvent> {
+        let events = self.release_events();
+        self.keys.clear();
+        self.buttons.clear();
+        events
+    }
+    pub fn release_events(&self) -> Vec<InputEvent> {
         let mut events = Vec::new();
-        for (code, modifiers) in self.keys.drain(..).rev() {
+        for (code, modifiers) in self.keys.iter().rev() {
             events.push(InputEvent::Key {
-                code,
+                code: *code,
                 pressed: false,
-                modifiers,
+                modifiers: *modifiers,
             });
         }
-        for button in self.buttons.drain(..).rev() {
+        for button in self.buttons.iter().rev() {
             events.push(InputEvent::MouseButton {
-                button,
+                button: *button,
                 pressed: false,
             });
         }

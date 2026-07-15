@@ -19,7 +19,7 @@
 - 第一版单用户、单被控端、单控制会话，首次连接必须由被控端手动接受。
 - 不建立账号系统，不保存屏幕画面、键盘文本、剪贴板内容或会话密钥。
 - 所有外部输入必须有长度、枚举值、帧分片数量和时间窗口限制。
-- 当前开发环境为 macOS；Windows 原生能力必须保留 Windows 机器或虚拟机上的最终验收命令。
+- 当前迭代环境为 Windows；优先完成 Rust/Windows 可验证内容，macOS 原生编译、链接、打包和跨机验收延后到 Apple Silicon 环境执行。
 - 每个任务都必须先写失败测试，再实现最小行为，再运行窄范围测试，最后提交独立 commit。
 
 ---
@@ -885,6 +885,10 @@ Define event kinds for state changes, error, video config, H.264 access unit, cu
 
 Use an opaque Rust Box<DesklinkRuntime> behind DesklinkHandle. Validate null pointers and UTF-8 inputs, return InvalidArgument for invalid pointers, and keep a ReleaseAll action in both desklink_reject and desklink_destroy.
 
+- [x] Rust `ControllerRuntime` 已完成真实 QUIC/Noise 握手、加密协商、VideoConfig/光标解密、视频重组、关键帧恢复和加密输入发送，并由真实 relay 双端测试覆盖；
+- [x] `ControllerRuntime` 已进入 C ABI 可取消后台 worker；安全连接配置、真实事件回调、加密输入/关键帧命令、连接中取消、销毁等待和失败后重连均已接线；
+- [x] macOS 已加入 Apple Keychain 控制端身份、Ed25519 验证公钥派生、开发期安全连接配置和 Swift Bridge/HomeView 入口；仍需在 macOS arm64 完成原生编译与跨机验收。
+
 - [ ] Step 5: Run ABI and workspace tests
 
 ~~~bash
@@ -978,9 +982,16 @@ H264Decoder creates a VTDecompressionSession after receiving SPS/PPS and dimensi
 
 MetalVideoView uses CVMetalTextureCache, handles BGRA/NV12, preserves aspect ratio, and ignores points outside the visible video rectangle for input mapping.
 
+- [x] VideoConfig、Annex B SPS/PPS 解析、Annex B → AVCC、异步最新帧发布、三次失败关键帧恢复与 Metal 等比黑边已接通；
+- [x] Swift Bridge 已由真实 Rust QUIC/Noise C ABI worker 驱动，解密后的 VideoConfig、H.264 access unit 和连接状态会进入现有解码链路；
+- [ ] 需在 macOS arm64 重新运行 Swift 测试、FFI 链接、打包检查和 Windows host 跨机验收。
+
 - [ ] Step 6: Implement desktop pointer and keyboard input
 
 InputMapper converts mouse locations inside the video rectangle to DesklinkInput values with x and y in 0...1. It maps Command to Control and Option to Alt in automatic mode, while raw mode preserves local modifier identity. It sends ReleaseAll from SessionView on disconnect and when the app leaves the foreground.
+
+- [x] SessionView 已按实际等比画面区域归一化指针坐标，并把移动、左键按下/抬起及离开会话时的 `ReleaseAll` 送入安全 C ABI；
+- [ ] 右键、中键、滚轮和原生键盘事件仍需在 macOS arm64 上完成接线与交互验收。
 
 - [ ] Step 7: Run Swift and macOS packaging checks
 
@@ -1019,7 +1030,7 @@ git commit -m "feat(macos): add Apple Silicon controller shell"
 - Produces DesktopCapturer, H264Encoder, InputInjector and a host runtime that sends encoded frames and applies remote input.
 - Windows-specific modules compile only under cfg(windows); common protocol and session tests remain runnable on macOS.
 
-- [ ] Step 1: Write failing Windows-only capture test
+- [x] Step 1: Write failing Windows-only capture test
 
 ~~~rust
 #[cfg(windows)]
@@ -1040,7 +1051,7 @@ cargo test --manifest-path apps/windows/Cargo.toml --test capture_smoke -- --noc
 
 Expected before implementation: FAIL because DxgiDesktopCapturer is not defined.
 
-- [ ] Step 2: Implement D3D11/DXGI Desktop Duplication
+- [x] Step 2: Implement D3D11/DXGI Desktop Duplication
 
 ~~~rust
 pub trait DesktopCapturer {
@@ -1057,7 +1068,7 @@ pub struct DxgiDesktopCapturer {
 
 Create a D3D11 device, select the primary IDXGIOutput, call DuplicateOutput, acquire frames with AcquireNextFrame, copy the GPU texture reference into the encoder queue, and always call ReleaseFrame including timeout and error paths. Handle DXGI_ERROR_ACCESS_LOST by recreating duplication.
 
-- [ ] Step 3: Implement Media Foundation H.264 encoding
+- [x] Step 3: Implement Media Foundation H.264 encoding
 
 ~~~rust
 pub struct H264Encoder {
@@ -1076,15 +1087,22 @@ impl H264Encoder {
 
 Configure Media Foundation H.264 for real-time 30FPS, no B-frames, one-second keyframe interval, 4Mbps starting bitrate and 1920×1080 maximum output. Keep the encode queue at two frames and discard the oldest unencoded frame when full.
 
-- [ ] Step 4: Implement SendInput and safe release
+- [x] Step 4: Implement SendInput and safe release
 
 InputInjector maps normalized coordinates to the virtual desktop rectangle, maps logical/physical keys to Windows virtual keys and scan codes, emits Unicode text events, and tracks pressed modifiers/buttons. release_all emits key-up and button-up events for every tracked input before clearing the set. Elevated/UAC targets return InputInjectionBlocked without crashing the host.
 
-- [ ] Step 5: Implement the Windows host runtime
+- [x] 归一化 `1.0` 已映射到虚拟桌面的最后一个有效像素，不再越界一像素；
+- [x] 共享协议、C ABI 和 Windows `SendInput` 已支持有界水平/垂直滚轮以及 Shift/Control/Alt/Meta 组合键；
+- [x] Windows 批量注入支持 Unicode UTF-16 代理对、扩展方向键和部分失败后的组合键清理，mock 后端验证滚轮不进入 pressed-state、`ReleaseAll` 保留原修饰键并可重试。
+
+- [x] Step 5: Implement the Windows host runtime
 
 main.rs starts the identity/session runtime, creates primary-display capture and encoder, handles connection approval in window.rs, sends VideoConfig followed by an IDR, handles RequestKeyframe, sends cursor updates independently, and dispatches InputEvent through InputInjector without waiting on the video queue.
 
-- [ ] Step 6: Run Windows checks
+- [x] Relay session、DXGI/MFT 专用线程、VideoConfig/IDR、关键帧请求、独立光标与输入调度已接通；
+- [x] DPAPI 持久设备身份、Noise 双向认证，以及控制/输入/视频配置/视频/光标分通道 AEAD 已接通；可信控制端公钥仍由环境变量注入，等待配对与可信设备 UI。
+
+- [x] Step 6: Run Windows checks
 
 ~~~powershell
 rustup target add x86_64-pc-windows-msvc

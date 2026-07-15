@@ -13,16 +13,29 @@ struct HomeView: View {
                 Text("Pairing code: \(pairing.code)")
                     .font(.title2.monospaced())
             }
+            if let verifyKey = bridge.controllerVerifyKeyHex {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Controller verify key")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(verifyKey)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+            }
             HStack {
                 Button("Start pairing") { bridge.startPairing() }
-                Button("Connect") { bridge.connect(code: "") }
+                Button("Connect securely") { bridge.connectSecureFromEnvironment() }
             }
+            Text("Secure connection uses the DESKLINK_* environment configuration.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if let error = bridge.lastError {
                 Text(error).foregroundStyle(.red)
             }
         }
         .padding(28)
-        .frame(minWidth: 420, minHeight: 240)
+        .frame(minWidth: 540, minHeight: 280)
     }
 
     private var statusText: String {

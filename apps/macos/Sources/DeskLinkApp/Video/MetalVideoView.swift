@@ -11,6 +11,8 @@ struct MetalVideoView: NSViewRepresentable {
         view.enableSetNeedsDisplay = true
         view.isPaused = true
         view.framebufferOnly = false
+        view.autoResizeDrawable = true
+        view.colorPixelFormat = .bgra8Unorm
         view.delegate = context.coordinator
         return view
     }
@@ -27,18 +29,43 @@ struct MetalVideoView: NSViewRepresentable {
     final class Renderer: NSObject, MTKViewDelegate {
         var pixelBuffer: CVPixelBuffer?
         private let context = CIContext()
+        private var commandQueue: MTLCommandQueue?
 
         func draw(in view: MTKView) {
             guard let drawable = view.currentDrawable,
-                  let commandBuffer = view.currentDrawable?.texture.device.makeCommandQueue()?.makeCommandBuffer(),
                   let pixelBuffer
             else { return }
+            if commandQueue == nil {
+                commandQueue = drawable.texture.device.makeCommandQueue()
+            }
+            guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
             let image = CIImage(cvPixelBuffer: pixelBuffer)
+            let target = CGRect(origin: .zero, size: view.drawableSize)
+            let fitted = VideoGeometry.aspectFit(source: image.extent.size, in: target)
+            guard !fitted.isEmpty else { return }
+            let normalized = image.transformed(
+                by: CGAffineTransform(
+                    translationX: -image.extent.minX,
+                    y: -image.extent.minY
+                )
+            )
+            let scaled = normalized.transformed(
+                by: CGAffineTransform(
+                    scaleX: fitted.width / image.extent.width,
+                    y: fitted.height / image.extent.height
+                )
+            )
+            let positioned = scaled.transformed(
+                by: CGAffineTransform(translationX: fitted.minX, y: fitted.minY)
+            )
+            let output = positioned.composited(
+                over: CIImage(color: .black).cropped(to: target)
+            )
             context.render(
-                image,
+                output,
                 to: drawable.texture,
                 commandBuffer: commandBuffer,
-                bounds: image.extent,
+                bounds: target,
                 colorSpace: CGColorSpaceCreateDeviceRGB()
             )
             commandBuffer.present(drawable)

@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-15T00:00:00+08:00",
+  "title": "Design System: DeskLink",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Control Coral",
+        "canonical": "oklch(0.500 0.151 40)",
+        "tonalRamp": [
+          "oklch(0.150 0.060 40)",
+          "oklch(0.250 0.090 40)",
+          "oklch(0.350 0.120 40)",
+          "oklch(0.500 0.151 40)",
+          "oklch(0.620 0.130 40)",
+          "oklch(0.740 0.100 40)",
+          "oklch(0.860 0.055 40)",
+          "oklch(0.950 0.020 40)"
+        ]
+      },
+      "background": {
+        "role": "neutral",
+        "displayName": "Host White",
+        "canonical": "oklch(1.000 0.000 0)",
+        "tonalRamp": [
+          "oklch(0.150 0.000 0)",
+          "oklch(0.250 0.000 0)",
+          "oklch(0.350 0.000 0)",
+          "oklch(0.500 0.000 0)",
+          "oklch(0.650 0.000 0)",
+          "oklch(0.780 0.000 0)",
+          "oklch(0.900 0.000 0)",
+          "oklch(1.000 0.000 0)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Window title and current connection state."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Status, controller identity, and security consequences."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "state-change",
+        "value": "150ms ease-out",
+        "purpose": "State feedback only; native Windows UI may render instantly when reduced motion is enabled."
+      }
+    ],
+    "breakpoints": []
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "The Quiet Control Light",
+    "overview": "One clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent.",
+    "keyCharacteristics": [
+      "Native Windows proportions and behavior",
+      "Status-first hierarchy with plain-language recovery detail",
+      "Restrained color with explicit semantic states",
+      "Compact trusted-device management without nested navigation",
+      "No decorative motion"
+    ],
+    "rules": [
+      {
+        "name": "The One Signal Rule",
+        "body": "At most one saturated status or action color dominates a view. Status is always paired with a written label.",
+        "section": "colors"
+      },
+      {
+        "name": "The Plain Label Rule",
+        "body": "Buttons name the action and object. Never use an unexplained OK for a security action.",
+        "section": "typography"
+      },
+      {
+        "name": "The System Owns the Shadow Rule",
+        "body": "Never draw additional card shadows inside the native window.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep the current connection state visible at the top of the window.",
+      "Do identify trusted controllers fully before revocation.",
+      "Do preserve keyboard access, DPI scaling, high contrast, and native focus behavior."
+    ],
+    "donts": [
+      "Don't build an enterprise administration console.",
+      "Don't use neon gaming or streaming overlays.",
+      "Don't add decorative security gauges, glowing maps, fear-driven warnings, glass surfaces, or gradient text.",
+      "Don't hide background behavior or label irreversible actions only OK or Yes."
+    ]
+  }
+}

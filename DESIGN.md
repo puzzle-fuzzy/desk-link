@@ -1,0 +1,182 @@
+---
+name: DeskLink
+description: A calm Windows control surface for a private personal remote desktop.
+colors:
+  primary: "oklch(0.500 0.151 40)"
+  background: "oklch(1.000 0.000 0)"
+  surface: "oklch(0.965 0.006 40)"
+  ink: "oklch(0.220 0.020 40)"
+  muted: "oklch(0.460 0.020 40)"
+  border: "oklch(0.860 0.010 40)"
+  success: "oklch(0.530 0.140 145)"
+  info: "oklch(0.430 0.105 225)"
+  error: "oklch(0.490 0.180 25)"
+  on-primary: "oklch(0.985 0.000 0)"
+typography:
+  headline:
+    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
+    fontSize: "24px"
+    fontWeight: 600
+    lineHeight: 1.25
+  title:
+    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
+    fontSize: "16px"
+    fontWeight: 600
+    lineHeight: 1.35
+  body:
+    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
+    fontSize: "14px"
+    fontWeight: 400
+    lineHeight: 1.45
+  label:
+    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
+    fontSize: "12px"
+    fontWeight: 600
+    lineHeight: 1.35
+rounded:
+  sm: "4px"
+  md: "8px"
+  lg: "12px"
+spacing:
+  xs: "4px"
+  sm: "8px"
+  md: "16px"
+  lg: "24px"
+  xl: "32px"
+components:
+  button-primary:
+    backgroundColor: "{colors.primary}"
+    textColor: "{colors.on-primary}"
+    typography: "{typography.body}"
+    rounded: "{rounded.sm}"
+    padding: "8px 16px"
+  button-secondary:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    rounded: "{rounded.sm}"
+    padding: "8px 16px"
+  status-window:
+    backgroundColor: "{colors.background}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.md}"
+    padding: "24px"
+---
+
+# Design System: DeskLink
+
+## Overview
+
+**Creative North Star: "The Quiet Control Light"**
+
+DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. The Windows host uses a restrained white surface, system typography, one burnt-coral action color, and semantic status colors only where state needs emphasis.
+
+This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls use standard Windows affordances, and security consequences are written in full.
+
+**Key Characteristics:**
+
+- Native Windows proportions and behavior
+- Status-first hierarchy with plain-language recovery detail
+- Restrained color with explicit semantic states
+- Compact trusted-device management without nested navigation
+- No decorative motion
+
+## Colors
+
+Pure white keeps the host surface neutral; burnt coral is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
+
+### Primary
+
+- **Control Coral:** used for the tray identity, focused primary action, and the single most important enabled command.
+
+### Secondary
+
+- **Recovery Blue:** used for connecting and retrying state indicators, never for decorative chrome.
+
+### Neutral
+
+- **Host White:** the main window background.
+- **Quiet Surface:** toolbar, list, and read-only status grouping.
+- **Warm Ink:** primary text with high contrast.
+- **Muted Ink:** secondary timestamps and explanatory text.
+- **Soft Divider:** structural separation only.
+
+**The One Signal Rule.** At most one saturated status or action color dominates a view. Status is always paired with a written label.
+
+## Typography
+
+**Display Font:** Segoe UI Variable (with Segoe UI fallback)
+**Body Font:** Segoe UI Variable (with Segoe UI fallback)
+
+**Character:** familiar, compact, and highly legible at Windows desktop scale. Weight and spacing create hierarchy without a second typeface.
+
+### Hierarchy
+
+- **Headline** (600, 24px, 1.25): window title and current connection state.
+- **Title** (600, 16px, 1.35): trusted-controller group and high-consequence confirmation title.
+- **Body** (400, 14px, 1.45): status detail, device identity, and consequences; prose stays below 70 characters per line where possible.
+- **Label** (600, 12px, 1.35): field labels and compact metadata, in sentence case.
+
+**The Plain Label Rule.** Buttons name the action and object, such as “Revoke controller” and “Exit DeskLink.” Never use an unexplained “OK” for a security action.
+
+## Elevation
+
+The system is flat by default. Native window elevation comes from Windows itself; internal depth uses tonal surfaces and dividers rather than decorative shadows.
+
+**The System Owns the Shadow Rule.** Never draw additional card shadows inside the native window.
+
+## Components
+
+### Buttons
+
+- **Shape:** standard, gently curved Windows control (4px radius).
+- **Primary:** Control Coral with near-white text and 8px by 16px padding.
+- **Hover / Focus:** use the platform focus rectangle and a modest tonal shift; never scale or bounce.
+- **Secondary:** Quiet Surface with Warm Ink; destructive actions stay secondary until a specific device is selected.
+
+### Cards / Containers
+
+- **Corner Style:** compact grouping only (8px radius), not a grid of floating cards.
+- **Background:** Host White for the page and Quiet Surface for a single status or device region.
+- **Shadow Strategy:** none inside the window.
+- **Border:** Soft Divider only where grouping is not otherwise clear.
+- **Internal Padding:** 16px for compact groups, 24px for the primary status region.
+
+### Inputs / Fields
+
+- **Style:** native Windows controls with system metrics.
+- **Focus:** visible platform focus state and keyboard traversal.
+- **Error / Disabled:** written explanation plus the native disabled state; color alone is forbidden.
+
+### Navigation
+
+The tray menu contains “Open DeskLink,” “Manage trusted controllers,” and “Exit DeskLink.” The main window is a single surface, not a sidebar application. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
+
+### Connection Status
+
+Show the written state, current stream when connected, retry count and delay when recovering, and the last safe error when stopped. Never expose relay authentication or private-key material.
+
+### Error Feedback and Diagnostics
+
+- Keep host availability independent from trusted-controller list failures.
+- Show refresh and revocation failures inline with a specific recovery action; never discard an operation error silently.
+- Replace internal runtime error strings with stable owner-facing explanations. Technical detail belongs in the local structured diagnostic log.
+- Keep the diagnostic log bounded and redact named credentials plus long hexadecimal identity or secret material before persistence.
+- Disable destructive controls whenever no exact trusted controller is selected, including partial-load and corrupt-store states.
+
+## Do's and Don'ts
+
+### Do:
+
+- **Do** keep the current connection state visible at the top of the window.
+- **Do** identify trusted controllers with their full device ID and public-key fingerprint before revocation.
+- **Do** preserve keyboard access, DPI scaling, high contrast, and native focus behavior.
+- **Do** keep healthy background operation in the tray and make explicit exit discoverable.
+
+### Don't:
+
+- **Don't** build an enterprise administration console with dense navigation and irrelevant organization features.
+- **Don't** use neon gaming or streaming overlays.
+- **Don't** add decorative security gauges, glowing maps, fear-driven warnings, glass surfaces, or gradient text.
+- **Don't** hide background behavior or label irreversible actions only “OK” or “Yes.”
+- **Don't** use color as the only signal or truncate the identity needed for a security decision.

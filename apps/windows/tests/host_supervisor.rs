@@ -1,0 +1,363 @@
+#[cfg(windows)]
+mod windows {
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use apps_windows::runtime::{
+        ControllerAuthorization, ControllerAuthorizer, HostLifecycleEvent, HostRuntimeError,
+        HostSupervisor, HostSupervisorError,
+    };
+    use desklink_crypto::{DeviceIdentity, PeerIdentity, SessionId};
+    use desklink_ffi::{ControllerEvent, ControllerRuntime};
+    use desklink_relay::{RelayConfig, RelayServer};
+    use desklink_session::ReconnectPolicy;
+    use desklink_transport::{
+        JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError,
+    };
+    use ed25519_dalek::VerifyingKey;
+    use quinn::ServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    struct TestTls {
+        certificate_der: Vec<u8>,
+        key_der: Vec<u8>,
+        client_config: quinn::ClientConfig,
+    }
+
+    impl TestTls {
+        fn new() -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+            let certificate_der = certificate.cert.der().to_vec();
+            let key_der = certificate.key_pair.serialize_der();
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(certificate_der.clone()))
+                .unwrap();
+            let client_tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let client_crypto =
+                quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+            Self {
+                certificate_der,
+                key_der,
+                client_config: quinn::ClientConfig::new(Arc::new(client_crypto)),
+            }
+        }
+
+        fn server_config(&self) -> ServerConfig {
+            ServerConfig::with_single_cert(
+                vec![CertificateDer::from(self.certificate_der.clone())],
+                PrivateKeyDer::Pkcs8(self.key_der.clone().into()),
+            )
+            .unwrap()
+        }
+
+        fn client_config(&self, address: SocketAddr) -> QuicClientConfig {
+            QuicClientConfig::with_client_config(address, "localhost", self.client_config.clone())
+                .try_with_timeouts(Duration::from_millis(50), Duration::from_millis(500))
+                .unwrap()
+        }
+    }
+
+    struct TestRelay {
+        address: SocketAddr,
+        relay: Arc<RelayServer>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestRelay {
+        async fn spawn(address: SocketAddr, tls: &TestTls) -> Self {
+            let mut attempts = 0;
+            let relay = loop {
+                attempts += 1;
+                match RelayServer::bind(
+                    address,
+                    tls.server_config(),
+                    RelayConfig {
+                        keep_alive: Duration::from_millis(50),
+                        dead_timeout: Duration::from_millis(500),
+                        sweep_interval: Duration::from_millis(50),
+                        ..RelayConfig::default()
+                    },
+                )
+                .await
+                {
+                    Ok(relay) => break Arc::new(relay),
+                    Err(error) if address.port() != 0 && attempts < 100 => {
+                        let _ = error;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("test relay bind failed: {error}"),
+                }
+            };
+            let address = relay.local_addr().unwrap();
+            let task_relay = relay.clone();
+            let task = tokio::spawn(async move {
+                let _ = task_relay.run().await;
+            });
+            Self {
+                address,
+                relay,
+                task,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.relay.close();
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.task).await;
+        }
+    }
+
+    struct ExpectedController(VerifyingKey);
+
+    impl ControllerAuthorizer for ExpectedController {
+        fn pinned_verify_key(&self) -> Option<VerifyingKey> {
+            Some(self.0)
+        }
+
+        fn authorize(&self, identity: PeerIdentity) -> Result<ControllerAuthorization, String> {
+            Ok(if identity.verify_key() == self.0 {
+                ControllerAuthorization::Authorized
+            } else {
+                ControllerAuthorization::Unknown
+            })
+        }
+    }
+
+    fn supervisor(
+        transport: QuicClientConfig,
+        session_id: SessionId,
+        authentication: [u8; 32],
+        host: DeviceIdentity,
+        controller_key: VerifyingKey,
+        expires_at_unix_s: Option<u64>,
+    ) -> HostSupervisor {
+        HostSupervisor::new(
+            transport,
+            session_id,
+            authentication,
+            1,
+            host,
+            Arc::new(ExpectedController(controller_key)),
+            expires_at_unix_s,
+        )
+        .unwrap()
+    }
+
+    async fn connect_controller(
+        tls: &TestTls,
+        address: SocketAddr,
+        session_id: SessionId,
+        authentication: [u8; 32],
+        identity: DeviceIdentity,
+        host_key: VerifyingKey,
+    ) -> ControllerRuntime {
+        let mut identity = Some(identity);
+        for _ in 0..100 {
+            let client = QuicClient::connect(tls.client_config(address))
+                .await
+                .unwrap();
+            match client
+                .join(RelayJoin::controller(session_id, authentication))
+                .await
+            {
+                Ok(()) => {
+                    return ControllerRuntime::connect(client, identity.take().unwrap(), host_key)
+                        .await
+                        .unwrap();
+                }
+                Err(TransportError::JoinRejected(JoinRejectCode::SessionNotFound)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("controller join failed: {error}"),
+            }
+        }
+        panic!("host did not recreate the relay session in time")
+    }
+
+    async fn next_video_config(controller: &mut ControllerRuntime) -> u64 {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), controller.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ControllerEvent::VideoConfig(config) => return config.stream_id,
+                ControllerEvent::Control(_)
+                | ControllerEvent::H264AccessUnit(_)
+                | ControllerEvent::Cursor(_)
+                | ControllerEvent::Closed { .. } => {}
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relay_restart_rebuilds_host_runtime_with_a_fresh_stream() {
+        let tls = TestTls::new();
+        let first_relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let address = first_relay.address;
+        let session_id = SessionId::from_bytes([111; 16]);
+        let authentication = [112; 32];
+        let host = DeviceIdentity::from_secret_key([113; 16], &[114; 32]);
+        let host_key = host.verify_key();
+        let controller_secret = [116; 32];
+        let controller = DeviceIdentity::from_secret_key([115; 16], &controller_secret);
+        let controller_key = controller.verify_key();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observer_events = events.clone();
+        let observer = Arc::new(move |event| observer_events.lock().unwrap().push(event));
+        let host_task = tokio::spawn(
+            supervisor(
+                tls.client_config(address),
+                session_id,
+                authentication,
+                host,
+                controller_key,
+                None,
+            )
+            .with_reconnect_policy(
+                ReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(100), 20)
+                    .unwrap(),
+            )
+            .with_observer(observer)
+            .run(),
+        );
+        let mut first_controller = connect_controller(
+            &tls,
+            address,
+            session_id,
+            authentication,
+            controller,
+            host_key,
+        )
+        .await;
+        let first_stream = next_video_config(&mut first_controller).await;
+        assert_eq!(first_stream, 1);
+
+        first_relay.shutdown().await;
+        drop(first_controller);
+        let second_relay = TestRelay::spawn(address, &tls).await;
+        let mut second_controller = connect_controller(
+            &tls,
+            address,
+            session_id,
+            authentication,
+            DeviceIdentity::from_secret_key([115; 16], &controller_secret),
+            host_key,
+        )
+        .await;
+        let second_stream = next_video_config(&mut second_controller).await;
+        assert!(second_stream > first_stream);
+        {
+            let recorded = events.lock().unwrap();
+            assert!(
+                recorded.iter().any(|event| matches!(
+                    event,
+                    HostLifecycleEvent::Reconnecting { retry: 1, .. }
+                ))
+            );
+            assert!(recorded.iter().any(|event| matches!(
+                event,
+                HostLifecycleEvent::Connected { stream_id } if *stream_id == second_stream
+            )));
+        }
+
+        host_task.abort();
+        let _ = host_task.await;
+        drop(second_controller);
+        second_relay.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authentication_mismatch_fails_without_retrying() {
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let session_id = SessionId::from_bytes([121; 16]);
+        let existing = QuicClient::connect(tls.client_config(relay.address))
+            .await
+            .unwrap();
+        existing
+            .join(RelayJoin::host(session_id, [122; 32]))
+            .await
+            .unwrap();
+        let host = DeviceIdentity::from_secret_key([123; 16], &[124; 32]);
+        let controller = DeviceIdentity::from_secret_key([125; 16], &[126; 32]);
+        let result = supervisor(
+            tls.client_config(relay.address),
+            session_id,
+            [127; 32],
+            host,
+            controller.verify_key(),
+            None,
+        )
+        .run()
+        .await;
+        assert_eq!(
+            result,
+            Err(HostSupervisorError::Permanent(HostRuntimeError::Transport(
+                TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch)
+            )))
+        );
+        drop(existing);
+        relay.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn occupied_session_exhausts_retry_budget_and_honors_pairing_expiry() {
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let session_id = SessionId::from_bytes([131; 16]);
+        let authentication = [132; 32];
+        let existing = QuicClient::connect(tls.client_config(relay.address))
+            .await
+            .unwrap();
+        existing
+            .join(RelayJoin::host(session_id, authentication))
+            .await
+            .unwrap();
+        let host = DeviceIdentity::from_secret_key([133; 16], &[134; 32]);
+        let controller = DeviceIdentity::from_secret_key([135; 16], &[136; 32]);
+        let result = supervisor(
+            tls.client_config(relay.address),
+            session_id,
+            authentication,
+            host,
+            controller.verify_key(),
+            None,
+        )
+        .with_reconnect_policy(
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(1), 2).unwrap(),
+        )
+        .run()
+        .await;
+        assert!(matches!(
+            result,
+            Err(HostSupervisorError::RetryBudgetExhausted { retries: 2, .. })
+        ));
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let result = supervisor(
+            tls.client_config(relay.address),
+            session_id,
+            authentication,
+            DeviceIdentity::from_secret_key([133; 16], &[134; 32]),
+            DeviceIdentity::from_secret_key([135; 16], &[136; 32]).verify_key(),
+            Some(now),
+        )
+        .run()
+        .await;
+        assert_eq!(result, Err(HostSupervisorError::PairingExpired));
+        drop(existing);
+        relay.shutdown().await;
+    }
+}

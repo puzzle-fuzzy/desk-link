@@ -6,3 +6,6 @@ DerivedData/
 .idea/
 .vscode/
 .superpowers/
+dist/
+__pycache__/
+*.py[cod]

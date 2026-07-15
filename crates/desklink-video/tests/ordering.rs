@@ -1,5 +1,10 @@
-use desklink_protocol::{FrameFlags, PROTOCOL_VERSION, VideoFrameHeader, VideoPacket};
-use desklink_video::{AssembleResult, DropReason, EncodedFrame, FrameAssembler, LatestFrameQueue};
+use desklink_protocol::{
+    FrameFlags, MAX_VIDEO_PACKET_BYTES, MAX_VIDEO_PACKET_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    VideoFrameHeader, VideoPacket, encode_video_packet,
+};
+use desklink_video::{
+    AssembleResult, DropReason, EncodedFrame, FrameAssembler, LatestFrameQueue, packetize_frame,
+};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -40,6 +45,48 @@ fn frame(frame_id: u64) -> EncodedFrame {
         flags: FrameFlags(0),
         data: vec![frame_id as u8],
     }
+}
+
+#[test]
+fn packetizer_keeps_serialized_video_packets_inside_quic_datagram_budget() {
+    let mut encoded = frame(42);
+    encoded.stream_id = u64::MAX;
+    encoded.frame_id = u64::MAX;
+    encoded.config_version = u32::MAX;
+    encoded.capture_timestamp_us = u64::MAX;
+    encoded.width = 1920;
+    encoded.height = 1080;
+    encoded.flags = FrameFlags::KEYFRAME;
+    encoded.data = vec![0x65; MAX_VIDEO_PACKET_PAYLOAD_BYTES * 2 + 17];
+
+    let packets = packetize_frame(&encoded).expect("packetize frame");
+    assert_eq!(packets.len(), 3);
+    for (index, packet) in packets.iter().enumerate() {
+        assert_eq!(usize::from(packet.header.chunk_index), index);
+        assert_eq!(usize::from(packet.header.chunk_count), packets.len());
+        assert!(encode_video_packet(packet).unwrap().len() <= MAX_VIDEO_PACKET_BYTES);
+    }
+    assert_eq!(
+        packets
+            .into_iter()
+            .flat_map(|packet| packet.payload)
+            .collect::<Vec<_>>(),
+        encoded.data
+    );
+}
+
+#[test]
+fn packetizer_rejects_empty_or_unbounded_access_units() {
+    let mut encoded = frame(42);
+    encoded.data.clear();
+    assert!(packetize_frame(&encoded).is_err());
+
+    encoded.data = vec![
+        0;
+        MAX_VIDEO_PACKET_PAYLOAD_BYTES
+            * (usize::from(desklink_protocol::MAX_VIDEO_CHUNKS) + 1)
+    ];
+    assert!(packetize_frame(&encoded).is_err());
 }
 
 #[test]

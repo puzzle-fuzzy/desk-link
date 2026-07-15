@@ -24,6 +24,7 @@ let package = Package(
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
+                .linkedFramework("Security"),
                 .linkedFramework("VideoToolbox"),
                 .unsafeFlags([
                     "-L", "../../target/aarch64-apple-darwin/release",

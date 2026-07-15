@@ -3,30 +3,65 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+private final class SendablePixelBuffer: @unchecked Sendable {
+    let value: CVPixelBuffer
+
+    init(_ value: CVPixelBuffer) {
+        self.value = value
+    }
+}
+
+@MainActor
 final class H264Decoder {
+    var onFrame: ((CVPixelBuffer) -> Void)?
+
     private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
     private(set) var latestPixelBuffer: CVPixelBuffer?
     private(set) var lastFrameID: UInt64 = 0
     private(set) var configVersion: UInt32 = 0
+    private(set) var configuredWidth: UInt16 = 0
+    private(set) var configuredHeight: UInt16 = 0
     private var consecutiveFailures = 0
+    private var keyframeRequestIssued = false
 
     deinit {
-        invalidate()
+        if let decompressionSession {
+            VTDecompressionSessionInvalidate(decompressionSession)
+        }
     }
 
     @discardableResult
-    func configure(sps: Data, pps: Data, version: UInt32) -> Bool {
-        guard !sps.isEmpty, !pps.isEmpty else { return false }
+    func configure(
+        sequenceHeader: Data,
+        width: UInt16,
+        height: UInt16,
+        version: UInt32
+    ) -> Bool {
+        guard width > 0, height > 0, version > 0, version >= configVersion else {
+            registerFailure()
+            return false
+        }
+        if version == configVersion,
+           width == configuredWidth,
+           height == configuredHeight,
+           decompressionSession != nil
+        {
+            return true
+        }
+        guard let parameterSets = try? H264AnnexB.parameterSets(in: sequenceHeader) else {
+            registerFailure()
+            return false
+        }
 
         var description: CMVideoFormatDescription?
-        let status = sps.withUnsafeBytes { spsBytes in
-            pps.withUnsafeBytes { ppsBytes in
+        let status = parameterSets.sps.withUnsafeBytes { spsBytes in
+            parameterSets.pps.withUnsafeBytes { ppsBytes in
                 var pointers: [UnsafePointer<UInt8>] = [
                     spsBytes.bindMemory(to: UInt8.self).baseAddress!,
                     ppsBytes.bindMemory(to: UInt8.self).baseAddress!,
                 ]
-                let sizes = [sps.count, pps.count]
+                let sizes = [parameterSets.sps.count, parameterSets.pps.count]
                 return pointers.withUnsafeMutableBufferPointer { pointerBuffer in
                     sizes.withUnsafeBufferPointer { sizeBuffer in
                         CMVideoFormatDescriptionCreateFromH264ParameterSets(
@@ -41,9 +76,12 @@ final class H264Decoder {
                 }
             }
         }
-        guard status == noErr, let description else { return false }
+        guard status == noErr, let description else {
+            registerFailure()
+            return false
+        }
 
-        invalidate()
+        invalidateSession()
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: h264OutputCallback,
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
@@ -55,26 +93,39 @@ final class H264Decoder {
             decoderSpecification: nil,
             imageBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: Int(width),
+                kCVPixelBufferHeightKey as String: Int(height),
+                kCVPixelBufferMetalCompatibilityKey as String: true,
             ] as CFDictionary,
             outputCallback: &callback,
             decompressionSessionOut: &session
         )
-        guard sessionStatus == noErr, let session else { return false }
+        guard sessionStatus == noErr, let session else {
+            registerFailure()
+            return false
+        }
         formatDescription = description
         decompressionSession = session
         configVersion = version
+        configuredWidth = width
+        configuredHeight = height
         consecutiveFailures = 0
+        keyframeRequestIssued = false
         return true
     }
 
     @discardableResult
     func receive(accessUnit: Data, frameID: UInt64, version: UInt32) -> Bool {
-        guard frameID > lastFrameID, !accessUnit.isEmpty else { return false }
+        guard frameID > lastFrameID,
+              frameID <= UInt64(Int64.max),
+              !accessUnit.isEmpty
+        else { return false }
         guard version == configVersion,
               let session = decompressionSession,
-              let formatDescription
+              let formatDescription,
+              let avcc = try? H264AnnexB.avccAccessUnit(from: accessUnit)
         else {
-            consecutiveFailures += 1
+            registerFailure()
             return false
         }
 
@@ -89,28 +140,28 @@ final class H264Decoder {
               CMBlockBufferAppendMemoryBlock(
                   blockBuffer,
                   memoryBlock: nil,
-                  length: accessUnit.count,
+                  length: avcc.count,
                   blockAllocator: nil,
                   customBlockSource: nil,
                   offsetToData: 0,
-                  dataLength: accessUnit.count,
+                  dataLength: avcc.count,
                   flags: CMBlockBufferFlags(0)
               ) == noErr
         else {
-            consecutiveFailures += 1
+            registerFailure()
             return false
         }
 
-        let copyStatus = accessUnit.withUnsafeBytes { bytes in
+        let copyStatus = avcc.withUnsafeBytes { bytes in
             CMBlockBufferReplaceDataBytes(
                 with: bytes.baseAddress!,
                 blockBuffer: blockBuffer,
                 offsetIntoDestination: 0,
-                dataLength: accessUnit.count
+                dataLength: avcc.count
             )
         }
         guard copyStatus == noErr else {
-            consecutiveFailures += 1
+            registerFailure()
             return false
         }
 
@@ -119,7 +170,7 @@ final class H264Decoder {
             presentationTimeStamp: CMTime(value: CMTimeValue(frameID), timescale: 30),
             decodeTimeStamp: .invalid
         )
-        var sampleSize = accessUnit.count
+        var sampleSize = avcc.count
         var sampleBuffer: CMSampleBuffer?
         let sampleStatus = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault,
@@ -133,38 +184,68 @@ final class H264Decoder {
             sampleBufferOut: &sampleBuffer
         )
         guard sampleStatus == noErr, let sampleBuffer else {
-            consecutiveFailures += 1
+            registerFailure()
             return false
         }
 
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
-            flags: [],
+            flags: [.enableAsynchronousDecompression],
             frameRefcon: nil,
             infoFlagsOut: nil
         )
         guard decodeStatus == noErr else {
-            consecutiveFailures += 1
+            registerFailure()
             return false
         }
         lastFrameID = frameID
         consecutiveFailures = 0
+        keyframeRequestIssued = false
         return true
     }
 
-    var shouldRequestKeyframe: Bool { consecutiveFailures >= 3 }
+    func takeKeyframeRequest() -> Bool {
+        guard consecutiveFailures >= 3, !keyframeRequestIssued else { return false }
+        keyframeRequestIssued = true
+        return true
+    }
 
-    func invalidate() {
-        if let session = decompressionSession {
-            VTDecompressionSessionInvalidate(session)
+    func reset() {
+        invalidateSession()
+        latestPixelBuffer = nil
+        lastFrameID = 0
+        configVersion = 0
+        configuredWidth = 0
+        configuredHeight = 0
+        consecutiveFailures = 0
+        keyframeRequestIssued = false
+    }
+
+    private func invalidateSession() {
+        if let decompressionSession {
+            VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
+            VTDecompressionSessionInvalidate(decompressionSession)
         }
         decompressionSession = nil
         formatDescription = nil
     }
 
-    fileprivate func accept(pixelBuffer: CVPixelBuffer) {
+    private func registerFailure() {
+        consecutiveFailures += 1
+    }
+
+    private func accept(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
+        guard frameID >= lastFrameID else { return }
         latestPixelBuffer = pixelBuffer
+        onFrame?(pixelBuffer)
+    }
+
+    nonisolated fileprivate func enqueue(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
+        let sendableBuffer = SendablePixelBuffer(pixelBuffer)
+        Task { @MainActor [weak self, sendableBuffer] in
+            self?.accept(pixelBuffer: sendableBuffer.value, frameID: frameID)
+        }
     }
 }
 
@@ -179,10 +260,14 @@ private func h264OutputCallback(
 ) {
     guard status == noErr,
           let decompressionOutputRefCon,
-          let imageBuffer
+          let imageBuffer,
+          presentationTimeStamp.value >= 0
     else { return }
     let decoder = Unmanaged<H264Decoder>
         .fromOpaque(decompressionOutputRefCon)
         .takeUnretainedValue()
-    decoder.accept(pixelBuffer: imageBuffer)
+    decoder.enqueue(
+        pixelBuffer: imageBuffer,
+        frameID: UInt64(presentationTimeStamp.value)
+    )
 }

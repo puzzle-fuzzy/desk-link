@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use desklink_session::DesktopRect;
+
 #[derive(Clone, Debug)]
 pub struct CapturedFrame {
     pub width: u32,
@@ -21,17 +23,21 @@ pub enum CaptureError {
 pub trait DesktopCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<CapturedFrame, CaptureError>;
     fn dimensions(&self) -> (u32, u32);
+    fn desktop_rect(&self) -> DesktopRect;
+    fn recover(&mut self) -> Result<(), CaptureError>;
 }
 
 #[cfg(windows)]
 pub struct DxgiDesktopCapturer {
     duplication: windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication,
     dimensions: (u32, u32),
+    desktop_rect: DesktopRect,
 }
 
 #[cfg(not(windows))]
 pub struct DxgiDesktopCapturer {
     dimensions: (u32, u32),
+    desktop_rect: DesktopRect,
     access_lost: bool,
 }
 
@@ -84,15 +90,22 @@ impl DxgiDesktopCapturer {
             if width == 0 || height == 0 {
                 return Err(CaptureError::NoDisplay);
             }
-            return Ok(Self {
+            Ok(Self {
                 duplication,
                 dimensions: (width, height),
-            });
+                desktop_rect: DesktopRect::new(
+                    description.DesktopCoordinates.left,
+                    description.DesktopCoordinates.top,
+                    width,
+                    height,
+                ),
+            })
         }
 
         #[cfg(not(windows))]
         Ok(Self {
             dimensions: (1920, 1080),
+            desktop_rect: DesktopRect::new(0, 0, 1920, 1080),
             access_lost: false,
         })
     }
@@ -119,21 +132,21 @@ impl DesktopCapturer for DxgiDesktopCapturer {
             unsafe {
                 self.duplication
                     .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
-                    .map_err(native_error)?;
+                    .map_err(map_dxgi_error)?;
             }
             let texture = resource
                 .ok_or_else(|| CaptureError::Native("DXGI returned no desktop resource".into()))
                 .and_then(|resource| resource.cast().map_err(native_error));
             let release_result = unsafe { self.duplication.ReleaseFrame() };
             let texture = texture?;
-            release_result.map_err(native_error)?;
-            return Ok(CapturedFrame {
+            release_result.map_err(map_dxgi_error)?;
+            Ok(CapturedFrame {
                 width: self.dimensions.0,
                 height: self.dimensions.1,
                 timestamp_us: now_micros(),
                 pixels: Vec::new(),
                 texture,
-            });
+            })
         }
 
         #[cfg(not(windows))]
@@ -157,11 +170,44 @@ impl DesktopCapturer for DxgiDesktopCapturer {
     fn dimensions(&self) -> (u32, u32) {
         self.dimensions
     }
+
+    fn desktop_rect(&self) -> DesktopRect {
+        self.desktop_rect
+    }
+
+    fn recover(&mut self) -> Result<(), CaptureError> {
+        #[cfg(windows)]
+        {
+            *self = Self::new_primary()?;
+        }
+        #[cfg(not(windows))]
+        {
+            self.access_lost = false;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
 fn native_error(error: windows::core::Error) -> CaptureError {
     CaptureError::Native(error.to_string())
+}
+
+#[cfg(windows)]
+fn map_dxgi_error(error: windows::core::Error) -> CaptureError {
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_WAIT_TIMEOUT,
+    };
+
+    match error.code() {
+        DXGI_ERROR_WAIT_TIMEOUT => CaptureError::Timeout,
+        DXGI_ERROR_ACCESS_LOST
+        | DXGI_ERROR_DEVICE_REMOVED
+        | DXGI_ERROR_DEVICE_RESET
+        | DXGI_ERROR_SESSION_DISCONNECTED => CaptureError::AccessLost,
+        _ => native_error(error),
+    }
 }
 
 fn now_micros() -> u64 {
@@ -173,4 +219,22 @@ fn now_micros() -> u64 {
                 .saturating_mul(1_000_000)
                 .saturating_add(u64::from(duration.subsec_micros()))
         })
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT};
+
+    #[test]
+    fn dxgi_timeout_and_access_loss_have_stable_recovery_errors() {
+        assert_eq!(
+            map_dxgi_error(windows::core::Error::from_hresult(DXGI_ERROR_WAIT_TIMEOUT)),
+            CaptureError::Timeout
+        );
+        assert_eq!(
+            map_dxgi_error(windows::core::Error::from_hresult(DXGI_ERROR_ACCESS_LOST)),
+            CaptureError::AccessLost
+        );
+    }
 }

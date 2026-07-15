@@ -146,6 +146,8 @@ y: 0.0 ～ 1.0
 
 支持鼠标移动、左/右/中键、双击、拖动、垂直/水平滚轮、键盘按下/抬起、Unicode 文本、常用组合键和 `ReleaseAll`。任何断线、拒绝、替换或结束流程都必须释放 Ctrl、Alt、Shift、Command、Win 以及所有鼠标按钮。
 
+当前共享输入线格式将指针限制在 `0..=1_000_000`，将单次滚轮增量限制在 `-1200..=1200`，修饰位固定为 Shift、Control、Alt、Meta；编码端和解码端都拒绝越界坐标、零滚动、过大滚动、零序列号和未知修饰位。Windows 映射将 `1.0` 对齐到虚拟桌面的最后一个有效像素，并以一个 `SendInput` 批次按顺序注入组合键。
+
 ## 8. 安全、配对与权限
 
 首次启动生成 Ed25519 长期身份密钥和设备 ID。私钥存储在 Windows DPAPI 或 Apple Keychain，不上传服务器。
@@ -208,11 +210,9 @@ Windows 测试覆盖 Windows 10/11、100%/125%/150% DPI、不同分辨率、Desk
 
 桌面 MVP 必须满足：远程画面持续更新；鼠标位置准确；点击、拖动、滚轮和常用键盘可用；中文最终文本可用；冻结、关键帧丢失、分辨率变化、断网和前后台切换可以恢复；断线后不会遗留按键状态；权限不足时给出明确提示；被控端可以立即断开。
 
-由于开发环境为 macOS，macOS Apple Silicon 端可以本机编译和验证；Windows 原生能力需要在 Windows 机器或虚拟机中完成最终验收。
+当前迭代环境为 Windows，可直接完成 Rust、Windows 原生采集/编码/输入和 PE 产物验证；macOS Apple Silicon 的 Swift、系统框架链接、应用打包和跨机验收保留到 Apple Silicon 环境执行。
 
-## 13. 里程碑
-
-## 11. 实现验证记录
+## 12. 实现验证记录
 
 已在 macOS Apple Silicon 开发环境验证：
 
@@ -221,9 +221,13 @@ Windows 测试覆盖 Windows 10/11、100%/125%/150% DPI、不同分辨率、Desk
 - 中继连接上限和连接错误码在并发条件下保持稳定；
 - `desklink.h` C ABI 的句柄生命周期、空指针校验、配对、控制事件、输入事件和 `ReleaseAll` 测试通过；
 - macOS arm64 Swift 输入映射、Rust FFI 链接、VideoToolbox 和 Metal 编译检查通过；
-- 确定性回环验证了旧帧丢弃后的关键帧恢复、最新帧优先和视频压力下输入仍可交付。
+- 本机 QUIC 中继回环验证了 access unit 分片、选定分片丢弃后的关键帧恢复、最新帧优先和视频 Datagram 洪峰下输入仍可交付。
 
-Windows 原生采集、Media Foundation H.264 编码、普通桌面输入和 PE 产物尚未在 Windows 机器上执行，不将交叉 `cargo check` 视为设备验收。
+已在 Windows MSVC 环境验证 Rust workspace 格式化、Clippy、全工作区测试、`DXGI Desktop Duplication` 主显示器采集冒烟和 PE 产物构建。真实 runtime 冒烟已覆盖桌面纹理读回、等比缩放、BGRA/RGBA → NV12、Media Foundation H.264、SPS/PPS VideoConfig、视频分片、本机 QUIC relay 转发、Noise 双向身份认证、分通道 AEAD 和独立光标 Datagram。Windows 长期 Ed25519 身份由当前用户 DPAPI 持久保护；加密数据报使用显式序号和重放窗口，允许丢包和有限乱序而不破坏后续解密。运行中显式 IDR、DXGI access-lost 重建策略和两帧最新优先队列均有独立测试。输入验证覆盖精确虚拟桌面端点、水平/垂直滚轮、Shift/Control/Alt/Meta 组合键、Unicode UTF-16 代理对、扩展方向键和未知修饰位拒绝；`ReleaseAll` 通过可注入 Windows 后端验证按键和鼠标抬起顺序，并在注入被阻止时保留未释放状态以便重试。
+
+Windows host runtime 已持续执行采集、编码、VideoConfig 和 QUIC 发送，并在 Noise 握手后只发送加密业务载荷。Rust FFI crate 的 `ControllerRuntime` 已通过真实 relay 双端测试及 Windows 实码流冒烟，覆盖 Noise 发起方、加密协商、配置/光标解密、乱序分片重组、配置竞态后的关键帧恢复和加密输入。该 runtime 已进入可取消 C ABI 后台 worker，安全输入与关键帧命令从 Swift 进入加密控制通道，销毁会等待后台线程退出且不会在销毁后继续回调。macOS 已实现 VideoConfig 驱动的 Annex B SPS/PPS 解析、access unit 到 AVCC 转换、VideoToolbox 异步最新帧发布、连续失败关键帧恢复和 Metal 等比显示，并以 Apple Keychain 持久保存控制端设备 ID 与私钥。开发期安全连接入口仍依赖预共享 relay 凭据和显式可信主机公钥；自动配对、可信设备列表、macOS arm64 原生复验和真实跨机验收尚未完成。因此当前 runtime 回环仍不作为完整跨平台远程控制验收。
+
+## 13. 里程碑
 
 1. 共享协议、状态机、帧分片、输入协议和本地回环测试；
 2. Windows 被控端屏幕采集和 H.264 编码；

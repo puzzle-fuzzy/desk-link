@@ -1,9 +1,13 @@
 use desklink_protocol::{
-    Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, InputEnvelope, InputEvent,
-    MAX_CONTROL_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US,
-    MAX_INPUT_FUTURE_SKEW_US, MAX_VIDEO_CHUNKS, PROTOCOL_VERSION, Platform, ProtocolError,
-    VideoFrameHeader, VideoPacket, decode_control, decode_input, decode_video_header,
-    decode_video_packet, encode_control, encode_input, encode_video_header, encode_video_packet,
+    Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEnvelope,
+    InputEvent, MAX_CONTROL_MESSAGE_BYTES, MAX_CURSOR_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES,
+    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_NOISE_HANDSHAKE_BYTES, MAX_VIDEO_CHUNKS,
+    MAX_VIDEO_CONFIG_BYTES, MAX_WHEEL_DELTA, Modifiers, NoiseHandshake, NoiseHandshakeStep,
+    PROTOCOL_VERSION, Platform, ProtocolError, VideoConfig, VideoFrameHeader, VideoPacket,
+    decode_control, decode_cursor_update, decode_input, decode_noise_handshake,
+    decode_video_config, decode_video_header, decode_video_packet, encode_control,
+    encode_cursor_update, encode_input, encode_noise_handshake, encode_video_config,
+    encode_video_header, encode_video_packet,
 };
 
 #[test]
@@ -11,6 +15,86 @@ fn control_message_round_trips() {
     let message = ControlMessage::RequestKeyframe { stream_id: 7 };
     let encoded = encode_control(&message).expect("encode");
     assert_eq!(decode_control(&encoded).expect("decode"), message);
+}
+
+#[test]
+fn noise_handshake_round_trips_and_rejects_invalid_envelopes() {
+    let handshake = NoiseHandshake {
+        protocol_version: PROTOCOL_VERSION,
+        step: NoiseHandshakeStep::InitiatorHello,
+        payload: vec![1, 2, 3],
+    };
+    let encoded = encode_noise_handshake(&handshake).expect("encode");
+    assert_eq!(decode_noise_handshake(&encoded).expect("decode"), handshake);
+
+    let mut invalid = handshake.clone();
+    invalid.protocol_version += 1;
+    assert!(matches!(
+        encode_noise_handshake(&invalid),
+        Err(ProtocolError::UnsupportedVersion(_))
+    ));
+    invalid.protocol_version = PROTOCOL_VERSION;
+    invalid.payload.clear();
+    assert_eq!(
+        encode_noise_handshake(&invalid),
+        Err(ProtocolError::Malformed)
+    );
+    invalid.payload = vec![0; MAX_NOISE_HANDSHAKE_BYTES + 1];
+    assert_eq!(
+        encode_noise_handshake(&invalid),
+        Err(ProtocolError::Malformed)
+    );
+}
+
+#[test]
+fn video_config_round_trips_and_rejects_invalid_decoder_state() {
+    let config = VideoConfig {
+        protocol_version: PROTOCOL_VERSION,
+        stream_id: 7,
+        config_version: 3,
+        codec: Codec::H264,
+        width: 1920,
+        height: 1080,
+        sequence_header: vec![0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4],
+    };
+    let encoded = encode_video_config(&config).expect("encode");
+    assert_eq!(decode_video_config(&encoded).expect("decode"), config);
+
+    let mut invalid = config.clone();
+    invalid.sequence_header.clear();
+    assert_eq!(
+        encode_video_config(&invalid),
+        Err(ProtocolError::InvalidVideoConfig)
+    );
+    invalid.sequence_header = vec![0; MAX_VIDEO_CONFIG_BYTES + 1];
+    assert!(matches!(
+        encode_video_config(&invalid),
+        Err(ProtocolError::MessageTooLarge { .. })
+    ));
+}
+
+#[test]
+fn cursor_update_round_trips_inside_datagram_budget() {
+    let cursor = CursorUpdate {
+        protocol_version: PROTOCOL_VERSION,
+        stream_id: 7,
+        sequence: 11,
+        timestamp_us: 42,
+        x_millionths: 250_000,
+        y_millionths: 750_000,
+        visible: true,
+        shape_id: 99,
+    };
+    let encoded = encode_cursor_update(&cursor).expect("encode");
+    assert!(encoded.len() <= MAX_CURSOR_MESSAGE_BYTES);
+    assert_eq!(decode_cursor_update(&encoded).expect("decode"), cursor);
+
+    let mut invalid = cursor;
+    invalid.x_millionths = 1_000_001;
+    assert_eq!(
+        encode_cursor_update(&invalid),
+        Err(ProtocolError::InvalidCursor)
+    );
 }
 
 #[test]
@@ -117,13 +201,19 @@ fn unknown_frame_flags_are_rejected() {
 }
 #[test]
 fn invalid_capabilities_are_rejected() {
-    let value = DeviceCapabilities {
+    let mut value = DeviceCapabilities {
         platform: Platform::IOS,
         role: DeviceRole::Host,
         codecs: vec![Codec::H264],
         width: 1921,
         height: 1080,
     };
+    assert!(matches!(
+        value.validate(),
+        Err(ProtocolError::InvalidCapabilities)
+    ));
+    value.width = 1920;
+    value.height = 0;
     assert!(matches!(
         value.validate(),
         Err(ProtocolError::InvalidCapabilities)
@@ -167,6 +257,67 @@ fn input_wire_decode_rejects_stale_and_future_values() {
         decode_input(&bytes, 10),
         Err(ProtocolError::TimestampOutsideWindow)
     ));
+}
+
+#[test]
+fn input_round_trips_wheel_and_explicit_modifiers() {
+    let cases = [
+        InputEvent::MouseWheel {
+            delta_x: -120,
+            delta_y: 240,
+        },
+        InputEvent::Key {
+            code: desklink_protocol::KeyCode::Character('c'),
+            pressed: true,
+            modifiers: Modifiers::CONTROL | Modifiers::SHIFT,
+        },
+    ];
+    for (index, event) in cases.into_iter().enumerate() {
+        let envelope = InputEnvelope {
+            sequence: index as u64 + 1,
+            timestamp_us: 1_000,
+            event,
+        };
+        let bytes = encode_input(&envelope).expect("encode valid input");
+        assert_eq!(decode_input(&bytes, 1_000).unwrap(), envelope);
+    }
+}
+
+#[test]
+fn input_rejects_out_of_bounds_pointer_wheel_and_modifier_values() {
+    let invalid_events = [
+        InputEvent::MouseMove { x: -1, y: 0 },
+        InputEvent::MouseMove { x: 0, y: 1_000_001 },
+        InputEvent::MouseWheel {
+            delta_x: 0,
+            delta_y: 0,
+        },
+        InputEvent::MouseWheel {
+            delta_x: MAX_WHEEL_DELTA + 1,
+            delta_y: 0,
+        },
+        InputEvent::Key {
+            code: desklink_protocol::KeyCode::Enter,
+            pressed: true,
+            modifiers: Modifiers(0x80),
+        },
+    ];
+    for (index, event) in invalid_events.into_iter().enumerate() {
+        let envelope = InputEnvelope {
+            sequence: index as u64 + 1,
+            timestamp_us: 1_000,
+            event,
+        };
+        assert!(matches!(
+            encode_input(&envelope),
+            Err(ProtocolError::InvalidInput)
+        ));
+        let bytes = postcard::to_allocvec(&envelope).unwrap();
+        assert!(matches!(
+            decode_input(&bytes, 1_000),
+            Err(ProtocolError::InvalidInput)
+        ));
+    }
 }
 
 #[test]

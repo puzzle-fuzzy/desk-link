@@ -6,8 +6,12 @@ struct DeskLinkApp: App {
 
     var body: some Scene {
         WindowGroup {
-            HomeView(bridge: bridge)
+            switch bridge.state {
+            case .connected:
+                SessionView(bridge: bridge)
+            default:
+                HomeView(bridge: bridge)
+            }
         }
-        .windowResizability(.contentSize)
     }
 }

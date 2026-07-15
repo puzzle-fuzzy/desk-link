@@ -8,6 +8,7 @@ members = [
   "crates/desklink-transport",
   "crates/desklink-ffi",
   "apps/windows",
+  "tools/windows-installer",
   "tests/end-to-end",
   "server/relay",
 ]
@@ -27,6 +28,7 @@ desklink-protocol = { path = "crates/desklink-protocol" }
 desklink-video = { path = "crates/desklink-video" }
 desklink-session = { path = "crates/desklink-session" }
 desklink-crypto = { path = "crates/desklink-crypto" }
+desklink-ffi = { path = "crates/desklink-ffi" }
 desklink-transport = { path = "crates/desklink-transport" }
 quinn = "0.11"
 rand_core = { version = "0.6", features = ["getrandom"] }
