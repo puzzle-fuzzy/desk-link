@@ -971,16 +971,18 @@ pub unsafe extern "C" fn desklink_send_input(
         Ok(event) => event,
         Err(error) => return error,
     };
-    runtime.pressed.press(&event);
-    if matches!(
-        &event,
-        InputEvent::MouseButton { pressed: false, .. } | InputEvent::Key { pressed: false, .. }
-    ) {
-        runtime.pressed.release(&event);
+    let result = runtime.dispatch_input(event.clone());
+    if result.is_ok() {
+        if matches!(
+            &event,
+            InputEvent::MouseButton { pressed: false, .. } | InputEvent::Key { pressed: false, .. }
+        ) {
+            runtime.pressed.release(&event);
+        } else {
+            runtime.pressed.press(&event);
+        }
     }
-    runtime
-        .dispatch_input(event)
-        .map_or_else(|error| error, |_| DesklinkResult::Ok)
+    result.map_or_else(|error| error, |_| DesklinkResult::Ok)
 }
 
 /// Requests a keyframe for the active video stream.
