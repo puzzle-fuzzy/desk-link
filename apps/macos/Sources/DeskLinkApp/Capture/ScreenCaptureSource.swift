@@ -12,16 +12,79 @@ private final class CapturedPixelBuffer: @unchecked Sendable {
     }
 }
 
+private final class LatestFrameDelivery: @unchecked Sendable {
+    typealias Handler = @Sendable (CVPixelBuffer, UInt64) -> Void
+
+    private let queue = DispatchQueue(label: "com.desklink.capture.delivery", qos: .userInitiated)
+    private let lock = NSLock()
+    private var streamIdentifier: ObjectIdentifier?
+    private var nextFrameID: UInt64 = 0
+    private var pending: (CapturedPixelBuffer, UInt64)?
+    private var draining = false
+    private var handler: Handler?
+
+    func begin(stream: SCStream, handler: @escaping Handler) {
+        lock.lock()
+        streamIdentifier = ObjectIdentifier(stream)
+        nextFrameID = 0
+        pending = nil
+        self.handler = handler
+        lock.unlock()
+    }
+
+    func end(stream: SCStream? = nil) {
+        lock.lock()
+        let matchesStream = stream.map { streamIdentifier == ObjectIdentifier($0) } ?? true
+        if matchesStream {
+            streamIdentifier = nil
+            nextFrameID = 0
+            pending = nil
+            handler = nil
+        }
+        lock.unlock()
+    }
+
+    func submit(stream: SCStream, buffer: CVPixelBuffer) {
+        let shouldSchedule: Bool
+        lock.lock()
+        guard streamIdentifier == ObjectIdentifier(stream), handler != nil else {
+            lock.unlock()
+            return
+        }
+        nextFrameID &+= 1
+        pending = (CapturedPixelBuffer(buffer), nextFrameID)
+        shouldSchedule = !draining
+        draining = true
+        lock.unlock()
+        if shouldSchedule {
+            queue.async { [weak self] in self?.drain() }
+        }
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard let pending, let handler else {
+                draining = false
+                lock.unlock()
+                return
+            }
+            self.pending = nil
+            lock.unlock()
+            handler(pending.0.value, pending.1)
+        }
+    }
+}
+
+@MainActor
 final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     typealias FrameHandler = @Sendable (CVPixelBuffer, UInt64) -> Void
     typealias StopHandler = @Sendable (Error) -> Void
 
     private let sampleQueue = DispatchQueue(label: "com.desklink.capture.sample", qos: .userInteractive)
-    private let deliveryQueue = DispatchQueue(label: "com.desklink.capture.delivery", qos: .userInitiated)
+    nonisolated private let delivery = LatestFrameDelivery()
     private var stream: SCStream?
-    private var frameID: UInt64 = 0
     private var selectedStreamID: UInt64 = 0
-    private var frameHandler: FrameHandler?
     private var stopHandler: StopHandler?
 
     private(set) var capturedDisplayFrame: CGRect = .zero
@@ -34,10 +97,12 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         onStop: @escaping StopHandler = { _ in }
     ) async throws {
         await stop()
+        try Task.checkCancellation()
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: true
         )
+        try Task.checkCancellation()
         let mainMenuBarOrigin = CGDisplayBounds(CGMainDisplayID()).origin
         let display = content.displays.first(where: { $0.displayID == displayID })
             ?? content.displays.first(where: { $0.frame.contains(mainMenuBarOrigin) })
@@ -56,34 +121,35 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             delegate: self
         )
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+        try Task.checkCancellation()
         self.stream = stream
-        frameID = 0
         selectedStreamID = streamID
         capturedDisplayFrame = display.frame
-        frameHandler = onFrame
         stopHandler = onStop
+        delivery.begin(stream: stream, handler: onFrame)
         do {
             try await stream.startCapture()
         } catch {
+            delivery.end(stream: stream)
             self.stream = nil
-            frameHandler = nil
+            selectedStreamID = 0
+            capturedDisplayFrame = .zero
             stopHandler = nil
             throw error
         }
     }
 
     func stop() async {
-        let stream = stream
+        let stream = self.stream
         self.stream = nil
-        frameHandler = nil
-        stopHandler = nil
-        frameID = 0
         selectedStreamID = 0
         capturedDisplayFrame = .zero
+        stopHandler = nil
+        delivery.end(stream: stream)
         if let stream { try? await stream.stopCapture() }
     }
 
-    func stream(
+    nonisolated func stream(
         _ stream: SCStream,
         didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of outputType: SCStreamOutputType
@@ -92,21 +158,22 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
               CMSampleBufferIsValid(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
-        frameID &+= 1
-        let nextFrameID = frameID
-        let buffer = CapturedPixelBuffer(pixelBuffer)
-        deliveryQueue.async { [weak self, buffer] in
-            self?.frameHandler?(buffer.value, nextFrameID)
-        }
+        delivery.submit(stream: stream, buffer: pixelBuffer)
     }
 
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        deliveryQueue.async { [weak self] in
-            self?.stopHandler?(error)
+    nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let streamIdentifier = ObjectIdentifier(stream)
+        let message = error.localizedDescription
+        Task { @MainActor [weak self, streamIdentifier, message] in
+            guard let self,
+                  self.stream.map({ ObjectIdentifier($0) }) == streamIdentifier
+            else { return }
+            stopHandler?(ScreenCaptureSourceError.streamStopped(message))
         }
     }
 }
 
 enum ScreenCaptureSourceError: Error, Equatable {
     case displayUnavailable
+    case streamStopped(String)
 }

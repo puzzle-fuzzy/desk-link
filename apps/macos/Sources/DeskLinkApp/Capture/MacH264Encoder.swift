@@ -29,9 +29,12 @@ enum EncodedVideoEvent: Equatable, Sendable {
     )
 }
 
-enum MacH264EncoderError: Error, Equatable {
+enum MacH264EncoderError: Error, Equatable, Sendable {
     case invalidDimensions
     case session(OSStatus)
+    case property(OSStatus)
+    case encoding(OSStatus)
+    case output(OSStatus)
     case malformedAVCC
     case missingFormatDescription
 }
@@ -95,6 +98,7 @@ enum H264EncoderOutputAssembler {
 
 final class MacH264Encoder: @unchecked Sendable {
     typealias EventHandler = @Sendable (EncodedVideoEvent) -> Void
+    typealias ErrorHandler = @Sendable (MacH264EncoderError) -> Void
 
     private let eventQueue = DispatchQueue(label: "com.desklink.encoder.events", qos: .userInitiated)
     private let lock = NSLock()
@@ -108,6 +112,7 @@ final class MacH264Encoder: @unchecked Sendable {
     private var latestFormat: H264EncoderFormat?
 
     var onEvent: EventHandler?
+    var onError: ErrorHandler?
 
     deinit { stop() }
 
@@ -131,7 +136,12 @@ final class MacH264Encoder: @unchecked Sendable {
             compressionSessionOut: &session
         )
         guard status == noErr, let session else { throw MacH264EncoderError.session(status) }
-        configure(session: session, width: width, height: height)
+        do {
+            try configure(session: session, width: width, height: height)
+        } catch {
+            VTCompressionSessionInvalidate(session)
+            throw error
+        }
         let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(session)
         guard prepareStatus == noErr else {
             VTCompressionSessionInvalidate(session)
@@ -161,7 +171,7 @@ final class MacH264Encoder: @unchecked Sendable {
         let properties: CFDictionary? = shouldForceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary
             : nil
-        _ = VTCompressionSessionEncodeFrame(
+        let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: CMTime(value: CMTimeValue(frameID), timescale: 30),
@@ -170,6 +180,9 @@ final class MacH264Encoder: @unchecked Sendable {
             sourceFrameRefcon: nil,
             infoFlagsOut: nil
         )
+        if status != noErr {
+            report(error: .encoding(status))
+        }
     }
 
     func requestKeyframe() {
@@ -187,17 +200,29 @@ final class MacH264Encoder: @unchecked Sendable {
         configurationVersion = 0
         lock.unlock()
         if let session {
-            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+            let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+            if status != noErr {
+                report(error: .encoding(status))
+            }
             VTCompressionSessionInvalidate(session)
         }
     }
 
     fileprivate func accept(sampleBuffer: CMSampleBuffer) {
-        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
-              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let format = Self.format(from: formatDescription),
-              let avcc = Self.data(from: dataBuffer)
-        else { return }
+        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+            report(error: .malformedAVCC)
+            return
+        }
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let format = Self.format(from: formatDescription)
+        else {
+            report(error: .missingFormatDescription)
+            return
+        }
+        guard let avcc = Self.data(from: dataBuffer) else {
+            report(error: .malformedAVCC)
+            return
+        }
         let frameID = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value))
         lock.lock()
         if latestFormat != format {
@@ -212,33 +237,54 @@ final class MacH264Encoder: @unchecked Sendable {
         let currentWidth = width
         let currentHeight = height
         lock.unlock()
-        guard version > 0,
-              let events = try? H264EncoderOutputAssembler.events(
-                  avccAccessUnit: avcc,
-                  format: format,
-                  frameID: frameID,
-                  streamID: currentStreamID,
-                  width: currentWidth,
-                  height: currentHeight,
-                  configVersion: version,
-                  emitsConfiguration: emitsConfiguration
-              )
-        else { return }
+        guard version > 0 else { return }
+        let events: [EncodedVideoEvent]
+        do {
+            events = try H264EncoderOutputAssembler.events(
+                avccAccessUnit: avcc,
+                format: format,
+                frameID: frameID,
+                streamID: currentStreamID,
+                width: currentWidth,
+                height: currentHeight,
+                configVersion: version,
+                emitsConfiguration: emitsConfiguration
+            )
+        } catch let error as MacH264EncoderError {
+            report(error: error)
+            return
+        } catch {
+            report(error: .malformedAVCC)
+            return
+        }
         for event in events { publish(event) }
+    }
+
+    fileprivate func report(error: MacH264EncoderError) {
+        eventQueue.async { [weak self] in self?.onError?(error) }
     }
 
     private func publish(_ event: EncodedVideoEvent) {
         eventQueue.async { [weak self] in self?.onEvent?(event) }
     }
 
-    private func configure(session: VTCompressionSession, width: Int, height: Int) {
+    private func configure(session: VTCompressionSession, width: Int, height: Int) throws {
         let bitrate = max(1_000_000, min(12_000_000, width * height * 4))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFTypeRef)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFTypeRef)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        try setProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        try setProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        try setProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
+        try setProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFTypeRef)
+        try setProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFTypeRef)
+        try setProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+    }
+
+    private func setProperty(
+        _ session: VTCompressionSession,
+        key: CFString,
+        value: CFTypeRef
+    ) throws {
+        let status = VTSessionSetProperty(session, key: key, value: value)
+        guard status == noErr else { throw MacH264EncoderError.property(status) }
     }
 
     private static func format(from description: CMFormatDescription) -> H264EncoderFormat? {
@@ -298,9 +344,17 @@ private func macH264EncoderOutputCallback(
     _ infoFlags: VTEncodeInfoFlags,
     _ sampleBuffer: CMSampleBuffer?
 ) {
-    guard status == noErr, let outputCallbackRefCon, let sampleBuffer else { return }
-    Unmanaged<MacH264Encoder>
+    guard let outputCallbackRefCon else { return }
+    let encoder = Unmanaged<MacH264Encoder>
         .fromOpaque(outputCallbackRefCon)
         .takeUnretainedValue()
-        .accept(sampleBuffer: sampleBuffer)
+    guard status == noErr else {
+        encoder.report(error: .output(status))
+        return
+    }
+    guard let sampleBuffer else {
+        encoder.report(error: .missingFormatDescription)
+        return
+    }
+    encoder.accept(sampleBuffer: sampleBuffer)
 }

@@ -18,6 +18,20 @@ final class MacInputInjectorTests: XCTestCase {
         XCTAssertEqual(backend.unicodeModifiers, [.shift])
     }
 
+    func testInputInjectorKeepsNormalizedMaximumInsideDisplayBounds() throws {
+        let backend = RecordingCGEventBackend()
+        let injector = MacInputInjector(
+            backend: backend,
+            displayFrame: CGRect(x: 100, y: 200, width: 800, height: 600)
+        )
+
+        try injector.inject(.move(normalizedX: 1, normalizedY: 1))
+
+        XCTAssertEqual(backend.moves.count, 1)
+        XCTAssertLessThan(backend.moves[0].x, 900)
+        XCTAssertLessThan(backend.moves[0].y, 800)
+    }
+
     func testInputInjectorReleaseAllClearsEveryPressedKeyAndButton() throws {
         let backend = RecordingCGEventBackend()
         let injector = MacInputInjector(backend: backend)

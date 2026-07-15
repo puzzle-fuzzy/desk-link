@@ -128,11 +128,14 @@ final class MacInputInjector {
         switch command {
         case let .move(normalizedX, normalizedY):
             guard normalizedX.isFinite, normalizedY.isFinite,
+                  displayFrame.width > 0, displayFrame.height > 0,
                   (0...1).contains(normalizedX), (0...1).contains(normalizedY)
             else { throw MacInputInjectorError.invalidCoordinate }
+            let maximumX = displayFrame.maxX.nextDown
+            let maximumY = displayFrame.maxY.nextDown
             let point = CGPoint(
-                x: displayFrame.minX + displayFrame.width * CGFloat(normalizedX),
-                y: displayFrame.minY + displayFrame.height * CGFloat(normalizedY)
+                x: min(maximumX, max(displayFrame.minX, displayFrame.minX + displayFrame.width * CGFloat(normalizedX))),
+                y: min(maximumY, max(displayFrame.minY, displayFrame.minY + displayFrame.height * CGFloat(normalizedY)))
             )
             try backend.moveMouse(to: point)
             pointer = point
