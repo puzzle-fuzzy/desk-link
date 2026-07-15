@@ -257,6 +257,7 @@ fn emit_terminal(events: &mpsc::Sender<HostEvent>, error: Option<HostError>) {
     let _ = events.try_send(HostEvent::State(HostState::Closed));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     client: QuicClient,
     identity: DeviceIdentity,

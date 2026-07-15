@@ -94,15 +94,13 @@ impl HostTestFixture {
         let host_identity = self.host_identity.with_secret_key_bytes(|secret_key| {
             HostIdentity::from_secret_key(self.host_identity.device_id, secret_key)
         });
-        let host = HostRuntime::start(
+        HostRuntime::start(
             host_client,
             host_identity,
             self.session_id,
             self.relay_authentication,
         )
-        .unwrap();
-
-        host
+        .unwrap()
     }
 
     async fn join_controller(&self) -> QuicClient {
