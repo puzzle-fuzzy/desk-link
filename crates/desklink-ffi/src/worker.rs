@@ -161,6 +161,10 @@ impl ControllerWorker {
         self.phase.load(Ordering::Acquire) == PHASE_FINISHED
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == PHASE_RUNNING
+    }
+
     pub(crate) fn shutdown(mut self) {
         let _ = self.commands.try_send(ControllerCommand::Shutdown);
         let _ = self.cancellation.send(true);

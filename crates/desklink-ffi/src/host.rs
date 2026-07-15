@@ -179,6 +179,10 @@ impl HostRuntime {
         self.worker.send(command)
     }
 
+    pub fn stop(&self) {
+        self.worker.cancel();
+    }
+
     pub async fn next_event(&self) -> Result<HostEvent, HostError> {
         self.events
             .lock()

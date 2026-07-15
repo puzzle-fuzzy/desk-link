@@ -199,13 +199,17 @@ impl HostWorker {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        let _ = self.send(HostCommand::Stop);
-        // destroy is an ownership teardown operation, so it must still interrupt the worker if
-        // the bounded command queue is already full. The phase remains unchanged in that case.
-        let _ = self.cancellation.send(true);
+        self.cancel();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    pub(crate) fn cancel(&self) {
+        // Cancellation is deliberately independent of command-queue admission. Destruction
+        // must still interrupt a worker whose bounded command queue is saturated.
+        let _ = self.commands.try_send(HostCommand::Stop);
+        let _ = self.cancellation.send(true);
     }
 }
 

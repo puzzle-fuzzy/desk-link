@@ -5,11 +5,11 @@ use std::{
 };
 
 use desklink_ffi::{
-    DesklinkHostConfig, DesklinkHostEvent, DesklinkHostEventCallback, DesklinkHostEventKind,
-    DesklinkHostHandle, DesklinkResult, desklink_host_approve, desklink_host_create,
-    desklink_host_destroy, desklink_host_release_all, desklink_host_send_cursor,
-    desklink_host_send_video_access_unit, desklink_host_send_video_config,
-    desklink_host_start_from_invite, desklink_host_start_pairing,
+    DesklinkConfig, DesklinkHostConfig, DesklinkHostEvent, DesklinkHostEventCallback,
+    DesklinkHostEventKind, DesklinkHostHandle, DesklinkResult, desklink_host_approve,
+    desklink_host_create, desklink_host_destroy, desklink_host_release_all,
+    desklink_host_send_cursor, desklink_host_send_video_access_unit,
+    desklink_host_send_video_config, desklink_host_start_from_invite, desklink_host_start_pairing,
 };
 
 static CALLBACK_EVENTS: OnceLock<Mutex<Vec<DesklinkHostEventKind>>> = OnceLock::new();
@@ -131,4 +131,31 @@ fn host_abi_destroy_emits_release_all() {
             .unwrap()
             .contains(&DesklinkHostEventKind::ReleaseAll)
     );
+}
+
+#[test]
+fn controller_saved_material_is_not_exported_before_authenticated_connection() {
+    let relay_url = CString::new("quic://127.0.0.1:1").unwrap();
+    let config = DesklinkConfig {
+        relay_url: relay_url.as_ptr(),
+        log_level: 0,
+    };
+    let mut handle = null_mut();
+    assert_eq!(
+        unsafe { desklink_ffi::desklink_create(&config, None, null_mut(), &mut handle) },
+        DesklinkResult::Ok
+    );
+    let mut material = desklink_ffi::DesklinkSavedHostMaterial {
+        session_id: [0; 16],
+        relay_authentication: [0; 32],
+        host_verify_key: [0; 32],
+        server_name: [0; 256],
+    };
+    assert_eq!(
+        unsafe {
+            desklink_ffi::desklink_controller_copy_saved_host_material(handle, &mut material)
+        },
+        DesklinkResult::InvalidState
+    );
+    unsafe { desklink_ffi::desklink_destroy(handle) };
 }

@@ -272,6 +272,7 @@ pub struct DesklinkHostHandle {
     config: DesklinkHostConfigOwned,
     runtime: Mutex<Option<Arc<HostRuntime>>>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
+    lifecycle: Mutex<HostLifecycle>,
     callback: Arc<HostCallbackState>,
 }
 
@@ -292,6 +293,14 @@ struct SavedHostMaterialOwned {
 
 struct HostCallbackState {
     callback: Mutex<Option<(DesklinkHostEventCallback, usize)>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostLifecycle {
+    Idle,
+    Starting,
+    Running,
+    Destroying,
 }
 
 impl HostCallbackState {
@@ -755,6 +764,7 @@ pub unsafe extern "C" fn desklink_connect_secure(
     if ed25519_dalek::VerifyingKey::from_bytes(&config.host_verify_key).is_err() {
         return DesklinkResult::InvalidArgument;
     }
+    runtime.saved_host_material = None;
     let saved = SavedHostMaterialOwned {
         session_id: config.session_id,
         relay_authentication: Zeroizing::new(config.relay_authentication),
@@ -825,6 +835,7 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
         Ok(invite) => invite,
         Err(_) => return DesklinkResult::InvalidArgument,
     };
+    runtime.saved_host_material = None;
     let session_id = *invite.session_id().as_bytes();
     let relay_authentication = *invite.relay_authentication();
     let host_verify_key = *invite.host_verify_key().as_bytes();
@@ -905,6 +916,7 @@ pub unsafe extern "C" fn desklink_reject(handle: *mut DesklinkHandle) -> Desklin
     runtime.stop_worker();
     let _ = runtime.advance(SessionEvent::UserDisconnected);
     runtime.closed = true;
+    runtime.saved_host_material = None;
     DesklinkResult::Ok
 }
 
@@ -1034,6 +1046,12 @@ pub unsafe extern "C" fn desklink_controller_copy_saved_host_material(
     if out_material.is_null() {
         return DesklinkResult::InvalidArgument;
     }
+    let Some(worker) = runtime.worker.as_ref() else {
+        return DesklinkResult::InvalidState;
+    };
+    if !worker.is_running() {
+        return DesklinkResult::InvalidState;
+    }
     let Some(material) = runtime.saved_host_material.as_ref() else {
         return DesklinkResult::InvalidState;
     };
@@ -1098,6 +1116,7 @@ pub unsafe extern "C" fn desklink_host_create(
         },
         runtime: Mutex::new(None),
         event_thread: Mutex::new(None),
+        lifecycle: Mutex::new(HostLifecycle::Idle),
         callback: Arc::new(HostCallbackState::new(callback, callback_context)),
     };
     unsafe { *out_handle = Box::into_raw(Box::new(handle)) };
@@ -1130,8 +1149,8 @@ pub unsafe extern "C" fn desklink_host_start_pairing(
     if invite_capacity < PAIRING_INVITE_BYTES {
         return DesklinkResult::InvalidArgument;
     }
-    if host_runtime(handle).is_some() {
-        return DesklinkResult::InvalidState;
+    if let Err(error) = reserve_host_start(handle) {
+        return error;
     }
     let identity = DeviceIdentity::from_secret_key(
         handle.config.host_device_id,
@@ -1139,12 +1158,18 @@ pub unsafe extern "C" fn desklink_host_start_pairing(
     );
     let invite = match PairingInvite::new(&identity, now_unix_s(), MAX_PAIRING_TTL_S) {
         Ok(invite) => invite,
-        Err(_) => return DesklinkResult::InternalError,
+        Err(_) => {
+            release_host_start(handle);
+            return DesklinkResult::InternalError;
+        }
     };
     let expires_at = invite.expires_at_unix_s();
     let encoded = match invite.encode() {
         Ok(encoded) => encoded,
-        Err(_) => return DesklinkResult::InternalError,
+        Err(_) => {
+            release_host_start(handle);
+            return DesklinkResult::InternalError;
+        }
     };
     let result = start_host_runtime(
         handle,
@@ -1183,9 +1208,6 @@ pub unsafe extern "C" fn desklink_host_start_from_invite(
     if invite.is_null() || invite_len != PAIRING_INVITE_BYTES {
         return DesklinkResult::InvalidArgument;
     }
-    if host_runtime(handle).is_some() {
-        return DesklinkResult::InvalidState;
-    }
     let invite_bytes = unsafe { std::slice::from_raw_parts(invite, invite_len) };
     let invite = match PairingInvite::decode(invite_bytes, now_unix_s()) {
         Ok(invite) => invite,
@@ -1199,6 +1221,9 @@ pub unsafe extern "C" fn desklink_host_start_from_invite(
         || invite.host_verify_key() != identity.verify_key()
     {
         return DesklinkResult::InvalidArgument;
+    }
+    if let Err(error) = reserve_host_start(handle) {
+        return error;
     }
     start_host_runtime(
         handle,
@@ -1390,7 +1415,11 @@ pub unsafe extern "C" fn desklink_host_stop(handle: *mut DesklinkHostHandle) -> 
     let Some(handle) = host_handle_ref(handle) else {
         return DesklinkResult::InvalidArgument;
     };
-    send_host_command(handle, HostCommand::Stop)
+    let Some(runtime) = host_runtime(handle) else {
+        return DesklinkResult::InvalidState;
+    };
+    runtime.stop();
+    DesklinkResult::Ok
 }
 
 /// Stops the host worker, waits for its callback dispatcher, clears callbacks,
@@ -1405,9 +1434,11 @@ pub unsafe extern "C" fn desklink_host_destroy(handle: *mut DesklinkHostHandle) 
         return;
     }
     let handle = unsafe { Box::from_raw(handle) };
+    if let Ok(mut lifecycle) = handle.lifecycle.lock() {
+        *lifecycle = HostLifecycle::Destroying;
+    }
     if let Some(runtime) = host_runtime(&handle) {
-        let _ = runtime.send(HostCommand::ReleaseAll);
-        let _ = runtime.send(HostCommand::Stop);
+        runtime.stop();
     } else {
         handle
             .callback
@@ -1461,6 +1492,36 @@ fn host_runtime(handle: &DesklinkHostHandle) -> Option<Arc<HostRuntime>> {
     handle.runtime.lock().ok()?.as_ref().cloned()
 }
 
+fn reserve_host_start(handle: &DesklinkHostHandle) -> Result<(), DesklinkResult> {
+    let Ok(mut lifecycle) = handle.lifecycle.lock() else {
+        return Err(DesklinkResult::InternalError);
+    };
+    if *lifecycle != HostLifecycle::Idle {
+        return Err(DesklinkResult::InvalidState);
+    }
+    *lifecycle = HostLifecycle::Starting;
+    Ok(())
+}
+
+fn release_host_start(handle: &DesklinkHostHandle) {
+    if let Ok(mut lifecycle) = handle.lifecycle.lock()
+        && *lifecycle == HostLifecycle::Starting
+    {
+        *lifecycle = HostLifecycle::Idle;
+    }
+}
+
+fn mark_host_running(handle: &DesklinkHostHandle) -> Result<(), DesklinkResult> {
+    let Ok(mut lifecycle) = handle.lifecycle.lock() else {
+        return Err(DesklinkResult::InternalError);
+    };
+    if *lifecycle != HostLifecycle::Starting {
+        return Err(DesklinkResult::InvalidState);
+    }
+    *lifecycle = HostLifecycle::Running;
+    Ok(())
+}
+
 fn host_handle_ref<'a>(handle: *mut DesklinkHostHandle) -> Option<&'a DesklinkHostHandle> {
     unsafe { handle.as_ref() }
 }
@@ -1470,9 +1531,21 @@ fn start_host_runtime(
     session_id: [u8; 16],
     relay_authentication: [u8; 32],
 ) -> DesklinkResult {
-    if host_runtime(handle).is_some() {
-        return DesklinkResult::InvalidState;
+    let result = start_host_runtime_inner(handle, session_id, relay_authentication);
+    if result != DesklinkResult::Ok {
+        release_host_start(handle);
+    } else if let Err(error) = mark_host_running(handle) {
+        release_host_start(handle);
+        return error;
     }
+    result
+}
+
+fn start_host_runtime_inner(
+    handle: &DesklinkHostHandle,
+    session_id: [u8; 16],
+    relay_authentication: [u8; 32],
+) -> DesklinkResult {
     let relay_addr = match resolve_relay(&handle.config.relay_url) {
         Ok(address) => address,
         Err(_) => return DesklinkResult::InvalidArgument,
