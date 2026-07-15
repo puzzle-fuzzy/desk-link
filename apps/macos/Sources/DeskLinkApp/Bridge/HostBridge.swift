@@ -217,20 +217,27 @@ final class HostBridge: ObservableObject {
     }
 
     func revoke(controller: TrustedController) {
-        do {
-            _ = try trustedControllerStore.revoke(deviceID: controller.deviceID)
-            reloadTrustedControllers()
-            if activeControllerDeviceID == controller.deviceID {
-                pendingApproval = nil
-                stop()
+        let revokingActiveController = activeControllerDeviceID == controller.deviceID
+        if revokingActiveController {
+            pendingApproval = nil
+            stop()
+        }
+        let pendingStop = stopTask
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let pendingStop { await pendingStop.value }
+            do {
+                _ = try trustedControllerStore.revoke(deviceID: controller.deviceID)
+                reloadTrustedControllers()
+            } catch {
+                publishError("The trusted controller could not be revoked.")
             }
-        } catch {
-            publishError("The trusted controller could not be revoked.")
         }
     }
 
     func stop() {
         guard stopTask == nil else { return }
+        beginStop()
         stopTask = Task { @MainActor [weak self] in await self?.performStop() }
     }
 
@@ -242,15 +249,19 @@ final class HostBridge: ObservableObject {
         if let stopTask {
             await stopTask.value
         } else {
+            beginStop()
             await performStop()
         }
     }
 
-    private func performStop() async {
+    private func beginStop() {
         callbackGeneration &+= 1
         activeControllerDeviceID = nil
         state = .stopping
         releaseAllLocalInput()
+    }
+
+    private func performStop() async {
         await captureSource.stop()
         captureStarting = false
         captureRunning = false
@@ -513,7 +524,8 @@ private func hostInputCommand(_ input: DesklinkHostInput) -> MacInputCommand? {
            let scalar = UnicodeScalar(input.character) {
             return .unicode(String(Character(scalar)), modifiers: modifiers)
         }
-        return .key(code: input.key_code, pressed: input.pressed != 0, modifiers: modifiers)
+        guard let virtualKeyCode = MacKeyCodeMapper.appKitKeyCode(forProtocolCode: input.key_code) else { return nil }
+        return .key(code: virtualKeyCode, pressed: input.pressed != 0, modifiers: modifiers)
     default:
         return nil
     }

@@ -39,6 +39,10 @@ struct HostApproval: Equatable, Identifiable {
     let controllerDeviceID: [UInt8]
     let controllerVerifyKey: [UInt8]
     var isApproved = false
+
+    var deviceIDText: String {
+        controllerDeviceID.map { String(format: "%02x", $0) }.joined(separator: ":")
+    }
 }
 
 struct HostMetrics: Equatable {

@@ -9,9 +9,17 @@ struct ApprovalView: View {
             Text("Allow this controller?").font(.headline)
             Text("Verify this fingerprint with the person requesting access before approving.")
                 .foregroundStyle(.secondary)
+            Text("Controller device ID: \(approval.deviceIDText)")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
             Text(approval.fingerprint)
                 .font(.body.monospaced())
                 .textSelection(.enabled)
+            if let expiresAt = bridge.pairingInvite?.expiresAt {
+                Text("Invitation expires \(expiresAt.formatted(date: .omitted, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             HStack {
                 Button("Reject") { bridge.reject() }
                     .keyboardShortcut(.cancelAction)
