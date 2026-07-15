@@ -198,7 +198,7 @@ async fn run_worker(
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
     loop {
-        if let Some(invalidate) = &material_invalidator {
+        if !first_attempt && let Some(invalidate) = &material_invalidator {
             invalidate();
         }
         phase.store(PHASE_CONNECTING, Ordering::Release);

@@ -1585,9 +1585,6 @@ fn start_host_runtime(
     let result = start_host_runtime_inner(handle, session_id, relay_authentication);
     if result != DesklinkResult::Ok {
         release_host_start(handle);
-    } else if let Err(error) = mark_host_running(handle) {
-        release_host_start(handle);
-        return error;
     }
     result
 }
@@ -1659,6 +1656,10 @@ fn start_host_runtime_inner(
     *thread_slot = Some(event_thread);
     if let Ok(mut thread_id_slot) = handle.event_thread_id.lock() {
         *thread_id_slot = Some(event_thread_id);
+    }
+    if let Err(error) = mark_host_running(handle) {
+        let _ = ready_sender.send(());
+        return error;
     }
     let _ = ready_sender.send(());
     DesklinkResult::Ok
