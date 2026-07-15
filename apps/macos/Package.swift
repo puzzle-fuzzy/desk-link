@@ -1,6 +1,10 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+#if arch(x86_64)
+fatalError("DeskLinkApp requires an Apple Silicon arm64 build")
+#endif
+
 let package = Package(
     name: "DeskLinkApp",
     platforms: [
