@@ -19,6 +19,7 @@ WINDOWS_UI = ROOT / "apps" / "windows-ui"
 TARGET = "x86_64-pc-windows-msvc"
 PRODUCT_CONFIG = WINDOWS_UI / "src" / "product-config.ts"
 RUST_RELAY_CONFIG = WINDOWS_UI / "src-tauri" / "src" / "local_relay.rs"
+WINDOWS_ASSETS = ROOT / "apps" / "windows" / "assets"
 
 
 def run(command: list[str], *, cwd: Path = ROOT) -> None:
@@ -90,6 +91,26 @@ def verify_managed_relay_profile() -> dict[str, str]:
     }
 
 
+def verify_static_windows_assets() -> dict[str, dict[str, object]]:
+    expected = {
+        "desklink-icon.png": b"\x89PNG\r\n\x1a\n",
+        "desklink.ico": b"\x00\x00\x01\x00",
+    }
+    verified: dict[str, dict[str, object]] = {}
+    for name, signature in expected.items():
+        path = WINDOWS_ASSETS / name
+        if not path.is_file():
+            raise SystemExit(f"Required Windows asset is missing: {path.relative_to(ROOT)}")
+        data = path.read_bytes()
+        if len(data) <= len(signature) or not data.startswith(signature):
+            raise SystemExit(f"Windows asset has an invalid file signature: {path.relative_to(ROOT)}")
+        verified[name] = {
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    return verified
+
+
 def verify_frontend_assets() -> list[str]:
     index = WINDOWS_UI / "dist" / "index.html"
     if not index.is_file():
@@ -140,7 +161,7 @@ def main() -> int:
         raise SystemExit("Windows release verification must run on Windows")
     version = verify_versions()
     managed_relay = verify_managed_relay_profile()
-    run([sys.executable, str(ROOT / "scripts" / "generate-windows-assets.py")])
+    windows_assets = verify_static_windows_assets()
     run(["bun", "install", "--frozen-lockfile"], cwd=WINDOWS_UI)
     run(["bun", "run", "test"], cwd=WINDOWS_UI)
     run(["bun", "run", "build"], cwd=WINDOWS_UI)
@@ -168,6 +189,7 @@ def main() -> int:
         "custom_protocol": True,
         "frontend_assets": assets,
         "managed_relay": managed_relay,
+        "windows_assets": windows_assets,
         "release": release,
         "passed": True,
     }

@@ -72,6 +72,8 @@ python scripts/verify-managed-relay.py
 
 `verify-windows-release.py` 会检查版本一致性、前后端正式中继配置、冻结依赖安装、前端测试与构建、全部生产资源中的开发地址、`custom-protocol` x64 PE、哈希和大小，并输出 `dist/windows/windows-release-verification.json`。
 
+应用图标作为版本化资源提交到 `apps/windows/assets`；`scripts/generate-windows-assets.py` 只用于设计资源发生变化时重新生成，发布门禁会直接验证 PNG/ICO 文件签名与哈希，不依赖 CI 临时安装图像处理库。
+
 `verify-windows-resilience.py` 会验证真实 DXGI 帧、H.264 编码、连续 relay 故障恢复、Windows suspend/resume callback，以及本机加密媒体和光标持续传输。它不等同于第二台物理电脑上的实际网络与睡眠验收。
 
 `verify-managed-relay.py` 使用产品 transport 客户端执行系统证书链和 QUIC 握手，结果写入 `dist/windows/managed-relay-verification.json`。GitHub Actions 另有定时外部握手监控。
