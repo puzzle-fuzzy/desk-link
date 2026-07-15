@@ -116,6 +116,7 @@ impl ControllerWorker {
         config: SecureConnectionConfigOwned,
         callback: Option<DesklinkEventCallback>,
         callback_context: *mut std::ffi::c_void,
+        material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, std::io::Error> {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (cancellation, cancellation_receiver) = watch::channel(false);
@@ -125,6 +126,7 @@ impl ControllerWorker {
             callback,
             context: callback_context as usize,
         };
+        let worker_material_invalidator = material_invalidator.clone();
         let thread = thread::Builder::new()
             .name("desklink-controller".into())
             .spawn(move || {
@@ -140,6 +142,7 @@ impl ControllerWorker {
                         cancellation_receiver,
                         worker_phase.clone(),
                         callback,
+                        worker_material_invalidator,
                     )),
                     Err(error) => callback.emit_error(&error.to_string(), 0),
                 }
@@ -190,10 +193,14 @@ async fn run_worker(
     mut cancellation: watch::Receiver<bool>,
     phase: Arc<AtomicU8>,
     callback: CallbackTarget,
+    material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
     loop {
+        if let Some(invalidate) = &material_invalidator {
+            invalidate();
+        }
         phase.store(PHASE_CONNECTING, Ordering::Release);
         callback.emit_state(
             if first_attempt {
@@ -258,6 +265,9 @@ async fn run_worker(
                 break;
             }
         }
+    }
+    if let Some(invalidate) = &material_invalidator {
+        invalidate();
     }
     callback.emit_state(DesklinkState::Closed, 0);
 }

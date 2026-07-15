@@ -423,7 +423,7 @@ struct DesklinkRuntime {
     stream_id: u64,
     closed: bool,
     worker: Option<ControllerWorker>,
-    saved_host_material: Option<SavedHostMaterialOwned>,
+    saved_host_material: Arc<Mutex<Option<SavedHostMaterialOwned>>>,
 }
 
 impl DesklinkRuntime {
@@ -600,7 +600,7 @@ pub unsafe extern "C" fn desklink_create(
         stream_id: 0,
         closed: false,
         worker: None,
-        saved_host_material: None,
+        saved_host_material: Arc::new(Mutex::new(None)),
     };
     unsafe { *out_handle = Box::into_raw(Box::new(DesklinkHandle { runtime })) };
     DesklinkResult::Ok
@@ -739,6 +739,7 @@ pub unsafe extern "C" fn desklink_connect_secure(
     let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
         return DesklinkResult::InvalidArgument;
     };
+    clear_saved_material(&runtime.saved_host_material);
     if config.is_null() {
         return DesklinkResult::InvalidArgument;
     }
@@ -765,7 +766,6 @@ pub unsafe extern "C" fn desklink_connect_secure(
     if ed25519_dalek::VerifyingKey::from_bytes(&config.host_verify_key).is_err() {
         return DesklinkResult::InvalidArgument;
     }
-    runtime.saved_host_material = None;
     let saved = SavedHostMaterialOwned {
         session_id: config.session_id,
         relay_authentication: Zeroizing::new(config.relay_authentication),
@@ -785,7 +785,10 @@ pub unsafe extern "C" fn desklink_connect_secure(
         },
     );
     if result == DesklinkResult::Ok {
-        runtime.saved_host_material = Some(saved);
+        let Ok(mut material) = runtime.saved_host_material.lock() else {
+            return DesklinkResult::InternalError;
+        };
+        *material = Some(saved);
     }
     result
 }
@@ -805,6 +808,7 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
     let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
         return DesklinkResult::InvalidArgument;
     };
+    clear_saved_material(&runtime.saved_host_material);
     if config.is_null() {
         return DesklinkResult::InvalidArgument;
     }
@@ -836,7 +840,6 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
         Ok(invite) => invite,
         Err(_) => return DesklinkResult::InvalidArgument,
     };
-    runtime.saved_host_material = None;
     let session_id = *invite.session_id().as_bytes();
     let relay_authentication = *invite.relay_authentication();
     let host_verify_key = *invite.host_verify_key().as_bytes();
@@ -859,7 +862,10 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
         },
     );
     if result == DesklinkResult::Ok {
-        runtime.saved_host_material = Some(saved);
+        let Ok(mut material) = runtime.saved_host_material.lock() else {
+            return DesklinkResult::InternalError;
+        };
+        *material = Some(saved);
     }
     result
 }
@@ -868,11 +874,16 @@ fn start_secure_worker(
     runtime: &mut DesklinkRuntime,
     config: SecureConnectionConfigOwned,
 ) -> DesklinkResult {
+    let saved_material = runtime.saved_host_material.clone();
+    let material_invalidator: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        clear_saved_material(&saved_material);
+    });
     let worker = match ControllerWorker::start(
         runtime.relay_url.clone(),
         config,
         runtime.callback,
         runtime.callback_context,
+        Some(material_invalidator),
     ) {
         Ok(worker) => worker,
         Err(error) => {
@@ -917,7 +928,7 @@ pub unsafe extern "C" fn desklink_reject(handle: *mut DesklinkHandle) -> Desklin
     runtime.stop_worker();
     let _ = runtime.advance(SessionEvent::UserDisconnected);
     runtime.closed = true;
-    runtime.saved_host_material = None;
+    clear_saved_material(&runtime.saved_host_material);
     DesklinkResult::Ok
 }
 
@@ -1051,10 +1062,13 @@ pub unsafe extern "C" fn desklink_controller_copy_saved_host_material(
         return DesklinkResult::InvalidState;
     };
     if !worker.is_running() {
-        runtime.saved_host_material = None;
+        clear_saved_material(&runtime.saved_host_material);
         return DesklinkResult::InvalidState;
     }
-    let Some(material) = runtime.saved_host_material.as_ref() else {
+    let Ok(material_guard) = runtime.saved_host_material.lock() else {
+        return DesklinkResult::InternalError;
+    };
+    let Some(material) = material_guard.as_ref() else {
         return DesklinkResult::InvalidState;
     };
     let server_name = material.server_name.as_bytes();
@@ -1521,6 +1535,12 @@ fn copy_payload(pointer: *const u8, length: usize, maximum: usize) -> Option<Vec
 
 fn host_runtime(handle: &DesklinkHostHandle) -> Option<Arc<HostRuntime>> {
     handle.runtime.lock().ok()?.as_ref().cloned()
+}
+
+fn clear_saved_material(material: &Arc<Mutex<Option<SavedHostMaterialOwned>>>) {
+    if let Ok(mut material) = material.lock() {
+        *material = None;
+    }
 }
 
 fn reserve_host_start(handle: &DesklinkHostHandle) -> Result<(), DesklinkResult> {
