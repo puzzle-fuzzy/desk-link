@@ -60,6 +60,15 @@ ss -lunp | grep ':4433'
 
 容器必须显示 `healthy`，日志应包含 `DeskLink relay listening on 0.0.0.0:4433`。健康检查会重新读取地址、证书、私钥和会话有效期配置，但不会占用第二个 UDP 端口。现有 `p2p-transmission` 容器状态应保持不变。
 
+在服务器外部使用项目自身的 QUIC 客户端验证公网、防火墙和受信任 TLS 证书：
+
+```sh
+cargo run -p desklink-transport --example relay_probe -- \
+  101.35.246.159:4433 turn.p2p.yxswy.com
+```
+
+输出 `中继连接成功` 才表示完整的公网 QUIC/TLS 握手已经通过；仅看到 UDP 端口监听不足以代替这项验证。
+
 ## 4. 两台 Windows 电脑验收
 
 在作为主机的 DeskLink 中进入“本机连接”，填写：

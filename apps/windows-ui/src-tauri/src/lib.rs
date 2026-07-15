@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 mod controller;
 mod host;
 mod local_relay;

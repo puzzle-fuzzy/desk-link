@@ -23,7 +23,7 @@ bench = false
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 apps-windows = { package = "desklink-windows", path = "../../windows" }
 desklink-crypto.workspace = true
 desklink-ffi.workspace = true
@@ -40,8 +40,6 @@ tauri = { version = "2.11.5", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2.4.3"
 tokio.workspace = true
 zeroize = "1.8"
-
-[target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",

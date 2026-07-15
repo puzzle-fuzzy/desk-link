@@ -1,3 +1,7 @@
+// Non-Windows workspace builds exercise portable test doubles. Private fields that are consumed
+// only by the real Windows backends are intentionally inactive on those targets.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 pub mod capture;
 #[cfg(windows)]
 pub mod configuration;

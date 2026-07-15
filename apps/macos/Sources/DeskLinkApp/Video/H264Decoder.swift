@@ -188,10 +188,13 @@ final class H264Decoder {
             return false
         }
 
+        // Use the stable CF_OPTIONS bit instead of an SDK-specific Swift enum spelling.
+        // kVTDecodeFrame_EnableAsynchronousDecompression has raw value 1 << 0.
+        let asynchronousDecode = VTDecodeFrameFlags(rawValue: 1 << 0)
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
-            flags: [.enableAsynchronousDecompression],
+            flags: asynchronousDecode,
             frameRefcon: nil,
             infoFlagsOut: nil
         )
