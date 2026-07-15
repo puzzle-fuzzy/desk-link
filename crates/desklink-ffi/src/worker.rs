@@ -22,6 +22,7 @@ use crate::{
 };
 
 const COMMAND_CAPACITY: usize = 1_024;
+const RELEASE_RESERVE: usize = 1;
 const PHASE_CONNECTING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
@@ -47,6 +48,7 @@ impl Drop for SecureConnectionConfigOwned {
 #[derive(Debug)]
 pub(crate) enum ControllerCommand {
     SendInput(InputEvent),
+    ReleaseAll(Vec<InputEvent>),
     RequestKeyframe,
     Shutdown,
 }
@@ -116,8 +118,9 @@ impl ControllerWorker {
         config: SecureConnectionConfigOwned,
         callback: Option<DesklinkEventCallback>,
         callback_context: *mut std::ffi::c_void,
+        material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, std::io::Error> {
-        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY + RELEASE_RESERVE);
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let phase = Arc::new(AtomicU8::new(PHASE_CONNECTING));
         let worker_phase = phase.clone();
@@ -125,6 +128,7 @@ impl ControllerWorker {
             callback,
             context: callback_context as usize,
         };
+        let worker_material_invalidator = material_invalidator.clone();
         let thread = thread::Builder::new()
             .name("desklink-controller".into())
             .spawn(move || {
@@ -140,6 +144,7 @@ impl ControllerWorker {
                         cancellation_receiver,
                         worker_phase.clone(),
                         callback,
+                        worker_material_invalidator,
                     )),
                     Err(error) => callback.emit_error(&error.to_string(), 0),
                 }
@@ -154,11 +159,24 @@ impl ControllerWorker {
     }
 
     pub(crate) fn send(&self, command: ControllerCommand) -> Result<(), ()> {
+        if self.commands.capacity() <= RELEASE_RESERVE {
+            return Err(());
+        }
         self.commands.try_send(command).map_err(|_| ())
+    }
+
+    pub(crate) fn release_all(&self, events: Vec<InputEvent>) -> Result<(), ()> {
+        self.commands
+            .try_send(ControllerCommand::ReleaseAll(events))
+            .map_err(|_| ())
     }
 
     pub(crate) fn is_finished(&self) -> bool {
         self.phase.load(Ordering::Acquire) == PHASE_FINISHED
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == PHASE_RUNNING
     }
 
     pub(crate) fn shutdown(mut self) {
@@ -186,10 +204,16 @@ async fn run_worker(
     mut cancellation: watch::Receiver<bool>,
     phase: Arc<AtomicU8>,
     callback: CallbackTarget,
+    material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
+    let mut pending_release: Option<Vec<InputEvent>> = None;
     loop {
+        if !first_attempt && let Some(invalidate) = &material_invalidator {
+            invalidate();
+        }
+        phase.store(PHASE_CONNECTING, Ordering::Release);
         callback.emit_state(
             if first_attempt {
                 DesklinkState::ConnectingRelay
@@ -208,6 +232,7 @@ async fn run_worker(
                         false,
                         &mut schedule,
                         &mut commands,
+                        &mut pending_release,
                         &mut cancellation,
                         callback,
                     ).await {
@@ -224,7 +249,15 @@ async fn run_worker(
         };
         phase.store(PHASE_RUNNING, Ordering::Release);
         callback.emit_state(DesklinkState::StartingVideo, 0);
-        match run_connected(controller, &mut commands, &mut cancellation, callback).await {
+        match run_connected(
+            controller,
+            &mut commands,
+            &mut pending_release,
+            &mut cancellation,
+            callback,
+        )
+        .await
+        {
             ConnectedOutcome::Shutdown { stream_id } => {
                 callback.emit_state(DesklinkState::Disconnecting, stream_id);
                 break;
@@ -239,6 +272,7 @@ async fn run_worker(
                     stable,
                     &mut schedule,
                     &mut commands,
+                    &mut pending_release,
                     &mut cancellation,
                     callback,
                 )
@@ -253,6 +287,9 @@ async fn run_worker(
                 break;
             }
         }
+    }
+    if let Some(invalidate) = &material_invalidator {
+        invalidate();
     }
     callback.emit_state(DesklinkState::Closed, 0);
 }
@@ -308,14 +345,37 @@ enum ConnectedOutcome {
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
 ) -> ConnectedOutcome {
     let mut stable = false;
+    if let Some(events) = pending_release.take() {
+        for event in events {
+            if let Err(error) = controller.send_input(event).await {
+                return ConnectedOutcome::Failed {
+                    failure: ConnectFailure::from_controller(error),
+                    stream_id: controller.active_stream_id().unwrap_or(0),
+                    stable,
+                };
+            }
+        }
+    }
     loop {
         tokio::select! {
             biased;
             command = commands.recv() => match command {
+                Some(ControllerCommand::ReleaseAll(events)) => {
+                    for event in events {
+                        if let Err(error) = controller.send_input(event).await {
+                            return ConnectedOutcome::Failed {
+                                failure: ConnectFailure::from_controller(error),
+                                stream_id: controller.active_stream_id().unwrap_or(0),
+                                stable,
+                            };
+                        }
+                    }
+                }
                 Some(ControllerCommand::SendInput(event)) => {
                     if let Err(error) = controller.send_input(event).await {
                         return ConnectedOutcome::Failed {
@@ -385,6 +445,7 @@ async fn schedule_retry(
     stable: bool,
     schedule: &mut ReconnectSchedule,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
 ) -> bool {
@@ -408,7 +469,7 @@ async fn schedule_retry(
                 0,
                 DesklinkState::Reconnecting,
             );
-            wait_for_retry(delay, commands, cancellation).await
+            wait_for_retry(delay, commands, pending_release, cancellation).await
         }
         ReconnectDecision::Exhausted => {
             callback.emit_error(
@@ -431,6 +492,7 @@ async fn schedule_retry(
 async fn wait_for_retry(
     delay: Duration,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
 ) -> bool {
     if *cancellation.borrow() {
@@ -442,6 +504,13 @@ async fn wait_for_retry(
         tokio::select! {
             biased;
             command = commands.recv() => match command {
+                Some(ControllerCommand::ReleaseAll(events)) => {
+                    if let Some(pending) = pending_release {
+                        pending.extend(events);
+                    } else {
+                        *pending_release = Some(events);
+                    }
+                }
                 Some(ControllerCommand::SendInput(_))
                 | Some(ControllerCommand::RequestKeyframe) => {}
                 Some(ControllerCommand::Shutdown) | None => return false,
@@ -629,14 +698,31 @@ mod tests {
     async fn retry_wait_discards_stale_commands_and_honors_cancellation() {
         let (sender, mut commands) = mpsc::channel(4);
         let (cancellation_sender, mut cancellation) = watch::channel(false);
+        let mut pending_release = None;
         sender
             .send(ControllerCommand::RequestKeyframe)
             .await
             .unwrap();
-        assert!(wait_for_retry(Duration::from_millis(1), &mut commands, &mut cancellation).await);
+        assert!(
+            wait_for_retry(
+                Duration::from_millis(1),
+                &mut commands,
+                &mut pending_release,
+                &mut cancellation,
+            )
+            .await
+        );
         assert!(commands.try_recv().is_err());
 
         cancellation_sender.send(true).unwrap();
-        assert!(!wait_for_retry(Duration::from_secs(30), &mut commands, &mut cancellation).await);
+        assert!(
+            !wait_for_retry(
+                Duration::from_secs(30),
+                &mut commands,
+                &mut pending_release,
+                &mut cancellation,
+            )
+            .await
+        );
     }
 }

@@ -2,48 +2,29 @@ import CoreVideo
 import SwiftUI
 
 struct SessionView: View {
-    @ObservedObject var bridge: RustBridge
-    @State private var leftButtonPressed = false
+    @ObservedObject var bridge: ControllerBridge
 
     var body: some View {
         VStack(spacing: 0) {
-            GeometryReader { geometry in
+            ZStack {
                 MetalVideoView(pixelBuffer: bridge.latestPixelBuffer)
                     .background(.black)
-                    .contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        if case let .active(location) = phase {
-                            sendPointer(at: location, in: geometry.size)
-                        }
-                    }
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { value in
-                                guard sendPointer(at: value.location, in: geometry.size) else {
-                                    return
-                                }
-                                if !leftButtonPressed {
-                                    leftButtonPressed = true
-                                    bridge.sendMouseButton(1, pressed: true)
-                                }
-                            }
-                            .onEnded { value in
-                                _ = sendPointer(at: value.location, in: geometry.size)
-                                if leftButtonPressed {
-                                    bridge.sendMouseButton(1, pressed: false)
-                                    leftButtonPressed = false
-                                }
-                            }
-                    )
-                    .overlay(alignment: .topTrailing) {
-                        Text("DeskLink")
+                SessionInputView(bridge: bridge, videoSize: videoSize)
+                    .background(Color.clear)
+                VStack {
+                    HStack {
+                        Spacer()
+                        Text(statusText)
                             .padding(8)
                             .background(.black.opacity(0.55), in: Capsule())
-                            .padding()
                     }
+                    Spacer()
+                }
+                .padding()
+                .allowsHitTesting(false)
             }
             HStack {
-                Text("Frames: \(bridge.metrics.receivedFrames)")
+                Text("Frames: \(bridge.metrics.receivedFrames) · Dropped: \(bridge.metrics.droppedFrames)")
                 Spacer()
                 Button("Keyframe") { bridge.requestKeyframe() }
                 Button("Disconnect") { bridge.disconnect() }
@@ -51,30 +32,21 @@ struct SessionView: View {
             .padding()
         }
         .frame(minWidth: 720, minHeight: 480)
-        .onDisappear {
-            if leftButtonPressed {
-                bridge.sendMouseButton(1, pressed: false)
-                leftButtonPressed = false
-            }
-            bridge.releaseAll()
-        }
+        .onDisappear { bridge.releaseAll() }
     }
 
-    @discardableResult
-    private func sendPointer(at location: CGPoint, in size: CGSize) -> Bool {
-        guard let pixelBuffer = bridge.latestPixelBuffer else { return false }
-        let source = CGSize(
-            width: CGFloat(CVPixelBufferGetWidth(pixelBuffer)),
-            height: CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-        )
-        let videoRect = VideoGeometry.aspectFit(
-            source: source,
-            in: CGRect(origin: .zero, size: size)
-        )
-        guard let normalized = InputMapper(videoRect: videoRect).normalizedPoint(for: location) else {
-            return false
+    private var videoSize: CGSize? {
+        guard let pixelBuffer = bridge.latestPixelBuffer else { return nil }
+        return CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+    }
+
+    private var statusText: String {
+        switch bridge.state {
+        case let .connected(streamID): "Connected · stream \(streamID)"
+        case .reconnecting: "Reconnecting"
+        case .recovering: "Recovering video"
+        case .frozen: "Video frozen"
+        default: "DeskLink"
         }
-        bridge.sendMouseMove(x: Float(normalized.x), y: Float(normalized.y))
-        return true
     }
 }

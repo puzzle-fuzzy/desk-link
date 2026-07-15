@@ -689,13 +689,22 @@ git commit -m "docs: record macOS desktop acceptance"
 
 ## Final Verification Checklist
 
-- [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo test -p desklink-ffi` passes with host and controller tests.
-- [ ] `cargo test --manifest-path tests/end-to-end/Cargo.toml` passes.
-- [ ] `cd apps/macos && swift test --arch arm64` passes.
-- [ ] `./scripts/build-macos-arm64.sh --check` produces and validates an arm64 app bundle.
-- [ ] Host approval blocks capture/video/input until explicit approval.
-- [ ] Screen Recording and Accessibility permissions have actionable UI.
-- [ ] Controller supports invite paste, Keychain persistence, reconnect and safe error text.
-- [ ] VideoToolbox/Metal display, mouse, keyboard, Unicode and ReleaseAll work in manual acceptance.
-- [ ] No iOS or Windows implementation is included in this delivery.
+- [x] `cargo fmt --all -- --check` passes.
+- [x] `cargo test -p desklink-ffi` passes with host and controller tests.
+- [x] `cargo test --manifest-path tests/end-to-end/Cargo.toml` passes.
+- [x] `cd apps/macos && swift test --arch arm64` passes.
+- [x] `./scripts/build-macos-arm64.sh --check` produces and validates an arm64 app bundle.
+- [x] Host approval blocks capture/video/input until explicit approval (automated coverage).
+- [x] Screen Recording and Accessibility permissions have actionable UI (automated coverage).
+- [x] Controller supports invite paste, Keychain persistence, reconnect and safe error text (automated coverage).
+- [ ] VideoToolbox/Metal display, mouse, keyboard, Unicode and ReleaseAll work in manual acceptance; a second Mac and interactive macOS permission/desktop access were unavailable in this environment.
+- [x] No iOS or Windows implementation is included in this delivery.
+
+## Final verification record — 2026-07-16
+
+- Completed the macOS Apple Silicon controller and host implementation; iOS, Windows, and Linux are outside this delivery.
+- `cargo fmt --all -- --check`, `cargo clippy -p desklink-ffi --all-targets -- -D warnings`, `cargo test -p desklink-ffi`, and the local relay recovery tests pass.
+- `cd apps/macos && swift test --arch arm64` passes with 29 tests; `./scripts/build-macos-arm64.sh --check` produces and validates an arm64-only `dist/macos/DeskLink.app`.
+- `./scripts/verify-macos-runtime.sh` runs the macOS-scoped Rust, relay, Swift, and packaging checks without system permissions.
+- Host approval now publishes the connected transition, host transport loss retries with bounded backoff, and initial host QUIC I/O is created inside the persistent worker runtime. Retina capture and encoder dimensions share one protocol-capped size, normalized input uses top-origin coordinates, and forced IDR frames retain the protocol keyframe flag.
+- Two-Mac pairing, Screen Recording/Accessibility consent, Keychain UI inspection, reconnect, revocation, and physical desktop interaction were not executed in this environment and remain manual acceptance items.

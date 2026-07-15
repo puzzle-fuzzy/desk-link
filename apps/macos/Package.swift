@@ -1,6 +1,10 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+#if arch(x86_64)
+fatalError("DeskLinkApp requires an Apple Silicon arm64 build")
+#endif
+
 let package = Package(
     name: "DeskLinkApp",
     platforms: [
@@ -20,10 +24,14 @@ let package = Package(
             dependencies: ["DeskLinkC"],
             path: "Sources/DeskLinkApp",
             linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
+                .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("Security"),
                 .linkedFramework("VideoToolbox"),
                 .unsafeFlags([

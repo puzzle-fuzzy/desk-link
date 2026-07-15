@@ -1,0 +1,39 @@
+import SwiftUI
+
+struct ApprovalView: View {
+    @ObservedObject var bridge: HostBridge
+    let approval: HostApproval
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Allow this controller?").font(.headline)
+            Text("Verify this fingerprint with the person requesting access before approving.")
+                .foregroundStyle(.secondary)
+            Text("Controller device ID: \(approval.deviceIDText)")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            Text(approval.fingerprint)
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+            if let expiresAt = bridge.pairingInvite?.expiresAt {
+                Text("Invitation expires \(expiresAt.formatted(date: .omitted, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Reject") { bridge.reject() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Approve") { bridge.approve() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!bridge.canApprove)
+            }
+            if !bridge.canApprove {
+                Text("Screen Recording and Accessibility are required before approval.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+    }
+}

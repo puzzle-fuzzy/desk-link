@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 typedef struct DesklinkHandle DesklinkHandle;
+typedef struct DesklinkHostHandle DesklinkHostHandle;
 
 typedef enum DesklinkResult {
     DESKLINK_OK = 0,
@@ -130,6 +131,89 @@ DesklinkResult desklink_send_input(DesklinkHandle *, const DesklinkInput *);
 DesklinkResult desklink_request_keyframe(DesklinkHandle *);
 DesklinkResult desklink_release_all(DesklinkHandle *);
 void desklink_destroy(DesklinkHandle *);
+
+typedef enum DesklinkHostEventKind {
+    DESKLINK_HOST_EVENT_STATE = 1,
+    DESKLINK_HOST_EVENT_ERROR = 2,
+    DESKLINK_HOST_EVENT_APPROVAL_REQUESTED = 3,
+    DESKLINK_HOST_EVENT_INPUT = 4,
+    DESKLINK_HOST_EVENT_KEYFRAME_REQUESTED = 5,
+    DESKLINK_HOST_EVENT_RELEASE_ALL = 6,
+    DESKLINK_HOST_EVENT_METRICS = 7,
+} DesklinkHostEventKind;
+
+typedef enum DesklinkHostState {
+    DESKLINK_HOST_CONNECTING = 1,
+    DESKLINK_HOST_WAITING_FOR_APPROVAL = 2,
+    DESKLINK_HOST_NEGOTIATING_CAPABILITIES = 3,
+    DESKLINK_HOST_CONNECTED = 4,
+    DESKLINK_HOST_STOPPING = 5,
+    DESKLINK_HOST_CLOSED = 6,
+} DesklinkHostState;
+
+typedef struct DesklinkHostConfig {
+    const char *relay_url;
+    const char *server_name;
+    uint8_t host_device_id[16];
+    uint8_t host_secret_key[32];
+    uint32_t log_level;
+} DesklinkHostConfig;
+
+typedef struct DesklinkHostInput {
+    DesklinkInputKind kind;
+    float x;
+    float y;
+    int32_t wheel_x;
+    int32_t wheel_y;
+    uint32_t button;
+    uint32_t key_code;
+    uint32_t character;
+    uint8_t pressed;
+    uint8_t modifiers;
+} DesklinkHostInput;
+
+typedef struct DesklinkHostMetrics {
+    uint64_t sent_video_configs;
+    uint64_t sent_video_packets;
+    uint64_t received_input_events;
+    uint64_t keyframe_requests;
+} DesklinkHostMetrics;
+
+typedef struct DesklinkHostEvent {
+    DesklinkHostEventKind kind;
+    DesklinkHostState state;
+    const uint8_t *data;
+    size_t data_len;
+    uint8_t controller_device_id[16];
+    uint8_t controller_verify_key[32];
+    const uint8_t *fingerprint;
+    size_t fingerprint_len;
+    DesklinkHostInput input;
+    DesklinkHostMetrics metrics;
+} DesklinkHostEvent;
+
+typedef void (*DesklinkHostEventCallback)(void *context, const DesklinkHostEvent *event);
+
+typedef struct DesklinkSavedHostMaterial {
+    uint8_t session_id[16];
+    uint8_t relay_authentication[32];
+    uint8_t host_verify_key[32];
+    char server_name[256];
+} DesklinkSavedHostMaterial;
+
+DesklinkResult desklink_host_create(const DesklinkHostConfig *, DesklinkHostEventCallback, void *, DesklinkHostHandle **);
+DesklinkResult desklink_host_start_pairing(DesklinkHostHandle *, uint8_t *, size_t, size_t *, uint64_t *);
+DesklinkResult desklink_host_start_from_invite(DesklinkHostHandle *, const uint8_t *, size_t);
+DesklinkResult desklink_host_approve(DesklinkHostHandle *, const uint8_t controller_device_id[16], const uint8_t controller_verify_key[32]);
+DesklinkResult desklink_host_reject(DesklinkHostHandle *);
+DesklinkResult desklink_host_send_video_config(DesklinkHostHandle *, uint64_t, uint32_t, uint16_t, uint16_t, const uint8_t *, size_t);
+DesklinkResult desklink_host_send_video_access_unit(DesklinkHostHandle *, uint64_t, uint64_t, uint32_t, const uint8_t *, size_t);
+DesklinkResult desklink_host_send_cursor(DesklinkHostHandle *, uint64_t, const uint8_t *, size_t);
+DesklinkResult desklink_host_request_keyframe(DesklinkHostHandle *);
+DesklinkResult desklink_host_release_all(DesklinkHostHandle *);
+DesklinkResult desklink_host_stop(DesklinkHostHandle *);
+void desklink_host_destroy(DesklinkHostHandle *);
+DesklinkResult desklink_controller_copy_saved_host_material(DesklinkHandle *, DesklinkSavedHostMaterial *);
 
 #ifdef __cplusplus
 }
