@@ -243,7 +243,7 @@ final class MacH264Encoder: @unchecked Sendable {
         if let session {
             let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             if status != noErr {
-                report(error: .encoding(status), generation: callbackContext?.generation)
+                report(error: .encoding(status))
             }
             VTCompressionSessionInvalidate(session)
         }
@@ -278,7 +278,6 @@ final class MacH264Encoder: @unchecked Sendable {
             }
             let version = self.configurationVersion
             let emitsConfiguration = self.emittedConfigurationVersion != version
-            if emitsConfiguration { self.emittedConfigurationVersion = version }
             let currentStreamID = self.streamID
             let currentWidth = self.width
             let currentHeight = self.height
@@ -296,6 +295,7 @@ final class MacH264Encoder: @unchecked Sendable {
                     emitsConfiguration: emitsConfiguration
                 )
                 guard self.isGenerationActive(generation) else { return }
+                if emitsConfiguration { self.emittedConfigurationVersion = version }
                 for event in events { self.onEvent?(event) }
             } catch let error as MacH264EncoderError {
                 guard self.isGenerationActive(generation) else { return }

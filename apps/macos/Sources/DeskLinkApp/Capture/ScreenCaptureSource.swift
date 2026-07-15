@@ -70,8 +70,11 @@ private final class LatestFrameDelivery: @unchecked Sendable {
                 return
             }
             self.pending = nil
-            lock.unlock()
+            // Keep the delivery lock while invoking the handler. `end()` therefore
+            // forms a real barrier: once it returns, no frame from this stream can
+            // still be inside the host callback.
             handler(pending.0.value, pending.1)
+            lock.unlock()
         }
     }
 }
@@ -86,6 +89,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
     private var stream: SCStream?
     private var selectedStreamID: UInt64 = 0
     private var stopHandler: StopHandler?
+    private var lifecycleGeneration: UInt64 = 0
 
     private(set) var capturedDisplayFrame: CGRect = .zero
 
@@ -96,7 +100,10 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         onFrame: @escaping FrameHandler,
         onStop: @escaping StopHandler = { _ in }
     ) async throws {
-        await stop()
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        await stopCurrent()
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         try Task.checkCancellation()
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
@@ -119,28 +126,37 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             configuration: configuration,
             delegate: self
         )
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
-        try Task.checkCancellation()
-        self.stream = stream
-        selectedStreamID = streamID
-        capturedDisplayFrame = display.frame
-        stopHandler = onStop
-        delivery.begin(stream: stream, handler: onFrame)
         do {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+            try Task.checkCancellation()
+            guard generation == lifecycleGeneration else { throw CancellationError() }
+            self.stream = stream
+            selectedStreamID = streamID
+            capturedDisplayFrame = display.frame
+            stopHandler = onStop
+            delivery.begin(stream: stream, handler: onFrame)
             try await stream.startCapture()
             try Task.checkCancellation()
+            guard generation == lifecycleGeneration else { throw CancellationError() }
         } catch {
             delivery.end(stream: stream)
             try? await stream.stopCapture()
-            self.stream = nil
-            selectedStreamID = 0
-            capturedDisplayFrame = .zero
-            stopHandler = nil
+            if self.stream.map({ ObjectIdentifier($0) }) == ObjectIdentifier(stream) {
+                self.stream = nil
+                selectedStreamID = 0
+                capturedDisplayFrame = .zero
+                stopHandler = nil
+            }
             throw error
         }
     }
 
     func stop() async {
+        lifecycleGeneration &+= 1
+        await stopCurrent()
+    }
+
+    private func stopCurrent() async {
         let stream = self.stream
         self.stream = nil
         selectedStreamID = 0
