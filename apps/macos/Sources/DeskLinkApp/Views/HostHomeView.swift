@@ -4,6 +4,7 @@ import SwiftUI
 struct HostHomeView: View {
     @ObservedObject var bridge: HostBridge
     let chooseRole: () -> Void
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ScrollView {
@@ -28,7 +29,7 @@ struct HostHomeView: View {
                 HStack {
                     Button("Create invitation") { bridge.createInvite() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(bridge.pairingInvite != nil)
+                        .disabled(bridge.pairingInvite != nil || !bridge.permissions.canCaptureAndControl)
                     if let invite = bridge.pairingInvite {
                         Button("Copy invitation") { bridge.copyInviteToPasteboard() }
                         Text("Expires \(invite.expiresAt.formatted(date: .omitted, time: .shortened))")
@@ -67,6 +68,9 @@ struct HostHomeView: View {
         }
         .frame(minWidth: 600, minHeight: 500)
         .onAppear { bridge.refreshPermissions() }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { bridge.refreshPermissions() }
+        }
     }
 
     private func permissionCard(title: String, granted: Bool, request: @escaping () -> Void, settingsURL: URL) -> some View {

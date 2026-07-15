@@ -5,9 +5,11 @@ import Foundation
 
 private final class HostCallbackContext: @unchecked Sendable {
     weak var bridge: HostBridge?
+    let generation: UInt64
 
-    init(bridge: HostBridge) {
+    init(bridge: HostBridge, generation: UInt64) {
         self.bridge = bridge
+        self.generation = generation
     }
 }
 
@@ -16,9 +18,9 @@ private final class HostHandleOwner: @unchecked Sendable {
     var callbackContext: UnsafeMutableRawPointer?
 
     func destroy() {
-        guard let pointer else { return }
+        let pointer = self.pointer
         self.pointer = nil
-        desklink_host_destroy(pointer)
+        if let pointer { desklink_host_destroy(pointer) }
         if let callbackContext {
             self.callbackContext = nil
             Unmanaged<HostCallbackContext>.fromOpaque(callbackContext).release()
@@ -43,7 +45,7 @@ final class HostBridge: ObservableObject {
     }
 
     var canInjectInput: Bool {
-        permissions.accessibility == .granted && state == .connected
+        permissions.canCaptureAndControl && state == .connected
     }
 
     var canApprove: Bool {
@@ -62,6 +64,8 @@ final class HostBridge: ObservableObject {
     private var captureStarting = false
     private var captureRunning = false
     private var stopTask: Task<Void, Never>?
+    private var callbackGeneration: UInt64 = 0
+    private var activeControllerDeviceID: [UInt8]?
 
     init(
         relayURL: String = ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] ?? "quic://127.0.0.1:4433",
@@ -99,7 +103,8 @@ final class HostBridge: ObservableObject {
         guard handleOwner.pointer == nil else { return }
         do {
             let identity = try identityStore.loadOrCreate()
-            let context = HostCallbackContext(bridge: self)
+            callbackGeneration &+= 1
+            let context = HostCallbackContext(bridge: self, generation: callbackGeneration)
             let contextPointer = Unmanaged.passRetained(context).toOpaque()
             var handle: OpaquePointer?
             let result = relayURL.withCString { relayURL in
@@ -140,6 +145,10 @@ final class HostBridge: ObservableObject {
     }
 
     func createInvite() {
+        guard permissions.canCaptureAndControl else {
+            publishError("Grant Screen Recording and Accessibility before creating an invitation.")
+            return
+        }
         start()
         guard let handle = handleOwner.pointer else { return }
         var bytes = [UInt8](repeating: 0, count: Int(DESKLINK_PAIRING_INVITE_BYTES))
@@ -181,6 +190,7 @@ final class HostBridge: ObservableObject {
             return
         }
         pendingApproval = nil
+        activeControllerDeviceID = approval.controllerDeviceID
         do {
             try trustedControllerStore.trust(TrustedController(
                 deviceID: approval.controllerDeviceID,
@@ -210,6 +220,10 @@ final class HostBridge: ObservableObject {
         do {
             _ = try trustedControllerStore.revoke(deviceID: controller.deviceID)
             reloadTrustedControllers()
+            if activeControllerDeviceID == controller.deviceID {
+                pendingApproval = nil
+                stop()
+            }
         } catch {
             publishError("The trusted controller could not be revoked.")
         }
@@ -233,6 +247,8 @@ final class HostBridge: ObservableObject {
     }
 
     private func performStop() async {
+        callbackGeneration &+= 1
+        activeControllerDeviceID = nil
         state = .stopping
         releaseAllLocalInput()
         await captureSource.stop()
@@ -287,6 +303,7 @@ final class HostBridge: ObservableObject {
         case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue): state = .negotiating
         case Int(DESKLINK_HOST_CONNECTED.rawValue):
             state = .connected
+            pendingApproval = nil
             startCaptureIfPermitted()
         case Int(DESKLINK_HOST_STOPPING.rawValue): state = .stopping
         case Int(DESKLINK_HOST_CLOSED.rawValue):
@@ -353,9 +370,11 @@ final class HostBridge: ObservableObject {
                 encoder.stop()
                 releaseAllLocalInput()
             }
+            if state == .connected { stop() }
         }
         if previous.accessibility == .granted, snapshot.accessibility != .granted {
             releaseAllLocalInput()
+            if state == .connected { stop() }
         }
         startCaptureIfPermitted()
     }
@@ -432,6 +451,8 @@ private struct HostCallbackEvent {
 private func desklinkHostEventCallback(_ context: UnsafeMutableRawPointer?, _ event: UnsafePointer<DesklinkHostEvent>?) {
     guard let context, let event else { return }
     let callbackContext = Unmanaged<HostCallbackContext>.fromOpaque(context).takeUnretainedValue()
+    guard let bridge = callbackContext.bridge else { return }
+    let generation = callbackContext.generation
     let value = event.pointee
     let mapped = HostCallbackEvent(
         kind: hostCallbackKind(value.kind),
@@ -449,7 +470,14 @@ private func desklinkHostEventCallback(_ context: UnsafeMutableRawPointer?, _ ev
         )
     )
     DispatchQueue.main.async {
-        callbackContext.bridge?.consume(mapped)
+        guard bridge.acceptsCallback(generation: generation) else { return }
+        bridge.consume(mapped)
+    }
+}
+
+private extension HostBridge {
+    func acceptsCallback(generation: UInt64) -> Bool {
+        callbackGeneration == generation
     }
 }
 

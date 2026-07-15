@@ -21,9 +21,9 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
         guard !terminationStarted else { return .terminateNow }
         terminationStarted = true
         Task { @MainActor [weak self] in
-            await self?.host?.shutdownAndWait()
             self?.controller?.releaseAll()
             self?.controller?.disconnect()
+            await self?.host?.shutdownAndWait()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
