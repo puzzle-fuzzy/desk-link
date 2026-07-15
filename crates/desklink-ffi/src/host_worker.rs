@@ -162,6 +162,81 @@ impl HostWorker {
         }
     }
 
+    pub(crate) fn start_from_config(
+        reconnect_config: QuicClientConfig,
+        identity: DeviceIdentity,
+        session_id: SessionId,
+        relay_authentication: [u8; 32],
+        events: mpsc::Sender<HostEvent>,
+    ) -> Result<Self, HostError> {
+        let (commands, receiver) = mpsc::channel(HOST_COMMAND_CAPACITY);
+        let (cancellation, cancellation_receiver) = watch::channel(false);
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        let phase = Arc::new(AtomicU8::new(WorkerPhase::Connecting as u8));
+        let phase_gate = Arc::new(Mutex::new(()));
+        let worker_phase = phase.clone();
+        let worker_phase_gate = phase_gate.clone();
+        let initial_config = reconnect_config.clone();
+        let thread = thread::Builder::new()
+            .name("desklink-host".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build();
+                match runtime {
+                    Ok(runtime) => runtime.block_on(async move {
+                        match QuicClient::connect(initial_config).await {
+                            Ok(client) => {
+                                run_worker(
+                                    client,
+                                    Some(reconnect_config),
+                                    identity,
+                                    session_id,
+                                    relay_authentication,
+                                    receiver,
+                                    cancellation_receiver,
+                                    events,
+                                    worker_phase.clone(),
+                                    worker_phase_gate.clone(),
+                                    ready_sender,
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                let error = transport_error(error);
+                                let _ = ready_sender.send(Err(error.clone()));
+                                emit_terminal(&events, Some(error));
+                                record_closed(&worker_phase, &worker_phase_gate);
+                            }
+                        }
+                    }),
+                    Err(_) => {
+                        let _ = ready_sender.send(Err(HostError::WorkerStopped));
+                        emit_terminal(&events, Some(HostError::WorkerStopped));
+                        record_closed(&worker_phase, &worker_phase_gate);
+                    }
+                }
+            })
+            .map_err(|_| HostError::WorkerStopped)?;
+        match ready_receiver
+            .recv()
+            .map_err(|_| HostError::WorkerStopped)?
+        {
+            Ok(()) => Ok(Self {
+                commands,
+                cancellation,
+                phase,
+                phase_gate,
+                thread: Some(thread),
+            }),
+            Err(error) => {
+                let _ = thread.join();
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn state(&self) -> HostState {
         WorkerPhase::load(&self.phase).into()
     }

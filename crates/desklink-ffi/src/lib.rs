@@ -1624,23 +1624,9 @@ fn start_host_runtime_inner(
         Ok(config) => config,
         Err(_) => return DesklinkResult::InternalError,
     };
-    let client = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime.block_on(desklink_transport::QuicClient::connect(
-            transport_config.clone(),
-        )),
-        Err(_) => return DesklinkResult::InternalError,
-    };
-    let client = match client {
-        Ok(client) => client,
-        Err(_) => return DesklinkResult::InternalError,
-    };
     let identity =
         HostIdentity::from_secret_key(handle.config.host_device_id, &handle.config.host_secret_key);
-    let runtime = match HostRuntime::start_with_reconnect(
-        client,
+    let runtime = match HostRuntime::start_from_config(
         transport_config,
         identity,
         SessionId::from_bytes(session_id),

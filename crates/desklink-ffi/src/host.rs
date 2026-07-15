@@ -194,6 +194,26 @@ impl HostRuntime {
         })
     }
 
+    pub fn start_from_config(
+        reconnect_config: QuicClientConfig,
+        identity: HostIdentity,
+        session_id: SessionId,
+        relay_authentication: [u8; 32],
+    ) -> Result<Self, HostError> {
+        let (events, receiver) = mpsc::channel(HOST_EVENT_CAPACITY);
+        let worker = HostWorker::start_from_config(
+            reconnect_config,
+            identity.into_device_identity(),
+            session_id,
+            relay_authentication,
+            events,
+        )?;
+        Ok(Self {
+            worker,
+            events: Arc::new(Mutex::new(receiver)),
+        })
+    }
+
     pub fn state(&self) -> HostState {
         self.worker.state()
     }
