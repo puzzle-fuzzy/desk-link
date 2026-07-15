@@ -4,6 +4,7 @@ import Foundation
 enum SecureConnectionSettingsError: LocalizedError, Equatable {
     case missing(String)
     case invalidHex(String, expectedBytes: Int)
+    case invalidSavedHost
     case rejectedPairingInvite(Int32)
 
     var errorDescription: String? {
@@ -12,6 +13,8 @@ enum SecureConnectionSettingsError: LocalizedError, Equatable {
             "Missing required environment variable \(name)."
         case let .invalidHex(name, expectedBytes):
             "\(name) must contain exactly \(expectedBytes * 2) hexadecimal characters."
+        case .invalidSavedHost:
+            "The saved host record is invalid."
         case let .rejectedPairingInvite(code):
             "The signed pairing invitation was rejected (code \(code))."
         }
@@ -23,6 +26,24 @@ struct SecureConnectionSettings: Equatable {
     let sessionID: [UInt8]
     let relayAuthentication: [UInt8]
     let hostVerifyKey: [UInt8]
+
+    init(savedHost: SavedHost) throws {
+        guard savedHost.isValid else { throw SecureConnectionSettingsError.invalidSavedHost }
+        serverName = savedHost.serverName
+        sessionID = savedHost.sessionID
+        relayAuthentication = savedHost.relayAuthentication
+        hostVerifyKey = savedHost.hostVerifyKey
+    }
+
+    var savedHost: SavedHost {
+        SavedHost(
+            id: UUID(),
+            serverName: serverName,
+            sessionID: sessionID,
+            relayAuthentication: relayAuthentication,
+            hostVerifyKey: hostVerifyKey
+        )
+    }
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment) throws {
         serverName = environment["DESKLINK_RELAY_SERVER_NAME"] ?? "localhost"

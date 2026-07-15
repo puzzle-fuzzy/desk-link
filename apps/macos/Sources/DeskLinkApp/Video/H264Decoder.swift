@@ -238,7 +238,9 @@ final class H264Decoder {
     }
 
     private func accept(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
-        guard frameID >= lastFrameID else { return }
+        // Asynchronous callbacks can arrive after a newer access unit was accepted.
+        // Displaying only the current frame prevents old decoded output from regressing video.
+        guard frameID == lastFrameID else { return }
         latestPixelBuffer = pixelBuffer
         onFrame?(pixelBuffer)
     }

@@ -1,4 +1,5 @@
 import CoreGraphics
+import AppKit
 import XCTest
 @testable import DeskLinkApp
 
@@ -17,5 +18,26 @@ final class InputMapperTests: XCTestCase {
         let mapper = InputMapper(videoRect: .zero, modifierMode: .automatic)
 
         XCTAssertEqual(mapper.remoteModifier(for: .command), .control)
+    }
+
+    func testKeyboardMapperPreservesUnicodeAndModifierFlags() {
+        XCTAssertEqual(KeyboardMapper.map(
+            keyCode: 0x24,
+            characters: "中",
+            modifiers: [.command, .shift],
+            isDown: true
+        ), [
+            .key(code: 0x24, pressed: true, modifiers: [.meta, .shift]),
+            .unicode("中", modifiers: [.meta, .shift]),
+        ])
+    }
+
+    func testKeyboardMapperDoesNotSendUnicodeForKeyUp() {
+        XCTAssertEqual(KeyboardMapper.map(
+            keyCode: 0x24,
+            characters: "中",
+            modifiers: [.command],
+            isDown: false
+        ), [.key(code: 0x24, pressed: false, modifiers: [.meta])])
     }
 }
