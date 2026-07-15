@@ -343,10 +343,10 @@ unsafe extern "system" fn connection_dialog_proc(
     if message == WM_INITDIALOG {
         let state = lparam.0 as *mut DialogState<'_>;
         unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, state as isize) };
-        if !state.is_null() {
-            if let Err(error) = unsafe { (&*state).initialize(dialog) } {
-                let _ = set_control_text(dialog, CONTROL_FEEDBACK, &error.to_string());
-            }
+        if !state.is_null()
+            && let Err(error) = unsafe { (&*state).initialize(dialog) }
+        {
+            let _ = set_control_text(dialog, CONTROL_FEEDBACK, &error.to_string());
         }
         return 1;
     }

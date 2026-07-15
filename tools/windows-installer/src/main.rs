@@ -1,11 +1,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(all(windows, feature = "embedded-payload"))]
-const APPLICATION_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_UI_PAYLOAD"));
+const APPLICATION_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_UI_PAYLOAD_RESOLVED"));
 #[cfg(all(windows, not(feature = "embedded-payload")))]
 const APPLICATION_PAYLOAD: &[u8] = &[];
 #[cfg(all(windows, feature = "embedded-payload"))]
-const HOST_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_HOST_PAYLOAD"));
+const HOST_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_HOST_PAYLOAD_RESOLVED"));
 #[cfg(all(windows, not(feature = "embedded-payload")))]
 const HOST_PAYLOAD: &[u8] = &[];
 

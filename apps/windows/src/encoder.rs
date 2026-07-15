@@ -73,8 +73,8 @@ pub fn convert_to_nv12(
         || source_height == 0
         || target_width < 2
         || target_height < 2
-        || target_width % 2 != 0
-        || target_height % 2 != 0
+        || !target_width.is_multiple_of(2)
+        || !target_height.is_multiple_of(2)
     {
         return Err(EncoderError::InvalidDimensions);
     }
@@ -217,8 +217,9 @@ impl H264Encoder {
         {
             let nv12 = native::frame_to_nv12(&frame, self.width, self.height)?;
             let next_frame_id = self.frame_id.wrapping_add(1).max(1);
-            let request_keyframe =
-                force_keyframe || next_frame_id == 1 || next_frame_id % u64::from(self.fps) == 0;
+            let request_keyframe = force_keyframe
+                || next_frame_id == 1
+                || next_frame_id.is_multiple_of(u64::from(self.fps));
             let output = self
                 .backend
                 .encode(&nv12, frame.timestamp_us, request_keyframe)?;

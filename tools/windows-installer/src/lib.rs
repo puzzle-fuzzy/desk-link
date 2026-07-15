@@ -53,43 +53,45 @@ mod tests {
 
     #[test]
     fn per_user_layout_separates_program_files_from_preserved_data() {
-        let layout = InstallLayout::from_user_roots(
-            Path::new(r"C:\Users\Owner\AppData\Local"),
-            Path::new(r"C:\Users\Owner\AppData\Roaming"),
-        );
+        let local = Path::new("user-local");
+        let roaming = Path::new("user-roaming");
+        let layout = InstallLayout::from_user_roots(local, roaming);
         assert_eq!(
             layout.application,
-            PathBuf::from(r"C:\Users\Owner\AppData\Local\Programs\DeskLink\DeskLink.exe")
+            local.join("Programs").join("DeskLink").join("DeskLink.exe")
         );
         assert_eq!(
             layout.host,
-            PathBuf::from(r"C:\Users\Owner\AppData\Local\Programs\DeskLink\desklink-windows.exe")
+            local
+                .join("Programs")
+                .join("DeskLink")
+                .join("desklink-windows.exe")
         );
-        assert_eq!(
-            layout.data_directory,
-            PathBuf::from(r"C:\Users\Owner\AppData\Local\DeskLink")
-        );
+        assert_eq!(layout.data_directory, local.join("DeskLink"));
         assert!(!layout.data_directory.starts_with(&layout.install_directory));
-        assert!(
-            layout
-                .start_menu_shortcut
-                .ends_with(r"Start Menu\Programs\DeskLink.lnk")
+        assert_eq!(
+            layout.start_menu_shortcut,
+            roaming
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("DeskLink.lnk")
         );
     }
 
     #[test]
     fn startup_and_uninstall_commands_quote_paths_and_contain_no_credentials() {
-        let layout = InstallLayout::from_user_roots(
-            Path::new(r"C:\Users\Desk Link\AppData\Local"),
-            Path::new(r"C:\Users\Desk Link\AppData\Roaming"),
-        );
+        let local = Path::new("Desk Link").join("Local Data");
+        let roaming = Path::new("Desk Link").join("Roaming Data");
+        let layout = InstallLayout::from_user_roots(&local, &roaming);
         assert_eq!(
             layout.startup_command(),
-            r#""C:\Users\Desk Link\AppData\Local\Programs\DeskLink\DeskLink.exe" --startup"#
+            format!("\"{}\" --startup", layout.application.display())
         );
         assert_eq!(
             layout.uninstall_command(),
-            r#""C:\Users\Desk Link\AppData\Local\Programs\DeskLink\DeskLinkUninstall.exe" --uninstall"#
+            format!("\"{}\" --uninstall", layout.uninstaller.display())
         );
         assert!(!layout.startup_command().contains("AUTH_KEY"));
         assert!(!layout.startup_command().contains("PAIRING"));
