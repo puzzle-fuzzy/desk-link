@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>DeskLink</string>
+	<key>CFBundleExecutable</key>
+	<string>DeskLinkApp</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.desklink.desktop</string>
 	<key>CFBundleName</key>
@@ -12,10 +14,19 @@
 	<string>APPL</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>LSMinimumSystemVersionByArchitecture</key>
+	<dict>
+		<key>arm64</key>
+		<string>13.0</string>
+	</dict>
+	<key>LSRequiresNativeExecution</key>
+	<true/>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>DeskLink uses Accessibility permission only to apply remote keyboard, pointer, click, and scroll input after you approve a controller.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>DeskLink uses the camera only when a future camera-sharing feature is enabled.</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>DeskLink needs screen recording permission to display the remote desktop.</string>
+	<string>DeskLink needs Screen Recording permission to share this Mac’s display with a controller you explicitly approve.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>DeskLink does not capture microphone input in the first release.</string>
 </dict>

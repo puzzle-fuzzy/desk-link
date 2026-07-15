@@ -20,10 +20,14 @@ let package = Package(
             dependencies: ["DeskLinkC"],
             path: "Sources/DeskLinkApp",
             linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
+                .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("Security"),
                 .linkedFramework("VideoToolbox"),
                 .unsafeFlags([
