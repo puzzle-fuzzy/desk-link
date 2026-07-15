@@ -28,3 +28,13 @@ Result: focused host test passed; full Swift suite passed with 29 tests and 0 fa
 ## Concern
 
 The linked Rust FFI release archive still emits the existing deployment-target warnings (built for macOS 26.5 while the Swift package targets macOS 13/14). No Rust or C ABI files were changed. Also, the protected Task 5 `ControllerBridge` does not expose its current decoder config version, so diagnostics deliberately shows that config ID as not announced instead of fabricating one.
+
+## Final review fixes
+
+- Permission checks now gate both capture and input, refresh when the app becomes active, and actively stop a connected host when Screen Recording or Accessibility is revoked.
+- Revoking the active trusted controller now stops the host runtime; terminal controller errors disconnect and clear decoder/display/input state.
+- Host and controller callbacks carry lifecycle generations, preventing queued callbacks from a stopped runtime from changing UI state after teardown.
+- Application termination releases controller input and disconnects the controller before awaiting host capture/encoder/runtime cleanup.
+- Host stop now invalidates callbacks, disables input, releases local input, and enters `.stopping` synchronously; active-controller revocation waits for shutdown before deleting its trust record.
+- Approval UI now shows the non-secret controller device ID, fingerprint, and current invitation expiry.
+- The production host startup path now creates its initial QUIC client inside the persistent host worker runtime, so the inbound transport reader remains alive after startup returns.
