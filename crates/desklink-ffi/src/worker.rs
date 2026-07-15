@@ -22,6 +22,7 @@ use crate::{
 };
 
 const COMMAND_CAPACITY: usize = 1_024;
+const RELEASE_RESERVE: usize = 1;
 const PHASE_CONNECTING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
@@ -47,6 +48,7 @@ impl Drop for SecureConnectionConfigOwned {
 #[derive(Debug)]
 pub(crate) enum ControllerCommand {
     SendInput(InputEvent),
+    ReleaseAll(Vec<InputEvent>),
     RequestKeyframe,
     Shutdown,
 }
@@ -105,7 +107,6 @@ impl CallbackTarget {
 
 pub(crate) struct ControllerWorker {
     commands: mpsc::Sender<ControllerCommand>,
-    release_commands: mpsc::UnboundedSender<Vec<InputEvent>>,
     cancellation: watch::Sender<bool>,
     phase: Arc<AtomicU8>,
     thread: Option<thread::JoinHandle<()>>,
@@ -119,8 +120,7 @@ impl ControllerWorker {
         callback_context: *mut std::ffi::c_void,
         material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, std::io::Error> {
-        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-        let (release_commands, release_receiver) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY + RELEASE_RESERVE);
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let phase = Arc::new(AtomicU8::new(PHASE_CONNECTING));
         let worker_phase = phase.clone();
@@ -141,7 +141,6 @@ impl ControllerWorker {
                         relay_url,
                         config,
                         receiver,
-                        release_receiver,
                         cancellation_receiver,
                         worker_phase.clone(),
                         callback,
@@ -153,7 +152,6 @@ impl ControllerWorker {
             })?;
         Ok(Self {
             commands,
-            release_commands,
             cancellation,
             phase,
             thread: Some(thread),
@@ -161,11 +159,16 @@ impl ControllerWorker {
     }
 
     pub(crate) fn send(&self, command: ControllerCommand) -> Result<(), ()> {
+        if self.commands.capacity() <= RELEASE_RESERVE {
+            return Err(());
+        }
         self.commands.try_send(command).map_err(|_| ())
     }
 
     pub(crate) fn release_all(&self, events: Vec<InputEvent>) -> Result<(), ()> {
-        self.release_commands.send(events).map_err(|_| ())
+        self.commands
+            .try_send(ControllerCommand::ReleaseAll(events))
+            .map_err(|_| ())
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -198,7 +201,6 @@ async fn run_worker(
     relay_url: String,
     config: SecureConnectionConfigOwned,
     mut commands: mpsc::Receiver<ControllerCommand>,
-    mut release_commands: mpsc::UnboundedReceiver<Vec<InputEvent>>,
     mut cancellation: watch::Receiver<bool>,
     phase: Arc<AtomicU8>,
     callback: CallbackTarget,
@@ -206,6 +208,7 @@ async fn run_worker(
 ) {
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
+    let mut pending_release: Option<Vec<InputEvent>> = None;
     loop {
         if !first_attempt && let Some(invalidate) = &material_invalidator {
             invalidate();
@@ -229,6 +232,7 @@ async fn run_worker(
                         false,
                         &mut schedule,
                         &mut commands,
+                        &mut pending_release,
                         &mut cancellation,
                         callback,
                     ).await {
@@ -248,7 +252,7 @@ async fn run_worker(
         match run_connected(
             controller,
             &mut commands,
-            &mut release_commands,
+            &mut pending_release,
             &mut cancellation,
             callback,
         )
@@ -268,6 +272,7 @@ async fn run_worker(
                     stable,
                     &mut schedule,
                     &mut commands,
+                    &mut pending_release,
                     &mut cancellation,
                     callback,
                 )
@@ -340,16 +345,27 @@ enum ConnectedOutcome {
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
-    release_commands: &mut mpsc::UnboundedReceiver<Vec<InputEvent>>,
+    pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
 ) -> ConnectedOutcome {
     let mut stable = false;
+    if let Some(events) = pending_release.take() {
+        for event in events {
+            if let Err(error) = controller.send_input(event).await {
+                return ConnectedOutcome::Failed {
+                    failure: ConnectFailure::from_controller(error),
+                    stream_id: controller.active_stream_id().unwrap_or(0),
+                    stable,
+                };
+            }
+        }
+    }
     loop {
         tokio::select! {
             biased;
-            release = release_commands.recv() => match release {
-                Some(events) => {
+            command = commands.recv() => match command {
+                Some(ControllerCommand::ReleaseAll(events)) => {
                     for event in events {
                         if let Err(error) = controller.send_input(event).await {
                             return ConnectedOutcome::Failed {
@@ -360,11 +376,6 @@ async fn run_connected(
                         }
                     }
                 }
-                None => return ConnectedOutcome::Shutdown {
-                    stream_id: controller.active_stream_id().unwrap_or(0),
-                },
-            },
-            command = commands.recv() => match command {
                 Some(ControllerCommand::SendInput(event)) => {
                     if let Err(error) = controller.send_input(event).await {
                         return ConnectedOutcome::Failed {
@@ -434,6 +445,7 @@ async fn schedule_retry(
     stable: bool,
     schedule: &mut ReconnectSchedule,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
 ) -> bool {
@@ -457,7 +469,7 @@ async fn schedule_retry(
                 0,
                 DesklinkState::Reconnecting,
             );
-            wait_for_retry(delay, commands, cancellation).await
+            wait_for_retry(delay, commands, pending_release, cancellation).await
         }
         ReconnectDecision::Exhausted => {
             callback.emit_error(
@@ -480,6 +492,7 @@ async fn schedule_retry(
 async fn wait_for_retry(
     delay: Duration,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
 ) -> bool {
     if *cancellation.borrow() {
@@ -491,6 +504,13 @@ async fn wait_for_retry(
         tokio::select! {
             biased;
             command = commands.recv() => match command {
+                Some(ControllerCommand::ReleaseAll(events)) => {
+                    if let Some(pending) = pending_release {
+                        pending.extend(events);
+                    } else {
+                        *pending_release = Some(events);
+                    }
+                }
                 Some(ControllerCommand::SendInput(_))
                 | Some(ControllerCommand::RequestKeyframe) => {}
                 Some(ControllerCommand::Shutdown) | None => return false,
@@ -678,14 +698,31 @@ mod tests {
     async fn retry_wait_discards_stale_commands_and_honors_cancellation() {
         let (sender, mut commands) = mpsc::channel(4);
         let (cancellation_sender, mut cancellation) = watch::channel(false);
+        let mut pending_release = None;
         sender
             .send(ControllerCommand::RequestKeyframe)
             .await
             .unwrap();
-        assert!(wait_for_retry(Duration::from_millis(1), &mut commands, &mut cancellation).await);
+        assert!(
+            wait_for_retry(
+                Duration::from_millis(1),
+                &mut commands,
+                &mut pending_release,
+                &mut cancellation,
+            )
+            .await
+        );
         assert!(commands.try_recv().is_err());
 
         cancellation_sender.send(true).unwrap();
-        assert!(!wait_for_retry(Duration::from_secs(30), &mut commands, &mut cancellation).await);
+        assert!(
+            !wait_for_retry(
+                Duration::from_secs(30),
+                &mut commands,
+                &mut pending_release,
+                &mut cancellation,
+            )
+            .await
+        );
     }
 }
