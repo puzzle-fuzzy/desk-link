@@ -188,6 +188,23 @@ pub enum KeyCode {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Function(u8),
+    CapsLock,
+}
+impl KeyCode {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Character(character) => !character.is_control(),
+            Self::Function(number) => (1..=12).contains(number),
+            _ => true,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct Modifiers(pub u8);

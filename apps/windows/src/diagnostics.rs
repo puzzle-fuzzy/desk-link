@@ -26,7 +26,7 @@ const MAX_REPORT_CHARS: usize = 256 * 1024;
 pub enum DiagnosticOperation {
     TrustedControllersRefresh,
     ControllerRevocation,
-    LocalRelayStartup,
+    ConnectionMigration,
     RelayProbe,
     DiagnosticExport,
 }
@@ -38,8 +38,8 @@ impl DiagnosticOperation {
             (Self::TrustedControllersRefresh, false) => "trusted_controllers_refresh_failed",
             (Self::ControllerRevocation, true) => "controller_revoked",
             (Self::ControllerRevocation, false) => "controller_revocation_failed",
-            (Self::LocalRelayStartup, true) => "local_relay_started",
-            (Self::LocalRelayStartup, false) => "local_relay_startup_failed",
+            (Self::ConnectionMigration, true) => "connection_migration_succeeded",
+            (Self::ConnectionMigration, false) => "connection_migration_failed",
             (Self::RelayProbe, true) => "relay_probe_succeeded",
             (Self::RelayProbe, false) => "relay_probe_failed",
             (Self::DiagnosticExport, true) => "diagnostic_report_exported",

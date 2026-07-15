@@ -271,6 +271,11 @@ fn input_round_trips_wheel_and_explicit_modifiers() {
             pressed: true,
             modifiers: Modifiers::CONTROL | Modifiers::SHIFT,
         },
+        InputEvent::Key {
+            code: desklink_protocol::KeyCode::Function(12),
+            pressed: false,
+            modifiers: Modifiers::default(),
+        },
     ];
     for (index, event) in cases.into_iter().enumerate() {
         let envelope = InputEnvelope {
@@ -300,6 +305,16 @@ fn input_rejects_out_of_bounds_pointer_wheel_and_modifier_values() {
             code: desklink_protocol::KeyCode::Enter,
             pressed: true,
             modifiers: Modifiers(0x80),
+        },
+        InputEvent::Key {
+            code: desklink_protocol::KeyCode::Function(13),
+            pressed: true,
+            modifiers: Modifiers::default(),
+        },
+        InputEvent::Key {
+            code: desklink_protocol::KeyCode::Character('\0'),
+            pressed: true,
+            modifiers: Modifiers::default(),
         },
     ];
     for (index, event) in invalid_events.into_iter().enumerate() {

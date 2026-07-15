@@ -43,7 +43,9 @@ LABEL org.opencontainers.image.title="DeskLink Relay" \
 COPY --from=builder /src/target/release/desklink-relay /usr/local/bin/desklink-relay
 
 ENV DESKLINK_RELAY_ADDR="0.0.0.0:4433" \
-    DESKLINK_RELAY_SESSION_TTL_S="86400"
+    DESKLINK_RELAY_SESSION_TTL_S="86400" \
+    DESKLINK_RELAY_MAX_CONNECTIONS="512" \
+    DESKLINK_RELAY_MAX_SESSIONS="256"
 
 EXPOSE 4433/udp
 

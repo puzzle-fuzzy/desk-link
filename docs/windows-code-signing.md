@@ -1,12 +1,11 @@
 # Windows 代码签名
 
-DeskLink 的发布构建会按正确顺序处理三个内层/外层可执行文件：
+DeskLink 的发布构建会按正确顺序处理应用与安装器两个可执行文件：
 
 1. 构建并签名现代入口 `DeskLink.exe`；
-2. 构建并签名配对辅助程序 `desklink-windows.exe`；
-3. 把两个已签名的应用嵌入单文件安装器；
-4. 构建并签名最终 `DeskLinkSetup-<version>-x64.exe`；
-5. 对每个签名执行 Authenticode 发布策略和时间戳验证。
+2. 把已签名应用嵌入单文件安装器；
+3. 构建并签名最终 `DeskLinkSetup-<version>-x64.exe`；
+4. 对两个签名执行 Authenticode 发布策略和时间戳验证。
 
 没有配置签名身份时，`python scripts/build-windows-installer.py` 仍会生成明确标记为 `unsigned` 的本地测试包。发布包不应跳过签名。
 

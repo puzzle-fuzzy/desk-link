@@ -11,6 +11,8 @@ services:
       DESKLINK_RELAY_CERT_PEM: /run/desklink/tls/fullchain.pem
       DESKLINK_RELAY_KEY_PEM: /run/desklink/tls/privkey.pem
       DESKLINK_RELAY_SESSION_TTL_S: "86400"
+      DESKLINK_RELAY_MAX_CONNECTIONS: "512"
+      DESKLINK_RELAY_MAX_SESSIONS: "256"
     ports:
       - target: 4433
         published: "4433"

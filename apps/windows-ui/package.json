@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:desktop": "tauri build --no-bundle --features custom-protocol",
     "test": "bun test",
+    "verify:release": "python ../../scripts/verify-windows-release.py",
     "preview": "vite preview",
     "tauri": "tauri"
   },

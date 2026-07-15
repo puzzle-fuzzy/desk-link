@@ -17,6 +17,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 const DEFAULT_SESSION_TTL_S: u64 = 86_400;
 const MIN_SESSION_TTL_S: u64 = 60;
 const MAX_SESSION_TTL_S: u64 = 2_592_000;
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+const DEFAULT_MAX_SESSIONS: usize = 1_024;
+const MAX_CONFIGURED_LIMIT: usize = 100_000;
 
 fn development_server_config() -> Result<ServerConfig, Box<dyn Error + Send + Sync>> {
     let server_name =
@@ -91,10 +94,47 @@ fn relay_config() -> Result<RelayConfig, Box<dyn Error + Send + Sync>> {
         )
         .into());
     }
+    let max_connections = bounded_limit(
+        "DESKLINK_RELAY_MAX_CONNECTIONS",
+        env::var("DESKLINK_RELAY_MAX_CONNECTIONS").ok().as_deref(),
+        DEFAULT_MAX_CONNECTIONS,
+    )?;
+    let max_sessions = bounded_limit(
+        "DESKLINK_RELAY_MAX_SESSIONS",
+        env::var("DESKLINK_RELAY_MAX_SESSIONS").ok().as_deref(),
+        DEFAULT_MAX_SESSIONS,
+    )?;
     Ok(RelayConfig {
         session_ttl: Duration::from_secs(session_ttl_s),
+        max_connections,
+        max_sessions,
         ..RelayConfig::default()
     })
+}
+
+fn bounded_limit(
+    name: &str,
+    value: Option<&str>,
+    default: usize,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let value = value
+        .map(str::parse::<usize>)
+        .transpose()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be an integer between 1 and {MAX_CONFIGURED_LIMIT}"),
+            )
+        })?
+        .unwrap_or(default);
+    if !(1..=MAX_CONFIGURED_LIMIT).contains(&value) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be between 1 and {MAX_CONFIGURED_LIMIT}"),
+        )
+        .into());
+    }
+    Ok(value)
 }
 
 fn relay_address() -> Result<SocketAddr, Box<dyn Error + Send + Sync>> {
@@ -121,4 +161,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     eprintln!("DeskLink relay listening on {}", relay.local_addr()?);
     relay.run().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_limit;
+
+    #[test]
+    fn configured_limits_are_bounded_and_have_a_default() {
+        assert_eq!(bounded_limit("LIMIT", None, 128).unwrap(), 128);
+        assert_eq!(bounded_limit("LIMIT", Some("512"), 128).unwrap(), 512);
+        assert!(bounded_limit("LIMIT", Some("0"), 128).is_err());
+        assert!(bounded_limit("LIMIT", Some("100001"), 128).is_err());
+        assert!(bounded_limit("LIMIT", Some("many"), 128).is_err());
+    }
 }

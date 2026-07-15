@@ -1,29 +1,30 @@
-use std::{env, error::Error, io, net::SocketAddr, time::Duration};
+use std::{env, error::Error, io, net::SocketAddr, time::Instant};
 
 use desklink_transport::{QuicClient, QuicClientConfig};
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut arguments = env::args().skip(1);
     let relay_address = arguments
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "缺少中继 IP:端口"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing relay IP:port"))?
         .parse::<SocketAddr>()?;
     let server_name = arguments
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "缺少 TLS 服务器名称"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing TLS server name"))?;
     if arguments.next().is_some() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "参数过多").into());
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "unexpected extra argument").into(),
+        );
     }
 
-    let config = QuicClientConfig::new(relay_address, server_name.clone())?;
-    let client = tokio::time::timeout(PROBE_TIMEOUT, QuicClient::connect(config))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC/TLS 握手超时"))??;
+    let started = Instant::now();
+    let client =
+        QuicClient::connect(QuicClientConfig::new(relay_address, server_name.clone())?).await?;
     drop(client);
-
-    println!("中继连接成功：{relay_address}，TLS 服务器名称：{server_name}");
+    println!(
+        "DeskLink relay TLS/QUIC probe passed: {relay_address} ({server_name}) in {} ms",
+        started.elapsed().as_millis().max(1)
+    );
     Ok(())
 }

@@ -119,7 +119,9 @@ fn validate_input(input: &InputEnvelope) -> Result<(), ProtocolError> {
                 (0..=MAX_POINTER_COORDINATE).contains(x) && (0..=MAX_POINTER_COORDINATE).contains(y)
             }
             InputEvent::MouseButton { .. } => true,
-            InputEvent::Key { modifiers, .. } => modifiers.is_valid(),
+            InputEvent::Key {
+                code, modifiers, ..
+            } => code.is_valid() && modifiers.is_valid(),
             InputEvent::MouseWheel { delta_x, delta_y } => {
                 (*delta_x != 0 || *delta_y != 0)
                     && (-MAX_WHEEL_DELTA..=MAX_WHEEL_DELTA).contains(delta_x)

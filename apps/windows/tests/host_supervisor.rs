@@ -332,7 +332,7 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn occupied_session_exhausts_retry_budget_and_honors_pairing_expiry() {
+    async fn occupied_normal_session_keeps_recovering_while_pairing_honors_expiry() {
         let tls = TestTls::new();
         let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let session_id = SessionId::from_bytes([131; 16]);
@@ -346,23 +346,27 @@ mod windows {
             .unwrap();
         let host = DeviceIdentity::from_secret_key([133; 16], &[134; 32]);
         let controller = DeviceIdentity::from_secret_key([135; 16], &[136; 32]);
-        let result = supervisor(
-            tls.client_config(relay.address),
-            session_id,
-            authentication,
-            host,
-            controller.verify_key(),
-            None,
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            supervisor(
+                tls.client_config(relay.address),
+                session_id,
+                authentication,
+                host,
+                controller.verify_key(),
+                None,
+            )
+            .with_reconnect_policy(
+                ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(1), 2)
+                    .unwrap(),
+            )
+            .run(),
         )
-        .with_reconnect_policy(
-            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(1), 2).unwrap(),
-        )
-        .run()
         .await;
-        assert!(matches!(
-            result,
-            Err(HostSupervisorError::RetryBudgetExhausted { retries: 2, .. })
-        ));
+        assert!(
+            result.is_err(),
+            "normal hosting must keep retrying after one budget window"
+        );
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

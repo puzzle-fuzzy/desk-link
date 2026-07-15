@@ -6,8 +6,6 @@ fn main() {
     println!("cargo:rerun-if-changed=../../apps/windows/assets/desklink.ico");
     println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_UI_PAYLOAD");
     println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_UI_PAYLOAD_SHA256");
-    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_HOST_PAYLOAD");
-    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_HOST_PAYLOAD_SHA256");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -16,11 +14,6 @@ fn main() {
             "DESKLINK_WINDOWS_UI_PAYLOAD",
             "DESKLINK_WINDOWS_UI_PAYLOAD_RESOLVED",
             "desklink-ui-payload.empty",
-        );
-        resolve_payload(
-            "DESKLINK_WINDOWS_HOST_PAYLOAD",
-            "DESKLINK_WINDOWS_HOST_PAYLOAD_RESOLVED",
-            "desklink-host-payload.empty",
         );
     }
     embed_resource::compile_for(

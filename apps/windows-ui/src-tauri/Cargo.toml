@@ -28,13 +28,9 @@ apps-windows = { package = "desklink-windows", path = "../../windows" }
 desklink-crypto.workspace = true
 desklink-ffi.workspace = true
 desklink-protocol.workspace = true
-desklink-relay = { path = "../../../server/relay" }
 desklink-session.workspace = true
 desklink-transport.workspace = true
-quinn.workspace = true
 rand_core.workspace = true
-rcgen.workspace = true
-rustls.workspace = true
 serde.workspace = true
 tauri = { version = "2.11.5", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2.4.3"

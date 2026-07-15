@@ -8,6 +8,7 @@ import {
   getHostSnapshot,
   revokeTrustedController,
   saveConnectionSettings,
+  setupManagedConnection,
   startPairingSession,
 } from "./api";
 import type {
@@ -24,7 +25,14 @@ import {
   prepareControllerRender,
   renderControllerView,
 } from "./controller";
-import { pairingCodeWithRelayAddress, parsePairingCode } from "./pairing-code";
+import {
+  MANAGED_RELAY_ADDRESS,
+  MANAGED_RELAY_SERVER_NAME,
+  isManagedRelay,
+} from "./product-config";
+import { nextTabIndex } from "./navigation";
+import { LatestRequest } from "./latest-request";
+import { escapeHtml } from "./html";
 
 type View = "overview" | "controller" | "connection" | "devices" | "pairing";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -40,24 +48,16 @@ let activeView: View = "overview";
 let renderedView: View | null = null;
 let loading = true;
 let saving = false;
+let managedSetupBusy = false;
 let pairingBusy = false;
 let pairingSession: PairingSessionSummary | null = null;
-let pairingRelayAddress: string | null = null;
 let diagnosticExportBusy = false;
 let lastDiagnosticExport: DiagnosticExportResult | null = null;
 let revokingFingerprint: string | null = null;
 let feedback: Feedback = null;
 let connectionDraft: ConnectionSettingsInput | null = null;
 let connectionAdvancedOpen = false;
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
+const snapshotRequests = new LatestRequest();
 
 function render(): void {
   const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
@@ -112,15 +112,17 @@ function renderNavigation(): string {
     { id: "devices", label: "已批准设备" },
   ];
   return `
-    <nav class="section-nav" aria-label="DeskLink 功能导航">
+    <nav class="section-nav" aria-label="DeskLink 功能导航" role="tablist">
       ${items
         .map(
           ({ id, label }) => `
             <button
               class="nav-item ${activeNavigationView === id ? "nav-item--active" : ""}"
               type="button"
+              role="tab"
               data-view="${id}"
-              ${activeNavigationView === id ? 'aria-current="page"' : ""}
+              aria-selected="${activeNavigationView === id}"
+              ${activeNavigationView === id ? 'tabindex="0"' : 'tabindex="-1"'}
             >${label}</button>
           `,
         )
@@ -184,12 +186,11 @@ function renderFatalState(): string {
 
 function renderOverview(state: HostSnapshot): string {
   const connection = state.connection;
-  const connectionMode =
-    state.relayStatus.mode === "lan"
-      ? { value: "同一局域网", detail: "另一台电脑与本机连接同一网络" }
-      : state.relayStatus.mode === "external"
-        ? { value: "外部中继", detail: connection?.serverName ?? "使用自建中继服务器" }
-        : { value: "未配置", detail: "请先保存本机连接" };
+  const connectionMode = connection
+    ? isManagedRelay(connection.relayAddress, connection.serverName)
+      ? { value: "DeskLink 公网中继", detail: "支持两台电脑位于不同网络" }
+      : { value: "自建中继", detail: connection.serverName }
+    : { value: "未配置", detail: "请先启用远程连接" };
   const metrics = [
     {
       label: "连接方式",
@@ -220,9 +221,12 @@ function renderOverview(state: HostSnapshot): string {
         </div>
         <div class="status-actions">
           ${connection ? renderPairingAction(state, state.trustedControllers.length > 0 ? "primary" : "secondary") : ""}
-          <button class="button button--${connection ? "secondary" : "primary"}" type="button" data-open-connection>
-            ${connection ? "连接设置" : "设置本机连接"}
-          </button>
+          ${
+            connection
+              ? '<button class="button button--secondary" type="button" data-open-connection>连接设置</button>'
+              : `<button class="button button--primary" type="button" data-setup-managed ${managedSetupBusy ? "disabled" : ""} ${managedSetupBusy ? 'aria-busy="true"' : ""}>${managedSetupBusy ? "正在启用…" : "启用远程连接"}</button>
+                 <button class="button button--secondary" type="button" data-open-connection ${managedSetupBusy ? "disabled" : ""}>高级设置</button>`
+          }
           <button class="button button--secondary" type="button" data-refresh>刷新状态</button>
         </div>
       </section>
@@ -274,31 +278,24 @@ function renderNextStep(state: HostSnapshot): string {
   if (state.trustedControllers.length > 0) {
     return "";
   }
-  const relayUnavailable =
-    state.relayStatus.mode === "lan" &&
-    (state.relayStatus.state === "failed" || state.relayStatus.state === "offline");
   const approvalStoreUnavailable = Boolean(state.trustedError);
   const stage = !state.connection ? 1 : state.pairingActive ? 3 : 2;
   const title = !state.connection
-    ? "先保存这台电脑的连接"
+    ? "启用这台电脑的远程连接"
     : approvalStoreUnavailable
       ? "先恢复已批准设备列表"
-    : relayUnavailable
-      ? "先让这台电脑可以被找到"
-      : state.pairingActive
+    : state.pairingActive
         ? "在另一台电脑粘贴连接码"
         : "创建第一份连接码";
   const detail = !state.connection
-    ? "同一局域网通常可以直接使用默认设置，保存后再创建连接码。"
+    ? "DeskLink 会生成受保护的连接凭据并使用已部署的公网中继，无需填写网络参数。"
     : approvalStoreUnavailable
       ? "DeskLink 暂时无法安全读取已批准设备，请重新读取本机状态后再创建连接码。"
-    : relayUnavailable
-      ? "请确认本机已连接 Wi-Fi 或网线，然后刷新状态。"
-      : state.pairingActive
+    : state.pairingActive
         ? "打开另一台电脑的“控制另一台”页面，粘贴完整连接码并请求批准。"
-        : "连接码会包含本机局域网地址，另一台电脑完整粘贴后会自动填写。";
-  const action = !state.connection || relayUnavailable
-    ? '<button class="button button--primary" type="button" data-open-connection>检查本机连接</button>'
+        : "连接码会包含中继地址和一次性凭据，另一台电脑完整粘贴后会自动填写。";
+  const action = !state.connection
+    ? `<button class="button button--primary" type="button" data-setup-managed ${managedSetupBusy ? "disabled" : ""}>${managedSetupBusy ? "正在启用…" : "启用远程连接"}</button>`
     : approvalStoreUnavailable
       ? '<button class="button button--primary" type="button" data-refresh>重新读取本机状态</button>'
     : state.pairingActive
@@ -312,7 +309,7 @@ function renderNextStep(state: HostSnapshot): string {
         <p>${detail}</p>
       </div>
       <ol class="setup-progress" aria-label="首次连接进度">
-        <li class="${stage > 1 ? "is-complete" : "is-current"}"><span>1</span><strong>保存本机连接</strong></li>
+        <li class="${stage > 1 ? "is-complete" : "is-current"}"><span>1</span><strong>启用远程连接</strong></li>
         <li class="${stage > 2 ? "is-complete" : stage === 2 ? "is-current" : ""}"><span>2</span><strong>创建连接码</strong></li>
         <li class="${stage === 3 ? "is-current" : ""}"><span>3</span><strong>在本机批准</strong></li>
       </ol>
@@ -326,51 +323,17 @@ function renderRelayDiagnostics(state: HostSnapshot): string {
   if (relay.mode === "unconfigured") {
     return "";
   }
-  const stateLabel =
-    relay.state === "ready"
-      ? "可连接"
-      : relay.state === "starting"
-        ? "启动中"
-        : relay.state === "offline"
-          ? "网络未连接"
-          : relay.state === "failed"
-            ? "需要处理"
-            : "未运行";
-  const addresses = relay.addresses
-    .map(
-      (address) => `
-        <li>
-          <div>
-            <code>${escapeHtml(address.relayAddress)}</code>
-            <span title="${escapeHtml(address.interfaceName)}">${escapeHtml(address.interfaceName)}</span>
-          </div>
-          <small>${address.isPrimary ? "推荐地址" : "配对时可选择"}</small>
-        </li>
-      `,
-    )
-    .join("");
   return `
     <section class="relay-diagnostics" aria-labelledby="relay-diagnostics-heading">
       <div class="section-heading">
         <div>
-          <h2 id="relay-diagnostics-heading">${relay.mode === "lan" ? "局域网连接检查" : "中继连接方式"}</h2>
+          <h2 id="relay-diagnostics-heading">中继连接方式</h2>
           <p>${escapeHtml(relay.detail)}</p>
         </div>
         <span class="relay-health relay-health--${relay.state}">
-          <span aria-hidden="true"></span>${stateLabel}
+          <span aria-hidden="true"></span>已配置
         </span>
       </div>
-      ${addresses ? `<ul class="relay-address-list" aria-label="本机可用局域网地址">${addresses}</ul>` : ""}
-      ${
-        relay.mode === "lan" && relay.addresses.length > 1
-          ? '<p class="relay-advice">检测到多个网卡。创建连接码后，请选择与另一台电脑处于同一 Wi-Fi 或有线网络的地址，通常不要选择 VPN 或虚拟网卡。</p>'
-          : ""
-      }
-      ${
-        relay.mode === "lan"
-          ? '<p class="relay-advice">另一台电脑仍需允许 Windows 防火墙“专用网络”访问；部分访客 Wi-Fi 会阻止设备互相连接。</p>'
-          : ""
-      }
     </section>
   `;
 }
@@ -409,7 +372,7 @@ function renderDiagnosticSummary(state: HostSnapshot): string {
         </div>
       </div>
       <details class="diagnostic-details" ${failed > 0 ? "open" : ""}>
-        <summary>${failed > 0 ? "查看需要处理的检查" : "查看 5 项检查结果"}</summary>
+        <summary>${failed > 0 ? "查看需要处理的检查" : `查看 ${state.diagnosticChecks.length} 项检查结果`}</summary>
         <ul class="diagnostic-check-list" aria-label="双机连接检查结果">${checks}</ul>
       </details>
       ${
@@ -423,7 +386,7 @@ function renderDiagnosticSummary(state: HostSnapshot): string {
               <code title="${escapeHtml(lastDiagnosticExport.filePath)}">${escapeHtml(lastDiagnosticExport.filePath)}</code>
             </div>
           `
-          : '<p class="diagnostic-privacy">报告会自动清除会话 ID、中继密钥、公钥和完整设备身份，保留排查所需的状态、网卡和最近事件。</p>'
+          : '<p class="diagnostic-privacy">报告会自动清除会话 ID、中继密钥、公钥和完整设备身份，只保留排查所需的运行状态、中继端点和最近事件。</p>'
       }
     </section>
   `;
@@ -520,8 +483,8 @@ function renderConnection(state: HostSnapshot): string {
       <div class="connection-guidance">
         <span class="connection-guidance-mark" aria-hidden="true"></span>
         <div>
-          <strong>同一局域网可以直接使用默认设置</strong>
-          <p>只有两台电脑不在同一网络、并且你已经部署公网中继时，才需要修改下面两项。</p>
+          <strong>${state.connection && isManagedRelay(state.connection.relayAddress, state.connection.serverName) ? "正在使用 DeskLink 公网中继" : "默认使用 DeskLink 公网中继"}</strong>
+          <p>公网中继可在不同网络之间连接。只有需要使用自己维护的中继基础设施时，才修改下面两项。</p>
         </div>
       </div>
 
@@ -538,7 +501,7 @@ function renderConnection(state: HostSnapshot): string {
             spellcheck="false"
             required
           />
-          <small>同一局域网保留 127.0.0.1:4433。</small>
+          <small>默认 ${MANAGED_RELAY_ADDRESS}；自建中继必须填写控制端可以访问的 IP 与 UDP 端口。</small>
         </div>
 
         <div class="field">
@@ -553,7 +516,7 @@ function renderConnection(state: HostSnapshot): string {
             spellcheck="false"
             required
           />
-          <small>同一局域网保留 localhost；公网中继必须与证书名称一致。</small>
+          <small>默认 ${MANAGED_RELAY_SERVER_NAME}；自建中继必须与证书名称一致。</small>
         </div>
 
         <details class="advanced-settings field--wide" data-connection-advanced ${connectionAdvancedOpen ? "open" : ""}>
@@ -723,12 +686,9 @@ function renderPairingAction(
   presentation: "primary" | "secondary" | "text",
 ): string {
   const active = state.pairingActive;
-  const lanUnavailable =
-    state.relayStatus.mode === "lan" &&
-    (state.relayStatus.state === "failed" || state.relayStatus.state === "offline");
   const disabled =
     pairingBusy ||
-    (!active && (!state.connection || Boolean(state.trustedError) || lanUnavailable));
+    (!active && (!state.connection || Boolean(state.trustedError)));
   const className = presentation === "text" ? "text-button" : `button button--${presentation}`;
   const action = active ? "data-open-pairing" : "data-start-pairing";
   const label = active ? "查看连接码" : pairingBusy ? "正在创建连接码…" : "连接新电脑";
@@ -736,8 +696,6 @@ function renderPairingAction(
     ? 'title="请先保存本机连接，再创建连接码"'
     : state.trustedError
       ? 'title="已批准设备存储可用后才能创建连接码"'
-      : lanUnavailable
-        ? 'title="连接局域网并让本机中继就绪后再开始配对"'
       : "";
   return `<button class="${className}" type="button" ${action} ${disabled ? "disabled" : ""} ${title}>${label}</button>`;
 }
@@ -745,10 +703,7 @@ function renderPairingAction(
 function renderPairing(state: HostSnapshot): string {
   const session = pairingSession;
   const active = state.pairingActive;
-  const selectedRelayAddress = session ? currentPairingRelayAddress(state, session) : null;
-  const displayedInvitation = session
-    ? currentPairingInvitation(state, session)
-    : "";
+  const displayedInvitation = session?.invitation ?? "";
   return `
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
@@ -774,27 +729,6 @@ function renderPairing(state: HostSnapshot): string {
                 <strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>
               </div>
               <label class="sr-only" for="pairing-invitation">配对连接码</label>
-              ${
-                state.relayStatus.mode === "lan" && state.relayStatus.addresses.length > 0
-                  ? `
-                    <label class="pairing-network" for="pairing-network-address">
-                      <span>另一台电脑所在的网络</span>
-                      <select id="pairing-network-address" data-pairing-address ${pairingBusy ? "disabled" : ""}>
-                        ${state.relayStatus.addresses
-                          .map(
-                            (address) => `
-                              <option value="${escapeHtml(address.relayAddress)}" ${address.relayAddress === selectedRelayAddress ? "selected" : ""}>
-                                ${escapeHtml(address.relayAddress)} · ${escapeHtml(address.interfaceName)}${address.isPrimary ? "（推荐）" : ""}
-                              </option>
-                            `,
-                          )
-                          .join("")}
-                      </select>
-                      <small>如果装有 VPN 或虚拟网卡，请选择与另一台电脑处于同一局域网的地址。</small>
-                    </label>
-                  `
-                  : ""
-              }
               <textarea
                 id="pairing-invitation"
                 class="pairing-invitation"
@@ -806,7 +740,7 @@ function renderPairing(state: HostSnapshot): string {
                 <button class="button button--primary" type="button" data-copy-pairing ${pairingBusy ? "disabled" : ""}>复制连接码</button>
                 <button class="button button--secondary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>${pairingBusy ? "正在恢复主机…" : "取消配对"}</button>
               </div>
-              <p class="secret-note" id="pairing-secret-note">连接码已经包含本机地址，请只粘贴到自己的另一台 DeskLink 电脑。Windows 防火墙首次询问时，只允许“专用网络”。</p>
+              <p class="secret-note" id="pairing-secret-note">连接码包含一次性中继凭据，请只粘贴到自己的另一台 DeskLink 电脑，不要发送到公开聊天或工单。</p>
             </section>
           `
           : `
@@ -836,35 +770,10 @@ function renderPairing(state: HostSnapshot): string {
   `;
 }
 
-function currentPairingRelayAddress(
-  state: HostSnapshot,
-  session: PairingSessionSummary,
-): string | null {
-  const available = state.relayStatus.addresses.map((address) => address.relayAddress);
-  if (pairingRelayAddress && available.includes(pairingRelayAddress)) {
-    return pairingRelayAddress;
-  }
-  const packaged = parsePairingCode(session.invitation, "", "")?.relayAddress;
-  if (packaged && available.includes(packaged)) {
-    return packaged;
-  }
-  return available[0] ?? packaged ?? null;
-}
-
-function currentPairingInvitation(
-  state: HostSnapshot,
-  session: PairingSessionSummary,
-): string {
-  const relayAddress = currentPairingRelayAddress(state, session);
-  return relayAddress
-    ? pairingCodeWithRelayAddress(session.invitation, relayAddress) ?? session.invitation
-    : session.invitation;
-}
-
 function connectionToInput(connection: ConnectionSummary | null): ConnectionSettingsInput {
   return {
-    relayAddress: connection?.relayAddress ?? "127.0.0.1:4433",
-    serverName: connection?.serverName ?? "localhost",
+    relayAddress: connection?.relayAddress ?? MANAGED_RELAY_ADDRESS,
+    serverName: connection?.serverName ?? MANAGED_RELAY_SERVER_NAME,
     sessionId: connection?.sessionId ?? randomHex(16),
     relayKey: connection ? "" : randomHex(32),
     streamId: String(connection?.streamId ?? 1),
@@ -907,7 +816,10 @@ function bindInteractions(): void {
   if (activeView === "controller") {
     bindControllerInteractions();
   }
-  document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
+  const navigationButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("[data-view]"),
+  );
+  navigationButtons.forEach((button, currentIndex) => {
     button.addEventListener("click", () => {
       activeView = button.dataset.view as View;
       if (activeView === "connection") {
@@ -917,6 +829,18 @@ function bindInteractions(): void {
       feedback = null;
       render();
     });
+    button.addEventListener("keydown", (event) => {
+      const nextIndex = nextTabIndex(currentIndex, navigationButtons.length, event.key);
+      if (nextIndex === null) {
+        return;
+      }
+      event.preventDefault();
+      navigationButtons[nextIndex]?.focus();
+      navigationButtons[nextIndex]?.click();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-setup-managed]").forEach((button) => {
+    button.addEventListener("click", () => void enableManagedConnection());
   });
   document.querySelectorAll<HTMLButtonElement>("[data-refresh]").forEach((button) => {
     button.addEventListener("click", () => void refreshSnapshot());
@@ -948,14 +872,6 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-copy-pairing]")?.addEventListener("click", () => {
     void copyPairingInvitation();
-  });
-  document.querySelector<HTMLSelectElement>("[data-pairing-address]")?.addEventListener("change", (event) => {
-    const selected = (event.currentTarget as HTMLSelectElement).value;
-    if (snapshot?.relayStatus.addresses.some((address) => address.relayAddress === selected)) {
-      pairingRelayAddress = selected;
-      feedback = { tone: "info", message: "连接码已切换到所选局域网地址，请重新复制后发送到另一台电脑。" };
-      render();
-    }
   });
   document.querySelector<HTMLButtonElement>("[data-cancel-pairing]")?.addEventListener("click", () => {
     void cancelPairing();
@@ -1016,26 +932,59 @@ function bindInteractions(): void {
 }
 
 async function refreshSnapshot(showLoading = true): Promise<void> {
+  const request = snapshotRequests.begin();
   loading = showLoading;
   if (showLoading) {
     feedback = null;
     render();
   }
   try {
-    snapshot = await getHostSnapshot();
+    const nextSnapshot = await getHostSnapshot();
+    if (!snapshotRequests.isCurrent(request)) {
+      return;
+    }
+    snapshot = nextSnapshot;
     if (!snapshot.pairingActive && pairingSession) {
       pairingSession.invitation = "";
       pairingSession = null;
-      pairingRelayAddress = null;
     }
   } catch (error) {
+    if (!snapshotRequests.isCurrent(request)) {
+      return;
+    }
     snapshot = null;
     feedback = {
       tone: "error",
       message: normalizeError(error),
     };
   } finally {
+    if (!snapshotRequests.isCurrent(request)) {
+      return;
+    }
     loading = false;
+    if (showLoading || activeView !== "controller") {
+      render();
+    }
+  }
+}
+
+async function enableManagedConnection(): Promise<void> {
+  if (managedSetupBusy || snapshot?.connection) {
+    return;
+  }
+  managedSetupBusy = true;
+  feedback = { tone: "info", message: "正在生成受保护的连接凭据并启用远程连接。" };
+  render();
+  try {
+    snapshot = await setupManagedConnection();
+    feedback = {
+      tone: "success",
+      message: "远程连接已启用。现在可以创建连接码并在另一台电脑上粘贴。",
+    };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    managedSetupBusy = false;
     render();
   }
 }
@@ -1070,12 +1019,10 @@ async function beginPairing(): Promise<void> {
   render();
   try {
     pairingSession = await startPairingSession();
-    pairingRelayAddress = currentPairingRelayAddress(snapshot, pairingSession);
     snapshot.pairingActive = true;
     activeView = "pairing";
   } catch (error) {
     pairingSession = null;
-    pairingRelayAddress = null;
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
     pairingBusy = false;
@@ -1093,7 +1040,6 @@ async function cancelPairing(): Promise<void> {
     pairingSession.invitation = "";
   }
   pairingSession = null;
-  pairingRelayAddress = null;
   render();
   try {
     snapshot = await cancelPairingSession();
@@ -1111,7 +1057,7 @@ async function copyPairingInvitation(): Promise<void> {
   if (!pairingSession || !snapshot) {
     return;
   }
-  const invitationText = currentPairingInvitation(snapshot, pairingSession);
+  const invitationText = pairingSession.invitation;
   try {
     try {
       await navigator.clipboard.writeText(invitationText);
@@ -1145,7 +1091,6 @@ async function revokeController(fingerprint: string): Promise<void> {
     if (!snapshot.pairingActive && pairingSession) {
       pairingSession.invitation = "";
       pairingSession = null;
-      pairingRelayAddress = null;
     }
     feedback = result.revoked
       ? { tone: "success", message: "控制端访问权限已撤销，主机已使用新的信任列表重新启动。" }
@@ -1223,7 +1168,6 @@ window.setInterval(() => {
   if (pairingSession.expiresAtUnixS <= Math.floor(Date.now() / 1000)) {
     pairingSession.invitation = "";
     pairingSession = null;
-    pairingRelayAddress = null;
     feedback = { tone: "info", message: "一次性配对邀请已过期，并已从此窗口清除。" };
     render();
     void refreshSnapshot(false);

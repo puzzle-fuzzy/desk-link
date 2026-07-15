@@ -366,7 +366,6 @@ enum HostPreparationFailure {
     Identity,
     TrustStorage,
     RelayConfiguration,
-    LanNetwork,
     Runtime,
     Clock,
     Pairing,
@@ -381,7 +380,6 @@ impl HostPreparationFailure {
             Self::Identity => "无法打开当前账户受保护的主机身份。",
             Self::TrustStorage => "可信设备存储不可用，主机将保持拒绝连接。",
             Self::RelayConfiguration => "已保存的中继服务器配置无效。",
-            Self::LanNetwork => "没有可用于配对的局域网地址。",
             Self::Runtime => "无法启动加密的 Windows 主机。",
             Self::Clock => "Windows 系统时钟不可用，无法安全配对。",
             Self::Pairing => "DeskLink 无法创建受保护的一次性配对邀请。",
@@ -400,7 +398,6 @@ impl HostPreparationFailure {
             Self::RelayConfiguration => {
                 "已保存的中继服务器配置无效，配对未启动，已恢复普通主机模式。"
             }
-            Self::LanNetwork => "未检测到可用的局域网地址，请连接 Wi-Fi 或网线后刷新状态再配对。",
             Self::Runtime | Self::Pairing | Self::Clock => {
                 "DeskLink 无法创建安全配对会话，已恢复普通主机模式。"
             }
@@ -502,8 +499,7 @@ fn prepare_pairing(
         .map_err(|_| HostPreparationFailure::Pairing)?;
     let invitation = crate::hex(encoded.as_bytes());
     let session = PairingSessionSummary {
-        invitation: crate::local_relay::pairing_package(&connection, &invitation)
-            .map_err(|_| HostPreparationFailure::LanNetwork)?,
+        invitation: crate::local_relay::pairing_package(&connection, &invitation),
         expires_at_unix_s: invite.expires_at_unix_s(),
     };
     let session_id = invite.session_id();

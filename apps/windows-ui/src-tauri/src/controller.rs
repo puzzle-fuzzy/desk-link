@@ -23,6 +23,8 @@ use zeroize::Zeroize;
 
 const COMMAND_CAPACITY: usize = 512;
 const FRAME_PREFIX_BYTES: usize = 17;
+const MAX_TEXT_INPUT_CHARACTERS: usize = 256;
+const MAX_TEXT_INPUT_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +173,7 @@ pub enum ControllerSignal {
 
 enum ControllerCommand {
     Input(InputEvent),
+    Text(String),
     RequestKeyframe,
     Stop,
 }
@@ -268,6 +271,11 @@ impl ControllerManager {
         self.send(ControllerCommand::Input(parse_input(input)?))
     }
 
+    pub fn send_text(&self, text: String) -> Result<(), String> {
+        validate_text_input(&text)?;
+        self.send(ControllerCommand::Text(text))
+    }
+
     pub fn request_keyframe(&self) -> Result<(), String> {
         self.send(ControllerCommand::RequestKeyframe)
     }
@@ -363,6 +371,35 @@ pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnap
     })
 }
 
+pub fn migrate_legacy_local_connection() -> Result<bool, String> {
+    let store = WindowsControllerConnectionStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?;
+    let Some(existing) = store
+        .load()
+        .map_err(|_| "无法打开已保存的控制端连接。".to_owned())?
+    else {
+        return Ok(false);
+    };
+    if !existing.relay_address().ip().is_loopback()
+        || !matches!(existing.server_name(), "localhost" | "desklink-lan")
+    {
+        return Ok(false);
+    }
+    let migrated = ControllerConnectionSettings::from_parts(
+        crate::local_relay::MANAGED_RELAY_ADDRESS,
+        crate::local_relay::MANAGED_RELAY_SERVER_NAME,
+        existing.session_id(),
+        *existing.authentication(),
+        existing.host_device_id(),
+        existing.host_verify_key(),
+    )
+    .map_err(|_| "无法迁移旧版控制端连接。".to_owned())?;
+    store
+        .save(&migrated)
+        .map_err(|_| "无法保存迁移后的控制端连接。".to_owned())?;
+    Ok(true)
+}
+
 fn settings_from_invitation(
     input: ControllerConnectionInput,
 ) -> Result<ControllerConnectionSettings, String> {
@@ -402,7 +439,9 @@ async fn run_controller(
                         manager.set_status(ControllerRuntimeSummary::idle());
                         return;
                     }
-                    Some(ControllerCommand::Input(_)) | Some(ControllerCommand::RequestKeyframe) => {}
+                    Some(ControllerCommand::Input(_))
+                    | Some(ControllerCommand::Text(_))
+                    | Some(ControllerCommand::RequestKeyframe) => {}
                 },
                 result = &mut connection => match result {
                     Ok(runtime) => break runtime,
@@ -424,6 +463,11 @@ async fn run_controller(
                 command = commands.recv() => match command {
                     Some(ControllerCommand::Input(input)) => {
                         if let Err(error) = runtime.send_input(input).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::Text(text)) => {
+                        if let Err(error) = send_text_input(&runtime, &text).await {
                             break ConnectFailure::from_controller(error);
                         }
                     }
@@ -519,20 +563,19 @@ async fn connect_once(
     signals: &Channel<ControllerSignal>,
 ) -> Result<ControllerRuntime, ConnectFailure> {
     manager.publish(signals, ControllerRuntimeSummary::connecting());
-    let lan = crate::local_relay::is_lan_endpoint(settings.relay_address(), settings.server_name());
     let config =
         crate::local_relay::client_config(settings.relay_address(), settings.server_name())
-            .map_err(|error| ConnectFailure::from_transport(error, lan))?;
+            .map_err(ConnectFailure::from_transport)?;
     let client = QuicClient::connect(config)
         .await
-        .map_err(|error| ConnectFailure::from_transport(error, lan))?;
+        .map_err(ConnectFailure::from_transport)?;
     client
         .join(RelayJoin::controller(
             settings.session_id(),
             *settings.authentication(),
         ))
         .await
-        .map_err(|error| ConnectFailure::from_transport(error, lan))?;
+        .map_err(ConnectFailure::from_transport)?;
     manager.publish(signals, ControllerRuntimeSummary::waiting_for_approval());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| ConnectFailure::permanent("控制端身份存储不可用"))?
@@ -568,7 +611,7 @@ impl ConnectFailure {
         }
     }
 
-    fn from_transport(error: TransportError, lan: bool) -> Self {
+    fn from_transport(error: TransportError) -> Self {
         match error {
             TransportError::JoinRejected(JoinRejectCode::SessionNotFound) => Self {
                 retryable: true,
@@ -592,10 +635,6 @@ impl ConnectFailure {
             TransportError::InvalidConfig(_) => Self {
                 retryable: false,
                 detail: "中继地址或 TLS 服务器名称无效，请重新复制完整连接码。",
-            },
-            TransportError::Connection(_) if lan => Self {
-                retryable: true,
-                detail: "无法到达主机电脑。请确认两台电脑位于同一局域网、主机 DeskLink 正在运行，并允许 Windows 防火墙的专用网络访问。",
             },
             TransportError::Connection(_)
             | TransportError::Stream(_)
@@ -655,7 +694,9 @@ async fn schedule_failure(
                             manager.set_status(ControllerRuntimeSummary::idle());
                             return false;
                         }
-                        Some(ControllerCommand::Input(_)) | Some(ControllerCommand::RequestKeyframe) => {}
+                        Some(ControllerCommand::Input(_))
+                        | Some(ControllerCommand::Text(_))
+                        | Some(ControllerCommand::RequestKeyframe) => {}
                     },
                     () = &mut sleep => return true,
                 }
@@ -671,6 +712,48 @@ async fn schedule_failure(
             false
         }
     }
+}
+
+async fn send_text_input(runtime: &ControllerRuntime, text: &str) -> Result<(), ControllerError> {
+    for character in text.chars() {
+        let code = match character {
+            '\n' => KeyCode::Enter,
+            '\t' => KeyCode::Tab,
+            character => KeyCode::Character(character),
+        };
+        runtime
+            .send_input(InputEvent::Key {
+                code,
+                pressed: true,
+                modifiers: Modifiers(0),
+            })
+            .await?;
+        runtime
+            .send_input(InputEvent::Key {
+                code,
+                pressed: false,
+                modifiers: Modifiers(0),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+fn validate_text_input(text: &str) -> Result<(), String> {
+    let character_count = text.chars().count();
+    if character_count == 0 {
+        return Err("请输入要发送到远程电脑的文字。".to_owned());
+    }
+    if character_count > MAX_TEXT_INPUT_CHARACTERS || text.len() > MAX_TEXT_INPUT_BYTES {
+        return Err("一次最多发送 256 个字符。".to_owned());
+    }
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err("文字包含不支持的控制字符。".to_owned());
+    }
+    Ok(())
 }
 
 fn parse_input(input: ControllerInput) -> Result<InputEvent, String> {
@@ -728,6 +811,21 @@ fn parse_input(input: ControllerInput) -> Result<InputEvent, String> {
                     Some("arrowDown") => KeyCode::ArrowDown,
                     Some("arrowLeft") => KeyCode::ArrowLeft,
                     Some("arrowRight") => KeyCode::ArrowRight,
+                    Some("delete") => KeyCode::Delete,
+                    Some("insert") => KeyCode::Insert,
+                    Some("home") => KeyCode::Home,
+                    Some("end") => KeyCode::End,
+                    Some("pageUp") => KeyCode::PageUp,
+                    Some("pageDown") => KeyCode::PageDown,
+                    Some("capsLock") => KeyCode::CapsLock,
+                    Some(value) if value.starts_with('f') => {
+                        let number = value[1..]
+                            .parse::<u8>()
+                            .ok()
+                            .filter(|number| (1..=12).contains(number))
+                            .ok_or_else(|| "不支持此功能键。".to_owned())?;
+                        KeyCode::Function(number)
+                    }
                     _ => return Err("不支持此键盘按键。".to_owned()),
                 },
                 pressed: input
@@ -775,7 +873,7 @@ fn now_unix_s() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectFailure, ControllerInput, parse_input};
+    use super::{ConnectFailure, ControllerInput, parse_input, validate_text_input};
     use desklink_protocol::{InputEvent, KeyCode, Modifiers};
     use desklink_transport::{JoinRejectCode, TransportError};
 
@@ -823,27 +921,66 @@ mod tests {
     }
 
     #[test]
-    fn lan_connection_failure_explains_firewall_and_network_requirements() {
-        let failure = ConnectFailure::from_transport(
-            TransportError::Connection("timed out".to_owned()),
-            true,
+    fn browser_input_supports_desktop_navigation_and_function_keys() {
+        let mut delete = empty_input("key");
+        delete.key = Some("delete".to_owned());
+        delete.pressed = Some(true);
+        delete.modifiers = Some(0);
+        assert_eq!(
+            parse_input(delete).unwrap(),
+            InputEvent::Key {
+                code: KeyCode::Delete,
+                pressed: true,
+                modifiers: Modifiers(0),
+            }
         );
 
+        let mut function = empty_input("key");
+        function.key = Some("f12".to_owned());
+        function.pressed = Some(true);
+        function.modifiers = Some(Modifiers::SHIFT.0);
+        assert_eq!(
+            parse_input(function).unwrap(),
+            InputEvent::Key {
+                code: KeyCode::Function(12),
+                pressed: true,
+                modifiers: Modifiers::SHIFT,
+            }
+        );
+
+        let mut unsupported = empty_input("key");
+        unsupported.key = Some("f13".to_owned());
+        unsupported.pressed = Some(true);
+        unsupported.modifiers = Some(0);
+        assert!(parse_input(unsupported).is_err());
+    }
+
+    #[test]
+    fn remote_text_input_accepts_unicode_and_rejects_oversized_or_control_text() {
+        assert!(validate_text_input("中文输入 ✓").is_ok());
+        assert!(validate_text_input("\n\t").is_ok());
+        assert!(validate_text_input("").is_err());
+        assert!(validate_text_input("\0").is_err());
+        assert!(validate_text_input(&"字".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn relay_connection_failure_explains_temporary_unavailability() {
+        let failure =
+            ConnectFailure::from_transport(TransportError::Connection("timed out".to_owned()));
+
         assert!(failure.retryable);
-        assert!(failure.detail.contains("同一局域网"));
-        assert!(failure.detail.contains("Windows 防火墙"));
+        assert!(failure.detail.contains("中继服务器或主机"));
     }
 
     #[test]
     fn expired_and_mismatched_pairing_sessions_have_distinct_recovery_text() {
-        let expired = ConnectFailure::from_transport(
-            TransportError::JoinRejected(JoinRejectCode::SessionNotFound),
-            true,
-        );
-        let mismatch = ConnectFailure::from_transport(
-            TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch),
-            true,
-        );
+        let expired = ConnectFailure::from_transport(TransportError::JoinRejected(
+            JoinRejectCode::SessionNotFound,
+        ));
+        let mismatch = ConnectFailure::from_transport(TransportError::JoinRejected(
+            JoinRejectCode::AuthenticationMismatch,
+        ));
 
         assert!(expired.retryable);
         assert!(expired.detail.contains("失效"));

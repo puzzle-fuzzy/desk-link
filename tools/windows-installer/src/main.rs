@@ -4,11 +4,6 @@
 const APPLICATION_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_UI_PAYLOAD_RESOLVED"));
 #[cfg(all(windows, not(feature = "embedded-payload")))]
 const APPLICATION_PAYLOAD: &[u8] = &[];
-#[cfg(all(windows, feature = "embedded-payload"))]
-const HOST_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_HOST_PAYLOAD_RESOLVED"));
-#[cfg(all(windows, not(feature = "embedded-payload")))]
-const HOST_PAYLOAD: &[u8] = &[];
-
 #[cfg(windows)]
 mod windows_installer {
     use std::{
@@ -20,7 +15,7 @@ mod windows_installer {
         time::{Duration, Instant},
     };
 
-    use crate::{APPLICATION_PAYLOAD, HOST_PAYLOAD};
+    use crate::APPLICATION_PAYLOAD;
     use desklink_delivery_layout::{InstallLayout, PRODUCT_NAME, PRODUCT_VERSION};
     use windows::{
         Win32::{
@@ -151,13 +146,13 @@ mod windows_installer {
     }
 
     fn install(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
-        if APPLICATION_PAYLOAD.is_empty() || HOST_PAYLOAD.is_empty() {
+        if APPLICATION_PAYLOAD.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "此开发版安装器不包含 DeskLink 应用程序文件",
             ));
         }
-        let upgrading = layout.application.is_file() || layout.host.is_file();
+        let upgrading = layout.application.is_file() || layout.legacy_host.is_file();
         if !options.quiet {
             let verb = if upgrading { "升级" } else { "安装" };
             let prompt = format!(
@@ -173,7 +168,9 @@ mod windows_installer {
         stop_running_application(layout);
         fs::create_dir_all(&layout.install_directory)?;
         atomic_write_with_retry(&layout.application, APPLICATION_PAYLOAD)?;
-        atomic_write_with_retry(&layout.host, HOST_PAYLOAD)?;
+        // 0.1.1 以前的安装包包含独立 host。现代 DeskLink.exe 已直接托管
+        // Windows runtime，升级时移除旧文件，避免保留第二个可执行入口。
+        remove_file_if_present(&layout.legacy_host)?;
         let installer = env::current_exe()?;
         if !same_file_path(&installer, &layout.uninstaller) {
             atomic_copy(&installer, &layout.uninstaller)?;
@@ -184,10 +181,7 @@ mod windows_installer {
         } else {
             set_registry_string(RUN_KEY, PRODUCT_NAME, &layout.startup_command())?;
         }
-        write_uninstall_registration(
-            layout,
-            APPLICATION_PAYLOAD.len().saturating_add(HOST_PAYLOAD.len()),
-        )?;
+        write_uninstall_registration(layout, APPLICATION_PAYLOAD.len())?;
 
         if !options.quiet {
             Command::new(&layout.application).spawn()?;

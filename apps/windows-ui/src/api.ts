@@ -33,6 +33,10 @@ export function saveConnectionSettings(
   return invoke<HostSnapshot>("save_connection_settings", { input });
 }
 
+export function setupManagedConnection(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("setup_managed_connection");
+}
+
 export function startPairingSession(): Promise<PairingSessionSummary> {
   return invoke<PairingSessionSummary>("start_pairing_session");
 }
@@ -80,6 +84,10 @@ export function reconnectController(
 
 export function sendControllerInput(input: ControllerInput): Promise<void> {
   return invoke<void>("send_controller_input", { input });
+}
+
+export function sendControllerText(text: string): Promise<void> {
+  return invoke<void>("send_controller_text", { text });
 }
 
 export function requestControllerKeyframe(): Promise<void> {

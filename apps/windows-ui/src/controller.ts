@@ -8,23 +8,32 @@ import {
   reconnectController,
   requestControllerKeyframe,
   sendControllerInput,
+  sendControllerText,
 } from "./api";
 import type { ControllerChannels } from "./api";
 import { parsePairingCode } from "./pairing-code";
+import { MANAGED_RELAY_ADDRESS, MANAGED_RELAY_SERVER_NAME } from "./product-config";
+import { escapeHtml } from "./html";
+import {
+  MAX_POINTER_COORDINATE,
+  clampWheel,
+  keyboardKey,
+  keyboardModifiers,
+  mouseButton,
+} from "./remote-input";
 import type {
   ControllerInput,
   ControllerSignal,
   ControllerSnapshot,
   ControllerVideoConfigSignal,
 } from "./types";
+import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
 type VideoPayload = ArrayBuffer | Uint8Array | number[];
 
 const FRAME_PREFIX_BYTES = 17;
-const MAX_POINTER_COORDINATE = 1_000_000;
-const MAX_WHEEL_DELTA = 1_200;
 
 let snapshot: ControllerSnapshot | null = null;
 let loading = true;
@@ -32,8 +41,8 @@ let busy = false;
 let checkingRelay = false;
 let feedback: ControllerFeedback = null;
 let invitationDraft = "";
-let relayDraft = "127.0.0.1:4433";
-let serverNameDraft = "localhost";
+let relayDraft = MANAGED_RELAY_ADDRESS;
+let serverNameDraft = MANAGED_RELAY_SERVER_NAME;
 let videoConfig: ControllerVideoConfigSignal | null = null;
 let activeChannels: ControllerChannels | null = null;
 let channelGeneration = 0;
@@ -41,6 +50,8 @@ let decoder: VideoDecoder | null = null;
 let pointerFrame: number | null = null;
 let requestRender: RenderRequest = () => {};
 let decodedFrames = 0;
+let textSending = false;
+let failedVideoConfig: string | null = null;
 
 export async function initializeController(renderer: RenderRequest): Promise<void> {
   requestRender = renderer;
@@ -55,6 +66,7 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
 }
 
 export function prepareControllerRender(): void {
+  releaseInputState();
   if (pointerFrame !== null) {
     window.cancelAnimationFrame(pointerFrame);
     pointerFrame = null;
@@ -121,10 +133,24 @@ export function bindControllerInteractions(): void {
     void endConnection();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-keyframe]")?.addEventListener("click", () => {
-    void requestControllerKeyframe().catch(showOperationError);
+    retryVideo();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-fullscreen]")?.addEventListener("click", () => {
     void toggleFullscreen();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-text]")?.addEventListener("click", () => {
+    const panel = document.querySelector<HTMLElement>("[data-controller-text-panel]");
+    const input = document.querySelector<HTMLInputElement>("[data-controller-text-input]");
+    if (panel && input) {
+      panel.hidden = false;
+      input.focus();
+    }
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-text-cancel]")?.addEventListener("click", () => {
+    closeTextInput();
+  });
+  document.querySelector<HTMLFormElement>("[data-controller-text-form]")?.addEventListener("submit", (event) => {
+    void submitTextInput(event);
   });
   if (snapshot?.runtime.state === "connected") {
     setupRemoteDesktop();
@@ -282,6 +308,7 @@ function renderNoSavedConnection(): string {
 
 function renderRemoteDesktop(): string {
   const config = videoConfig;
+  const videoFailed = config ? failedVideoConfig === videoConfigKey(config) : false;
   return `
     <section class="remote-session" aria-label="当前远程控制会话">
       <div class="remote-toolbar">
@@ -290,13 +317,24 @@ function renderRemoteDesktop(): string {
           <div><strong>实时远程桌面</strong><small data-controller-metrics>${config ? `${config.width} × ${config.height} · 已加密` : "正在等待首个视频画面"}</small></div>
         </div>
         <div class="remote-toolbar-actions">
+          <button class="toolbar-button" type="button" data-controller-text title="发送中文、符号或一段文字">发送文字</button>
           <button class="toolbar-button" type="button" data-controller-keyframe title="刷新远程画面">刷新画面</button>
           <button class="toolbar-button" type="button" data-controller-fullscreen>全屏</button>
           <button class="toolbar-button toolbar-button--danger" type="button" data-controller-disconnect>断开连接</button>
         </div>
       </div>
+      <form class="remote-text-entry" data-controller-text-form data-controller-text-panel hidden>
+        <label for="remote-text-input">发送文字到远程电脑</label>
+        <input id="remote-text-input" data-controller-text-input type="text" maxlength="256" autocomplete="off" placeholder="可输入或粘贴中文、符号和短文本" required>
+        <button class="toolbar-button" type="submit">发送文字</button>
+        <button class="toolbar-button" type="button" data-controller-text-cancel>取消</button>
+      </form>
       <div class="remote-viewport" data-remote-viewport tabindex="0" aria-label="远程 Windows 桌面，点击后可发送键盘和鼠标输入。">
-        ${config ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden></span>` : '<div class="remote-waiting"><span class="controller-spinner" aria-hidden="true"></span><strong>正在准备远程画面</strong><p>DeskLink 协商视频流时，请保持此窗口打开。</p></div>'}
+        ${videoFailed
+          ? '<div class="remote-waiting remote-waiting--error"><strong>远程画面暂时无法解码</strong><p>请更新 WebView2，或点击“刷新画面”再试一次。</p></div>'
+          : config
+            ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden></span>`
+            : '<div class="remote-waiting"><span class="controller-spinner" aria-hidden="true"></span><strong>正在准备远程画面</strong><p>DeskLink 协商视频流时，请保持此窗口打开。</p></div>'}
         <div class="remote-focus-hint">点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作</div>
       </div>
     </section>
@@ -384,6 +422,7 @@ async function beginConnection(operation: (channels: ControllerChannels) => Prom
   busy = true;
   feedback = null;
   videoConfig = null;
+  failedVideoConfig = null;
   prepareControllerRender();
   const generation = ++channelGeneration;
   const channels = createControllerChannels(
@@ -464,6 +503,7 @@ function handleSignal(signal: ControllerSignal): void {
       }
       if (signal.runtime.state !== "connected") {
         videoConfig = null;
+        failedVideoConfig = null;
       }
       requestRender();
       break;
@@ -493,6 +533,11 @@ function setupRemoteDesktop(): void {
   if (!viewport || !canvas || !videoConfig) {
     return;
   }
+  const config = videoConfig;
+  const configKey = videoConfigKey(config);
+  if (failedVideoConfig === configKey) {
+    return;
+  }
   if (typeof VideoDecoder === "undefined") {
     feedback = { tone: "error", message: "当前 Windows WebView2 无法解码远程 H.264 画面。请更新 Microsoft Edge WebView2 Runtime 后重新打开 DeskLink。" };
     queueMicrotask(requestRender);
@@ -504,25 +549,45 @@ function setupRemoteDesktop(): void {
     queueMicrotask(requestRender);
     return;
   }
-  decoder = new VideoDecoder({
-    output: (frame) => {
-      context.drawImage(frame, 0, 0, canvas.width, canvas.height);
-      frame.close();
-      decodedFrames += 1;
-    },
-    error: () => {
-      feedback = { tone: "error", message: "远程视频解码器已停止，请刷新画面或重新连接主机。" };
-      decoder = null;
-      requestRender();
-    },
-  });
-  decoder.configure({
-    codec: codecFromSequenceHeader(new Uint8Array(videoConfig.sequenceHeader)),
-    codedWidth: videoConfig.width,
-    codedHeight: videoConfig.height,
-    hardwareAcceleration: "prefer-hardware",
-    optimizeForLatency: true,
-  });
+  let nextDecoder: VideoDecoder;
+  try {
+    nextDecoder = new VideoDecoder({
+      output: (frame) => {
+        context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        frame.close();
+        decodedFrames += 1;
+      },
+      error: () => {
+        if (decoder !== nextDecoder) {
+          return;
+        }
+        failedVideoConfig = configKey;
+        feedback = { tone: "error", message: "远程视频解码器已停止，请刷新画面或重新连接主机。" };
+        decoder = null;
+        requestRender();
+      },
+    });
+    decoder = nextDecoder;
+    nextDecoder.configure({
+      codec: h264CodecFromSequenceHeader(new Uint8Array(config.sequenceHeader)),
+      codedWidth: config.width,
+      codedHeight: config.height,
+      hardwareAcceleration: "prefer-hardware",
+      optimizeForLatency: true,
+    });
+  } catch {
+    failedVideoConfig = configKey;
+    if (decoder && decoder.state !== "closed") {
+      decoder.close();
+    }
+    decoder = null;
+    feedback = {
+      tone: "error",
+      message: "当前 WebView2 不支持主机发送的 H.264 画面。请更新 Microsoft Edge WebView2 Runtime 后重试。",
+    };
+    queueMicrotask(requestRender);
+    return;
+  }
   bindRemoteInput(viewport, canvas);
   viewport.focus({ preventScroll: true });
   void requestControllerKeyframe().catch(showOperationError);
@@ -555,6 +620,12 @@ function handleVideo(payload: VideoPayload): void {
   } catch {
     void requestControllerKeyframe().catch(showOperationError);
   }
+}
+
+function retryVideo(): void {
+  failedVideoConfig = null;
+  feedback = null;
+  requestRender();
 }
 
 const pressedKeys = new Map<string, ControllerInput>();
@@ -604,6 +675,8 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     pressedButtons.delete(button);
     fireInput({ kind: "mouseButton", button, pressed: false });
   });
+  viewport.addEventListener("pointercancel", releaseInputState);
+  viewport.addEventListener("lostpointercapture", releaseInputState);
   viewport.addEventListener("contextmenu", (event) => event.preventDefault());
   viewport.addEventListener("wheel", (event) => {
     event.preventDefault();
@@ -664,6 +737,52 @@ function fireInput(input: ControllerInput): void {
   });
 }
 
+async function submitTextInput(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (textSending) {
+    return;
+  }
+  const input = document.querySelector<HTMLInputElement>("[data-controller-text-input]");
+  if (!input || !input.reportValidity()) {
+    return;
+  }
+  const text = input.value;
+  const submit = (event.currentTarget as HTMLFormElement).querySelector<HTMLButtonElement>(
+    'button[type="submit"]',
+  );
+  textSending = true;
+  input.disabled = true;
+  if (submit) {
+    submit.disabled = true;
+    submit.setAttribute("aria-busy", "true");
+  }
+  try {
+    await sendControllerText(text);
+    input.value = "";
+    closeTextInput();
+  } catch (error) {
+    showOperationError(error);
+  } finally {
+    textSending = false;
+    if (input.isConnected) {
+      input.disabled = false;
+    }
+    if (submit?.isConnected) {
+      submit.disabled = false;
+      submit.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function closeTextInput(): void {
+  const panel = document.querySelector<HTMLElement>("[data-controller-text-panel]");
+  const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
+  if (panel) {
+    panel.hidden = true;
+  }
+  viewport?.focus({ preventScroll: true });
+}
+
 function pointerPosition(event: PointerEvent, canvas: HTMLCanvasElement): { x: number; y: number } | null {
   const bounds = canvas.getBoundingClientRect();
   if (
@@ -698,35 +817,6 @@ function updateRemoteCursor(x: number, y: number, visible: boolean): void {
   cursor.hidden = !visible;
 }
 
-function keyboardKey(value: string): { key: string; character?: string } | null {
-  const named: Record<string, string> = {
-    Enter: "enter",
-    Escape: "escape",
-    Backspace: "backspace",
-    Tab: "tab",
-    ArrowUp: "arrowUp",
-    ArrowDown: "arrowDown",
-    ArrowLeft: "arrowLeft",
-    ArrowRight: "arrowRight",
-  };
-  if (named[value]) {
-    return { key: named[value] };
-  }
-  return Array.from(value).length === 1 ? { key: "character", character: value } : null;
-}
-
-function keyboardModifiers(event: KeyboardEvent): number {
-  return Number(event.shiftKey) | (Number(event.ctrlKey) << 1) | (Number(event.altKey) << 2) | (Number(event.metaKey) << 3);
-}
-
-function mouseButton(button: number): "left" | "right" | "middle" | null {
-  return button === 0 ? "left" : button === 1 ? "middle" : button === 2 ? "right" : null;
-}
-
-function clampWheel(value: number): number {
-  return Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, value));
-}
-
 async function toggleFullscreen(): Promise<void> {
   const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
   if (!viewport) {
@@ -738,18 +828,6 @@ async function toggleFullscreen(): Promise<void> {
     await viewport.requestFullscreen();
     viewport.focus({ preventScroll: true });
   }
-}
-
-function codecFromSequenceHeader(header: Uint8Array): string {
-  for (let index = 0; index < header.length - 7; index += 1) {
-    const fourByteStart = header[index] === 0 && header[index + 1] === 0 && header[index + 2] === 0 && header[index + 3] === 1;
-    const threeByteStart = header[index] === 0 && header[index + 1] === 0 && header[index + 2] === 1;
-    const nalIndex = index + (fourByteStart ? 4 : threeByteStart ? 3 : 0);
-    if (nalIndex !== index && (header[nalIndex]! & 0x1f) === 7 && nalIndex + 3 < header.length) {
-      return `avc1.${hexByte(header[nalIndex + 1]!)}${hexByte(header[nalIndex + 2]!)}${hexByte(header[nalIndex + 3]!)}`;
-    }
-  }
-  return "avc1.42E01E";
 }
 
 function concatenate(prefix: Uint8Array, data: Uint8Array): Uint8Array {
@@ -769,10 +847,6 @@ function toUint8Array(payload: VideoPayload): Uint8Array {
   return new Uint8Array(payload);
 }
 
-function hexByte(value: number): string {
-  return value.toString(16).padStart(2, "0").toUpperCase();
-}
-
 function compact(value: string): string {
   return value.length <= 20 ? value : `${value.slice(0, 8)}…${value.slice(-8)}`;
 }
@@ -790,13 +864,4 @@ function normalizeError(error: unknown): string {
     return error.message;
   }
   return "DeskLink 无法完成此控制端操作。";
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }

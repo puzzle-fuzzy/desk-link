@@ -15,22 +15,14 @@ export interface TrustedControllerSummary {
   approvedAtUnixS: number;
 }
 
-export interface LanAddressSummary {
-  relayAddress: string;
-  interfaceName: string;
-  isPrimary: boolean;
-}
-
-export type RelayMode = "unconfigured" | "lan" | "external";
-export type RelayState = "inactive" | "starting" | "ready" | "offline" | "failed";
+export type RelayMode = "unconfigured" | "external";
+export type RelayState = "inactive" | "ready";
 
 export interface RelayStatusSummary {
   mode: RelayMode;
   state: RelayState;
   title: string;
   detail: string;
-  port: number | null;
-  addresses: LanAddressSummary[];
 }
 
 export type DiagnosticCheckStatus = "passed" | "warning" | "failed" | "notApplicable";

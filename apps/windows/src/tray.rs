@@ -67,10 +67,10 @@ fn user_facing_host_reason(reason: &str) -> &'static str {
         || reason.contains("key changed")
     {
         "无法验证控制端身份，请检查设备后重新配对。"
-    } else if reason.contains("rejected") {
-        "此 Windows 设备未批准控制端请求。"
     } else if reason.contains("occupied") || reason.contains("already in use") {
         "此中继会话正在使用中，恢复可用后 DeskLink 将重试。"
+    } else if reason.contains("rejected") {
+        "此 Windows 设备未批准控制端请求。"
     } else if reason.contains("capture") || reason.contains("desktop duplication") {
         "DeskLink 无法捕获 Windows 桌面，请检查当前显示器后重试。"
     } else if reason.contains("encoder") || reason.contains("media foundation") {
@@ -1271,6 +1271,19 @@ mod tests {
         });
         assert!(model.detail.contains("捕获 Windows 桌面"));
         assert!(!model.detail.contains("AccessLost"));
+    }
+
+    #[test]
+    fn occupied_session_is_not_misreported_as_user_rejection() {
+        let mut model = HostStatusViewModel::starting();
+        model.apply(&HostLifecycleEvent::Reconnecting {
+            retry: 1,
+            maximum_retries: 6,
+            delay: Duration::from_secs(1),
+            reason: "transport error: join rejected: SessionOccupied".to_owned(),
+        });
+        assert!(model.detail.contains("会话正在使用中"));
+        assert!(!model.detail.contains("未批准"));
     }
 
     #[test]

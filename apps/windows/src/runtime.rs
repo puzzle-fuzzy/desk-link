@@ -226,15 +226,7 @@ impl HostSupervisor {
             let reason = error.to_string();
             match schedule.next(now_unix_s()) {
                 ReconnectDecision::RetryAfter { retry, delay } => {
-                    stream_id = match stream_id.checked_add(1).filter(|stream_id| *stream_id != 0) {
-                        Some(stream_id) => stream_id,
-                        None => {
-                            self.publish(HostLifecycleEvent::Stopped {
-                                reason: "video stream identifier space is exhausted".to_owned(),
-                            });
-                            return Err(HostSupervisorError::StreamIdExhausted);
-                        }
-                    };
+                    stream_id = self.next_stream_id(stream_id)?;
                     self.publish(HostLifecycleEvent::Reconnecting {
                         retry,
                         maximum_retries: schedule.max_retries(),
@@ -245,6 +237,19 @@ impl HostSupervisor {
                 }
                 ReconnectDecision::Exhausted => {
                     let retries = schedule.retries_used();
+                    if self.expires_at_unix_s.is_none() {
+                        stream_id = self.next_stream_id(stream_id)?;
+                        let delay = self.reconnect_policy.max_delay();
+                        self.publish(HostLifecycleEvent::Reconnecting {
+                            retry: retries,
+                            maximum_retries: schedule.max_retries(),
+                            delay,
+                            reason,
+                        });
+                        tokio::time::sleep(delay).await;
+                        schedule.reset();
+                        continue;
+                    }
                     self.publish(HostLifecycleEvent::Stopped {
                         reason: format!(
                             "reconnect retry budget exhausted after {retries} retries: {reason}"
@@ -261,6 +266,18 @@ impl HostSupervisor {
                     });
                     return Err(HostSupervisorError::PairingExpired);
                 }
+            }
+        }
+    }
+
+    fn next_stream_id(&self, stream_id: u64) -> Result<u64, HostSupervisorError> {
+        match stream_id.checked_add(1).filter(|stream_id| *stream_id != 0) {
+            Some(stream_id) => Ok(stream_id),
+            None => {
+                self.publish(HostLifecycleEvent::Stopped {
+                    reason: "video stream identifier space is exhausted".to_owned(),
+                });
+                Err(HostSupervisorError::StreamIdExhausted)
             }
         }
     }

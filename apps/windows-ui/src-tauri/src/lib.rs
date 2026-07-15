@@ -45,6 +45,7 @@ use controller::{
     ControllerSnapshot,
 };
 use host::{HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, RunEvent, State, WindowEvent,
@@ -238,6 +239,11 @@ fn send_controller_input(
 }
 
 #[tauri::command]
+fn send_controller_text(manager: State<'_, ControllerManager>, text: String) -> Result<(), String> {
+    manager.send_text(text)
+}
+
+#[tauri::command]
 fn request_controller_keyframe(manager: State<'_, ControllerManager>) -> Result<(), String> {
     manager.request_keyframe()
 }
@@ -265,7 +271,6 @@ async fn save_connection_settings(
     tauri::async_runtime::spawn_blocking(move || save_connection(input))
         .await
         .map_err(|_| "DeskLink 无法完成连接保存，请重试。".to_owned())??;
-    local_relay::start_if_configured();
     manager.restart(app).await;
     let runtime = manager.snapshot();
     let pairing_active = manager.is_pairing_active();
@@ -275,11 +280,25 @@ async fn save_connection_settings(
 }
 
 #[tauri::command]
+async fn setup_managed_connection(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(create_managed_connection)
+        .await
+        .map_err(|_| "DeskLink 无法创建受保护的本机连接，请重试。".to_owned())??;
+    manager.restart(app).await;
+    let runtime = manager.snapshot();
+    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, false))
+        .await
+        .map_err(|_| "DeskLink 已保存本机连接，但无法刷新状态，请重试。".to_owned())?
+}
+
+#[tauri::command]
 async fn start_pairing_session(
     app: AppHandle,
     manager: State<'_, HostManager>,
 ) -> Result<PairingSessionSummary, String> {
-    local_relay::start_if_configured();
     manager.start_pairing(app).await
 }
 
@@ -394,7 +413,6 @@ fn load_host_snapshot(
         connection.as_ref(),
         connection_error.as_deref(),
         trusted_error.as_deref(),
-        &relay_status,
     );
 
     Ok(HostSnapshot {
@@ -421,7 +439,6 @@ fn build_diagnostic_checks(
     connection: Option<&ConnectionSummary>,
     connection_error: Option<&str>,
     trusted_error: Option<&str>,
-    relay: &local_relay::RelayStatusSummary,
 ) -> Vec<DiagnosticCheckSummary> {
     let configuration = if connection_error.is_some() {
         diagnostic_check(
@@ -460,58 +477,36 @@ fn build_diagnostic_checks(
             "可信设备列表可读取，本地批准边界可用。",
         )
     };
-    let relay_check = match (relay.mode, relay.state) {
-        ("external", _) => diagnostic_check(
-            "DL-NET-201",
-            "passed",
-            "中继运行方式",
-            "当前使用已保存的外部中继服务器。",
-        ),
-        ("lan", "ready") => diagnostic_check(
-            "DL-NET-201",
-            "passed",
-            "局域网中继",
-            "本机局域网中继已经监听 UDP 4433。",
-        ),
-        ("lan", "failed" | "offline") => {
-            diagnostic_check("DL-NET-201", "failed", "局域网中继", &relay.detail)
-        }
-        ("lan", _) => diagnostic_check("DL-NET-201", "warning", "局域网中继", &relay.detail),
-        _ => diagnostic_check(
+    let relay_check = match (connection.is_some(), runtime.state) {
+        (false, _) => diagnostic_check(
             "DL-NET-201",
             "warning",
-            "中继运行方式",
-            "保存连接设置后才能检查中继。",
+            "中继连接状态",
+            "尚未保存中继配置，暂时无法建立远程连接。",
         ),
-    };
-    let adapter_check = match relay.mode {
-        "lan" if relay.addresses.is_empty() => diagnostic_check(
-            "DL-NET-202",
+        (true, "connected") => diagnostic_check(
+            "DL-NET-201",
+            "passed",
+            "中继连接状态",
+            "中继连接和端到端安全会话均已建立。",
+        ),
+        (true, "stopped") => diagnostic_check(
+            "DL-NET-201",
             "failed",
-            "局域网地址",
-            "未检测到可供另一台电脑连接的局域网地址。",
+            "中继连接状态",
+            "主机连接已经停止，请根据主机运行状态处理后重试。",
         ),
-        "lan" => diagnostic_check(
-            "DL-NET-202",
-            "passed",
-            "局域网地址",
-            &format!(
-                "检测到 {} 个可用地址，推荐使用 {}。",
-                relay.addresses.len(),
-                relay.addresses[0].relay_address
-            ),
-        ),
-        "external" => diagnostic_check(
-            "DL-NET-202",
-            "notApplicable",
-            "局域网地址",
-            "外部中继模式不依赖主机局域网入站地址。",
-        ),
-        _ => diagnostic_check(
-            "DL-NET-202",
+        (true, "reconnecting") => diagnostic_check(
+            "DL-NET-201",
             "warning",
-            "局域网地址",
-            "尚未配置连接，暂不检查局域网地址。",
+            "中继恢复状态",
+            "中继连接暂时中断，DeskLink 正在按退避策略重连。",
+        ),
+        (true, _) => diagnostic_check(
+            "DL-NET-201",
+            "warning",
+            "中继连接状态",
+            "中继配置已保存，主机正在建立或等待安全会话。",
         ),
     };
     let host_check = match runtime.state {
@@ -519,7 +514,7 @@ fn build_diagnostic_checks(
         "stopped" => diagnostic_check("DL-HOST-301", "failed", "主机运行状态", &runtime.detail),
         _ => diagnostic_check("DL-HOST-301", "warning", "主机运行状态", &runtime.detail),
     };
-    vec![configuration, trust, relay_check, adapter_check, host_check]
+    vec![configuration, trust, relay_check, host_check]
 }
 
 fn diagnostic_check(
@@ -649,19 +644,6 @@ fn build_diagnostic_report(
     let _ = writeln!(report, "\n[网络状态]");
     let _ = writeln!(report, "中继模式: {}", snapshot.relay_status.mode);
     let _ = writeln!(report, "中继状态: {}", snapshot.relay_status.state);
-    for address in &snapshot.relay_status.addresses {
-        let _ = writeln!(
-            report,
-            "网卡: {} | {} | {}",
-            address.interface_name,
-            address.relay_address,
-            if address.is_primary {
-                "推荐"
-            } else {
-                "可选"
-            }
-        );
-    }
     let _ = writeln!(report, "\n[控制端状态]");
     let _ = writeln!(report, "运行状态: {}", controller_runtime.state);
     let _ = writeln!(report, "运行说明: {}", controller_runtime.detail);
@@ -777,6 +759,71 @@ fn save_connection(input: ConnectionSettingsInput) -> Result<(), String> {
     Ok(())
 }
 
+fn create_managed_connection() -> Result<(), String> {
+    let store = WindowsConnectionSettingsStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用连接设置。".to_owned())?;
+    if store
+        .load()
+        .map_err(|_| "无法打开已保存的连接设置。".to_owned())?
+        .is_some()
+    {
+        return Err("本机连接已经存在。如需修改，请打开高级连接设置。".to_owned());
+    }
+
+    let mut session_id = [0u8; 16];
+    let mut authentication = [0u8; 32];
+    OsRng.fill_bytes(&mut session_id);
+    OsRng.fill_bytes(&mut authentication);
+    let session_id = hex(&session_id);
+    let authentication_text = Zeroizing::new(hex(&authentication));
+    authentication.zeroize();
+    let settings = HostConnectionSettings::from_text(
+        local_relay::MANAGED_RELAY_ADDRESS,
+        local_relay::MANAGED_RELAY_SERVER_NAME,
+        &session_id,
+        authentication_text.as_str(),
+        None,
+        "1",
+    )
+    .map_err(|_| "DeskLink 无法创建默认公网中继设置。".to_owned())?;
+    store
+        .save(&settings)
+        .map_err(|_| "DeskLink 无法加密保存本机连接。".to_owned())
+}
+
+fn migrate_legacy_local_connection() -> Result<bool, String> {
+    let store = WindowsConnectionSettingsStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用连接设置。".to_owned())?;
+    let Some(existing) = store
+        .load()
+        .map_err(|_| "无法打开已保存的连接设置。".to_owned())?
+    else {
+        return Ok(false);
+    };
+    if !is_legacy_local_connection(&existing) {
+        return Ok(false);
+    }
+    let authentication = Zeroizing::new(hex(existing.authentication()));
+    let migrated = HostConnectionSettings::from_text(
+        local_relay::MANAGED_RELAY_ADDRESS,
+        local_relay::MANAGED_RELAY_SERVER_NAME,
+        &hex(existing.session_id().as_bytes()),
+        authentication.as_str(),
+        None,
+        &existing.stream_id().to_string(),
+    )
+    .map_err(|_| "无法迁移旧版局域网连接。".to_owned())?;
+    store
+        .save(&migrated)
+        .map_err(|_| "无法保存迁移后的公网中继连接。".to_owned())?;
+    Ok(true)
+}
+
+fn is_legacy_local_connection(settings: &HostConnectionSettings) -> bool {
+    settings.relay_address().ip().is_loopback()
+        && matches!(settings.server_name(), "localhost" | "desklink-lan")
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -819,7 +866,25 @@ pub fn run() {
                 let _ = diagnostics.record(&DiagnosticEvent::ControlSurfaceStarted);
             }
             setup_tray(app)?;
-            local_relay::start_if_configured();
+            let migration = migrate_legacy_local_connection().and_then(|host_migrated| {
+                controller::migrate_legacy_local_connection()
+                    .map(|controller_migrated| host_migrated || controller_migrated)
+            });
+            match migration {
+                Ok(true) => {
+                    if let Some(diagnostics) = diagnostics.as_ref() {
+                        let _ = diagnostics.record(&DiagnosticEvent::OperationSucceeded(
+                            DiagnosticOperation::ConnectionMigration,
+                        ));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => record_operation_failure(
+                    diagnostics.as_ref(),
+                    DiagnosticOperation::ConnectionMigration,
+                    &error,
+                ),
+            }
             let manager = app.state::<HostManager>().inner().clone();
             #[cfg(windows)]
             match power::install(app.handle(), manager.clone()) {
@@ -852,6 +917,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_host_snapshot,
             save_connection_settings,
+            setup_managed_connection,
             start_pairing_session,
             cancel_pairing_session,
             revoke_trusted_controller,
@@ -861,6 +927,7 @@ pub fn run() {
             connect_controller,
             reconnect_controller,
             send_controller_input,
+            send_controller_text,
             request_controller_keyframe,
             disconnect_controller,
             forget_controller
@@ -931,9 +998,8 @@ mod tests {
         build_diagnostic_report, hex, normalize_fingerprint,
     };
     use crate::{
-        controller::ControllerRuntimeSummary,
-        host::HostRuntimeSummary,
-        local_relay::{LanAddressSummary, RelayStatusSummary},
+        controller::ControllerRuntimeSummary, host::HostRuntimeSummary,
+        local_relay::RelayStatusSummary,
     };
 
     #[test]
@@ -962,26 +1028,19 @@ mod tests {
             tooltip: "DeskLink：已连接".to_owned(),
         };
         let relay_status = RelayStatusSummary {
-            mode: "lan",
+            mode: "external",
             state: "ready",
-            title: "局域网中继已就绪".to_owned(),
-            detail: "可以连接".to_owned(),
-            port: Some(4433),
-            addresses: vec![LanAddressSummary {
-                relay_address: "192.168.1.20:4433".to_owned(),
-                interface_name: "以太网".to_owned(),
-                is_primary: true,
-            }],
+            title: "DeskLink 公网中继已配置".to_owned(),
+            detail: "支持跨网络连接".to_owned(),
         };
         let connection = ConnectionSummary {
-            relay_address: "127.0.0.1:4433".to_owned(),
-            server_name: "localhost".to_owned(),
+            relay_address: "101.35.246.159:4433".to_owned(),
+            server_name: "turn.p2p.yxswy.com".to_owned(),
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             stream_id: 9,
             has_saved_key: true,
         };
-        let checks =
-            build_diagnostic_checks(&runtime, Some(&connection), None, None, &relay_status);
+        let checks = build_diagnostic_checks(&runtime, Some(&connection), None, None);
         let verify_key = "ab".repeat(32);
         let snapshot = HostSnapshot {
             readiness: "configured",
@@ -1019,7 +1078,7 @@ mod tests {
 
         assert!(report.contains("DL-CFG-101 [通过]"));
         assert!(report.contains("DL-NET-201 [通过]"));
-        assert!(report.contains("192.168.1.20:4433"));
+        assert!(report.contains("101.35.246.159:4433"));
         assert!(report.contains("<redacted>"));
         assert!(!report.contains("0123456789abcdef0123456789abcdef"));
         assert!(!report.contains(&verify_key));

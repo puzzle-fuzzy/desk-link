@@ -209,8 +209,9 @@ mod native {
         MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
         MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
-        VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN,
-        VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP, VkKeyScanW,
+        VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1,
+        VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+        VK_SHIFT, VK_TAB, VK_UP, VkKeyScanW,
     };
 
     pub(super) fn send(
@@ -382,6 +383,18 @@ mod native {
             KeyCode::ArrowDown => vec![spec(VK_DOWN, KEYEVENTF_EXTENDEDKEY)],
             KeyCode::ArrowLeft => vec![spec(VK_LEFT, KEYEVENTF_EXTENDEDKEY)],
             KeyCode::ArrowRight => vec![spec(VK_RIGHT, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::Delete => vec![spec(VK_DELETE, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::Insert => vec![spec(VK_INSERT, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::Home => vec![spec(VK_HOME, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::End => vec![spec(VK_END, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::PageUp => vec![spec(VK_PRIOR, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::PageDown => vec![spec(VK_NEXT, KEYEVENTF_EXTENDEDKEY)],
+            KeyCode::Function(number @ 1..=12) => vec![spec(
+                VIRTUAL_KEY(VK_F1.0 + u16::from(number) - 1),
+                KEYBD_EVENT_FLAGS(0),
+            )],
+            KeyCode::Function(_) => return Err(InputInjectionError::UnsupportedKey),
+            KeyCode::CapsLock => vec![spec(VK_CAPITAL, KEYBD_EVENT_FLAGS(0))],
         };
         Ok(specs)
     }
@@ -404,7 +417,7 @@ mod native {
 
 fn supported_key(code: &KeyCode, modifiers: Modifiers) -> bool {
     modifiers.is_valid()
-        && matches!(
+        && (matches!(
             code,
             KeyCode::Character(_)
                 | KeyCode::Enter
@@ -415,7 +428,14 @@ fn supported_key(code: &KeyCode, modifiers: Modifiers) -> bool {
                 | KeyCode::ArrowDown
                 | KeyCode::ArrowLeft
                 | KeyCode::ArrowRight
-        )
+                | KeyCode::Delete
+                | KeyCode::Insert
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::CapsLock
+        ) || matches!(code, KeyCode::Function(1..=12)))
 }
 
 #[cfg(test)]

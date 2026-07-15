@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tomllib
+import time
 from pathlib import Path
 
 
@@ -59,59 +61,26 @@ def main() -> int:
     if os.name != "nt":
         raise SystemExit("The Windows installer must be built on Windows.")
 
-    run([sys.executable, str(ROOT / "scripts" / "generate-windows-assets.py")])
-    windows_ui = ROOT / "apps" / "windows-ui"
-    run(["bun", "install", "--frozen-lockfile"], cwd=windows_ui)
-    run(["bun", "run", "build"], cwd=windows_ui)
-    run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--target",
-            TARGET,
-            "--package",
-            "desklink-windows-ui",
-            "--bin",
-            "desklink-windows-ui",
-            "--features",
-            "custom-protocol",
-        ]
-    )
-    run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--target",
-            TARGET,
-            "--package",
-            "desklink-windows",
-            "--bin",
-            "desklink-windows",
-            "--features",
-            "installer-gui",
-        ]
-    )
-
+    run([sys.executable, str(ROOT / "scripts" / "verify-windows-release.py")])
     release = ROOT / "target" / TARGET / "release"
     application = release / "desklink-windows-ui.exe"
-    host = release / "desklink-windows.exe"
     if not application.is_file():
         raise SystemExit(f"Windows UI payload was not produced: {application}")
-    if not host.is_file():
-        raise SystemExit(f"Windows host payload was not produced: {host}")
+    release_report = json.loads(
+        (ROOT / "dist" / "windows" / "windows-release-verification.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    verified_application_sha256 = str(release_report["release"]["sha256"])
+    if sha256(application) != verified_application_sha256:
+        raise SystemExit("Windows UI payload changed after release verification")
 
     should_sign = signing_requested()
     application_payload = application
-    host_payload = host
     if should_sign:
         application_payload = application.with_name("DeskLink.signed-payload.exe")
-        host_payload = host.with_name("desklink-windows.signed-payload.exe")
         shutil.copy2(application, application_payload)
-        shutil.copy2(host, host_payload)
         sign(application_payload)
-        sign(host_payload)
     else:
         print(
             "Signing skipped: configure Artifact Signing or DESKLINK_SIGN_CERT_SHA1 "
@@ -126,8 +95,6 @@ def main() -> int:
     installer_environment["DESKLINK_WINDOWS_UI_PAYLOAD_SHA256"] = sha256(
         application_payload
     )
-    installer_environment["DESKLINK_WINDOWS_HOST_PAYLOAD"] = str(host_payload.resolve())
-    installer_environment["DESKLINK_WINDOWS_HOST_PAYLOAD_SHA256"] = sha256(host_payload)
     run(
         [
             "cargo",
@@ -160,9 +127,42 @@ def main() -> int:
     if should_sign:
         sign(destination)
 
+    payload_bytes = application_payload.read_bytes()
+    installer_bytes = destination.read_bytes()
+    payload_offset = installer_bytes.find(payload_bytes)
+    if payload_offset < 0:
+        raise SystemExit("Final installer does not contain the exact verified application payload")
+
+    manifest = {
+        "schema": 1,
+        "version": str(version),
+        "target": TARGET,
+        "signed": should_sign,
+        "application": {
+            "file_name": "DeskLink.exe",
+            "size_bytes": len(payload_bytes),
+            "sha256": sha256(application_payload),
+            "source_release_sha256": verified_application_sha256,
+        },
+        "installer": {
+            "file_name": destination.name,
+            "size_bytes": len(installer_bytes),
+            "sha256": sha256(destination),
+            "embedded_payload_offset": payload_offset,
+        },
+        "passed": True,
+        "completed_at_unix_s": int(time.time()),
+    }
+    manifest_path = destination.parent / "windows-installer-manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
     size_mib = destination.stat().st_size / (1024 * 1024)
     signature = "signed and verified" if should_sign else "unsigned"
     print(f"Built {destination} ({size_mib:.1f} MiB, {signature})")
+    print(f"Manifest: {manifest_path}")
     return 0
 
 
