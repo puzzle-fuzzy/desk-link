@@ -272,7 +272,10 @@ final class MacH264Encoder: @unchecked Sendable {
         }
         let frameID = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value))
         eventQueue.async { [weak self] in
-            guard let self, self.isGenerationActive(generation) else { return }
+            guard let self else { return }
+            self.sessionOperationLock.lock()
+            defer { self.sessionOperationLock.unlock() }
+            guard self.isGenerationActive(generation) else { return }
             self.lock.lock()
             if self.latestFormat != format {
                 self.latestFormat = format
