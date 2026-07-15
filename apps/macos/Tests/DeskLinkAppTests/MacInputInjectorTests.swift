@@ -44,9 +44,23 @@ final class MacInputInjectorTests: XCTestCase {
         XCTAssertEqual(backend.releasedButtons, [.left])
         XCTAssertTrue(injector.pressedInputs.isEmpty)
     }
+
+    func testInputInjectorRetainsInputsWhoseReleaseFails() throws {
+        let backend = RecordingCGEventBackend()
+        backend.failReleases = true
+        let injector = MacInputInjector(backend: backend)
+        try injector.inject(.key(code: 0x24, pressed: true, modifiers: []))
+        try injector.inject(.mouseButton(.left, pressed: true))
+
+        let failures = injector.releaseAll()
+
+        XCTAssertEqual(failures.count, 2)
+        XCTAssertEqual(injector.pressedInputs, [.key(0x24), .button(.left)])
+    }
 }
 
 private final class RecordingCGEventBackend: CGEventBackend {
+    var failReleases = false
     var moves: [CGPoint] = []
     var unicodeEvents: [String] = []
     var unicodeModifiers: [Modifiers] = []
@@ -56,12 +70,14 @@ private final class RecordingCGEventBackend: CGEventBackend {
     func moveMouse(to point: CGPoint) throws { moves.append(point) }
 
     func postMouseButton(_ button: MouseButton, pressed: Bool, at point: CGPoint) throws {
+        if !pressed, failReleases { throw MacInputInjectorError.eventCreationFailed }
         if !pressed { releasedButtons.append(button) }
     }
 
     func postScroll(deltaX: Int32, deltaY: Int32) throws {}
 
     func postKey(code: UInt32, pressed: Bool, modifiers: Modifiers) throws {
+        if !pressed, failReleases { throw MacInputInjectorError.eventCreationFailed }
         if !pressed { releasedKeys.append(code) }
     }
 

@@ -106,7 +106,6 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         let mainMenuBarOrigin = CGDisplayBounds(CGMainDisplayID()).origin
         let display = content.displays.first(where: { $0.displayID == displayID })
             ?? content.displays.first(where: { $0.frame.contains(mainMenuBarOrigin) })
-            ?? content.displays.first
         guard let display else { throw ScreenCaptureSourceError.displayUnavailable }
 
         configuration.width = display.width

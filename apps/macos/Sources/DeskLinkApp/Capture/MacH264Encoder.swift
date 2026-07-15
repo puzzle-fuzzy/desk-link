@@ -96,6 +96,15 @@ enum H264EncoderOutputAssembler {
     }
 }
 
+private final class MacH264EncoderCallbackContext: @unchecked Sendable {
+    weak var encoder: MacH264Encoder?
+    let generation: UInt64
+
+    init(generation: UInt64) {
+        self.generation = generation
+    }
+}
+
 final class MacH264Encoder: @unchecked Sendable {
     typealias EventHandler = @Sendable (EncodedVideoEvent) -> Void
     typealias ErrorHandler = @Sendable (MacH264EncoderError) -> Void
@@ -103,6 +112,9 @@ final class MacH264Encoder: @unchecked Sendable {
     private let eventQueue = DispatchQueue(label: "com.desklink.encoder.events", qos: .userInitiated)
     private let lock = NSLock()
     private var compressionSession: VTCompressionSession?
+    private var callbackContext: MacH264EncoderCallbackContext?
+    private var nextGeneration: UInt64 = 0
+    private var activeGeneration: UInt64?
     private var forceKeyframe = false
     private var streamID: UInt64 = 0
     private var width: UInt16 = 0
@@ -122,6 +134,14 @@ final class MacH264Encoder: @unchecked Sendable {
               encodedWidth > 0, encodedHeight > 0
         else { throw MacH264EncoderError.invalidDimensions }
         stop()
+        lock.lock()
+        nextGeneration &+= 1
+        if nextGeneration == 0 { nextGeneration = 1 }
+        let generation = nextGeneration
+        lock.unlock()
+
+        let callbackContext = MacH264EncoderCallbackContext(generation: generation)
+        callbackContext.encoder = self
         var session: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
@@ -132,23 +152,30 @@ final class MacH264Encoder: @unchecked Sendable {
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: macH264EncoderOutputCallback,
-            refcon: Unmanaged.passUnretained(self).toOpaque(),
+            refcon: Unmanaged.passRetained(callbackContext).toOpaque(),
             compressionSessionOut: &session
         )
-        guard status == noErr, let session else { throw MacH264EncoderError.session(status) }
+        guard status == noErr, let session else {
+            Unmanaged.passUnretained(callbackContext).release()
+            throw MacH264EncoderError.session(status)
+        }
         do {
             try configure(session: session, width: width, height: height)
         } catch {
             VTCompressionSessionInvalidate(session)
+            Unmanaged.passUnretained(callbackContext).release()
             throw error
         }
         let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(session)
         guard prepareStatus == noErr else {
             VTCompressionSessionInvalidate(session)
+            Unmanaged.passUnretained(callbackContext).release()
             throw MacH264EncoderError.session(prepareStatus)
         }
         lock.lock()
         compressionSession = session
+        self.callbackContext = callbackContext
+        activeGeneration = generation
         self.streamID = streamID
         self.width = encodedWidth
         self.height = encodedHeight
@@ -161,7 +188,7 @@ final class MacH264Encoder: @unchecked Sendable {
 
     func encode(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
         lock.lock()
-        guard let session = compressionSession else {
+        guard let session = compressionSession, let generation = activeGeneration else {
             lock.unlock()
             return
         }
@@ -181,7 +208,7 @@ final class MacH264Encoder: @unchecked Sendable {
             infoFlagsOut: nil
         )
         if status != noErr {
-            report(error: .encoding(status))
+            report(error: .encoding(status), generation: generation)
         }
     }
 
@@ -194,7 +221,10 @@ final class MacH264Encoder: @unchecked Sendable {
     func stop() {
         lock.lock()
         let session = compressionSession
+        let callbackContext = self.callbackContext
         compressionSession = nil
+        self.callbackContext = nil
+        activeGeneration = nil
         latestFormat = nil
         emittedConfigurationVersion = 0
         configurationVersion = 0
@@ -202,70 +232,84 @@ final class MacH264Encoder: @unchecked Sendable {
         if let session {
             let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             if status != noErr {
-                report(error: .encoding(status))
+                report(error: .encoding(status), generation: callbackContext?.generation)
             }
             VTCompressionSessionInvalidate(session)
         }
+        if let callbackContext {
+            Unmanaged.passUnretained(callbackContext).release()
+        }
     }
 
-    fileprivate func accept(sampleBuffer: CMSampleBuffer) {
+    fileprivate func accept(sampleBuffer: CMSampleBuffer, generation: UInt64) {
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-            report(error: .malformedAVCC)
+            report(error: .malformedAVCC, generation: generation)
             return
         }
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let format = Self.format(from: formatDescription)
         else {
-            report(error: .missingFormatDescription)
+            report(error: .missingFormatDescription, generation: generation)
             return
         }
         guard let avcc = Self.data(from: dataBuffer) else {
-            report(error: .malformedAVCC)
+            report(error: .malformedAVCC, generation: generation)
             return
         }
         let frameID = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value))
+        eventQueue.async { [weak self] in
+            guard let self, self.isGenerationActive(generation) else { return }
+            self.lock.lock()
+            if self.latestFormat != format {
+                self.latestFormat = format
+                self.configurationVersion &+= 1
+                if self.configurationVersion == 0 { self.configurationVersion = 1 }
+            }
+            let version = self.configurationVersion
+            let emitsConfiguration = self.emittedConfigurationVersion != version
+            if emitsConfiguration { self.emittedConfigurationVersion = version }
+            let currentStreamID = self.streamID
+            let currentWidth = self.width
+            let currentHeight = self.height
+            self.lock.unlock()
+            guard version > 0, self.isGenerationActive(generation) else { return }
+            do {
+                let events = try H264EncoderOutputAssembler.events(
+                    avccAccessUnit: avcc,
+                    format: format,
+                    frameID: frameID,
+                    streamID: currentStreamID,
+                    width: currentWidth,
+                    height: currentHeight,
+                    configVersion: version,
+                    emitsConfiguration: emitsConfiguration
+                )
+                guard self.isGenerationActive(generation) else { return }
+                for event in events { self.onEvent?(event) }
+            } catch let error as MacH264EncoderError {
+                guard self.isGenerationActive(generation) else { return }
+                self.onError?(error)
+            } catch {
+                guard self.isGenerationActive(generation) else { return }
+                self.onError?(.malformedAVCC)
+            }
+        }
+    }
+
+    fileprivate func report(error: MacH264EncoderError, generation: UInt64? = nil) {
+        eventQueue.async { [weak self] in
+            guard let self,
+                  generation.map({ self.isGenerationActive($0) }) ?? true
+            else { return }
+            self.onError?(error)
+        }
+    }
+
+    private func isGenerationActive(_ generation: UInt64) -> Bool {
         lock.lock()
-        if latestFormat != format {
-            latestFormat = format
-            configurationVersion &+= 1
-            if configurationVersion == 0 { configurationVersion = 1 }
-        }
-        let version = configurationVersion
-        let emitsConfiguration = emittedConfigurationVersion != version
-        if emitsConfiguration { emittedConfigurationVersion = version }
-        let currentStreamID = streamID
-        let currentWidth = width
-        let currentHeight = height
+        let isActive = activeGeneration == generation
         lock.unlock()
-        guard version > 0 else { return }
-        let events: [EncodedVideoEvent]
-        do {
-            events = try H264EncoderOutputAssembler.events(
-                avccAccessUnit: avcc,
-                format: format,
-                frameID: frameID,
-                streamID: currentStreamID,
-                width: currentWidth,
-                height: currentHeight,
-                configVersion: version,
-                emitsConfiguration: emitsConfiguration
-            )
-        } catch let error as MacH264EncoderError {
-            report(error: error)
-            return
-        } catch {
-            report(error: .malformedAVCC)
-            return
-        }
-        for event in events { publish(event) }
-    }
-
-    fileprivate func report(error: MacH264EncoderError) {
-        eventQueue.async { [weak self] in self?.onError?(error) }
-    }
-
-    private func publish(_ event: EncodedVideoEvent) {
-        eventQueue.async { [weak self] in self?.onEvent?(event) }
+        return isActive
     }
 
     private func configure(session: VTCompressionSession, width: Int, height: Int) throws {
@@ -345,16 +389,17 @@ private func macH264EncoderOutputCallback(
     _ sampleBuffer: CMSampleBuffer?
 ) {
     guard let outputCallbackRefCon else { return }
-    let encoder = Unmanaged<MacH264Encoder>
+    let context = Unmanaged<MacH264EncoderCallbackContext>
         .fromOpaque(outputCallbackRefCon)
         .takeUnretainedValue()
+    guard let encoder = context.encoder else { return }
     guard status == noErr else {
-        encoder.report(error: .output(status))
+        encoder.report(error: .output(status), generation: context.generation)
         return
     }
     guard let sampleBuffer else {
-        encoder.report(error: .missingFormatDescription)
+        encoder.report(error: .missingFormatDescription, generation: context.generation)
         return
     }
-    encoder.accept(sampleBuffer: sampleBuffer)
+    encoder.accept(sampleBuffer: sampleBuffer, generation: context.generation)
 }

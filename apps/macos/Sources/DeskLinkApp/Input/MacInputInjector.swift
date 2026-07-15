@@ -83,15 +83,24 @@ final class SystemCGEventBackend: CGEventBackend {
     }
 
     func postUnicode(_ text: String, modifiers: Modifiers) throws {
-        guard !text.isEmpty, let event = CGEvent(source: nil) else {
+        guard !text.isEmpty,
+              let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+        else {
             throw MacInputInjectorError.eventCreationFailed
         }
         let characters = Array(text.utf16)
-        event.flags = cgFlags(for: modifiers)
-        characters.withUnsafeBufferPointer {
-            event.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: $0.baseAddress!)
+        let flags = cgFlags(for: modifiers)
+        for event in [keyDown, keyUp] {
+            event.flags = flags
+            characters.withUnsafeBufferPointer {
+                event.keyboardSetUnicodeString(
+                    stringLength: characters.count,
+                    unicodeString: $0.baseAddress!
+                )
+            }
+            event.post(tap: .cghidEventTap)
         }
-        event.post(tap: .cghidEventTap)
     }
 
     private func mouseEvent(type: CGEventType, point: CGPoint, button: CGMouseButton) -> CGEvent? {
@@ -152,13 +161,32 @@ final class MacInputInjector {
         }
     }
 
-    func releaseAll() {
+    @discardableResult
+    func releaseAll() -> [MacInputInjectorError] {
         let keys = pressedKeys.sorted()
         let buttons = pressedButtons.sorted()
-        for key in keys { try? backend.postKey(code: key, pressed: false, modifiers: []) }
-        for button in buttons { try? backend.postMouseButton(button, pressed: false, at: pointer) }
-        pressedKeys.removeAll()
-        pressedButtons.removeAll()
+        var failures: [MacInputInjectorError] = []
+        for key in keys {
+            do {
+                try backend.postKey(code: key, pressed: false, modifiers: [])
+                pressedKeys.remove(key)
+            } catch let error as MacInputInjectorError {
+                failures.append(error)
+            } catch {
+                failures.append(.eventCreationFailed)
+            }
+        }
+        for button in buttons {
+            do {
+                try backend.postMouseButton(button, pressed: false, at: pointer)
+                pressedButtons.remove(button)
+            } catch let error as MacInputInjectorError {
+                failures.append(error)
+            } catch {
+                failures.append(.eventCreationFailed)
+            }
+        }
+        return failures
     }
 }
 
