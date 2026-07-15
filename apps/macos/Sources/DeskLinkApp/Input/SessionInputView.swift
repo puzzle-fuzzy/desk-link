@@ -77,10 +77,10 @@ struct SessionInputView: NSViewRepresentable {
         override func otherMouseUp(with event: NSEvent) { sendButton(event, pressed: false) }
 
         override func scrollWheel(with event: NSEvent) {
-            bridge?.send(input: .wheel(
-                deltaX: Int32(event.scrollingDeltaX.rounded()),
-                deltaY: Int32(event.scrollingDeltaY.rounded())
-            ))
+            let deltaX = quantizeScrollDelta(event.scrollingDeltaX)
+            let deltaY = quantizeScrollDelta(event.scrollingDeltaY)
+            guard deltaX != 0 || deltaY != 0 else { return }
+            bridge?.send(input: .wheel(deltaX: deltaX, deltaY: deltaY))
         }
 
         deinit {
@@ -136,4 +136,12 @@ struct SessionInputView: NSViewRepresentable {
             return InputMapper(videoRect: videoRect).normalizedPoint(for: convert(event.locationInWindow, from: nil))
         }
     }
+}
+
+func quantizeScrollDelta(_ delta: CGFloat) -> Int32 {
+    guard delta.isFinite, delta != 0 else { return 0 }
+    let rounded = delta.rounded()
+    let bounded = min(CGFloat(1_200), max(CGFloat(-1_200), rounded))
+    if bounded == 0 { return delta < 0 ? -1 : 1 }
+    return Int32(bounded)
 }

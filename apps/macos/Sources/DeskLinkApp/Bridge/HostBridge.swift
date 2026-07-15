@@ -81,7 +81,7 @@ final class HostBridge: ObservableObject {
         self.trustedControllerStore = trustedControllerStore
         self.permissions = permissions.snapshot()
         encoder.onEvent = { [weak self] event in
-            Task { @MainActor in self?.sendVideo(event) }
+            DispatchQueue.main.async { [weak self] in self?.sendVideo(event) }
         }
         encoder.onError = { [weak self] error in
             Task { @MainActor in self?.publishError("Video encoding could not continue: \(error).") }
@@ -520,7 +520,8 @@ private func hostInputCommand(_ input: DesklinkHostInput) -> MacInputCommand? {
         return .wheel(deltaX: input.wheel_x, deltaY: input.wheel_y)
     case DESKLINK_INPUT_KEY:
         let modifiers = Modifiers(rawValue: UInt32(input.modifiers))
-        if input.character != 0,
+        if input.pressed != 0,
+           input.character != 0,
            let scalar = UnicodeScalar(input.character) {
             return .unicode(String(Character(scalar)), modifiers: modifiers)
         }

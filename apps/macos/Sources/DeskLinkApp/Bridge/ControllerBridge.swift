@@ -367,7 +367,9 @@ final class ControllerBridge: ObservableObject {
 
     private func sendInput(_ input: inout DesklinkInput) {
         guard case .connected = state, let handle = handleOwner.pointer else { return }
-        if desklink_send_input(handle, &input) != DESKLINK_OK {
+        let result = desklink_send_input(handle, &input)
+        guard result != DESKLINK_INVALID_ARGUMENT else { return }
+        if result != DESKLINK_OK {
             publishErrorMessage("Input delivery failed.")
         }
     }

@@ -59,4 +59,11 @@ final class InputMapperTests: XCTestCase {
         XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 8), 0x7c)
         XCTAssertNil(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 0))
     }
+
+    func testScrollQuantizationNeverSendsInvalidZeroOrOversizedDeltas() {
+        XCTAssertEqual(quantizeScrollDelta(0), 0)
+        XCTAssertEqual(quantizeScrollDelta(0.25), 1)
+        XCTAssertEqual(quantizeScrollDelta(-0.25), -1)
+        XCTAssertEqual(quantizeScrollDelta(2_000), 1_200)
+    }
 }
