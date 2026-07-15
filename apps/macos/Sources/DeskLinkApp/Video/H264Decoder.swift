@@ -13,9 +13,11 @@ private final class SendablePixelBuffer: @unchecked Sendable {
 
 @MainActor
 final class H264Decoder {
+    static let decodeFlags: VTDecodeFrameFlags = [._EnableAsynchronousDecompression]
+
     var onFrame: ((CVPixelBuffer) -> Void)?
 
-    private var decompressionSession: VTDecompressionSession?
+    nonisolated(unsafe) private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
     private(set) var latestPixelBuffer: CVPixelBuffer?
     private(set) var lastFrameID: UInt64 = 0
@@ -191,7 +193,7 @@ final class H264Decoder {
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sampleBuffer,
-            flags: [.enableAsynchronousDecompression],
+            flags: Self.decodeFlags,
             frameRefcon: nil,
             infoFlagsOut: nil
         )
