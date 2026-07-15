@@ -100,6 +100,10 @@ fn host_abi_validates_invites_approval_and_media_arguments() {
         DesklinkResult::InvalidArgument
     );
     assert_eq!(
+        unsafe { desklink_host_send_video_config(handle, 1, 1, 1, 1, null(), 0) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
         unsafe { desklink_host_send_video_access_unit(handle, 1, 1, 1, null(), 1) },
         DesklinkResult::InvalidArgument
     );

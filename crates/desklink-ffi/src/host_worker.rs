@@ -16,7 +16,8 @@ use desklink_protocol::{
     decode_cursor_update, decode_input, decode_noise_handshake, encode_control,
     encode_noise_handshake, encode_video_config, encode_video_packet,
 };
-use desklink_transport::{QuicClient, RelayJoin, TransportError, TransportEvent};
+use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
+use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin, TransportError, TransportEvent};
 use desklink_video::{EncodedFrame, packetize_frame};
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
@@ -101,6 +102,7 @@ pub(crate) struct HostWorker {
 impl HostWorker {
     pub(crate) fn start(
         client: QuicClient,
+        reconnect_config: Option<QuicClientConfig>,
         identity: DeviceIdentity,
         session_id: SessionId,
         relay_authentication: [u8; 32],
@@ -123,6 +125,7 @@ impl HostWorker {
                 match runtime {
                     Ok(runtime) => runtime.block_on(run_worker(
                         client,
+                        reconnect_config,
                         identity,
                         session_id,
                         relay_authentication,
@@ -263,10 +266,11 @@ fn emit_terminal(events: &mpsc::Sender<HostEvent>, error: Option<HostError>) {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_worker(
-    client: QuicClient,
+    mut client: QuicClient,
+    reconnect_config: Option<QuicClientConfig>,
     identity: DeviceIdentity,
     session_id: SessionId,
-    mut relay_authentication: [u8; 32],
+    relay_authentication: [u8; 32],
     mut commands: mpsc::Receiver<HostCommand>,
     mut cancellation: watch::Receiver<bool>,
     events: mpsc::Sender<HostEvent>,
@@ -274,43 +278,94 @@ async fn run_worker(
     phase_gate: Arc<Mutex<()>>,
     ready: std::sync::mpsc::SyncSender<Result<(), HostError>>,
 ) {
+    let mut relay_authentication = relay_authentication;
     let join = client
         .join(RelayJoin::host(session_id, relay_authentication))
         .await
         .map_err(transport_error);
-    relay_authentication.zeroize();
     if let Err(error) = join {
+        relay_authentication.zeroize();
         let _ = ready.send(Err(error.clone()));
         emit_terminal(&events, Some(error));
         record_closed(&phase, &phase_gate);
         return;
     }
     let _ = ready.send(Ok(()));
-    let result = run_session(
-        &client,
-        identity,
-        &mut commands,
-        &mut cancellation,
-        &events,
-        &phase,
-        &phase_gate,
-    )
-    .await;
+    let mut approved_controller = None;
+    let mut reconnect_schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+    let mut terminal_error = None;
+    loop {
+        match run_session(
+            &client,
+            &identity,
+            &mut commands,
+            &mut cancellation,
+            &events,
+            &phase,
+            &phase_gate,
+            &mut approved_controller,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error)
+                if reconnect_config.is_some()
+                    && is_retryable_host_error(&error)
+                    && !*cancellation.borrow() =>
+            {
+                let _ = try_advance_worker_phase(&phase, &phase_gate, WorkerPhase::Connecting);
+                emit_nonterminal(&events, HostEvent::ReleaseAll);
+                emit_nonterminal(&events, HostEvent::State(HostState::Connecting));
+                match reconnect_host(
+                    reconnect_config.as_ref().expect("checked above"),
+                    session_id,
+                    relay_authentication,
+                    &mut reconnect_schedule,
+                    &mut cancellation,
+                )
+                .await
+                {
+                    Ok(Some(reconnected)) => {
+                        client = reconnected;
+                        reconnect_schedule.reset();
+                    }
+                    Ok(None) => break,
+                    Err(reconnect_error) => {
+                        terminal_error = Some(reconnect_error);
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                terminal_error = Some(error);
+                break;
+            }
+        }
+    }
 
+    emit_nonterminal(&events, HostEvent::State(HostState::Stopping));
     record_closed(&phase, &phase_gate);
-    emit_terminal(&events, result.err());
+    emit_terminal(&events, terminal_error);
+    relay_authentication.zeroize();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     client: &QuicClient,
-    identity: DeviceIdentity,
+    identity: &DeviceIdentity,
     commands: &mut mpsc::Receiver<HostCommand>,
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
     phase: &Arc<AtomicU8>,
     phase_gate: &Arc<Mutex<()>>,
+    approved_controller: &mut Option<ApprovedController>,
 ) -> Result<(), HostError> {
-    let Some(mut secure) = perform_noise_handshake(client, identity, cancellation).await? else {
+    let handshake_identity = identity.with_secret_key_bytes(|secret| {
+        DeviceIdentity::from_secret_key(identity.device_id, secret)
+    });
+    let Some(mut secure) =
+        perform_noise_handshake(client, handshake_identity, cancellation).await?
+    else {
         return Ok(());
     };
     let peer = secure.peer_identity();
@@ -320,30 +375,46 @@ async fn run_session(
             return Ok(());
         }
         phase.store(WorkerPhase::WaitingForApproval as u8, Ordering::Release);
-        emit_nonterminal(
-            events,
-            HostEvent::ApprovalRequested {
-                device_id: peer.device_id(),
-                verify_key: *peer.verify_key().as_bytes(),
-                fingerprint: fingerprint(peer.verify_key()),
-            },
-        );
+        if !approved_controller.is_some_and(|approved| {
+            approved.device_id == peer.device_id()
+                && approved.verify_key == *peer.verify_key().as_bytes()
+        }) {
+            emit_nonterminal(
+                events,
+                HostEvent::ApprovalRequested {
+                    device_id: peer.device_id(),
+                    verify_key: *peer.verify_key().as_bytes(),
+                    fingerprint: fingerprint(peer.verify_key()),
+                },
+            );
+        }
     }
 
-    if !wait_for_approval(
-        peer.device_id(),
-        peer.verify_key(),
-        commands,
-        cancellation,
-        events,
-    )
-    .await?
-    {
-        return Ok(());
+    let approved = approved_controller.is_some_and(|approved| {
+        approved.device_id == peer.device_id()
+            && approved.verify_key == *peer.verify_key().as_bytes()
+    });
+    if !approved {
+        if !wait_for_approval(
+            peer.device_id(),
+            peer.verify_key(),
+            commands,
+            cancellation,
+            events,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        *approved_controller = Some(ApprovedController {
+            device_id: peer.device_id(),
+            verify_key: *peer.verify_key().as_bytes(),
+        });
     }
     if !try_advance_worker_phase(phase, phase_gate, WorkerPhase::NegotiatingCapabilities) {
         return Ok(());
     }
+    emit_nonterminal(events, HostEvent::State(HostState::NegotiatingCapabilities));
     negotiate_controller(client, &mut secure, cancellation).await?;
     if *cancellation.borrow() {
         return Ok(());
@@ -351,7 +422,76 @@ async fn run_session(
     if !try_advance_worker_phase(phase, phase_gate, WorkerPhase::Connected) {
         return Ok(());
     }
+    emit_nonterminal(events, HostEvent::State(HostState::Connected));
     run_connected(client, &mut secure, commands, cancellation, events).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ApprovedController {
+    device_id: [u8; 16],
+    verify_key: [u8; 32],
+}
+
+fn is_retryable_host_error(error: &HostError) -> bool {
+    matches!(error, HostError::Transport(_))
+}
+
+async fn reconnect_host(
+    config: &QuicClientConfig,
+    session_id: SessionId,
+    relay_authentication: [u8; 32],
+    schedule: &mut ReconnectSchedule,
+    cancellation: &mut watch::Receiver<bool>,
+) -> Result<Option<QuicClient>, HostError> {
+    let mut last_error = None;
+    loop {
+        let decision = schedule.next(now_unix_s());
+        let delay = match decision {
+            ReconnectDecision::RetryAfter { delay, .. } => delay,
+            ReconnectDecision::Exhausted => {
+                return Err(last_error.unwrap_or_else(|| {
+                    HostError::Transport("host reconnect retry budget exhausted".into())
+                }));
+            }
+            ReconnectDecision::SessionExpired => {
+                return Err(HostError::Transport(
+                    "host pairing session expired before reconnect".into(),
+                ));
+            }
+        };
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        tokio::select! {
+            biased;
+            changed = cancellation.changed() => {
+                let _ = changed;
+                return Ok(None);
+            }
+            () = &mut sleep => {}
+        }
+        if *cancellation.borrow() {
+            return Ok(None);
+        }
+        match connect_and_join(config, session_id, relay_authentication).await {
+            Ok(client) => return Ok(Some(client)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+}
+
+async fn connect_and_join(
+    config: &QuicClientConfig,
+    session_id: SessionId,
+    relay_authentication: [u8; 32],
+) -> Result<QuicClient, HostError> {
+    let client = QuicClient::connect(config.clone())
+        .await
+        .map_err(transport_error)?;
+    client
+        .join(RelayJoin::host(session_id, relay_authentication))
+        .await
+        .map_err(transport_error)?;
+    Ok(client)
 }
 
 /*
@@ -619,9 +759,13 @@ async fn handle_command(
             if (stream_id, config_version) != (configured_stream, configured_version) {
                 return Err(HostError::InvalidState);
             }
-            let flags = if video.next_access_unit_is_keyframe {
+            let config_flag = video.next_access_unit_is_keyframe;
+            let keyframe_flag = config_flag || contains_idr(&bytes);
+            let flags = if keyframe_flag {
                 video.next_access_unit_is_keyframe = false;
-                FrameFlags(FrameFlags::KEYFRAME.0 | FrameFlags::CONFIG.0)
+                FrameFlags(
+                    FrameFlags::KEYFRAME.0 | if config_flag { FrameFlags::CONFIG.0 } else { 0 },
+                )
             } else {
                 FrameFlags(FrameFlags::VIDEO_ALIVE.0)
             };
@@ -697,10 +841,36 @@ fn fingerprint(verify_key: VerifyingKey) -> String {
     )
 }
 
+fn contains_idr(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 3 < bytes.len() {
+        let start_code_len = if bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if bytes[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            index += 1;
+            continue;
+        };
+        let nal_start = index + start_code_len;
+        if nal_start < bytes.len() && bytes[nal_start] & 0x1f == 5 {
+            return true;
+        }
+        index = nal_start;
+    }
+    false
+}
+
 fn now_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_micros() as u64)
+}
+
+fn now_unix_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn transport_error(error: TransportError) -> HostError {
@@ -720,8 +890,8 @@ mod tests {
     use std::sync::{Mutex, atomic::AtomicU8};
 
     use super::{
-        HostCommand, WorkerPhase, command_is_admissible, record_terminal_admission,
-        try_advance_worker_phase,
+        HostCommand, HostError, WorkerPhase, command_is_admissible, contains_idr,
+        is_retryable_host_error, record_terminal_admission, try_advance_worker_phase,
     };
 
     #[test]
@@ -779,5 +949,25 @@ mod tests {
                 assert!(!command_is_admissible(command, phase), "{command:?}");
             }
         }
+    }
+
+    #[test]
+    fn detects_idr_nals_in_three_and_four_byte_annex_b_start_codes() {
+        assert!(contains_idr(&[0, 0, 1, 0x65, 0x88]));
+        assert!(contains_idr(&[0, 0, 0, 1, 0x25, 0x88]));
+        assert!(!contains_idr(&[0, 0, 1, 0x41, 0x88]));
+    }
+
+    #[test]
+    fn only_transport_failures_enter_host_reconnect_path() {
+        assert!(is_retryable_host_error(&HostError::Transport(
+            "closed".into()
+        )));
+        assert!(!is_retryable_host_error(&HostError::Protocol(
+            "malformed".into()
+        )));
+        assert!(!is_retryable_host_error(&HostError::Crypto(
+            "tampered".into()
+        )));
     }
 }

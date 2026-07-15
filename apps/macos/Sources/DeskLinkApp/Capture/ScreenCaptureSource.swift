@@ -79,6 +79,32 @@ private final class LatestFrameDelivery: @unchecked Sendable {
     }
 }
 
+struct CaptureVideoDimensions: Equatable, Sendable {
+    let width: Int
+    let height: Int
+}
+
+func captureVideoDimensions(
+    displayWidth: Int,
+    displayHeight: Int,
+    maximumWidth: Int = 1_920,
+    maximumHeight: Int = 1_080
+) -> CaptureVideoDimensions {
+    guard displayWidth > 0, displayHeight > 0, maximumWidth > 0, maximumHeight > 0 else {
+        return CaptureVideoDimensions(width: 0, height: 0)
+    }
+    let scale = min(
+        1,
+        min(
+            Double(maximumWidth) / Double(displayWidth),
+            Double(maximumHeight) / Double(displayHeight)
+        )
+    )
+    let width = max(1, Int(floor(Double(displayWidth) * scale)))
+    let height = max(1, Int(floor(Double(displayHeight) * scale)))
+    return CaptureVideoDimensions(width: width, height: height)
+}
+
 @MainActor
 final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     typealias FrameHandler = @Sendable (CVPixelBuffer, UInt64) -> Void
@@ -92,6 +118,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
     private var lifecycleGeneration: UInt64 = 0
 
     private(set) var capturedDisplayFrame: CGRect = .zero
+    private(set) var capturedVideoSize: CGSize = .zero
 
     func start(
         displayID: CGDirectDisplayID,
@@ -115,8 +142,15 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             ?? content.displays.first(where: { $0.frame.contains(mainMenuBarOrigin) })
         guard let display else { throw ScreenCaptureSourceError.displayUnavailable }
 
-        configuration.width = display.width
-        configuration.height = display.height
+        let dimensions = captureVideoDimensions(
+            displayWidth: Int(display.width),
+            displayHeight: Int(display.height)
+        )
+        guard dimensions.width > 0, dimensions.height > 0 else {
+            throw ScreenCaptureSourceError.displayUnavailable
+        }
+        configuration.width = dimensions.width
+        configuration.height = dimensions.height
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.queueDepth = 3
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
@@ -133,6 +167,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             self.stream = stream
             selectedStreamID = streamID
             capturedDisplayFrame = display.frame
+            capturedVideoSize = CGSize(width: dimensions.width, height: dimensions.height)
             stopHandler = onStop
             delivery.begin(stream: stream, handler: onFrame)
             try await stream.startCapture()
@@ -145,6 +180,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
                 self.stream = nil
                 selectedStreamID = 0
                 capturedDisplayFrame = .zero
+                capturedVideoSize = .zero
                 stopHandler = nil
             }
             throw error
@@ -161,6 +197,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         self.stream = nil
         selectedStreamID = 0
         capturedDisplayFrame = .zero
+        capturedVideoSize = .zero
         stopHandler = nil
         delivery.end(stream: stream)
         if let stream { try? await stream.stopCapture() }
@@ -190,6 +227,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             self.stream = nil
             self.selectedStreamID = 0
             self.capturedDisplayFrame = .zero
+            self.capturedVideoSize = .zero
             self.stopHandler = nil
             self.delivery.end(stream: currentStream)
             handler?(ScreenCaptureSourceError.streamStopped(message))

@@ -1333,6 +1333,9 @@ pub unsafe extern "C" fn desklink_host_send_video_config(
     let Some(bytes) = copy_payload(bytes, bytes_len, MAX_VIDEO_CONFIG_BYTES) else {
         return DesklinkResult::InvalidArgument;
     };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
     send_host_command(
         handle,
         HostCommand::SendVideoConfig {
@@ -1625,7 +1628,9 @@ fn start_host_runtime_inner(
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(desklink_transport::QuicClient::connect(transport_config)),
+        Ok(runtime) => runtime.block_on(desklink_transport::QuicClient::connect(
+            transport_config.clone(),
+        )),
         Err(_) => return DesklinkResult::InternalError,
     };
     let client = match client {
@@ -1634,8 +1639,9 @@ fn start_host_runtime_inner(
     };
     let identity =
         HostIdentity::from_secret_key(handle.config.host_device_id, &handle.config.host_secret_key);
-    let runtime = match HostRuntime::start(
+    let runtime = match HostRuntime::start_with_reconnect(
         client,
+        transport_config,
         identity,
         SessionId::from_bytes(session_id),
         relay_authentication,

@@ -228,7 +228,7 @@ impl HostTestFixture {
     }
 
     async fn received_release_all(&self, host: &HostRuntime) -> bool {
-        for _ in 0..3 {
+        for _ in 0..8 {
             if matches!(self.next_event(host).await, HostEvent::ReleaseAll) {
                 return true;
             }
@@ -398,11 +398,41 @@ async fn terminal_events(host: &HostRuntime) -> Vec<HostEvent> {
             .unwrap()
             .unwrap();
         let closed = matches!(event, HostEvent::State(HostState::Closed));
-        events.push(event);
+        if !matches!(event, HostEvent::State(_)) || closed {
+            events.push(event);
+        }
         if closed {
             return events;
         }
     }
+}
+
+async fn next_connected_state(host: &HostRuntime) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(
+                host.next_event().await.unwrap(),
+                HostEvent::State(HostState::Connected)
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approval_emits_connected_state_for_capture_start() {
+    let fixture = HostTestFixture::new().await;
+    let host = fixture.start_host().await;
+    assert!(matches!(
+        fixture.next_event(&host).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    fixture.approve(&host).await;
+    next_connected_state(&host).await;
+    host.destroy();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -462,14 +492,18 @@ async fn host_decodes_input_and_keyframe_requests_after_approval() {
 
     let mut saw_input = false;
     let mut saw_keyframe = false;
-    for _ in 0..2 {
+    for _ in 0..8 {
         match fixture.next_event(&host).await {
             HostEvent::Input(InputEvent::MouseWheel {
                 delta_x: -120,
                 delta_y: 240,
             }) => saw_input = true,
             HostEvent::KeyframeRequested => saw_keyframe = true,
+            HostEvent::State(_) => continue,
             event => panic!("unexpected host event: {event:?}"),
+        }
+        if saw_input && saw_keyframe {
+            break;
         }
     }
     assert!(saw_input && saw_keyframe);

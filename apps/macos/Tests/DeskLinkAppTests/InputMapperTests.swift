@@ -11,7 +11,26 @@ final class InputMapperTests: XCTestCase {
             mapper.normalizedPoint(for: CGPoint(x: 500, y: 275)),
             CGPoint(x: 0.5, y: 0.5)
         )
+        XCTAssertEqual(
+            mapper.normalizedPoint(for: CGPoint(x: 100, y: 50)),
+            CGPoint(x: 0, y: 1)
+        )
+        XCTAssertEqual(
+            mapper.normalizedPoint(for: CGPoint(x: 900, y: 500)),
+            CGPoint(x: 1, y: 0)
+        )
         XCTAssertNil(mapper.normalizedPoint(for: CGPoint(x: 50, y: 275)))
+    }
+
+    func testCaptureVideoDimensionsFitProtocolBounds() {
+        XCTAssertEqual(
+            captureVideoDimensions(displayWidth: 3840, displayHeight: 2160),
+            CaptureVideoDimensions(width: 1920, height: 1080)
+        )
+        XCTAssertEqual(
+            captureVideoDimensions(displayWidth: 2560, displayHeight: 1600),
+            CaptureVideoDimensions(width: 1728, height: 1080)
+        )
     }
 
     func testCommandMapsToRemoteControlWhenAutomaticMappingIsEnabled() {

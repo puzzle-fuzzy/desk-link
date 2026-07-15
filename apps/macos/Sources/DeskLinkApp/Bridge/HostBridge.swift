@@ -63,6 +63,7 @@ final class HostBridge: ObservableObject {
     private var inputInjector = MacInputInjector()
     private var captureStarting = false
     private var captureRunning = false
+    private var nextStreamID: UInt64 = 0
     private var stopTask: Task<Void, Never>?
     private var callbackGeneration: UInt64 = 0
     private var activeControllerDeviceID: [UInt8]?
@@ -309,9 +310,13 @@ final class HostBridge: ObservableObject {
 
     private func consumeState(_ rawState: Int) {
         switch rawState {
-        case Int(DESKLINK_HOST_CONNECTING.rawValue): state = .connecting
+        case Int(DESKLINK_HOST_CONNECTING.rawValue):
+            state = .connecting
+            pauseCaptureForReconnect()
         case Int(DESKLINK_HOST_WAITING_FOR_APPROVAL.rawValue): state = .waitingForApproval
-        case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue): state = .negotiating
+        case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue):
+            state = .negotiating
+            pauseCaptureForReconnect()
         case Int(DESKLINK_HOST_CONNECTED.rawValue):
             state = .connected
             pendingApproval = nil
@@ -327,13 +332,19 @@ final class HostBridge: ObservableObject {
 
     private func startCaptureIfPermitted() {
         guard canStartCapture, !captureStarting, !captureRunning else { return }
+        let streamID: UInt64
+        if nextStreamID == UInt64.max {
+            streamID = 1
+        } else {
+            streamID = max(1, nextStreamID + 1)
+        }
         captureStarting = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await captureSource.start(
                     displayID: CGMainDisplayID(),
-                    streamID: 1,
+                    streamID: streamID,
                     onFrame: { [weak encoder] buffer, frameID in
                         encoder?.encode(pixelBuffer: buffer, frameID: frameID)
                     },
@@ -347,8 +358,17 @@ final class HostBridge: ObservableObject {
                     return
                 }
                 let frame = captureSource.capturedDisplayFrame
-                try encoder.start(width: Int(frame.width), height: Int(frame.height), streamID: 1)
+                let videoSize = captureSource.capturedVideoSize
+                guard videoSize.width > 0, videoSize.height > 0 else {
+                    throw ScreenCaptureSourceError.displayUnavailable
+                }
+                try encoder.start(
+                    width: Int(videoSize.width),
+                    height: Int(videoSize.height),
+                    streamID: streamID
+                )
                 inputInjector = MacInputInjector(displayFrame: frame)
+                nextStreamID = streamID
                 captureRunning = true
                 captureStarting = false
             } catch {
@@ -356,6 +376,17 @@ final class HostBridge: ObservableObject {
                 captureRunning = false
                 publishError("Screen capture could not start. Check Screen Recording permission.")
             }
+        }
+    }
+
+    private func pauseCaptureForReconnect() {
+        guard captureStarting || captureRunning else { return }
+        captureStarting = false
+        captureRunning = false
+        encoder.stop()
+        releaseAllLocalInput()
+        Task { @MainActor [weak self] in
+            await self?.captureSource.stop()
         }
     }
 

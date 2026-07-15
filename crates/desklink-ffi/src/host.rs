@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use desklink_crypto::{DeviceIdentity, SessionId};
 use desklink_protocol::InputEvent;
-use desklink_transport::QuicClient;
+use desklink_transport::{QuicClient, QuicClientConfig};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 
@@ -160,6 +160,29 @@ impl HostRuntime {
         let (events, receiver) = mpsc::channel(HOST_EVENT_CAPACITY);
         let worker = HostWorker::start(
             client,
+            None,
+            identity.into_device_identity(),
+            session_id,
+            relay_authentication,
+            events,
+        )?;
+        Ok(Self {
+            worker,
+            events: Arc::new(Mutex::new(receiver)),
+        })
+    }
+
+    pub fn start_with_reconnect(
+        client: QuicClient,
+        reconnect_config: QuicClientConfig,
+        identity: HostIdentity,
+        session_id: SessionId,
+        relay_authentication: [u8; 32],
+    ) -> Result<Self, HostError> {
+        let (events, receiver) = mpsc::channel(HOST_EVENT_CAPACITY);
+        let worker = HostWorker::start(
+            client,
+            Some(reconnect_config),
             identity.into_device_identity(),
             session_id,
             relay_authentication,

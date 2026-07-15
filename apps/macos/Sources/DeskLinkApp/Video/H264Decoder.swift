@@ -29,6 +29,7 @@ final class H264Decoder {
 
     deinit {
         if let decompressionSession {
+            VTDecompressionSessionWaitForAsynchronousFrames(decompressionSession)
             VTDecompressionSessionInvalidate(decompressionSession)
         }
     }
