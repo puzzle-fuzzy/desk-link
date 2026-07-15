@@ -136,12 +136,14 @@ final class MacH264Encoder: @unchecked Sendable {
         else { throw MacH264EncoderError.invalidDimensions }
         sessionOperationLock.lock()
         defer { sessionOperationLock.unlock() }
-        stopLocked()
         lock.lock()
         nextGeneration &+= 1
         if nextGeneration == 0 { nextGeneration = 1 }
         let generation = nextGeneration
         lock.unlock()
+        // Reserve the successor generation before flushing the retired session so
+        // an asynchronous completion error cannot win the race into the new one.
+        stopLocked()
 
         let callbackContext = MacH264EncoderCallbackContext(generation: generation)
         callbackContext.encoder = self
@@ -233,6 +235,7 @@ final class MacH264Encoder: @unchecked Sendable {
         lock.lock()
         let session = compressionSession
         let callbackContext = self.callbackContext
+        let retiringGeneration = activeGeneration
         compressionSession = nil
         self.callbackContext = nil
         activeGeneration = nil
@@ -243,7 +246,7 @@ final class MacH264Encoder: @unchecked Sendable {
         if let session {
             let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             if status != noErr {
-                report(error: .encoding(status))
+                report(error: .encoding(status), generation: retiringGeneration, allowRetiredGeneration: true)
             }
             VTCompressionSessionInvalidate(session)
         }
@@ -307,10 +310,18 @@ final class MacH264Encoder: @unchecked Sendable {
         }
     }
 
-    fileprivate func report(error: MacH264EncoderError, generation: UInt64? = nil) {
+    fileprivate func report(
+        error: MacH264EncoderError,
+        generation: UInt64? = nil,
+        allowRetiredGeneration: Bool = false
+    ) {
         eventQueue.async { [weak self] in
             guard let self,
-                  generation.map({ self.isGenerationActive($0) }) ?? true
+                  generation.map({
+                      allowRetiredGeneration
+                          ? self.isGenerationCurrentOrUnreplaced($0)
+                          : self.isGenerationActive($0)
+                  }) ?? true
             else { return }
             self.onError?(error)
         }
@@ -321,6 +332,14 @@ final class MacH264Encoder: @unchecked Sendable {
         let isActive = activeGeneration == generation
         lock.unlock()
         return isActive
+    }
+
+    private func isGenerationCurrentOrUnreplaced(_ generation: UInt64) -> Bool {
+        lock.lock()
+        let isCurrentOrUnreplaced = activeGeneration == generation
+            || (activeGeneration == nil && nextGeneration == generation)
+        lock.unlock()
+        return isCurrentOrUnreplaced
     }
 
     private func configure(session: VTCompressionSession, width: Int, height: Int) throws {
