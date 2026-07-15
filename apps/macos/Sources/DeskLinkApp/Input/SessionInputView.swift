@@ -26,6 +26,7 @@ struct SessionInputView: NSViewRepresentable {
     final class InputView: NSView {
         weak var bridge: ControllerBridge?
         var videoSize: CGSize?
+        private var pressedButtons = Set<MouseButton>()
 
         init(bridge: ControllerBridge, videoSize: CGSize?) {
             self.bridge = bridge
@@ -87,7 +88,10 @@ struct SessionInputView: NSViewRepresentable {
             Task { @MainActor in bridge?.releaseAll() }
         }
 
-        func releaseAll() { bridge?.releaseAll() }
+        func releaseAll() {
+            bridge?.releaseAll()
+            pressedButtons.removeAll()
+        }
 
         private func sendKeyboard(_ event: NSEvent, isDown: Bool) {
             for command in KeyboardMapper.map(
@@ -109,15 +113,21 @@ struct SessionInputView: NSViewRepresentable {
         }
 
         private func sendButton(_ event: NSEvent, pressed: Bool) {
-            guard normalizedPoint(for: event) != nil else { return }
-            sendPointer(event)
             let button: MouseButton
             switch event.buttonNumber {
             case 0: button = .left
             case 1: button = .right
             default: button = .center
             }
+            guard normalizedPoint(for: event) != nil else {
+                if !pressed, pressedButtons.remove(button) != nil {
+                    bridge?.send(input: .mouseButton(button, pressed: false))
+                }
+                return
+            }
+            sendPointer(event)
             bridge?.send(input: .mouseButton(button, pressed: pressed))
+            if pressed { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
         }
 
         private func normalizedPoint(for event: NSEvent) -> CGPoint? {

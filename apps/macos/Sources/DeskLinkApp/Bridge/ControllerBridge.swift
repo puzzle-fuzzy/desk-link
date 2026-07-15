@@ -3,13 +3,28 @@ import CoreVideo
 import DeskLinkC
 import Foundation
 
+private final class ControllerCallbackContext: @unchecked Sendable {
+    weak var bridge: ControllerBridge?
+    let generation: UInt64
+
+    init(bridge: ControllerBridge, generation: UInt64) {
+        self.bridge = bridge
+        self.generation = generation
+    }
+}
+
 private final class DeskLinkHandleOwner: @unchecked Sendable {
     var pointer: OpaquePointer?
+    var callbackContext: UnsafeMutableRawPointer?
 
     func destroy() {
-        guard let pointer else { return }
+        let pointer = self.pointer
         self.pointer = nil
-        desklink_destroy(pointer)
+        if let pointer { desklink_destroy(pointer) }
+        if let callbackContext {
+            self.callbackContext = nil
+            Unmanaged<ControllerCallbackContext>.fromOpaque(callbackContext).release()
+        }
     }
 
     deinit { destroy() }
@@ -41,6 +56,7 @@ final class ControllerBridge: ObservableObject {
     private var controllerIdentity: ControllerIdentity?
     private var activeStreamID: UInt64 = 0
     private var highestStreamID: UInt64 = 0
+    private var callbackGeneration: UInt64 = 0
     private var awaitingApprovedHostMaterial = false
 
     init(
@@ -148,7 +164,7 @@ final class ControllerBridge: ObservableObject {
         case let .move(x, y):
             input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_MOVE, x: x, y: y, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0)
         case let .mouseButton(button, pressed):
-            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_BUTTON, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: button.rawValue, key_code: 0, character: 0, pressed: pressed ? 1 : 0, modifiers: 0)
+            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_BUTTON, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: button.rawValue + 1, key_code: 0, character: 0, pressed: pressed ? 1 : 0, modifiers: 0)
         case let .wheel(x, y):
             input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_WHEEL, x: 0, y: 0, wheel_x: x, wheel_y: y, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0)
         case let .key(code, pressed, modifiers):
@@ -169,6 +185,7 @@ final class ControllerBridge: ObservableObject {
     }
 
     func disconnect() {
+        callbackGeneration &+= 1
         releaseAll()
         if let handle = handleOwner.pointer { _ = desklink_reject(handle) }
         handleOwner.destroy()
@@ -244,16 +261,21 @@ final class ControllerBridge: ObservableObject {
 
     private func createIfNeeded() {
         guard handleOwner.pointer == nil else { return }
+        callbackGeneration &+= 1
+        let callbackContext = ControllerCallbackContext(bridge: self, generation: callbackGeneration)
+        let callbackPointer = Unmanaged.passRetained(callbackContext).toOpaque()
         var createdHandle: OpaquePointer?
         let result = relayURL.withCString { relayPointer in
             var config = DesklinkConfig(relay_url: relayPointer, log_level: 1)
-            return desklink_create(&config, desklinkEventCallback, Unmanaged.passUnretained(self).toOpaque(), &createdHandle)
+            return desklink_create(&config, desklinkEventCallback, callbackPointer, &createdHandle)
         }
         guard result == DESKLINK_OK, let createdHandle else {
+            Unmanaged<ControllerCallbackContext>.fromOpaque(callbackPointer).release()
             publishResultError("DeskLink could not start its connection runtime.", result: result)
             return
         }
         handleOwner.pointer = createdHandle
+        handleOwner.callbackContext = callbackPointer
     }
 
     private func consumeState(streamID: UInt64, stateValue: Int) {
@@ -279,6 +301,10 @@ final class ControllerBridge: ObservableObject {
             state = .closed
         case Int(DESKLINK_WAITING_FOR_APPROVAL.rawValue): state = .pairing
         case Int(DESKLINK_IDLE.rawValue): state = .idle
+        case Int(DESKLINK_DEGRADED.rawValue): state = .frozen
+        case Int(DESKLINK_RECOVERING_VIDEO.rawValue): state = .recovering
+        case Int(DESKLINK_RECONNECTING.rawValue): state = .reconnecting
+        case Int(DESKLINK_DISCONNECTING.rawValue): state = .reconnecting
         default: state = .connecting
         }
     }
@@ -362,6 +388,9 @@ final class ControllerBridge: ObservableObject {
 
     private func publishErrorMessage(_ message: String) {
         let safe = Self.redact(message)
+        if handleOwner.pointer != nil {
+            disconnect()
+        }
         lastError = safe
         state = .failed(safe)
     }
@@ -379,9 +408,11 @@ typealias RustBridge = ControllerBridge
 
 private func desklinkEventCallback(_ context: UnsafeMutableRawPointer?, _ event: UnsafePointer<DesklinkEvent>?) {
     guard let context, let event else { return }
+    let callbackContext = Unmanaged<ControllerCallbackContext>.fromOpaque(context).takeUnretainedValue()
+    guard let bridge = callbackContext.bridge else { return }
     let value = event.pointee
     let data = value.data.map { Data(bytes: $0, count: value.data_len) } ?? Data()
-    let bridge = Unmanaged<ControllerBridge>.fromOpaque(context).takeUnretainedValue()
+    let generation = callbackContext.generation
     let eventKind = Int(value.kind.rawValue)
     let streamID = value.stream_id
     let frameID = value.frame_id
@@ -390,9 +421,16 @@ private func desklinkEventCallback(_ context: UnsafeMutableRawPointer?, _ event:
     let height = value.height
     let stateValue = Int(value.state.rawValue)
     DispatchQueue.main.async {
+        guard bridge.acceptsCallback(generation: generation) else { return }
         bridge.consume(
             eventKind: eventKind, data: data, streamID: streamID, frameID: frameID,
             configVersion: configVersion, width: width, height: height, stateValue: stateValue
         )
+    }
+}
+
+private extension ControllerBridge {
+    func acceptsCallback(generation: UInt64) -> Bool {
+        callbackGeneration == generation
     }
 }
