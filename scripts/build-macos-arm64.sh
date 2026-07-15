@@ -31,9 +31,9 @@ cp "$ROOT/apps/macos/Info.plist" "$APP/Contents/Info.plist"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     test -f "$RUST_LIBRARY"
-    lipo -archs "$RUST_LIBRARY" | tr ' ' '\n' | grep -qx 'arm64'
+    test "$(lipo -archs "$RUST_LIBRARY")" = 'arm64'
     test -x "$APP/Contents/MacOS/DeskLinkApp"
-    file "$APP/Contents/MacOS/DeskLinkApp" | grep -q 'arm64'
+    test "$(lipo -archs "$APP/Contents/MacOS/DeskLinkApp")" = 'arm64'
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" | grep -qx 'com.desklink.desktop'
     /usr/libexec/PlistBuddy -c 'Print :NSScreenCaptureUsageDescription' "$APP/Contents/Info.plist" >/dev/null
     /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" | grep -qx '13.0'
