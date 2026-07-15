@@ -105,6 +105,7 @@ impl CallbackTarget {
 
 pub(crate) struct ControllerWorker {
     commands: mpsc::Sender<ControllerCommand>,
+    release_commands: mpsc::UnboundedSender<Vec<InputEvent>>,
     cancellation: watch::Sender<bool>,
     phase: Arc<AtomicU8>,
     thread: Option<thread::JoinHandle<()>>,
@@ -119,6 +120,7 @@ impl ControllerWorker {
         material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, std::io::Error> {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (release_commands, release_receiver) = mpsc::unbounded_channel();
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let phase = Arc::new(AtomicU8::new(PHASE_CONNECTING));
         let worker_phase = phase.clone();
@@ -139,6 +141,7 @@ impl ControllerWorker {
                         relay_url,
                         config,
                         receiver,
+                        release_receiver,
                         cancellation_receiver,
                         worker_phase.clone(),
                         callback,
@@ -150,6 +153,7 @@ impl ControllerWorker {
             })?;
         Ok(Self {
             commands,
+            release_commands,
             cancellation,
             phase,
             thread: Some(thread),
@@ -158,6 +162,10 @@ impl ControllerWorker {
 
     pub(crate) fn send(&self, command: ControllerCommand) -> Result<(), ()> {
         self.commands.try_send(command).map_err(|_| ())
+    }
+
+    pub(crate) fn release_all(&self, events: Vec<InputEvent>) -> Result<(), ()> {
+        self.release_commands.send(events).map_err(|_| ())
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -190,6 +198,7 @@ async fn run_worker(
     relay_url: String,
     config: SecureConnectionConfigOwned,
     mut commands: mpsc::Receiver<ControllerCommand>,
+    mut release_commands: mpsc::UnboundedReceiver<Vec<InputEvent>>,
     mut cancellation: watch::Receiver<bool>,
     phase: Arc<AtomicU8>,
     callback: CallbackTarget,
@@ -236,7 +245,15 @@ async fn run_worker(
         };
         phase.store(PHASE_RUNNING, Ordering::Release);
         callback.emit_state(DesklinkState::StartingVideo, 0);
-        match run_connected(controller, &mut commands, &mut cancellation, callback).await {
+        match run_connected(
+            controller,
+            &mut commands,
+            &mut release_commands,
+            &mut cancellation,
+            callback,
+        )
+        .await
+        {
             ConnectedOutcome::Shutdown { stream_id } => {
                 callback.emit_state(DesklinkState::Disconnecting, stream_id);
                 break;
@@ -323,6 +340,7 @@ enum ConnectedOutcome {
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    release_commands: &mut mpsc::UnboundedReceiver<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
 ) -> ConnectedOutcome {
@@ -330,6 +348,22 @@ async fn run_connected(
     loop {
         tokio::select! {
             biased;
+            release = release_commands.recv() => match release {
+                Some(events) => {
+                    for event in events {
+                        if let Err(error) = controller.send_input(event).await {
+                            return ConnectedOutcome::Failed {
+                                failure: ConnectFailure::from_controller(error),
+                                stream_id: controller.active_stream_id().unwrap_or(0),
+                                stable,
+                            };
+                        }
+                    }
+                }
+                None => return ConnectedOutcome::Shutdown {
+                    stream_id: controller.active_stream_id().unwrap_or(0),
+                },
+            },
             command = commands.recv() => match command {
                 Some(ControllerCommand::SendInput(event)) => {
                     if let Err(error) = controller.send_input(event).await {

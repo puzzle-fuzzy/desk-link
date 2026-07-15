@@ -503,11 +503,20 @@ impl DesklinkRuntime {
         }
     }
 
-    fn release_all(&mut self) {
-        let events = self.pressed.release_all();
-        for event in events {
-            let _ = self.dispatch_input(event);
+    fn release_all(&mut self) -> DesklinkResult {
+        let events = self.pressed.release_events();
+        if let Some(worker) = &self.worker {
+            if worker.release_all(events).is_err() {
+                return DesklinkResult::InternalError;
+            }
+        } else {
+            for event in events {
+                if let Err(error) = self.dispatch_input(event) {
+                    return error;
+                }
+            }
         }
+        self.pressed.release_all();
         self.emit(
             DesklinkEventKind::ReleaseAll,
             &[],
@@ -519,6 +528,7 @@ impl DesklinkRuntime {
                 height: 0,
             },
         );
+        DesklinkResult::Ok
     }
 
     fn emit_input(&mut self, event: InputEvent) {
@@ -929,12 +939,12 @@ pub unsafe extern "C" fn desklink_reject(handle: *mut DesklinkHandle) -> Desklin
     if runtime.closed {
         return DesklinkResult::InvalidState;
     }
-    runtime.release_all();
+    let release_result = runtime.release_all();
     runtime.stop_worker();
     let _ = runtime.advance(SessionEvent::UserDisconnected);
     runtime.closed = true;
     clear_saved_material(&runtime.saved_host_material);
-    DesklinkResult::Ok
+    release_result
 }
 
 /// Sends one normalized pointer, mouse-button, wheel, or keyboard input event.
@@ -1025,8 +1035,7 @@ pub unsafe extern "C" fn desklink_release_all(handle: *mut DesklinkHandle) -> De
     if let Err(error) = runtime.ensure_active() {
         return error;
     }
-    runtime.release_all();
-    DesklinkResult::Ok
+    runtime.release_all()
 }
 
 /// Destroys a handle and releases all pressed input.
@@ -1040,7 +1049,7 @@ pub unsafe extern "C" fn desklink_destroy(handle: *mut DesklinkHandle) {
         return;
     }
     let mut handle = unsafe { Box::from_raw(handle) };
-    handle.runtime.release_all();
+    let _ = handle.runtime.release_all();
     handle.runtime.stop_worker();
 }
 

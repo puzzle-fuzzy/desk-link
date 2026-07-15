@@ -199,35 +199,6 @@ final class ControllerBridge: ObservableObject {
         state = .closed
     }
 
-    // These shims keep the Task 1-4 views source-compatible while they are migrated.
-    @available(*, deprecated, message: "Use connect(invite:) or connect(savedHost:).")
-    func connectSecureFromEnvironment() {
-        do {
-            if ProcessInfo.processInfo.environment["DESKLINK_PAIRING_INVITE"] != nil {
-                connect(invite: try PairingInviteConnectionSettings().invite)
-                return
-            }
-            let settings = try SecureConnectionSettings()
-            connect(savedHost: settings.savedHost)
-        } catch {
-            publishError(error)
-        }
-    }
-
-    @available(*, deprecated, message: "Use connect(invite:).")
-    func connect(code: String) {
-        publishErrorMessage("Pairing codes are no longer supported. Use a signed invitation.")
-    }
-
-    @available(*, deprecated, message: "Use SessionInputView.")
-    func sendMouseMove(x: Float, y: Float) { send(input: .move(normalizedX: x, normalizedY: y)) }
-    @available(*, deprecated, message: "Use SessionInputView.")
-    func sendMouseButton(_ button: UInt32, pressed: Bool) { send(input: .mouseButton(MouseButton(rawValue: button) ?? .center, pressed: pressed)) }
-    @available(*, deprecated, message: "Use SessionInputView.")
-    func sendMouseWheel(deltaX: Int32, deltaY: Int32) { send(input: .wheel(deltaX: deltaX, deltaY: deltaY)) }
-    @available(*, deprecated, message: "Use connect(invite:).")
-    func startPairing() { publishErrorMessage("This controller connects with a signed invitation.") }
-
     fileprivate func consume(
         eventKind: Int,
         data: Data,
@@ -405,8 +376,6 @@ final class ControllerBridge: ObservableObject {
         return message
     }
 }
-
-typealias RustBridge = ControllerBridge
 
 private func desklinkEventCallback(_ context: UnsafeMutableRawPointer?, _ event: UnsafePointer<DesklinkEvent>?) {
     guard let context, let event else { return }
