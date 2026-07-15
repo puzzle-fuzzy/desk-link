@@ -61,7 +61,7 @@ final class HostBridge: ObservableObject {
     private var inputInjector = MacInputInjector()
     private var captureStarting = false
     private var captureRunning = false
-    private var stopInProgress = false
+    private var stopTask: Task<Void, Never>?
 
     init(
         relayURL: String = ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] ?? "quic://127.0.0.1:4433",
@@ -128,17 +128,15 @@ final class HostBridge: ObservableObject {
     }
 
     func refreshPermissions() {
-        permissions = permissionProvider.snapshot()
-        startCaptureIfPermitted()
+        applyPermissions(permissionProvider.snapshot())
     }
 
     func requestScreenRecording() {
-        permissions = permissionProvider.requestScreenRecording()
-        startCaptureIfPermitted()
+        applyPermissions(permissionProvider.requestScreenRecording())
     }
 
     func requestAccessibility() {
-        permissions = permissionProvider.requestAccessibility()
+        applyPermissions(permissionProvider.requestAccessibility())
     }
 
     func createInvite() {
@@ -182,7 +180,7 @@ final class HostBridge: ObservableObject {
             publishResultError("The controller could not be approved.", result: result)
             return
         }
-        pendingApproval = approval
+        pendingApproval = nil
         do {
             try trustedControllerStore.trust(TrustedController(
                 deviceID: approval.controllerDeviceID,
@@ -218,20 +216,25 @@ final class HostBridge: ObservableObject {
     }
 
     func stop() {
-        guard !stopInProgress else { return }
-        stopInProgress = true
-        state = .stopping
-        releaseAllLocalInput()
-        Task { @MainActor [weak self] in
-            await self?.stopRuntime()
-        }
+        guard stopTask == nil else { return }
+        stopTask = Task { @MainActor [weak self] in await self?.performStop() }
     }
 
     func shutdown() {
         stop()
     }
 
-    private func stopRuntime() async {
+    func shutdownAndWait() async {
+        if let stopTask {
+            await stopTask.value
+        } else {
+            await performStop()
+        }
+    }
+
+    private func performStop() async {
+        state = .stopping
+        releaseAllLocalInput()
         await captureSource.stop()
         captureStarting = false
         captureRunning = false
@@ -244,7 +247,7 @@ final class HostBridge: ObservableObject {
         pairingInvite = nil
         pendingApproval = nil
         state = .closed
-        stopInProgress = false
+        stopTask = nil
     }
 
     fileprivate func consume(_ event: HostCallbackEvent) {
@@ -289,7 +292,7 @@ final class HostBridge: ObservableObject {
         case Int(DESKLINK_HOST_CLOSED.rawValue):
             releaseAllLocalInput()
             state = .closed
-            if !stopInProgress { stop() }
+            if stopTask == nil { stop() }
         default: state = .idle
         }
     }
@@ -336,6 +339,27 @@ final class HostBridge: ObservableObject {
         if state == .connected { publishError("Screen capture stopped unexpectedly.") }
     }
 
+    private func applyPermissions(_ snapshot: MacPermissionSnapshot) {
+        let previous = permissions
+        permissions = snapshot
+        if previous.screenRecording == .granted, snapshot.screenRecording != .granted,
+           captureRunning || captureStarting
+        {
+            captureRunning = false
+            captureStarting = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await captureSource.stop()
+                encoder.stop()
+                releaseAllLocalInput()
+            }
+        }
+        if previous.accessibility == .granted, snapshot.accessibility != .granted {
+            releaseAllLocalInput()
+        }
+        startCaptureIfPermitted()
+    }
+
     private func sendVideo(_ event: EncodedVideoEvent) {
         guard state == .connected, let handle = handleOwner.pointer else { return }
         let result: DesklinkResult
@@ -372,6 +396,7 @@ final class HostBridge: ObservableObject {
         let safe = Self.redact(message)
         lastError = safe
         state = .failed(safe)
+        if handleOwner.pointer != nil, stopTask == nil { stop() }
     }
 
     private static func redact(_ message: String) -> String {

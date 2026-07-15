@@ -5,6 +5,7 @@ import SwiftUI
 private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
     weak var controller: ControllerBridge?
     weak var host: HostBridge?
+    private var terminationStarted = false
 
     func configure(controller: ControllerBridge, host: HostBridge) {
         self.controller = controller
@@ -12,9 +13,20 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        host?.shutdown()
         controller?.releaseAll()
         controller?.disconnect()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationStarted else { return .terminateNow }
+        terminationStarted = true
+        Task { @MainActor [weak self] in
+            await self?.host?.shutdownAndWait()
+            self?.controller?.releaseAll()
+            self?.controller?.disconnect()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }
 
