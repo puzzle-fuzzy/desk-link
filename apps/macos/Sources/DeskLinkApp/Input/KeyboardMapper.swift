@@ -11,7 +11,11 @@ enum KeyboardMapper {
         var commands: [MacInputCommand] = [
             .key(code: UInt32(keyCode), pressed: isDown, modifiers: mappedModifiers),
         ]
-        if isDown, let characters, !characters.isEmpty {
+        if isDown,
+           let characters,
+           !characters.isEmpty,
+           characters.unicodeScalars.contains(where: { $0.value > 0x7f })
+        {
             commands.append(.unicode(characters, modifiers: mappedModifiers))
         }
         return commands

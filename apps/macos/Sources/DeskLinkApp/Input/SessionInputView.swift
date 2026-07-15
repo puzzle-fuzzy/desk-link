@@ -40,6 +40,10 @@ struct SessionInputView: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            if window == nil {
+                releaseAll()
+                return
+            }
             window?.acceptsMouseMovedEvents = true
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -105,6 +109,7 @@ struct SessionInputView: NSViewRepresentable {
         }
 
         private func sendButton(_ event: NSEvent, pressed: Bool) {
+            guard normalizedPoint(for: event) != nil else { return }
             sendPointer(event)
             let button: MouseButton
             switch event.buttonNumber {

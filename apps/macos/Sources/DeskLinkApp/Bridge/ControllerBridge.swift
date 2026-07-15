@@ -40,6 +40,7 @@ final class ControllerBridge: ObservableObject {
     private let savedHostStore: SavedHostStore
     private var controllerIdentity: ControllerIdentity?
     private var activeStreamID: UInt64 = 0
+    private var highestStreamID: UInt64 = 0
     private var awaitingApprovedHostMaterial = false
 
     init(
@@ -173,6 +174,7 @@ final class ControllerBridge: ObservableObject {
         handleOwner.destroy()
         decoder.reset()
         activeStreamID = 0
+        highestStreamID = 0
         awaitingApprovedHostMaterial = false
         latestAccessUnit = nil
         latestPixelBuffer = nil
@@ -257,15 +259,19 @@ final class ControllerBridge: ObservableObject {
     private func consumeState(streamID: UInt64, stateValue: Int) {
         switch stateValue {
         case Int(DESKLINK_CONNECTED.rawValue):
-            guard streamID > 0 else { return }
+            guard streamID > 0,
+                  streamID == activeStreamID || streamID > highestStreamID
+            else { return }
             if activeStreamID != streamID {
                 decoder.reset()
                 activeStreamID = streamID
                 metrics.lastFrameID = nil
             }
+            highestStreamID = max(highestStreamID, streamID)
             state = .connected(streamID: streamID)
             stageApprovedHostMaterialIfNeeded()
         case Int(DESKLINK_CLOSED.rawValue):
+            guard streamID == 0 || activeStreamID == 0 || streamID == activeStreamID else { return }
             decoder.reset()
             activeStreamID = 0
             latestPixelBuffer = nil
@@ -278,17 +284,25 @@ final class ControllerBridge: ObservableObject {
     }
 
     private func consumeVideoConfig(data: Data, streamID: UInt64, version: UInt32, width: UInt16, height: UInt16) {
-        guard streamID > 0, version > 0, width > 0, height > 0, !data.isEmpty else {
+        guard case let .connected(connectedStreamID) = state,
+              connectedStreamID == streamID,
+              streamID > 0,
+              version > 0,
+              width > 0,
+              height > 0,
+              !data.isEmpty
+        else {
             dropFrame(); return
         }
-        if activeStreamID == 0 { activeStreamID = streamID }
         guard streamID == activeStreamID, version >= decoder.configVersion,
               decoder.configure(sequenceHeader: data, width: width, height: height, version: version)
         else { dropFrame(); return }
     }
 
     private func consumeFrame(data: Data, streamID: UInt64, frameID: UInt64, version: UInt32) {
-        guard streamID == activeStreamID,
+        guard case let .connected(connectedStreamID) = state,
+              connectedStreamID == streamID,
+              streamID == activeStreamID,
               frameID > (metrics.lastFrameID ?? 0),
               version == decoder.configVersion,
               decoder.receive(accessUnit: data, frameID: frameID, version: version)

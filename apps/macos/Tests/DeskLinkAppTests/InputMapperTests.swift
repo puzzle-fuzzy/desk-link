@@ -40,4 +40,11 @@ final class InputMapperTests: XCTestCase {
             isDown: false
         ), [.key(code: 0x24, pressed: false, modifiers: [.meta])])
     }
+
+    func testKeyboardMapperDoesNotDuplicateOrdinaryASCIIKeyInput() {
+        XCTAssertEqual(
+            KeyboardMapper.map(keyCode: 0, characters: "a", modifiers: [], isDown: true),
+            [.key(code: 0, pressed: true, modifiers: [])]
+        )
+    }
 }
