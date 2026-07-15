@@ -22,12 +22,11 @@ final class InputMapperTests: XCTestCase {
 
     func testKeyboardMapperPreservesUnicodeAndModifierFlags() {
         XCTAssertEqual(KeyboardMapper.map(
-            keyCode: 0x24,
+            keyCode: 0x00,
             characters: "中",
             modifiers: [.command, .shift],
             isDown: true
         ), [
-            .key(code: 0x24, pressed: true, modifiers: [.meta, .shift]),
             .unicode("中", modifiers: [.meta, .shift]),
         ])
     }
@@ -38,13 +37,26 @@ final class InputMapperTests: XCTestCase {
             characters: "中",
             modifiers: [.command],
             isDown: false
-        ), [.key(code: 0x24, pressed: false, modifiers: [.meta])])
+        ), [.key(code: 1, pressed: false, modifiers: [.meta])])
     }
 
-    func testKeyboardMapperDoesNotDuplicateOrdinaryASCIIKeyInput() {
+    func testKeyboardMapperSendsOrdinaryASCIIAsProtocolCharacter() {
         XCTAssertEqual(
             KeyboardMapper.map(keyCode: 0, characters: "a", modifiers: [], isDown: true),
-            [.key(code: 0, pressed: true, modifiers: [])]
+            [.unicode("a", modifiers: [])]
         )
+    }
+
+    func testKeyboardMapperUsesLogicalCodesForSpecialKeysAndIgnoresCapsLockBit() {
+        XCTAssertEqual(
+            KeyboardMapper.map(keyCode: 0x7b, characters: nil, modifiers: [.capsLock], isDown: true),
+            [.key(code: 7, pressed: true, modifiers: [])]
+        )
+    }
+
+    func testProtocolSpecialKeyCodesRoundTripToMacVirtualKeys() {
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 1), 0x24)
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 8), 0x7c)
+        XCTAssertNil(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 0))
     }
 }

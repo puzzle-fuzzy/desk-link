@@ -8,17 +8,42 @@ enum KeyboardMapper {
         isDown: Bool
     ) -> [MacInputCommand] {
         let mappedModifiers = Modifiers(appKit: modifiers)
-        var commands: [MacInputCommand] = [
-            .key(code: UInt32(keyCode), pressed: isDown, modifiers: mappedModifiers),
-        ]
-        if isDown,
-           let characters,
-           !characters.isEmpty,
-           characters.unicodeScalars.contains(where: { $0.value > 0x7f })
-        {
-            commands.append(.unicode(characters, modifiers: mappedModifiers))
+        if let logicalKeyCode = MacKeyCodeMapper.protocolCode(forAppKitKeyCode: keyCode) {
+            return [.key(code: logicalKeyCode, pressed: isDown, modifiers: mappedModifiers)]
         }
-        return commands
+        guard isDown, let characters, !characters.isEmpty else { return [] }
+        return [.unicode(characters, modifiers: mappedModifiers)]
+    }
+
+}
+
+enum MacKeyCodeMapper {
+    static func protocolCode(forAppKitKeyCode keyCode: UInt16) -> UInt32? {
+        switch keyCode {
+        case 0x24, 0x4c: return 1 // Return / keypad Enter
+        case 0x35: return 2 // Escape
+        case 0x33: return 3 // Delete / Backspace
+        case 0x30: return 4 // Tab
+        case 0x7e: return 5 // Arrow up
+        case 0x7d: return 6 // Arrow down
+        case 0x7b: return 7 // Arrow left
+        case 0x7c: return 8 // Arrow right
+        default: return nil
+        }
+    }
+
+    static func appKitKeyCode(forProtocolCode code: UInt32) -> UInt32? {
+        switch code {
+        case 1: return 0x24 // Return
+        case 2: return 0x35 // Escape
+        case 3: return 0x33 // Delete / Backspace
+        case 4: return 0x30 // Tab
+        case 5: return 0x7e // Arrow up
+        case 6: return 0x7d // Arrow down
+        case 7: return 0x7b // Arrow left
+        case 8: return 0x7c // Arrow right
+        default: return nil
+        }
     }
 }
 
@@ -29,7 +54,6 @@ private extension Modifiers {
         if flags.contains(.control) { result.insert(.control) }
         if flags.contains(.option) { result.insert(.option) }
         if flags.contains(.command) { result.insert(.meta) }
-        if flags.contains(.capsLock) { result.insert(.capsLock) }
         self = result
     }
 }
