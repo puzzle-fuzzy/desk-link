@@ -10,27 +10,24 @@ pub struct HostStatusViewModel {
 impl HostStatusViewModel {
     pub fn starting() -> Self {
         Self {
-            title: "Starting DeskLink".to_owned(),
-            detail: "Preparing the encrypted Windows host.".to_owned(),
-            tooltip: "DeskLink: starting".to_owned(),
+            title: "正在启动 DeskLink".to_owned(),
+            detail: "正在准备加密的 Windows 主机。".to_owned(),
+            tooltip: "DeskLink：正在启动".to_owned(),
         }
     }
 
     pub fn apply(&mut self, event: &HostLifecycleEvent) {
         match event {
             HostLifecycleEvent::Connecting { attempt, stream_id } => {
-                self.title = "Connecting to relay".to_owned();
-                self.detail = format!(
-                    "Connection attempt {attempt}. The next video stream will use ID {stream_id}."
-                );
-                self.tooltip = "DeskLink: connecting".to_owned();
+                self.title = "正在连接中继服务器".to_owned();
+                self.detail =
+                    format!("第 {attempt} 次连接尝试。下一个视频流将使用 ID {stream_id}。");
+                self.tooltip = "DeskLink：正在连接".to_owned();
             }
             HostLifecycleEvent::Connected { stream_id } => {
-                self.title = "Remote control active".to_owned();
-                self.detail = format!(
-                    "An authenticated controller is connected through encrypted video stream {stream_id}."
-                );
-                self.tooltip = "DeskLink: remote control active".to_owned();
+                self.title = "远程控制已连接".to_owned();
+                self.detail = format!("已验证的控制端正通过加密视频流 {stream_id} 连接。");
+                self.tooltip = "DeskLink：远程控制已连接".to_owned();
             }
             HostLifecycleEvent::Reconnecting {
                 retry,
@@ -38,18 +35,18 @@ impl HostStatusViewModel {
                 delay,
                 reason,
             } => {
-                self.title = "Connection interrupted".to_owned();
+                self.title = "连接已中断".to_owned();
                 self.detail = format!(
-                    "Retry {retry} of {maximum_retries} begins in {} ms.\r\n{reason}",
+                    "第 {retry}/{maximum_retries} 次重试将在 {} 毫秒后开始。\r\n{reason}",
                     delay.as_millis(),
                     reason = user_facing_host_reason(reason)
                 );
-                self.tooltip = format!("DeskLink: reconnecting ({retry}/{maximum_retries})");
+                self.tooltip = format!("DeskLink：正在重新连接（{retry}/{maximum_retries}）");
             }
             HostLifecycleEvent::Stopped { reason } => {
-                self.title = "Hosting stopped".to_owned();
+                self.title = "主机服务已停止".to_owned();
                 self.detail = user_facing_host_reason(reason).to_owned();
-                self.tooltip = "DeskLink: hosting stopped".to_owned();
+                self.tooltip = "DeskLink：主机服务已停止".to_owned();
             }
         }
     }
@@ -58,38 +55,38 @@ impl HostStatusViewModel {
 fn user_facing_host_reason(reason: &str) -> &'static str {
     let reason = reason.to_ascii_lowercase();
     if reason.contains("configuration") && reason.contains("could not be loaded") {
-        "Saved connection settings could not be opened. Open the tray menu, choose Connection settings, and enter them again."
+        "无法打开已保存的连接设置。请打开托盘菜单，选择“连接设置”后重新填写。"
     } else if reason.contains("configuration") || reason.contains("not configured") {
-        "DeskLink does not have host connection settings yet. Open the tray menu and choose Connection settings."
+        "DeskLink 尚未配置主机连接。请打开托盘菜单并选择“连接设置”。"
     } else if reason.contains("pairing") && reason.contains("expired") {
-        "The pairing invitation expired. Start pairing again to create a new invitation."
+        "配对邀请已过期，请重新开始配对以创建新邀请。"
     } else if reason.contains("untrusted")
         || reason.contains("authentication")
         || reason.contains("cryptographic")
         || reason.contains("public key")
         || reason.contains("key changed")
     {
-        "The controller identity could not be authenticated. Review the device before pairing again."
+        "无法验证控制端身份，请检查设备后重新配对。"
     } else if reason.contains("rejected") {
-        "The controller request was not approved on this Windows device."
+        "此 Windows 设备未批准控制端请求。"
     } else if reason.contains("occupied") || reason.contains("already in use") {
-        "This relay session is currently in use. DeskLink will retry when it becomes available."
+        "此中继会话正在使用中，恢复可用后 DeskLink 将重试。"
     } else if reason.contains("capture") || reason.contains("desktop duplication") {
-        "DeskLink could not capture the Windows desktop. Check the active display and try again."
+        "DeskLink 无法捕获 Windows 桌面，请检查当前显示器后重试。"
     } else if reason.contains("encoder") || reason.contains("media foundation") {
-        "DeskLink could not start the Windows video encoder."
+        "DeskLink 无法启动 Windows 视频编码器。"
     } else if reason.contains("input injection") || reason.contains("sendinput") {
-        "DeskLink could not initialize remote input control."
+        "DeskLink 无法启动远程输入控制。"
     } else if reason.contains("timeout") || reason.contains("timed out") {
-        "The secure relay connection timed out. DeskLink will retry when allowed."
+        "安全中继连接超时，条件允许时 DeskLink 将重试。"
     } else if reason.contains("transport")
         || reason.contains("connection")
         || reason.contains("relay")
         || reason.contains("closed")
     {
-        "The secure relay connection closed. DeskLink will retry when allowed."
+        "安全中继连接已关闭，条件允许时 DeskLink 将重试。"
     } else {
-        "DeskLink stopped after an internal host error. Review the local diagnostic log for details."
+        "DeskLink 因主机内部错误而停止，请查看本地诊断日志了解详情。"
     }
 }
 
@@ -201,13 +198,13 @@ mod windows_ui {
 
     #[derive(Debug, Error)]
     pub enum WindowsTrayError {
-        #[error("Windows tray operation failed: {0}")]
+        #[error("Windows 托盘操作失败：{0}")]
         Platform(#[from] WindowsError),
-        #[error("Windows tray thread failed to start: {0}")]
+        #[error("Windows 托盘线程启动失败：{0}")]
         Thread(#[from] std::io::Error),
-        #[error("Windows tray startup failed: {0}")]
+        #[error("Windows 托盘启动失败：{0}")]
         Startup(String),
-        #[error("Windows tray command channel is closed")]
+        #[error("Windows 托盘命令通道已关闭")]
         Closed,
     }
 
@@ -400,7 +397,7 @@ mod windows_ui {
                     hwnd,
                     instance,
                     w!("STATIC"),
-                    "Trusted controllers",
+                    "可信控制端",
                     CONTROL_TRUST_HEADING,
                     0,
                 )?
@@ -433,7 +430,7 @@ mod windows_ui {
                     hwnd,
                     instance,
                     w!("BUTTON"),
-                    "Refresh list",
+                    "刷新列表",
                     CONTROL_REFRESH,
                     WS_TABSTOP.0,
                 )?
@@ -443,7 +440,7 @@ mod windows_ui {
                     hwnd,
                     instance,
                     w!("BUTTON"),
-                    "Revoke controller",
+                    "撤销控制端",
                     CONTROL_REVOKE,
                     WS_TABSTOP.0,
                 )?
@@ -453,7 +450,7 @@ mod windows_ui {
                     hwnd,
                     instance,
                     w!("BUTTON"),
-                    "Exit DeskLink",
+                    "退出 DeskLink",
                     CONTROL_EXIT,
                     WS_TABSTOP.0,
                 )?
@@ -485,14 +482,11 @@ mod windows_ui {
             self.apply_status(hwnd)?;
             let _ = unsafe { EnableWindow(self.revoke_button, false) };
             if let Err(error) = self.refresh_trusted_controllers() {
-                let _ = set_text(
-                    self.trust_detail,
-                    "Trusted controller details are temporarily unavailable.",
-                );
+                let _ = set_text(self.trust_detail, "可信控制端详情暂时不可用。");
                 self.report_operation_failure(
                     DiagnosticOperation::TrustedControllersRefresh,
                     &error,
-                    "Trusted controllers could not be loaded. Remote hosting is still available.",
+                    "无法加载可信控制端，远程主机服务仍可使用。",
                 );
             }
             unsafe { self.layout(hwnd)? };
@@ -540,14 +534,14 @@ mod windows_ui {
                         DiagnosticOperation::TrustedControllersRefresh,
                     ));
                     self.set_operation_feedback(
-                        "Trusted controller list refreshed.",
+                        "可信控制端列表已刷新。",
                         OperationFeedbackTone::Success,
                     );
                 }
                 Err(error) => self.report_operation_failure(
                     DiagnosticOperation::TrustedControllersRefresh,
                     &error,
-                    "Could not refresh trusted controllers. Remote hosting is still available.",
+                    "无法刷新可信控制端，远程主机服务仍可使用。",
                 ),
             }
         }
@@ -561,20 +555,20 @@ mod windows_ui {
                     ));
                     match self.refresh_trusted_controllers() {
                         Ok(()) => self.set_operation_feedback(
-                            "Controller revoked. It must be paired again before reconnecting.",
+                            "控制端权限已撤销，重新连接前必须再次配对。",
                             OperationFeedbackTone::Success,
                         ),
                         Err(error) => self.report_operation_failure(
                             DiagnosticOperation::TrustedControllersRefresh,
                             &error,
-                            "Controller revoked, but the list could not be refreshed. Reopen this window.",
+                            "控制端权限已撤销，但无法刷新列表，请重新打开此窗口。",
                         ),
                     }
                 }
                 Err(error) => self.report_operation_failure(
                     DiagnosticOperation::ControllerRevocation,
                     &error,
-                    "Could not revoke the controller. Its trust has not changed; try again.",
+                    "无法撤销控制端，其信任状态未改变，请重试。",
                 ),
             }
         }
@@ -591,7 +585,7 @@ mod windows_ui {
             }
             for record in &self.records {
                 let label = format!(
-                    "Device {}  |  approved at Unix time {}",
+                    "设备 {}  |  批准时间（Unix）{}",
                     grouped_hex(&record.device_id()),
                     record.approved_at_unix_s()
                 );
@@ -608,12 +602,12 @@ mod windows_ui {
             if self.records.is_empty() {
                 set_text(
                     self.trust_detail,
-                    "No controllers are trusted. A controller appears here only after authenticated local approval.",
+                    "当前没有可信控制端。控制端通过身份验证并在本机获批后才会出现在这里。",
                 )?;
             } else {
                 set_text(
                     self.trust_detail,
-                    "Select a controller to review its complete public identity before revocation.",
+                    "请选择一个控制端，在撤销前检查其完整公开身份。",
                 )?;
             }
             let _ = unsafe { EnableWindow(self.revoke_button, false) };
@@ -624,13 +618,13 @@ mod windows_ui {
             let Some(record) = self.selected_controller() else {
                 set_text(
                     self.trust_detail,
-                    "Select a controller to review its complete public identity before revocation.",
+                    "请选择一个控制端，在撤销前检查其完整公开身份。",
                 )?;
                 let _ = unsafe { EnableWindow(self.revoke_button, false) };
                 return Ok(());
             };
             let detail = format!(
-                "Device ID:\r\n{}\r\n\r\nEd25519 public-key fingerprint:\r\n{}",
+                "设备 ID：\r\n{}\r\n\r\nEd25519 公钥指纹：\r\n{}",
                 grouped_hex(&record.device_id()),
                 grouped_hex(record.verify_key().as_bytes())
             );
@@ -962,12 +956,12 @@ mod windows_ui {
                             TrayMenuAction::Open => unsafe { show_window(hwnd) },
                             TrayMenuAction::Configure => match launch_connection_settings() {
                                 Ok(()) => state.set_operation_feedback(
-                                    "Connection settings opened in a separate window.",
+                                    "连接设置已在单独窗口中打开。",
                                     OperationFeedbackTone::Neutral,
                                 ),
                                 Err(_) => {
                                     state.set_operation_feedback(
-                                        "Could not open Connection settings. Try again from the Start menu.",
+                                        "无法打开连接设置，请从“开始”菜单重试。",
                                         OperationFeedbackTone::Error,
                                     );
                                     unsafe { show_window(hwnd) };
@@ -1146,25 +1140,11 @@ mod windows_ui {
             return;
         };
         let result = unsafe {
-            AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("Open DeskLink"))
-                .and_then(|_| {
-                    AppendMenuW(
-                        menu,
-                        MF_STRING,
-                        MENU_CONFIGURE,
-                        w!("Connection settings..."),
-                    )
-                })
-                .and_then(|_| {
-                    AppendMenuW(
-                        menu,
-                        MF_STRING,
-                        MENU_MANAGE_TRUST,
-                        w!("Manage trusted controllers"),
-                    )
-                })
+            AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("打开 DeskLink"))
+                .and_then(|_| AppendMenuW(menu, MF_STRING, MENU_CONFIGURE, w!("连接设置...")))
+                .and_then(|_| AppendMenuW(menu, MF_STRING, MENU_MANAGE_TRUST, w!("管理可信控制端")))
                 .and_then(|_| AppendMenuW(menu, MENU_ITEM_FLAGS(MF_SEPARATOR.0), 0, PCWSTR::null()))
-                .and_then(|_| AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit DeskLink")))
+                .and_then(|_| AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出 DeskLink")))
         };
         if result.is_ok() {
             let mut point = POINT::default();
@@ -1253,8 +1233,8 @@ mod tests {
     fn status_model_distinguishes_active_recovery_and_stopped_states() {
         let mut model = HostStatusViewModel::starting();
         model.apply(&HostLifecycleEvent::Connected { stream_id: 7 });
-        assert_eq!(model.title, "Remote control active");
-        assert!(model.detail.contains("stream 7"));
+        assert_eq!(model.title, "远程控制已连接");
+        assert!(model.detail.contains("视频流 7"));
 
         model.apply(&HostLifecycleEvent::Reconnecting {
             retry: 2,
@@ -1262,15 +1242,15 @@ mod tests {
             delay: Duration::from_millis(500),
             reason: "relay unavailable".to_owned(),
         });
-        assert_eq!(model.title, "Connection interrupted");
-        assert!(model.detail.contains("Retry 2 of 6"));
-        assert!(model.detail.contains("500 ms"));
+        assert_eq!(model.title, "连接已中断");
+        assert!(model.detail.contains("第 2/6 次重试"));
+        assert!(model.detail.contains("500 毫秒"));
 
         model.apply(&HostLifecycleEvent::Stopped {
             reason: "authentication rejected".to_owned(),
         });
-        assert_eq!(model.title, "Hosting stopped");
-        assert_eq!(model.tooltip, "DeskLink: hosting stopped");
+        assert_eq!(model.title, "主机服务已停止");
+        assert_eq!(model.tooltip, "DeskLink：主机服务已停止");
     }
 
     #[test]
@@ -1282,14 +1262,14 @@ mod tests {
             delay: Duration::from_millis(250),
             reason: "transport error DESKLINK_AUTH_KEY=00112233445566778899aabbccddeeff".to_owned(),
         });
-        assert!(model.detail.contains("secure relay connection"));
+        assert!(model.detail.contains("安全中继连接"));
         assert!(!model.detail.contains("DESKLINK_AUTH_KEY"));
         assert!(!model.detail.contains("00112233"));
 
         model.apply(&HostLifecycleEvent::Stopped {
             reason: "capture error: AccessLost".to_owned(),
         });
-        assert!(model.detail.contains("capture the Windows desktop"));
+        assert!(model.detail.contains("捕获 Windows 桌面"));
         assert!(!model.detail.contains("AccessLost"));
     }
 
@@ -1299,11 +1279,7 @@ mod tests {
         model.apply(&HostLifecycleEvent::Stopped {
             reason: "hosting configuration is missing".to_owned(),
         });
-        assert!(
-            model
-                .detail
-                .contains("does not have host connection settings")
-        );
+        assert!(model.detail.contains("尚未配置主机连接"));
         assert!(!model.detail.contains("internal host error"));
     }
 

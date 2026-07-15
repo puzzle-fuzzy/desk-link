@@ -31,7 +31,7 @@ pub struct RelayConfig {
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            session_ttl: Duration::from_secs(600),
+            session_ttl: Duration::from_secs(86_400),
             sweep_interval: Duration::from_secs(1),
             keep_alive: KEEPALIVE_INTERVAL,
             dead_timeout: DEAD_TIMEOUT,

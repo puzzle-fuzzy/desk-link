@@ -2,13 +2,15 @@ use std::path::{Path, PathBuf};
 
 pub const PRODUCT_NAME: &str = "DeskLink";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const APPLICATION_FILE_NAME: &str = "desklink-windows.exe";
+pub const APPLICATION_FILE_NAME: &str = "DeskLink.exe";
+pub const HOST_FILE_NAME: &str = "desklink-windows.exe";
 pub const UNINSTALLER_FILE_NAME: &str = "DeskLinkUninstall.exe";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallLayout {
     pub install_directory: PathBuf,
     pub application: PathBuf,
+    pub host: PathBuf,
     pub uninstaller: PathBuf,
     pub start_menu_shortcut: PathBuf,
     pub data_directory: PathBuf,
@@ -19,6 +21,7 @@ impl InstallLayout {
         let install_directory = local_app_data.join("Programs").join(PRODUCT_NAME);
         Self {
             application: install_directory.join(APPLICATION_FILE_NAME),
+            host: install_directory.join(HOST_FILE_NAME),
             uninstaller: install_directory.join(UNINSTALLER_FILE_NAME),
             start_menu_shortcut: roaming_app_data
                 .join("Microsoft")
@@ -56,6 +59,10 @@ mod tests {
         );
         assert_eq!(
             layout.application,
+            PathBuf::from(r"C:\Users\Owner\AppData\Local\Programs\DeskLink\DeskLink.exe")
+        );
+        assert_eq!(
+            layout.host,
             PathBuf::from(r"C:\Users\Owner\AppData\Local\Programs\DeskLink\desklink-windows.exe")
         );
         assert_eq!(
@@ -78,7 +85,7 @@ mod tests {
         );
         assert_eq!(
             layout.startup_command(),
-            r#""C:\Users\Desk Link\AppData\Local\Programs\DeskLink\desklink-windows.exe" --startup"#
+            r#""C:\Users\Desk Link\AppData\Local\Programs\DeskLink\DeskLink.exe" --startup"#
         );
         assert_eq!(
             layout.uninstall_command(),

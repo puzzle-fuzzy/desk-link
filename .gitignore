@@ -9,3 +9,5 @@ DerivedData/
 dist/
 __pycache__/
 *.py[cod]
+node_modules/
+apps/windows-ui/src-tauri/gen/

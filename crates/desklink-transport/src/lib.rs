@@ -1,4 +1,4 @@
-use std::{fmt, net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
@@ -239,6 +239,29 @@ impl QuicClientConfig {
         ))
     }
 
+    /// Creates a QUIC client for DeskLink's explicitly selected local-LAN relay mode.
+    ///
+    /// The relay certificate is allowed to be self-signed because the remote host is still
+    /// authenticated by the signed pairing invitation and the Noise handshake before video or
+    /// input is enabled. Callers must restrict this mode to private or loopback relay addresses.
+    pub fn new_lan(
+        relay_addr: SocketAddr,
+        server_name: impl Into<String>,
+    ) -> Result<Self, TransportError> {
+        let verifier = Arc::new(LanRelayCertificateVerifier::new());
+        let tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+            .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
+        Ok(Self::with_client_config(
+            relay_addr,
+            server_name,
+            quinn::ClientConfig::new(Arc::new(crypto)),
+        ))
+    }
+
     pub fn with_client_config(
         relay_addr: SocketAddr,
         server_name: impl Into<String>,
@@ -281,5 +304,53 @@ impl QuicClientConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct LanRelayCertificateVerifier {
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl LanRelayCertificateVerifier {
+    fn new() -> Self {
+        Self {
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for LanRelayCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, certificate, signature, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, certificate, signature, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
     }
 }

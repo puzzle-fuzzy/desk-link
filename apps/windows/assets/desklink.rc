@@ -1,4 +1,5 @@
 #include <windows.h>
+#pragma code_page(65001)
 
 #define IDI_DESKLINK 101
 #define IDD_CONNECTION_SETTINGS 201
@@ -13,8 +14,8 @@ IDI_DESKLINK ICON "assets/desklink.ico"
 1 RT_MANIFEST "assets/desklink.manifest"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION 0,1,1,0
+PRODUCTVERSION 0,1,1,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -23,42 +24,42 @@ FILESUBTYPE 0x0L
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
-        BLOCK "040904B0"
+        BLOCK "080404B0"
         BEGIN
             VALUE "CompanyName", "DeskLink"
-            VALUE "FileDescription", "DeskLink Windows Host"
-            VALUE "FileVersion", "0.1.0"
+            VALUE "FileDescription", "DeskLink Windows 主机"
+            VALUE "FileVersion", "0.1.1"
             VALUE "InternalName", "desklink-windows"
-            VALUE "LegalCopyright", "Copyright (c) 2026 DeskLink contributors"
+            VALUE "LegalCopyright", "版权所有 (c) 2026 DeskLink 贡献者"
             VALUE "OriginalFilename", "desklink-windows.exe"
             VALUE "ProductName", "DeskLink"
-            VALUE "ProductVersion", "0.1.0"
+            VALUE "ProductVersion", "0.1.1"
         END
     END
     BLOCK "VarFileInfo"
     BEGIN
-        VALUE "Translation", 0x0409, 1200
+        VALUE "Translation", 0x0804, 1200
     END
 END
 
 IDD_CONNECTION_SETTINGS DIALOGEX 0, 0, 372, 258
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "DeskLink connection settings"
+CAPTION "DeskLink 连接设置"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Connect this Windows host to the relay used by your other DeskLink device.", -1, 16, 12, 340, 18
-    LTEXT           "Relay address", -1, 16, 38, 92, 10
+    LTEXT           "将此 Windows 主机连接到另一台 DeskLink 设备使用的中继服务器。", -1, 16, 12, 340, 18
+    LTEXT           "中继服务器地址", -1, 16, 38, 92, 10
     EDITTEXT        IDC_RELAY_ADDRESS, 116, 35, 240, 14, ES_AUTOHSCROLL
-    LTEXT           "TLS server name", -1, 16, 62, 92, 10
+    LTEXT           "TLS 服务器名称", -1, 16, 62, 92, 10
     EDITTEXT        IDC_SERVER_NAME, 116, 59, 240, 14, ES_AUTOHSCROLL
-    LTEXT           "Session ID", -1, 16, 86, 92, 10
+    LTEXT           "会话 ID", -1, 16, 86, 92, 10
     EDITTEXT        IDC_SESSION_ID, 116, 83, 240, 14, ES_AUTOHSCROLL
-    LTEXT           "Relay key", -1, 16, 110, 92, 10
+    LTEXT           "中继密钥", -1, 16, 110, 92, 10
     EDITTEXT        IDC_AUTHENTICATION, 116, 107, 240, 14, ES_PASSWORD | ES_AUTOHSCROLL
-    LTEXT           "Stream ID", -1, 16, 134, 92, 10
+    LTEXT           "视频流 ID", -1, 16, 134, 92, 10
     EDITTEXT        IDC_STREAM_ID, 116, 131, 96, 14, ES_AUTOHSCROLL
-    LTEXT           "Session ID uses 32 hexadecimal characters. Relay key uses 64.", -1, 116, 151, 240, 18
-    LTEXT           "Connection credentials are encrypted for this Windows user.", IDC_CONFIGURATION_FEEDBACK, 16, 181, 340, 28
-    DEFPUSHBUTTON   "Save connection", IDOK, 230, 230, 72, 16
-    PUSHBUTTON      "Cancel", IDCANCEL, 308, 230, 48, 16
+    LTEXT           "会话 ID 使用 32 位十六进制字符，中继密钥使用 64 位。", -1, 116, 151, 240, 18
+    LTEXT           "连接凭据将为当前 Windows 用户加密保护。", IDC_CONFIGURATION_FEEDBACK, 16, 181, 340, 28
+    DEFPUSHBUTTON   "保存连接", IDOK, 230, 230, 72, 16
+    PUSHBUTTON      "取消", IDCANCEL, 308, 230, 48, 16
 END

@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     fs::OpenOptions,
     io,
     io::Write as _,
@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::storage::local_app_data_path;
 
 use thiserror::Error;
 
@@ -20,6 +22,7 @@ const MAX_REASON_CHARS: usize = 512;
 pub enum DiagnosticOperation {
     TrustedControllersRefresh,
     ControllerRevocation,
+    LocalRelayStartup,
 }
 
 impl DiagnosticOperation {
@@ -29,16 +32,24 @@ impl DiagnosticOperation {
             (Self::TrustedControllersRefresh, false) => "trusted_controllers_refresh_failed",
             (Self::ControllerRevocation, true) => "controller_revoked",
             (Self::ControllerRevocation, false) => "controller_revocation_failed",
+            (Self::LocalRelayStartup, true) => "local_relay_started",
+            (Self::LocalRelayStartup, false) => "local_relay_startup_failed",
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiagnosticEvent {
+    ControlSurfaceStarted,
     ApplicationStarted {
         pairing_mode: bool,
     },
     ApplicationStopped,
+    PowerResumeMonitoringStarted,
+    PowerResumeMonitoringFailed {
+        reason: String,
+    },
+    PowerResumeDetected,
     Lifecycle(HostLifecycleEvent),
     OperationSucceeded(DiagnosticOperation),
     OperationFailed {
@@ -70,9 +81,7 @@ struct DiagnosticLogInner {
 
 impl DiagnosticLog {
     pub fn for_current_user() -> Result<Self, DiagnosticLogError> {
-        let local_app_data = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or(DiagnosticLogError::MissingStoragePath)?;
+        let local_app_data = local_app_data_path().ok_or(DiagnosticLogError::MissingStoragePath)?;
         Ok(Self::new(
             local_app_data
                 .join("DeskLink")
@@ -161,11 +170,24 @@ fn encode_event(event: &DiagnosticEvent) -> String {
         .unwrap_or_default()
         .as_millis();
     let fields = match event {
+        DiagnosticEvent::ControlSurfaceStarted => {
+            "\"level\":\"info\",\"event\":\"control_surface_started\"".to_owned()
+        }
         DiagnosticEvent::ApplicationStarted { pairing_mode } => format!(
             "\"level\":\"info\",\"event\":\"application_started\",\"pairing_mode\":{pairing_mode}"
         ),
         DiagnosticEvent::ApplicationStopped => {
             "\"level\":\"info\",\"event\":\"application_stopped\"".to_owned()
+        }
+        DiagnosticEvent::PowerResumeMonitoringStarted => {
+            "\"level\":\"info\",\"event\":\"power_resume_monitoring_started\"".to_owned()
+        }
+        DiagnosticEvent::PowerResumeMonitoringFailed { reason } => format!(
+            "\"level\":\"warning\",\"event\":\"power_resume_monitoring_failed\",\"reason\":{}",
+            json_string(&bounded_redacted_text(reason))
+        ),
+        DiagnosticEvent::PowerResumeDetected => {
+            "\"level\":\"info\",\"event\":\"power_resume_detected\"".to_owned()
         }
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Connecting { attempt, stream_id }) => {
             format!(
@@ -307,7 +329,7 @@ fn rotated_path(path: &Path, index: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        env, fs,
         sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };

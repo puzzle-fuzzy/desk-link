@@ -458,6 +458,19 @@ fn join(role: DeviceRole) -> RelayJoin {
     RelayJoin::new(SessionId::from_bytes([8; 16]), role, [4; 32])
 }
 
+#[tokio::test]
+async fn explicit_lan_mode_accepts_a_self_signed_local_relay() {
+    let relay = spawn_mock_relay(false).await;
+    let config = QuicClientConfig::new_lan(relay.address, "desklink-lan").unwrap();
+    let client = QuicClient::connect(config).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    client.send_control(vec![1, 2, 3]).await.unwrap();
+    assert_eq!(
+        client.next_event().await.unwrap(),
+        TransportEvent::Control(vec![1, 2, 3])
+    );
+}
+
 async fn next_n(client: &QuicClient, count: usize) -> Vec<TransportEvent> {
     let mut events = Vec::with_capacity(count);
     for _ in 0..count {

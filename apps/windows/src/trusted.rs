@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env, fmt,
+    fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
     os::windows::ffi::OsStrExt,
@@ -28,6 +28,7 @@ use zeroize::Zeroize;
 
 use crate::{
     runtime::{ControllerAuthorization, ControllerAuthorizer},
+    storage::local_app_data_path,
     window::{
         ApprovedController, PairingApprovalError, PairingApprovalGate, PendingController,
         WindowsLocalApprovalDialog,
@@ -276,9 +277,8 @@ fn now_unix_s() -> Result<u64, String> {
 
 impl WindowsTrustedControllerStore {
     pub fn for_current_user() -> Result<Self, WindowsTrustedControllerError> {
-        let local_app_data = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or(WindowsTrustedControllerError::MissingStoragePath)?;
+        let local_app_data =
+            local_app_data_path().ok_or(WindowsTrustedControllerError::MissingStoragePath)?;
         Ok(Self::new(
             local_app_data
                 .join("DeskLink")

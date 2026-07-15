@@ -81,6 +81,12 @@ This is a compact personal tool, not an enterprise console or a neon streaming o
 - Compact trusted-device management without nested navigation
 - No decorative motion
 
+## Implementation boundary
+
+The ordinary Windows status, connection, and trusted-device views are implemented as a Tauri 2 control surface using semantic HTML/CSS and Vanilla TypeScript. Rust remains the trust boundary: it owns DPAPI storage, validates all connection input, never returns the saved relay key, and exposes only the minimum Tauri commands and capabilities required by the view.
+
+The Tauri process owns the single-instance application lifetime, native tray, and host supervisor start/stop boundary. Capture, encoding, encrypted transport, input injection, and high-consequence approval or revocation confirmations remain in Rust/Win32. The WebView receives sanitized lifecycle summaries and is a presentation layer, not a replacement for native security or media boundaries.
+
 ## Colors
 
 Pure white keeps the host surface neutral; burnt coral is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
@@ -144,13 +150,21 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Inputs / Fields
 
-- **Style:** native Windows controls with system metrics.
-- **Focus:** visible platform focus state and keyboard traversal.
+- **Style:** semantic HTML controls sized to Windows system metrics inside the Tauri/WebView surface.
+- **Focus:** visible `:focus-visible` state and logical keyboard traversal.
 - **Error / Disabled:** written explanation plus the native disabled state; color alone is forbidden.
 
 ### Navigation
 
-The tray menu contains “Open DeskLink,” “Manage trusted controllers,” and “Exit DeskLink.” The main window is a single surface, not a sidebar application. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
+The tray menu contains “Open DeskLink” and “Exit DeskLink.” Trusted-device management stays in the main window so the tray remains compact. The main window is a single surface, not a sidebar application. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
+
+### Pairing and Revocation
+
+- Create pairing only after an explicit local action and require saved relay settings plus an available trusted-device store.
+- Show the single signed invitation, its live expiry, and a plain warning that it contains the private relay join secret retained by an approved controller for reconnecting. Never log it or return it as part of routine status refreshes.
+- Clear the WebView copy on cancellation, expiry, revocation restart, or pairing-worker completion; restore normal hosting after cancellation or preparation failure.
+- Pairing approval and trusted-controller revocation use native Win32 Yes/No confirmations with “No” selected by default. The WebView must not imitate or replace that decision boundary.
+- A successful revocation restarts the host immediately so an already-authorized runtime cannot retain access under stale trust.
 
 ### Connection Status
 
@@ -163,6 +177,13 @@ Show the written state, current stream when connected, retry count and delay whe
 - Replace internal runtime error strings with stable owner-facing explanations. Technical detail belongs in the local structured diagnostic log.
 - Keep the diagnostic log bounded and redact named credentials plus long hexadecimal identity or secret material before persistence.
 - Disable destructive controls whenever no exact trusted controller is selected, including partial-load and corrupt-store states.
+
+### Runtime Resilience
+
+- On a multi-display Windows desktop, capture the attached output whose desktop coordinates contain `(0, 0)`, which is the Windows primary display. Do not imply that the current build composites the full virtual desktop or supports display switching.
+- Register for Windows suspend/resume callbacks independently of the WebView window. Debounce duplicate resume notifications and rebuild the host supervisor so QUIC, Noise, capture, encoding, and input state are all fresh after wake.
+- Resolve current-user storage through the Windows Local AppData known folder rather than depending on a process environment variable.
+- Keep the repeatable Windows acceptance path in `scripts/verify-windows-resilience.py`, including physical capture, repeated relay recovery, power notification registration, and an encrypted hardware-media soak.
 
 ## Do's and Don'ts
 

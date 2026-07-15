@@ -103,11 +103,20 @@ impl ControllerRuntime {
         identity: DeviceIdentity,
         expected_host: VerifyingKey,
     ) -> Result<Self, ControllerError> {
+        Self::connect_for_platform(client, identity, expected_host, Platform::MacOS).await
+    }
+
+    pub async fn connect_for_platform(
+        client: QuicClient,
+        identity: DeviceIdentity,
+        expected_host: VerifyingKey,
+        platform: Platform,
+    ) -> Result<Self, ControllerError> {
         let client = Arc::new(client);
         let secure = Arc::new(Mutex::new(
             perform_noise_handshake(&client, identity, expected_host).await?,
         ));
-        negotiate_host(&client, &secure).await?;
+        negotiate_host(&client, &secure, platform).await?;
         Ok(Self {
             client,
             secure,
@@ -318,12 +327,13 @@ async fn perform_noise_handshake(
 async fn negotiate_host(
     client: &QuicClient,
     secure: &Arc<Mutex<SecureSession>>,
+    platform: Platform,
 ) -> Result<(), ControllerError> {
     send_control(
         client,
         secure,
         &ControlMessage::Hello {
-            platform: Platform::MacOS,
+            platform,
             role: DeviceRole::Controller,
         },
     )
@@ -332,7 +342,7 @@ async fn negotiate_host(
         client,
         secure,
         &ControlMessage::Capabilities(DeviceCapabilities {
-            platform: Platform::MacOS,
+            platform,
             role: DeviceRole::Controller,
             codecs: vec![Codec::H264],
             width: 1920,

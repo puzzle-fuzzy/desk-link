@@ -16,9 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET = "x86_64-pc-windows-msvc"
 
 
-def run(command: list[str], *, env: dict[str, str] | None = None) -> None:
+def run(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path = ROOT,
+) -> None:
     print("+", subprocess.list2cmdline(command), flush=True)
-    subprocess.run(command, cwd=ROOT, env=env, check=True)
+    subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
 def signing_requested() -> bool:
@@ -55,6 +60,24 @@ def main() -> int:
         raise SystemExit("The Windows installer must be built on Windows.")
 
     run([sys.executable, str(ROOT / "scripts" / "generate-windows-assets.py")])
+    windows_ui = ROOT / "apps" / "windows-ui"
+    run(["bun", "install", "--frozen-lockfile"], cwd=windows_ui)
+    run(["bun", "run", "build"], cwd=windows_ui)
+    run(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--target",
+            TARGET,
+            "--package",
+            "desklink-windows-ui",
+            "--bin",
+            "desklink-windows-ui",
+            "--features",
+            "custom-protocol",
+        ]
+    )
     run(
         [
             "cargo",
@@ -71,16 +94,24 @@ def main() -> int:
         ]
     )
 
-    application = ROOT / "target" / TARGET / "release" / "desklink-windows.exe"
+    release = ROOT / "target" / TARGET / "release"
+    application = release / "desklink-windows-ui.exe"
+    host = release / "desklink-windows.exe"
     if not application.is_file():
-        raise SystemExit(f"Application payload was not produced: {application}")
+        raise SystemExit(f"Windows UI payload was not produced: {application}")
+    if not host.is_file():
+        raise SystemExit(f"Windows host payload was not produced: {host}")
 
     should_sign = signing_requested()
-    payload = application
+    application_payload = application
+    host_payload = host
     if should_sign:
-        payload = application.with_name("desklink-windows.signed-payload.exe")
-        shutil.copy2(application, payload)
-        sign(payload)
+        application_payload = application.with_name("DeskLink.signed-payload.exe")
+        host_payload = host.with_name("desklink-windows.signed-payload.exe")
+        shutil.copy2(application, application_payload)
+        shutil.copy2(host, host_payload)
+        sign(application_payload)
+        sign(host_payload)
     else:
         print(
             "Signing skipped: configure Artifact Signing or DESKLINK_SIGN_CERT_SHA1 "
@@ -89,8 +120,14 @@ def main() -> int:
         )
 
     installer_environment = os.environ.copy()
-    installer_environment["DESKLINK_WINDOWS_PAYLOAD"] = str(payload.resolve())
-    installer_environment["DESKLINK_WINDOWS_PAYLOAD_SHA256"] = sha256(payload)
+    installer_environment["DESKLINK_WINDOWS_UI_PAYLOAD"] = str(
+        application_payload.resolve()
+    )
+    installer_environment["DESKLINK_WINDOWS_UI_PAYLOAD_SHA256"] = sha256(
+        application_payload
+    )
+    installer_environment["DESKLINK_WINDOWS_HOST_PAYLOAD"] = str(host_payload.resolve())
+    installer_environment["DESKLINK_WINDOWS_HOST_PAYLOAD_SHA256"] = sha256(host_payload)
     run(
         [
             "cargo",

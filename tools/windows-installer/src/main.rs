@@ -1,9 +1,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(all(windows, feature = "embedded-payload"))]
-const APPLICATION_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_PAYLOAD"));
+const APPLICATION_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_UI_PAYLOAD"));
 #[cfg(all(windows, not(feature = "embedded-payload")))]
 const APPLICATION_PAYLOAD: &[u8] = &[];
+#[cfg(all(windows, feature = "embedded-payload"))]
+const HOST_PAYLOAD: &[u8] = include_bytes!(env!("DESKLINK_WINDOWS_HOST_PAYLOAD"));
+#[cfg(all(windows, not(feature = "embedded-payload")))]
+const HOST_PAYLOAD: &[u8] = &[];
 
 #[cfg(windows)]
 mod windows_installer {
@@ -16,7 +20,7 @@ mod windows_installer {
         time::{Duration, Instant},
     };
 
-    use crate::APPLICATION_PAYLOAD;
+    use crate::{APPLICATION_PAYLOAD, HOST_PAYLOAD};
     use desklink_delivery_layout::{InstallLayout, PRODUCT_NAME, PRODUCT_VERSION};
     use windows::{
         Win32::{
@@ -35,7 +39,10 @@ mod windows_installer {
                     REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
                     RegSetValueExW,
                 },
-                Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+                Threading::{
+                    OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_ACCESS_RIGHTS,
+                    WaitForSingleObject,
+                },
             },
             UI::{
                 Shell::{IShellLinkW, ShellLink},
@@ -53,6 +60,10 @@ mod windows_installer {
     const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskLink";
     const WINDOW_CLASS: &str = "DeskLinkHostStatusWindow";
     const INSTALLER_SHUTDOWN_MESSAGE: &str = "DeskLinkInstallerShutdown";
+    const CONTROL_SURFACE_MUTEX: windows::core::PCWSTR =
+        windows::core::w!("Local\\DeskLinkControlSurface");
+    const SYNCHRONIZE_ACCESS: SYNCHRONIZATION_ACCESS_RIGHTS =
+        SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Action {
@@ -84,11 +95,11 @@ mod windows_installer {
                     "--remove-data" => options.remove_data = true,
                     "--uninstall" => options.action = Action::Uninstall,
                     "--uninstall-worker" => options.action = Action::UninstallWorker,
-                    _ => return Err(format!("unknown installer option: {argument}")),
+                    _ => return Err(format!("未知的安装器选项：{argument}")),
                 }
             }
             if options.action == Action::Install && options.remove_data {
-                return Err("--remove-data can only be used with --uninstall".to_owned());
+                return Err("--remove-data 只能与 --uninstall 一起使用".to_owned());
             }
             Ok(options)
         }
@@ -129,11 +140,10 @@ mod windows_installer {
     }
 
     fn current_user_layout() -> io::Result<InstallLayout> {
-        let local = env::var_os("LOCALAPPDATA").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not available")
-        })?;
+        let local = env::var_os("LOCALAPPDATA")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法读取 LOCALAPPDATA"))?;
         let roaming = env::var_os("APPDATA")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "APPDATA is not available"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无法读取 APPDATA"))?;
         Ok(InstallLayout::from_user_roots(
             Path::new(&local),
             Path::new(&roaming),
@@ -141,17 +151,17 @@ mod windows_installer {
     }
 
     fn install(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
-        if APPLICATION_PAYLOAD.is_empty() {
+        if APPLICATION_PAYLOAD.is_empty() || HOST_PAYLOAD.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "this development installer does not contain the DeskLink application payload",
+                "此开发版安装器不包含 DeskLink 应用程序文件",
             ));
         }
-        let upgrading = layout.application.is_file();
+        let upgrading = layout.application.is_file() || layout.host.is_file();
         if !options.quiet {
-            let verb = if upgrading { "Upgrade" } else { "Install" };
+            let verb = if upgrading { "升级" } else { "安装" };
             let prompt = format!(
-                "{verb} DeskLink {PRODUCT_VERSION} for the current Windows user?\r\n\r\nProgram: {}\r\nUser data: {}\r\n\r\nYour identity, trusted controllers, and diagnostic history stay separate from program files.",
+                "要为当前 Windows 用户{verb} DeskLink {PRODUCT_VERSION} 吗？\r\n\r\n程序位置：{}\r\n用户数据：{}\r\n\r\n设备身份、可信控制端和诊断记录将与程序文件分开保存。",
                 layout.install_directory.display(),
                 layout.data_directory.display()
             );
@@ -160,9 +170,10 @@ mod windows_installer {
             }
         }
 
-        stop_running_application();
+        stop_running_application(layout);
         fs::create_dir_all(&layout.install_directory)?;
-        atomic_write(&layout.application, APPLICATION_PAYLOAD)?;
+        atomic_write_with_retry(&layout.application, APPLICATION_PAYLOAD)?;
+        atomic_write_with_retry(&layout.host, HOST_PAYLOAD)?;
         let installer = env::current_exe()?;
         if !same_file_path(&installer, &layout.uninstaller) {
             atomic_copy(&installer, &layout.uninstaller)?;
@@ -173,20 +184,21 @@ mod windows_installer {
         } else {
             set_registry_string(RUN_KEY, PRODUCT_NAME, &layout.startup_command())?;
         }
-        write_uninstall_registration(layout, APPLICATION_PAYLOAD.len())?;
+        write_uninstall_registration(
+            layout,
+            APPLICATION_PAYLOAD.len().saturating_add(HOST_PAYLOAD.len()),
+        )?;
+
+        if !options.quiet {
+            Command::new(&layout.application).spawn()?;
+        }
 
         let message = if upgrading {
-            format!(
-                "DeskLink {PRODUCT_VERSION} was upgraded. Existing identity and trust data were preserved."
-            )
+            format!("DeskLink {PRODUCT_VERSION} 已升级，现有设备身份和信任数据均已保留。")
         } else if options.no_autostart {
-            format!(
-                "DeskLink {PRODUCT_VERSION} was installed for this Windows user. Automatic startup is disabled."
-            )
+            format!("DeskLink {PRODUCT_VERSION} 已为当前 Windows 用户安装，开机自动启动未启用。")
         } else {
-            format!(
-                "DeskLink {PRODUCT_VERSION} was installed for this Windows user. It will start automatically at sign-in."
-            )
+            format!("DeskLink {PRODUCT_VERSION} 已为当前 Windows 用户安装，并会在登录后自动启动。")
         };
         Ok(Outcome::Completed(message))
     }
@@ -194,27 +206,25 @@ mod windows_installer {
     fn uninstall(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
         if !options.quiet {
             let data_copy = if options.remove_data {
-                "Identity, trusted-controller records, and diagnostics will also be deleted."
+                "设备身份、可信控制端记录和诊断数据也会被删除。"
             } else {
-                "Identity, trusted-controller records, and diagnostics will be preserved."
+                "设备身份、可信控制端记录和诊断数据将保留。"
             };
             if !confirm(&format!(
-                "Uninstall DeskLink for this Windows user?\r\n\r\n{data_copy}"
+                "要为当前 Windows 用户卸载 DeskLink 吗？\r\n\r\n{data_copy}"
             )) {
                 return Ok(Outcome::Cancelled);
             }
         }
         if same_file_path(&env::current_exe()?, &layout.uninstaller) {
             spawn_uninstall_worker(options)?;
-            return Ok(Outcome::Completed(
-                "DeskLink uninstall has started.".to_owned(),
-            ));
+            return Ok(Outcome::Completed("DeskLink 卸载程序已启动。".to_owned()));
         }
         uninstall_now(layout, options)
     }
 
     fn uninstall_now(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
-        stop_running_application();
+        stop_running_application(layout);
         delete_registry_value(RUN_KEY, PRODUCT_NAME)?;
         delete_registry_tree(UNINSTALL_KEY)?;
         remove_file_if_present(&layout.start_menu_shortcut)?;
@@ -226,10 +236,10 @@ mod windows_installer {
             schedule_current_executable_for_deletion();
         }
         Ok(Outcome::Completed(if options.remove_data {
-            "DeskLink and its current-user data were removed.".to_owned()
+            "DeskLink 及当前用户的数据均已移除。".to_owned()
         } else {
             format!(
-                "DeskLink was removed. Current-user identity, trust, and diagnostics remain in {}.",
+                "DeskLink 已移除。当前用户的设备身份、信任和诊断数据仍保存在 {}。",
                 layout.data_directory.display()
             )
         }))
@@ -248,7 +258,21 @@ mod windows_installer {
         Ok(())
     }
 
-    fn stop_running_application() {
+    fn stop_running_application(layout: &InstallLayout) {
+        let control_surface =
+            unsafe { OpenMutexW(SYNCHRONIZE_ACCESS, false, CONTROL_SURFACE_MUTEX) }.ok();
+        if layout.application.is_file() {
+            let _ = Command::new(&layout.application)
+                .arg("--installer-shutdown")
+                .spawn()
+                .and_then(|mut child| child.wait());
+        }
+        if let Some(control_surface) = control_surface {
+            unsafe {
+                let _ = WaitForSingleObject(control_surface, 6_000);
+                let _ = CloseHandle(control_surface);
+            }
+        }
         let class = wide(WINDOW_CLASS);
         let hwnd = unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) };
         let Ok(hwnd) = hwnd else {
@@ -293,6 +317,22 @@ mod windows_installer {
         }
     }
 
+    fn atomic_write_with_retry(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match atomic_write(destination, bytes) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if Instant::now() < deadline
+                        && matches!(error.raw_os_error(), Some(5) | Some(32)) =>
+                {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         let temporary = temporary_sibling(destination)?;
         let result = (|| {
@@ -325,9 +365,9 @@ mod windows_installer {
     }
 
     fn temporary_sibling(destination: &Path) -> io::Result<PathBuf> {
-        let name = destination.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
-        })?;
+        let name = destination
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "目标路径没有文件名"))?;
         Ok(
             destination.with_file_name(format!(
                 ".{}.tmp-{}",
@@ -365,7 +405,7 @@ mod windows_installer {
             let shortcut = wide_path(&layout.start_menu_shortcut);
             unsafe {
                 link.SetPath(PCWSTR(application.as_ptr()))?;
-                link.SetDescription(windows::core::w!("Securely control this Windows PC"))?;
+                link.SetDescription(windows::core::w!("安全控制此 Windows 电脑"))?;
                 link.SetWorkingDirectory(PCWSTR(working_directory.as_ptr()))?;
                 link.SetIconLocation(PCWSTR(application.as_ptr()), 0)?;
                 let persist: IPersistFile = link.cast()?;
@@ -534,14 +574,14 @@ mod windows_installer {
         style: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
     ) -> MESSAGEBOX_RESULT {
         let text = wide(text);
-        let title = wide("DeskLink Setup");
+        let title = wide("DeskLink 安装程序");
         unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) }
     }
 
     fn report_error(quiet: bool, error: &str) -> i32 {
         if !quiet {
             show_message(
-                &format!("DeskLink Setup could not complete.\r\n\r\n{error}"),
+                &format!("DeskLink 安装程序无法完成操作。\r\n\r\n{error}"),
                 MB_OK | MB_ICONERROR,
             );
         }

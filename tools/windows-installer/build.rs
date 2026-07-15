@@ -2,8 +2,10 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/installer.rc");
     println!("cargo:rerun-if-changed=assets/installer.manifest");
     println!("cargo:rerun-if-changed=../../apps/windows/assets/desklink.ico");
-    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_PAYLOAD");
-    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_PAYLOAD_SHA256");
+    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_UI_PAYLOAD");
+    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_UI_PAYLOAD_SHA256");
+    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_HOST_PAYLOAD");
+    println!("cargo:rerun-if-env-changed=DESKLINK_WINDOWS_HOST_PAYLOAD_SHA256");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

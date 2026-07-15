@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeskLink",
+  "version": "0.1.1",
+  "identifier": "com.desklink.host",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "DeskLink",
+        "width": 920,
+        "height": 660,
+        "minWidth": 760,
+        "minHeight": 560,
+        "center": true,
+        "visible": false,
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#f6f4f3"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": [
+      "../../windows/assets/desklink.ico",
+      "../../windows/assets/desklink-icon.png"
+    ]
+  }
+}

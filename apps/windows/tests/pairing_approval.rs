@@ -109,8 +109,8 @@ fn approval_prompt_contains_the_full_authenticated_identity_and_defaults_to_no_s
 
     assert!(prompt.contains(&pending.verification_fingerprint()));
     assert!(prompt.contains("48:48:48:48:48:48:48:48:48:48:48:48:48:48:48:48"));
-    assert!(prompt.contains("Ed25519 public-key fingerprint"));
-    assert!(prompt.contains("screen viewing and input control"));
+    assert!(prompt.contains("Ed25519 公钥指纹"));
+    assert!(prompt.contains("屏幕查看和输入控制权限"));
     assert!(!prompt.contains("relay"));
 }
 
@@ -120,6 +120,6 @@ fn revocation_prompt_identifies_the_exact_key_and_explains_repairing() {
     let prompt = controller_revocation_prompt(controller.device_id, controller.verify_key());
 
     assert!(prompt.contains("50:50:50:50:50:50:50:50:50:50:50:50:50:50:50:50"));
-    assert!(prompt.contains("Ed25519 public-key fingerprint"));
-    assert!(prompt.contains("paired and approved again"));
+    assert!(prompt.contains("Ed25519 公钥指纹"));
+    assert!(prompt.contains("重新配对并获得批准"));
 }

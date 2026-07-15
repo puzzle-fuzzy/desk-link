@@ -130,10 +130,28 @@ impl PairingInvite {
         rng.fill_bytes(&mut session_id);
         let mut relay_authentication = Zeroizing::new([0; RELAY_AUTHENTICATION_BYTES]);
         rng.fill_bytes(&mut relay_authentication[..]);
+        Self::for_connection(
+            host,
+            SessionId::from_bytes(session_id),
+            *relay_authentication,
+            now_unix_s,
+            ttl_s,
+        )
+    }
+
+    pub fn for_connection(
+        host: &crate::DeviceIdentity,
+        session_id: SessionId,
+        relay_authentication: [u8; RELAY_AUTHENTICATION_BYTES],
+        now_unix_s: u64,
+        ttl_s: u64,
+    ) -> Result<Self, PairingError> {
+        validate_ttl(ttl_s)?;
+        let relay_authentication = Zeroizing::new(relay_authentication);
         let expires_at_unix_s = now_unix_s.saturating_add(ttl_s);
         let host_verify_key = host.verify_key();
         let unsigned = encode_unsigned_invite(
-            SessionId::from_bytes(session_id),
+            session_id,
             &relay_authentication,
             host.device_id,
             host_verify_key,
@@ -142,7 +160,7 @@ impl PairingInvite {
         );
         let signature_input = invite_signature_input(&unsigned);
         Ok(Self {
-            session_id: SessionId::from_bytes(session_id),
+            session_id,
             relay_authentication,
             host_device_id: host.device_id,
             host_verify_key,

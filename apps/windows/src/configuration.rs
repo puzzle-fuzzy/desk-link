@@ -1,5 +1,5 @@
 use std::{
-    env, fmt,
+    fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
     net::SocketAddr,
@@ -7,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
     slice,
 };
+
+use crate::storage::local_app_data_path;
 
 use desklink_crypto::SessionId;
 use thiserror::Error;
@@ -49,17 +51,17 @@ const CONTROL_FEEDBACK: i32 = 2106;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ConnectionSettingsInputError {
-    #[error("Relay address must be an IP address and port, for example 192.0.2.10:4433.")]
+    #[error("中继服务器地址必须包含 IP 地址和端口，例如 192.0.2.10:4433。")]
     InvalidRelayAddress,
-    #[error("TLS server name is required and cannot contain spaces or control characters.")]
+    #[error("必须填写 TLS 服务器名称，且不能包含空格或控制字符。")]
     InvalidServerName,
-    #[error("Session ID must contain exactly 32 hexadecimal characters.")]
+    #[error("会话 ID 必须正好包含 32 位十六进制字符。")]
     InvalidSessionId,
-    #[error("Relay key is required for a new connection.")]
+    #[error("新连接必须填写中继密钥。")]
     MissingAuthentication,
-    #[error("Relay key must contain exactly 64 hexadecimal characters.")]
+    #[error("中继密钥必须正好包含 64 位十六进制字符。")]
     InvalidAuthentication,
-    #[error("Stream ID must be a positive whole number.")]
+    #[error("视频流 ID 必须是正整数。")]
     InvalidStreamId,
 }
 
@@ -168,17 +170,17 @@ impl Drop for HostConnectionSettings {
 
 #[derive(Debug, Error)]
 pub enum WindowsConnectionSettingsError {
-    #[error("connection storage path is unavailable")]
+    #[error("连接设置存储路径不可用")]
     MissingStoragePath,
-    #[error("connection settings file operation failed: {0}")]
+    #[error("连接设置文件操作失败：{0}")]
     Io(#[from] io::Error),
-    #[error("Windows connection protection failed: {0}")]
+    #[error("Windows 连接保护失败：{0}")]
     Platform(#[from] WindowsError),
-    #[error("protected connection settings are corrupt or belong to another Windows user")]
+    #[error("受保护的连接设置已损坏，或属于其他 Windows 用户")]
     CorruptProtectedData,
-    #[error("connection settings data is malformed")]
+    #[error("连接设置数据格式无效")]
     CorruptStore,
-    #[error("the running DeskLink host did not stop after its configuration changed")]
+    #[error("连接配置改变后，正在运行的 DeskLink 主机未能停止")]
     HostDidNotStop,
 }
 
@@ -189,9 +191,8 @@ pub struct WindowsConnectionSettingsStore {
 
 impl WindowsConnectionSettingsStore {
     pub fn for_current_user() -> Result<Self, WindowsConnectionSettingsError> {
-        let local_app_data = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or(WindowsConnectionSettingsError::MissingStoragePath)?;
+        let local_app_data =
+            local_app_data_path().ok_or(WindowsConnectionSettingsError::MissingStoragePath)?;
         Ok(Self::new(
             local_app_data.join("DeskLink").join("connection.bin"),
         ))
@@ -289,14 +290,14 @@ impl DialogState<'_> {
                 settings.server_name().to_owned(),
                 settings.session_id_text(),
                 settings.stream_id().to_string(),
-                "The saved relay key is protected. Leave that field blank to keep it.",
+                "已保存的中继密钥受 Windows 保护，留空即可保留原密钥。",
             ),
             None => (
                 "127.0.0.1:4433".to_owned(),
                 "localhost".to_owned(),
                 String::new(),
                 "1".to_owned(),
-                "Enter the connection values shared with your other DeskLink device.",
+                "请输入另一台 DeskLink 设备共享的连接信息。",
             ),
         };
         set_control_text(dialog, CONTROL_RELAY_ADDRESS, &relay)?;

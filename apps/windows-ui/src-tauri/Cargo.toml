@@ -1,0 +1,53 @@
+[package]
+name = "desklink-windows-ui"
+version = "0.1.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Modern Windows control surface for the DeskLink host"
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]
+
+[lib]
+name = "desklink_windows_ui_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "desklink-windows-ui"
+path = "src/main.rs"
+test = false
+bench = false
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+apps-windows = { package = "desklink-windows", path = "../../windows" }
+desklink-crypto.workspace = true
+desklink-ffi.workspace = true
+desklink-protocol.workspace = true
+desklink-relay = { path = "../../../server/relay" }
+desklink-session.workspace = true
+desklink-transport.workspace = true
+quinn.workspace = true
+rand_core.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2.4.3"
+tokio.workspace = true
+zeroize = "1.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_System_Power",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }

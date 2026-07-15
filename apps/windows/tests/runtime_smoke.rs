@@ -2,7 +2,7 @@
 mod windows {
     use std::{
         sync::Arc,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use apps_windows::{
@@ -13,9 +13,9 @@ mod windows {
         },
         window::PendingController,
     };
-    use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
+    use desklink_crypto::{DeviceIdentity, PairingInvite};
     use desklink_ffi::{ControllerEvent, ControllerRuntime};
-    use desklink_protocol::{FrameFlags, VideoConfig};
+    use desklink_protocol::{FrameFlags, Platform, VideoConfig};
     use desklink_relay::{RelayConfig, RelayServer};
     use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
     use desklink_video::EncodedFrame;
@@ -81,7 +81,7 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn local_relay_pairing_persists_trust_for_a_fresh_session_reconnect() {
+    async fn local_relay_windows_pairing_persists_trust_and_connection_for_reconnect() {
         let relay = spawn_test_relay().await;
         let config = || {
             QuicClientConfig::with_client_config(
@@ -121,10 +121,14 @@ mod windows {
         let runtime =
             HostRuntime::with_authorizer(host, 1, host_identity, Arc::new(authorizer)).unwrap();
         let runtime_task = tokio::spawn(async move { runtime.run().await });
-        let mut controller =
-            ControllerRuntime::connect(controller, controller_identity, host_verify_key)
-                .await
-                .unwrap();
+        let mut controller = ControllerRuntime::connect_for_platform(
+            controller,
+            controller_identity,
+            host_verify_key,
+            Platform::Windows,
+        )
+        .await
+        .unwrap();
 
         let mut video_config: Option<VideoConfig> = None;
         let mut frame: Option<EncodedFrame> = None;
@@ -175,8 +179,8 @@ mod windows {
         };
         let reconnect_host = QuicClient::connect(reconnect_config()).await.unwrap();
         let reconnect_controller = QuicClient::connect(reconnect_config()).await.unwrap();
-        let reconnect_session = SessionId::from_bytes([81; 16]);
-        let reconnect_authentication = [82; 32];
+        let reconnect_session = session_id;
+        let reconnect_authentication = authentication;
         reconnect_host
             .join(RelayJoin::host(reconnect_session, reconnect_authentication))
             .await
@@ -197,10 +201,11 @@ mod windows {
         )
         .unwrap();
         let reconnect_task = tokio::spawn(async move { reconnect_runtime.run().await });
-        let mut reconnect_controller = ControllerRuntime::connect(
+        let mut reconnect_controller = ControllerRuntime::connect_for_platform(
             reconnect_controller,
             DeviceIdentity::from_secret_key([63; 16], &[64; 32]),
             host_verify_key,
+            Platform::Windows,
         )
         .await
         .unwrap();
@@ -220,6 +225,119 @@ mod windows {
         let _ = reconnect_task.await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(reconnect_controller);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "hardware soak; run through scripts/verify-windows-resilience.py"]
+    async fn local_relay_hardware_soak_keeps_secure_media_and_cursor_alive() {
+        let soak_seconds = std::env::var("DESKLINK_SOAK_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30)
+            .clamp(10, 300);
+        let relay = spawn_test_relay().await;
+        let config = || {
+            QuicClientConfig::with_client_config(
+                relay.address,
+                "localhost",
+                relay.client_config.clone(),
+            )
+        };
+        let host = QuicClient::connect(config()).await.unwrap();
+        let controller = QuicClient::connect(config()).await.unwrap();
+        let host_identity = DeviceIdentity::from_secret_key([91; 16], &[92; 32]);
+        let host_verify_key = host_identity.verify_key();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let invite = PairingInvite::new(&host_identity, now, 600).unwrap();
+        let session_id = invite.session_id();
+        let authentication = *invite.relay_authentication();
+        host.join(RelayJoin::host(session_id, authentication))
+            .await
+            .unwrap();
+        controller
+            .join(RelayJoin::controller(session_id, authentication))
+            .await
+            .unwrap();
+
+        let controller_identity = DeviceIdentity::from_secret_key([93; 16], &[94; 32]);
+        let directory = std::env::temp_dir().join(format!(
+            "desklink-runtime-soak-{}-{now}",
+            std::process::id()
+        ));
+        let trusted = WindowsTrustedControllerStore::new(directory.join("controllers.bin"));
+        let authorizer =
+            WindowsPairingAuthorizer::new(trusted, invite, Box::new(AcceptLocalPairing));
+        let runtime =
+            HostRuntime::with_authorizer(host, 1, host_identity, Arc::new(authorizer)).unwrap();
+        let runtime_task = tokio::spawn(async move { runtime.run().await });
+        let mut controller =
+            ControllerRuntime::connect(controller, controller_identity, host_verify_key)
+                .await
+                .unwrap();
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(soak_seconds);
+        let mut video_configs = 0_u64;
+        let mut frames = 0_u64;
+        let mut cursors = 0_u64;
+        let mut last_frame_id = 0_u64;
+        let mut last_cursor_sequence = 0_u64;
+        let mut next_keyframe_request = started + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let event = tokio::time::timeout(Duration::from_secs(3), controller.next_event())
+                .await
+                .expect("soak event timeout")
+                .expect("soak controller closed");
+            match event {
+                ControllerEvent::VideoConfig(config) => {
+                    assert_eq!(config.stream_id, 1);
+                    assert!(!config.sequence_header.is_empty());
+                    video_configs += 1;
+                }
+                ControllerEvent::H264AccessUnit(frame) => {
+                    assert_eq!(frame.stream_id, 1);
+                    assert!(frame.frame_id > last_frame_id);
+                    assert!(!frame.data.is_empty());
+                    last_frame_id = frame.frame_id;
+                    frames += 1;
+                }
+                ControllerEvent::Cursor(cursor) => {
+                    assert_eq!(cursor.stream_id, 1);
+                    assert!(cursor.sequence > last_cursor_sequence);
+                    assert!((0..=1_000_000).contains(&cursor.x_millionths));
+                    assert!((0..=1_000_000).contains(&cursor.y_millionths));
+                    last_cursor_sequence = cursor.sequence;
+                    cursors += 1;
+                }
+                ControllerEvent::Control(_) => {}
+                ControllerEvent::Closed { reason } => {
+                    panic!("secure soak session closed early: {reason}")
+                }
+            }
+            if Instant::now() >= next_keyframe_request {
+                controller.request_keyframe().await.unwrap();
+                next_keyframe_request += Duration::from_secs(5);
+            }
+        }
+        assert!(video_configs >= 1);
+        assert!(
+            frames >= 2,
+            "expected multiple H.264 frames, observed {frames}"
+        );
+        assert!(
+            cursors >= soak_seconds.saturating_mul(10),
+            "cursor lane stalled: observed {cursors} updates in {soak_seconds}s"
+        );
+        assert!(controller.metrics().completed_frames >= frames);
+
+        runtime_task.abort();
+        let _ = runtime_task.await;
+        drop(controller);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

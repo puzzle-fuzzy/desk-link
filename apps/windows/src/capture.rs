@@ -50,13 +50,11 @@ impl DxgiDesktopCapturer {
             use windows::Win32::Graphics::Direct3D11::{
                 D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
             };
-            use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1};
+            use windows::Win32::Graphics::Dxgi::IDXGIOutput1;
             use windows::core::Interface;
 
-            let (factory, adapter, output, device) = unsafe {
-                let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(native_error)?;
-                let adapter = factory.EnumAdapters1(0).map_err(native_error)?;
-                let output = adapter.EnumOutputs(0).map_err(native_error)?;
+            let (adapter, output, description, device) = unsafe {
+                let (adapter, output, description) = find_primary_output()?;
                 let mut device: Option<ID3D11Device> = None;
                 D3D11CreateDevice(
                     &adapter,
@@ -71,18 +69,17 @@ impl DxgiDesktopCapturer {
                 )
                 .map_err(native_error)?;
                 (
-                    factory,
                     adapter,
                     output,
+                    description,
                     device.ok_or_else(|| {
                         CaptureError::Native("D3D11 device was not created".into())
                     })?,
                 )
             };
-            let _ = (factory, adapter);
+            let _ = adapter;
             let output1: IDXGIOutput1 = output.cast().map_err(native_error)?;
             let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(native_error)?;
-            let description = unsafe { output.GetDesc() }.map_err(native_error)?;
             let width =
                 (description.DesktopCoordinates.right - description.DesktopCoordinates.left) as u32;
             let height =
@@ -114,6 +111,97 @@ impl DxgiDesktopCapturer {
     pub fn mark_access_lost(&mut self) {
         self.access_lost = true;
     }
+}
+
+#[cfg(windows)]
+unsafe fn find_primary_output() -> Result<
+    (
+        windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+        windows::Win32::Graphics::Dxgi::IDXGIOutput,
+        windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+    ),
+    CaptureError,
+> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
+    };
+
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(native_error)?;
+    let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput, _)> = None;
+    let mut adapter_index = 0;
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => return Err(native_error(error)),
+        };
+        let mut output_index = 0;
+        loop {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(error) => return Err(native_error(error)),
+            };
+            let description = unsafe { output.GetDesc() }.map_err(native_error)?;
+            if description.AttachedToDesktop.as_bool() {
+                let coordinates = description.DesktopCoordinates;
+                let contains_primary_origin = coordinates.left <= 0
+                    && coordinates.top <= 0
+                    && coordinates.right > 0
+                    && coordinates.bottom > 0;
+                if contains_primary_origin {
+                    return Ok((adapter, output, description));
+                }
+                if fallback.is_none() {
+                    fallback = Some((adapter.clone(), output, description));
+                }
+            }
+            output_index += 1;
+        }
+        adapter_index += 1;
+    }
+    fallback.ok_or(CaptureError::NoDisplay)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayTopology {
+    pub monitor_count: u32,
+    pub primary: DesktopRect,
+    pub virtual_desktop: DesktopRect,
+}
+
+#[cfg(windows)]
+pub fn display_topology() -> Result<DisplayTopology, CaptureError> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CMONITORS, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+        SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+
+    let monitor_count = unsafe { GetSystemMetrics(SM_CMONITORS) };
+    let primary_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let primary_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if monitor_count <= 0
+        || primary_width <= 0
+        || primary_height <= 0
+        || virtual_width <= 0
+        || virtual_height <= 0
+    {
+        return Err(CaptureError::NoDisplay);
+    }
+    Ok(DisplayTopology {
+        monitor_count: monitor_count as u32,
+        primary: DesktopRect::new(0, 0, primary_width as u32, primary_height as u32),
+        virtual_desktop: DesktopRect::new(
+            virtual_left,
+            virtual_top,
+            virtual_width as u32,
+            virtual_height as u32,
+        ),
+    })
 }
 
 impl DesktopCapturer for DxgiDesktopCapturer {

@@ -7,7 +7,8 @@ use thiserror::Error;
 #[cfg(windows)]
 use windows::{
     Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, MessageBoxW,
+        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, MESSAGEBOX_STYLE,
+        MessageBoxW,
     },
     core::PCWSTR,
 };
@@ -66,12 +67,12 @@ fn grouped_hex(bytes: &[u8]) -> String {
 
 pub fn controller_approval_prompt(pending: PendingController) -> String {
     format!(
-        "DeskLink received an authenticated remote-control request.\n\n\
-         Device ID:\n{}\n\n\
-         Ed25519 public-key fingerprint:\n{}\n\n\
-         Session ID:\n{}\n\n\
-         Request expires at Unix time {}.\n\n\
-         Approve only if you recognize this controller. Approval grants screen viewing and input control.",
+        "DeskLink 收到一项已通过身份验证的远程控制请求。\n\n\
+         设备 ID：\n{}\n\n\
+         Ed25519 公钥指纹：\n{}\n\n\
+         会话 ID：\n{}\n\n\
+         请求过期时间（Unix）：{}。\n\n\
+         仅当你确认这是自己的控制端时才批准。批准后，对方将获得屏幕查看和输入控制权限。",
         grouped_hex(&pending.identity().device_id()),
         pending.verification_fingerprint(),
         grouped_hex(pending.session_id().as_bytes()),
@@ -81,10 +82,10 @@ pub fn controller_approval_prompt(pending: PendingController) -> String {
 
 pub fn controller_revocation_prompt(device_id: [u8; 16], verify_key: VerifyingKey) -> String {
     format!(
-        "Revoke this trusted DeskLink controller?\n\n\
-         Device ID:\n{}\n\n\
-         Ed25519 public-key fingerprint:\n{}\n\n\
-         Revocation takes effect for the next connection. The controller must be paired and approved again to regain access.",
+        "要撤销此可信 DeskLink 控制端吗？\n\n\
+         设备 ID：\n{}\n\n\
+         Ed25519 公钥指纹：\n{}\n\n\
+         撤销将在下次连接时生效。此控制端必须重新配对并获得批准，才能再次访问。",
         grouped_hex(&device_id),
         grouped_hex(verify_key.as_bytes()),
     )
@@ -101,7 +102,7 @@ impl WindowsLocalApprovalDialog {
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
-        let title = "DeskLink controller approval"
+        let title = "DeskLink 控制端批准"
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
@@ -110,7 +111,7 @@ impl WindowsLocalApprovalDialog {
                 None,
                 PCWSTR(message.as_ptr()),
                 PCWSTR(title.as_ptr()),
-                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+                default_reject_warning_style(),
             ) == IDYES
         }
     }
@@ -120,7 +121,7 @@ impl WindowsLocalApprovalDialog {
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
-        let title = "DeskLink trusted controller"
+        let title = "DeskLink 可信控制端"
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
@@ -129,10 +130,15 @@ impl WindowsLocalApprovalDialog {
                 None,
                 PCWSTR(message.as_ptr()),
                 PCWSTR(title.as_ptr()),
-                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+                default_reject_warning_style(),
             ) == IDYES
         }
     }
+}
+
+#[cfg(windows)]
+fn default_reject_warning_style() -> MESSAGEBOX_STYLE {
+    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND
 }
 
 /// Proof that the exact authenticated controller shown locally was approved.
@@ -160,15 +166,15 @@ impl ApprovedController {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum PairingApprovalError {
-    #[error("pairing invitation is not active: {0}")]
+    #[error("配对邀请当前未生效：{0}")]
     Pairing(#[from] PairingError),
-    #[error("an approval request is already active or has already been resolved")]
+    #[error("已有批准请求正在处理或该请求已处理")]
     InvalidState,
-    #[error("there is no authenticated controller waiting for approval")]
+    #[error("没有等待批准且已通过身份验证的控制端")]
     NoPendingController,
-    #[error("the authenticated controller changed after the approval prompt was shown")]
+    #[error("显示批准提示后，已验证的控制端发生了变化")]
     ControllerChanged,
-    #[error("the approval request expired")]
+    #[error("批准请求已过期")]
     Expired,
 }
 
@@ -297,5 +303,16 @@ impl HostApprovalWindow {
 impl Default for HostApprovalWindow {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn native_confirmation_uses_second_no_button_as_default() {
+        let style = super::default_reject_warning_style();
+        assert_eq!(style.0 & 0x0000_0300, 0x0000_0100);
+        assert_ne!(style.0 & 0x0000_0004, 0);
     }
 }

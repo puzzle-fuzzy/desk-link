@@ -1,11 +1,12 @@
 use std::{
-    env,
     fs::{self, OpenOptions},
     io::{self, Write},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     slice,
 };
+
+use crate::storage::local_app_data_path;
 
 use desklink_crypto::{DeviceIdentity, IdentityStore};
 use rand_core::CryptoRngCore;
@@ -43,9 +44,8 @@ pub struct WindowsIdentityStore {
 
 impl WindowsIdentityStore {
     pub fn for_current_user() -> Result<Self, WindowsIdentityError> {
-        let local_app_data = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or(WindowsIdentityError::MissingStoragePath)?;
+        let local_app_data =
+            local_app_data_path().ok_or(WindowsIdentityError::MissingStoragePath)?;
         Ok(Self::new(
             local_app_data.join("DeskLink").join("identity.bin"),
         ))

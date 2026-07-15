@@ -198,7 +198,7 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn relay_restart_rebuilds_host_runtime_with_a_fresh_stream() {
+    async fn repeated_relay_restarts_rebuild_host_runtime_with_fresh_streams() {
         let tls = TestTls::new();
         let first_relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let address = first_relay.address;
@@ -254,6 +254,21 @@ mod windows {
         .await;
         let second_stream = next_video_config(&mut second_controller).await;
         assert!(second_stream > first_stream);
+
+        second_relay.shutdown().await;
+        drop(second_controller);
+        let third_relay = TestRelay::spawn(address, &tls).await;
+        let mut third_controller = connect_controller(
+            &tls,
+            address,
+            session_id,
+            authentication,
+            DeviceIdentity::from_secret_key([115; 16], &controller_secret),
+            host_key,
+        )
+        .await;
+        let third_stream = next_video_config(&mut third_controller).await;
+        assert!(third_stream > second_stream);
         {
             let recorded = events.lock().unwrap();
             assert!(
@@ -264,14 +279,21 @@ mod windows {
             );
             assert!(recorded.iter().any(|event| matches!(
                 event,
-                HostLifecycleEvent::Connected { stream_id } if *stream_id == second_stream
+                HostLifecycleEvent::Connected { stream_id } if *stream_id == third_stream
             )));
+            assert!(
+                recorded
+                    .iter()
+                    .filter(|event| matches!(event, HostLifecycleEvent::Reconnecting { .. }))
+                    .count()
+                    >= 2
+            );
         }
 
         host_task.abort();
         let _ = host_task.await;
-        drop(second_controller);
-        second_relay.shutdown().await;
+        drop(third_controller);
+        third_relay.shutdown().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
