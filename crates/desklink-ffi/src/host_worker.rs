@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
     thread,
@@ -28,6 +28,9 @@ use crate::host::{
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
+// Nonterminal events may be dropped when this reserve would be consumed. That keeps the
+// bounded event path nonblocking while guaranteeing room for ReleaseAll, Error, and Closed.
+const TERMINAL_EVENT_RESERVE: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -57,6 +60,7 @@ pub(crate) struct HostWorker {
     commands: mpsc::Sender<HostCommand>,
     cancellation: watch::Sender<bool>,
     phase: Arc<AtomicU8>,
+    command_gate: Mutex<()>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -94,9 +98,7 @@ impl HostWorker {
                     )),
                     Err(_) => {
                         let _ = ready_sender.send(Err(HostError::WorkerStopped));
-                        let _ = events.try_send(HostEvent::ReleaseAll);
-                        let _ = events.try_send(HostEvent::Error(HostError::WorkerStopped));
-                        let _ = events.try_send(HostEvent::State(HostState::Closed));
+                        emit_terminal(&events, Some(HostError::WorkerStopped));
                     }
                 }
                 worker_phase.store(WorkerPhase::Closed as u8, Ordering::Release);
@@ -110,6 +112,7 @@ impl HostWorker {
                 commands,
                 cancellation,
                 phase,
+                command_gate: Mutex::new(()),
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -124,6 +127,10 @@ impl HostWorker {
     }
 
     pub(crate) fn send(&self, command: HostCommand) -> Result<(), HostError> {
+        let _command_gate = self
+            .command_gate
+            .lock()
+            .map_err(|_| HostError::WorkerStopped)?;
         let phase = WorkerPhase::load(&self.phase);
         if command.requires_connection()
             && !matches!(
@@ -141,32 +148,48 @@ impl HostWorker {
         if matches!(command, HostCommand::Reject)
             && !matches!(
                 phase,
-                WorkerPhase::WaitingForApproval
+                WorkerPhase::Connecting
+                    | WorkerPhase::WaitingForApproval
                     | WorkerPhase::NegotiatingCapabilities
                     | WorkerPhase::Connected
             )
         {
             return Err(HostError::InvalidState);
         }
-        if matches!(command, HostCommand::Approve { .. }) {
-            self.phase.store(
-                WorkerPhase::NegotiatingCapabilities as u8,
-                Ordering::Release,
-            );
+        if matches!(command, HostCommand::Stop)
+            && matches!(phase, WorkerPhase::Stopping | WorkerPhase::Closed)
+        {
+            return Err(HostError::InvalidState);
         }
-        if matches!(command, HostCommand::Reject | HostCommand::Stop) {
-            self.phase
-                .store(WorkerPhase::Stopping as u8, Ordering::Release);
-        }
+
+        let next_phase = match &command {
+            HostCommand::Approve { .. } => Some(WorkerPhase::NegotiatingCapabilities),
+            HostCommand::Reject | HostCommand::Stop => Some(WorkerPhase::Stopping),
+            _ => None,
+        };
+        let cancels_worker = matches!(&command, HostCommand::Reject | HostCommand::Stop);
         self.commands
             .try_send(command)
-            .map_err(|_| HostError::CommandQueueFull)
+            .map_err(|_| HostError::CommandQueueFull)?;
+
+        // Command acceptance and the externally visible phase transition share this gate. A
+        // full command queue therefore leaves the prior phase intact, so a rejected Approve
+        // cannot unlock media and a rejected Reject/Stop cannot invent a terminal state.
+        if let Some(next_phase) = next_phase {
+            self.phase.store(next_phase as u8, Ordering::Release);
+        }
+        if cancels_worker {
+            // Cancellation is signalled only after the terminal command entered the bounded
+            // command path. It interrupts Noise and capability waits immediately.
+            let _ = self.cancellation.send(true);
+        }
+        Ok(())
     }
 
     pub(crate) fn shutdown(&mut self) {
-        self.phase
-            .store(WorkerPhase::Stopping as u8, Ordering::Release);
-        let _ = self.commands.try_send(HostCommand::Stop);
+        let _ = self.send(HostCommand::Stop);
+        // destroy is an ownership teardown operation, so it must still interrupt the worker if
+        // the bounded command queue is already full. The phase remains unchanged in that case.
         let _ = self.cancellation.send(true);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -178,6 +201,25 @@ impl Drop for HostWorker {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn emit_nonterminal(events: &mpsc::Sender<HostEvent>, event: HostEvent) {
+    // Never await application event capacity on the worker. Input, keyframe, metrics, and
+    // approval notifications are best-effort under backpressure; terminal notifications below
+    // retain their reserved slots and are never displaced by this path.
+    if events.capacity() > TERMINAL_EVENT_RESERVE {
+        let _ = events.try_send(event);
+    }
+}
+
+fn emit_terminal(events: &mpsc::Sender<HostEvent>, error: Option<HostError>) {
+    // Every worker producer uses emit_nonterminal, so the three slots reserved above make this
+    // nonblocking sequence deliver ReleaseAll before its optional Error and final Closed state.
+    let _ = events.try_send(HostEvent::ReleaseAll);
+    if let Some(error) = error {
+        let _ = events.try_send(HostEvent::Error(error));
+    }
+    let _ = events.try_send(HostEvent::State(HostState::Closed));
 }
 
 async fn run_worker(
@@ -198,10 +240,8 @@ async fn run_worker(
     relay_authentication.zeroize();
     if let Err(error) = join {
         let _ = ready.send(Err(error.clone()));
-        let _ = events.send(HostEvent::ReleaseAll).await;
-        let _ = events.send(HostEvent::Error(error)).await;
+        emit_terminal(&events, Some(error));
         phase.store(WorkerPhase::Closed as u8, Ordering::Release);
-        let _ = events.send(HostEvent::State(HostState::Closed)).await;
         return;
     }
     let _ = ready.send(Ok(()));
@@ -215,12 +255,8 @@ async fn run_worker(
     )
     .await;
 
-    let _ = events.send(HostEvent::ReleaseAll).await;
-    if let Err(error) = result {
-        let _ = events.send(HostEvent::Error(error)).await;
-    }
     phase.store(WorkerPhase::Closed as u8, Ordering::Release);
-    let _ = events.send(HostEvent::State(HostState::Closed)).await;
+    emit_terminal(&events, result.err());
 }
 
 async fn run_session(
@@ -236,14 +272,14 @@ async fn run_session(
     };
     let peer = secure.peer_identity();
     phase.store(WorkerPhase::WaitingForApproval as u8, Ordering::Release);
-    events
-        .send(HostEvent::ApprovalRequested {
+    emit_nonterminal(
+        events,
+        HostEvent::ApprovalRequested {
             device_id: peer.device_id(),
             verify_key: *peer.verify_key().as_bytes(),
             fingerprint: fingerprint(peer.verify_key()),
-        })
-        .await
-        .map_err(|_| HostError::WorkerStopped)?;
+        },
+    );
 
     if !wait_for_approval(
         peer.device_id(),
@@ -261,9 +297,17 @@ async fn run_session(
         Ordering::Release,
     );
     negotiate_controller(client, &mut secure, cancellation).await?;
+    if *cancellation.borrow() {
+        return Ok(());
+    }
     phase.store(WorkerPhase::Connected as u8, Ordering::Release);
     run_connected(client, &mut secure, commands, cancellation, events).await
 }
+
+/*
+ * The worker functions below are deliberately kept after the event helpers so every event
+ * emission can use the same bounded, nonblocking policy.
+ */
 
 async fn perform_noise_handshake(
     client: &QuicClient,
@@ -340,7 +384,7 @@ async fn wait_for_approval(
                 }
                 Some(HostCommand::Reject | HostCommand::Stop) | None => return Ok(false),
                 Some(HostCommand::ReleaseAll) => {
-                    events.send(HostEvent::ReleaseAll).await.map_err(|_| HostError::WorkerStopped)?;
+                    emit_nonterminal(events, HostEvent::ReleaseAll);
                 }
                 Some(_) => return Err(HostError::InvalidState),
             },
@@ -423,6 +467,9 @@ async fn run_connected(
     let mut video = VideoState::default();
     let mut metrics = HostMetrics::default();
     loop {
+        if *cancellation.borrow() {
+            return Ok(());
+        }
         tokio::select! {
             biased;
             changed = cancellation.changed() => {
@@ -443,17 +490,21 @@ async fn run_connected(
                         let plaintext = secure.open(SecureLane::Control, &ciphertext).map_err(crypto_error)?;
                         if matches!(decode_control(&plaintext).map_err(protocol_error)?, ControlMessage::RequestKeyframe { .. }) {
                             metrics.keyframe_requests = metrics.keyframe_requests.saturating_add(1);
-                            events.send(HostEvent::KeyframeRequested).await.map_err(|_| HostError::WorkerStopped)?;
+                            emit_nonterminal(events, HostEvent::KeyframeRequested);
                         }
                     }
                     TransportEvent::Input(ciphertext) => {
                         let plaintext = secure.open(SecureLane::Input, &ciphertext).map_err(crypto_error)?;
                         let input = decode_input(&plaintext, now_micros()).map_err(protocol_error)?;
                         metrics.received_input_events = metrics.received_input_events.saturating_add(1);
-                        events.send(HostEvent::Input(input.event)).await.map_err(|_| HostError::WorkerStopped)?;
+                        emit_nonterminal(events, HostEvent::Input(input.event));
                     }
                     TransportEvent::Closed { reason } => return Err(HostError::Transport(format!("transport closed: {reason}"))),
-                    TransportEvent::VideoConfig(_) | TransportEvent::VideoDatagram(_) | TransportEvent::CursorDatagram(_) => {}
+                    TransportEvent::VideoConfig(_) | TransportEvent::VideoDatagram(_) | TransportEvent::CursorDatagram(_) => {
+                        return Err(HostError::Protocol(
+                            "controller sent data on a host-only transport lane".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -563,17 +614,11 @@ async fn handle_command(
         }
         HostCommand::RequestKeyframe => {
             metrics.keyframe_requests = metrics.keyframe_requests.saturating_add(1);
-            events
-                .send(HostEvent::KeyframeRequested)
-                .await
-                .map_err(|_| HostError::WorkerStopped)?;
+            emit_nonterminal(events, HostEvent::KeyframeRequested);
             Ok(true)
         }
         HostCommand::ReleaseAll => {
-            events
-                .send(HostEvent::ReleaseAll)
-                .await
-                .map_err(|_| HostError::WorkerStopped)?;
+            emit_nonterminal(events, HostEvent::ReleaseAll);
             Ok(true)
         }
     }

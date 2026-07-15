@@ -1,10 +1,17 @@
 use std::{sync::Arc, time::Duration};
 
-use desklink_crypto::{DeviceIdentity, SessionId};
-use desklink_ffi::{
-    ControllerEvent, ControllerRuntime, HostCommand, HostEvent, HostIdentity, HostRuntime,
+use desklink_crypto::{
+    DeviceIdentity, NoiseInitiator, SecureLane, SecureRole, SecureSession, SessionId,
 };
-use desklink_protocol::InputEvent;
+use desklink_ffi::{
+    ControllerEvent, ControllerRuntime, HostCommand, HostError, HostEvent, HostIdentity,
+    HostRuntime, HostState,
+};
+use desklink_protocol::{
+    Codec, ControlMessage, DeviceCapabilities, DeviceRole, InputEnvelope, InputEvent,
+    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, encode_control, encode_input,
+    encode_noise_handshake,
+};
 use desklink_relay::{RelayConfig, RelayServer};
 use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
 use quinn::ServerConfig;
@@ -54,36 +61,8 @@ impl HostTestFixture {
     }
 
     async fn start_host(&self) -> HostRuntime {
-        let config = || {
-            QuicClientConfig::with_client_config(
-                self.relay_addr,
-                "localhost",
-                self.relay.client_config.clone(),
-            )
-        };
-        let host_client = QuicClient::connect(config()).await.unwrap();
-        let controller_client = QuicClient::connect(config()).await.unwrap();
-        let host_identity = self.host_identity.with_secret_key_bytes(|secret_key| {
-            HostIdentity::from_secret_key(self.host_identity.device_id, secret_key)
-        });
-        let host = HostRuntime::start(
-            host_client,
-            host_identity,
-            self.session_id,
-            self.relay_authentication,
-        )
-        .unwrap();
-
-        let join = RelayJoin::controller(self.session_id, self.relay_authentication);
-        let mut joined = false;
-        for _ in 0..20 {
-            if controller_client.join(join.clone()).await.is_ok() {
-                joined = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(joined, "controller could not join the host session");
+        let host = self.start_host_only().await;
+        let controller_client = self.join_controller().await;
 
         let controller_identity = self
             .controller_identity
@@ -101,6 +80,51 @@ impl HostTestFixture {
         });
         *self.controller_ready.lock().await = Some(receiver);
         host
+    }
+
+    async fn start_host_only(&self) -> HostRuntime {
+        let config = || {
+            QuicClientConfig::with_client_config(
+                self.relay_addr,
+                "localhost",
+                self.relay.client_config.clone(),
+            )
+        };
+        let host_client = QuicClient::connect(config()).await.unwrap();
+        let host_identity = self.host_identity.with_secret_key_bytes(|secret_key| {
+            HostIdentity::from_secret_key(self.host_identity.device_id, secret_key)
+        });
+        let host = HostRuntime::start(
+            host_client,
+            host_identity,
+            self.session_id,
+            self.relay_authentication,
+        )
+        .unwrap();
+
+        host
+    }
+
+    async fn join_controller(&self) -> QuicClient {
+        let config = || {
+            QuicClientConfig::with_client_config(
+                self.relay_addr,
+                "localhost",
+                self.relay.client_config.clone(),
+            )
+        };
+        let join = RelayJoin::controller(self.session_id, self.relay_authentication);
+        let controller_client = QuicClient::connect(config()).await.unwrap();
+        let mut joined = false;
+        for _ in 0..20 {
+            if controller_client.join(join.clone()).await.is_ok() {
+                joined = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(joined, "controller could not join the host session");
+        controller_client
     }
 
     async fn approve(&self, host: &HostRuntime) {
@@ -215,6 +239,174 @@ impl HostTestFixture {
     }
 }
 
+struct RawController {
+    client: QuicClient,
+    secure: SecureSession,
+    input_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ForbiddenControllerLane {
+    VideoConfig,
+    VideoDatagram,
+    CursorDatagram,
+}
+
+impl RawController {
+    async fn pair(fixture: &HostTestFixture) -> Self {
+        let client = fixture.join_controller().await;
+        let identity = fixture
+            .controller_identity
+            .with_secret_key_bytes(|secret_key| {
+                DeviceIdentity::from_secret_key(fixture.controller_identity.device_id, secret_key)
+            });
+        let (mut initiator, hello) =
+            NoiseInitiator::start(identity, fixture.host_identity.verify_key()).unwrap();
+        client
+            .send_control(
+                encode_noise_handshake(&NoiseHandshake {
+                    protocol_version: PROTOCOL_VERSION,
+                    step: NoiseHandshakeStep::InitiatorHello,
+                    payload: hello,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response =
+            desklink_protocol::decode_noise_handshake(&client.next_control().await.unwrap())
+                .unwrap();
+        assert_eq!(response.step, NoiseHandshakeStep::ResponderHello);
+        let finish = initiator.receive(&response.payload).unwrap();
+        client
+            .send_control(
+                encode_noise_handshake(&NoiseHandshake {
+                    protocol_version: PROTOCOL_VERSION,
+                    step: NoiseHandshakeStep::InitiatorFinish,
+                    payload: finish,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        Self {
+            client,
+            secure: initiator
+                .finish()
+                .unwrap()
+                .into_secure_session(SecureRole::Initiator),
+            input_sequence: 0,
+        }
+    }
+
+    async fn negotiate(&mut self) {
+        self.send_control(ControlMessage::Hello {
+            platform: Platform::MacOS,
+            role: DeviceRole::Controller,
+        })
+        .await;
+        self.send_control(ControlMessage::Capabilities(DeviceCapabilities {
+            platform: Platform::MacOS,
+            role: DeviceRole::Controller,
+            codecs: vec![Codec::H264],
+            width: 1920,
+            height: 1080,
+        }))
+        .await;
+    }
+
+    async fn send_input(&mut self) {
+        self.input_sequence += 1;
+        let plaintext = encode_input(&InputEnvelope {
+            sequence: self.input_sequence,
+            timestamp_us: now_micros(),
+            event: InputEvent::MouseWheel {
+                delta_x: 1,
+                delta_y: -1,
+            },
+        })
+        .unwrap();
+        self.client
+            .send_input(self.secure.seal(SecureLane::Input, &plaintext).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn send_forbidden_lane(&mut self, lane: ForbiddenControllerLane) {
+        let plaintext = b"controller media is forbidden";
+        match lane {
+            ForbiddenControllerLane::VideoConfig => {
+                self.client
+                    .send_video_config(
+                        self.secure
+                            .seal(SecureLane::VideoConfig, plaintext)
+                            .unwrap(),
+                    )
+                    .await
+            }
+            ForbiddenControllerLane::VideoDatagram => {
+                self.client
+                    .send_video_datagram(
+                        self.secure
+                            .seal(SecureLane::VideoDatagram, plaintext)
+                            .unwrap(),
+                    )
+                    .await
+            }
+            ForbiddenControllerLane::CursorDatagram => {
+                self.client
+                    .send_cursor_datagram(
+                        self.secure
+                            .seal(SecureLane::CursorDatagram, plaintext)
+                            .unwrap(),
+                    )
+                    .await
+            }
+        }
+        .unwrap();
+    }
+
+    async fn send_control(&mut self, message: ControlMessage) {
+        let plaintext = encode_control(&message).unwrap();
+        self.client
+            .send_control(self.secure.seal(SecureLane::Control, &plaintext).unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
+
+async fn wait_for_state(host: &HostRuntime, expected: HostState) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while host.state() != expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn terminal_events(host: &HostRuntime) -> Vec<HostEvent> {
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), host.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        let closed = matches!(event, HostEvent::State(HostState::Closed));
+        events.push(event);
+        if closed {
+            return events;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_does_not_publish_video_before_approval() {
     let fixture = HostTestFixture::new().await;
@@ -287,6 +479,133 @@ async fn host_decodes_input_and_keyframe_requests_after_approval() {
     fixture.reject(&host).await;
     assert!(fixture.received_release_all(&host).await);
     host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_cancels_a_pending_noise_handshake() {
+    let fixture = HostTestFixture::new().await;
+    let host = fixture.start_host_only().await;
+    let _controller = fixture.join_controller().await;
+
+    host.send(HostCommand::Stop).unwrap();
+    let events = terminal_events(&host).await;
+    assert!(matches!(
+        events.as_slice(),
+        [HostEvent::ReleaseAll, HostEvent::State(HostState::Closed)]
+    ));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reject_cancels_pending_capability_negotiation() {
+    let fixture = HostTestFixture::new().await;
+    let host = fixture.start_host_only().await;
+    let _controller = RawController::pair(&fixture).await;
+    assert!(matches!(
+        fixture.next_event(&host).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    fixture.approve(&host).await;
+    wait_for_state(&host, HostState::NegotiatingCapabilities).await;
+
+    host.send(HostCommand::Reject).unwrap();
+    let events = terminal_events(&host).await;
+    assert!(matches!(
+        events.as_slice(),
+        [HostEvent::ReleaseAll, HostEvent::State(HostState::Closed)]
+    ));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_command_queue_does_not_publish_a_false_terminal_phase() {
+    let fixture = HostTestFixture::new().await;
+    let host = fixture.start_host_only().await;
+    let _controller = RawController::pair(&fixture).await;
+    assert!(matches!(
+        fixture.next_event(&host).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    fixture.approve(&host).await;
+    wait_for_state(&host, HostState::NegotiatingCapabilities).await;
+
+    let mut accepted = 0;
+    loop {
+        match host.send(HostCommand::ReleaseAll) {
+            Ok(()) => accepted += 1,
+            Err(HostError::CommandQueueFull) => break,
+            result => panic!("unexpected command result: {result:?}"),
+        }
+    }
+    assert!(accepted > 0);
+    assert!(matches!(
+        host.send(HostCommand::Reject),
+        Err(HostError::CommandQueueFull)
+    ));
+    assert_eq!(host.state(), HostState::NegotiatingCapabilities);
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destroy_completes_when_input_and_keyframe_events_saturate_the_queue() {
+    let fixture = HostTestFixture::new().await;
+    let host = fixture.start_host_only().await;
+    let mut controller = RawController::pair(&fixture).await;
+    assert!(matches!(
+        fixture.next_event(&host).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    fixture.approve(&host).await;
+    controller.negotiate().await;
+    wait_for_state(&host, HostState::Connected).await;
+
+    for _ in 0..600 {
+        host.send(HostCommand::RequestKeyframe).unwrap();
+    }
+    for _ in 0..600 {
+        controller.send_input().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || host.destroy()),
+    )
+    .await
+    .expect("destroy must not wait for event-channel capacity")
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_rejects_controller_originated_video_lanes() {
+    for lane in [
+        ForbiddenControllerLane::VideoConfig,
+        ForbiddenControllerLane::VideoDatagram,
+        ForbiddenControllerLane::CursorDatagram,
+    ] {
+        let fixture = HostTestFixture::new().await;
+        let host = fixture.start_host_only().await;
+        let mut controller = RawController::pair(&fixture).await;
+        assert!(matches!(
+            fixture.next_event(&host).await,
+            HostEvent::ApprovalRequested { .. }
+        ));
+        fixture.approve(&host).await;
+        controller.negotiate().await;
+        wait_for_state(&host, HostState::Connected).await;
+
+        controller.send_forbidden_lane(lane).await;
+        let events = terminal_events(&host).await;
+        assert!(
+            matches!(events.as_slice(), [
+            HostEvent::ReleaseAll,
+            HostEvent::Error(HostError::Protocol(message)),
+            HostEvent::State(HostState::Closed),
+        ] if message.contains("host-only transport lane")),
+            "lane: {lane:?}"
+        );
+        host.destroy();
+    }
 }
 
 async fn spawn_test_relay() -> TestRelay {
