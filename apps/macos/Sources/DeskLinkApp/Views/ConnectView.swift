@@ -1,18 +1,26 @@
+import AppKit
 import SwiftUI
 
 struct ConnectView: View {
-    @ObservedObject var bridge: RustBridge
-    @State private var code = ""
+    @ObservedObject var bridge: ControllerBridge
 
     var body: some View {
-        Form {
-            TextField("8-character code", text: $code)
-                .textCase(.uppercase)
-            Button("Connect") {
-                bridge.connect(code: code.trimmingCharacters(in: .whitespacesAndNewlines))
-            }
-            .disabled(code.count != 8)
+        HStack {
+            Button("Paste invitation") { connectFromPasteboard() }
+                .buttonStyle(.borderedProminent)
+            Text("The invitation is read from the clipboard and is never shown here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .padding()
+    }
+
+    private func connectFromPasteboard() {
+        guard let encoded = NSPasteboard.general.string(forType: .string),
+              let invite = Data(base64Encoded: encoded.trimmingCharacters(in: .whitespacesAndNewlines))
+        else {
+            bridge.connect(invite: Data())
+            return
+        }
+        bridge.connect(invite: invite)
     }
 }

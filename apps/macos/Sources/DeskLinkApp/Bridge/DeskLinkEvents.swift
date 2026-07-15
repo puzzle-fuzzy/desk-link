@@ -5,8 +5,47 @@ enum ConnectionState: Equatable {
     case pairing
     case connecting
     case connected(streamID: UInt64)
+    case reconnecting
+    case recovering
+    case frozen
     case closed
     case failed(String)
+}
+
+enum AppRole: Hashable {
+    case controller
+    case host
+}
+
+enum HostState: Equatable {
+    case idle
+    case connecting
+    case waitingForApproval
+    case negotiating
+    case connected
+    case stopping
+    case closed
+    case failed(String)
+}
+
+struct HostPairingInvite: Equatable {
+    let expiresAt: Date
+    let encoded: Data
+}
+
+struct HostApproval: Equatable, Identifiable {
+    let id: UUID
+    let fingerprint: String
+    let controllerDeviceID: [UInt8]
+    let controllerVerifyKey: [UInt8]
+    var isApproved = false
+}
+
+struct HostMetrics: Equatable {
+    var sentVideoConfigurations = 0
+    var sentVideoPackets = 0
+    var receivedInputEvents = 0
+    var keyframeRequests = 0
 }
 
 struct PairingInfo: Equatable {
