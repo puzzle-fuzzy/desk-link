@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   cancelPairingSession,
+  exportDiagnosticReport,
   getHostSnapshot,
   revokeTrustedController,
   saveConnectionSettings,
@@ -12,6 +13,7 @@ import {
 import type {
   ConnectionSettingsInput,
   ConnectionSummary,
+  DiagnosticExportResult,
   HostSnapshot,
   PairingSessionSummary,
   TrustedControllerSummary,
@@ -35,14 +37,18 @@ const app: HTMLElement = applicationRoot;
 
 let snapshot: HostSnapshot | null = null;
 let activeView: View = "overview";
+let renderedView: View | null = null;
 let loading = true;
 let saving = false;
 let pairingBusy = false;
 let pairingSession: PairingSessionSummary | null = null;
 let pairingRelayAddress: string | null = null;
+let diagnosticExportBusy = false;
+let lastDiagnosticExport: DiagnosticExportResult | null = null;
 let revokingFingerprint: string | null = null;
 let feedback: Feedback = null;
 let connectionDraft: ConnectionSettingsInput | null = null;
+let connectionAdvancedOpen = false;
 
 function escapeHtml(value: string): string {
   return value
@@ -54,6 +60,8 @@ function escapeHtml(value: string): string {
 }
 
 function render(): void {
+  const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
+  const preservedScrollTop = renderedView === activeView ? (previousWorkspace?.scrollTop ?? 0) : 0;
   prepareControllerRender();
   app.innerHTML = `
     <div class="app-shell">
@@ -65,6 +73,11 @@ function render(): void {
       </section>
     </div>
   `;
+  const currentWorkspace = document.querySelector<HTMLElement>(".workspace");
+  if (currentWorkspace && preservedScrollTop > 0) {
+    currentWorkspace.scrollTop = preservedScrollTop;
+  }
+  renderedView = activeView;
   bindInteractions();
 }
 
@@ -93,10 +106,10 @@ function renderHeader(): string {
 function renderNavigation(): string {
   const activeNavigationView = activeView === "pairing" ? "devices" : activeView;
   const items: Array<{ id: View; label: string }> = [
-    { id: "overview", label: "概览" },
-    { id: "controller", label: "控制电脑" },
-    { id: "connection", label: "连接设置" },
-    { id: "devices", label: "可信设备" },
+    { id: "overview", label: "本机状态" },
+    { id: "controller", label: "控制另一台" },
+    { id: "connection", label: "本机连接" },
+    { id: "devices", label: "已批准设备" },
   ];
   return `
     <nav class="section-nav" aria-label="DeskLink 功能导航">
@@ -118,7 +131,7 @@ function renderNavigation(): string {
 
 function renderFeedback(item: NonNullable<Feedback>): string {
   return `
-    <div class="feedback feedback--${item.tone}" role="status">
+    <div class="feedback feedback--${item.tone}" role="${item.tone === "error" ? "alert" : "status"}" aria-live="${item.tone === "error" ? "assertive" : "polite"}">
       <span class="feedback-symbol" aria-hidden="true"></span>
       <span>${escapeHtml(item.message)}</span>
       <button type="button" class="feedback-close" data-dismiss-feedback aria-label="关闭消息">×</button>
@@ -171,21 +184,27 @@ function renderFatalState(): string {
 
 function renderOverview(state: HostSnapshot): string {
   const connection = state.connection;
+  const connectionMode =
+    state.relayStatus.mode === "lan"
+      ? { value: "同一局域网", detail: "另一台电脑与本机连接同一网络" }
+      : state.relayStatus.mode === "external"
+        ? { value: "外部中继", detail: connection?.serverName ?? "使用自建中继服务器" }
+        : { value: "未配置", detail: "请先保存本机连接" };
   const metrics = [
     {
-      label: "中继服务器",
-      value: connection?.relayAddress ?? "未配置",
-      detail: connection?.serverName ?? "请添加连接设置",
+      label: "连接方式",
+      value: connectionMode.value,
+      detail: connectionMode.detail,
     },
     {
-      label: "会话",
-      value: connection ? compactIdentifier(connection.sessionId) : "不可用",
-      detail: connection ? "已为当前账户加密保护" : "没有已保存的会话",
+      label: "Windows 保护",
+      value: connection ? "已启用" : "未配置",
+      detail: connection ? "连接信息仅当前账户可用" : "保存后自动加密保护",
     },
     {
-      label: "可信设备",
+      label: "已批准设备",
       value: String(state.trustedControllers.length),
-      detail: "已批准的控制端",
+      detail: "可以重新连接本机的电脑",
     },
   ];
   return `
@@ -194,21 +213,23 @@ function renderOverview(state: HostSnapshot): string {
         <div class="status-copy">
           <div class="status-label">
             <span class="status-light" aria-hidden="true"></span>
-            主机状态
+            这台电脑
           </div>
           <h1 id="status-heading">${escapeHtml(state.title)}</h1>
           <p>${escapeHtml(state.detail)}</p>
         </div>
         <div class="status-actions">
-          <button class="button button--primary" type="button" data-open-connection>
-            ${connection ? "编辑连接" : "设置连接"}
+          ${connection ? renderPairingAction(state, state.trustedControllers.length > 0 ? "primary" : "secondary") : ""}
+          <button class="button button--${connection ? "secondary" : "primary"}" type="button" data-open-connection>
+            ${connection ? "连接设置" : "设置本机连接"}
           </button>
-          ${renderPairingAction(state, "secondary")}
           <button class="button button--secondary" type="button" data-refresh>刷新状态</button>
         </div>
       </section>
 
       ${renderStateWarnings(state)}
+
+      ${renderNextStep(state)}
 
       <section class="facts" aria-label="主机连接详情">
         ${metrics
@@ -226,15 +247,17 @@ function renderOverview(state: HostSnapshot): string {
 
       ${renderRelayDiagnostics(state)}
 
+      ${renderDiagnosticSummary(state)}
+
       <section class="recent-access" aria-labelledby="recent-access-heading">
         <div class="section-heading">
           <div>
-            <h2 id="recent-access-heading">可信访问</h2>
+            <h2 id="recent-access-heading">已批准的访问</h2>
             <p>只有在这台 Windows 设备上批准过的控制端才能重新连接。</p>
           </div>
           <div class="section-actions">
             ${renderPairingAction(state, "text")}
-            <button class="text-button" type="button" data-open-devices>查看设备</button>
+            <button class="text-button" type="button" data-open-devices>管理已批准设备</button>
           </div>
         </div>
         ${renderCompactDeviceList(state.trustedControllers)}
@@ -244,6 +267,57 @@ function renderOverview(state: HostSnapshot): string {
         本地状态刷新于 ${formatTime(state.refreshedAtUnixS)}。中继密钥不会在此窗口中显示。
       </footer>
     </div>
+  `;
+}
+
+function renderNextStep(state: HostSnapshot): string {
+  if (state.trustedControllers.length > 0) {
+    return "";
+  }
+  const relayUnavailable =
+    state.relayStatus.mode === "lan" &&
+    (state.relayStatus.state === "failed" || state.relayStatus.state === "offline");
+  const approvalStoreUnavailable = Boolean(state.trustedError);
+  const stage = !state.connection ? 1 : state.pairingActive ? 3 : 2;
+  const title = !state.connection
+    ? "先保存这台电脑的连接"
+    : approvalStoreUnavailable
+      ? "先恢复已批准设备列表"
+    : relayUnavailable
+      ? "先让这台电脑可以被找到"
+      : state.pairingActive
+        ? "在另一台电脑粘贴连接码"
+        : "创建第一份连接码";
+  const detail = !state.connection
+    ? "同一局域网通常可以直接使用默认设置，保存后再创建连接码。"
+    : approvalStoreUnavailable
+      ? "DeskLink 暂时无法安全读取已批准设备，请重新读取本机状态后再创建连接码。"
+    : relayUnavailable
+      ? "请确认本机已连接 Wi-Fi 或网线，然后刷新状态。"
+      : state.pairingActive
+        ? "打开另一台电脑的“控制另一台”页面，粘贴完整连接码并请求批准。"
+        : "连接码会包含本机局域网地址，另一台电脑完整粘贴后会自动填写。";
+  const action = !state.connection || relayUnavailable
+    ? '<button class="button button--primary" type="button" data-open-connection>检查本机连接</button>'
+    : approvalStoreUnavailable
+      ? '<button class="button button--primary" type="button" data-refresh>重新读取本机状态</button>'
+    : state.pairingActive
+      ? '<button class="button button--primary" type="button" data-open-pairing>查看连接码</button>'
+      : '<button class="button button--primary" type="button" data-start-pairing>创建连接码</button>';
+  return `
+    <section class="next-step" aria-labelledby="next-step-heading">
+      <div class="next-step-copy">
+        <span>建议下一步</span>
+        <h2 id="next-step-heading">${title}</h2>
+        <p>${detail}</p>
+      </div>
+      <ol class="setup-progress" aria-label="首次连接进度">
+        <li class="${stage > 1 ? "is-complete" : "is-current"}"><span>1</span><strong>保存本机连接</strong></li>
+        <li class="${stage > 2 ? "is-complete" : stage === 2 ? "is-current" : ""}"><span>2</span><strong>创建连接码</strong></li>
+        <li class="${stage === 3 ? "is-current" : ""}"><span>3</span><strong>在本机批准</strong></li>
+      </ol>
+      <div class="next-step-action">${action}</div>
+    </section>
   `;
 }
 
@@ -299,6 +373,73 @@ function renderRelayDiagnostics(state: HostSnapshot): string {
       }
     </section>
   `;
+}
+
+function renderDiagnosticSummary(state: HostSnapshot): string {
+  const failed = state.diagnosticChecks.filter((check) => check.status === "failed").length;
+  const warning = state.diagnosticChecks.filter((check) => check.status === "warning").length;
+  const summary = failed > 0 ? `${failed} 项需要处理` : warning > 0 ? `${warning} 项需要注意` : "全部检查通过";
+  const checks = state.diagnosticChecks
+    .map(
+      (check) => `
+        <li class="diagnostic-check diagnostic-check--${check.status}">
+          <span class="diagnostic-check-mark" aria-hidden="true"></span>
+          <code>${escapeHtml(check.code)}</code>
+          <div>
+            <strong>${escapeHtml(check.title)}</strong>
+            <p>${escapeHtml(check.detail)}</p>
+          </div>
+          <small>${diagnosticStatusLabel(check.status)}</small>
+        </li>
+      `,
+    )
+    .join("");
+  return `
+    <section class="diagnostic-summary" aria-labelledby="diagnostic-summary-heading">
+      <div class="section-heading">
+        <div>
+          <h2 id="diagnostic-summary-heading">双机连接诊断</h2>
+          <p>连接遇到问题时，可展开检查结果或导出报告。</p>
+        </div>
+        <div class="diagnostic-actions">
+          <span class="diagnostic-overall">${summary}</span>
+          <button class="button button--secondary button--compact" type="button" data-export-diagnostics ${diagnosticExportBusy ? "disabled" : ""}>
+            ${diagnosticExportBusy ? "正在导出…" : "导出诊断报告"}
+          </button>
+        </div>
+      </div>
+      <details class="diagnostic-details" ${failed > 0 ? "open" : ""}>
+        <summary>${failed > 0 ? "查看需要处理的检查" : "查看 5 项检查结果"}</summary>
+        <ul class="diagnostic-check-list" aria-label="双机连接检查结果">${checks}</ul>
+      </details>
+      ${
+        lastDiagnosticExport
+          ? `
+            <div class="diagnostic-export-result" role="status">
+              <div>
+                <strong>最近导出：${escapeHtml(lastDiagnosticExport.reportId)}</strong>
+                <span>${escapeHtml(lastDiagnosticExport.fileName)}</span>
+              </div>
+              <code title="${escapeHtml(lastDiagnosticExport.filePath)}">${escapeHtml(lastDiagnosticExport.filePath)}</code>
+            </div>
+          `
+          : '<p class="diagnostic-privacy">报告会自动清除会话 ID、中继密钥、公钥和完整设备身份，保留排查所需的状态、网卡和最近事件。</p>'
+      }
+    </section>
+  `;
+}
+
+function diagnosticStatusLabel(status: string): string {
+  switch (status) {
+    case "passed":
+      return "通过";
+    case "failed":
+      return "失败";
+    case "notApplicable":
+      return "不适用";
+    default:
+      return "注意";
+  }
 }
 
 function renderStateWarnings(state: HostSnapshot): string {
@@ -358,21 +499,31 @@ function renderCompactDeviceList(devices: TrustedControllerSummary[]): string {
 }
 
 function renderConnection(state: HostSnapshot): string {
-  const fields = connectionDraft ?? connectionToInput(state.connection);
+  if (!connectionDraft) {
+    connectionDraft = connectionToInput(state.connection);
+  }
+  const fields = connectionDraft;
   return `
     <div class="page-layout page-layout--form">
       <header class="page-heading">
         <div>
-          <h1>连接设置</h1>
-          <p>这些信息用于将本机连接到另一台 DeskLink 设备使用的中继服务器。</p>
+          <h1>本机连接</h1>
+          <p>保存后，这台电脑才能创建连接码并等待另一台电脑连接。</p>
         </div>
         <div class="page-actions">
           <span class="storage-note">由 Windows DPAPI 加密保护</span>
-          <button class="button button--secondary button--compact" type="button" data-generate-connection ${saving ? "disabled" : ""}>生成安全凭据</button>
         </div>
       </header>
 
       ${state.connectionError ? renderStateWarnings(state) : ""}
+
+      <div class="connection-guidance">
+        <span class="connection-guidance-mark" aria-hidden="true"></span>
+        <div>
+          <strong>同一局域网可以直接使用默认设置</strong>
+          <p>只有两台电脑不在同一网络、并且你已经部署公网中继时，才需要修改下面两项。</p>
+        </div>
+      </div>
 
       <form class="connection-form" data-connection-form novalidate>
         <div class="field">
@@ -387,7 +538,7 @@ function renderConnection(state: HostSnapshot): string {
             spellcheck="false"
             required
           />
-          <small>DeskLink 中继服务器的 IP 地址和端口。</small>
+          <small>同一局域网保留 127.0.0.1:4433。</small>
         </div>
 
         <div class="field">
@@ -402,68 +553,80 @@ function renderConnection(state: HostSnapshot): string {
             spellcheck="false"
             required
           />
-          <small>必须与中继服务器 TLS 证书中的名称一致。</small>
+          <small>同一局域网保留 localhost；公网中继必须与证书名称一致。</small>
         </div>
 
-        <div class="field field--wide">
-          <label for="session-id">会话 ID</label>
-          <input
-            id="session-id"
-            name="sessionId"
-            type="text"
-            value="${escapeHtml(fields.sessionId)}"
-            placeholder="32 位十六进制字符"
-            minlength="32"
-            maxlength="32"
-            pattern="[0-9a-fA-F]{32}"
-            autocomplete="off"
-            spellcheck="false"
-            required
-          />
-          <small>用于识别此私有中继会话，它不是中继密钥。</small>
-        </div>
+        <details class="advanced-settings field--wide" data-connection-advanced ${connectionAdvancedOpen ? "open" : ""}>
+          <summary>
+            <span>高级连接设置</span>
+            <small>会话标识、密钥和视频流编号</small>
+          </summary>
+          <div class="advanced-settings-grid">
+            <div class="field field--wide">
+              <label for="session-id">会话 ID</label>
+              <input
+                id="session-id"
+                name="sessionId"
+                type="text"
+                value="${escapeHtml(fields.sessionId)}"
+                placeholder="32 位十六进制字符"
+                minlength="32"
+                maxlength="32"
+                pattern="[0-9a-fA-F]{32}"
+                autocomplete="off"
+                spellcheck="false"
+                required
+              />
+              <small>用于识别这台电脑的私有中继会话。</small>
+            </div>
 
-        <div class="field field--wide">
-          <label for="relay-key">中继密钥</label>
-          <div class="secret-input">
-            <input
-              id="relay-key"
-              name="relayKey"
-              type="password"
-              value="${escapeHtml(fields.relayKey)}"
-              placeholder="${state.connection?.hasSavedKey ? "留空可保留已保存的密钥" : "64 位十六进制字符"}"
-              minlength="${state.connection?.hasSavedKey ? "0" : "64"}"
-              maxlength="64"
-              pattern="[0-9a-fA-F]{64}"
-              autocomplete="new-password"
-              spellcheck="false"
-              ${state.connection?.hasSavedKey ? "" : "required"}
-            />
-            <button type="button" class="secret-toggle" data-toggle-secret aria-label="显示中继密钥">显示</button>
+            <div class="field field--wide">
+              <label for="relay-key">中继密钥</label>
+              <div class="secret-input">
+                <input
+                  id="relay-key"
+                  name="relayKey"
+                  type="password"
+                  value="${escapeHtml(fields.relayKey)}"
+                  placeholder="${state.connection?.hasSavedKey ? "留空可保留已保存的密钥" : "64 位十六进制字符"}"
+                  minlength="${state.connection?.hasSavedKey ? "0" : "64"}"
+                  maxlength="64"
+                  pattern="[0-9a-fA-F]{64}"
+                  autocomplete="new-password"
+                  spellcheck="false"
+                  ${state.connection?.hasSavedKey ? "" : "required"}
+                />
+                <button type="button" class="secret-toggle" data-toggle-secret aria-label="显示中继密钥">显示</button>
+              </div>
+              <small>${state.connection?.hasSavedKey ? "密钥已保存，留空即可继续使用。" : "已自动生成，只会加密保存在当前 Windows 账户。"}</small>
+            </div>
+
+            <div class="field field--compact">
+              <label for="stream-id">视频流 ID</label>
+              <input
+                id="stream-id"
+                name="streamId"
+                type="number"
+                value="${escapeHtml(fields.streamId)}"
+                min="1"
+                step="1"
+                required
+              />
+              <small>通常保持为 1，安全重连时会自动递增。</small>
+            </div>
+            <div class="advanced-settings-action">
+              <button class="button button--secondary button--compact" type="button" data-generate-connection ${saving ? "disabled" : ""}>重新生成连接凭据</button>
+              <small>重新生成后，已经配对的电脑需要再次配对。</small>
+            </div>
           </div>
-          <small>已保存的密钥不会重新返回此界面。</small>
-        </div>
+        </details>
 
-        <div class="field field--compact">
-          <label for="stream-id">视频流 ID</label>
-          <input
-            id="stream-id"
-            name="streamId"
-            type="number"
-            value="${escapeHtml(fields.streamId)}"
-            min="1"
-            step="1"
-            required
-          />
-          <small>初始值为 1，每次安全重连后递增。</small>
-        </div>
-
-        <div class="form-actions">
-          <button class="button button--primary" type="submit" ${saving ? "disabled" : ""}>
-            ${saving ? "正在保存连接…" : "保存连接"}
+        <div class="form-actions field--wide">
+          <button class="button button--primary" type="submit" ${saving ? "disabled" : ""} ${saving ? 'aria-busy="true"' : ""}>
+            ${saving ? "正在保存本机连接…" : "保存本机连接"}
           </button>
           <button class="button button--secondary" type="button" data-cancel-connection ${saving ? "disabled" : ""}>
-            取消修改
+            返回本机状态
           </button>
         </div>
       </form>
@@ -476,8 +639,8 @@ function renderDevices(state: HostSnapshot): string {
     <div class="page-layout">
       <header class="page-heading">
         <div>
-          <h1>可信设备</h1>
-          <p>这里的控制端均已完成加密身份验证和本地批准。</p>
+          <h1>已批准设备</h1>
+          <p>这些电脑已经在本机完成身份核对，可以再次连接。</p>
         </div>
         <div class="page-actions">
           ${renderPairingAction(state, "primary")}
@@ -487,7 +650,7 @@ function renderDevices(state: HostSnapshot): string {
 
       ${state.trustedError ? renderStateWarnings(state) : ""}
 
-      <section class="device-register" aria-label="可信控制端身份列表">
+      <section class="device-register" aria-label="已批准设备身份列表">
         ${
           state.trustedControllers.length === 0
             ? renderDeviceEmptyState()
@@ -510,8 +673,8 @@ function renderDeviceEmptyState(): string {
   return `
     <div class="empty-state empty-state--devices">
       <span class="empty-device" aria-hidden="true"></span>
-      <h2>还没有可信控制端</h2>
-      <p>创建一个短期邀请，然后在本机核对并批准控制端身份。</p>
+      <h2>还没有已批准的电脑</h2>
+      <p>创建一份短期连接码，在另一台电脑粘贴后回到本机确认身份。</p>
       ${snapshot ? renderPairingAction(snapshot, "primary") : ""}
     </div>
   `;
@@ -524,11 +687,11 @@ function renderDevice(device: TrustedControllerSummary): string {
       <div class="device-record-heading">
         <span class="device-avatar" aria-hidden="true"></span>
         <div>
-          <h2>控制端 ${escapeHtml(compactIdentifier(device.deviceId))}</h2>
+          <h2>已批准电脑 ${escapeHtml(compactIdentifier(device.deviceId))}</h2>
           <p>批准于 ${formatDate(device.approvedAtUnixS)}</p>
         </div>
         <div class="device-actions">
-          <span class="trusted-badge">已信任</span>
+          <span class="trusted-badge">已批准</span>
           <button
             class="button button--danger-quiet button--compact"
             type="button"
@@ -568,11 +731,11 @@ function renderPairingAction(
     (!active && (!state.connection || Boolean(state.trustedError) || lanUnavailable));
   const className = presentation === "text" ? "text-button" : `button button--${presentation}`;
   const action = active ? "data-open-pairing" : "data-start-pairing";
-  const label = active ? "查看当前配对" : pairingBusy ? "正在启动配对…" : "配对设备";
+  const label = active ? "查看连接码" : pairingBusy ? "正在创建连接码…" : "连接新电脑";
   const title = !state.connection
-    ? 'title="请先保存连接设置，再开始配对"'
+    ? 'title="请先保存本机连接，再创建连接码"'
     : state.trustedError
-      ? 'title="可信设备存储可用后才能开始配对"'
+      ? 'title="已批准设备存储可用后才能创建连接码"'
       : lanUnavailable
         ? 'title="连接局域网并让本机中继就绪后再开始配对"'
       : "";
@@ -590,9 +753,9 @@ function renderPairing(state: HostSnapshot): string {
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
         <div>
-          <button class="back-button" type="button" data-open-devices aria-label="返回可信设备">← 可信设备</button>
-          <h1>配对控制端</h1>
-          <p>邀请仅在短时间内有效，控制端仍需在本机获得 Windows 批准后才会被信任。</p>
+          <button class="back-button" type="button" data-open-devices aria-label="返回已批准设备">← 已批准设备</button>
+          <h1>连接另一台电脑</h1>
+          <p>连接码只在短时间内有效。另一台电脑发起连接后，仍需要你在本机确认身份。</p>
         </div>
         <span class="pairing-state ${active ? "pairing-state--active" : ""}">
           <span aria-hidden="true"></span>${active ? "邀请有效" : "邀请已失效"}
@@ -606,7 +769,7 @@ function renderPairing(state: HostSnapshot): string {
               <div class="pairing-card-heading">
                 <div>
                   <span class="eyebrow">一次性连接码</span>
-                  <h2 id="pairing-invitation-heading">发送给另一台 DeskLink 控制端</h2>
+                  <h2 id="pairing-invitation-heading">复制到另一台电脑</h2>
                 </div>
                 <strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>
               </div>
@@ -643,7 +806,7 @@ function renderPairing(state: HostSnapshot): string {
                 <button class="button button--primary" type="button" data-copy-pairing ${pairingBusy ? "disabled" : ""}>复制连接码</button>
                 <button class="button button--secondary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>${pairingBusy ? "正在恢复主机…" : "取消配对"}</button>
               </div>
-              <p class="secret-note" id="pairing-secret-note">连接码已包含主机的中继地址和一次性邀请。请只发送给自己的 DeskLink 设备；局域网首次连接时，请允许 Windows 防火墙的专用网络访问。</p>
+              <p class="secret-note" id="pairing-secret-note">连接码已经包含本机地址，请只粘贴到自己的另一台 DeskLink 电脑。Windows 防火墙首次询问时，只允许“专用网络”。</p>
             </section>
           `
           : `
@@ -665,8 +828,8 @@ function renderPairing(state: HostSnapshot): string {
       <div class="security-note security-note--pairing">
         <span class="security-note-mark" aria-hidden="true"></span>
         <div>
-          <strong>批准操作不能远程完成</strong>
-          <p>控制端连接后，Windows 会显示完整的设备 ID 和公钥指纹，并默认选择更安全的“否”。</p>
+          <strong>下一步需要回到这台电脑确认</strong>
+          <p>另一台电脑发起连接后，Windows 会显示完整身份信息。核对无误后才能批准查看画面和控制输入。</p>
         </div>
       </div>
     </div>
@@ -702,8 +865,8 @@ function connectionToInput(connection: ConnectionSummary | null): ConnectionSett
   return {
     relayAddress: connection?.relayAddress ?? "127.0.0.1:4433",
     serverName: connection?.serverName ?? "localhost",
-    sessionId: connection?.sessionId ?? "",
-    relayKey: "",
+    sessionId: connection?.sessionId ?? randomHex(16),
+    relayKey: connection ? "" : randomHex(32),
     streamId: String(connection?.streamId ?? 1),
   };
 }
@@ -747,6 +910,10 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
       activeView = button.dataset.view as View;
+      if (activeView === "connection") {
+        connectionDraft = null;
+        connectionAdvancedOpen = false;
+      }
       feedback = null;
       render();
     });
@@ -754,9 +921,13 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-refresh]").forEach((button) => {
     button.addEventListener("click", () => void refreshSnapshot());
   });
+  document.querySelector<HTMLButtonElement>("[data-export-diagnostics]")?.addEventListener("click", () => {
+    void exportDiagnostics();
+  });
   document.querySelector<HTMLButtonElement>("[data-open-connection]")?.addEventListener("click", () => {
     activeView = "connection";
     connectionDraft = null;
+    connectionAdvancedOpen = false;
     feedback = null;
     render();
   });
@@ -803,6 +974,7 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-cancel-connection]")?.addEventListener("click", () => {
     connectionDraft = null;
+    connectionAdvancedOpen = false;
     activeView = "overview";
     feedback = null;
     render();
@@ -818,6 +990,9 @@ function bindInteractions(): void {
     button.textContent = showing ? "显示" : "隐藏";
     button.setAttribute("aria-label", showing ? "显示中继密钥" : "隐藏中继密钥");
   });
+  document.querySelector<HTMLDetailsElement>("[data-connection-advanced]")?.addEventListener("toggle", (event) => {
+    connectionAdvancedOpen = (event.currentTarget as HTMLDetailsElement).open;
+  });
   document.querySelector<HTMLButtonElement>("[data-generate-connection]")?.addEventListener("click", () => {
     const form = document.querySelector<HTMLFormElement>("[data-connection-form]");
     if (!form) {
@@ -831,7 +1006,8 @@ function bindInteractions(): void {
       relayKey: randomHex(32),
       streamId: "1",
     };
-    feedback = { tone: "info", message: "新的会话凭据已生成，请保存连接，让 Windows 对它们进行加密保护。" };
+    connectionAdvancedOpen = true;
+    feedback = { tone: "info", message: "新的连接凭据已生成。保存后，已经配对的电脑需要重新配对。" };
     render();
   });
   document
@@ -860,6 +1036,27 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
     };
   } finally {
     loading = false;
+    render();
+  }
+}
+
+async function exportDiagnostics(): Promise<void> {
+  if (diagnosticExportBusy) {
+    return;
+  }
+  diagnosticExportBusy = true;
+  feedback = null;
+  render();
+  try {
+    lastDiagnosticExport = await exportDiagnosticReport();
+    feedback = {
+      tone: "success",
+      message: `诊断报告已导出到 Windows 下载文件夹，报告编号：${lastDiagnosticExport.reportId}。`,
+    };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    diagnosticExportBusy = false;
     render();
   }
 }
@@ -982,6 +1179,7 @@ async function submitConnection(event: SubmitEvent): Promise<void> {
     snapshot = await saveConnectionSettings(connectionDraft);
     connectionDraft.relayKey = "";
     connectionDraft = null;
+    connectionAdvancedOpen = false;
     activeView = "overview";
     feedback = { tone: "success", message: "连接设置已保存，并由当前 Windows 账户加密保护。" };
   } catch (error) {

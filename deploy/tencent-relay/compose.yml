@@ -1,0 +1,49 @@
+name: desklink-relay
+
+services:
+  relay:
+    image: desklink-relay:0.1.0
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    environment:
+      DESKLINK_RELAY_ADDR: 0.0.0.0:4433
+      DESKLINK_RELAY_CERT_PEM: /run/desklink/tls/fullchain.pem
+      DESKLINK_RELAY_KEY_PEM: /run/desklink/tls/privkey.pem
+      DESKLINK_RELAY_SESSION_TTL_S: "86400"
+    ports:
+      - target: 4433
+        published: "4433"
+        protocol: udp
+    volumes:
+      - type: bind
+        source: /opt/p2p-transmission/deploy/coturn/.local/tls
+        target: /run/desklink/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.75
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/desklink-relay
+        - --check-config
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

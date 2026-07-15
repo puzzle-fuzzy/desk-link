@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     fs::OpenOptions,
     io,
@@ -8,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::storage::local_app_data_path;
+use crate::storage::{downloads_path, local_app_data_path};
 
 use thiserror::Error;
 
@@ -17,12 +18,17 @@ use crate::runtime::HostLifecycleEvent;
 const DEFAULT_MAX_BYTES: u64 = 512 * 1024;
 const DEFAULT_RETAINED_FILES: usize = 3;
 const MAX_REASON_CHARS: usize = 512;
+const MAX_EXPORT_LINES: usize = 200;
+const MAX_EXPORT_LINE_CHARS: usize = 2_048;
+const MAX_REPORT_CHARS: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticOperation {
     TrustedControllersRefresh,
     ControllerRevocation,
     LocalRelayStartup,
+    RelayProbe,
+    DiagnosticExport,
 }
 
 impl DiagnosticOperation {
@@ -34,6 +40,10 @@ impl DiagnosticOperation {
             (Self::ControllerRevocation, false) => "controller_revocation_failed",
             (Self::LocalRelayStartup, true) => "local_relay_started",
             (Self::LocalRelayStartup, false) => "local_relay_startup_failed",
+            (Self::RelayProbe, true) => "relay_probe_succeeded",
+            (Self::RelayProbe, false) => "relay_probe_failed",
+            (Self::DiagnosticExport, true) => "diagnostic_report_exported",
+            (Self::DiagnosticExport, false) => "diagnostic_report_export_failed",
         }
     }
 }
@@ -130,6 +140,50 @@ impl DiagnosticLog {
         file.write_all(line.as_bytes())?;
         file.sync_data()?;
         Ok(())
+    }
+
+    pub fn recent_sanitized_lines(&self) -> Result<Vec<String>, DiagnosticLogError> {
+        let _guard = self
+            .inner
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("diagnostic log read lock is poisoned"))?;
+        let mut lines = VecDeque::with_capacity(MAX_EXPORT_LINES);
+        let mut paths = (1..=self.inner.retained_files)
+            .rev()
+            .map(|index| rotated_path(&self.inner.path, index))
+            .collect::<Vec<_>>();
+        paths.push(self.inner.path.clone());
+        for path in paths {
+            let contents = match fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for line in contents.lines() {
+                if lines.len() == MAX_EXPORT_LINES {
+                    lines.pop_front();
+                }
+                lines.push_back(bounded_export_line(line));
+            }
+        }
+        Ok(lines.into_iter().collect())
+    }
+
+    pub fn export_report(
+        &self,
+        report_id: &str,
+        contents: &str,
+    ) -> Result<PathBuf, DiagnosticLogError> {
+        let directory = downloads_path()
+            .or_else(|| {
+                self.inner
+                    .path
+                    .parent()
+                    .map(|parent| parent.join("exports"))
+            })
+            .ok_or(DiagnosticLogError::MissingStoragePath)?;
+        export_report_to_directory(&directory, report_id, contents)
     }
 
     fn rotate_if_needed(&self, incoming_bytes: u64) -> io::Result<()> {
@@ -296,6 +350,66 @@ fn redact_long_hex_sequences(value: &str) -> String {
     output
 }
 
+fn bounded_export_line(value: &str) -> String {
+    let redacted = redact_sensitive_text(value);
+    let mut characters = redacted.chars();
+    let mut bounded = characters
+        .by_ref()
+        .take(MAX_EXPORT_LINE_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+fn export_report_to_directory(
+    directory: &Path,
+    report_id: &str,
+    contents: &str,
+) -> Result<PathBuf, DiagnosticLogError> {
+    fs::create_dir_all(directory)?;
+    let safe_report_id = report_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(64)
+        .collect::<String>();
+    let safe_report_id = if safe_report_id.is_empty() {
+        "DeskLink".to_owned()
+    } else {
+        safe_report_id
+    };
+    let redacted = redact_sensitive_text(contents);
+    let mut bounded = redacted.chars().take(MAX_REPORT_CHARS).collect::<String>();
+    if redacted.chars().count() > MAX_REPORT_CHARS {
+        bounded.push_str("\n[报告内容已达到安全长度上限]\n");
+    } else if !bounded.ends_with('\n') {
+        bounded.push('\n');
+    }
+
+    for collision in 0..=99 {
+        let suffix = if collision == 0 {
+            String::new()
+        } else {
+            format!("-{collision}")
+        };
+        let path = directory.join(format!("DeskLink-Diagnostics-{safe_report_id}{suffix}.txt"));
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        file.write_all(bounded.as_bytes())?;
+        file.sync_all()?;
+        return Ok(path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "too many diagnostic report files share this identifier",
+    )
+    .into())
+}
+
 fn json_string(value: &str) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('\"');
@@ -419,5 +533,55 @@ mod tests {
             redact_sensitive_text("error=0x80004005"),
             "error=0x80004005"
         );
+    }
+
+    #[test]
+    fn recent_export_lines_remain_bounded_and_redacted() {
+        let path = temporary_log_path("recent-export");
+        let logger = DiagnosticLog::new(&path);
+        let secret = "ab".repeat(32);
+        logger
+            .record(&DiagnosticEvent::OperationFailed {
+                operation: DiagnosticOperation::RelayProbe,
+                reason: format!("DESKLINK_AUTH_KEY={secret}"),
+            })
+            .unwrap();
+
+        let lines = logger.recent_sanitized_lines().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("relay_probe_failed"));
+        assert!(lines[0].contains("<redacted>"));
+        assert!(!lines[0].contains(&secret));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn exported_report_uses_safe_unique_names_and_redacts_again() {
+        let root = temporary_log_path("report-export")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let directory = root.join("Downloads");
+        let secret = "cd".repeat(32);
+        let first = export_report_to_directory(
+            &directory,
+            "DL-WIN/../../unsafe",
+            &format!("报告\nDESKLINK_AUTH_KEY={secret}"),
+        )
+        .unwrap();
+        let second = export_report_to_directory(
+            &directory,
+            "DL-WIN/../../unsafe",
+            &format!("报告\nDESKLINK_AUTH_KEY={secret}"),
+        )
+        .unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(&directory));
+        assert!(!first.file_name().unwrap().to_string_lossy().contains('/'));
+        let contents = fs::read_to_string(first).unwrap();
+        assert!(contents.contains("<redacted>"));
+        assert!(!contents.contains(&secret));
+        let _ = fs::remove_dir_all(root);
     }
 }

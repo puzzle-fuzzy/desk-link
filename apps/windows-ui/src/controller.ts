@@ -81,9 +81,8 @@ export function renderControllerView(): string {
       ${feedback ? renderFeedback(feedback) : ""}
       <div class="controller-heading">
         <div>
-          <span class="eyebrow">Windows 电脑互控</span>
           <h1>控制另一台电脑</h1>
-          <p>通过中继服务器连接后，此窗口将作为另一台电脑的屏幕、键盘和鼠标。</p>
+          <p>粘贴另一台电脑生成的连接码，然后回到那台电脑确认身份。</p>
         </div>
         ${renderRuntimeBadge()}
       </div>
@@ -100,6 +99,15 @@ export function bindControllerInteractions(): void {
   document
     .querySelector<HTMLFormElement>("[data-controller-form]")
     ?.addEventListener("submit", (event) => void submitInvitation(event));
+  document.querySelector<HTMLTextAreaElement>("[data-controller-invitation]")?.addEventListener("input", (event) => {
+    updatePairingCodePreview((event.currentTarget as HTMLTextAreaElement).value);
+  });
+  document.querySelector<HTMLInputElement>("[data-controller-relay-address]")?.addEventListener("input", (event) => {
+    relayDraft = (event.currentTarget as HTMLInputElement).value;
+  });
+  document.querySelector<HTMLInputElement>("[data-controller-server-name]")?.addEventListener("input", (event) => {
+    serverNameDraft = (event.currentTarget as HTMLInputElement).value;
+  });
   document.querySelector<HTMLButtonElement>("[data-controller-probe]")?.addEventListener("click", () => {
     void checkRelayConnection();
   });
@@ -123,9 +131,41 @@ export function bindControllerInteractions(): void {
   }
 }
 
+function updatePairingCodePreview(value: string): void {
+  invitationDraft = value;
+  const relayInput = document.querySelector<HTMLInputElement>("[data-controller-relay-address]");
+  const serverNameInput = document.querySelector<HTMLInputElement>("[data-controller-server-name]");
+  const status = document.querySelector<HTMLElement>("[data-controller-code-status]");
+  const parsed = parsePairingCode(value, relayInput?.value ?? relayDraft, serverNameInput?.value ?? serverNameDraft);
+  if (parsed) {
+    relayDraft = parsed.relayAddress;
+    serverNameDraft = parsed.serverName;
+    if (relayInput) {
+      relayInput.value = parsed.relayAddress;
+    }
+    if (serverNameInput) {
+      serverNameInput.value = parsed.serverName;
+    }
+  }
+  if (!status) {
+    return;
+  }
+  const tone = !value.trim() ? "empty" : parsed ? "ready" : "attention";
+  const text = !value.trim()
+    ? "粘贴完整连接码后，DeskLink 会自动填写连接地址。"
+    : parsed
+      ? `已识别连接码，将连接 ${parsed.relayAddress}。`
+      : "连接码尚不完整，请回到另一台电脑重新复制完整内容。";
+  status.className = `connection-code-status connection-code-status--${tone}`;
+  const message = status.querySelector("p");
+  if (message) {
+    message.textContent = text;
+  }
+}
+
 function renderFeedback(item: NonNullable<ControllerFeedback>): string {
   return `
-    <div class="feedback feedback--${item.tone}" role="status">
+    <div class="feedback feedback--${item.tone}" role="${item.tone === "error" ? "alert" : "status"}" aria-live="${item.tone === "error" ? "assertive" : "polite"}">
       <span class="feedback-symbol" aria-hidden="true"></span>
       <span>${escapeHtml(item.message)}</span>
       <button type="button" class="feedback-close" data-controller-dismiss aria-label="关闭消息">×</button>
@@ -149,45 +189,54 @@ function renderConnectionPanel(): string {
   const saved = snapshot?.savedConnection;
   const isWorking =
     busy || checkingRelay || ["connecting", "waitingApproval", "reconnecting"].includes(snapshot?.runtime.state ?? "");
+  const recognizedCode = parsePairingCode(invitationDraft, relayDraft, serverNameDraft);
+  const codeStatus = !invitationDraft.trim()
+    ? { tone: "empty", text: "粘贴完整连接码后，DeskLink 会自动填写连接地址。" }
+    : recognizedCode
+      ? { tone: "ready", text: `已识别连接码，将连接 ${recognizedCode.relayAddress}。` }
+      : { tone: "attention", text: "连接码尚不完整，请回到另一台电脑重新复制完整内容。" };
   return `
     <div class="controller-connect-grid">
       <section class="controller-card controller-card--primary">
         <div class="controller-card-heading">
-          <span class="controller-step">01</span>
-          <div><h2>使用连接码配对</h2><p>在主机电脑的“可信设备”页面创建连接码，然后完整粘贴到这里。</p></div>
+          <div><h2>首次连接这台电脑</h2><p>在另一台电脑的“已批准设备”页面创建连接码，然后完整粘贴到这里。</p></div>
         </div>
         <form class="controller-form" data-controller-form>
-          <div class="field-grid field-grid--controller">
-            <label class="field">
-              <span>中继地址</span>
-              <input name="relayAddress" value="${escapeHtml(relayDraft)}" placeholder="relay.example.com:4433" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
-            </label>
-            <label class="field">
-              <span>TLS 服务器名称</span>
-              <input name="serverName" value="${escapeHtml(serverNameDraft)}" placeholder="relay.example.com" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
-            </label>
-          </div>
           <label class="field">
-            <span>配对连接码</span>
-            <textarea name="invitation" rows="7" maxlength="1024" placeholder="粘贴主机生成的完整连接码" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>${escapeHtml(invitationDraft)}</textarea>
-            <small>局域网连接码会自动填写中继地址。开始控制前，DeskLink 仍会验证主机身份并请求本地批准。</small>
+            <span>连接码</span>
+            <textarea name="invitation" data-controller-invitation rows="6" maxlength="1024" placeholder="在这里粘贴另一台电脑生成的完整连接码" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>${escapeHtml(invitationDraft)}</textarea>
           </label>
+          <div class="connection-code-status connection-code-status--${codeStatus.tone}" data-controller-code-status role="status">
+            <span aria-hidden="true"></span><p>${escapeHtml(codeStatus.text)}</p>
+          </div>
+          <details class="controller-network-details" ${invitationDraft.trim() && !recognizedCode ? "open" : ""}>
+            <summary>检查或手动填写连接地址</summary>
+            <div class="field-grid field-grid--controller">
+              <label class="field">
+                <span>中继地址</span>
+                <input name="relayAddress" data-controller-relay-address value="${escapeHtml(recognizedCode?.relayAddress ?? relayDraft)}" placeholder="relay.example.com:4433" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
+              </label>
+              <label class="field">
+                <span>TLS 服务器名称</span>
+                <input name="serverName" data-controller-server-name value="${escapeHtml(recognizedCode?.serverName ?? serverNameDraft)}" placeholder="relay.example.com" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
+              </label>
+            </div>
+          </details>
           <div class="controller-form-actions">
-            <button class="button button--primary" type="submit" ${isWorking ? "disabled" : ""}>
-              ${checkingRelay ? "等待检测完成" : isWorking ? '<span class="button-spinner" aria-hidden="true"></span> 正在连接' : "安全连接"}
+            <button class="button button--primary" type="submit" ${isWorking ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
+              ${checkingRelay ? "等待检测完成" : isWorking ? '<span class="button-spinner" aria-hidden="true"></span> 正在连接' : "连接并请求批准"}
             </button>
             <button class="button button--secondary" type="button" data-controller-probe ${isWorking ? "disabled" : ""}>
-              ${checkingRelay ? "正在检测…" : "检测连接"}
+              ${checkingRelay ? "正在检测…" : "先检测网络"}
             </button>
-            <span>连接成功启动后，邀请内容会从此窗口清除。</span>
+            <span>发起连接后，请回到另一台电脑核对并批准本机身份。</span>
           </div>
         </form>
       </section>
 
       <aside class="controller-card controller-card--saved">
         <div class="controller-card-heading">
-          <span class="controller-step">02</span>
-          <div><h2>已保存的电脑</h2><p>批准后的连接由 Windows DPAPI 为当前账户加密保护。</p></div>
+          <div><h2>重新连接已批准电脑</h2><p>首次批准后，可以直接从这里重新连接。</p></div>
         </div>
         ${saved ? renderSavedConnection(isWorking) : renderNoSavedConnection()}
       </aside>

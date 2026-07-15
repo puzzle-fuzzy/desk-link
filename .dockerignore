@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.vscode
+.build
+.swiftpm
+DerivedData
+dist
+target
+node_modules
+apps/windows-ui/node_modules
+apps/windows-ui/dist
+apps/windows-ui/src-tauri/gen
+docs
+*.log
+*.pdb

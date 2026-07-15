@@ -60,7 +60,7 @@ Windows 真实码流已经接入持续运行的 QUIC host loop，并完成端到
 
 ## 两台 Windows 电脑使用
 
-两台电脑安装同一个 DeskLink 安装包，任意一台都可以作为 host 或 controller。`0.1.1` 起，同一局域网可直接使用内置 UDP 中继：host 保留默认连接设置并创建多行配对连接码，controller 完整粘贴后会自动取得主机局域网地址，host 本地确认完整身份后即可控制。跨网络使用仍需要两台机器都能访问、且 TLS 证书受 Windows 信任的公网 relay。完整部署和故障检查见 [`docs/windows-two-pc-setup.md`](docs/windows-two-pc-setup.md)。
+两台电脑安装同一个 DeskLink 安装包，任意一台都可以作为 host 或 controller。`0.1.1` 起，同一局域网可直接使用内置 UDP 中继：host 保留默认连接设置并创建多行配对连接码，controller 完整粘贴后会自动取得主机局域网地址，host 本地确认完整身份后即可控制。跨网络使用仍需要两台机器都能访问、且 TLS 证书受 Windows 信任的公网 relay。“概览”会以稳定检查代码汇总双机连接状态，并可将已脱敏的中文诊断报告导出到 Windows“下载”文件夹。完整部署和故障检查见 [`docs/windows-two-pc-setup.md`](docs/windows-two-pc-setup.md)。
 
 ## Windows 安装包
 

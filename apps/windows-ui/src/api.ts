@@ -6,6 +6,7 @@ import type {
   ControllerInput,
   ControllerSignal,
   ControllerSnapshot,
+  DiagnosticExportResult,
   HostSnapshot,
   PairingSessionSummary,
   RelayProbeInput,
@@ -20,6 +21,10 @@ export interface ControllerChannels {
 
 export function getHostSnapshot(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("get_host_snapshot");
+}
+
+export function exportDiagnosticReport(): Promise<DiagnosticExportResult> {
+  return invoke<DiagnosticExportResult>("export_diagnostic_report");
 }
 
 export function saveConnectionSettings(

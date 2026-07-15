@@ -26,7 +26,9 @@ mod instance_guard {
 
 use std::{
     env,
+    fmt::Write as _,
     net::SocketAddr,
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -62,6 +64,7 @@ struct HostSnapshot {
     trusted_controllers: Vec<TrustedControllerSummary>,
     trusted_error: Option<String>,
     relay_status: local_relay::RelayStatusSummary,
+    diagnostic_checks: Vec<DiagnosticCheckSummary>,
     pairing_active: bool,
     refreshed_at_unix_s: u64,
 }
@@ -83,6 +86,24 @@ struct TrustedControllerSummary {
     verify_key: String,
     fingerprint: String,
     approved_at_unix_s: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticCheckSummary {
+    code: &'static str,
+    status: &'static str,
+    title: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticExportResult {
+    report_id: String,
+    file_name: String,
+    file_path: String,
+    check_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +158,22 @@ async fn get_controller_snapshot(
 }
 
 #[tauri::command]
+async fn export_diagnostic_report(
+    host_manager: State<'_, HostManager>,
+    controller_manager: State<'_, ControllerManager>,
+) -> Result<DiagnosticExportResult, String> {
+    let runtime = host_manager.snapshot();
+    let pairing_active = host_manager.is_pairing_active();
+    let controller_runtime = controller_manager.snapshot();
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = load_host_snapshot(runtime, pairing_active)?;
+        export_snapshot_report(&snapshot, &controller_runtime)
+    })
+    .await
+    .map_err(|_| "DeskLink 无法完成诊断报告导出，请重试。".to_owned())?
+}
+
+#[tauri::command]
 async fn probe_relay(input: RelayProbeInput) -> Result<local_relay::RelayProbeResult, String> {
     let relay_address = input
         .relay_address
@@ -150,7 +187,25 @@ async fn probe_relay(input: RelayProbeInput) -> Result<local_relay::RelayProbeRe
     {
         return Err("TLS 服务器名称无效，请重新复制完整连接码。".to_owned());
     }
-    local_relay::probe(relay_address, server_name).await
+    let diagnostics = DiagnosticLog::for_current_user().ok();
+    match local_relay::probe(relay_address, server_name).await {
+        Ok(result) => {
+            if let Some(diagnostics) = diagnostics.as_ref() {
+                let _ = diagnostics.record(&DiagnosticEvent::OperationSucceeded(
+                    DiagnosticOperation::RelayProbe,
+                ));
+            }
+            Ok(result)
+        }
+        Err(message) => {
+            record_operation_failure(
+                diagnostics.as_ref(),
+                DiagnosticOperation::RelayProbe,
+                &message,
+            );
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
@@ -332,6 +387,13 @@ fn load_host_snapshot(
             "启动主机前，请填写另一台 DeskLink 设备共享的中继服务器信息。".to_owned(),
         )
     };
+    let diagnostic_checks = build_diagnostic_checks(
+        &runtime,
+        connection.as_ref(),
+        connection_error.as_deref(),
+        trusted_error.as_deref(),
+        &relay_status,
+    );
 
     Ok(HostSnapshot {
         readiness,
@@ -343,12 +405,282 @@ fn load_host_snapshot(
         trusted_controllers,
         trusted_error,
         relay_status,
+        diagnostic_checks,
         pairing_active,
         refreshed_at_unix_s: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
     })
+}
+
+fn build_diagnostic_checks(
+    runtime: &HostRuntimeSummary,
+    connection: Option<&ConnectionSummary>,
+    connection_error: Option<&str>,
+    trusted_error: Option<&str>,
+    relay: &local_relay::RelayStatusSummary,
+) -> Vec<DiagnosticCheckSummary> {
+    let configuration = if connection_error.is_some() {
+        diagnostic_check(
+            "DL-CFG-101",
+            "failed",
+            "连接设置保护",
+            "无法打开已保存的连接设置，需要重新填写。",
+        )
+    } else if connection.is_some() {
+        diagnostic_check(
+            "DL-CFG-101",
+            "passed",
+            "连接设置保护",
+            "连接设置已由当前 Windows 账户加密保护。",
+        )
+    } else {
+        diagnostic_check(
+            "DL-CFG-101",
+            "warning",
+            "连接设置保护",
+            "尚未保存连接设置，主机不能接受控制端。",
+        )
+    };
+    let trust = if trusted_error.is_some() {
+        diagnostic_check(
+            "DL-SEC-102",
+            "failed",
+            "可信设备存储",
+            "可信设备存储不可用，主机将拒绝新的控制连接。",
+        )
+    } else {
+        diagnostic_check(
+            "DL-SEC-102",
+            "passed",
+            "可信设备存储",
+            "可信设备列表可读取，本地批准边界可用。",
+        )
+    };
+    let relay_check = match (relay.mode, relay.state) {
+        ("external", _) => diagnostic_check(
+            "DL-NET-201",
+            "passed",
+            "中继运行方式",
+            "当前使用已保存的外部中继服务器。",
+        ),
+        ("lan", "ready") => diagnostic_check(
+            "DL-NET-201",
+            "passed",
+            "局域网中继",
+            "本机局域网中继已经监听 UDP 4433。",
+        ),
+        ("lan", "failed" | "offline") => {
+            diagnostic_check("DL-NET-201", "failed", "局域网中继", &relay.detail)
+        }
+        ("lan", _) => diagnostic_check("DL-NET-201", "warning", "局域网中继", &relay.detail),
+        _ => diagnostic_check(
+            "DL-NET-201",
+            "warning",
+            "中继运行方式",
+            "保存连接设置后才能检查中继。",
+        ),
+    };
+    let adapter_check = match relay.mode {
+        "lan" if relay.addresses.is_empty() => diagnostic_check(
+            "DL-NET-202",
+            "failed",
+            "局域网地址",
+            "未检测到可供另一台电脑连接的局域网地址。",
+        ),
+        "lan" => diagnostic_check(
+            "DL-NET-202",
+            "passed",
+            "局域网地址",
+            &format!(
+                "检测到 {} 个可用地址，推荐使用 {}。",
+                relay.addresses.len(),
+                relay.addresses[0].relay_address
+            ),
+        ),
+        "external" => diagnostic_check(
+            "DL-NET-202",
+            "notApplicable",
+            "局域网地址",
+            "外部中继模式不依赖主机局域网入站地址。",
+        ),
+        _ => diagnostic_check(
+            "DL-NET-202",
+            "warning",
+            "局域网地址",
+            "尚未配置连接，暂不检查局域网地址。",
+        ),
+    };
+    let host_check = match runtime.state {
+        "connected" => diagnostic_check("DL-HOST-301", "passed", "主机运行状态", &runtime.detail),
+        "stopped" => diagnostic_check("DL-HOST-301", "failed", "主机运行状态", &runtime.detail),
+        _ => diagnostic_check("DL-HOST-301", "warning", "主机运行状态", &runtime.detail),
+    };
+    vec![configuration, trust, relay_check, adapter_check, host_check]
+}
+
+fn diagnostic_check(
+    code: &'static str,
+    status: &'static str,
+    title: &str,
+    detail: &str,
+) -> DiagnosticCheckSummary {
+    DiagnosticCheckSummary {
+        code,
+        status,
+        title: title.to_owned(),
+        detail: detail.to_owned(),
+    }
+}
+
+fn export_snapshot_report(
+    snapshot: &HostSnapshot,
+    controller_runtime: &controller::ControllerRuntimeSummary,
+) -> Result<DiagnosticExportResult, String> {
+    let diagnostics = DiagnosticLog::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用诊断报告存储。".to_owned())?;
+    let generated_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let report_id = format!("DL-WIN-{generated_at_unix_ms}-{:05}", std::process::id());
+    let recent_events = diagnostics
+        .recent_sanitized_lines()
+        .unwrap_or_else(|_| vec!["{\"event\":\"diagnostic_history_unavailable\"}".to_owned()]);
+    let report = build_diagnostic_report(
+        snapshot,
+        controller_runtime,
+        &report_id,
+        generated_at_unix_ms,
+        &recent_events,
+    );
+    let path = match diagnostics.export_report(&report_id, &report) {
+        Ok(path) => path,
+        Err(error) => {
+            record_operation_failure(
+                Some(&diagnostics),
+                DiagnosticOperation::DiagnosticExport,
+                &error.to_string(),
+            );
+            return Err(
+                "无法写入 Windows 下载文件夹，请检查磁盘空间和文件夹权限后重试。".to_owned(),
+            );
+        }
+    };
+    let _ = diagnostics.record(&DiagnosticEvent::OperationSucceeded(
+        DiagnosticOperation::DiagnosticExport,
+    ));
+    Ok(DiagnosticExportResult {
+        report_id,
+        file_name: report_file_name(&path),
+        file_path: path.to_string_lossy().into_owned(),
+        check_count: snapshot.diagnostic_checks.len(),
+    })
+}
+
+fn report_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("DeskLink-Diagnostics.txt")
+        .to_owned()
+}
+
+fn build_diagnostic_report(
+    snapshot: &HostSnapshot,
+    controller_runtime: &controller::ControllerRuntimeSummary,
+    report_id: &str,
+    generated_at_unix_ms: u128,
+    recent_events: &[String],
+) -> String {
+    let mut report = String::new();
+    let _ = writeln!(report, "DeskLink Windows 诊断报告");
+    let _ = writeln!(report, "报告编号: {report_id}");
+    let _ = writeln!(report, "生成时间 (Unix 毫秒): {generated_at_unix_ms}");
+    let _ = writeln!(report, "DeskLink 版本: {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(
+        report,
+        "隐私说明: 会话 ID、中继密钥、公钥、设备完整身份和长十六进制内容不会写入此报告。"
+    );
+    let _ = writeln!(report, "\n[检查结论]");
+    for check in &snapshot.diagnostic_checks {
+        let _ = writeln!(
+            report,
+            "{} [{}] {}",
+            check.code,
+            diagnostic_status_label(check.status),
+            check.title
+        );
+        let _ = writeln!(report, "  {}", check.detail);
+    }
+    let _ = writeln!(report, "\n[主机状态]");
+    let _ = writeln!(report, "界面状态: {}", snapshot.readiness);
+    let _ = writeln!(report, "运行状态: {}", snapshot.runtime.state);
+    let _ = writeln!(report, "运行说明: {}", snapshot.runtime.detail);
+    let _ = writeln!(
+        report,
+        "配对会话: {}",
+        if snapshot.pairing_active {
+            "正在运行"
+        } else {
+            "未运行"
+        }
+    );
+    let _ = writeln!(
+        report,
+        "连接设置: {}",
+        if snapshot.connection.is_some() {
+            "已保存"
+        } else {
+            "未保存"
+        }
+    );
+    let _ = writeln!(
+        report,
+        "可信控制端数量: {}",
+        snapshot.trusted_controllers.len()
+    );
+    if let Some(connection) = snapshot.connection.as_ref() {
+        let _ = writeln!(report, "中继地址: {}", connection.relay_address);
+        let _ = writeln!(report, "TLS 服务器名称: {}", connection.server_name);
+    }
+    let _ = writeln!(report, "\n[网络状态]");
+    let _ = writeln!(report, "中继模式: {}", snapshot.relay_status.mode);
+    let _ = writeln!(report, "中继状态: {}", snapshot.relay_status.state);
+    for address in &snapshot.relay_status.addresses {
+        let _ = writeln!(
+            report,
+            "网卡: {} | {} | {}",
+            address.interface_name,
+            address.relay_address,
+            if address.is_primary {
+                "推荐"
+            } else {
+                "可选"
+            }
+        );
+    }
+    let _ = writeln!(report, "\n[控制端状态]");
+    let _ = writeln!(report, "运行状态: {}", controller_runtime.state);
+    let _ = writeln!(report, "运行说明: {}", controller_runtime.detail);
+    let _ = writeln!(report, "\n[最近诊断事件，最多 200 条]");
+    if recent_events.is_empty() {
+        let _ = writeln!(report, "没有可用的历史事件。");
+    } else {
+        for event in recent_events {
+            let _ = writeln!(report, "{event}");
+        }
+    }
+    apps_windows::diagnostics::redact_sensitive_text(&report)
+}
+
+fn diagnostic_status_label(status: &str) -> &'static str {
+    match status {
+        "passed" => "通过",
+        "failed" => "失败",
+        "notApplicable" => "不适用",
+        _ => "注意",
+    }
 }
 
 fn normalize_fingerprint(fingerprint: &str) -> Result<String, String> {
@@ -522,6 +854,7 @@ pub fn run() {
             cancel_pairing_session,
             revoke_trusted_controller,
             probe_relay,
+            export_diagnostic_report,
             get_controller_snapshot,
             connect_controller,
             reconnect_controller,
@@ -591,7 +924,15 @@ fn show_main_window(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex, normalize_fingerprint};
+    use super::{
+        ConnectionSummary, HostSnapshot, TrustedControllerSummary, build_diagnostic_checks,
+        build_diagnostic_report, hex, normalize_fingerprint,
+    };
+    use crate::{
+        controller::ControllerRuntimeSummary,
+        host::HostRuntimeSummary,
+        local_relay::{LanAddressSummary, RelayStatusSummary},
+    };
 
     #[test]
     fn hex_preserves_leading_zeroes() {
@@ -608,5 +949,78 @@ mod tests {
     fn fingerprint_validation_rejects_wrong_length_and_non_hex() {
         assert!(normalize_fingerprint("ab").is_err());
         assert!(normalize_fingerprint(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn diagnostic_report_uses_stable_checks_without_identity_or_session_secrets() {
+        let runtime = HostRuntimeSummary {
+            state: "connected",
+            title: "主机已连接".to_owned(),
+            detail: "正在等待控制端。".to_owned(),
+            tooltip: "DeskLink：已连接".to_owned(),
+        };
+        let relay_status = RelayStatusSummary {
+            mode: "lan",
+            state: "ready",
+            title: "局域网中继已就绪".to_owned(),
+            detail: "可以连接".to_owned(),
+            port: Some(4433),
+            addresses: vec![LanAddressSummary {
+                relay_address: "192.168.1.20:4433".to_owned(),
+                interface_name: "以太网".to_owned(),
+                is_primary: true,
+            }],
+        };
+        let connection = ConnectionSummary {
+            relay_address: "127.0.0.1:4433".to_owned(),
+            server_name: "localhost".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            stream_id: 9,
+            has_saved_key: true,
+        };
+        let checks =
+            build_diagnostic_checks(&runtime, Some(&connection), None, None, &relay_status);
+        let verify_key = "ab".repeat(32);
+        let snapshot = HostSnapshot {
+            readiness: "configured",
+            title: "主机已连接".to_owned(),
+            detail: "可以接受控制端".to_owned(),
+            runtime,
+            connection: Some(connection),
+            connection_error: None,
+            trusted_controllers: vec![TrustedControllerSummary {
+                device_id: "cd".repeat(16),
+                verify_key: verify_key.clone(),
+                fingerprint: "ef".repeat(32),
+                approved_at_unix_s: 100,
+            }],
+            trusted_error: None,
+            relay_status,
+            diagnostic_checks: checks,
+            pairing_active: false,
+            refreshed_at_unix_s: 200,
+        };
+        let controller = ControllerRuntimeSummary {
+            state: "idle",
+            title: "可以控制另一台电脑".to_owned(),
+            detail: "尚未连接".to_owned(),
+            stream_id: None,
+        };
+        let secret = "99".repeat(32);
+        let report = build_diagnostic_report(
+            &snapshot,
+            &controller,
+            "DL-WIN-TEST-00001",
+            123,
+            &[format!("DESKLINK_AUTH_KEY={secret}")],
+        );
+
+        assert!(report.contains("DL-CFG-101 [通过]"));
+        assert!(report.contains("DL-NET-201 [通过]"));
+        assert!(report.contains("192.168.1.20:4433"));
+        assert!(report.contains("<redacted>"));
+        assert!(!report.contains("0123456789abcdef0123456789abcdef"));
+        assert!(!report.contains(&verify_key));
+        assert!(!report.contains(&secret));
     }
 }

@@ -33,6 +33,15 @@ export interface RelayStatusSummary {
   addresses: LanAddressSummary[];
 }
 
+export type DiagnosticCheckStatus = "passed" | "warning" | "failed" | "notApplicable";
+
+export interface DiagnosticCheckSummary {
+  code: string;
+  status: DiagnosticCheckStatus;
+  title: string;
+  detail: string;
+}
+
 export type HostRuntimeState =
   | "starting"
   | "pairing"
@@ -59,6 +68,7 @@ export interface HostSnapshot {
   trustedControllers: TrustedControllerSummary[];
   trustedError: string | null;
   relayStatus: RelayStatusSummary;
+  diagnosticChecks: DiagnosticCheckSummary[];
   pairingActive: boolean;
   refreshedAtUnixS: number;
 }
@@ -91,6 +101,13 @@ export interface RelayProbeResult {
   detail: string;
   relayAddress: string;
   elapsedMs: number;
+}
+
+export interface DiagnosticExportResult {
+  reportId: string;
+  fileName: string;
+  filePath: string;
+  checkCount: number;
 }
 
 export type ControllerRuntimeState =

@@ -1,8 +1,10 @@
 use std::{
     env,
     error::Error,
+    ffi::OsStr,
     fs::File,
     io::{self, BufReader},
+    net::SocketAddr,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -95,11 +97,26 @@ fn relay_config() -> Result<RelayConfig, Box<dyn Error + Send + Sync>> {
     })
 }
 
+fn relay_address() -> Result<SocketAddr, Box<dyn Error + Send + Sync>> {
+    Ok(env::var("DESKLINK_RELAY_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:4433".to_owned())
+        .parse()?)
+}
+
+fn check_configuration() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _ = relay_address()?;
+    let _ = server_config()?;
+    let _ = relay_config()?;
+    eprintln!("DeskLink relay configuration is valid");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let address = env::var("DESKLINK_RELAY_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:4433".to_owned())
-        .parse()?;
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("--check-config")) {
+        return check_configuration();
+    }
+    let address = relay_address()?;
     let relay = Arc::new(RelayServer::bind(address, server_config()?, relay_config()?).await?);
     eprintln!("DeskLink relay listening on {}", relay.local_addr()?);
     relay.run().await?;
