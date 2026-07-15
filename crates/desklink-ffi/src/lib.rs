@@ -17,9 +17,14 @@ use desklink_session::{
 use rand_core::{OsRng, RngCore};
 
 mod controller;
+mod host;
+mod host_worker;
 mod worker;
 
 pub use controller::{ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime};
+pub use host::{
+    HostCommand, HostError, HostEvent, HostIdentity, HostMetrics, HostRuntime, HostState,
+};
 use worker::{ControllerCommand, ControllerWorker, SecureConnectionConfigOwned};
 
 pub const PACKAGE_NAME: &str = "desklink-ffi";
