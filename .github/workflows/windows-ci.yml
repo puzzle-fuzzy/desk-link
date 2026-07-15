@@ -31,6 +31,12 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Prepare Windows UI assets for Rust checks
+        working-directory: apps/windows-ui
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
