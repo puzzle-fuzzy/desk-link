@@ -54,13 +54,47 @@ impl WorkerPhase {
             _ => Self::Closed,
         }
     }
+
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopping | Self::Closed)
+    }
+}
+
+fn try_advance_worker_phase(phase: &AtomicU8, phase_gate: &Mutex<()>, next: WorkerPhase) -> bool {
+    let Ok(_phase_gate) = phase_gate.lock() else {
+        return false;
+    };
+    if WorkerPhase::load(phase).is_terminal() {
+        return false;
+    }
+    phase.store(next as u8, Ordering::Release);
+    true
+}
+
+#[cfg(test)]
+fn record_terminal_admission(phase: &AtomicU8, phase_gate: &Mutex<()>) {
+    let Ok(_phase_gate) = phase_gate.lock() else {
+        return;
+    };
+    record_terminal_admission_locked(phase);
+}
+
+fn record_terminal_admission_locked(phase: &AtomicU8) {
+    phase.store(WorkerPhase::Stopping as u8, Ordering::Release);
+}
+
+fn record_closed(phase: &AtomicU8, phase_gate: &Mutex<()>) {
+    let Ok(_phase_gate) = phase_gate.lock() else {
+        return;
+    };
+    phase.store(WorkerPhase::Closed as u8, Ordering::Release);
 }
 
 pub(crate) struct HostWorker {
     commands: mpsc::Sender<HostCommand>,
     cancellation: watch::Sender<bool>,
     phase: Arc<AtomicU8>,
-    command_gate: Mutex<()>,
+    phase_gate: Arc<Mutex<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -76,7 +110,9 @@ impl HostWorker {
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
         let phase = Arc::new(AtomicU8::new(WorkerPhase::Connecting as u8));
+        let phase_gate = Arc::new(Mutex::new(()));
         let worker_phase = phase.clone();
+        let worker_phase_gate = phase_gate.clone();
         let thread = thread::Builder::new()
             .name("desklink-host".into())
             .spawn(move || {
@@ -94,14 +130,15 @@ impl HostWorker {
                         cancellation_receiver,
                         events,
                         worker_phase.clone(),
+                        worker_phase_gate.clone(),
                         ready_sender,
                     )),
                     Err(_) => {
                         let _ = ready_sender.send(Err(HostError::WorkerStopped));
                         emit_terminal(&events, Some(HostError::WorkerStopped));
+                        record_closed(&worker_phase, &worker_phase_gate);
                     }
                 }
-                worker_phase.store(WorkerPhase::Closed as u8, Ordering::Release);
             })
             .map_err(|_| HostError::WorkerStopped)?;
         match ready_receiver
@@ -112,7 +149,7 @@ impl HostWorker {
                 commands,
                 cancellation,
                 phase,
-                command_gate: Mutex::new(()),
+                phase_gate,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -127,41 +164,14 @@ impl HostWorker {
     }
 
     pub(crate) fn send(&self, command: HostCommand) -> Result<(), HostError> {
-        let _command_gate = self
-            .command_gate
+        let _phase_gate = self
+            .phase_gate
             .lock()
             .map_err(|_| HostError::WorkerStopped)?;
         let phase = WorkerPhase::load(&self.phase);
-        if command.requires_connection()
-            && !matches!(
-                phase,
-                WorkerPhase::NegotiatingCapabilities | WorkerPhase::Connected
-            )
-        {
+        if !command_is_admissible(&command, phase) {
             return Err(HostError::InvalidState);
         }
-        if matches!(command, HostCommand::Approve { .. })
-            && phase != WorkerPhase::WaitingForApproval
-        {
-            return Err(HostError::InvalidState);
-        }
-        if matches!(command, HostCommand::Reject)
-            && !matches!(
-                phase,
-                WorkerPhase::Connecting
-                    | WorkerPhase::WaitingForApproval
-                    | WorkerPhase::NegotiatingCapabilities
-                    | WorkerPhase::Connected
-            )
-        {
-            return Err(HostError::InvalidState);
-        }
-        if matches!(command, HostCommand::Stop)
-            && matches!(phase, WorkerPhase::Stopping | WorkerPhase::Closed)
-        {
-            return Err(HostError::InvalidState);
-        }
-
         let next_phase = match &command {
             HostCommand::Approve { .. } => Some(WorkerPhase::NegotiatingCapabilities),
             HostCommand::Reject | HostCommand::Stop => Some(WorkerPhase::Stopping),
@@ -175,7 +185,9 @@ impl HostWorker {
         // Command acceptance and the externally visible phase transition share this gate. A
         // full command queue therefore leaves the prior phase intact, so a rejected Approve
         // cannot unlock media and a rejected Reject/Stop cannot invent a terminal state.
-        if let Some(next_phase) = next_phase {
+        if cancels_worker {
+            record_terminal_admission_locked(&self.phase);
+        } else if let Some(next_phase) = next_phase {
             self.phase.store(next_phase as u8, Ordering::Release);
         }
         if cancels_worker {
@@ -195,6 +207,29 @@ impl HostWorker {
             let _ = thread.join();
         }
     }
+}
+
+fn command_is_admissible(command: &HostCommand, phase: WorkerPhase) -> bool {
+    if phase.is_terminal() {
+        return false;
+    }
+    if command.requires_connection() {
+        return matches!(
+            phase,
+            WorkerPhase::NegotiatingCapabilities | WorkerPhase::Connected
+        );
+    }
+    if matches!(command, HostCommand::Approve { .. }) {
+        return phase == WorkerPhase::WaitingForApproval;
+    }
+    !matches!(command, HostCommand::Reject)
+        || matches!(
+            phase,
+            WorkerPhase::Connecting
+                | WorkerPhase::WaitingForApproval
+                | WorkerPhase::NegotiatingCapabilities
+                | WorkerPhase::Connected
+        )
 }
 
 impl Drop for HostWorker {
@@ -231,6 +266,7 @@ async fn run_worker(
     mut cancellation: watch::Receiver<bool>,
     events: mpsc::Sender<HostEvent>,
     phase: Arc<AtomicU8>,
+    phase_gate: Arc<Mutex<()>>,
     ready: std::sync::mpsc::SyncSender<Result<(), HostError>>,
 ) {
     let join = client
@@ -241,7 +277,7 @@ async fn run_worker(
     if let Err(error) = join {
         let _ = ready.send(Err(error.clone()));
         emit_terminal(&events, Some(error));
-        phase.store(WorkerPhase::Closed as u8, Ordering::Release);
+        record_closed(&phase, &phase_gate);
         return;
     }
     let _ = ready.send(Ok(()));
@@ -252,10 +288,11 @@ async fn run_worker(
         &mut cancellation,
         &events,
         &phase,
+        &phase_gate,
     )
     .await;
 
-    phase.store(WorkerPhase::Closed as u8, Ordering::Release);
+    record_closed(&phase, &phase_gate);
     emit_terminal(&events, result.err());
 }
 
@@ -266,20 +303,27 @@ async fn run_session(
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
     phase: &Arc<AtomicU8>,
+    phase_gate: &Arc<Mutex<()>>,
 ) -> Result<(), HostError> {
     let Some(mut secure) = perform_noise_handshake(client, identity, cancellation).await? else {
         return Ok(());
     };
     let peer = secure.peer_identity();
-    phase.store(WorkerPhase::WaitingForApproval as u8, Ordering::Release);
-    emit_nonterminal(
-        events,
-        HostEvent::ApprovalRequested {
-            device_id: peer.device_id(),
-            verify_key: *peer.verify_key().as_bytes(),
-            fingerprint: fingerprint(peer.verify_key()),
-        },
-    );
+    {
+        let _phase_gate = phase_gate.lock().map_err(|_| HostError::WorkerStopped)?;
+        if WorkerPhase::load(phase).is_terminal() {
+            return Ok(());
+        }
+        phase.store(WorkerPhase::WaitingForApproval as u8, Ordering::Release);
+        emit_nonterminal(
+            events,
+            HostEvent::ApprovalRequested {
+                device_id: peer.device_id(),
+                verify_key: *peer.verify_key().as_bytes(),
+                fingerprint: fingerprint(peer.verify_key()),
+            },
+        );
+    }
 
     if !wait_for_approval(
         peer.device_id(),
@@ -292,15 +336,16 @@ async fn run_session(
     {
         return Ok(());
     }
-    phase.store(
-        WorkerPhase::NegotiatingCapabilities as u8,
-        Ordering::Release,
-    );
+    if !try_advance_worker_phase(phase, phase_gate, WorkerPhase::NegotiatingCapabilities) {
+        return Ok(());
+    }
     negotiate_controller(client, &mut secure, cancellation).await?;
     if *cancellation.borrow() {
         return Ok(());
     }
-    phase.store(WorkerPhase::Connected as u8, Ordering::Release);
+    if !try_advance_worker_phase(phase, phase_gate, WorkerPhase::Connected) {
+        return Ok(());
+    }
     run_connected(client, &mut secure, commands, cancellation, events).await
 }
 
@@ -663,4 +708,71 @@ fn protocol_error(error: desklink_protocol::ProtocolError) -> HostError {
 
 fn crypto_error(error: desklink_crypto::CryptoError) -> HostError {
     HostError::Crypto(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, atomic::AtomicU8};
+
+    use super::{
+        HostCommand, WorkerPhase, command_is_admissible, record_terminal_admission,
+        try_advance_worker_phase,
+    };
+
+    #[test]
+    fn terminal_admission_blocks_late_worker_completion_transitions() {
+        let phase = AtomicU8::new(WorkerPhase::NegotiatingCapabilities as u8);
+        let gate = Mutex::new(());
+
+        record_terminal_admission(&phase, &gate);
+
+        assert!(!try_advance_worker_phase(
+            &phase,
+            &gate,
+            WorkerPhase::Connected
+        ));
+        assert!(!try_advance_worker_phase(
+            &phase,
+            &gate,
+            WorkerPhase::WaitingForApproval
+        ));
+        assert_eq!(WorkerPhase::load(&phase), WorkerPhase::Stopping);
+    }
+
+    #[test]
+    fn terminal_phase_rejects_every_public_command() {
+        let commands = [
+            HostCommand::Approve {
+                controller_device_id: [0; 16],
+                controller_verify_key: [0; 32],
+            },
+            HostCommand::Reject,
+            HostCommand::SendVideoConfig {
+                stream_id: 1,
+                version: 1,
+                width: 1,
+                height: 1,
+                bytes: vec![],
+            },
+            HostCommand::SendVideoAccessUnit {
+                stream_id: 1,
+                frame_id: 1,
+                config_version: 1,
+                bytes: vec![],
+            },
+            HostCommand::SendCursor {
+                stream_id: 1,
+                bytes: vec![],
+            },
+            HostCommand::RequestKeyframe,
+            HostCommand::ReleaseAll,
+            HostCommand::Stop,
+        ];
+
+        for phase in [WorkerPhase::Stopping, WorkerPhase::Closed] {
+            for command in &commands {
+                assert!(!command_is_admissible(command, phase), "{command:?}");
+            }
+        }
+    }
 }
