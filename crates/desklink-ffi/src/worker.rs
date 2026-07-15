@@ -194,6 +194,7 @@ async fn run_worker(
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
     loop {
+        phase.store(PHASE_CONNECTING, Ordering::Release);
         callback.emit_state(
             if first_attempt {
                 DesklinkState::ConnectingRelay

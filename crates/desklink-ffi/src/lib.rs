@@ -3,7 +3,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     ptr::{null, null_mut},
     sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle, ThreadId},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -272,6 +272,7 @@ pub struct DesklinkHostHandle {
     config: DesklinkHostConfigOwned,
     runtime: Mutex<Option<Arc<HostRuntime>>>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
+    event_thread_id: Mutex<Option<ThreadId>>,
     lifecycle: Mutex<HostLifecycle>,
     callback: Arc<HostCallbackState>,
 }
@@ -1050,6 +1051,7 @@ pub unsafe extern "C" fn desklink_controller_copy_saved_host_material(
         return DesklinkResult::InvalidState;
     };
     if !worker.is_running() {
+        runtime.saved_host_material = None;
         return DesklinkResult::InvalidState;
     }
     let Some(material) = runtime.saved_host_material.as_ref() else {
@@ -1116,6 +1118,7 @@ pub unsafe extern "C" fn desklink_host_create(
         },
         runtime: Mutex::new(None),
         event_thread: Mutex::new(None),
+        event_thread_id: Mutex::new(None),
         lifecycle: Mutex::new(HostLifecycle::Idle),
         callback: Arc::new(HostCallbackState::new(callback, callback_context)),
     };
@@ -1444,14 +1447,42 @@ pub unsafe extern "C" fn desklink_host_destroy(handle: *mut DesklinkHostHandle) 
             .callback
             .emit(HostEvent::ReleaseAll, HostState::Stopping);
     }
-    if let Ok(mut thread) = handle.event_thread.lock()
-        && let Some(thread) = thread.take()
-    {
+    let on_callback_thread = handle
+        .event_thread_id
+        .lock()
+        .ok()
+        .and_then(|thread_id| *thread_id)
+        == Some(thread::current().id());
+    let event_thread = handle
+        .event_thread
+        .lock()
+        .ok()
+        .and_then(|mut thread| thread.take());
+    let runtime = handle
+        .runtime
+        .lock()
+        .ok()
+        .and_then(|mut runtime| runtime.take());
+    handle.callback.clear();
+    if on_callback_thread {
+        let _ = thread::Builder::new()
+            .name("desklink-host-destroy".into())
+            .spawn(move || {
+                if let Some(thread) = event_thread {
+                    let _ = thread.join();
+                }
+                if let Some(runtime) = runtime
+                    && let Ok(runtime) = Arc::try_unwrap(runtime)
+                {
+                    runtime.destroy();
+                }
+            });
+        return;
+    }
+    if let Some(thread) = event_thread {
         let _ = thread.join();
     }
-    handle.callback.clear();
-    if let Ok(mut runtime) = handle.runtime.lock()
-        && let Some(runtime) = runtime.take()
+    if let Some(runtime) = runtime
         && let Ok(runtime) = Arc::try_unwrap(runtime)
     {
         runtime.destroy();
@@ -1581,23 +1612,35 @@ fn start_host_runtime_inner(
     };
     let callback = handle.callback.clone();
     let event_runtime = runtime.clone();
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
     let event_thread = match thread::Builder::new()
         .name("desklink-host-callback".into())
-        .spawn(move || dispatch_host_events(event_runtime, callback))
-    {
+        .spawn(move || {
+            if ready_receiver.recv().is_ok() {
+                dispatch_host_events(event_runtime, callback);
+            }
+        }) {
         Ok(thread) => thread,
         Err(_) => return DesklinkResult::InternalError,
     };
     let Ok(mut runtime_slot) = handle.runtime.lock() else {
+        let _ = ready_sender.send(());
         let _ = event_thread.join();
         return DesklinkResult::InternalError;
     };
+    let event_thread_id = event_thread.thread().id();
     *runtime_slot = Some(runtime);
     drop(runtime_slot);
     let Ok(mut thread_slot) = handle.event_thread.lock() else {
+        let _ = ready_sender.send(());
+        let _ = event_thread.join();
         return DesklinkResult::InternalError;
     };
     *thread_slot = Some(event_thread);
+    if let Ok(mut thread_id_slot) = handle.event_thread_id.lock() {
+        *thread_id_slot = Some(event_thread_id);
+    }
+    let _ = ready_sender.send(());
     DesklinkResult::Ok
 }
 
