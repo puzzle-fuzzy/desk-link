@@ -1,9 +1,12 @@
 import {
+  clearSavedDevices,
   connectDevice,
+  connectSavedDevice,
   connectController,
   createControllerChannels,
   disconnectController,
   forgetController,
+  forgetSavedDevice,
   getControllerSnapshot,
   probeRelay,
   reconnectController,
@@ -40,10 +43,10 @@ type ControllerFeedback = { tone: "success" | "error" | "info"; message: string 
 type VideoPayload = ArrayBuffer | Uint8Array | number[];
 
 const FRAME_PREFIX_BYTES = 17;
-
 let snapshot: ControllerSnapshot | null = null;
 let loading = true;
 let busy = false;
+let cancelling = false;
 let checkingRelay = false;
 let feedback: ControllerFeedback = null;
 let deviceIdDraft = "";
@@ -65,6 +68,10 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
   requestRender = renderer;
   try {
     snapshot = await getControllerSnapshot();
+    const latestSavedDevice = snapshot.savedDevices.at(0);
+    if (!deviceIdDraft && latestSavedDevice) {
+      deviceIdDraft = latestSavedDevice.deviceId;
+    }
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -102,7 +109,7 @@ export function renderControllerView(): string {
       <div class="controller-heading">
         <div>
           <h1>连接另一台电脑</h1>
-          <p>输入主机上显示的设备 ID 和临时密码，然后在主机上确认连接。</p>
+          <p>输入主机上显示的设备 ID 和访问密码，然后在主机上确认连接。</p>
         </div>
         ${renderRuntimeBadge()}
       </div>
@@ -131,6 +138,39 @@ export function bindControllerInteractions(): void {
     input.value = temporaryPasswordDraft;
     updateDeviceSubmitState();
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-controller-saved-device-connect]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const selected = button.dataset.controllerSavedDeviceConnect;
+      if (!selected) {
+        return;
+      }
+      void beginStoredDeviceConnection(selected);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-controller-saved-device-update]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const selected = button.dataset.controllerSavedDeviceUpdate;
+      if (!selected) {
+        return;
+      }
+      deviceIdDraft = formatDeviceId(selected);
+      temporaryPasswordDraft = "";
+      feedback = { tone: "info", message: "请输入主机当前显示的新密码；验证成功后会替换已保存密码。" };
+      requestRender();
+      window.setTimeout(() => document.querySelector<HTMLInputElement>("[data-controller-password]")?.focus(), 0);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-controller-saved-device-forget]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const selected = button.dataset.controllerSavedDeviceForget;
+      if (selected) {
+        void removeStoredDevice(selected);
+      }
+    });
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-saved-devices-clear]")?.addEventListener("click", () => {
+    void clearStoredDevices();
+  });
   document
     .querySelector<HTMLFormElement>("[data-controller-legacy-form]")
     ?.addEventListener("submit", (event) => void submitInvitation(event));
@@ -153,7 +193,10 @@ export function bindControllerInteractions(): void {
     void forgetSavedConnection();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-disconnect]")?.addEventListener("click", () => {
-    void endConnection();
+    void cancelConnection();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-cancel]")?.addEventListener("click", () => {
+    void cancelConnection();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-keyframe]")?.addEventListener("click", () => {
     retryVideo();
@@ -236,11 +279,15 @@ function renderRuntimeBadge(): string {
 
 function renderConnectionPanel(): string {
   const saved = snapshot?.savedConnection;
+  const connectionState = snapshot?.runtime.state ?? "idle";
+  const connectionActive = busy || isActiveConnectionState(connectionState);
   const isWorking =
-    busy
+    connectionActive
+    || cancelling
     || checkingRelay
-    || ["finding", "connecting", "waitingApproval", "reconnecting"].includes(snapshot?.runtime.state ?? "");
+    ;
   const credentialsReady = deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft);
+  const retryAvailable = feedback?.tone === "error" && credentialsReady;
   const recognizedCode = parsePairingCode(invitationDraft, relayDraft, serverNameDraft);
   const codeStatus = !invitationDraft.trim()
     ? { tone: "empty", text: "粘贴完整连接码后，DeskLink 会自动填写连接地址。" }
@@ -251,7 +298,7 @@ function renderConnectionPanel(): string {
     <div class="controller-connect-grid">
       <section class="controller-card controller-card--primary">
         <div class="controller-card-heading">
-          <div><h2>连接远程设备</h2><p>在另一台电脑打开 DeskLink，查看本机 ID 并生成临时密码。</p></div>
+          <div><h2>连接远程设备</h2><p>输入另一台电脑显示的本机 ID，以及临时密码或固定密码。</p></div>
         </div>
         <form class="controller-form controller-device-form" data-controller-device-form>
           <label class="field device-credential-field">
@@ -272,14 +319,14 @@ function renderConnectionPanel(): string {
             >
           </label>
           <label class="field device-credential-field">
-            <span>临时密码</span>
+            <span>访问密码</span>
             <input
               class="temporary-password-input"
               name="temporaryPassword"
               data-controller-password
               value="${escapeHtml(temporaryPasswordDraft)}"
               maxlength="8"
-              placeholder="8 位临时密码"
+              placeholder="8 位访问密码"
               aria-describedby="controller-device-hint"
               required
               autocomplete="one-time-code"
@@ -288,12 +335,15 @@ function renderConnectionPanel(): string {
               ${isWorking ? "disabled" : ""}
             >
           </label>
-          <p class="controller-device-hint" id="controller-device-hint">临时密码仅在主机当前连接窗口内有效。</p>
+          <p class="controller-device-hint" id="controller-device-hint">可以使用主机刚生成的临时密码，或主机已启用的固定密码。</p>
           <div class="controller-form-actions">
             <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
-              ${isWorking ? '<span class="button-spinner" aria-hidden="true"></span> 正在查找设备' : "查找并连接设备"}
+              ${connectionActive ? `<span class="button-spinner" aria-hidden="true"></span> ${escapeHtml(connectionActionLabel(connectionState))}` : connectionState === "stopped" || retryAvailable ? "重新尝试" : "查找并连接设备"}
             </button>
-            <span>找到设备后，主机会显示本次控制请求。</span>
+            ${connectionActive || cancelling
+              ? `<button class="button button--secondary" type="button" data-controller-cancel ${cancelling ? "disabled" : ""}>${cancelling ? "正在取消…" : "取消连接"}</button>`
+              : ""}
+            <span>${connectionActive ? "取消后仍会保留已输入的 ID 和密码，方便再次尝试。" : "找到设备后，主机会显示本次控制请求。"}</span>
           </div>
         </form>
       </section>
@@ -305,6 +355,7 @@ function renderConnectionPanel(): string {
         ${saved ? renderSavedConnection(isWorking) : renderNoSavedConnection()}
       </aside>
     </div>
+    ${renderSavedDevices(isWorking)}
     <details class="controller-legacy-panel" ${invitationDraft.trim() && !recognizedCode ? "open" : ""}>
       <summary>使用旧版连接码</summary>
       <div class="controller-legacy-content">
@@ -341,6 +392,40 @@ function renderConnectionPanel(): string {
       <span class="security-note-mark" aria-hidden="true"></span>
       <div><strong>连接仍需主机确认</strong><p>设备 ID 只用于查找在线主机，远程画面和输入经过端到端加密；新控制端必须在主机上获得本地批准。</p></div>
     </div>
+  `;
+}
+
+function renderSavedDevices(isWorking: boolean): string {
+  const savedDevices = snapshot?.savedDevices ?? [];
+  if (savedDevices.length === 0 && !snapshot?.savedDevicesError) {
+    return "";
+  }
+  return `
+    <section class="saved-devices-panel" aria-label="已加密保存的设备">
+      <div class="saved-devices-heading">
+        <div><h2>已保存设备</h2><p>设备 ID 和密码由当前 Windows 账户加密保存，密码不会发送到页面。</p></div>
+        ${snapshot?.savedDevicesError ? `<button type="button" data-controller-saved-devices-clear ${isWorking ? "disabled" : ""}>清除异常记录</button>` : ""}
+      </div>
+      ${snapshot?.savedDevicesError ? `<p class="inline-error">${escapeHtml(snapshot.savedDevicesError)}</p>` : ""}
+      <div class="saved-device-list">
+        ${savedDevices
+          .map(
+            (saved) => `<article class="saved-device-row">
+              <div class="saved-device-identity">
+                <strong>${escapeHtml(saved.deviceId)}</strong>
+                <span class="saved-device-kind saved-device-kind--${saved.persistent ? "fixed" : "temporary"}">${saved.persistent ? "固定密码" : "临时密码"}</span>
+                <small>${saved.persistent ? "可长期一键连接；主机仍会按安全设置确认。" : "仅在临时密码到期前可重试；失效后请更新密码。"}</small>
+              </div>
+              <div class="saved-device-actions">
+                <button class="button button--primary" type="button" data-controller-saved-device-connect="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>${saved.persistent ? "一键连接" : "快速重试"}</button>
+                <button class="button button--secondary" type="button" data-controller-saved-device-update="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>更新密码</button>
+                <button class="saved-device-remove" type="button" data-controller-saved-device-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
+              </div>
+            </article>`,
+          )
+          .join("")}
+      </div>
+    </section>
   `;
 }
 
@@ -414,13 +499,13 @@ function renderRemoteDesktop(): string {
 function updateDeviceSubmitState(): void {
   const submit = document.querySelector<HTMLButtonElement>("[data-controller-device-submit]");
   if (submit) {
-    submit.disabled = busy || !deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft);
+    submit.disabled = busy || cancelling || !deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft);
   }
 }
 
 async function submitDevice(event: SubmitEvent): Promise<void> {
   event.preventDefault();
-  if (busy) {
+  if (busy || cancelling) {
     return;
   }
   const form = event.currentTarget as HTMLFormElement;
@@ -428,19 +513,16 @@ async function submitDevice(event: SubmitEvent): Promise<void> {
   deviceIdDraft = formatDeviceId(String(data.get("deviceId") ?? ""));
   temporaryPasswordDraft = normalizeTemporaryPassword(String(data.get("temporaryPassword") ?? ""));
   if (!deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft)) {
-    feedback = { tone: "error", message: "请输入完整的 12 位设备 ID 和 8 位临时密码。" };
+    feedback = { tone: "error", message: "请输入完整的 12 位设备 ID 和 8 位访问密码。" };
     requestRender();
     return;
   }
-  const started = await beginConnection((channels) =>
+  await beginConnection((channels) =>
     connectDevice(
       { deviceId: deviceIdDraft, temporaryPassword: temporaryPasswordDraft },
       channels,
     ),
   );
-  if (started) {
-    temporaryPasswordDraft = "";
-  }
 }
 
 async function submitInvitation(event: SubmitEvent): Promise<void> {
@@ -517,8 +599,13 @@ async function beginSavedConnection(): Promise<void> {
   await beginConnection((channels) => reconnectController(channels));
 }
 
+async function beginStoredDeviceConnection(deviceId: string): Promise<void> {
+  deviceIdDraft = formatDeviceId(deviceId);
+  await beginConnection((channels) => connectSavedDevice({ deviceId: deviceIdDraft }, channels));
+}
+
 async function beginConnection(operation: (channels: ControllerChannels) => Promise<ControllerSnapshot>): Promise<boolean> {
-  if (busy) {
+  if (busy || cancelling) {
     return false;
   }
   busy = true;
@@ -543,9 +630,16 @@ async function beginConnection(operation: (channels: ControllerChannels) => Prom
   requestRender();
   let started = false;
   try {
-    snapshot = await operation(channels);
+    const nextSnapshot = await operation(channels);
+    if (generation !== channelGeneration) {
+      return false;
+    }
+    snapshot = nextSnapshot;
     started = true;
   } catch (error) {
+    if (generation !== channelGeneration) {
+      return false;
+    }
     feedback = { tone: "error", message: normalizeError(error) };
     try {
       snapshot = await getControllerSnapshot();
@@ -553,30 +647,49 @@ async function beginConnection(operation: (channels: ControllerChannels) => Prom
       // Keep the last known state; the actionable connection error remains visible.
     }
   } finally {
-    busy = false;
-    requestRender();
+    if (generation === channelGeneration) {
+      busy = false;
+      requestRender();
+    }
   }
   return started;
 }
 
-async function endConnection(): Promise<void> {
-  if (busy) {
+async function cancelConnection(): Promise<void> {
+  if (cancelling) {
     return;
   }
-  busy = true;
+  const wasConnected = snapshot?.runtime.state === "connected";
+  const generation = ++channelGeneration;
+  busy = false;
+  cancelling = true;
   releaseInputState();
   prepareControllerRender();
+  videoConfig = null;
+  activeChannels = null;
+  feedback = { tone: "info", message: wasConnected ? "正在断开远程控制…" : "正在取消本次连接…" };
+  requestRender();
   try {
-    snapshot = await disconnectController();
-    videoConfig = null;
-    channelGeneration += 1;
-    activeChannels = null;
-    feedback = { tone: "info", message: "远程控制已结束，已批准的电脑仍可重新连接。" };
+    const nextSnapshot = await disconnectController();
+    if (generation !== channelGeneration) {
+      return;
+    }
+    snapshot = nextSnapshot;
+    feedback = {
+      tone: "success",
+      message: wasConnected
+        ? "远程控制已结束，已批准的电脑仍可重新连接。"
+        : "已取消连接。设备 ID 和访问密码仍保留，可以直接重新尝试。",
+    };
   } catch (error) {
-    feedback = { tone: "error", message: normalizeError(error) };
+    if (generation === channelGeneration) {
+      feedback = { tone: "error", message: normalizeError(error) };
+    }
   } finally {
-    busy = false;
-    requestRender();
+    if (generation === channelGeneration) {
+      cancelling = false;
+      requestRender();
+    }
   }
 }
 
@@ -600,17 +713,62 @@ async function forgetSavedConnection(): Promise<void> {
   }
 }
 
+async function removeStoredDevice(deviceId: string): Promise<void> {
+  if (busy || cancelling) {
+    return;
+  }
+  busy = true;
+  feedback = null;
+  requestRender();
+  try {
+    snapshot = await forgetSavedDevice({ deviceId });
+    feedback = { tone: "success", message: `已移除设备 ${deviceId} 的加密密码。` };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    busy = false;
+    requestRender();
+  }
+}
+
+async function clearStoredDevices(): Promise<void> {
+  if (busy || cancelling) {
+    return;
+  }
+  busy = true;
+  feedback = null;
+  requestRender();
+  try {
+    snapshot = await clearSavedDevices();
+    feedback = { tone: "success", message: "已清除异常的加密设备记录，现在可以重新输入设备密码。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    busy = false;
+    requestRender();
+  }
+}
+
 function handleSignal(signal: ControllerSignal): void {
   switch (signal.kind) {
     case "status":
       if (snapshot) {
         snapshot.runtime = signal.runtime;
       } else {
-        snapshot = { runtime: signal.runtime, savedConnection: null, connectionError: null };
+        snapshot = {
+          runtime: signal.runtime,
+          savedConnection: null,
+          connectionError: null,
+          savedDevices: [],
+          savedDevicesError: null,
+        };
       }
       if (signal.runtime.state !== "connected") {
         videoConfig = null;
         failedVideoConfig = null;
+      }
+      if (signal.runtime.state === "connected") {
+        temporaryPasswordDraft = "";
       }
       requestRender();
       break;
@@ -631,6 +789,23 @@ function handleSignal(signal: ControllerSignal): void {
       }
       break;
     }
+  }
+}
+
+function isActiveConnectionState(state: string): boolean {
+  return ["finding", "connecting", "waitingApproval", "reconnecting"].includes(state);
+}
+
+function connectionActionLabel(state: string): string {
+  switch (state) {
+    case "waitingApproval":
+      return "等待主机确认";
+    case "reconnecting":
+      return "正在重试连接";
+    case "connecting":
+      return "正在建立安全连接";
+    default:
+      return "正在查找设备";
   }
 }
 

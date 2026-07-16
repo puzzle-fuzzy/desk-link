@@ -153,7 +153,9 @@ impl RelayDirectoryRegistration {
                 "device directory invitation has an invalid length".to_owned(),
             ));
         }
-        if ttl_s == 0 || ttl_s > MAX_DIRECTORY_TTL_S {
+        // A zero TTL is a persistent entry whose lifetime is bound to the
+        // publishing host's live relay connection.
+        if ttl_s > MAX_DIRECTORY_TTL_S {
             return Err(TransportError::InvalidConfig(
                 "device directory TTL is invalid".to_owned(),
             ));

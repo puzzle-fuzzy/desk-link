@@ -11,7 +11,7 @@ use std::{
 };
 
 use blake2::{Blake2s256, Digest};
-use desklink_crypto::{PairingError, PairingInvite, PeerIdentity};
+use desklink_crypto::{PairingError, PairingInvite, PeerIdentity, SessionId};
 use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 use windows::{
@@ -31,7 +31,7 @@ use crate::{
     storage::local_app_data_path,
     window::{
         ApprovedController, PairingApprovalError, PairingApprovalGate, PendingController,
-        WindowsLocalApprovalDialog,
+        PersistentApprovalGate, WindowsLocalApprovalDialog,
     },
 };
 
@@ -259,6 +259,80 @@ impl ControllerAuthorizer for WindowsPairingAuthorizer {
             Err(PairingApprovalError::Expired) => {
                 return Ok(ControllerAuthorization::Expired);
             }
+            Err(error) => return Err(error.to_string()),
+        };
+        self.store
+            .trust(approved)
+            .map_err(|error| error.to_string())?;
+        Ok(ControllerAuthorization::Authorized)
+    }
+}
+
+const PERSISTENT_APPROVAL_TTL_S: u64 = 120;
+
+/// Authorizes access found through the host's fixed password. Existing trusted
+/// controllers connect immediately; every unknown authenticated identity still
+/// requires an explicit local Windows confirmation before trust is persisted.
+pub struct WindowsPersistentAccessAuthorizer {
+    store: WindowsTrustedControllerStore,
+    gate: Mutex<PersistentApprovalGate>,
+    approval: Box<dyn LocalControllerApproval>,
+}
+
+impl WindowsPersistentAccessAuthorizer {
+    pub fn new(
+        store: WindowsTrustedControllerStore,
+        session_id: SessionId,
+        approval: Box<dyn LocalControllerApproval>,
+    ) -> Self {
+        Self {
+            store,
+            gate: Mutex::new(PersistentApprovalGate::new(session_id)),
+            approval,
+        }
+    }
+}
+
+impl ControllerAuthorizer for WindowsPersistentAccessAuthorizer {
+    fn authorize(&self, identity: PeerIdentity) -> Result<ControllerAuthorization, String> {
+        match self
+            .store
+            .status(identity)
+            .map_err(|error| error.to_string())?
+        {
+            TrustStatus::Trusted(_) => return Ok(ControllerAuthorization::Authorized),
+            TrustStatus::KeyChanged { .. } => return Ok(ControllerAuthorization::KeyChanged),
+            TrustStatus::Unknown => {}
+        }
+
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| "fixed-access approval lock is poisoned".to_owned())?;
+        // Another request may have approved this identity while this request
+        // was waiting for the serialized local prompt.
+        match self
+            .store
+            .status(identity)
+            .map_err(|error| error.to_string())?
+        {
+            TrustStatus::Trusted(_) => return Ok(ControllerAuthorization::Authorized),
+            TrustStatus::KeyChanged { .. } => return Ok(ControllerAuthorization::KeyChanged),
+            TrustStatus::Unknown => {}
+        }
+
+        let started_at_unix_s = now_unix_s()?;
+        let pending = gate
+            .begin(identity, started_at_unix_s, PERSISTENT_APPROVAL_TTL_S)
+            .map_err(|error| error.to_string())?;
+        if !self.approval.approve(pending) {
+            gate.reject(pending.identity())
+                .map_err(|error| error.to_string())?;
+            return Ok(ControllerAuthorization::Rejected);
+        }
+        let approved = match gate.approve(pending.identity(), now_unix_s()?) {
+            Ok(approved) => approved,
+            Err(PairingApprovalError::Expired) => return Ok(ControllerAuthorization::Expired),
             Err(error) => return Err(error.to_string()),
         };
         self.store

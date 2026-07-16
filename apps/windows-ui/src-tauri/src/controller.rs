@@ -1,13 +1,17 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use apps_windows::{
     controller_settings::{ControllerConnectionSettings, WindowsControllerConnectionStore},
     identity::WindowsIdentityStore,
+    recent_access::{RecentAccessEntry, WindowsRecentAccessStore},
 };
-use desklink_crypto::{PAIRING_INVITE_BYTES, PairingInvite};
+use desklink_crypto::{PAIRING_INVITE_BYTES, PairingCode, PairingInvite};
 use desklink_ffi::{ControllerError, ControllerEvent, ControllerRuntime};
 use desklink_protocol::{
     FrameFlags, InputEvent, KeyCode, MAX_POINTER_COORDINATE, MAX_WHEEL_DELTA, Modifiers,
@@ -27,6 +31,9 @@ const COMMAND_CAPACITY: usize = 512;
 const FRAME_PREFIX_BYTES: usize = 17;
 const MAX_TEXT_INPUT_CHARACTERS: usize = 256;
 const MAX_TEXT_INPUT_BYTES: usize = 1_024;
+const RECENT_CANCELLATION_WINDOW: Duration = Duration::from_secs(15);
+const DIRECTORY_RECOVERY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(500), Duration::from_millis(1_250)];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,7 +67,20 @@ impl ControllerRuntimeSummary {
         Self {
             state: "finding",
             title: "正在查找设备".to_owned(),
-            detail: "DeskLink 正在通过安全中继确认设备 ID 和临时密码。".to_owned(),
+            detail: "DeskLink 正在通过安全中继确认设备 ID 和访问密码。".to_owned(),
+            stream_id: None,
+        }
+    }
+
+    fn finding_after_cancel(retry: usize, delay: Duration) -> Self {
+        Self {
+            state: "finding",
+            title: "正在恢复上次连接".to_owned(),
+            detail: format!(
+                "主机可能正在重新上线，DeskLink 将在 {} 毫秒后自动重试（{retry}/{}）。",
+                delay.as_millis(),
+                DIRECTORY_RECOVERY_DELAYS.len()
+            ),
             stream_id: None,
         }
     }
@@ -120,9 +140,11 @@ pub struct ControllerSnapshot {
     pub runtime: ControllerRuntimeSummary,
     pub saved_connection: Option<SavedControllerConnectionSummary>,
     pub connection_error: Option<String>,
+    pub saved_devices: Vec<SavedDeviceCredentialSummary>,
+    pub saved_devices_error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerConnectionInput {
     relay_address: String,
@@ -130,11 +152,25 @@ pub struct ControllerConnectionInput {
     invitation: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerDeviceInput {
     device_id: String,
     temporary_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDeviceInput {
+    device_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDeviceCredentialSummary {
+    pub device_id: String,
+    pub persistent: bool,
+    pub last_used_unix_s: u64,
 }
 
 impl Drop for ControllerDeviceInput {
@@ -146,6 +182,29 @@ impl Drop for ControllerDeviceInput {
 impl Drop for ControllerConnectionInput {
     fn drop(&mut self) {
         self.invitation.zeroize();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeviceCredentialSource {
+    Entered,
+    Saved { persistent: bool },
+}
+
+impl DeviceCredentialSource {
+    fn not_found_message(self, recover_after_cancel: bool) -> &'static str {
+        match self {
+            Self::Entered if recover_after_cancel => {
+                "主机仍未恢复在线。如果使用临时密码，请在主机上重新生成；如果使用固定密码，请确认主机已打开后再试。"
+            }
+            Self::Entered => "找不到在线设备或访问密码不正确，请确认主机在线并检查密码后重试。",
+            Self::Saved { persistent: true } => {
+                "找不到在线设备。请确认主机已打开；如果主机更换过固定密码，请移除此记录并输入新密码。"
+            }
+            Self::Saved { persistent: false } => {
+                "保存的临时密码可能已经过期。请在主机上重新生成临时密码，再输入新密码连接。"
+            }
+        }
     }
 }
 
@@ -212,6 +271,8 @@ pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
     worker: Arc<Mutex<Option<ControllerWorker>>>,
     operation_lock: Arc<AsyncMutex<()>>,
+    operation_generation: Arc<AtomicU64>,
+    recent_cancellation: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Default for ControllerManager {
@@ -220,6 +281,8 @@ impl Default for ControllerManager {
             status: Arc::new(Mutex::new(ControllerRuntimeSummary::idle())),
             worker: Arc::new(Mutex::new(None)),
             operation_lock: Arc::new(AsyncMutex::new(())),
+            operation_generation: Arc::new(AtomicU64::new(0)),
+            recent_cancellation: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -240,8 +303,10 @@ impl ControllerManager {
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
+        let generation = self.begin_operation();
         let settings = settings_from_invitation(input)?;
-        self.start(settings, true, signals, video).await?;
+        self.start(generation, settings, true, signals, video)
+            .await?;
         load_snapshot(self.snapshot())
     }
 
@@ -251,12 +316,54 @@ impl ControllerManager {
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
-        self.publish(&signals, ControllerRuntimeSummary::finding());
+        let device_id =
+            crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
+        let access_code = crate::device_directory::parse_access_code(&input.temporary_password)
+            .map_err(str::to_owned)?;
+        let password = PairingCode::from_bytes(access_code)
+            .map_err(|_| "设备 ID 或访问密码格式无效。".to_owned())?;
+        self.connect_device_credentials(
+            device_id,
+            password,
+            DeviceCredentialSource::Entered,
+            signals,
+            video,
+        )
+        .await
+    }
+
+    pub async fn connect_saved_device(
+        &self,
+        input: SavedDeviceInput,
+        signals: Channel<ControllerSignal>,
+        video: Channel<Response>,
+    ) -> Result<ControllerSnapshot, String> {
+        let device_id =
+            crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
+        let saved = WindowsRecentAccessStore::for_current_user()
+            .map_err(|_| "当前 Windows 账户无法使用已保存的设备密码。".to_owned())?
+            .find(device_id)
+            .map_err(|_| "无法解密已保存的设备密码，请移除此记录后重新输入。".to_owned())?
+            .ok_or_else(|| "这台设备没有已保存的访问密码，请重新输入密码。".to_owned())?;
+        let source = DeviceCredentialSource::Saved {
+            persistent: saved.is_persistent(),
+        };
+        self.connect_device_credentials(device_id, saved.password().clone(), source, signals, video)
+            .await
+    }
+
+    async fn connect_device_credentials(
+        &self,
+        device_id: u64,
+        password: PairingCode,
+        source: DeviceCredentialSource,
+        signals: Channel<ControllerSignal>,
+        video: Channel<Response>,
+    ) -> Result<ControllerSnapshot, String> {
+        let recover_after_cancel = self.take_recent_cancellation();
+        let generation = self.begin_operation();
+        self.publish_if_current(generation, &signals, ControllerRuntimeSummary::finding());
         let settings = async {
-            let device_id = crate::device_directory::parse_device_id(&input.device_id)
-                .map_err(str::to_owned)?;
-            let access_code = crate::device_directory::parse_access_code(&input.temporary_password)
-                .map_err(str::to_owned)?;
             let config = crate::local_relay::client_config(
                 crate::local_relay::MANAGED_RELAY_ADDRESS
                     .parse()
@@ -267,46 +374,77 @@ impl ControllerManager {
             let client = QuicClient::connect(config)
                 .await
                 .map_err(|_| "无法连接 DeskLink 中继服务器，请检查网络后重试。".to_owned())?;
-            let lookup = RelayDirectoryLookup::new(device_id, access_code)
-                .map_err(|_| "设备 ID 或临时密码格式无效。".to_owned())?;
-            let mut invitation =
-                client
-                    .lookup_directory(lookup)
-                    .await
-                    .map_err(|error| match error {
-                        TransportError::DirectoryNotFound => {
-                            "找不到在线设备或临时密码不正确，请在主机上刷新密码后重试。".to_owned()
-                        }
-                        TransportError::DirectoryRateLimited => {
-                            "尝试次数过多，请等待一分钟后再试。".to_owned()
-                        }
-                        _ => "设备查询暂时失败，请检查网络后重试。".to_owned(),
-                    })?;
+            let lookup = RelayDirectoryLookup::new(device_id, *password.as_bytes())
+                .map_err(|_| "设备 ID 或访问密码格式无效。".to_owned())?;
+            let mut retry = 0;
+            let mut invitation = loop {
+                match client.lookup_directory(lookup.clone()).await {
+                    Ok(invitation) => break invitation,
+                    Err(TransportError::DirectoryNotFound)
+                        if recover_after_cancel && retry < DIRECTORY_RECOVERY_DELAYS.len() =>
+                    {
+                        let delay = DIRECTORY_RECOVERY_DELAYS[retry];
+                        retry += 1;
+                        self.publish_if_current(
+                            generation,
+                            &signals,
+                            ControllerRuntimeSummary::finding_after_cancel(retry, delay),
+                        );
+                        tokio::time::sleep(delay).await;
+                        self.ensure_current(generation)?;
+                    }
+                    Err(TransportError::DirectoryNotFound) => {
+                        return Err(source.not_found_message(recover_after_cancel).to_owned());
+                    }
+                    Err(TransportError::DirectoryRateLimited) => {
+                        return Err("尝试次数过多，请等待一分钟后再试。".to_owned());
+                    }
+                    Err(_) => {
+                        return Err("设备查询暂时失败，请检查网络后重试。".to_owned());
+                    }
+                }
+            };
             drop(client);
             let invite = match PairingInvite::decode(&invitation, now_unix_s()) {
                 Ok(invite) => invite,
                 Err(_) => {
                     invitation.zeroize();
-                    return Err("主机返回的连接信息无效或已经过期，请刷新临时密码。".to_owned());
+                    return Err(
+                        "主机返回的连接信息无效或已经过期，请检查或刷新访问密码。".to_owned()
+                    );
                 }
             };
             invitation.zeroize();
-            ControllerConnectionSettings::from_invite(
+            let persistent = invite.is_persistent();
+            let settings = ControllerConnectionSettings::from_invite(
                 crate::local_relay::MANAGED_RELAY_ADDRESS,
                 crate::local_relay::MANAGED_RELAY_SERVER_NAME,
                 &invite,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            WindowsRecentAccessStore::for_current_user()
+                .map_err(|_| "当前 Windows 账户无法安全保存设备密码。".to_owned())?
+                .remember(device_id, password, persistent, now_unix_s())
+                .map_err(|_| {
+                    "设备验证成功，但 Windows 无法加密保存密码。请检查当前账户的数据目录后重试。"
+                        .to_owned()
+                })?;
+            Ok(settings)
         }
         .await;
         let settings = match settings {
             Ok(settings) => settings,
             Err(error) => {
-                self.publish(&signals, ControllerRuntimeSummary::idle());
+                if !self.is_current(generation) {
+                    return Err("连接已取消。".to_owned());
+                }
+                self.publish_if_current(generation, &signals, ControllerRuntimeSummary::idle());
                 return Err(error);
             }
         };
-        self.start(settings, true, signals, video).await?;
+        self.ensure_current(generation)?;
+        self.start(generation, settings, true, signals, video)
+            .await?;
         load_snapshot(self.snapshot())
     }
 
@@ -315,26 +453,31 @@ impl ControllerManager {
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
+        let generation = self.begin_operation();
         let store = WindowsControllerConnectionStore::for_current_user()
             .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?;
         let settings = store
             .load()
             .map_err(|_| "无法打开已保存的控制端连接。".to_owned())?
             .ok_or_else(|| "没有可供重新连接的已保存 Windows 电脑。".to_owned())?;
-        self.start(settings, false, signals, video).await?;
+        self.start(generation, settings, false, signals, video)
+            .await?;
         load_snapshot(self.snapshot())
     }
 
     async fn start(
         &self,
+        generation: u64,
         settings: ControllerConnectionSettings,
         save_after_approval: bool,
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
     ) -> Result<(), String> {
         let _operation = self.operation_lock.lock().await;
+        self.ensure_current(generation)?;
         self.stop_current().await;
-        self.publish(&signals, ControllerRuntimeSummary::connecting());
+        self.ensure_current(generation)?;
+        self.publish_if_current(generation, &signals, ControllerRuntimeSummary::connecting());
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let manager = self.clone();
         let task = tauri::async_runtime::spawn(async move {
@@ -383,6 +526,8 @@ impl ControllerManager {
     }
 
     pub async fn disconnect(&self) -> Result<ControllerSnapshot, String> {
+        self.remember_active_cancellation();
+        self.cancel_operations();
         let _operation = self.operation_lock.lock().await;
         self.stop_current().await;
         self.set_status(ControllerRuntimeSummary::idle());
@@ -390,6 +535,7 @@ impl ControllerManager {
     }
 
     pub async fn forget_saved(&self) -> Result<ControllerSnapshot, String> {
+        self.cancel_operations();
         let _operation = self.operation_lock.lock().await;
         self.stop_current().await;
         WindowsControllerConnectionStore::for_current_user()
@@ -400,7 +546,29 @@ impl ControllerManager {
         load_snapshot(self.snapshot())
     }
 
+    pub async fn forget_saved_device(
+        &self,
+        input: SavedDeviceInput,
+    ) -> Result<ControllerSnapshot, String> {
+        let device_id =
+            crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
+        WindowsRecentAccessStore::for_current_user()
+            .map_err(|_| "当前 Windows 账户无法使用已保存的设备密码。".to_owned())?
+            .remove(device_id)
+            .map_err(|_| "DeskLink 无法移除已保存的设备密码。".to_owned())?;
+        load_snapshot(self.snapshot())
+    }
+
+    pub async fn clear_saved_devices(&self) -> Result<ControllerSnapshot, String> {
+        WindowsRecentAccessStore::for_current_user()
+            .map_err(|_| "当前 Windows 账户无法使用已保存的设备密码。".to_owned())?
+            .clear()
+            .map_err(|_| "DeskLink 无法清除已保存的设备密码。".to_owned())?;
+        load_snapshot(self.snapshot())
+    }
+
     pub fn request_stop(&self) {
+        self.cancel_operations();
         if let Ok(worker) = self.worker.lock()
             && let Some(worker) = worker.as_ref()
         {
@@ -433,6 +601,61 @@ impl ControllerManager {
             *current = status;
         }
     }
+
+    fn begin_operation(&self) -> u64 {
+        self.operation_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn cancel_operations(&self) {
+        self.operation_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn remember_active_cancellation(&self) {
+        let active = self
+            .status
+            .lock()
+            .map(|status| {
+                matches!(
+                    status.state,
+                    "finding" | "connecting" | "waitingApproval" | "reconnecting"
+                )
+            })
+            .unwrap_or(false);
+        if active && let Ok(mut cancelled_at) = self.recent_cancellation.lock() {
+            *cancelled_at = Some(Instant::now());
+        }
+    }
+
+    fn take_recent_cancellation(&self) -> bool {
+        self.recent_cancellation
+            .lock()
+            .ok()
+            .and_then(|mut cancelled_at| cancelled_at.take())
+            .is_some_and(|cancelled_at| cancelled_at.elapsed() <= RECENT_CANCELLATION_WINDOW)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.operation_generation.load(Ordering::SeqCst) == generation
+    }
+
+    fn ensure_current(&self, generation: u64) -> Result<(), String> {
+        if self.is_current(generation) {
+            Ok(())
+        } else {
+            Err("连接已取消。".to_owned())
+        }
+    }
+
+    fn publish_if_current(
+        &self,
+        generation: u64,
+        signals: &Channel<ControllerSignal>,
+        status: ControllerRuntimeSummary,
+    ) {
+        if self.is_current(generation) {
+            self.publish(signals, status);
+        }
+    }
 }
 
 pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnapshot, String> {
@@ -453,11 +676,37 @@ pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnap
             Some("无法打开已保存的控制端连接，请先移除记录再重新配对。".to_owned()),
         ),
     };
+    let (saved_devices, saved_devices_error) = match WindowsRecentAccessStore::for_current_user() {
+        Ok(store) => match store.load() {
+            Ok(entries) => (
+                entries.iter().map(saved_device_summary).collect::<Vec<_>>(),
+                None,
+            ),
+            Err(_) => (
+                Vec::new(),
+                Some("无法解密已保存的设备密码，请移除异常记录后重新输入。".to_owned()),
+            ),
+        },
+        Err(_) => (
+            Vec::new(),
+            Some("当前 Windows 账户无法使用加密的设备密码存储。".to_owned()),
+        ),
+    };
     Ok(ControllerSnapshot {
         runtime,
         saved_connection,
         connection_error,
+        saved_devices,
+        saved_devices_error,
     })
+}
+
+fn saved_device_summary(entry: &RecentAccessEntry) -> SavedDeviceCredentialSummary {
+    SavedDeviceCredentialSummary {
+        device_id: crate::device_directory::format_device_id(entry.device_id()),
+        persistent: entry.is_persistent(),
+        last_used_unix_s: entry.last_used_unix_s(),
+    }
 }
 
 pub fn migrate_legacy_local_connection() -> Result<bool, String> {
@@ -963,7 +1212,10 @@ fn now_unix_s() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectFailure, ControllerInput, parse_input, validate_text_input};
+    use super::{
+        ConnectFailure, ControllerInput, ControllerManager, ControllerRuntimeSummary, parse_input,
+        validate_text_input,
+    };
     use desklink_protocol::{InputEvent, KeyCode, Modifiers};
     use desklink_transport::{JoinRejectCode, TransportError};
 
@@ -1076,5 +1328,36 @@ mod tests {
         assert!(expired.detail.contains("失效"));
         assert!(!mismatch.retryable);
         assert!(mismatch.detail.contains("不匹配"));
+    }
+
+    #[test]
+    fn cancelling_invalidates_every_in_flight_connection_generation() {
+        let manager = ControllerManager::default();
+        let first = manager.begin_operation();
+        assert!(manager.ensure_current(first).is_ok());
+
+        manager.cancel_operations();
+        assert_eq!(
+            manager.ensure_current(first),
+            Err("连接已取消。".to_owned())
+        );
+
+        let retry = manager.begin_operation();
+        assert!(retry > first);
+        assert!(manager.ensure_current(retry).is_ok());
+    }
+
+    #[test]
+    fn only_an_active_recent_cancellation_enables_one_recovery_lookup() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::finding());
+        manager.remember_active_cancellation();
+
+        assert!(manager.take_recent_cancellation());
+        assert!(!manager.take_recent_cancellation());
+
+        manager.set_status(ControllerRuntimeSummary::idle());
+        manager.remember_active_cancellation();
+        assert!(!manager.take_recent_cancellation());
     }
 }

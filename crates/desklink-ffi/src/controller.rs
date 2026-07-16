@@ -22,8 +22,10 @@ use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
+// The host opens its local approval dialog after the Noise handshake. The
+// controller waits for capability negotiation while that dialog is visible.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ASSEMBLY_CAPACITY: usize = 3;
 const ASSEMBLY_MAX_AGE: Duration = Duration::from_millis(500);
 

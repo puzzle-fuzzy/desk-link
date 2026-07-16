@@ -207,6 +207,45 @@ async fn directory_resolves_an_online_host_only_with_the_temporary_password() {
 }
 
 #[tokio::test]
+async fn persistent_directory_entry_lives_until_the_host_disconnects() {
+    let relay = spawn_test_relay().await;
+    let device_id = 223_456_789_012;
+    let access_code = *b"AB2DEF3G";
+    let invitation = b"persistent signed invitation".to_vec();
+    let registration =
+        RelayDirectoryRegistration::new(device_id, access_code, invitation.clone(), 0).unwrap();
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(
+            RelayJoin::host_with_participant(session(24), [5; 32], [8; 16])
+                .with_directory_registration(registration)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let lookup = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        lookup
+            .lookup_directory(RelayDirectoryLookup::new(device_id, access_code).unwrap())
+            .await
+            .unwrap(),
+        invitation
+    );
+
+    drop(host_client);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let lookup = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        lookup
+            .lookup_directory(RelayDirectoryLookup::new(device_id, access_code).unwrap())
+            .await,
+        Err(TransportError::DirectoryNotFound)
+    );
+}
+
+#[tokio::test]
 async fn directory_rate_limits_repeated_failed_lookups_without_revealing_device_presence() {
     let relay = spawn_test_relay().await;
     let lookup = RelayDirectoryLookup::new(987_654_321_012, *b"AB2DEF3G").unwrap();

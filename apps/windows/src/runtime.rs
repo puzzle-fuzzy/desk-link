@@ -37,7 +37,9 @@ use crate::{
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
 const CURSOR_INTERVAL: Duration = Duration::from_millis(16);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+// The authenticated handshake includes the native local-approval dialog. Give
+// the person at the host enough time to inspect and approve the controller.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,16 +338,18 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         | HostRuntimeError::HandshakeTimeout
         | HostRuntimeError::NegotiationTimeout
         | HostRuntimeError::UntrustedController
-        | HostRuntimeError::ControllerKeyChanged => true,
-        HostRuntimeError::Protocol(_)
+        | HostRuntimeError::ControllerKeyChanged
+        // A malformed, incompatible, or interrupted controller must only end
+        // that peer attempt. It must never be able to stop the host service.
+        | HostRuntimeError::Protocol(_)
         | HostRuntimeError::Crypto(_)
-        | HostRuntimeError::Capture(_)
+        | HostRuntimeError::InvalidControllerCapabilities
+        | HostRuntimeError::UnexpectedHandshakeStep => true,
+        HostRuntimeError::Capture(_)
         | HostRuntimeError::InvalidDimensions
         | HostRuntimeError::InconsistentVideoConfig
         | HostRuntimeError::Encoder(_)
         | HostRuntimeError::Input(_)
-        | HostRuntimeError::InvalidControllerCapabilities
-        | HostRuntimeError::UnexpectedHandshakeStep
         | HostRuntimeError::CaptureWorkerStopped
         | HostRuntimeError::CaptureWorkerPanicked
         | HostRuntimeError::ApprovalRequired
@@ -370,7 +374,8 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::ConnectionLimit
         | TransportError::Stream(_)
         | TransportError::Datagram(_)
-        | TransportError::Closed => true,
+        | TransportError::Closed
+        | TransportError::Malformed => true,
         TransportError::JoinRejected(code) => matches!(
             code,
             JoinRejectCode::SessionNotFound
@@ -384,7 +389,6 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::AlreadyJoined
         | TransportError::DirectoryNotFound
         | TransportError::DirectoryRateLimited
-        | TransportError::Malformed
         | TransportError::InvalidConfig(_) => false,
     }
 }

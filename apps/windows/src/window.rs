@@ -276,6 +276,78 @@ impl Default for PairingApprovalGate {
     }
 }
 
+/// Serializes approval requests for fixed-password access. Unlike a one-time
+/// invitation, this gate returns to its empty state after every decision.
+pub struct PersistentApprovalGate {
+    session_id: SessionId,
+    pending: Option<PendingController>,
+}
+
+impl PersistentApprovalGate {
+    pub const fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            pending: None,
+        }
+    }
+
+    pub fn begin(
+        &mut self,
+        identity: PeerIdentity,
+        now_unix_s: u64,
+        ttl_s: u64,
+    ) -> Result<PendingController, PairingApprovalError> {
+        if self.pending.is_some() || ttl_s == 0 {
+            return Err(PairingApprovalError::InvalidState);
+        }
+        let pending = PendingController {
+            session_id: self.session_id,
+            identity,
+            expires_at_unix_s: now_unix_s.saturating_add(ttl_s),
+        };
+        self.pending = Some(pending);
+        Ok(pending)
+    }
+
+    pub fn approve(
+        &mut self,
+        displayed_identity: PeerIdentity,
+        now_unix_s: u64,
+    ) -> Result<ApprovedController, PairingApprovalError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(PairingApprovalError::NoPendingController)?;
+        if now_unix_s >= pending.expires_at_unix_s {
+            self.pending = None;
+            return Err(PairingApprovalError::Expired);
+        }
+        if pending.identity != displayed_identity {
+            return Err(PairingApprovalError::ControllerChanged);
+        }
+        let pending = self
+            .pending
+            .take()
+            .ok_or(PairingApprovalError::NoPendingController)?;
+        Ok(ApprovedController {
+            identity: pending.identity,
+            approved_at_unix_s: now_unix_s,
+        })
+    }
+
+    pub fn reject(&mut self, displayed_identity: PeerIdentity) -> Result<(), PairingApprovalError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(PairingApprovalError::NoPendingController)?;
+        if pending.identity != displayed_identity {
+            return Err(PairingApprovalError::ControllerChanged);
+        }
+        self.pending = None;
+        Ok(())
+    }
+}
+
 pub struct HostApprovalWindow {
     state: ApprovalState,
 }

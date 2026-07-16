@@ -156,7 +156,7 @@ fn cursor_coordinates_are_normalized_and_clamped() {
 }
 
 #[test]
-fn host_retries_only_transient_network_and_timeout_failures() {
+fn host_rearms_after_network_or_peer_session_failures() {
     assert!(host_error_is_retryable(&HostRuntimeError::TransportClosed(
         "relay restarted".to_owned()
     )));
@@ -169,6 +169,15 @@ fn host_retries_only_transient_network_and_timeout_failures() {
     ));
     assert!(host_error_is_retryable(&HostRuntimeError::Transport(
         TransportError::JoinRejected(JoinRejectCode::SessionOccupied)
+    )));
+    assert!(host_error_is_retryable(
+        &HostRuntimeError::UnexpectedHandshakeStep
+    ));
+    assert!(host_error_is_retryable(
+        &HostRuntimeError::InvalidControllerCapabilities
+    ));
+    assert!(host_error_is_retryable(&HostRuntimeError::Transport(
+        TransportError::Malformed
     )));
     assert!(!host_error_is_retryable(&HostRuntimeError::Transport(
         TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch)

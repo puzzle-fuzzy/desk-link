@@ -340,6 +340,100 @@ mod windows {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn malformed_controller_attempt_does_not_stop_the_host_service() {
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let session_id = SessionId::from_bytes([131; 16]);
+        let authentication = [132; 32];
+        let host = DeviceIdentity::from_secret_key([133; 16], &[134; 32]);
+        let host_key = host.verify_key();
+        let controller_secret = [136; 32];
+        let controller = DeviceIdentity::from_secret_key([135; 16], &controller_secret);
+        let controller_key = controller.verify_key();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observer_events = events.clone();
+        let observer = Arc::new(move |event| observer_events.lock().unwrap().push(event));
+        let host_task = tokio::spawn(
+            supervisor(
+                tls.client_config(relay.address),
+                session_id,
+                authentication,
+                host,
+                controller_key,
+                None,
+            )
+            .with_reconnect_policy(
+                ReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(100), 20)
+                    .unwrap(),
+            )
+            .with_observer(observer)
+            .run(),
+        );
+
+        let malformed = loop {
+            let client = QuicClient::connect(tls.client_config(relay.address))
+                .await
+                .unwrap();
+            match client
+                .join(RelayJoin::controller(session_id, authentication))
+                .await
+            {
+                Ok(()) => break client,
+                Err(TransportError::JoinRejected(JoinRejectCode::SessionNotFound)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("malformed controller join failed: {error}"),
+            }
+        };
+        malformed.send_control(vec![0xff]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, HostLifecycleEvent::Reconnecting { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host did not rearm after the malformed controller request");
+        drop(malformed);
+
+        let mut valid = connect_controller(
+            &tls,
+            relay.address,
+            session_id,
+            authentication,
+            DeviceIdentity::from_secret_key([135; 16], &controller_secret),
+            host_key,
+        )
+        .await;
+        assert!(next_video_config(&mut valid).await > 1);
+        {
+            let recorded = events.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|event| matches!(event, HostLifecycleEvent::Reconnecting { .. }))
+            );
+            assert!(
+                recorded
+                    .iter()
+                    .all(|event| !matches!(event, HostLifecycleEvent::Stopped { .. }))
+            );
+        }
+
+        host_task.abort();
+        let _ = host_task.await;
+        drop(valid);
+        relay.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authentication_mismatch_fails_without_retrying() {
         let tls = TestTls::new();

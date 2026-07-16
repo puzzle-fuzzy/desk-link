@@ -430,7 +430,7 @@ struct DirectoryRecord {
     connection_id: u64,
     access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
     invitation: Vec<u8>,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
 }
 
 impl Drop for DirectoryRecord {
@@ -518,7 +518,7 @@ impl RelayState {
                 connection_id,
                 *registration.access_code(),
                 registration.invitation().to_vec(),
-                Duration::from_secs(u64::from(registration.ttl_s())),
+                registration.ttl_s(),
             );
         }
         let mut participants = self.lock_participants();
@@ -544,7 +544,7 @@ impl RelayState {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        directory.retain(|_, record| record.expires_at > now);
+        directory.retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
         if directory
             .get(&device_id)
             .is_some_and(|record| record.participant_id != participant_id)
@@ -562,7 +562,7 @@ impl RelayState {
         connection_id: u64,
         access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
         invitation: Vec<u8>,
-        ttl: Duration,
+        ttl_s: u16,
     ) {
         let mut directory = match self.directory.lock() {
             Ok(guard) => guard,
@@ -575,7 +575,8 @@ impl RelayState {
                 connection_id,
                 access_code,
                 invitation,
-                expires_at: Instant::now() + ttl,
+                expires_at: (ttl_s != 0)
+                    .then(|| Instant::now() + Duration::from_secs(u64::from(ttl_s))),
             },
         );
     }
@@ -608,7 +609,8 @@ impl RelayState {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            directory.retain(|_, record| record.expires_at > now);
+            directory
+                .retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
             directory.get(&lookup.device_id()).and_then(|record| {
                 bool::from(record.access_code.ct_eq(lookup.access_code()))
                     .then(|| record.invitation.clone())
@@ -682,7 +684,7 @@ impl RelayState {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        directory.retain(|_, record| record.expires_at > now);
+        directory.retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
     }
 }
 

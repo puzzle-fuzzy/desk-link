@@ -10,8 +10,12 @@ pub mod controller_settings;
 pub mod diagnostics;
 pub mod encoder;
 #[cfg(windows)]
+pub mod fixed_access;
+#[cfg(windows)]
 pub mod identity;
 pub mod input;
+#[cfg(windows)]
+pub mod recent_access;
 pub mod runtime;
 mod storage;
 pub mod tray;

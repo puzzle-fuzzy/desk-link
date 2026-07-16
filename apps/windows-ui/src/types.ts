@@ -51,6 +51,13 @@ export interface HostRuntimeSummary {
   tooltip: string;
 }
 
+export interface HostApprovalSummary {
+  requestId: number;
+  deviceId: string;
+  fingerprint: string;
+  expiresAtUnixS: number;
+}
+
 export interface HostSnapshot {
   readiness: Readiness;
   title: string;
@@ -63,6 +70,9 @@ export interface HostSnapshot {
   relayStatus: RelayStatusSummary;
   diagnosticChecks: DiagnosticCheckSummary[];
   pairingActive: boolean;
+  pendingApproval: HostApprovalSummary | null;
+  fixedPasswordEnabled: boolean;
+  fixedPasswordError: string | null;
   deviceId: string | null;
   refreshedAtUnixS: number;
 }
@@ -72,6 +82,11 @@ export interface PairingSessionSummary {
   temporaryPassword: string;
   invitation: string;
   expiresAtUnixS: number;
+}
+
+export interface FixedAccessSummary {
+  deviceId: string;
+  password: string;
 }
 
 export interface RevocationResult {
@@ -129,10 +144,18 @@ export interface SavedControllerConnectionSummary {
   hostVerifyKey: string;
 }
 
+export interface SavedDeviceCredentialSummary {
+  deviceId: string;
+  persistent: boolean;
+  lastUsedUnixS: number;
+}
+
 export interface ControllerSnapshot {
   runtime: ControllerRuntimeSummary;
   savedConnection: SavedControllerConnectionSummary | null;
   connectionError: string | null;
+  savedDevices: SavedDeviceCredentialSummary[];
+  savedDevicesError: string | null;
 }
 
 export interface ControllerConnectionInput {
@@ -144,6 +167,10 @@ export interface ControllerConnectionInput {
 export interface ControllerDeviceInput {
   deviceId: string;
   temporaryPassword: string;
+}
+
+export interface SavedDeviceInput {
+  deviceId: string;
 }
 
 export interface ControllerInput {

@@ -4,8 +4,12 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   cancelPairingSession,
+  disableFixedAccessPassword,
   exportDiagnosticReport,
+  getFixedAccessPassword,
   getHostSnapshot,
+  regenerateFixedAccessPassword,
+  respondHostApproval,
   restartHost,
   revokeTrustedController,
   saveConnectionSettings,
@@ -16,6 +20,7 @@ import type {
   ConnectionSettingsInput,
   ConnectionSummary,
   DiagnosticExportResult,
+  FixedAccessSummary,
   HostSnapshot,
   PairingSessionSummary,
   TrustedControllerSummary,
@@ -35,7 +40,7 @@ import { nextTabIndex } from "./navigation";
 import { LatestRequest } from "./latest-request";
 import { escapeHtml } from "./html";
 
-type View = "overview" | "controller" | "connection" | "devices" | "pairing";
+type View = "overview" | "controller" | "connection" | "devices" | "pairing" | "fixedAccess";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
 
 const applicationRoot = document.querySelector<HTMLElement>("#app");
@@ -51,8 +56,12 @@ let loading = true;
 let saving = false;
 let managedSetupBusy = false;
 let hostRestartBusy = false;
+let approvalBusy = false;
+let focusedApprovalId: number | null = null;
 let pairingBusy = false;
 let pairingSession: PairingSessionSummary | null = null;
+let fixedAccess: FixedAccessSummary | null = null;
+let fixedAccessBusy = false;
 let diagnosticExportBusy = false;
 let lastDiagnosticExport: DiagnosticExportResult | null = null;
 let revokingFingerprint: string | null = null;
@@ -75,6 +84,7 @@ function render(): void {
         ${loading ? renderLoading() : renderCurrentView()}
       </section>
     </div>
+    ${renderHostApproval()}
   `;
   const currentWorkspace = document.querySelector<HTMLElement>(".workspace");
   if (currentWorkspace && preservedScrollTop > 0) {
@@ -82,13 +92,69 @@ function render(): void {
   }
   renderedView = activeView;
   bindInteractions();
+  focusNewApproval();
+}
+
+function renderHostApproval(): string {
+  const approval = snapshot?.pendingApproval;
+  if (!approval) {
+    return "";
+  }
+  return `
+    <div class="approval-backdrop">
+      <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-description">
+        <div class="approval-heading">
+          <span class="approval-icon" aria-hidden="true"></span>
+          <div>
+            <span class="approval-eyebrow">新的远程控制请求</span>
+            <h2 id="approval-title">是否允许这台电脑控制本机？</h2>
+          </div>
+        </div>
+        <p id="approval-description">允许后，对方可以查看你的屏幕，并使用鼠标和键盘。只有确认这是你认识的设备时才允许。</p>
+        <dl class="approval-identity">
+          <div>
+            <dt>控制端设备</dt>
+            <dd>${escapeHtml(formatApprovalDeviceId(approval.deviceId))}</dd>
+          </div>
+          <div>
+            <dt>安全指纹</dt>
+            <dd class="approval-fingerprint">${escapeHtml(approval.fingerprint)}</dd>
+          </div>
+        </dl>
+        <p class="approval-warning"><span aria-hidden="true">!</span> 如果你没有主动发起连接，请选择“拒绝”。请求会在两分钟内自动失效。</p>
+        <div class="approval-actions">
+          <button class="button button--secondary" type="button" data-reject-host-approval ${approvalBusy ? "disabled" : ""}>${approvalBusy ? "正在处理…" : "拒绝"}</button>
+          <button class="button button--primary" type="button" data-allow-host-approval ${approvalBusy ? "disabled" : ""}>允许本次控制</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function formatApprovalDeviceId(deviceId: string): string {
+  return deviceId.match(/.{1,4}/g)?.join("-") ?? deviceId;
+}
+
+function focusNewApproval(): void {
+  const requestId = snapshot?.pendingApproval?.requestId ?? null;
+  if (requestId === null) {
+    focusedApprovalId = null;
+    return;
+  }
+  if (focusedApprovalId === requestId) {
+    return;
+  }
+  focusedApprovalId = requestId;
+  window.requestAnimationFrame(() => {
+    document.querySelector<HTMLButtonElement>("[data-reject-host-approval]")?.focus();
+  });
 }
 
 function renderHeader(): string {
-  const protectionCopy = snapshot?.connectionError
+  const protectionCopy = snapshot?.connectionError || snapshot?.trustedError || snapshot?.fixedPasswordError
     ? "需要检查本地保护"
     : "Windows 保护已启用";
-  const protectionTone = snapshot?.connectionError ? "attention" : "secure";
+  const protectionTone = snapshot?.connectionError || snapshot?.trustedError || snapshot?.fixedPasswordError ? "attention" : "secure";
   return `
     <header class="topbar">
       <div class="product-lockup" aria-label="DeskLink Windows 远程桌面">
@@ -113,6 +179,7 @@ function renderNavigation(): string {
     { id: "controller", label: "控制另一台" },
     { id: "connection", label: "本机连接" },
     { id: "devices", label: "已批准设备" },
+    { id: "fixedAccess", label: "访问密码" },
   ];
   return `
     <nav class="section-nav" aria-label="DeskLink 功能导航" role="tablist">
@@ -173,6 +240,8 @@ function renderCurrentView(): string {
       return renderDevices(snapshot);
     case "pairing":
       return renderPairing(snapshot);
+    case "fixedAccess":
+      return renderFixedAccess(snapshot);
   }
 }
 
@@ -299,6 +368,7 @@ function renderHostAccessCard(state: HostSnapshot): string {
       </div>
       <div class="host-access-actions">
         <button class="button button--secondary" type="button" data-copy-host-id>复制设备 ID</button>
+        <button class="button button--secondary" type="button" data-open-fixed-access>${state.fixedPasswordEnabled ? "查看固定密码" : "启用固定密码"}</button>
         ${renderPairingAction(state, "primary")}
       </div>
     </section>
@@ -717,12 +787,20 @@ function renderPairingAction(
   presentation: "primary" | "secondary" | "text",
 ): string {
   const active = state.pairingActive;
+  const connectedPairing = active && state.runtime.state === "connected";
   const disabled =
     pairingBusy ||
+    connectedPairing ||
     (!active && (!state.connection || Boolean(state.trustedError)));
   const className = presentation === "text" ? "text-button" : `button button--${presentation}`;
   const action = active ? "data-open-pairing" : "data-start-pairing";
-  const label = active ? "查看临时密码" : pairingBusy ? "正在生成临时密码…" : "生成临时密码";
+  const label = connectedPairing
+    ? "连接进行中"
+    : active
+      ? "查看临时密码"
+      : pairingBusy
+        ? "正在生成临时密码…"
+        : "生成临时密码";
   const title = !state.connection
     ? 'title="请先启用本机远程连接，再生成临时密码"'
     : state.trustedError
@@ -794,14 +872,16 @@ function renderPairing(state: HostSnapshot): string {
           : `
             <section class="pairing-card pairing-card--unavailable">
               <span class="empty-symbol" aria-hidden="true">${active ? "…" : "×"}</span>
-              <h2>${active ? "本机正在等待连接" : "临时密码已失效"}</h2>
+              <h2>${active ? "本机正在等待连接" : "上次连接没有完成"}</h2>
               <p>${
                 active
                   ? "为保护连接安全，临时密码只显示在生成它的窗口中。如需重新获取，请结束本次连接窗口后重新生成。"
-                  : "临时密码已过期或主机已停止，本机在线服务会自动恢复。"
+                  : "临时密码已过期或连接已经结束。请生成一份新密码后重新尝试。"
               }</p>
               <div class="pairing-card-actions">
-                <button class="button button--primary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>恢复本机在线服务</button>
+                ${active
+                  ? `<button class="button button--secondary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>结束当前等待</button>`
+                  : `<button class="button button--primary" type="button" data-start-pairing ${pairingBusy ? "disabled" : ""}>重新生成临时密码</button>`}
               </div>
             </section>
           `
@@ -813,6 +893,71 @@ function renderPairing(state: HostSnapshot): string {
           <strong>下一步需要回到这台电脑确认</strong>
           <p>设备 ID 和临时密码只能用于找到本机。Windows 会显示控制端身份，确认后才允许查看画面和控制输入。</p>
         </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderFixedAccess(state: HostSnapshot): string {
+  const enabled = state.fixedPasswordEnabled;
+  const canEnable = Boolean(state.connection) && !state.fixedPasswordError;
+  return `
+    <div class="page-layout page-layout--pairing">
+      <header class="page-heading page-heading--pairing">
+        <div>
+          <button class="back-button" type="button" data-open-overview aria-label="返回本机状态">← 本机状态</button>
+          <h1>固定访问密码</h1>
+          <p>适合经常从自己的另一台电脑连接本机，无需每次重新生成临时密码。</p>
+        </div>
+        <span class="pairing-state ${enabled ? "pairing-state--active" : ""}">
+          <span aria-hidden="true"></span>${enabled ? "固定密码已启用" : "固定密码未启用"}
+        </span>
+      </header>
+
+      ${state.fixedPasswordError
+        ? `<section class="pairing-card pairing-card--unavailable"><span class="empty-symbol" aria-hidden="true">!</span><h2>无法读取固定密码</h2><p>${escapeHtml(state.fixedPasswordError)}</p></section>`
+        : enabled
+          ? fixedAccess
+            ? `
+              <section class="pairing-card" aria-labelledby="fixed-access-heading">
+                <div class="pairing-card-heading">
+                  <div><span class="eyebrow">长期访问凭据</span><h2 id="fixed-access-heading">输入到另一台电脑</h2></div>
+                  <strong>由 Windows 加密保护</strong>
+                </div>
+                <div class="pairing-credentials">
+                  <div class="pairing-credential">
+                    <span>设备 ID</span>
+                    <strong id="fixed-access-device-id">${escapeHtml(fixedAccess.deviceId)}</strong>
+                    <button class="button button--secondary button--compact" type="button" data-copy-fixed-device-id>复制设备 ID</button>
+                  </div>
+                  <div class="pairing-credential pairing-credential--password">
+                    <span>固定密码</span>
+                    <strong id="fixed-access-password">${escapeHtml(fixedAccess.password)}</strong>
+                    <button class="button button--secondary button--compact" type="button" data-copy-fixed-password>复制固定密码</button>
+                  </div>
+                </div>
+                <div class="pairing-card-actions">
+                  <button class="button button--secondary" type="button" data-regenerate-fixed-access ${fixedAccessBusy ? "disabled" : ""}>${fixedAccessBusy ? "正在更换…" : "更换固定密码"}</button>
+                  <button class="button button--danger-quiet" type="button" data-disable-fixed-access ${fixedAccessBusy ? "disabled" : ""}>关闭固定密码</button>
+                </div>
+                <p class="secret-note">更换或关闭后，旧固定密码会立即失效；已批准设备仍可使用保存的安全连接。</p>
+              </section>
+            `
+            : `<section class="pairing-card pairing-card--unavailable"><span class="controller-spinner" aria-hidden="true"></span><h2>正在读取固定密码</h2><p>密码只会在你主动打开此页面时解密显示。</p></section>`
+          : `
+            <section class="pairing-card pairing-card--unavailable">
+              <span class="empty-symbol" aria-hidden="true">•••</span>
+              <h2>使用 ID 和固定密码快速查找本机</h2>
+              <p>DeskLink 会生成高强度的 8 位密码，并使用当前 Windows 账户加密保存。陌生控制端第一次连接时，仍必须在本机确认。</p>
+              <div class="pairing-card-actions">
+                <button class="button button--primary" type="button" data-regenerate-fixed-access ${!canEnable || fixedAccessBusy ? "disabled" : ""}>${fixedAccessBusy ? "正在启用…" : "启用固定密码"}</button>
+              </div>
+            </section>
+          `}
+
+      <div class="security-note security-note--pairing">
+        <span class="security-note-mark" aria-hidden="true"></span>
+        <div><strong>固定密码不等于静默授权</strong><p>密码只用于通过中继查找本机。新的控制端仍需通过端到端身份验证，并在这台电脑上获得一次本地批准。</p></div>
       </div>
     </div>
   `;
@@ -868,15 +1013,94 @@ function clearPairingSecrets(): void {
   pairingSession.invitation = "";
 }
 
+function clearFixedAccessSecrets(): void {
+  if (fixedAccess) {
+    fixedAccess.password = "";
+  }
+  fixedAccess = null;
+}
+
+async function loadFixedAccess(): Promise<void> {
+  if (!snapshot?.fixedPasswordEnabled || fixedAccessBusy || fixedAccess) {
+    return;
+  }
+  fixedAccessBusy = true;
+  render();
+  try {
+    fixedAccess = await getFixedAccessPassword();
+  } catch (error) {
+    clearFixedAccessSecrets();
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    fixedAccessBusy = false;
+    render();
+  }
+}
+
+async function regenerateFixedAccess(): Promise<void> {
+  if (!snapshot?.connection || fixedAccessBusy) {
+    return;
+  }
+  if (snapshot.fixedPasswordEnabled
+    && !window.confirm("更换固定密码后，旧固定密码会立即失效。要继续吗？")) {
+    return;
+  }
+  fixedAccessBusy = true;
+  feedback = { tone: "info", message: snapshot.fixedPasswordEnabled ? "正在更换固定密码…" : "正在启用固定密码…" };
+  clearFixedAccessSecrets();
+  render();
+  try {
+    fixedAccess = await regenerateFixedAccessPassword();
+    snapshot.fixedPasswordEnabled = true;
+    snapshot.fixedPasswordError = null;
+    feedback = { tone: "success", message: "固定密码已启用，本机正在向中继发布新的安全访问入口。" };
+    await refreshSnapshot(false);
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    fixedAccessBusy = false;
+    render();
+  }
+}
+
+async function disableFixedAccess(): Promise<void> {
+  if (!snapshot?.fixedPasswordEnabled || fixedAccessBusy
+    || !window.confirm("关闭固定密码后，其他电脑将无法再用它查找本机。要继续吗？")) {
+    return;
+  }
+  fixedAccessBusy = true;
+  clearFixedAccessSecrets();
+  feedback = { tone: "info", message: "正在关闭固定密码…" };
+  render();
+  try {
+    snapshot = await disableFixedAccessPassword();
+    feedback = { tone: "success", message: "固定密码已关闭，旧密码已经失效。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    fixedAccessBusy = false;
+    render();
+  }
+}
+
 function bindInteractions(): void {
   if (activeView === "controller") {
     bindControllerInteractions();
   }
+  document.querySelector<HTMLButtonElement>("[data-reject-host-approval]")?.addEventListener("click", () => {
+    void answerHostApproval(false);
+  });
+  document.querySelector<HTMLButtonElement>("[data-allow-host-approval]")?.addEventListener("click", () => {
+    void answerHostApproval(true);
+  });
   const navigationButtons = Array.from(
     document.querySelectorAll<HTMLButtonElement>("[data-view]"),
   );
   navigationButtons.forEach((button, currentIndex) => {
     button.addEventListener("click", () => {
+      if (activeView === "fixedAccess") {
+        clearFixedAccessSecrets();
+      }
       activeView = button.dataset.view as View;
       if (activeView === "connection") {
         connectionDraft = null;
@@ -884,6 +1108,9 @@ function bindInteractions(): void {
       }
       feedback = null;
       render();
+      if (activeView === "fixedAccess") {
+        void loadFixedAccess();
+      }
     });
     button.addEventListener("keydown", (event) => {
       const nextIndex = nextTabIndex(currentIndex, navigationButtons.length, event.key);
@@ -919,7 +1146,15 @@ function bindInteractions(): void {
     feedback = null;
     render();
   });
+  document.querySelector<HTMLButtonElement>("[data-open-fixed-access]")?.addEventListener("click", () => {
+    activeView = "fixedAccess";
+    feedback = null;
+    clearFixedAccessSecrets();
+    render();
+    void loadFixedAccess();
+  });
   document.querySelector<HTMLButtonElement>("[data-open-overview]")?.addEventListener("click", () => {
+    clearFixedAccessSecrets();
     activeView = "overview";
     feedback = null;
     render();
@@ -951,6 +1186,22 @@ function bindInteractions(): void {
     if (pairingSession) {
       void copyCredential(pairingSession.temporaryPassword, "pairing-temporary-password", "临时密码已复制。");
     }
+  });
+  document.querySelector<HTMLButtonElement>("[data-copy-fixed-device-id]")?.addEventListener("click", () => {
+    if (fixedAccess) {
+      void copyCredential(fixedAccess.deviceId, "fixed-access-device-id", "设备 ID 已复制。");
+    }
+  });
+  document.querySelector<HTMLButtonElement>("[data-copy-fixed-password]")?.addEventListener("click", () => {
+    if (fixedAccess) {
+      void copyCredential(fixedAccess.password, "fixed-access-password", "固定密码已复制。");
+    }
+  });
+  document.querySelector<HTMLButtonElement>("[data-regenerate-fixed-access]")?.addEventListener("click", () => {
+    void regenerateFixedAccess();
+  });
+  document.querySelector<HTMLButtonElement>("[data-disable-fixed-access]")?.addEventListener("click", () => {
+    void disableFixedAccess();
   });
   document.querySelector<HTMLButtonElement>("[data-cancel-pairing]")?.addEventListener("click", () => {
     void cancelPairing();
@@ -1010,6 +1261,31 @@ function bindInteractions(): void {
     ?.addEventListener("submit", (event) => void submitConnection(event));
 }
 
+async function answerHostApproval(allow: boolean): Promise<void> {
+  const requestId = snapshot?.pendingApproval?.requestId;
+  if (!requestId || approvalBusy) {
+    return;
+  }
+  approvalBusy = true;
+  render();
+  try {
+    await respondHostApproval(requestId, allow);
+    if (snapshot?.pendingApproval?.requestId === requestId) {
+      snapshot.pendingApproval = null;
+    }
+    feedback = allow
+      ? { tone: "success", message: "已允许本次控制，正在建立加密连接。" }
+      : { tone: "info", message: "已拒绝本次远程控制请求。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    approvalBusy = false;
+    focusedApprovalId = null;
+    render();
+    void refreshSnapshot(false);
+  }
+}
+
 async function refreshSnapshot(showLoading = true): Promise<void> {
   const request = snapshotRequests.begin();
   loading = showLoading;
@@ -1023,9 +1299,22 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
       return;
     }
     snapshot = nextSnapshot;
-    if (!snapshot.pairingActive && pairingSession) {
+    if (pairingSession && snapshot.runtime.state === "connected") {
       clearPairingSecrets();
       pairingSession = null;
+      if (activeView === "pairing") {
+        activeView = "overview";
+      }
+      feedback = { tone: "success", message: "连接已批准并成功建立。临时密码已从此窗口清除。" };
+    } else if (!snapshot.pairingActive && pairingSession) {
+      clearPairingSecrets();
+      pairingSession = null;
+      if (activeView === "pairing") {
+        feedback = { tone: "info", message: "上次连接没有完成。你可以重新生成临时密码再试一次。" };
+      }
+    }
+    if (!snapshot.fixedPasswordEnabled || snapshot.fixedPasswordError) {
+      clearFixedAccessSecrets();
     }
   } catch (error) {
     if (!snapshotRequests.isCurrent(request)) {
@@ -1269,6 +1558,7 @@ render();
 void refreshSnapshot();
 void initializeController(render);
 void listen("host-runtime-changed", () => void refreshSnapshot(false));
+void listen("host-approval-changed", () => void refreshSnapshot(false));
 window.setInterval(() => {
   if (!pairingSession || activeView !== "pairing") {
     return;
@@ -1280,7 +1570,7 @@ window.setInterval(() => {
   if (pairingSession.expiresAtUnixS <= Math.floor(Date.now() / 1000)) {
     clearPairingSecrets();
     pairingSession = null;
-    feedback = { tone: "info", message: "临时密码已过期，并已从此窗口清除。" };
+    feedback = { tone: "info", message: "临时密码已过期，本次连接没有完成。请重新生成密码后再试。" };
     render();
     void refreshSnapshot(false);
   }

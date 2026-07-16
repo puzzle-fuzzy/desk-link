@@ -38,15 +38,16 @@ use std::{
 use apps_windows::{
     configuration::{HostConnectionSettings, WindowsConnectionSettingsStore},
     diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
+    fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
     trusted::WindowsTrustedControllerStore,
     window::WindowsLocalApprovalDialog,
 };
 use controller::{
     ControllerConnectionInput, ControllerDeviceInput, ControllerInput, ControllerManager,
-    ControllerSignal, ControllerSnapshot,
+    ControllerSignal, ControllerSnapshot, SavedDeviceInput,
 };
-use host::{HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
+use host::{HostApprovalSummary, HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -71,6 +72,9 @@ struct HostSnapshot {
     relay_status: local_relay::RelayStatusSummary,
     diagnostic_checks: Vec<DiagnosticCheckSummary>,
     pairing_active: bool,
+    pending_approval: Option<HostApprovalSummary>,
+    fixed_password_enabled: bool,
+    fixed_password_error: Option<String>,
     device_id: Option<String>,
     refreshed_at_unix_s: u64,
 }
@@ -119,6 +123,19 @@ struct RevocationResult {
     snapshot: HostSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FixedAccessSummary {
+    device_id: String,
+    password: String,
+}
+
+impl Drop for FixedAccessSummary {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
 enum RevocationOutcome {
     Revoked,
     Cancelled,
@@ -151,9 +168,12 @@ impl Drop for ConnectionSettingsInput {
 async fn get_host_snapshot(manager: State<'_, HostManager>) -> Result<HostSnapshot, String> {
     let runtime = manager.snapshot();
     let pairing_active = manager.is_pairing_active();
-    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, pairing_active))
-        .await
-        .map_err(|_| "DeskLink 无法读取本地状态，请重试。".to_owned())?
+    let pending_approval = manager.pending_approval();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, pairing_active, pending_approval)
+    })
+    .await
+    .map_err(|_| "DeskLink 无法读取本地状态，请重试。".to_owned())?
 }
 
 #[tauri::command]
@@ -164,9 +184,21 @@ async fn restart_host(
     manager.restart(app).await;
     let runtime = manager.snapshot();
     let pairing_active = manager.is_pairing_active();
-    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, pairing_active))
-        .await
-        .map_err(|_| "DeskLink 已重新启动主机，但无法刷新本地状态。".to_owned())?
+    let pending_approval = manager.pending_approval();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, pairing_active, pending_approval)
+    })
+    .await
+    .map_err(|_| "DeskLink 已重新启动主机，但无法刷新本地状态。".to_owned())?
+}
+
+#[tauri::command]
+fn respond_host_approval(
+    manager: State<'_, HostManager>,
+    request_id: u64,
+    allow: bool,
+) -> Result<(), String> {
+    manager.respond_approval(request_id, allow)
 }
 
 #[tauri::command]
@@ -183,9 +215,10 @@ async fn export_diagnostic_report(
 ) -> Result<DiagnosticExportResult, String> {
     let runtime = host_manager.snapshot();
     let pairing_active = host_manager.is_pairing_active();
+    let pending_approval = host_manager.pending_approval();
     let controller_runtime = controller_manager.snapshot();
     tauri::async_runtime::spawn_blocking(move || {
-        let snapshot = load_host_snapshot(runtime, pairing_active)?;
+        let snapshot = load_host_snapshot(runtime, pairing_active, pending_approval)?;
         export_snapshot_report(&snapshot, &controller_runtime)
     })
     .await
@@ -248,6 +281,16 @@ async fn connect_device(
 }
 
 #[tauri::command]
+async fn connect_saved_device(
+    manager: State<'_, ControllerManager>,
+    input: SavedDeviceInput,
+    signals: Channel<ControllerSignal>,
+    video: Channel<Response>,
+) -> Result<ControllerSnapshot, String> {
+    manager.connect_saved_device(input, signals, video).await
+}
+
+#[tauri::command]
 async fn reconnect_controller(
     manager: State<'_, ControllerManager>,
     signals: Channel<ControllerSignal>,
@@ -289,6 +332,21 @@ async fn forget_controller(
 }
 
 #[tauri::command]
+async fn forget_saved_device(
+    manager: State<'_, ControllerManager>,
+    input: SavedDeviceInput,
+) -> Result<ControllerSnapshot, String> {
+    manager.forget_saved_device(input).await
+}
+
+#[tauri::command]
+async fn clear_saved_devices(
+    manager: State<'_, ControllerManager>,
+) -> Result<ControllerSnapshot, String> {
+    manager.clear_saved_devices().await
+}
+
+#[tauri::command]
 async fn save_connection_settings(
     app: AppHandle,
     manager: State<'_, HostManager>,
@@ -300,9 +358,12 @@ async fn save_connection_settings(
     manager.restart(app).await;
     let runtime = manager.snapshot();
     let pairing_active = manager.is_pairing_active();
-    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, pairing_active))
-        .await
-        .map_err(|_| "DeskLink 无法刷新本地状态，请重试。".to_owned())?
+    let pending_approval = manager.pending_approval();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, pairing_active, pending_approval)
+    })
+    .await
+    .map_err(|_| "DeskLink 无法刷新本地状态，请重试。".to_owned())?
 }
 
 #[tauri::command]
@@ -315,9 +376,12 @@ async fn setup_managed_connection(
         .map_err(|_| "DeskLink 无法创建受保护的本机连接，请重试。".to_owned())??;
     manager.restart(app).await;
     let runtime = manager.snapshot();
-    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, false))
-        .await
-        .map_err(|_| "DeskLink 已保存本机连接，但无法刷新状态，请重试。".to_owned())?
+    let pending_approval = manager.pending_approval();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, false, pending_approval)
+    })
+    .await
+    .map_err(|_| "DeskLink 已保存本机连接，但无法刷新状态，请重试。".to_owned())?
 }
 
 #[tauri::command]
@@ -336,9 +400,49 @@ async fn cancel_pairing_session(
     manager.restart(app).await;
     let runtime = manager.snapshot();
     let pairing_active = manager.is_pairing_active();
-    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, pairing_active))
+    let pending_approval = manager.pending_approval();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, pairing_active, pending_approval)
+    })
+    .await
+    .map_err(|_| "DeskLink 已恢复普通主机模式，但无法刷新本地状态。".to_owned())?
+}
+
+#[tauri::command]
+async fn get_fixed_access_password() -> Result<FixedAccessSummary, String> {
+    tauri::async_runtime::spawn_blocking(load_fixed_access_password)
         .await
-        .map_err(|_| "DeskLink 已恢复普通主机模式，但无法刷新本地状态。".to_owned())?
+        .map_err(|_| "DeskLink 无法读取固定密码，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn regenerate_fixed_access_password(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<FixedAccessSummary, String> {
+    let summary = tauri::async_runtime::spawn_blocking(create_fixed_access_password)
+        .await
+        .map_err(|_| "DeskLink 无法生成固定密码，请重试。".to_owned())??;
+    manager.restart(app).await;
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn disable_fixed_access_password(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(clear_fixed_access_password)
+        .await
+        .map_err(|_| "DeskLink 无法关闭固定密码，请重试。".to_owned())??;
+    manager.restart(app).await;
+    let runtime = manager.snapshot();
+    let pending_approval = manager.pending_approval();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, false, pending_approval)
+    })
+    .await
+    .map_err(|_| "固定密码已关闭，但 DeskLink 无法刷新本地状态。".to_owned())?
 }
 
 #[tauri::command]
@@ -357,16 +461,19 @@ async fn revoke_trusted_controller(
     }
     let runtime = manager.snapshot();
     let pairing_active = manager.is_pairing_active();
-    let snapshot =
-        tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, pairing_active))
-            .await
-            .map_err(|_| "DeskLink 已完成本地确认，但无法刷新设备状态。".to_owned())??;
+    let pending_approval = manager.pending_approval();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        load_host_snapshot(runtime, pairing_active, pending_approval)
+    })
+    .await
+    .map_err(|_| "DeskLink 已完成本地确认，但无法刷新设备状态。".to_owned())??;
     Ok(RevocationResult { revoked, snapshot })
 }
 
 fn load_host_snapshot(
     runtime: HostRuntimeSummary,
     pairing_active: bool,
+    pending_approval: Option<HostApprovalSummary>,
 ) -> Result<HostSnapshot, String> {
     let device_id = WindowsIdentityStore::for_current_user()
         .ok()
@@ -411,6 +518,15 @@ fn load_host_snapshot(
         ),
     };
 
+    let (fixed_password_enabled, fixed_password_error) =
+        match WindowsFixedAccessStore::for_current_user().and_then(|store| store.load()) {
+            Ok(password) => (password.is_some(), None),
+            Err(_) => (
+                false,
+                Some("无法打开受保护的固定密码，请重新设置。".to_owned()),
+            ),
+        };
+
     let relay_status = local_relay::status(connection.as_ref());
     let connection = connection.map(|settings| ConnectionSummary {
         relay_address: settings.relay_address_text(),
@@ -419,7 +535,10 @@ fn load_host_snapshot(
         stream_id: settings.stream_id(),
         has_saved_key: true,
     });
-    let (readiness, title, detail) = if connection_error.is_some() || trusted_error.is_some() {
+    let (readiness, title, detail) = if connection_error.is_some()
+        || trusted_error.is_some()
+        || fixed_password_error.is_some()
+    {
         (
             "attention",
             "检查本地保护状态".to_owned(),
@@ -447,6 +566,7 @@ fn load_host_snapshot(
         connection.as_ref(),
         connection_error.as_deref(),
         trusted_error.as_deref(),
+        fixed_password_error.as_deref(),
     );
 
     Ok(HostSnapshot {
@@ -461,6 +581,9 @@ fn load_host_snapshot(
         relay_status,
         diagnostic_checks,
         pairing_active,
+        pending_approval,
+        fixed_password_enabled,
+        fixed_password_error,
         device_id,
         refreshed_at_unix_s: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -474,6 +597,7 @@ fn build_diagnostic_checks(
     connection: Option<&ConnectionSummary>,
     connection_error: Option<&str>,
     trusted_error: Option<&str>,
+    fixed_password_error: Option<&str>,
 ) -> Vec<DiagnosticCheckSummary> {
     let configuration = if connection_error.is_some() {
         diagnostic_check(
@@ -510,6 +634,21 @@ fn build_diagnostic_checks(
             "passed",
             "可信设备存储",
             "可信设备列表可读取，本地批准边界可用。",
+        )
+    };
+    let fixed_access = if fixed_password_error.is_some() {
+        diagnostic_check(
+            "DL-SEC-103",
+            "failed",
+            "固定密码保护",
+            "受保护的固定密码无法读取；DeskLink 不会发布固定密码入口。",
+        )
+    } else {
+        diagnostic_check(
+            "DL-SEC-103",
+            "passed",
+            "固定密码保护",
+            "固定密码状态可读取，启用后由当前 Windows 账户加密保护。",
         )
     };
     let relay_check = match (connection.is_some(), runtime.state) {
@@ -549,7 +688,47 @@ fn build_diagnostic_checks(
         "stopped" => diagnostic_check("DL-HOST-301", "failed", "主机运行状态", &runtime.detail),
         _ => diagnostic_check("DL-HOST-301", "warning", "主机运行状态", &runtime.detail),
     };
-    vec![configuration, trust, relay_check, host_check]
+    vec![configuration, trust, fixed_access, relay_check, host_check]
+}
+
+fn fixed_access_summary(
+    password: desklink_crypto::PairingCode,
+) -> Result<FixedAccessSummary, String> {
+    let identity = WindowsIdentityStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用主机身份。".to_owned())?
+        .load_or_create(&mut OsRng)
+        .map_err(|_| "无法打开当前账户受保护的主机身份。".to_owned())?;
+    Ok(FixedAccessSummary {
+        device_id: device_directory::format_device_id(device_directory::public_device_id(
+            identity.device_id,
+        )),
+        password: password.to_string(),
+    })
+}
+
+fn load_fixed_access_password() -> Result<FixedAccessSummary, String> {
+    let password = WindowsFixedAccessStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用固定密码存储。".to_owned())?
+        .load()
+        .map_err(|_| "无法打开受保护的固定密码，请重新设置。".to_owned())?
+        .ok_or_else(|| "尚未启用固定密码。".to_owned())?;
+    fixed_access_summary(password)
+}
+
+fn create_fixed_access_password() -> Result<FixedAccessSummary, String> {
+    let password = WindowsFixedAccessStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用固定密码存储。".to_owned())?
+        .generate_and_save(&mut OsRng)
+        .map_err(|_| "DeskLink 无法加密保存固定密码。".to_owned())?;
+    fixed_access_summary(password)
+}
+
+fn clear_fixed_access_password() -> Result<(), String> {
+    WindowsFixedAccessStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用固定密码存储。".to_owned())?
+        .clear()
+        .map_err(|_| "DeskLink 无法清除受保护的固定密码。".to_owned())?;
+    Ok(())
 }
 
 fn diagnostic_check(
@@ -951,23 +1130,30 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_snapshot,
+            respond_host_approval,
             restart_host,
             save_connection_settings,
             setup_managed_connection,
             start_pairing_session,
             cancel_pairing_session,
+            get_fixed_access_password,
+            regenerate_fixed_access_password,
+            disable_fixed_access_password,
             revoke_trusted_controller,
             probe_relay,
             export_diagnostic_report,
             get_controller_snapshot,
             connect_device,
+            connect_saved_device,
+            clear_saved_devices,
             connect_controller,
             reconnect_controller,
             send_controller_input,
             send_controller_text,
             request_controller_keyframe,
             disconnect_controller,
-            forget_controller
+            forget_controller,
+            forget_saved_device
         ])
         .build(tauri::generate_context!())
         .expect("DeskLink could not start its control surface");
@@ -1077,7 +1263,7 @@ mod tests {
             stream_id: 9,
             has_saved_key: true,
         };
-        let checks = build_diagnostic_checks(&runtime, Some(&connection), None, None);
+        let checks = build_diagnostic_checks(&runtime, Some(&connection), None, None, None);
         let verify_key = "ab".repeat(32);
         let snapshot = HostSnapshot {
             readiness: "configured",
@@ -1096,6 +1282,9 @@ mod tests {
             relay_status,
             diagnostic_checks: checks,
             pairing_active: false,
+            pending_approval: None,
+            fixed_password_enabled: true,
+            fixed_password_error: None,
             device_id: Some("123 456 789 012".to_owned()),
             refreshed_at_unix_s: 200,
         };

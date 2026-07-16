@@ -204,6 +204,29 @@ fn pairing_invite_round_trips_fixed_credentials_and_redacts_debug_output() {
 }
 
 #[test]
+fn persistent_invite_is_signed_and_decodes_without_a_wall_clock_expiry() {
+    let host = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([41; 32]));
+    let session_id = SessionId::from_bytes([42; 16]);
+    let authentication = [43; 32];
+    let invite = PairingInvite::for_persistent_connection(&host, session_id, authentication);
+    let encoded = invite.encode().unwrap();
+
+    for now in [1, 10_000, u64::MAX] {
+        let decoded = PairingInvite::decode(encoded.as_bytes(), now).unwrap();
+        assert!(decoded.is_persistent());
+        assert_eq!(decoded.session_id(), session_id);
+        assert_eq!(decoded.relay_authentication(), &authentication);
+    }
+
+    let mut tampered = encoded.as_bytes().to_vec();
+    tampered[109] = 1;
+    assert!(matches!(
+        PairingInvite::decode(&tampered, 10_000),
+        Err(PairingError::InvalidInvite)
+    ));
+}
+
+#[test]
 fn pairing_invite_rejects_tampering_wrong_size_and_expiry() {
     let host = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([17; 32]));
     let invite =

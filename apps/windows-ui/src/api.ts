@@ -8,11 +8,13 @@ import type {
   ControllerSignal,
   ControllerSnapshot,
   DiagnosticExportResult,
+  FixedAccessSummary,
   HostSnapshot,
   PairingSessionSummary,
   RelayProbeInput,
   RelayProbeResult,
   RevocationResult,
+  SavedDeviceInput,
 } from "./types";
 
 export interface ControllerChannels {
@@ -26,6 +28,10 @@ export function getHostSnapshot(): Promise<HostSnapshot> {
 
 export function restartHost(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("restart_host");
+}
+
+export function respondHostApproval(requestId: number, allow: boolean): Promise<void> {
+  return invoke<void>("respond_host_approval", { requestId, allow });
 }
 
 export function exportDiagnosticReport(): Promise<DiagnosticExportResult> {
@@ -48,6 +54,18 @@ export function startPairingSession(): Promise<PairingSessionSummary> {
 
 export function cancelPairingSession(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("cancel_pairing_session");
+}
+
+export function getFixedAccessPassword(): Promise<FixedAccessSummary> {
+  return invoke<FixedAccessSummary>("get_fixed_access_password");
+}
+
+export function regenerateFixedAccessPassword(): Promise<FixedAccessSummary> {
+  return invoke<FixedAccessSummary>("regenerate_fixed_access_password");
+}
+
+export function disableFixedAccessPassword(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("disable_fixed_access_password");
 }
 
 export function probeRelay(input: RelayProbeInput): Promise<RelayProbeResult> {
@@ -88,6 +106,13 @@ export function connectDevice(
   return invoke<ControllerSnapshot>("connect_device", { input, ...channels });
 }
 
+export function connectSavedDevice(
+  input: SavedDeviceInput,
+  channels: ControllerChannels,
+): Promise<ControllerSnapshot> {
+  return invoke<ControllerSnapshot>("connect_saved_device", { input, ...channels });
+}
+
 export function reconnectController(
   channels: ControllerChannels,
 ): Promise<ControllerSnapshot> {
@@ -112,4 +137,12 @@ export function disconnectController(): Promise<ControllerSnapshot> {
 
 export function forgetController(): Promise<ControllerSnapshot> {
   return invoke<ControllerSnapshot>("forget_controller");
+}
+
+export function forgetSavedDevice(input: SavedDeviceInput): Promise<ControllerSnapshot> {
+  return invoke<ControllerSnapshot>("forget_saved_device", { input });
+}
+
+export function clearSavedDevices(): Promise<ControllerSnapshot> {
+  return invoke<ControllerSnapshot>("clear_saved_devices");
 }

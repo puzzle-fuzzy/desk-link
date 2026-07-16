@@ -48,6 +48,17 @@ impl PairingCode {
     pub fn as_bytes(&self) -> &[u8; PAIRING_CODE_LENGTH] {
         &self.bytes
     }
+
+    pub fn from_bytes(bytes: [u8; PAIRING_CODE_LENGTH]) -> Result<Self, PairingError> {
+        if bytes
+            .iter()
+            .all(|byte| PAIRING_CODE_ALPHABET.contains(byte))
+        {
+            Ok(Self { bytes })
+        } else {
+            Err(PairingError::InvalidCode)
+        }
+    }
 }
 
 impl fmt::Display for PairingCode {
@@ -171,6 +182,37 @@ impl PairingInvite {
         })
     }
 
+    /// Creates a signed invitation for a host directory entry that remains
+    /// valid only while that host is connected to the relay. Zero timestamps
+    /// are an authenticated sentinel and are never accepted for normal invites.
+    pub fn for_persistent_connection(
+        host: &crate::DeviceIdentity,
+        session_id: SessionId,
+        relay_authentication: [u8; RELAY_AUTHENTICATION_BYTES],
+    ) -> Self {
+        let relay_authentication = Zeroizing::new(relay_authentication);
+        let host_verify_key = host.verify_key();
+        let unsigned = encode_unsigned_invite(
+            session_id,
+            &relay_authentication,
+            host.device_id,
+            host_verify_key,
+            0,
+            0,
+        );
+        let signature_input = invite_signature_input(&unsigned);
+        Self {
+            session_id,
+            relay_authentication,
+            host_device_id: host.device_id,
+            host_verify_key,
+            created_at_unix_s: 0,
+            expires_at_unix_s: 0,
+            signature: host.sign(&signature_input),
+            consumed: false,
+        }
+    }
+
     pub fn decode(bytes: &[u8], now_unix_s: u64) -> Result<Self, PairingError> {
         if bytes.len() != PAIRING_INVITE_BYTES
             || &bytes[..4] != PAIRING_INVITE_MAGIC
@@ -270,6 +312,10 @@ impl PairingInvite {
         self.created_at_unix_s
     }
 
+    pub const fn is_persistent(&self) -> bool {
+        self.created_at_unix_s == 0 && self.expires_at_unix_s == 0
+    }
+
     pub fn consume(&mut self, now_unix_s: u64) -> Result<(), PairingError> {
         self.ensure_active(now_unix_s)?;
         self.consumed = true;
@@ -342,6 +388,9 @@ fn validate_window(
     expires_at_unix_s: u64,
     now_unix_s: u64,
 ) -> Result<(), PairingError> {
+    if created_at_unix_s == 0 && expires_at_unix_s == 0 {
+        return Ok(());
+    }
     let ttl_s = expires_at_unix_s.saturating_sub(created_at_unix_s);
     if !(1..=MAX_PAIRING_TTL_S).contains(&ttl_s) {
         return Err(PairingError::InvalidInvite);
