@@ -248,6 +248,12 @@ select:focus-visible {
 
 .overview-stack,
 .page-layout {
+  animation: none;
+}
+
+.workspace[data-surface-transition="true"] .overview-stack,
+.workspace[data-surface-transition="true"] .page-layout,
+.workspace[data-surface-transition="true"] .controller-stack {
   animation: surface-enter var(--transition) both;
 }
 
@@ -383,6 +389,61 @@ select:focus-visible {
 .status-actions {
   display: flex;
   flex-shrink: 0;
+  gap: 8px;
+}
+
+.host-access-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+  margin-top: 16px;
+  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--success);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.host-access-copy {
+  min-width: 0;
+}
+
+.host-access-copy h2 {
+  margin: 5px 0 0;
+  color: var(--ink);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: clamp(22px, 3vw, 30px);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: 0.055em;
+  overflow-wrap: anywhere;
+}
+
+.host-access-copy p {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  color: var(--ink-secondary);
+  font-size: 12px;
+}
+
+.host-presence {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.host-presence--online {
+  background: var(--success);
+}
+
+.host-access-actions {
+  display: flex;
+  flex: 0 0 auto;
   gap: 8px;
 }
 
@@ -1440,6 +1501,86 @@ select:focus-visible {
   font-weight: 600;
 }
 
+.pairing-credentials {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(220px, 0.8fr);
+  gap: 12px;
+}
+
+.pairing-credential {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.pairing-credential > span {
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.pairing-credential > strong {
+  color: var(--ink);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: clamp(20px, 3.2vw, 27px);
+  font-weight: 650;
+  letter-spacing: 0.045em;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.pairing-credential--password > strong {
+  color: var(--primary);
+  letter-spacing: 0.12em;
+}
+
+.pairing-credential .button {
+  justify-self: start;
+}
+
+.pairing-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pairing-steps li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-quiet);
+}
+
+.pairing-steps li > span {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--surface);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pairing-steps p {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .eyebrow {
   color: var(--ink-muted);
   font-size: 11px;
@@ -1466,6 +1607,33 @@ select:focus-visible {
 
 .pairing-card-actions {
   margin-top: 14px;
+}
+
+.pairing-legacy-panel {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.pairing-legacy-panel > summary {
+  padding: 13px 2px 0;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pairing-legacy-content {
+  padding-top: 12px;
+}
+
+.pairing-legacy-content > p {
+  margin: 0 0 9px;
+  color: var(--ink-muted);
+  font-size: 11px;
+}
+
+.pairing-legacy-content .button {
+  margin-top: 9px;
 }
 
 .secret-note {
@@ -1645,6 +1813,21 @@ select:focus-visible {
     flex-wrap: wrap;
   }
 
+  .host-access-card {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .host-access-actions {
+    flex-wrap: wrap;
+  }
+
+  .pairing-credentials,
+  .pairing-steps {
+    grid-template-columns: 1fr;
+  }
+
   .next-step {
     grid-template-columns: 1fr;
     gap: 16px;
@@ -1746,6 +1929,7 @@ select:focus-visible {
   }
 
   .status-actions,
+  .host-access-actions,
   .form-actions,
   .page-actions,
   .pairing-card-actions {
@@ -1831,7 +2015,7 @@ select:focus-visible {
 .controller-stack {
   width: min(100%, 1260px);
   margin: 0 auto;
-  animation: surface-enter var(--transition) both;
+  animation: none;
 }
 
 .controller-stack > .feedback {
@@ -1934,6 +2118,7 @@ select:focus-visible {
   box-shadow: 0 0 0 3px color-mix(in oklch, var(--success), transparent 78%);
 }
 
+.controller-runtime--finding > span,
 .controller-runtime--connecting > span,
 .controller-runtime--waitingApproval > span,
 .controller-runtime--reconnecting > span {
@@ -2019,6 +2204,10 @@ select:focus-visible {
   margin-top: 20px;
 }
 
+.controller-device-form {
+  gap: 16px;
+}
+
 .field-grid--controller {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -2050,6 +2239,33 @@ select:focus-visible {
 .controller-form .field input {
   height: 36px;
   padding: 7px 10px;
+}
+
+.controller-form .field .device-id-input,
+.controller-form .field .temporary-password-input {
+  height: 52px;
+  padding: 10px 13px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.controller-form .field .device-id-input {
+  letter-spacing: 0.035em;
+}
+
+.controller-form .field .temporary-password-input {
+  color: var(--primary);
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.controller-device-hint {
+  margin: -6px 0 0;
+  color: var(--ink-muted);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .controller-form .field textarea {
@@ -2142,6 +2358,33 @@ select:focus-visible {
   color: var(--ink-muted);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.controller-legacy-panel {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.controller-legacy-panel > summary {
+  padding: 12px 15px;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.controller-legacy-content {
+  padding: 0 15px 15px;
+  border-top: 1px solid var(--border);
+}
+
+.controller-legacy-content > p {
+  margin: 12px 0 0;
+  color: var(--ink-muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .saved-controller {

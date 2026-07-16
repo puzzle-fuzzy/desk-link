@@ -1,6 +1,6 @@
 ---
 name: DeskLink
-description: A calm Windows control surface for a private personal remote desktop.
+description: A calm cross-platform control surface for a private personal remote desktop.
 colors:
   primary: "oklch(0.500 0.151 40)"
   background: "oklch(1.000 0.000 0)"
@@ -69,13 +69,13 @@ components:
 
 **Creative North Star: "The Quiet Control Light"**
 
-DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. The Windows host uses a restrained white surface, system typography, one burnt-coral action color, and semantic status colors only where state needs emphasis.
+DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. Windows and macOS use the same restrained white surface, one burnt-coral action color, four-section navigation, and semantic status colors only where state needs emphasis.
 
-This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls use standard Windows affordances, and security consequences are written in full.
+This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
 **Key Characteristics:**
 
-- Native Windows proportions and behavior
+- Shared Windows/macOS information architecture with native platform behavior
 - Status-first hierarchy with plain-language recovery detail
 - Restrained color with explicit semantic states
 - Compact trusted-device management without nested navigation
@@ -86,6 +86,8 @@ This is a compact personal tool, not an enterprise console or a neon streaming o
 The ordinary Windows status, connection, and trusted-device views are implemented as a Tauri 2 control surface using semantic HTML/CSS and Vanilla TypeScript. Rust remains the trust boundary: it owns DPAPI storage, validates all connection input, never returns the saved relay key, and exposes only the minimum Tauri commands and capabilities required by the view.
 
 The Tauri process owns the single-instance application lifetime, native tray, and host supervisor start/stop boundary. Capture, encoding, encrypted transport, input injection, and high-consequence approval or revocation confirmations remain in Rust/Win32. The WebView receives sanitized lifecycle summaries and is a presentation layer, not a replacement for native security or media boundaries.
+
+The macOS surface is implemented with SwiftUI and mirrors the Windows top bar, four navigation sections, status-first hierarchy, flat groups, Chinese copy, and shared semantic colors. SwiftUI owns presentation only; Keychain, Rust FFI, ScreenCaptureKit, VideoToolbox, AppKit input injection, and system permission boundaries retain their platform responsibilities.
 
 ## Colors
 
@@ -111,10 +113,10 @@ Pure white keeps the host surface neutral; burnt coral is reserved for the prima
 
 ## Typography
 
-**Display Font:** Segoe UI Variable (with Segoe UI fallback)
-**Body Font:** Segoe UI Variable (with Segoe UI fallback)
+**Windows Font:** Segoe UI Variable (with Segoe UI fallback)
+**macOS Font:** SF Pro through SwiftUI system typography
 
-**Character:** familiar, compact, and highly legible at Windows desktop scale. Weight and spacing create hierarchy without a second typeface.
+**Character:** familiar, compact, and highly legible at desktop scale. Weight and spacing create hierarchy without introducing a second typeface on either platform.
 
 ### Hierarchy
 

@@ -3,6 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ConnectionSettingsInput,
   ControllerConnectionInput,
+  ControllerDeviceInput,
   ControllerInput,
   ControllerSignal,
   ControllerSnapshot,
@@ -21,6 +22,10 @@ export interface ControllerChannels {
 
 export function getHostSnapshot(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("get_host_snapshot");
+}
+
+export function restartHost(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("restart_host");
 }
 
 export function exportDiagnosticReport(): Promise<DiagnosticExportResult> {
@@ -74,6 +79,13 @@ export function connectController(
   channels: ControllerChannels,
 ): Promise<ControllerSnapshot> {
   return invoke<ControllerSnapshot>("connect_controller", { input, ...channels });
+}
+
+export function connectDevice(
+  input: ControllerDeviceInput,
+  channels: ControllerChannels,
+): Promise<ControllerSnapshot> {
+  return invoke<ControllerSnapshot>("connect_device", { input, ...channels });
 }
 
 export function reconnectController(

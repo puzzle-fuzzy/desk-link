@@ -24,6 +24,11 @@ impl HostStatusViewModel {
                     format!("第 {attempt} 次连接尝试。下一个视频流将使用 ID {stream_id}。");
                 self.tooltip = "DeskLink：正在连接".to_owned();
             }
+            HostLifecycleEvent::Available { .. } => {
+                self.title = "此设备已在线".to_owned();
+                self.detail = "DeskLink 已连接安全中继，正在等待另一台电脑发起连接。".to_owned();
+                self.tooltip = "DeskLink：设备在线".to_owned();
+            }
             HostLifecycleEvent::Connected { stream_id } => {
                 self.title = "远程控制已连接".to_owned();
                 self.detail = format!("已验证的控制端正通过加密视频流 {stream_id} 连接。");
@@ -35,21 +40,60 @@ impl HostStatusViewModel {
                 delay,
                 reason,
             } => {
-                self.title = "连接已中断".to_owned();
-                self.detail = format!(
-                    "第 {retry}/{maximum_retries} 次重试将在 {} 毫秒后开始。\r\n{reason}",
-                    delay.as_millis(),
-                    reason = user_facing_host_reason(reason)
-                );
+                let occupied = host_reason_is_occupied(reason);
+                let untrusted = host_reason_is_untrusted(reason);
+                self.title = if occupied {
+                    "正在等待旧连接释放".to_owned()
+                } else if untrusted {
+                    "已拒绝未批准的设备".to_owned()
+                } else {
+                    "连接已中断".to_owned()
+                };
+                self.detail = if occupied {
+                    format!(
+                        "中继仍保留此设备的上一条连接。第 {retry}/{maximum_retries} 次重试将在 {} 毫秒后开始；如果持续出现，请先升级中继服务器。",
+                        delay.as_millis()
+                    )
+                } else if untrusted {
+                    format!(
+                        "DeskLink 没有授予对方远程控制权限。已安全断开该连接，将在 {} 毫秒后继续等待已批准设备。",
+                        delay.as_millis()
+                    )
+                } else {
+                    format!(
+                        "第 {retry}/{maximum_retries} 次重试将在 {} 毫秒后开始。\r\n{reason}",
+                        delay.as_millis(),
+                        reason = user_facing_host_reason(reason)
+                    )
+                };
                 self.tooltip = format!("DeskLink：正在重新连接（{retry}/{maximum_retries}）");
             }
             HostLifecycleEvent::Stopped { reason } => {
-                self.title = "主机服务已停止".to_owned();
-                self.detail = user_facing_host_reason(reason).to_owned();
-                self.tooltip = "DeskLink：主机服务已停止".to_owned();
+                if host_reason_is_occupied(reason) {
+                    self.title = "中继会话仍被旧连接占用".to_owned();
+                    self.detail = "请先升级中继服务器，然后点击“重新启动主机”。".to_owned();
+                    self.tooltip = "DeskLink：等待中继升级".to_owned();
+                } else {
+                    self.title = "主机服务已停止".to_owned();
+                    self.detail = user_facing_host_reason(reason).to_owned();
+                    self.tooltip = "DeskLink：主机服务已停止".to_owned();
+                }
             }
         }
     }
+}
+
+fn host_reason_is_occupied(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("occupied") || reason.contains("already in use")
+}
+
+fn host_reason_is_untrusted(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("untrusted controller")
+        || reason.contains("controller is not trusted")
+        || reason.contains("controller key changed")
+        || (reason.contains("controller") && reason.contains("pairing request"))
 }
 
 fn user_facing_host_reason(reason: &str) -> &'static str {
@@ -1232,6 +1276,10 @@ mod tests {
     #[test]
     fn status_model_distinguishes_active_recovery_and_stopped_states() {
         let mut model = HostStatusViewModel::starting();
+        model.apply(&HostLifecycleEvent::Available { stream_id: 7 });
+        assert_eq!(model.title, "此设备已在线");
+        assert!(model.detail.contains("等待另一台电脑"));
+
         model.apply(&HostLifecycleEvent::Connected { stream_id: 7 });
         assert_eq!(model.title, "远程控制已连接");
         assert!(model.detail.contains("视频流 7"));
@@ -1282,8 +1330,29 @@ mod tests {
             delay: Duration::from_secs(1),
             reason: "transport error: join rejected: SessionOccupied".to_owned(),
         });
-        assert!(model.detail.contains("会话正在使用中"));
+        assert_eq!(model.title, "正在等待旧连接释放");
+        assert!(model.detail.contains("升级中继服务器"));
         assert!(!model.detail.contains("未批准"));
+
+        model.apply(&HostLifecycleEvent::Stopped {
+            reason: "reconnect retry budget exhausted: SessionOccupied".to_owned(),
+        });
+        assert_eq!(model.title, "中继会话仍被旧连接占用");
+        assert!(model.detail.contains("重新启动主机"));
+    }
+
+    #[test]
+    fn untrusted_controller_is_rejected_without_misreporting_a_host_failure() {
+        let mut model = HostStatusViewModel::starting();
+        model.apply(&HostLifecycleEvent::Reconnecting {
+            retry: 1,
+            maximum_retries: 6,
+            delay: Duration::from_millis(250),
+            reason: "the authenticated controller is not trusted".to_owned(),
+        });
+        assert_eq!(model.title, "已拒绝未批准的设备");
+        assert!(model.detail.contains("继续等待已批准设备"));
+        assert!(!model.detail.contains("主机服务已停止"));
     }
 
     #[test]

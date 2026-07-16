@@ -7,9 +7,11 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
-    ChannelKind, JOIN_ENVELOPE_BYTES, JoinRejectCode, MAX_DATAGRAM_BYTES,
-    MAX_RELIABLE_MESSAGE_BYTES, QuicClientConfig, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayJoin,
-    TransportError, TransportEvent,
+    ChannelKind, DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED, DIRECTORY_LOOKUP_NOT_FOUND,
+    DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode, MAX_DATAGRAM_BYTES,
+    MAX_DIRECTORY_INVITATION_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClientConfig,
+    RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayJoin, TransportError,
+    TransportEvent,
 };
 
 const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
@@ -233,7 +235,7 @@ impl QuicClient {
             .await
             .map_err(map_connection_error)?;
         let envelope = join.encode();
-        send.write_all(&(JOIN_ENVELOPE_BYTES as u32).to_be_bytes())
+        send.write_all(&(envelope.len() as u32).to_be_bytes())
             .await
             .map_err(map_write_error)?;
         send.write_all(&envelope).await.map_err(map_write_error)?;
@@ -252,6 +254,58 @@ impl QuicClient {
         }
         self.inner.joined.store(true, Ordering::Release);
         Ok(())
+    }
+
+    pub async fn lookup_directory(
+        &self,
+        lookup: RelayDirectoryLookup,
+    ) -> Result<Vec<u8>, TransportError> {
+        let _join_guard = self.inner.join_lock.lock().await;
+        if self.inner.joined.load(Ordering::Acquire) {
+            return Err(TransportError::AlreadyJoined);
+        }
+        let (mut send, mut receive) = self
+            .inner
+            .connection
+            .open_bi()
+            .await
+            .map_err(map_connection_error)?;
+        let envelope = lookup.encode();
+        send.write_all(&(envelope.len() as u32).to_be_bytes())
+            .await
+            .map_err(map_write_error)?;
+        send.write_all(&envelope).await.map_err(map_write_error)?;
+        send.finish()
+            .map_err(|error| TransportError::Stream(error.to_string()))?;
+
+        let mut status = [0; 1];
+        receive
+            .read_exact(&mut status)
+            .await
+            .map_err(|error| map_read_exact_error(&self.inner.connection, error))?;
+        match status[0] {
+            DIRECTORY_LOOKUP_FOUND => {
+                let mut length = [0; 2];
+                receive
+                    .read_exact(&mut length)
+                    .await
+                    .map_err(|error| map_read_exact_error(&self.inner.connection, error))?;
+                let length = u16::from_be_bytes(length) as usize;
+                if length == 0 || length > MAX_DIRECTORY_INVITATION_BYTES {
+                    return Err(TransportError::Malformed);
+                }
+                let mut invitation = vec![0; length];
+                receive
+                    .read_exact(&mut invitation)
+                    .await
+                    .map_err(|error| map_read_exact_error(&self.inner.connection, error))?;
+                Ok(invitation)
+            }
+            DIRECTORY_LOOKUP_NOT_FOUND => Err(TransportError::DirectoryNotFound),
+            DIRECTORY_LOOKUP_RATE_LIMITED => Err(TransportError::DirectoryRateLimited),
+            DIRECTORY_LOOKUP_MALFORMED => Err(TransportError::Malformed),
+            _ => Err(TransportError::Malformed),
+        }
     }
 
     pub async fn send_control(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
@@ -453,6 +507,14 @@ impl QuicClient {
         } else {
             Err(TransportError::NotJoined)
         }
+    }
+}
+
+impl Drop for QuicClient {
+    fn drop(&mut self) {
+        self.inner
+            .connection
+            .close(quinn::VarInt::from_u32(0), b"DeskLink client closed");
     }
 }
 

@@ -248,6 +248,9 @@ fn encode_event(event: &DiagnosticEvent) -> String {
                 "\"level\":\"info\",\"event\":\"host_connecting\",\"attempt\":{attempt},\"stream_id\":{stream_id}"
             )
         }
+        DiagnosticEvent::Lifecycle(HostLifecycleEvent::Available { stream_id }) => {
+            format!("\"level\":\"info\",\"event\":\"host_available\",\"stream_id\":{stream_id}")
+        }
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Connected { stream_id }) => {
             format!("\"level\":\"info\",\"event\":\"host_connected\",\"stream_id\":{stream_id}")
         }

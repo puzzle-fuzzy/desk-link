@@ -354,8 +354,13 @@ async fn run_worker(
     ready: std::sync::mpsc::SyncSender<Result<(), HostError>>,
 ) {
     let mut relay_authentication = relay_authentication;
+    let host_participant_id = identity.device_id;
     let join = client
-        .join(RelayJoin::host(session_id, relay_authentication))
+        .join(RelayJoin::host_with_participant(
+            session_id,
+            relay_authentication,
+            host_participant_id,
+        ))
         .await
         .map_err(transport_error);
     if let Err(error) = join {
@@ -395,6 +400,7 @@ async fn run_worker(
                     reconnect_config.as_ref().expect("checked above"),
                     session_id,
                     relay_authentication,
+                    host_participant_id,
                     &mut reconnect_schedule,
                     &mut cancellation,
                 )
@@ -515,6 +521,7 @@ async fn reconnect_host(
     config: &QuicClientConfig,
     session_id: SessionId,
     relay_authentication: [u8; 32],
+    host_participant_id: [u8; 16],
     schedule: &mut ReconnectSchedule,
     cancellation: &mut watch::Receiver<bool>,
 ) -> Result<Option<QuicClient>, HostError> {
@@ -547,7 +554,14 @@ async fn reconnect_host(
         if *cancellation.borrow() {
             return Ok(None);
         }
-        match connect_and_join(config, session_id, relay_authentication).await {
+        match connect_and_join(
+            config,
+            session_id,
+            relay_authentication,
+            host_participant_id,
+        )
+        .await
+        {
             Ok(client) => return Ok(Some(client)),
             Err(error) => last_error = Some(error),
         }
@@ -558,12 +572,17 @@ async fn connect_and_join(
     config: &QuicClientConfig,
     session_id: SessionId,
     relay_authentication: [u8; 32],
+    host_participant_id: [u8; 16],
 ) -> Result<QuicClient, HostError> {
     let client = QuicClient::connect(config.clone())
         .await
         .map_err(transport_error)?;
     client
-        .join(RelayJoin::host(session_id, relay_authentication))
+        .join(RelayJoin::host_with_participant(
+            session_id,
+            relay_authentication,
+            host_participant_id,
+        ))
         .await
         .map_err(transport_error)?;
     Ok(client)

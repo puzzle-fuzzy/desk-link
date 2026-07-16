@@ -5,13 +5,9 @@ struct ConnectView: View {
     @ObservedObject var bridge: ControllerBridge
 
     var body: some View {
-        HStack {
-            Button("Paste invitation") { connectFromPasteboard() }
-                .buttonStyle(.borderedProminent)
-            Text("The invitation is read from the clipboard and is never shown here.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        Button("粘贴连接码") { connectFromPasteboard() }
+            .buttonStyle(DeskLinkPrimaryButtonStyle())
+            .help("从剪贴板读取完整连接码并开始连接")
     }
 
     private func connectFromPasteboard() {

@@ -18,7 +18,8 @@ use desklink_protocol::{
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError, TransportEvent,
+    JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryRegistration, RelayJoin,
+    TransportError, TransportEvent,
 };
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, packetize_frame};
 use ed25519_dalek::VerifyingKey;
@@ -110,6 +111,9 @@ pub enum HostLifecycleEvent {
         attempt: u32,
         stream_id: u64,
     },
+    Available {
+        stream_id: u64,
+    },
     Connected {
         stream_id: u64,
     },
@@ -159,6 +163,7 @@ pub struct HostSupervisor {
     authorizer: Arc<dyn ControllerAuthorizer>,
     reconnect_policy: ReconnectPolicy,
     expires_at_unix_s: Option<u64>,
+    directory_registration: Option<RelayDirectoryRegistration>,
     observer: Option<Arc<dyn HostLifecycleObserver>>,
 }
 
@@ -186,6 +191,7 @@ impl HostSupervisor {
             authorizer,
             reconnect_policy: ReconnectPolicy::default(),
             expires_at_unix_s,
+            directory_registration: None,
             observer: None,
         })
     }
@@ -197,6 +203,11 @@ impl HostSupervisor {
 
     pub fn with_observer(mut self, observer: Arc<dyn HostLifecycleObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    pub fn with_directory_registration(mut self, registration: RelayDirectoryRegistration) -> Self {
+        self.directory_registration = Some(registration);
         self
     }
 
@@ -212,7 +223,12 @@ impl HostSupervisor {
             let outcome = self.run_attempt(stream_id, &stable).await;
             let error = match outcome {
                 Ok(()) => return Ok(()),
-                Err(error) if !host_error_is_retryable(&error) => {
+                Err(error)
+                    if !host_error_is_retryable_for_session(
+                        &error,
+                        self.expires_at_unix_s.is_none(),
+                    ) =>
+                {
                     self.publish(HostLifecycleEvent::Stopped {
                         reason: error.to_string(),
                     });
@@ -288,9 +304,16 @@ impl HostSupervisor {
         stable: &AtomicBool,
     ) -> Result<(), HostRuntimeError> {
         let client = QuicClient::connect(self.transport.clone()).await?;
-        client
-            .join(RelayJoin::host(self.session_id, *self.relay_authentication))
-            .await?;
+        let mut join = RelayJoin::host_with_participant(
+            self.session_id,
+            *self.relay_authentication,
+            self.host_device_id,
+        );
+        if let Some(registration) = &self.directory_registration {
+            join = join.with_directory_registration(registration.clone())?;
+        }
+        client.join(join).await?;
+        self.publish(HostLifecycleEvent::Available { stream_id });
         let identity = DeviceIdentity::from_secret_key(self.host_device_id, &self.host_secret_key);
         HostRuntime::with_authorizer(client, stream_id, identity, self.authorizer.clone())?
             .run_tracking_stability(stable, |stream_id| {
@@ -311,7 +334,9 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         HostRuntimeError::Transport(error) => transport_error_is_retryable(error),
         HostRuntimeError::TransportClosed(_)
         | HostRuntimeError::HandshakeTimeout
-        | HostRuntimeError::NegotiationTimeout => true,
+        | HostRuntimeError::NegotiationTimeout
+        | HostRuntimeError::UntrustedController
+        | HostRuntimeError::ControllerKeyChanged => true,
         HostRuntimeError::Protocol(_)
         | HostRuntimeError::Crypto(_)
         | HostRuntimeError::Capture(_)
@@ -324,12 +349,19 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         | HostRuntimeError::CaptureWorkerStopped
         | HostRuntimeError::CaptureWorkerPanicked
         | HostRuntimeError::ApprovalRequired
-        | HostRuntimeError::UntrustedController
-        | HostRuntimeError::ControllerKeyChanged
         | HostRuntimeError::PairingRejected
         | HostRuntimeError::PairingExpired
         | HostRuntimeError::AuthorizationBackend(_) => false,
     }
+}
+
+fn host_error_is_retryable_for_session(error: &HostRuntimeError, persistent_session: bool) -> bool {
+    host_error_is_retryable(error)
+        || (persistent_session
+            && matches!(
+                error,
+                HostRuntimeError::ApprovalRequired | HostRuntimeError::PairingRejected
+            ))
 }
 
 fn transport_error_is_retryable(error: &TransportError) -> bool {
@@ -350,6 +382,8 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         TransportError::MessageTooLarge { .. }
         | TransportError::NotJoined
         | TransportError::AlreadyJoined
+        | TransportError::DirectoryNotFound
+        | TransportError::DirectoryRateLimited
         | TransportError::Malformed
         | TransportError::InvalidConfig(_) => false,
     }
@@ -755,11 +789,13 @@ async fn perform_noise_handshake(
     identity: DeviceIdentity,
     authorizer: &dyn ControllerAuthorizer,
 ) -> Result<SecureSession, HostRuntimeError> {
+    // An idle host is already online at the relay. Waiting for the first controller message is
+    // therefore not a failed handshake and must not churn the relay session or the UI state.
+    let first = decode_noise_handshake(&client.next_control().await?)?;
+    if first.step != NoiseHandshakeStep::InitiatorHello {
+        return Err(HostRuntimeError::UnexpectedHandshakeStep);
+    }
     let handshake = async {
-        let first = decode_noise_handshake(&client.next_control().await?)?;
-        if first.step != NoiseHandshakeStep::InitiatorHello {
-            return Err(HostRuntimeError::UnexpectedHandshakeStep);
-        }
         let (mut responder, response) = match authorizer.pinned_verify_key() {
             Some(expected) => NoiseResponder::accept(&first.payload, identity, expected)?,
             None => NoiseResponder::accept_pairing(&first.payload, identity)?,
@@ -1100,4 +1136,21 @@ fn now_unix_s() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::{HostRuntimeError, host_error_is_retryable_for_session};
+
+    #[test]
+    fn persistent_host_recovers_after_rejecting_a_stale_pairing_request() {
+        assert!(host_error_is_retryable_for_session(
+            &HostRuntimeError::PairingRejected,
+            true
+        ));
+        assert!(!host_error_is_retryable_for_session(
+            &HostRuntimeError::PairingRejected,
+            false
+        ));
+    }
 }

@@ -6,6 +6,7 @@ import {
   cancelPairingSession,
   exportDiagnosticReport,
   getHostSnapshot,
+  restartHost,
   revokeTrustedController,
   saveConnectionSettings,
   setupManagedConnection,
@@ -49,6 +50,7 @@ let renderedView: View | null = null;
 let loading = true;
 let saving = false;
 let managedSetupBusy = false;
+let hostRestartBusy = false;
 let pairingBusy = false;
 let pairingSession: PairingSessionSummary | null = null;
 let diagnosticExportBusy = false;
@@ -62,12 +64,13 @@ const snapshotRequests = new LatestRequest();
 function render(): void {
   const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
   const preservedScrollTop = renderedView === activeView ? (previousWorkspace?.scrollTop ?? 0) : 0;
+  const animateSurface = renderedView !== activeView;
   prepareControllerRender();
   app.innerHTML = `
     <div class="app-shell">
       ${renderHeader()}
       ${renderNavigation()}
-      <section class="workspace" aria-busy="${loading}">
+      <section class="workspace" aria-busy="${loading}" data-surface-transition="${animateSurface}">
         ${feedback ? renderFeedback(feedback) : ""}
         ${loading ? renderLoading() : renderCurrentView()}
       </section>
@@ -186,6 +189,8 @@ function renderFatalState(): string {
 
 function renderOverview(state: HostSnapshot): string {
   const connection = state.connection;
+  const statusTitle = connection ? state.runtime.title : state.title;
+  const statusDetail = connection ? state.runtime.detail : state.detail;
   const connectionMode = connection
     ? isManagedRelay(connection.relayAddress, connection.serverName)
       ? { value: "DeskLink 公网中继", detail: "支持两台电脑位于不同网络" }
@@ -216,11 +221,15 @@ function renderOverview(state: HostSnapshot): string {
             <span class="status-light" aria-hidden="true"></span>
             这台电脑
           </div>
-          <h1 id="status-heading">${escapeHtml(state.title)}</h1>
-          <p>${escapeHtml(state.detail)}</p>
+          <h1 id="status-heading">${escapeHtml(statusTitle)}</h1>
+          <p>${escapeHtml(statusDetail)}</p>
         </div>
         <div class="status-actions">
-          ${connection ? renderPairingAction(state, state.trustedControllers.length > 0 ? "primary" : "secondary") : ""}
+          ${
+            connection && state.runtime.state === "stopped"
+              ? `<button class="button button--primary" type="button" data-restart-host ${hostRestartBusy ? "disabled" : ""} ${hostRestartBusy ? 'aria-busy="true"' : ""}>${hostRestartBusy ? "正在重新启动…" : "重新启动主机"}</button>`
+              : ""
+          }
           ${
             connection
               ? '<button class="button button--secondary" type="button" data-open-connection>连接设置</button>'
@@ -232,6 +241,8 @@ function renderOverview(state: HostSnapshot): string {
       </section>
 
       ${renderStateWarnings(state)}
+
+      ${renderHostAccessCard(state)}
 
       ${renderNextStep(state)}
 
@@ -274,6 +285,26 @@ function renderOverview(state: HostSnapshot): string {
   `;
 }
 
+function renderHostAccessCard(state: HostSnapshot): string {
+  if (!state.connection || !state.deviceId) {
+    return "";
+  }
+  const available = ["available", "pairing", "connected"].includes(state.runtime.state);
+  return `
+    <section class="host-access-card" aria-labelledby="host-access-heading">
+      <div class="host-access-copy">
+        <span class="eyebrow">本机 ID</span>
+        <h2 id="host-access-heading">${escapeHtml(state.deviceId)}</h2>
+        <p><span class="host-presence ${available ? "host-presence--online" : ""}" aria-hidden="true"></span>${available ? "此设备已在线，可从另一台电脑查找" : "正在恢复在线状态"}</p>
+      </div>
+      <div class="host-access-actions">
+        <button class="button button--secondary" type="button" data-copy-host-id>复制设备 ID</button>
+        ${renderPairingAction(state, "primary")}
+      </div>
+    </section>
+  `;
+}
+
 function renderNextStep(state: HostSnapshot): string {
   if (state.trustedControllers.length > 0) {
     return "";
@@ -285,22 +316,22 @@ function renderNextStep(state: HostSnapshot): string {
     : approvalStoreUnavailable
       ? "先恢复已批准设备列表"
     : state.pairingActive
-        ? "在另一台电脑粘贴连接码"
-        : "创建第一份连接码";
+        ? "在另一台电脑输入 ID 和临时密码"
+        : "生成第一份临时密码";
   const detail = !state.connection
     ? "DeskLink 会生成受保护的连接凭据并使用已部署的公网中继，无需填写网络参数。"
     : approvalStoreUnavailable
       ? "DeskLink 暂时无法安全读取已批准设备，请重新读取本机状态后再创建连接码。"
     : state.pairingActive
-        ? "打开另一台电脑的“控制另一台”页面，粘贴完整连接码并请求批准。"
-        : "连接码会包含中继地址和一次性凭据，另一台电脑完整粘贴后会自动填写。";
+        ? "打开另一台电脑的“控制另一台”页面，输入本机 ID 和临时密码。"
+        : "临时密码有效时间很短；找到本机后，仍需在这台电脑上确认连接请求。";
   const action = !state.connection
     ? `<button class="button button--primary" type="button" data-setup-managed ${managedSetupBusy ? "disabled" : ""}>${managedSetupBusy ? "正在启用…" : "启用远程连接"}</button>`
     : approvalStoreUnavailable
       ? '<button class="button button--primary" type="button" data-refresh>重新读取本机状态</button>'
     : state.pairingActive
-      ? '<button class="button button--primary" type="button" data-open-pairing>查看连接码</button>'
-      : '<button class="button button--primary" type="button" data-start-pairing>创建连接码</button>';
+      ? '<button class="button button--primary" type="button" data-open-pairing>查看临时密码</button>'
+      : '<button class="button button--primary" type="button" data-start-pairing>生成临时密码</button>';
   return `
     <section class="next-step" aria-labelledby="next-step-heading">
       <div class="next-step-copy">
@@ -310,7 +341,7 @@ function renderNextStep(state: HostSnapshot): string {
       </div>
       <ol class="setup-progress" aria-label="首次连接进度">
         <li class="${stage > 1 ? "is-complete" : "is-current"}"><span>1</span><strong>启用远程连接</strong></li>
-        <li class="${stage > 2 ? "is-complete" : stage === 2 ? "is-current" : ""}"><span>2</span><strong>创建连接码</strong></li>
+        <li class="${stage > 2 ? "is-complete" : stage === 2 ? "is-current" : ""}"><span>2</span><strong>生成临时密码</strong></li>
         <li class="${stage === 3 ? "is-current" : ""}"><span>3</span><strong>在本机批准</strong></li>
       </ol>
       <div class="next-step-action">${action}</div>
@@ -637,7 +668,7 @@ function renderDeviceEmptyState(): string {
     <div class="empty-state empty-state--devices">
       <span class="empty-device" aria-hidden="true"></span>
       <h2>还没有已批准的电脑</h2>
-      <p>创建一份短期连接码，在另一台电脑粘贴后回到本机确认身份。</p>
+      <p>生成一份临时密码，在另一台电脑输入本机 ID 后回到这里确认身份。</p>
       ${snapshot ? renderPairingAction(snapshot, "primary") : ""}
     </div>
   `;
@@ -691,11 +722,11 @@ function renderPairingAction(
     (!active && (!state.connection || Boolean(state.trustedError)));
   const className = presentation === "text" ? "text-button" : `button button--${presentation}`;
   const action = active ? "data-open-pairing" : "data-start-pairing";
-  const label = active ? "查看连接码" : pairingBusy ? "正在创建连接码…" : "连接新电脑";
+  const label = active ? "查看临时密码" : pairingBusy ? "正在生成临时密码…" : "生成临时密码";
   const title = !state.connection
-    ? 'title="请先保存本机连接，再创建连接码"'
+    ? 'title="请先启用本机远程连接，再生成临时密码"'
     : state.trustedError
-      ? 'title="已批准设备存储可用后才能创建连接码"'
+      ? 'title="已批准设备存储可用后才能生成临时密码"'
       : "";
   return `<button class="${className}" type="button" ${action} ${disabled ? "disabled" : ""} ${title}>${label}</button>`;
 }
@@ -708,12 +739,12 @@ function renderPairing(state: HostSnapshot): string {
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
         <div>
-          <button class="back-button" type="button" data-open-devices aria-label="返回已批准设备">← 已批准设备</button>
-          <h1>连接另一台电脑</h1>
-          <p>连接码只在短时间内有效。另一台电脑发起连接后，仍需要你在本机确认身份。</p>
+          <button class="back-button" type="button" data-open-overview aria-label="返回本机状态">← 本机状态</button>
+          <h1>允许另一台电脑连接</h1>
+          <p>在另一台电脑输入下面的设备 ID 和临时密码。</p>
         </div>
         <span class="pairing-state ${active ? "pairing-state--active" : ""}">
-          <span aria-hidden="true"></span>${active ? "邀请有效" : "邀请已失效"}
+          <span aria-hidden="true"></span>${active ? "临时密码有效" : "临时密码已失效"}
         </span>
       </header>
 
@@ -723,37 +754,54 @@ function renderPairing(state: HostSnapshot): string {
             <section class="pairing-card" aria-labelledby="pairing-invitation-heading">
               <div class="pairing-card-heading">
                 <div>
-                  <span class="eyebrow">一次性连接码</span>
-                  <h2 id="pairing-invitation-heading">复制到另一台电脑</h2>
+                  <span class="eyebrow">本次连接凭据</span>
+                  <h2 id="pairing-invitation-heading">输入到另一台电脑</h2>
                 </div>
                 <strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>
               </div>
-              <label class="sr-only" for="pairing-invitation">配对连接码</label>
-              <textarea
-                id="pairing-invitation"
-                class="pairing-invitation"
-                readonly
-                spellcheck="false"
-                aria-describedby="pairing-secret-note"
-              >${escapeHtml(displayedInvitation)}</textarea>
-              <div class="pairing-card-actions">
-                <button class="button button--primary" type="button" data-copy-pairing ${pairingBusy ? "disabled" : ""}>复制连接码</button>
-                <button class="button button--secondary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>${pairingBusy ? "正在恢复主机…" : "取消配对"}</button>
+              <div class="pairing-credentials">
+                <div class="pairing-credential">
+                  <span>设备 ID</span>
+                  <strong id="pairing-device-id">${escapeHtml(session.deviceId)}</strong>
+                  <button class="button button--secondary button--compact" type="button" data-copy-device-id ${pairingBusy ? "disabled" : ""}>复制设备 ID</button>
+                </div>
+                <div class="pairing-credential pairing-credential--password">
+                  <span>临时密码</span>
+                  <strong id="pairing-temporary-password">${escapeHtml(session.temporaryPassword)}</strong>
+                  <button class="button button--secondary button--compact" type="button" data-copy-temporary-password ${pairingBusy ? "disabled" : ""}>复制临时密码</button>
+                </div>
               </div>
-              <p class="secret-note" id="pairing-secret-note">连接码包含一次性中继凭据，请只粘贴到自己的另一台 DeskLink 电脑，不要发送到公开聊天或工单。</p>
+              <ol class="pairing-steps" aria-label="连接步骤">
+                <li><span>1</span><p>在另一台电脑打开“控制另一台”</p></li>
+                <li><span>2</span><p>输入设备 ID 和临时密码</p></li>
+                <li><span>3</span><p>回到本机确认连接请求</p></li>
+              </ol>
+              <div class="pairing-card-actions">
+                <button class="button button--secondary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>${pairingBusy ? "正在结束…" : "结束本次连接窗口"}</button>
+              </div>
+              <details class="pairing-legacy-panel">
+                <summary>旧版 DeskLink 连接码</summary>
+                <div class="pairing-legacy-content">
+                  <p>只有另一台电脑尚未升级、没有设备 ID 输入框时才需要使用。</p>
+                  <label class="sr-only" for="pairing-invitation">旧版配对连接码</label>
+                  <textarea id="pairing-invitation" class="pairing-invitation" readonly spellcheck="false">${escapeHtml(displayedInvitation)}</textarea>
+                  <button class="button button--secondary button--compact" type="button" data-copy-pairing ${pairingBusy ? "disabled" : ""}>复制旧版连接码</button>
+                </div>
+              </details>
+              <p class="secret-note" id="pairing-secret-note">临时密码仅供本次连接使用，请勿发送到公开聊天或工单。</p>
             </section>
           `
           : `
             <section class="pairing-card pairing-card--unavailable">
               <span class="empty-symbol" aria-hidden="true">${active ? "…" : "×"}</span>
-              <h2>${active ? "本机正在等待配对" : "此邀请已失效"}</h2>
+              <h2>${active ? "本机正在等待连接" : "临时密码已失效"}</h2>
               <p>${
                 active
-                  ? "为保护连接安全，邀请只会显示在创建它的窗口中。如需重新获取，请取消本次配对并创建新邀请。"
-                  : "邀请已过期或配对主机已停止，普通主机模式会自动恢复。"
+                  ? "为保护连接安全，临时密码只显示在生成它的窗口中。如需重新获取，请结束本次连接窗口后重新生成。"
+                  : "临时密码已过期或主机已停止，本机在线服务会自动恢复。"
               }</p>
               <div class="pairing-card-actions">
-                <button class="button button--primary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>恢复普通主机模式</button>
+                <button class="button button--primary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>恢复本机在线服务</button>
               </div>
             </section>
           `
@@ -763,7 +811,7 @@ function renderPairing(state: HostSnapshot): string {
         <span class="security-note-mark" aria-hidden="true"></span>
         <div>
           <strong>下一步需要回到这台电脑确认</strong>
-          <p>另一台电脑发起连接后，Windows 会显示完整身份信息。核对无误后才能批准查看画面和控制输入。</p>
+          <p>设备 ID 和临时密码只能用于找到本机。Windows 会显示控制端身份，确认后才允许查看画面和控制输入。</p>
         </div>
       </div>
     </div>
@@ -812,6 +860,14 @@ function formatPairingRemaining(expiresAtUnixS: number): string {
   return `剩余 ${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
+function clearPairingSecrets(): void {
+  if (!pairingSession) {
+    return;
+  }
+  pairingSession.temporaryPassword = "";
+  pairingSession.invitation = "";
+}
+
 function bindInteractions(): void {
   if (activeView === "controller") {
     bindControllerInteractions();
@@ -845,6 +901,9 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-refresh]").forEach((button) => {
     button.addEventListener("click", () => void refreshSnapshot());
   });
+  document.querySelector<HTMLButtonElement>("[data-restart-host]")?.addEventListener("click", () => {
+    void restartStoppedHost();
+  });
   document.querySelector<HTMLButtonElement>("[data-export-diagnostics]")?.addEventListener("click", () => {
     void exportDiagnostics();
   });
@@ -860,6 +919,11 @@ function bindInteractions(): void {
     feedback = null;
     render();
   });
+  document.querySelector<HTMLButtonElement>("[data-open-overview]")?.addEventListener("click", () => {
+    activeView = "overview";
+    feedback = null;
+    render();
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-start-pairing]").forEach((button) => {
     button.addEventListener("click", () => void beginPairing());
   });
@@ -872,6 +936,21 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-copy-pairing]")?.addEventListener("click", () => {
     void copyPairingInvitation();
+  });
+  document.querySelector<HTMLButtonElement>("[data-copy-host-id]")?.addEventListener("click", () => {
+    if (snapshot?.deviceId) {
+      void copyCredential(snapshot.deviceId, "host-access-heading", "设备 ID 已复制。");
+    }
+  });
+  document.querySelector<HTMLButtonElement>("[data-copy-device-id]")?.addEventListener("click", () => {
+    if (pairingSession) {
+      void copyCredential(pairingSession.deviceId, "pairing-device-id", "设备 ID 已复制。");
+    }
+  });
+  document.querySelector<HTMLButtonElement>("[data-copy-temporary-password]")?.addEventListener("click", () => {
+    if (pairingSession) {
+      void copyCredential(pairingSession.temporaryPassword, "pairing-temporary-password", "临时密码已复制。");
+    }
   });
   document.querySelector<HTMLButtonElement>("[data-cancel-pairing]")?.addEventListener("click", () => {
     void cancelPairing();
@@ -945,7 +1024,7 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
     }
     snapshot = nextSnapshot;
     if (!snapshot.pairingActive && pairingSession) {
-      pairingSession.invitation = "";
+      clearPairingSecrets();
       pairingSession = null;
     }
   } catch (error) {
@@ -968,6 +1047,24 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
   }
 }
 
+async function restartStoppedHost(): Promise<void> {
+  if (hostRestartBusy) {
+    return;
+  }
+  hostRestartBusy = true;
+  feedback = null;
+  render();
+  try {
+    snapshot = await restartHost();
+    feedback = { tone: "info", message: "主机已重新启动，DeskLink 正在连接中继服务器。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    hostRestartBusy = false;
+    render();
+  }
+}
+
 async function enableManagedConnection(): Promise<void> {
   if (managedSetupBusy || snapshot?.connection) {
     return;
@@ -979,7 +1076,7 @@ async function enableManagedConnection(): Promise<void> {
     snapshot = await setupManagedConnection();
     feedback = {
       tone: "success",
-      message: "远程连接已启用。现在可以创建连接码并在另一台电脑上粘贴。",
+      message: "远程连接已启用。本机现在可以显示设备 ID，并生成临时密码供另一台电脑连接。",
     };
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
@@ -1037,14 +1134,14 @@ async function cancelPairing(): Promise<void> {
   pairingBusy = true;
   feedback = null;
   if (pairingSession) {
-    pairingSession.invitation = "";
+    clearPairingSecrets();
   }
   pairingSession = null;
   render();
   try {
     snapshot = await cancelPairingSession();
     activeView = "devices";
-    feedback = { tone: "success", message: "一次性邀请已清除，普通主机模式已恢复。" };
+    feedback = { tone: "success", message: "临时密码已清除，本机在线服务已恢复。" };
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -1057,21 +1154,36 @@ async function copyPairingInvitation(): Promise<void> {
   if (!pairingSession || !snapshot) {
     return;
   }
-  const invitationText = pairingSession.invitation;
+  await copyCredential(
+    pairingSession.invitation,
+    "pairing-invitation",
+    "旧版连接码已复制，请在另一台 DeskLink 电脑的兼容入口粘贴。",
+  );
+}
+
+async function copyCredential(text: string, fallbackElementId: string, successMessage: string): Promise<void> {
   try {
     try {
-      await navigator.clipboard.writeText(invitationText);
+      await navigator.clipboard.writeText(text);
     } catch {
-      const invitation = document.querySelector<HTMLTextAreaElement>("#pairing-invitation");
-      if (!invitation) {
-        throw new Error("配对邀请已不可用。");
+      const source = fallbackElementId ? document.getElementById(fallbackElementId) : null;
+      if (source instanceof HTMLTextAreaElement || source instanceof HTMLInputElement) {
+        source.select();
+      } else if (source) {
+        const range = document.createRange();
+        range.selectNodeContents(source);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      } else {
+        throw new Error("此信息已不可用。");
       }
-      invitation.select();
       if (!document.execCommand("copy")) {
-        throw new Error("Windows 未允许 DeskLink 复制邀请。");
+        throw new Error("Windows 未允许 DeskLink 复制此信息。");
       }
+      window.getSelection()?.removeAllRanges();
     }
-    feedback = { tone: "success", message: "配对连接码已复制，请在另一台 DeskLink 电脑的“控制电脑”页面完整粘贴。" };
+    feedback = { tone: "success", message: successMessage };
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   }
@@ -1089,7 +1201,7 @@ async function revokeController(fingerprint: string): Promise<void> {
     const result = await revokeTrustedController(fingerprint);
     snapshot = result.snapshot;
     if (!snapshot.pairingActive && pairingSession) {
-      pairingSession.invitation = "";
+      clearPairingSecrets();
       pairingSession = null;
     }
     feedback = result.revoked
@@ -1166,9 +1278,9 @@ window.setInterval(() => {
     countdown.textContent = formatPairingRemaining(pairingSession.expiresAtUnixS);
   }
   if (pairingSession.expiresAtUnixS <= Math.floor(Date.now() / 1000)) {
-    pairingSession.invitation = "";
+    clearPairingSecrets();
     pairingSession = null;
-    feedback = { tone: "info", message: "一次性配对邀请已过期，并已从此窗口清除。" };
+    feedback = { tone: "info", message: "临时密码已过期，并已从此窗口清除。" };
     render();
     void refreshSnapshot(false);
   }

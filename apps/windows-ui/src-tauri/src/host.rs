@@ -14,7 +14,8 @@ use apps_windows::{
     },
     window::WindowsLocalApprovalDialog,
 };
-use desklink_crypto::{MAX_PAIRING_TTL_S, PairingInvite};
+use desklink_crypto::{MAX_PAIRING_TTL_S, PairingCode, PairingInvite};
+use desklink_transport::RelayDirectoryRegistration;
 use rand_core::OsRng;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -92,6 +93,7 @@ impl HostRuntimeSummary {
     fn from_event(event: &HostLifecycleEvent) -> Self {
         let state = match event {
             HostLifecycleEvent::Connecting { .. } => "connecting",
+            HostLifecycleEvent::Available { .. } => "available",
             HostLifecycleEvent::Connected { .. } => "connected",
             HostLifecycleEvent::Reconnecting { .. } => "reconnecting",
             HostLifecycleEvent::Stopped { .. } => "stopped",
@@ -110,12 +112,15 @@ impl HostRuntimeSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingSessionSummary {
+    pub device_id: String,
+    pub temporary_password: String,
     pub invitation: String,
     pub expires_at_unix_s: u64,
 }
 
 impl Drop for PairingSessionSummary {
     fn drop(&mut self) {
+        self.temporary_password.zeroize();
         self.invitation.zeroize();
     }
 }
@@ -497,8 +502,21 @@ fn prepare_pairing(
     let encoded = invite
         .encode()
         .map_err(|_| HostPreparationFailure::Pairing)?;
+    let device_id = crate::device_directory::public_device_id(identity.device_id);
+    let access_code = PairingCode::generate(&mut OsRng);
+    let directory_registration = RelayDirectoryRegistration::new(
+        device_id,
+        *access_code.as_bytes(),
+        encoded.as_bytes().to_vec(),
+        MAX_PAIRING_TTL_S
+            .try_into()
+            .map_err(|_| HostPreparationFailure::Pairing)?,
+    )
+    .map_err(|_| HostPreparationFailure::Pairing)?;
     let invitation = crate::hex(encoded.as_bytes());
     let session = PairingSessionSummary {
+        device_id: crate::device_directory::format_device_id(device_id),
+        temporary_password: access_code.to_string(),
         invitation: crate::local_relay::pairing_package(&connection, &invitation),
         expires_at_unix_s: invite.expires_at_unix_s(),
     };
@@ -531,6 +549,7 @@ fn prepare_pairing(
         Some(expires_at_unix_s),
     )
     .map_err(|_| HostPreparationFailure::Runtime)?
+    .with_directory_registration(directory_registration)
     .with_observer(observer);
     Ok(PreparedPairing {
         supervisor: Box::new(supervisor),
@@ -559,6 +578,15 @@ mod tests {
         assert_eq!(status.state, "connected");
         assert_eq!(status.title, "远程控制已连接");
         assert!(status.detail.contains("视频流 9"));
+    }
+
+    #[test]
+    fn lifecycle_status_reports_an_idle_relay_connection_as_available() {
+        let status =
+            HostRuntimeSummary::from_event(&HostLifecycleEvent::Available { stream_id: 4 });
+        assert_eq!(status.state, "available");
+        assert_eq!(status.title, "此设备已在线");
+        assert!(status.detail.contains("等待另一台电脑"));
     }
 
     #[test]

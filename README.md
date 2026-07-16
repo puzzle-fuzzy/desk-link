@@ -90,11 +90,19 @@ python scripts/verify-managed-relay.py
 python scripts/build-windows-installer.py
 ```
 
-输出为 `dist/windows/DeskLinkSetup-0.1.1-x64.exe`。构建脚本会先执行完整 Windows 发布验证，再原样封装同一份已验证程序，确认最终安装器包含与清单哈希完全一致的负载，并写入 `dist/windows/windows-installer-manifest.json`。
+输出为 `dist/windows/DeskLinkSetup-0.1.2-x64.exe`。构建脚本会先执行完整 Windows 发布验证，再原样封装同一份已验证程序，确认最终安装器包含与清单哈希完全一致的负载，并写入 `dist/windows/windows-installer-manifest.json`。
 
 安装器是单文件、当前用户、无需管理员权限的 GUI 安装包，只部署 `DeskLink.exe` 到 `%LOCALAPPDATA%\Programs\DeskLink`。静默安装使用 `--quiet`，同时指定 `--no-autostart` 可关闭登录启动。默认卸载保留 `%LOCALAPPDATA%\DeskLink` 下的身份、连接、信任和诊断数据；只有显式 `--remove-data` 才删除用户数据。
 
 未设置签名环境变量时，构建结果会标记为 `unsigned`，只适合本地测试。正式分发必须先签应用、再封装并签最终安装器；配置见 [`docs/windows-code-signing.md`](docs/windows-code-signing.md)。
+
+正式发布必须使用强制签名门禁：
+
+```powershell
+python scripts/build-windows-installer.py --require-signing
+```
+
+远程的 `Windows Signed Release` 工作流只接受 GitHub Secrets 中的可信 PFX，缺少证书、证书用途不正确、证书过期、签名失败或没有 RFC 3161 时间戳都会中止，不会上传未签名安装器。
 
 ## macOS 构建与使用
 
@@ -111,10 +119,7 @@ open dist/macos/DeskLink.app
 
 `build-macos-arm64.sh --check` 会先构建 `aarch64-apple-darwin` Rust FFI，再构建 arm64 Swift release executable，生成 `dist/macos/DeskLink.app`，并检查可执行文件架构、bundle identifier、Screen Recording 声明和最低系统版本。`verify-macos-runtime.sh` 运行 Rust FFI、local-relay fake-media 端到端测试与 Swift arm64 测试。
 
-首次打开应用后选择角色：
-
-- `Control another Mac`：粘贴 host 创建的签名邀请；host 批准后显示远端画面并发送鼠标、滚轮和键盘输入；
-- `Share this Mac`：授予 Screen Recording 与 Accessibility 权限，然后创建邀请并在本机核对控制端指纹后批准。
+macOS 主窗口与 Windows 使用同一套中文页面结构：`本机状态`、`控制另一台`、`本机连接` 和 `已批准设备`。控制端在“控制另一台”粘贴连接码；主机在“本机连接”授予屏幕录制与辅助功能权限、创建连接码，并在本机核对控制端身份后批准。
 
 长期身份、可信控制端和已批准 host 的重连材料保存在当前用户 Apple Keychain。邀请仅应通过可信渠道传递；身份更换、撤销、邀请过期或凭据变化后，应重新创建邀请并配对。
 
@@ -135,6 +140,8 @@ Windows 当前用户数据位于 Known Folder API 返回的 Local AppData 下：
 ## 自建中继
 
 生产 relay 需要受客户端系统信任的 TLS 证书链，并开放 UDP 监听端口。主要配置包括 `DESKLINK_RELAY_ADDR`、`DESKLINK_RELAY_CERT_PEM`、`DESKLINK_RELAY_KEY_PEM`、`DESKLINK_RELAY_SESSION_TTL_S` 和容量限制变量。没有 PEM 时生成的 `localhost` 自签名证书只用于自动化测试。
+
+加入中继信封 v2 会携带非秘密的稳定设备参与者 ID：同一设备重连时可原子替换自己的旧连接，不同控制端仍受单控制端限制。relay 同时接受旧版 v1 客户端；发布时必须先升级 relay，再发布使用 v2 的 Windows/macOS 客户端。
 
 ## 发布前仍需人工验收
 

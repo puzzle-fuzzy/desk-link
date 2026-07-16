@@ -4,7 +4,7 @@ use bytes::Bytes;
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
-    DEAD_TIMEOUT, JOIN_ENVELOPE_BYTES, JoinRejectCode, MAX_DATAGRAM_BYTES,
+    DEAD_TIMEOUT, JOIN_ENVELOPE_BYTES, JOIN_ENVELOPE_V2_BYTES, JoinRejectCode, MAX_DATAGRAM_BYTES,
     MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig, RelayJoin, TransportError,
     TransportEvent, decode_relay_join,
 };
@@ -456,6 +456,20 @@ fn config(relay: &MockRelay) -> QuicClientConfig {
 
 fn join(role: DeviceRole) -> RelayJoin {
     RelayJoin::new(SessionId::from_bytes([8; 16]), role, [4; 32])
+}
+
+#[test]
+fn relay_join_v2_round_trips_participant_identity_and_keeps_v1_compatible() {
+    let session_id = SessionId::from_bytes([8; 16]);
+    let legacy = RelayJoin::host(session_id, [4; 32]);
+    let legacy_bytes = legacy.encode();
+    assert_eq!(legacy_bytes.len(), JOIN_ENVELOPE_BYTES);
+    assert_eq!(decode_relay_join(&legacy_bytes).unwrap(), legacy);
+
+    let resumable = RelayJoin::controller_with_participant(session_id, [4; 32], [9; 16]);
+    let resumable_bytes = resumable.encode();
+    assert_eq!(resumable_bytes.len(), JOIN_ENVELOPE_V2_BYTES);
+    assert_eq!(decode_relay_join(&resumable_bytes).unwrap(), resumable);
 }
 
 #[tokio::test]

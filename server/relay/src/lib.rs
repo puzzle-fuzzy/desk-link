@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -11,9 +11,11 @@ use std::{
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
-    ChannelKind, DEAD_TIMEOUT, JOIN_ENVELOPE_BYTES, JoinRejectCode, KEEPALIVE_INTERVAL,
-    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayJoin,
-    decode_relay_join,
+    ChannelKind, DEAD_TIMEOUT, DIRECTORY_ACCESS_CODE_BYTES, DIRECTORY_LOOKUP_ENVELOPE_BYTES,
+    DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_NOT_FOUND, DIRECTORY_LOOKUP_RATE_LIMITED,
+    JoinRejectCode, KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES,
+    MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayJoin,
+    decode_directory_lookup, decode_relay_join,
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -71,7 +73,12 @@ pub enum RelayError {
     ConnectionLimitReached,
     #[error("session admission limit reached")]
     SessionLimitReached,
+    #[error("device directory ID is already registered by another host")]
+    DirectoryConflict,
 }
+
+const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
+const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 
 #[derive(Clone)]
 pub struct RelaySessionTable {
@@ -85,6 +92,8 @@ struct SessionRecord {
     authentication: Option<[u8; 32]>,
     host: Option<u64>,
     controller: Option<u64>,
+    host_participant_id: Option<[u8; 16]>,
+    controller_participant_id: Option<[u8; 16]>,
 }
 
 impl RelaySessionTable {
@@ -96,7 +105,8 @@ impl RelaySessionTable {
     }
 
     pub fn attach_host(&self, session_id: SessionId, connection_id: u64) -> Result<(), RelayError> {
-        self.attach_role(session_id, DeviceRole::Host, None, connection_id)
+        self.attach_role(session_id, DeviceRole::Host, None, None, connection_id)
+            .map(|_| ())
     }
 
     pub fn attach_controller(
@@ -104,7 +114,14 @@ impl RelaySessionTable {
         session_id: SessionId,
         connection_id: u64,
     ) -> Result<(), RelayError> {
-        self.attach_role(session_id, DeviceRole::Controller, None, connection_id)
+        self.attach_role(
+            session_id,
+            DeviceRole::Controller,
+            None,
+            None,
+            connection_id,
+        )
+        .map(|_| ())
     }
 
     pub fn attach_host_with_auth(
@@ -117,8 +134,10 @@ impl RelaySessionTable {
             session_id,
             DeviceRole::Host,
             Some(authentication),
+            None,
             connection_id,
         )
+        .map(|_| ())
     }
 
     pub fn attach_controller_with_auth(
@@ -131,8 +150,10 @@ impl RelaySessionTable {
             session_id,
             DeviceRole::Controller,
             Some(authentication),
+            None,
             connection_id,
         )
+        .map(|_| ())
     }
 
     pub fn attach_with_auth(
@@ -142,7 +163,25 @@ impl RelaySessionTable {
         authentication: [u8; 32],
         connection_id: u64,
     ) -> Result<(), RelayError> {
-        self.attach_role(session_id, role, Some(authentication), connection_id)
+        self.attach_role(session_id, role, Some(authentication), None, connection_id)
+            .map(|_| ())
+    }
+
+    fn attach_with_auth_and_participant(
+        &self,
+        session_id: SessionId,
+        role: DeviceRole,
+        authentication: [u8; 32],
+        participant_id: Option<[u8; 16]>,
+        connection_id: u64,
+    ) -> Result<Option<u64>, RelayError> {
+        self.attach_role(
+            session_id,
+            role,
+            Some(authentication),
+            participant_id,
+            connection_id,
+        )
     }
 
     pub fn detach(&self, session_id: SessionId, connection_id: u64) -> bool {
@@ -160,9 +199,11 @@ impl RelaySessionTable {
         };
         let detached = if session.host == Some(connection_id) {
             session.host = None;
+            session.host_participant_id = None;
             true
         } else if session.controller == Some(connection_id) {
             session.controller = None;
+            session.controller_participant_id = None;
             true
         } else {
             false
@@ -233,8 +274,9 @@ impl RelaySessionTable {
         session_id: SessionId,
         role: DeviceRole,
         authentication: Option<[u8; 32]>,
+        participant_id: Option<[u8; 16]>,
         connection_id: u64,
-    ) -> Result<(), RelayError> {
+    ) -> Result<Option<u64>, RelayError> {
         let now = Instant::now();
         let mut sessions = self.lock_sessions();
         sessions.retain(|_, session| session.expires_at > now);
@@ -257,9 +299,11 @@ impl RelaySessionTable {
                     authentication,
                     host: Some(connection_id),
                     controller: None,
+                    host_participant_id: participant_id,
+                    controller_participant_id: None,
                 },
             );
-            return Ok(());
+            return Ok(None);
         }
 
         let current_connections = active_connection_count(&sessions);
@@ -269,28 +313,44 @@ impl RelaySessionTable {
         apply_authentication(&mut session.authentication, authentication)?;
         match role {
             DeviceRole::Host => {
-                if session.host.is_some() {
-                    Err(RelayError::SessionOccupied)
+                if let Some(current) = session.host {
+                    if participant_id.is_some() && participant_id == session.host_participant_id {
+                        session.host = Some(connection_id);
+                        session.host_participant_id = participant_id;
+                        Ok(Some(current))
+                    } else {
+                        Err(RelayError::SessionOccupied)
+                    }
                 } else {
                     if current_connections >= self.config.max_connections {
                         return Err(RelayError::ConnectionLimitReached);
                     }
                     session.host = Some(connection_id);
-                    Ok(())
+                    session.host_participant_id = participant_id;
+                    Ok(None)
                 }
             }
             DeviceRole::Controller => {
                 if session.host.is_none() {
                     return Err(RelayError::RoleMismatch);
                 }
-                if session.controller.is_some() {
-                    Err(RelayError::SessionOccupied)
+                if let Some(current) = session.controller {
+                    if participant_id.is_some()
+                        && participant_id == session.controller_participant_id
+                    {
+                        session.controller = Some(connection_id);
+                        session.controller_participant_id = participant_id;
+                        Ok(Some(current))
+                    } else {
+                        Err(RelayError::SessionOccupied)
+                    }
                 } else {
                     if current_connections >= self.config.max_connections {
                         return Err(RelayError::ConnectionLimitReached);
                     }
                     session.controller = Some(connection_id);
-                    Ok(())
+                    session.controller_participant_id = participant_id;
+                    Ok(None)
                 }
             }
         }
@@ -359,8 +419,30 @@ struct RelayState {
     sessions: RelaySessionTable,
     membership: Mutex<()>,
     participants: Mutex<HashMap<u64, Participant>>,
+    directory: Mutex<HashMap<u64, DirectoryRecord>>,
+    lookup_attempts: Mutex<HashMap<(IpAddr, u64), LookupAttempt>>,
     next_connection_id: AtomicU64,
     active_connections: std::sync::atomic::AtomicUsize,
+}
+
+struct DirectoryRecord {
+    participant_id: [u8; 16],
+    connection_id: u64,
+    access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
+    invitation: Vec<u8>,
+    expires_at: Instant,
+}
+
+impl Drop for DirectoryRecord {
+    fn drop(&mut self) {
+        self.access_code.fill(0);
+        self.invitation.fill(0);
+    }
+}
+
+struct LookupAttempt {
+    window_started: Instant,
+    failures: u8,
 }
 
 impl RelayState {
@@ -415,17 +497,144 @@ impl RelayState {
         join: &RelayJoin,
         connection_id: u64,
         connection: quinn::Connection,
-    ) -> Result<(), RelayError> {
+    ) -> Result<Option<quinn::Connection>, RelayError> {
         let _membership = self.lock_membership();
-        self.sessions.attach_with_auth(
+        if let Some(registration) = join.directory_registration() {
+            self.validate_directory_slot(registration.device_id(), join.participant_id().copied())?;
+        }
+        let replaced = self.sessions.attach_with_auth_and_participant(
             join.session_id(),
             join.role(),
             *join.authentication(),
+            join.participant_id().copied(),
             connection_id,
         )?;
-        self.lock_participants()
-            .insert(connection_id, Participant { connection });
-        Ok(())
+        if let Some(registration) = join.directory_registration() {
+            self.publish_directory(
+                registration.device_id(),
+                join.participant_id()
+                    .copied()
+                    .ok_or(RelayError::MalformedJoin)?,
+                connection_id,
+                *registration.access_code(),
+                registration.invitation().to_vec(),
+                Duration::from_secs(u64::from(registration.ttl_s())),
+            );
+        }
+        let mut participants = self.lock_participants();
+        let replaced = replaced.and_then(|connection_id| {
+            participants
+                .remove(&connection_id)
+                .map(|participant| participant.connection)
+        });
+        participants.insert(connection_id, Participant { connection });
+        Ok(replaced)
+    }
+
+    fn validate_directory_slot(
+        &self,
+        device_id: u64,
+        participant_id: Option<[u8; 16]>,
+    ) -> Result<(), RelayError> {
+        let Some(participant_id) = participant_id else {
+            return Err(RelayError::MalformedJoin);
+        };
+        let now = Instant::now();
+        let mut directory = match self.directory.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        directory.retain(|_, record| record.expires_at > now);
+        if directory
+            .get(&device_id)
+            .is_some_and(|record| record.participant_id != participant_id)
+        {
+            Err(RelayError::DirectoryConflict)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn publish_directory(
+        &self,
+        device_id: u64,
+        participant_id: [u8; 16],
+        connection_id: u64,
+        access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
+        invitation: Vec<u8>,
+        ttl: Duration,
+    ) {
+        let mut directory = match self.directory.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        directory.insert(
+            device_id,
+            DirectoryRecord {
+                participant_id,
+                connection_id,
+                access_code,
+                invitation,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+
+    fn lookup_directory(
+        &self,
+        source: IpAddr,
+        lookup: &RelayDirectoryLookup,
+    ) -> Result<Vec<u8>, u8> {
+        let now = Instant::now();
+        let key = (source, lookup.device_id());
+        {
+            let mut attempts = match self.lookup_attempts.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            attempts.retain(|_, attempt| {
+                now.duration_since(attempt.window_started) < DIRECTORY_LOOKUP_WINDOW
+            });
+            if attempts
+                .get(&key)
+                .is_some_and(|attempt| attempt.failures >= DIRECTORY_LOOKUP_FAILURE_LIMIT)
+            {
+                return Err(DIRECTORY_LOOKUP_RATE_LIMITED);
+            }
+        }
+
+        let invitation = {
+            let mut directory = match self.directory.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            directory.retain(|_, record| record.expires_at > now);
+            directory.get(&lookup.device_id()).and_then(|record| {
+                bool::from(record.access_code.ct_eq(lookup.access_code()))
+                    .then(|| record.invitation.clone())
+            })
+        };
+        if let Some(invitation) = invitation {
+            if let Ok(mut attempts) = self.lookup_attempts.lock() {
+                attempts.remove(&key);
+            }
+            return Ok(invitation);
+        }
+
+        let mut attempts = match self.lookup_attempts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let attempt = attempts.entry(key).or_insert(LookupAttempt {
+            window_started: now,
+            failures: 0,
+        });
+        if now.duration_since(attempt.window_started) >= DIRECTORY_LOOKUP_WINDOW {
+            attempt.window_started = now;
+            attempt.failures = 0;
+        }
+        attempt.failures = attempt.failures.saturating_add(1);
+        Err(DIRECTORY_LOOKUP_NOT_FOUND)
     }
 
     fn peer(
@@ -446,6 +655,11 @@ impl RelayState {
         let _membership = self.lock_membership();
         self.sessions.detach(session_id, connection_id);
         self.lock_participants().remove(&connection_id);
+        let mut directory = match self.directory.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        directory.retain(|_, record| record.connection_id != connection_id);
     }
 
     fn sweep_expired(&self, now: Instant) {
@@ -464,6 +678,11 @@ impl RelayState {
                 }
             }
         }
+        let mut directory = match self.directory.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        directory.retain(|_, record| record.expires_at > now);
     }
 }
 
@@ -507,6 +726,8 @@ impl RelayServer {
             sessions: RelaySessionTable::new(config.clone()),
             membership: Mutex::new(()),
             participants: Mutex::new(HashMap::new()),
+            directory: Mutex::new(HashMap::new()),
+            lookup_attempts: Mutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
             active_connections: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -581,8 +802,8 @@ async fn handle_connection(
     let Ok((mut join_send, mut join_receive)) = connection.accept_bi().await else {
         return;
     };
-    let join = match read_join(&mut join_receive).await {
-        Ok(join) => join,
+    let request = match read_request(&mut join_receive).await {
+        Ok(request) => request,
         Err(error) => {
             if join_send
                 .write_all(&[join_error_code(&error)])
@@ -595,16 +816,52 @@ async fn handle_connection(
             return;
         }
     };
-    if let Err(error) = state.attach_participant(&join, connection_id, connection.clone()) {
-        if join_send
-            .write_all(&[relay_error_code(&error)])
-            .await
-            .is_ok()
-        {
-            let _ = join_send.finish();
+    let join = match request {
+        RelayRequest::Join(join) => join,
+        RelayRequest::DirectoryLookup(lookup) => {
+            let response = state.lookup_directory(connection.remote_address().ip(), &lookup);
+            match response {
+                Ok(mut invitation) => {
+                    let length = invitation.len() as u16;
+                    let sent = join_send.write_all(&[DIRECTORY_LOOKUP_FOUND]).await.is_ok()
+                        && join_send.write_all(&length.to_be_bytes()).await.is_ok()
+                        && join_send.write_all(&invitation).await.is_ok();
+                    invitation.fill(0);
+                    if sent {
+                        let _ = join_send.finish();
+                    }
+                }
+                Err(status) => {
+                    if join_send.write_all(&[status]).await.is_ok() {
+                        let _ = join_send.finish();
+                    }
+                }
+            }
+            // Keep the QUIC connection alive briefly so the peer can consume the completed
+            // response stream before this handler releases its final connection handle.
             tokio::time::sleep(Duration::from_millis(20)).await;
+            return;
         }
-        return;
+    };
+    let replaced = match state.attach_participant(&join, connection_id, connection.clone()) {
+        Ok(replaced) => replaced,
+        Err(error) => {
+            if join_send
+                .write_all(&[relay_error_code(&error)])
+                .await
+                .is_ok()
+            {
+                let _ = join_send.finish();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            return;
+        }
+    };
+    if let Some(previous) = replaced {
+        previous.close(
+            quinn::VarInt::from_u32(4),
+            b"participant resumed on a new connection",
+        );
     }
     let session_id = join.session_id();
     let role = join.role();
@@ -740,25 +997,34 @@ fn length_to_bytes(length: usize) -> [u8; 4] {
     (length as u32).to_be_bytes()
 }
 
-async fn read_join(receive: &mut quinn::RecvStream) -> Result<RelayJoin, JoinRejectCode> {
+enum RelayRequest {
+    Join(RelayJoin),
+    DirectoryLookup(RelayDirectoryLookup),
+}
+
+async fn read_request(receive: &mut quinn::RecvStream) -> Result<RelayRequest, JoinRejectCode> {
     let mut length = [0; 4];
     receive
         .read_exact(&mut length)
         .await
         .map_err(|_| JoinRejectCode::Malformed)?;
     let length = u32::from_be_bytes(length) as usize;
-    if length > JOIN_ENVELOPE_BYTES {
+    if length > MAX_JOIN_ENVELOPE_BYTES {
         return Err(JoinRejectCode::TooLarge);
-    }
-    if length != JOIN_ENVELOPE_BYTES {
-        return Err(JoinRejectCode::Malformed);
     }
     let mut bytes = vec![0; length];
     receive
         .read_exact(&mut bytes)
         .await
         .map_err(|_| JoinRejectCode::Malformed)?;
-    decode_relay_join(&bytes).map_err(|_| JoinRejectCode::Malformed)
+    if length == DIRECTORY_LOOKUP_ENVELOPE_BYTES
+        && let Ok(lookup) = decode_directory_lookup(&bytes)
+    {
+        return Ok(RelayRequest::DirectoryLookup(lookup));
+    }
+    decode_relay_join(&bytes)
+        .map(RelayRequest::Join)
+        .map_err(|_| JoinRejectCode::Malformed)
 }
 
 fn join_error_code(error: &JoinRejectCode) -> u8 {
@@ -778,6 +1044,7 @@ impl From<&RelayError> for JoinRejectCode {
             RelayError::RoleMismatch => Self::RoleMismatch,
             RelayError::ConnectionLimitReached => Self::ConnectionLimit,
             RelayError::SessionLimitReached => Self::SessionLimit,
+            RelayError::DirectoryConflict => Self::DirectoryConflict,
             _ => Self::Internal,
         }
     }

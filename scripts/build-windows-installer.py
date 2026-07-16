@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -16,6 +17,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "x86_64-pc-windows-msvc"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build the verified DeskLink Windows x64 installer."
+    )
+    parser.add_argument(
+        "--require-signing",
+        action="store_true",
+        help="fail before building unless a signing identity is configured",
+    )
+    return parser.parse_args()
 
 
 def run(
@@ -37,6 +50,28 @@ def signing_requested() -> bool:
             "DESKLINK_SIGN_CERT_SHA1",
         )
     )
+
+
+def environment_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return False
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(
+        f"{name} must be one of 1/0, true/false, yes/no, or on/off."
+    )
+
+
+def enforce_signing_policy(*, requested: bool, required: bool) -> None:
+    if required and not requested:
+        raise SystemExit(
+            "Trusted Windows signing is required for this build, but no signing "
+            "identity is configured. Set the Artifact Signing variables or "
+            "DESKLINK_SIGN_CERT_SHA1."
+        )
 
 
 def sign(artifact: Path) -> None:
@@ -61,6 +96,14 @@ def main() -> int:
     if os.name != "nt":
         raise SystemExit("The Windows installer must be built on Windows.")
 
+    arguments = parse_args()
+    should_sign = signing_requested()
+    enforce_signing_policy(
+        requested=should_sign,
+        required=arguments.require_signing
+        or environment_flag("DESKLINK_REQUIRE_SIGNING"),
+    )
+
     run([sys.executable, str(ROOT / "scripts" / "verify-windows-release.py")])
     release = ROOT / "target" / TARGET / "release"
     application = release / "desklink-windows-ui.exe"
@@ -75,7 +118,6 @@ def main() -> int:
     if sha256(application) != verified_application_sha256:
         raise SystemExit("Windows UI payload changed after release verification")
 
-    should_sign = signing_requested()
     application_payload = application
     if should_sign:
         application_payload = application.with_name("DeskLink.signed-payload.exe")

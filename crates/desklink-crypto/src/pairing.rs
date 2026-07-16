@@ -35,7 +35,7 @@ pub struct PairingCode {
 }
 
 impl PairingCode {
-    fn generate(rng: &mut impl CryptoRngCore) -> Self {
+    pub fn generate(rng: &mut impl CryptoRngCore) -> Self {
         let mut random = Zeroizing::new([0; PAIRING_CODE_LENGTH]);
         rng.fill_bytes(&mut random[..]);
         let mut bytes = [0; PAIRING_CODE_LENGTH];

@@ -35,33 +35,30 @@ struct DeskLinkApp: App {
     @NSApplicationDelegateAdaptor(DeskLinkLifecycleDelegate.self) private var lifecycle
     @StateObject private var controller = ControllerBridge()
     @StateObject private var host = HostBridge()
-    @State private var role: AppRole?
+    @State private var section: DeskLinkSection = .overview
 
     var body: some Scene {
         WindowGroup {
-            Group {
-                if let role {
-                    switch role {
+            if isControllerSessionState(controller.state) {
+                SessionView(bridge: controller)
+            } else {
+                DeskLinkShell(
+                    selection: $section,
+                    needsAttention: host.lastError != nil || controller.lastError != nil
+                ) {
+                    switch section {
+                    case .overview:
+                        HostHomeView(bridge: host, page: .overview)
                     case .controller:
-                        if isControllerSessionState(controller.state) {
-                            SessionView(bridge: controller)
-                        } else {
-                            HomeView(bridge: controller, chooseRole: { self.role = nil })
-                        }
-                    case .host:
-                        HostHomeView(bridge: host, chooseRole: { self.role = nil })
-                    }
-                } else {
-                    RolePickerView { selectedRole in
-                        role = selectedRole
+                        ControllerHomeView(bridge: controller)
+                    case .connection:
+                        HostHomeView(bridge: host, page: .connection)
+                    case .devices:
+                        HostHomeView(bridge: host, page: .devices)
                     }
                 }
             }
             .onAppear { lifecycle.configure(controller: controller, host: host) }
-            .onChange(of: role) { selectedRole in
-                if selectedRole != .host { host.stop() }
-                if selectedRole != .controller { controller.disconnect() }
-            }
             .onDisappear {
                 host.shutdown()
                 controller.releaseAll()

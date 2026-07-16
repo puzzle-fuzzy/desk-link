@@ -1,0 +1,54 @@
+name: Windows Signed Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-signed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-signed-installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DESKLINK_REQUIRE_SIGNING: "1"
+      DESKLINK_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+      DESKLINK_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Test signing policy
+        run: python -m unittest discover -s scripts/tests -p "test_*.py"
+
+      - name: Import trusted code-signing certificate
+        run: python scripts/prepare-windows-signing-certificate.py
+
+      - name: Build, sign, and verify installer
+        run: python scripts/build-windows-installer.py --require-signing
+
+      - name: Upload signed installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskLink-Windows-signed-${{ github.ref_name }}
+          path: |
+            dist/windows/DeskLinkSetup-*-x64.exe
+            dist/windows/windows-installer-manifest.json
+            dist/windows/windows-release-verification.json
+          if-no-files-found: error
+          retention-days: 30

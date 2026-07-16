@@ -556,6 +556,8 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         TransportError::MessageTooLarge { .. }
         | TransportError::NotJoined
         | TransportError::AlreadyJoined
+        | TransportError::DirectoryNotFound
+        | TransportError::DirectoryRateLimited
         | TransportError::Malformed
         | TransportError::InvalidConfig(_) => false,
     }
@@ -579,9 +581,10 @@ async fn connect_controller(
         .await
         .map_err(ConnectFailure::from_transport)?;
     client
-        .join(RelayJoin::controller(
+        .join(RelayJoin::controller_with_participant(
             SessionId::from_bytes(config.session_id),
             config.relay_authentication,
+            config.controller_device_id,
         ))
         .await
         .map_err(ConnectFailure::from_transport)?;

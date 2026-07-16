@@ -7,7 +7,8 @@ use desklink_crypto::SessionId;
 use desklink_relay::{RelayConfig, RelayError, RelayServer, RelaySessionTable};
 use desklink_transport::{
     MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
-    RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayJoin, TransportError, TransportEvent,
+    RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
+    TransportError, TransportEvent,
 };
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -174,6 +175,56 @@ async fn relay_matches_host_and_controller_and_forwards_opaque_bytes() {
 }
 
 #[tokio::test]
+async fn directory_resolves_an_online_host_only_with_the_temporary_password() {
+    let relay = spawn_test_relay().await;
+    let device_id = 123_456_789_012;
+    let access_code = *b"AB2DEF3G";
+    let invitation = b"signed pairing invitation".to_vec();
+    let registration =
+        RelayDirectoryRegistration::new(device_id, access_code, invitation.clone(), 60).unwrap();
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    let join = RelayJoin::host_with_participant(session(23), [4; 32], [7; 16])
+        .with_directory_registration(registration)
+        .unwrap();
+    host_client.join(join).await.unwrap();
+
+    let wrong_lookup = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        wrong_lookup
+            .lookup_directory(RelayDirectoryLookup::new(device_id, *b"AB2DEF4G").unwrap(),)
+            .await,
+        Err(TransportError::DirectoryNotFound)
+    );
+
+    let correct_lookup = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        correct_lookup
+            .lookup_directory(RelayDirectoryLookup::new(device_id, access_code).unwrap())
+            .await
+            .unwrap(),
+        invitation
+    );
+}
+
+#[tokio::test]
+async fn directory_rate_limits_repeated_failed_lookups_without_revealing_device_presence() {
+    let relay = spawn_test_relay().await;
+    let lookup = RelayDirectoryLookup::new(987_654_321_012, *b"AB2DEF3G").unwrap();
+    for _ in 0..5 {
+        let client = QuicClient::connect(config(&relay)).await.unwrap();
+        assert_eq!(
+            client.lookup_directory(lookup.clone()).await,
+            Err(TransportError::DirectoryNotFound)
+        );
+    }
+    let limited = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        limited.lookup_directory(lookup).await,
+        Err(TransportError::DirectoryRateLimited)
+    );
+}
+
+#[tokio::test]
 async fn second_controller_is_rejected() {
     let relay = spawn_test_relay().await;
     let first_host = QuicClient::connect(config(&relay)).await.unwrap();
@@ -189,6 +240,52 @@ async fn second_controller_is_rejected() {
     assert_eq!(
         second_controller
             .join(controller(session_id, [4; 32]))
+            .await,
+        Err(TransportError::JoinRejected(
+            desklink_transport::JoinRejectCode::SessionOccupied
+        ))
+    );
+}
+
+#[tokio::test]
+async fn same_controller_identity_replaces_its_stale_connection_without_waiting_for_timeout() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(22);
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(RelayJoin::host_with_participant(
+            session_id, [4; 32], [1; 16],
+        ))
+        .await
+        .unwrap();
+    let first_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    first_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id, [4; 32], [2; 16],
+        ))
+        .await
+        .unwrap();
+
+    let resumed_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    resumed_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id, [4; 32], [2; 16],
+        ))
+        .await
+        .unwrap();
+
+    let closed = tokio::time::timeout(Duration::from_secs(2), first_controller.next_event())
+        .await
+        .expect("the superseded connection was not closed")
+        .expect("the superseded connection did not publish its close event");
+    assert!(matches!(closed, TransportEvent::Closed { .. }));
+
+    let different_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        different_controller
+            .join(RelayJoin::controller_with_participant(
+                session_id, [4; 32], [3; 16],
+            ))
             .await,
         Err(TransportError::JoinRejected(
             desklink_transport::JoinRejectCode::SessionOccupied

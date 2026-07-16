@@ -161,6 +161,12 @@ fn host_retries_only_transient_network_and_timeout_failures() {
         "relay restarted".to_owned()
     )));
     assert!(host_error_is_retryable(&HostRuntimeError::HandshakeTimeout));
+    assert!(host_error_is_retryable(
+        &HostRuntimeError::UntrustedController
+    ));
+    assert!(host_error_is_retryable(
+        &HostRuntimeError::ControllerKeyChanged
+    ));
     assert!(host_error_is_retryable(&HostRuntimeError::Transport(
         TransportError::JoinRejected(JoinRejectCode::SessionOccupied)
     )));

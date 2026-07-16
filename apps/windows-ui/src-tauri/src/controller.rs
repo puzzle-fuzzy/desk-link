@@ -14,7 +14,9 @@ use desklink_protocol::{
     MouseButton, Platform,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
-use desklink_transport::{JoinRejectCode, QuicClient, RelayJoin, TransportError};
+use desklink_transport::{
+    JoinRejectCode, QuicClient, RelayDirectoryLookup, RelayJoin, TransportError,
+};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Response};
@@ -50,6 +52,15 @@ impl ControllerRuntimeSummary {
             state: "connecting",
             title: "正在连接中继服务器".to_owned(),
             detail: "DeskLink 正在打开另一台电脑共享的私有会话。".to_owned(),
+            stream_id: None,
+        }
+    }
+
+    fn finding() -> Self {
+        Self {
+            state: "finding",
+            title: "正在查找设备".to_owned(),
+            detail: "DeskLink 正在通过安全中继确认设备 ID 和临时密码。".to_owned(),
             stream_id: None,
         }
     }
@@ -117,6 +128,19 @@ pub struct ControllerConnectionInput {
     relay_address: String,
     server_name: String,
     invitation: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerDeviceInput {
+    device_id: String,
+    temporary_password: String,
+}
+
+impl Drop for ControllerDeviceInput {
+    fn drop(&mut self) {
+        self.temporary_password.zeroize();
+    }
 }
 
 impl Drop for ControllerConnectionInput {
@@ -217,6 +241,71 @@ impl ControllerManager {
         video: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let settings = settings_from_invitation(input)?;
+        self.start(settings, true, signals, video).await?;
+        load_snapshot(self.snapshot())
+    }
+
+    pub async fn connect_device(
+        &self,
+        input: ControllerDeviceInput,
+        signals: Channel<ControllerSignal>,
+        video: Channel<Response>,
+    ) -> Result<ControllerSnapshot, String> {
+        self.publish(&signals, ControllerRuntimeSummary::finding());
+        let settings = async {
+            let device_id = crate::device_directory::parse_device_id(&input.device_id)
+                .map_err(str::to_owned)?;
+            let access_code = crate::device_directory::parse_access_code(&input.temporary_password)
+                .map_err(str::to_owned)?;
+            let config = crate::local_relay::client_config(
+                crate::local_relay::MANAGED_RELAY_ADDRESS
+                    .parse()
+                    .map_err(|_| "DeskLink 内置中继地址无效，请重新安装应用。".to_owned())?,
+                crate::local_relay::MANAGED_RELAY_SERVER_NAME,
+            )
+            .map_err(|_| "DeskLink 无法准备安全中继连接。".to_owned())?;
+            let client = QuicClient::connect(config)
+                .await
+                .map_err(|_| "无法连接 DeskLink 中继服务器，请检查网络后重试。".to_owned())?;
+            let lookup = RelayDirectoryLookup::new(device_id, access_code)
+                .map_err(|_| "设备 ID 或临时密码格式无效。".to_owned())?;
+            let mut invitation =
+                client
+                    .lookup_directory(lookup)
+                    .await
+                    .map_err(|error| match error {
+                        TransportError::DirectoryNotFound => {
+                            "找不到在线设备或临时密码不正确，请在主机上刷新密码后重试。".to_owned()
+                        }
+                        TransportError::DirectoryRateLimited => {
+                            "尝试次数过多，请等待一分钟后再试。".to_owned()
+                        }
+                        _ => "设备查询暂时失败，请检查网络后重试。".to_owned(),
+                    })?;
+            drop(client);
+            let invite = match PairingInvite::decode(&invitation, now_unix_s()) {
+                Ok(invite) => invite,
+                Err(_) => {
+                    invitation.zeroize();
+                    return Err("主机返回的连接信息无效或已经过期，请刷新临时密码。".to_owned());
+                }
+            };
+            invitation.zeroize();
+            ControllerConnectionSettings::from_invite(
+                crate::local_relay::MANAGED_RELAY_ADDRESS,
+                crate::local_relay::MANAGED_RELAY_SERVER_NAME,
+                &invite,
+            )
+            .map_err(|error| error.to_string())
+        }
+        .await;
+        let settings = match settings {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.publish(&signals, ControllerRuntimeSummary::idle());
+                return Err(error);
+            }
+        };
         self.start(settings, true, signals, video).await?;
         load_snapshot(self.snapshot())
     }
@@ -569,18 +658,19 @@ async fn connect_once(
     let client = QuicClient::connect(config)
         .await
         .map_err(ConnectFailure::from_transport)?;
-    client
-        .join(RelayJoin::controller(
-            settings.session_id(),
-            *settings.authentication(),
-        ))
-        .await
-        .map_err(ConnectFailure::from_transport)?;
-    manager.publish(signals, ControllerRuntimeSummary::waiting_for_approval());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| ConnectFailure::permanent("控制端身份存储不可用"))?
         .load_or_create(&mut OsRng)
         .map_err(|_| ConnectFailure::permanent("无法打开控制端身份"))?;
+    client
+        .join(RelayJoin::controller_with_participant(
+            settings.session_id(),
+            *settings.authentication(),
+            identity.device_id,
+        ))
+        .await
+        .map_err(ConnectFailure::from_transport)?;
+    manager.publish(signals, ControllerRuntimeSummary::waiting_for_approval());
     ControllerRuntime::connect_for_platform(
         client,
         identity,

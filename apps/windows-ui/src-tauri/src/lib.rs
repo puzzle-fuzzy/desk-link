@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 mod controller;
+mod device_directory;
 mod host;
 mod local_relay;
 
@@ -37,12 +38,13 @@ use std::{
 use apps_windows::{
     configuration::{HostConnectionSettings, WindowsConnectionSettingsStore},
     diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
+    identity::WindowsIdentityStore,
     trusted::WindowsTrustedControllerStore,
     window::WindowsLocalApprovalDialog,
 };
 use controller::{
-    ControllerConnectionInput, ControllerInput, ControllerManager, ControllerSignal,
-    ControllerSnapshot,
+    ControllerConnectionInput, ControllerDeviceInput, ControllerInput, ControllerManager,
+    ControllerSignal, ControllerSnapshot,
 };
 use host::{HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
 use rand_core::{OsRng, RngCore};
@@ -69,6 +71,7 @@ struct HostSnapshot {
     relay_status: local_relay::RelayStatusSummary,
     diagnostic_checks: Vec<DiagnosticCheckSummary>,
     pairing_active: bool,
+    device_id: Option<String>,
     refreshed_at_unix_s: u64,
 }
 
@@ -154,6 +157,19 @@ async fn get_host_snapshot(manager: State<'_, HostManager>) -> Result<HostSnapsh
 }
 
 #[tauri::command]
+async fn restart_host(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.restart(app).await;
+    let runtime = manager.snapshot();
+    let pairing_active = manager.is_pairing_active();
+    tauri::async_runtime::spawn_blocking(move || load_host_snapshot(runtime, pairing_active))
+        .await
+        .map_err(|_| "DeskLink 已重新启动主机，但无法刷新本地状态。".to_owned())?
+}
+
+#[tauri::command]
 async fn get_controller_snapshot(
     manager: State<'_, ControllerManager>,
 ) -> Result<ControllerSnapshot, String> {
@@ -219,6 +235,16 @@ async fn connect_controller(
     video: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
     manager.connect_invitation(input, signals, video).await
+}
+
+#[tauri::command]
+async fn connect_device(
+    manager: State<'_, ControllerManager>,
+    input: ControllerDeviceInput,
+    signals: Channel<ControllerSignal>,
+    video: Channel<Response>,
+) -> Result<ControllerSnapshot, String> {
+    manager.connect_device(input, signals, video).await
 }
 
 #[tauri::command]
@@ -342,6 +368,14 @@ fn load_host_snapshot(
     runtime: HostRuntimeSummary,
     pairing_active: bool,
 ) -> Result<HostSnapshot, String> {
+    let device_id = WindowsIdentityStore::for_current_user()
+        .ok()
+        .and_then(|store| store.load_or_create(&mut OsRng).ok())
+        .map(|identity| {
+            device_directory::format_device_id(device_directory::public_device_id(
+                identity.device_id,
+            ))
+        });
     let connection_store = WindowsConnectionSettingsStore::for_current_user()
         .map_err(|_| "当前 Windows 账户无法使用连接设置。".to_owned())?;
     let (connection, connection_error) = match connection_store.load() {
@@ -427,6 +461,7 @@ fn load_host_snapshot(
         relay_status,
         diagnostic_checks,
         pairing_active,
+        device_id,
         refreshed_at_unix_s: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -916,6 +951,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_snapshot,
+            restart_host,
             save_connection_settings,
             setup_managed_connection,
             start_pairing_session,
@@ -924,6 +960,7 @@ pub fn run() {
             probe_relay,
             export_diagnostic_report,
             get_controller_snapshot,
+            connect_device,
             connect_controller,
             reconnect_controller,
             send_controller_input,
@@ -1059,6 +1096,7 @@ mod tests {
             relay_status,
             diagnostic_checks: checks,
             pairing_active: false,
+            device_id: Some("123 456 789 012".to_owned()),
             refreshed_at_unix_s: 200,
         };
         let controller = ControllerRuntimeSummary {

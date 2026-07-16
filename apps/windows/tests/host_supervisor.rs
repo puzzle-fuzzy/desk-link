@@ -197,6 +197,49 @@ mod windows {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_host_becomes_available_without_waiting_for_a_controller() {
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observer = Arc::new(move |event| {
+            let _ = event_sender.send(event);
+        });
+        let host_task = tokio::spawn(
+            supervisor(
+                tls.client_config(relay.address),
+                SessionId::from_bytes([101; 16]),
+                [102; 32],
+                DeviceIdentity::from_secret_key([103; 16], &[104; 32]),
+                DeviceIdentity::from_secret_key([105; 16], &[106; 32]).verify_key(),
+                None,
+            )
+            .with_observer(observer)
+            .run(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    event_receiver.recv().await,
+                    Some(HostLifecycleEvent::Available { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("host never published its available state");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while let Ok(event) = event_receiver.try_recv() {
+            assert!(!matches!(event, HostLifecycleEvent::Reconnecting { .. }));
+        }
+
+        host_task.abort();
+        let _ = host_task.await;
+        relay.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn repeated_relay_restarts_rebuild_host_runtime_with_fresh_streams() {
         let tls = TestTls::new();

@@ -31,6 +31,9 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Test Windows signing policy
+        run: python -m unittest discover -s scripts/tests -p "test_*.py"
+
       - name: Prepare Windows UI assets for Rust checks
         working-directory: apps/windows-ui
         run: |
@@ -46,5 +49,5 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace
 
-      - name: Verify production application and build unsigned installer
+      - name: Verify production application and build local-test installer
         run: python scripts/build-windows-installer.py

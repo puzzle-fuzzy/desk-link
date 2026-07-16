@@ -5,18 +5,24 @@ struct RolePickerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("DeskLink")
-                .font(.largeTitle.bold())
-            Text("Choose how this Mac participates in a remote session.")
-                .foregroundStyle(.secondary)
             HStack(spacing: 12) {
-                Button("Control another Mac") { selectRole(.controller) }
-                    .buttonStyle(.borderedProminent)
-                Button("Share this Mac") { selectRole(.host) }
-                    .buttonStyle(.bordered)
+                DeskLinkMark()
+                Text("DeskLink")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(DeskLinkPalette.ink)
+            }
+            Text("选择此 Mac 在远程会话中的用途。")
+                .font(.system(size: 14))
+                .foregroundStyle(DeskLinkPalette.secondaryInk)
+            HStack(spacing: 10) {
+                Button("控制另一台设备") { selectRole(.controller) }
+                    .buttonStyle(DeskLinkPrimaryButtonStyle())
+                Button("共享此 Mac") { selectRole(.host) }
+                    .buttonStyle(DeskLinkSecondaryButtonStyle())
             }
         }
         .padding(28)
         .frame(minWidth: 500, minHeight: 230)
+        .background(DeskLinkPalette.surface)
     }
 }

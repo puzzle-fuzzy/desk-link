@@ -1,4 +1,5 @@
 import {
+  connectDevice,
   connectController,
   createControllerChannels,
   disconnectController,
@@ -11,6 +12,11 @@ import {
   sendControllerText,
 } from "./api";
 import type { ControllerChannels } from "./api";
+import {
+  deviceCredentialsAreValid,
+  formatDeviceId,
+  normalizeTemporaryPassword,
+} from "./device-credentials";
 import { parsePairingCode } from "./pairing-code";
 import { MANAGED_RELAY_ADDRESS, MANAGED_RELAY_SERVER_NAME } from "./product-config";
 import { escapeHtml } from "./html";
@@ -40,6 +46,8 @@ let loading = true;
 let busy = false;
 let checkingRelay = false;
 let feedback: ControllerFeedback = null;
+let deviceIdDraft = "";
+let temporaryPasswordDraft = "";
 let invitationDraft = "";
 let relayDraft = MANAGED_RELAY_ADDRESS;
 let serverNameDraft = MANAGED_RELAY_SERVER_NAME;
@@ -93,8 +101,8 @@ export function renderControllerView(): string {
       ${feedback ? renderFeedback(feedback) : ""}
       <div class="controller-heading">
         <div>
-          <h1>控制另一台电脑</h1>
-          <p>粘贴另一台电脑生成的连接码，然后回到那台电脑确认身份。</p>
+          <h1>连接另一台电脑</h1>
+          <p>输入主机上显示的设备 ID 和临时密码，然后在主机上确认连接。</p>
         </div>
         ${renderRuntimeBadge()}
       </div>
@@ -109,7 +117,22 @@ export function bindControllerInteractions(): void {
     requestRender();
   });
   document
-    .querySelector<HTMLFormElement>("[data-controller-form]")
+    .querySelector<HTMLFormElement>("[data-controller-device-form]")
+    ?.addEventListener("submit", (event) => void submitDevice(event));
+  document.querySelector<HTMLInputElement>("[data-controller-device-id]")?.addEventListener("input", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    deviceIdDraft = formatDeviceId(input.value);
+    input.value = deviceIdDraft;
+    updateDeviceSubmitState();
+  });
+  document.querySelector<HTMLInputElement>("[data-controller-password]")?.addEventListener("input", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    temporaryPasswordDraft = normalizeTemporaryPassword(input.value);
+    input.value = temporaryPasswordDraft;
+    updateDeviceSubmitState();
+  });
+  document
+    .querySelector<HTMLFormElement>("[data-controller-legacy-form]")
     ?.addEventListener("submit", (event) => void submitInvitation(event));
   document.querySelector<HTMLTextAreaElement>("[data-controller-invitation]")?.addEventListener("input", (event) => {
     updatePairingCodePreview((event.currentTarget as HTMLTextAreaElement).value);
@@ -214,7 +237,10 @@ function renderRuntimeBadge(): string {
 function renderConnectionPanel(): string {
   const saved = snapshot?.savedConnection;
   const isWorking =
-    busy || checkingRelay || ["connecting", "waitingApproval", "reconnecting"].includes(snapshot?.runtime.state ?? "");
+    busy
+    || checkingRelay
+    || ["finding", "connecting", "waitingApproval", "reconnecting"].includes(snapshot?.runtime.state ?? "");
+  const credentialsReady = deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft);
   const recognizedCode = parsePairingCode(invitationDraft, relayDraft, serverNameDraft);
   const codeStatus = !invitationDraft.trim()
     ? { tone: "empty", text: "粘贴完整连接码后，DeskLink 会自动填写连接地址。" }
@@ -225,18 +251,74 @@ function renderConnectionPanel(): string {
     <div class="controller-connect-grid">
       <section class="controller-card controller-card--primary">
         <div class="controller-card-heading">
-          <div><h2>首次连接这台电脑</h2><p>在另一台电脑的“已批准设备”页面创建连接码，然后完整粘贴到这里。</p></div>
+          <div><h2>连接远程设备</h2><p>在另一台电脑打开 DeskLink，查看本机 ID 并生成临时密码。</p></div>
         </div>
-        <form class="controller-form" data-controller-form>
+        <form class="controller-form controller-device-form" data-controller-device-form>
+          <label class="field device-credential-field">
+            <span>设备 ID</span>
+            <input
+              class="device-id-input"
+              name="deviceId"
+              data-controller-device-id
+              value="${escapeHtml(deviceIdDraft)}"
+              inputmode="numeric"
+              maxlength="15"
+              placeholder="123 456 789 012"
+              aria-describedby="controller-device-hint"
+              required
+              autocomplete="off"
+              spellcheck="false"
+              ${isWorking ? "disabled" : ""}
+            >
+          </label>
+          <label class="field device-credential-field">
+            <span>临时密码</span>
+            <input
+              class="temporary-password-input"
+              name="temporaryPassword"
+              data-controller-password
+              value="${escapeHtml(temporaryPasswordDraft)}"
+              maxlength="8"
+              placeholder="8 位临时密码"
+              aria-describedby="controller-device-hint"
+              required
+              autocomplete="one-time-code"
+              autocapitalize="characters"
+              spellcheck="false"
+              ${isWorking ? "disabled" : ""}
+            >
+          </label>
+          <p class="controller-device-hint" id="controller-device-hint">临时密码仅在主机当前连接窗口内有效。</p>
+          <div class="controller-form-actions">
+            <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
+              ${isWorking ? '<span class="button-spinner" aria-hidden="true"></span> 正在查找设备' : "查找并连接设备"}
+            </button>
+            <span>找到设备后，主机会显示本次控制请求。</span>
+          </div>
+        </form>
+      </section>
+
+      <aside class="controller-card controller-card--saved">
+        <div class="controller-card-heading">
+          <div><h2>重新连接已批准电脑</h2><p>首次批准后，可以直接从这里重新连接。</p></div>
+        </div>
+        ${saved ? renderSavedConnection(isWorking) : renderNoSavedConnection()}
+      </aside>
+    </div>
+    <details class="controller-legacy-panel" ${invitationDraft.trim() && !recognizedCode ? "open" : ""}>
+      <summary>使用旧版连接码</summary>
+      <div class="controller-legacy-content">
+        <p>仅用于连接尚未升级到设备 ID 的旧版 DeskLink。</p>
+        <form class="controller-form" data-controller-legacy-form>
           <label class="field">
-            <span>连接码</span>
-            <textarea name="invitation" data-controller-invitation rows="6" maxlength="1024" placeholder="在这里粘贴另一台电脑生成的完整连接码" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>${escapeHtml(invitationDraft)}</textarea>
+            <span>旧版连接码</span>
+            <textarea name="invitation" data-controller-invitation rows="4" maxlength="1024" placeholder="粘贴完整连接码" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>${escapeHtml(invitationDraft)}</textarea>
           </label>
           <div class="connection-code-status connection-code-status--${codeStatus.tone}" data-controller-code-status role="status">
             <span aria-hidden="true"></span><p>${escapeHtml(codeStatus.text)}</p>
           </div>
-          <details class="controller-network-details" ${invitationDraft.trim() && !recognizedCode ? "open" : ""}>
-            <summary>检查或手动填写连接地址</summary>
+          <details class="controller-network-details">
+            <summary>高级连接设置</summary>
             <div class="field-grid field-grid--controller">
               <label class="field">
                 <span>中继地址</span>
@@ -249,27 +331,15 @@ function renderConnectionPanel(): string {
             </div>
           </details>
           <div class="controller-form-actions">
-            <button class="button button--primary" type="submit" ${isWorking ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
-              ${checkingRelay ? "等待检测完成" : isWorking ? '<span class="button-spinner" aria-hidden="true"></span> 正在连接' : "连接并请求批准"}
-            </button>
-            <button class="button button--secondary" type="button" data-controller-probe ${isWorking ? "disabled" : ""}>
-              ${checkingRelay ? "正在检测…" : "先检测网络"}
-            </button>
-            <span>发起连接后，请回到另一台电脑核对并批准本机身份。</span>
+            <button class="button button--secondary" type="submit" ${isWorking ? "disabled" : ""}>使用连接码</button>
+            <button class="button button--secondary" type="button" data-controller-probe ${isWorking ? "disabled" : ""}>${checkingRelay ? "正在检测…" : "检测中继网络"}</button>
           </div>
         </form>
-      </section>
-
-      <aside class="controller-card controller-card--saved">
-        <div class="controller-card-heading">
-          <div><h2>重新连接已批准电脑</h2><p>首次批准后，可以直接从这里重新连接。</p></div>
-        </div>
-        ${saved ? renderSavedConnection(isWorking) : renderNoSavedConnection()}
-      </aside>
-    </div>
+      </div>
+    </details>
     <div class="controller-security-note">
       <span class="security-note-mark" aria-hidden="true"></span>
-      <div><strong>两台电脑分别保留自己的身份</strong><p>中继服务器只转发加密流量。新的控制端必须在主机上获得准确的本地批准后，才能查看画面或发送输入。</p></div>
+      <div><strong>连接仍需主机确认</strong><p>设备 ID 只用于查找在线主机，远程画面和输入经过端到端加密；新控制端必须在主机上获得本地批准。</p></div>
     </div>
   `;
 }
@@ -341,6 +411,38 @@ function renderRemoteDesktop(): string {
   `;
 }
 
+function updateDeviceSubmitState(): void {
+  const submit = document.querySelector<HTMLButtonElement>("[data-controller-device-submit]");
+  if (submit) {
+    submit.disabled = busy || !deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft);
+  }
+}
+
+async function submitDevice(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (busy) {
+    return;
+  }
+  const form = event.currentTarget as HTMLFormElement;
+  const data = new FormData(form);
+  deviceIdDraft = formatDeviceId(String(data.get("deviceId") ?? ""));
+  temporaryPasswordDraft = normalizeTemporaryPassword(String(data.get("temporaryPassword") ?? ""));
+  if (!deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft)) {
+    feedback = { tone: "error", message: "请输入完整的 12 位设备 ID 和 8 位临时密码。" };
+    requestRender();
+    return;
+  }
+  const started = await beginConnection((channels) =>
+    connectDevice(
+      { deviceId: deviceIdDraft, temporaryPassword: temporaryPasswordDraft },
+      channels,
+    ),
+  );
+  if (started) {
+    temporaryPasswordDraft = "";
+  }
+}
+
 async function submitInvitation(event: SubmitEvent): Promise<void> {
   event.preventDefault();
   if (busy) {
@@ -377,7 +479,7 @@ async function checkRelayConnection(): Promise<void> {
   if (busy || checkingRelay) {
     return;
   }
-  const form = document.querySelector<HTMLFormElement>("[data-controller-form]");
+  const form = document.querySelector<HTMLFormElement>("[data-controller-legacy-form]");
   if (!form || !form.reportValidity()) {
     return;
   }
@@ -445,6 +547,11 @@ async function beginConnection(operation: (channels: ControllerChannels) => Prom
     started = true;
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
+    try {
+      snapshot = await getControllerSnapshot();
+    } catch {
+      // Keep the last known state; the actionable connection error remains visible.
+    }
   } finally {
     busy = false;
     requestRender();

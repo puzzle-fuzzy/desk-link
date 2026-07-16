@@ -6,32 +6,66 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                DeskLinkMark()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("DeskLink")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(DeskLinkPalette.ink)
+                    Text("正在控制另一台设备")
+                        .font(.system(size: 11))
+                        .foregroundStyle(DeskLinkPalette.mutedInk)
+                }
+                Spacer()
+                HStack(spacing: 8) {
+                    DeskLinkStatusLight(color: sessionStatusColor)
+                    Text(statusText)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                }
+                Button("请求关键帧") { bridge.requestKeyframe() }
+                    .buttonStyle(DeskLinkSecondaryButtonStyle())
+                Button("断开连接") { bridge.disconnect() }
+                    .buttonStyle(DeskLinkPrimaryButtonStyle())
+            }
+            .padding(.horizontal, 20)
+            .frame(height: 60)
+            .background(DeskLinkPalette.surface)
+
+            Rectangle().fill(DeskLinkPalette.border).frame(height: 1)
+
             ZStack {
                 MetalVideoView(pixelBuffer: bridge.latestPixelBuffer)
-                    .background(.black)
+                    .background(Color.black)
                 SessionInputView(bridge: bridge, videoSize: videoSize)
                     .background(Color.clear)
-                VStack {
-                    HStack {
-                        Spacer()
-                        Text(statusText)
-                            .padding(8)
-                            .background(.black.opacity(0.55), in: Capsule())
+                if bridge.latestPixelBuffer == nil {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(videoPlaceholder)
+                            .font(.system(size: 13))
+                            .foregroundStyle(Color.white.opacity(0.88))
                     }
-                    Spacer()
+                    .allowsHitTesting(false)
                 }
-                .padding()
-                .allowsHitTesting(false)
             }
+
+            Rectangle().fill(DeskLinkPalette.border).frame(height: 1)
+
             HStack {
-                Text("Frames: \(bridge.metrics.receivedFrames) · Dropped: \(bridge.metrics.droppedFrames)")
+                Text("已接收 \(bridge.metrics.receivedFrames) 帧")
+                Text("已丢弃 \(bridge.metrics.droppedFrames) 帧")
                 Spacer()
-                Button("Keyframe") { bridge.requestKeyframe() }
-                Button("Disconnect") { bridge.disconnect() }
+                Text("退出窗口前，DeskLink 会释放所有按键与鼠标状态。")
             }
-            .padding()
+            .font(.system(size: 11))
+            .foregroundStyle(DeskLinkPalette.mutedInk)
+            .padding(.horizontal, 20)
+            .frame(height: 38)
+            .background(DeskLinkPalette.subtle)
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(minWidth: 760, minHeight: 520)
         .onDisappear { bridge.releaseAll() }
     }
 
@@ -42,11 +76,28 @@ struct SessionView: View {
 
     private var statusText: String {
         switch bridge.state {
-        case let .connected(streamID): "Connected · stream \(streamID)"
-        case .reconnecting: "Reconnecting"
-        case .recovering: "Recovering video"
-        case .frozen: "Video frozen"
-        default: "DeskLink"
+        case let .connected(streamID): "已连接，视频流 \(streamID)"
+        case .reconnecting: "正在恢复连接"
+        case .recovering: "正在恢复画面"
+        case .frozen: "远程画面已暂停"
+        default: "正在准备远程画面"
+        }
+    }
+
+    private var videoPlaceholder: String {
+        switch bridge.state {
+        case .reconnecting: "网络暂时中断，DeskLink 正在重新连接"
+        case .recovering: "正在等待新的关键帧"
+        case .frozen: "远程画面暂时没有更新"
+        default: "正在准备远程画面"
+        }
+    }
+
+    private var sessionStatusColor: Color {
+        switch bridge.state {
+        case .connected: DeskLinkPalette.success
+        case .frozen: DeskLinkPalette.warning
+        default: DeskLinkPalette.info
         }
     }
 }

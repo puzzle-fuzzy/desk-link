@@ -34,7 +34,7 @@ def main() -> int:
         "-p",
         "desklink-transport",
         "--example",
-        "relay_probe",
+        "directory_probe",
         "--",
         address,
         server_name,

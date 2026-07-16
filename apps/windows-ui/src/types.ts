@@ -38,6 +38,7 @@ export type HostRuntimeState =
   | "starting"
   | "pairing"
   | "connecting"
+  | "available"
   | "connected"
   | "reconnecting"
   | "stopped"
@@ -62,10 +63,13 @@ export interface HostSnapshot {
   relayStatus: RelayStatusSummary;
   diagnosticChecks: DiagnosticCheckSummary[];
   pairingActive: boolean;
+  deviceId: string | null;
   refreshedAtUnixS: number;
 }
 
 export interface PairingSessionSummary {
+  deviceId: string;
+  temporaryPassword: string;
   invitation: string;
   expiresAtUnixS: number;
 }
@@ -104,6 +108,7 @@ export interface DiagnosticExportResult {
 
 export type ControllerRuntimeState =
   | "idle"
+  | "finding"
   | "connecting"
   | "waitingApproval"
   | "connected"
@@ -134,6 +139,11 @@ export interface ControllerConnectionInput {
   relayAddress: string;
   serverName: string;
   invitation: string;
+}
+
+export interface ControllerDeviceInput {
+  deviceId: string;
+  temporaryPassword: string;
 }
 
 export interface ControllerInput {
