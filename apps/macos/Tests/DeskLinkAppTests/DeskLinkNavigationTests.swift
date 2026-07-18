@@ -2,6 +2,12 @@ import XCTest
 @testable import DeskLinkApp
 
 final class DeskLinkNavigationTests: XCTestCase {
+    func testConnectionWorkspaceCopyNamesTheRemoteTask() {
+        XCTAssertEqual("连接设备", DeskLinkSection.connect.rawValue)
+        XCTAssertEqual("共享此设备", DeskLinkSection.share.rawValue)
+        XCTAssertNotEqual(DeskLinkSection.connect.rawValue, "本机状态")
+    }
+
     func testPrimaryNavigationUsesRemoteTasks() {
         XCTAssertEqual(
             DeskLinkSection.allCases.map(\.rawValue),

@@ -61,25 +61,25 @@ func deskLinkHostStatus(for state: HostState, lastError: String?) -> DeskLinkHos
 
 struct DeskLinkHostStatusPopover: View {
     @ObservedObject var host: HostBridge
-    @ObservedObject var controller: ControllerBridge
+    let openSettings: () -> Void
+    let openSharing: () -> Void
 
     var body: some View {
         let status = deskLinkHostStatus(for: host.state, lastError: host.lastError)
 
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("本机共享")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(DeskLinkPalette.ink)
             Label(status.title, systemImage: status.systemImage)
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(color(for: status.tone))
             Text(status.detail)
                 .font(.system(size: 12))
                 .foregroundStyle(DeskLinkPalette.secondaryInk)
-
-            if controller.lastError != nil {
-                Divider()
-                Text("另一台设备的连接需要检查")
-                    .font(.system(size: 12))
-                    .foregroundStyle(DeskLinkPalette.warning)
-            }
+            Divider()
+            Button("打开设置 / 诊断", action: openSettings)
+            Button("共享此设备", action: openSharing)
         }
         .padding(16)
         .frame(width: 260, alignment: .leading)

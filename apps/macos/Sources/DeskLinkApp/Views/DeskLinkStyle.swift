@@ -73,7 +73,11 @@ struct DeskLinkShell<Content: View>: View {
                 }
                 .buttonStyle(.plain)
                 .popover(isPresented: $isShowingHostStatus) {
-                    DeskLinkHostStatusPopover(host: host, controller: controller)
+                    DeskLinkHostStatusPopover(
+                        host: host,
+                        openSettings: { selection = .settings },
+                        openSharing: { selection = .share }
+                    )
                 }
             }
             .padding(.horizontal, 28)

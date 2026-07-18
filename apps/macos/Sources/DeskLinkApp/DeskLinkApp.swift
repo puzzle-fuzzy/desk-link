@@ -50,7 +50,9 @@ struct DeskLinkApp: App {
                     ) {
                         switch section {
                         case .connect:
-                            ControllerHomeView(bridge: controller)
+                            ControllerHomeView(bridge: controller, openSharing: {
+                                section = .share
+                            })
                         case .share:
                             HostHomeView(bridge: host, page: .connection)
                         case .devices:
