@@ -74,6 +74,19 @@ def enforce_signing_policy(*, requested: bool, required: bool) -> None:
         )
 
 
+def enforce_release_ref(version: str) -> None:
+    """Prevent a tagged release from publishing a differently-versioned binary."""
+    if os.environ.get("GITHUB_REF_TYPE", "").strip() != "tag":
+        return
+    actual = os.environ.get("GITHUB_REF_NAME", "").strip()
+    expected = f"v{version}"
+    if actual != expected:
+        raise SystemExit(
+            f"Release tag {actual!r} does not match the Windows version {version!r}; "
+            f"expected {expected!r}."
+        )
+
+
 def sign(artifact: Path) -> None:
     run(
         [
@@ -97,6 +110,11 @@ def main() -> int:
         raise SystemExit("The Windows installer must be built on Windows.")
 
     arguments = parse_args()
+    package = tomllib.loads(
+        (ROOT / "tools" / "windows-installer" / "Cargo.toml").read_text(encoding="utf-8")
+    )["package"]
+    version = str(package["version"])
+    enforce_release_ref(version)
     should_sign = signing_requested()
     enforce_signing_policy(
         requested=should_sign,
@@ -158,10 +176,6 @@ def main() -> int:
     if not built_installer.is_file():
         raise SystemExit(f"Installer executable was not produced: {built_installer}")
 
-    package = tomllib.loads(
-        (ROOT / "tools" / "windows-installer" / "Cargo.toml").read_text(encoding="utf-8")
-    )["package"]
-    version = package["version"]
     destination = ROOT / "dist" / "windows" / f"DeskLinkSetup-{version}-x64.exe"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built_installer, destination)

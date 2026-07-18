@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Ordering,
+    path::{Path, PathBuf},
+};
 
 pub const PRODUCT_NAME: &str = "DeskLink";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -45,6 +48,25 @@ impl InstallLayout {
 
 pub fn quote_executable(path: &Path) -> String {
     format!("\"{}\"", path.display())
+}
+
+/// Compares two public DeskLink release versions.
+///
+/// Installer versions deliberately use the strict `major.minor.patch` form. Returning
+/// `None` for an unknown value preserves repair compatibility with very old builds
+/// that may have written a non-standard registry value.
+pub fn compare_release_versions(left: &str, right: &str) -> Option<Ordering> {
+    Some(parse_release_version(left)?.cmp(&parse_release_version(right)?))
+}
+
+fn parse_release_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().split('.');
+    let version = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(version)
 }
 
 #[cfg(test)]
@@ -95,5 +117,28 @@ mod tests {
         );
         assert!(!layout.startup_command().contains("AUTH_KEY"));
         assert!(!layout.startup_command().contains("PAIRING"));
+    }
+
+    #[test]
+    fn release_versions_are_compared_numerically() {
+        assert_eq!(
+            compare_release_versions("0.1.25", "0.1.24"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_release_versions("0.10.0", "0.9.99"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_release_versions("1.0.0", "1.0.0"),
+            Some(Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn non_release_versions_are_not_guessed() {
+        assert_eq!(compare_release_versions("0.1", "0.1.25"), None);
+        assert_eq!(compare_release_versions("v0.1.25", "0.1.25"), None);
+        assert_eq!(compare_release_versions("0.1.25-beta", "0.1.25"), None);
     }
 }

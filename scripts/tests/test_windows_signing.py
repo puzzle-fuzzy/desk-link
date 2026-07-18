@@ -43,6 +43,29 @@ class BuildSigningPolicyTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.build.environment_flag("DESKLINK_REQUIRE_SIGNING")
 
+    def test_tag_must_match_windows_release_version(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"GITHUB_REF_TYPE": "tag", "GITHUB_REF_NAME": "v0.1.25"},
+            clear=True,
+        ):
+            self.build.enforce_release_ref("0.1.25")
+        with patch.dict(
+            os.environ,
+            {"GITHUB_REF_TYPE": "tag", "GITHUB_REF_NAME": "v0.1.24"},
+            clear=True,
+        ):
+            with self.assertRaises(SystemExit):
+                self.build.enforce_release_ref("0.1.25")
+
+    def test_non_tag_ci_build_does_not_require_release_tag(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": "main"},
+            clear=True,
+        ):
+            self.build.enforce_release_ref("0.1.25")
+
 
 class SignToolConfigurationTests(unittest.TestCase):
     @classmethod
