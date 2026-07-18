@@ -26,7 +26,7 @@ use desklink_transport::{
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Response};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use zeroize::Zeroize;
 
 const COMMAND_CAPACITY: usize = 512;
@@ -285,11 +285,11 @@ enum ControllerCommand {
     Text(String),
     RequestKeyframe,
     SelectDisplay(u32),
-    Stop,
 }
 
 struct ControllerWorker {
     commands: mpsc::Sender<ControllerCommand>,
+    cancellation: watch::Sender<bool>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -533,6 +533,7 @@ impl ControllerManager {
         self.ensure_current(generation)?;
         self.publish_if_current(generation, &signals, ControllerRuntimeSummary::connecting());
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (cancellation, cancellation_receiver) = watch::channel(false);
         let manager = self.clone();
         let task = tauri::async_runtime::spawn(async move {
             run_controller(
@@ -540,6 +541,7 @@ impl ControllerManager {
                 settings,
                 save_after_approval,
                 receiver,
+                cancellation_receiver,
                 signals,
                 video,
             )
@@ -549,7 +551,11 @@ impl ControllerManager {
             .worker
             .lock()
             .map_err(|_| "DeskLink 无法启动控制端任务。".to_owned())?;
-        *worker = Some(ControllerWorker { commands, task });
+        *worker = Some(ControllerWorker {
+            commands,
+            cancellation,
+            task,
+        });
         Ok(())
     }
 
@@ -660,7 +666,7 @@ impl ControllerManager {
         if let Ok(worker) = self.worker.lock()
             && let Some(worker) = worker.as_ref()
         {
-            let _ = worker.commands.try_send(ControllerCommand::Stop);
+            let _ = worker.cancellation.send(true);
         }
     }
 
@@ -669,7 +675,7 @@ impl ControllerManager {
         let Some(mut worker) = worker else {
             return;
         };
-        let _ = worker.commands.try_send(ControllerCommand::Stop);
+        let _ = worker.cancellation.send(true);
         if tokio::time::timeout(Duration::from_secs(5), &mut worker.task)
             .await
             .is_err()
@@ -838,6 +844,7 @@ async fn run_controller(
     settings: ControllerConnectionSettings,
     mut save_after_approval: bool,
     mut commands: mpsc::Receiver<ControllerCommand>,
+    mut cancellation: watch::Receiver<bool>,
     signals: Channel<ControllerSignal>,
     video: Channel<Response>,
 ) {
@@ -859,17 +866,15 @@ async fn run_controller(
         tokio::pin!(connection);
         let mut runtime = loop {
             tokio::select! {
+                changed = cancellation.changed() => {
+                    if cancellation_requested(changed, &cancellation) {
+                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
+                        return;
+                    }
+                }
                 command = commands.recv() => match command {
-                    Some(ControllerCommand::Stop) | None => {
-                        record_controller_diagnostic(
-                            diagnostics.as_ref(),
-                            ControllerDiagnosticStage::Cancelled,
-                            attempt,
-                            None,
-                            None,
-                            None,
-                        );
-                        manager.set_status(ControllerRuntimeSummary::idle());
+                    None => {
+                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
                         return;
                     }
                     Some(ControllerCommand::Input(_))
@@ -885,7 +890,10 @@ async fn run_controller(
                             &signals,
                             &mut schedule,
                             failure,
-                            &mut commands,
+                            ControllerWaitChannels {
+                                commands: &mut commands,
+                                cancellation: &mut cancellation,
+                            },
                             diagnostics.as_ref(),
                             attempt,
                         ).await {
@@ -905,6 +913,12 @@ async fn run_controller(
             .unwrap_or_else(Instant::now);
         let failure = loop {
             tokio::select! {
+                changed = cancellation.changed() => {
+                    if cancellation_requested(changed, &cancellation) {
+                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
+                        return;
+                    }
+                }
                 command = commands.recv() => match command {
                     Some(ControllerCommand::Input(input)) => {
                         if let Err(error) = runtime.send_input(input).await {
@@ -928,16 +942,8 @@ async fn run_controller(
                             break ConnectFailure::from_controller(error);
                         }
                     }
-                    Some(ControllerCommand::Stop) | None => {
-                        record_controller_diagnostic(
-                            diagnostics.as_ref(),
-                            ControllerDiagnosticStage::Cancelled,
-                            attempt,
-                            None,
-                            None,
-                            None,
-                        );
-                        manager.set_status(ControllerRuntimeSummary::idle());
+                    None => {
+                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
                         return;
                     }
                 },
@@ -1053,7 +1059,10 @@ async fn run_controller(
             &signals,
             &mut schedule,
             failure,
-            &mut commands,
+            ControllerWaitChannels {
+                commands: &mut commands,
+                cancellation: &mut cancellation,
+            },
             diagnostics.as_ref(),
             attempt,
         )
@@ -1312,7 +1321,7 @@ async fn schedule_failure(
     signals: &Channel<ControllerSignal>,
     schedule: &mut ReconnectSchedule,
     failure: ConnectFailure,
-    commands: &mut mpsc::Receiver<ControllerCommand>,
+    wait_channels: ControllerWaitChannels<'_>,
     diagnostics: Option<&DiagnosticLog>,
     attempt: u32,
 ) -> bool {
@@ -1342,29 +1351,13 @@ async fn schedule_failure(
                 signals,
                 ControllerRuntimeSummary::reconnecting(retry, schedule.max_retries(), delay),
             );
-            let sleep = tokio::time::sleep(delay);
-            tokio::pin!(sleep);
-            loop {
-                tokio::select! {
-                    command = commands.recv() => match command {
-                        Some(ControllerCommand::Stop) | None => {
-                            record_controller_diagnostic(
-                                diagnostics,
-                                ControllerDiagnosticStage::Cancelled,
-                                attempt,
-                                Some(retry),
-                                None,
-                                None,
-                            );
-                            manager.set_status(ControllerRuntimeSummary::idle());
-                            return false;
-                        }
-                        Some(ControllerCommand::Input(_))
-                        | Some(ControllerCommand::Text(_))
-                        | Some(ControllerCommand::RequestKeyframe)
-                        | Some(ControllerCommand::SelectDisplay(_)) => {}
-                    },
-                    () = &mut sleep => return true,
+            match wait_for_retry_deadline(wait_channels.commands, wait_channels.cancellation, delay)
+                .await
+            {
+                RetryWaitOutcome::Retry => true,
+                RetryWaitOutcome::Cancelled => {
+                    finish_cancelled(manager, signals, diagnostics, attempt, Some(retry));
+                    false
                 }
             }
         }
@@ -1386,6 +1379,67 @@ async fn schedule_failure(
             false
         }
     }
+}
+
+struct ControllerWaitChannels<'a> {
+    commands: &'a mut mpsc::Receiver<ControllerCommand>,
+    cancellation: &'a mut watch::Receiver<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryWaitOutcome {
+    Retry,
+    Cancelled,
+}
+
+async fn wait_for_retry_deadline(
+    commands: &mut mpsc::Receiver<ControllerCommand>,
+    cancellation: &mut watch::Receiver<bool>,
+    delay: Duration,
+) -> RetryWaitOutcome {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            changed = cancellation.changed() => {
+                if cancellation_requested(changed, cancellation) {
+                    return RetryWaitOutcome::Cancelled;
+                }
+            }
+            () = &mut sleep => return RetryWaitOutcome::Retry,
+            command = commands.recv() => {
+                if command.is_none() {
+                    return RetryWaitOutcome::Cancelled;
+                }
+            }
+        }
+    }
+}
+
+fn cancellation_requested(
+    changed: Result<(), watch::error::RecvError>,
+    cancellation: &watch::Receiver<bool>,
+) -> bool {
+    changed.is_err() || *cancellation.borrow()
+}
+
+fn finish_cancelled(
+    manager: &ControllerManager,
+    signals: &Channel<ControllerSignal>,
+    diagnostics: Option<&DiagnosticLog>,
+    attempt: u32,
+    retry: Option<u32>,
+) {
+    record_controller_diagnostic(
+        diagnostics,
+        ControllerDiagnosticStage::Cancelled,
+        attempt,
+        retry,
+        None,
+        None,
+    );
+    manager.publish(signals, ControllerRuntimeSummary::idle());
 }
 
 fn record_controller_diagnostic(
@@ -1561,13 +1615,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectFailure, ControllerInput, ControllerManager, ControllerRuntimeSummary,
-        directory_transport_error_is_retryable, directory_transport_error_message, parse_input,
-        session_earned_fresh_retry_budget, validate_text_input,
+        ConnectFailure, ControllerCommand, ControllerInput, ControllerManager,
+        ControllerRuntimeSummary, RetryWaitOutcome, directory_transport_error_is_retryable,
+        directory_transport_error_message, parse_input, session_earned_fresh_retry_budget,
+        validate_text_input, wait_for_retry_deadline,
     };
     use desklink_ffi::ControllerError;
     use desklink_protocol::{AccessDenialReason, InputEvent, KeyCode, Modifiers};
     use desklink_transport::{JoinRejectCode, TransportError};
+    use tokio::sync::{mpsc, watch};
 
     fn empty_input(kind: &str) -> ControllerInput {
         ControllerInput {
@@ -1736,6 +1792,55 @@ mod tests {
         let retry = manager.begin_operation();
         assert!(retry > first);
         assert!(manager.ensure_current(retry).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_independent_from_a_saturated_input_queue() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        commands
+            .send(ControllerCommand::RequestKeyframe)
+            .await
+            .unwrap();
+        let (cancellation, mut cancellation_receiver) = watch::channel(false);
+        cancellation.send(true).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_retry_deadline(
+                &mut receiver,
+                &mut cancellation_receiver,
+                Duration::from_secs(10),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RetryWaitOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_is_not_starved_by_continuous_input() {
+        let (commands, mut receiver) = mpsc::channel(8);
+        let producer = tokio::spawn(async move {
+            while commands
+                .send(ControllerCommand::RequestKeyframe)
+                .await
+                .is_ok()
+            {}
+        });
+        let (_cancellation, mut cancellation_receiver) = watch::channel(false);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_retry_deadline(
+                &mut receiver,
+                &mut cancellation_receiver,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .unwrap();
+        producer.abort();
+        assert_eq!(outcome, RetryWaitOutcome::Retry);
     }
 
     #[test]
