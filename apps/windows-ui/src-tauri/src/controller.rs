@@ -7,6 +7,7 @@ use std::{
 };
 
 use apps_windows::{
+    cloud_diagnostics::{DiagnosticSource, set_session_correlation},
     controller_settings::{ControllerConnectionSettings, WindowsControllerConnectionStore},
     diagnostics::{ControllerDiagnosticStage, DiagnosticEvent, DiagnosticLog},
     identity::WindowsIdentityStore,
@@ -841,6 +842,7 @@ async fn run_controller(
     video: Channel<Response>,
 ) {
     let diagnostics = DiagnosticLog::controller_for_current_user().ok();
+    let _ = set_session_correlation(DiagnosticSource::Controller, settings.session_id());
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
     let mut attempt = 0_u32;
     'connect: loop {

@@ -67,6 +67,7 @@ DeskLink.exe
 - 公网产品配置与 tab 键盘导航提取为纯模块并增加单元测试。
 - 发布门禁检查 Rust 与 TypeScript 的正式中继地址一致，并扫描全部生产 HTML/CSS/JS 资源中的开发服务器 URL。
 - 新增使用生产 transport 客户端的公网 TLS/QUIC 探针，以及每半小时执行的 Windows GitHub Actions 中继监控。
+- 新增独立的 HTTPS 脱敏诊断服务：用户主动开启、设备身份签名、会话单向关联、断网补传、服务端字段白名单、去重和 14 天保留；诊断服务不进入远控中继或 Noise 业务通道。
 - Dependabot 每周检查 Cargo、Windows UI npm 与 GitHub Actions 依赖，降低锁文件长期不更新带来的供应链风险。
 - 删除 Tauri 对 relay 服务端、`rcgen`、`rustls`、`quinn` 的重复直接依赖，网络客户端只通过共享 transport crate。
 - 控制端只保留设备 ID 与访问密码入口，邀请材料由 Rust 和中继目录内部处理，不再暴露给 WebView。

@@ -19,8 +19,10 @@ import {
   revokeTrustedController,
   saveConnectionSettings,
   setupManagedConnection,
+  setDiagnosticsSharing,
   setLaunchAtLogin,
   startPairingSession,
+  uploadDiagnosticsNow,
 } from "./api";
 import type {
   ConnectionSettingsInput,
@@ -82,6 +84,8 @@ let connectionAdvancedOpen = false;
 let preferences: WindowsPreferencesSummary | null = null;
 let preferencesLoading = false;
 let launchAtLoginBusy = false;
+let diagnosticsSharingBusy = false;
+let diagnosticsUploadBusy = false;
 let quitConfirming = false;
 let applicationVersion = "";
 const snapshotRequests = new LatestRequest();
@@ -902,7 +906,7 @@ function renderSettings(): string {
       <header class="page-heading">
         <div>
           <h1>Windows 设置</h1>
-          <p>管理 DeskLink 的登录启动、托盘运行方式和应用退出。</p>
+          <p>管理 DeskLink 的后台运行、脱敏诊断和应用退出。</p>
         </div>
       </header>
 
@@ -949,6 +953,35 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
         </div>
         <span class="settings-value">${settings.closeToTray ? "系统托盘" : "直接退出"}</span>
       </div>
+    </section>
+
+    <section class="settings-group" aria-labelledby="diagnostics-sharing-heading">
+      <div class="settings-group-heading">
+        <h2 id="diagnostics-sharing-heading">连接问题诊断</h2>
+        <p>仅在你明确开启后，将经过清理的连接状态自动发送到 DeskLink 诊断服务。</p>
+      </div>
+      <div class="settings-row settings-row--diagnostics">
+        <div class="settings-row-copy">
+          <strong>共享脱敏诊断</strong>
+          <p>不会上传屏幕、按键、访问密码、会话密钥或完整设备身份；记录最多保留 14 天，并在网络恢复后自动补传。</p>
+        </div>
+        <label class="switch-control">
+          <input type="checkbox" data-diagnostics-sharing ${settings.diagnosticsSharingEnabled ? "checked" : ""} ${diagnosticsSharingBusy ? "disabled" : ""}>
+          <span aria-hidden="true"></span>
+          <b>${diagnosticsSharingBusy ? "正在保存" : settings.diagnosticsSharingEnabled ? "已开启" : "已关闭"}</b>
+        </label>
+      </div>
+      ${settings.diagnosticsSharingEnabled
+        ? `<div class="settings-inline-action">
+            <div>
+              <strong>需要立即排查时</strong>
+              <p>点击后发送本机最近的主机端和控制端脱敏事件，重复事件会由服务器自动去重。</p>
+            </div>
+            <button class="button button--secondary button--compact" type="button" data-upload-diagnostics ${diagnosticsUploadBusy ? "disabled" : ""}>
+              ${diagnosticsUploadBusy ? "正在发送…" : "立即发送诊断"}
+            </button>
+          </div>`
+        : ""}
     </section>
 
     <section class="settings-group" aria-labelledby="application-settings-heading">
@@ -1137,6 +1170,52 @@ async function updateLaunchAtLogin(enabled: boolean): Promise<void> {
   }
 }
 
+async function updateDiagnosticsSharing(enabled: boolean): Promise<void> {
+  if (diagnosticsSharingBusy) {
+    return;
+  }
+  diagnosticsSharingBusy = true;
+  feedback = null;
+  render();
+  try {
+    preferences = await setDiagnosticsSharing(enabled);
+    feedback = {
+      tone: "success",
+      message: enabled
+        ? "已开启脱敏诊断共享。连接事件会在后台安全发送，网络中断后自动补传。"
+        : "已关闭脱敏诊断共享。本机日志仍只保存在当前 Windows 账户中。",
+    };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    diagnosticsSharingBusy = false;
+    render();
+  }
+}
+
+async function sendDiagnosticsNow(): Promise<void> {
+  if (diagnosticsUploadBusy) {
+    return;
+  }
+  diagnosticsUploadBusy = true;
+  feedback = null;
+  render();
+  try {
+    const result = await uploadDiagnosticsNow();
+    feedback = {
+      tone: "success",
+      message: result.uploadedEvents > 0
+        ? `已发送 ${result.uploadedEvents} 条脱敏事件，可使用同一连接关联编号排查两台电脑。`
+        : "当前没有需要发送的新诊断事件。",
+    };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    diagnosticsUploadBusy = false;
+    render();
+  }
+}
+
 async function exitDeskLink(): Promise<void> {
   feedback = { tone: "info", message: "正在停止远程主机并退出 DeskLink。" };
   render();
@@ -1321,6 +1400,12 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLInputElement>("[data-launch-at-login]")?.addEventListener("change", (event) => {
     void updateLaunchAtLogin((event.currentTarget as HTMLInputElement).checked);
+  });
+  document.querySelector<HTMLInputElement>("[data-diagnostics-sharing]")?.addEventListener("change", (event) => {
+    void updateDiagnosticsSharing((event.currentTarget as HTMLInputElement).checked);
+  });
+  document.querySelector<HTMLButtonElement>("[data-upload-diagnostics]")?.addEventListener("click", () => {
+    void sendDiagnosticsNow();
   });
   document.querySelector<HTMLButtonElement>("[data-request-quit]")?.addEventListener("click", () => {
     quitConfirming = true;

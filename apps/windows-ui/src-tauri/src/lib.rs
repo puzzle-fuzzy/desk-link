@@ -36,7 +36,9 @@ use std::{
 };
 
 use apps_windows::{
+    cloud_diagnostics::{DiagnosticUploadSummary, start_background_uploader, upload_all_once},
     configuration::{HostConnectionSettings, WindowsConnectionSettingsStore},
+    diagnostic_sharing::WindowsDiagnosticSharing,
     diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
@@ -135,9 +137,26 @@ struct FixedAccessSummary {
 #[serde(rename_all = "camelCase")]
 struct WindowsPreferencesSummary {
     launch_at_login: bool,
+    diagnostics_sharing_enabled: bool,
     close_to_tray: bool,
     interface_language: &'static str,
     version: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticUploadResult {
+    uploaded_sources: u32,
+    uploaded_events: u32,
+}
+
+impl From<DiagnosticUploadSummary> for DiagnosticUploadResult {
+    fn from(value: DiagnosticUploadSummary) -> Self {
+        Self {
+            uploaded_sources: value.uploaded_sources,
+            uploaded_events: value.uploaded_events,
+        }
+    }
 }
 
 impl Drop for FixedAccessSummary {
@@ -205,6 +224,30 @@ async fn set_launch_at_login(enabled: bool) -> Result<WindowsPreferencesSummary,
     })
     .await
     .map_err(|_| "DeskLink 无法更新 Windows 偏好设置，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn set_diagnostics_sharing(enabled: bool) -> Result<WindowsPreferencesSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        WindowsDiagnosticSharing::for_current_user()
+            .map_err(|_| "DeskLink 无法打开诊断共享设置。".to_owned())?
+            .set_enabled(enabled)
+            .map_err(|_| "Windows 未能保存诊断共享设置，请检查当前账户权限后重试。".to_owned())?;
+        load_windows_preferences()
+    })
+    .await
+    .map_err(|_| "DeskLink 无法更新诊断共享设置，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn upload_diagnostics_now() -> Result<DiagnosticUploadResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        upload_all_once().map(Into::into).map_err(|_| {
+            "暂时无法发送脱敏诊断，请检查网络后重试。DeskLink 会在后台自动补传。".to_owned()
+        })
+    })
+    .await
+    .map_err(|_| "DeskLink 无法启动诊断发送任务，请重试。".to_owned())?
 }
 
 #[tauri::command]
@@ -1079,8 +1122,13 @@ fn load_windows_preferences() -> Result<WindowsPreferencesSummary, String> {
         .map_err(|_| "DeskLink 无法定位当前安装程序。".to_owned())?
         .is_enabled()
         .map_err(|_| "Windows 登录启动设置当前不可用。".to_owned())?;
+    let diagnostics_sharing_enabled = WindowsDiagnosticSharing::for_current_user()
+        .map_err(|_| "DeskLink 无法打开诊断共享设置。".to_owned())?
+        .is_enabled()
+        .map_err(|_| "诊断共享设置当前不可用。".to_owned())?;
     Ok(WindowsPreferencesSummary {
         launch_at_login,
+        diagnostics_sharing_enabled,
         close_to_tray: true,
         interface_language: "简体中文",
         version: env!("CARGO_PKG_VERSION"),
@@ -1128,6 +1176,7 @@ pub fn run() {
             if let Some(diagnostics) = diagnostics.as_ref() {
                 let _ = diagnostics.record(&DiagnosticEvent::ControlSurfaceStarted);
             }
+            start_background_uploader();
             setup_tray(app)?;
             let manager = app.state::<HostManager>().inner().clone();
             #[cfg(windows)]
@@ -1162,6 +1211,8 @@ pub fn run() {
             get_host_snapshot,
             get_windows_preferences,
             set_launch_at_login,
+            set_diagnostics_sharing,
+            upload_diagnostics_now,
             quit_desklink,
             respond_host_approval,
             restart_host,

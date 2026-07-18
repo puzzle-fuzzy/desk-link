@@ -1,0 +1,26 @@
+[Unit]
+Description=DeskLink privacy-preserving diagnostics ingestion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=desklink-diagnostics
+Group=desklink-diagnostics
+WorkingDirectory=/opt/desklink-diagnostics/current
+Environment=DESKLINK_DIAGNOSTICS_ADDR=127.0.0.1
+Environment=DESKLINK_DIAGNOSTICS_PORT=3411
+Environment=DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink-diagnostics/diagnostics.sqlite
+ExecStart=/usr/local/bin/bun run src/index.ts
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/desklink-diagnostics
+MemoryMax=256M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

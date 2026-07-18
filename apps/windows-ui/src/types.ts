@@ -123,9 +123,15 @@ export interface DiagnosticExportResult {
 
 export interface WindowsPreferencesSummary {
   launchAtLogin: boolean;
+  diagnosticsSharingEnabled: boolean;
   closeToTray: boolean;
   interfaceLanguage: string;
   version: string;
+}
+
+export interface DiagnosticUploadResult {
+  uploadedSources: number;
+  uploadedEvents: number;
 }
 
 export type ControllerRuntimeState =

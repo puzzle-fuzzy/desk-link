@@ -232,6 +232,34 @@ select:focus-visible {
   text-wrap: pretty;
 }
 
+.settings-row--diagnostics {
+  align-items: flex-start;
+}
+
+.settings-inline-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-quiet);
+}
+
+.settings-inline-action strong {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.settings-inline-action p {
+  max-width: 72ch;
+  margin-top: 4px;
+  color: var(--ink-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .settings-value {
   flex: 0 0 auto;
   padding: 5px 8px;
@@ -2876,6 +2904,7 @@ select:focus-visible {
   }
 
   .settings-row,
+  .settings-inline-action,
   .settings-exit {
     align-items: flex-start;
     flex-direction: column;

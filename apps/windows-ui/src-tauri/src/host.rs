@@ -4,6 +4,7 @@ use std::{
 };
 
 use apps_windows::{
+    cloud_diagnostics::{DiagnosticSource, set_session_correlation},
     configuration::WindowsConnectionSettingsStore,
     diagnostics::{DiagnosticEvent, DiagnosticLog},
     fixed_access::WindowsFixedAccessStore,
@@ -621,6 +622,7 @@ fn prepare_host(
     else {
         return Ok(PreparedHost::Unconfigured { diagnostics });
     };
+    let _ = set_session_correlation(DiagnosticSource::Host, connection.session_id());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| HostPreparationFailure::Identity)?
         .load_or_create(&mut OsRng)
@@ -709,6 +711,7 @@ fn prepare_pairing(
         .load()
         .map_err(|_| HostPreparationFailure::ConnectionProtection)?
         .ok_or(HostPreparationFailure::ConnectionProtection)?;
+    let _ = set_session_correlation(DiagnosticSource::Host, connection.session_id());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| HostPreparationFailure::Identity)?
         .load_or_create(&mut OsRng)

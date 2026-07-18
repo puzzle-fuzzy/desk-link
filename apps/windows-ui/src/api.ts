@@ -7,6 +7,7 @@ import type {
   ControllerSignal,
   ControllerSnapshot,
   DiagnosticExportResult,
+  DiagnosticUploadResult,
   FixedAccessSummary,
   HostSnapshot,
   PairingSessionSummary,
@@ -33,6 +34,14 @@ export function getWindowsPreferences(): Promise<WindowsPreferencesSummary> {
 
 export function setLaunchAtLogin(enabled: boolean): Promise<WindowsPreferencesSummary> {
   return invoke<WindowsPreferencesSummary>("set_launch_at_login", { enabled });
+}
+
+export function setDiagnosticsSharing(enabled: boolean): Promise<WindowsPreferencesSummary> {
+  return invoke<WindowsPreferencesSummary>("set_diagnostics_sharing", { enabled });
+}
+
+export function uploadDiagnosticsNow(): Promise<DiagnosticUploadResult> {
+  return invoke<DiagnosticUploadResult>("upload_diagnostics_now");
 }
 
 export function quitDeskLink(): Promise<void> {
