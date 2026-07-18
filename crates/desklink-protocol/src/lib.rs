@@ -2,9 +2,9 @@ mod codec;
 
 pub use codec::{
     ProtocolError, decode_control, decode_cursor_update, decode_input, decode_noise_handshake,
-    decode_video_config, decode_video_header, decode_video_packet, encode_control,
-    encode_cursor_update, encode_input, encode_noise_handshake, encode_video_config,
-    encode_video_header, encode_video_packet,
+    decode_session_input, decode_video_config, decode_video_header, decode_video_packet,
+    encode_control, encode_cursor_update, encode_input, encode_noise_handshake,
+    encode_video_config, encode_video_header, encode_video_packet,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::{BitOr, BitOrAssign};
@@ -140,6 +140,36 @@ pub enum ControlMessage {
         role: DeviceRole,
     },
     Capabilities(DeviceCapabilities),
+    AccessDenied {
+        reason: AccessDenialReason,
+    },
+    DisplayList {
+        displays: Vec<RemoteDisplay>,
+        active_display_id: u32,
+    },
+    SelectDisplay {
+        display_id: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDisplay {
+    pub id: u32,
+    pub width: u16,
+    pub height: u16,
+    pub primary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AccessDenialReason {
+    ApprovalRejected,
+    ApprovalExpired,
+    ControllerNotTrusted,
+    ControllerIdentityChanged,
+    HostUnavailable,
+    HostCaptureFailed,
+    HostEncoderFailed,
+    HostInputFailed,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceCapabilities {

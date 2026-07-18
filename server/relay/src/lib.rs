@@ -1,21 +1,22 @@
 use std::{
     collections::HashMap,
+    hash::{DefaultHasher, Hasher},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
     ChannelKind, DEAD_TIMEOUT, DIRECTORY_ACCESS_CODE_BYTES, DIRECTORY_LOOKUP_ENVELOPE_BYTES,
-    DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_NOT_FOUND, DIRECTORY_LOOKUP_RATE_LIMITED,
-    JoinRejectCode, KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES,
-    MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayJoin,
-    decode_directory_lookup, decode_relay_join,
+    DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED, DIRECTORY_LOOKUP_NOT_FOUND,
+    DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode, KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES,
+    MAX_JOIN_ENVELOPE_BYTES, MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE,
+    RelayDirectoryLookup, RelayJoin, decode_directory_lookup, decode_relay_join,
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -639,29 +640,31 @@ impl RelayState {
         Err(DIRECTORY_LOOKUP_NOT_FOUND)
     }
 
-    fn peer(
+    fn peer_with_id(
         &self,
         session_id: SessionId,
         role: DeviceRole,
         connection_id: u64,
-    ) -> Option<quinn::Connection> {
+    ) -> Option<(u64, quinn::Connection)> {
         let peer_id = self
             .sessions
             .peer_connection(session_id, role, connection_id)?;
         self.lock_participants()
             .get(&peer_id)
-            .map(|participant| participant.connection.clone())
+            .map(|participant| (peer_id, participant.connection.clone()))
     }
 
     fn remove_connection(&self, session_id: SessionId, connection_id: u64) {
-        let _membership = self.lock_membership();
-        self.sessions.detach(session_id, connection_id);
-        self.lock_participants().remove(&connection_id);
-        let mut directory = match self.directory.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        directory.retain(|_, record| record.connection_id != connection_id);
+        {
+            let _membership = self.lock_membership();
+            self.sessions.detach(session_id, connection_id);
+            self.lock_participants().remove(&connection_id);
+            let mut directory = match self.directory.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            directory.retain(|_, record| record.connection_id != connection_id);
+        }
     }
 
     fn sweep_expired(&self, now: Instant) {
@@ -807,6 +810,7 @@ async fn handle_connection(
     let request = match read_request(&mut join_receive).await {
         Ok(request) => request,
         Err(error) => {
+            log_connection_event("request_rejected", connection_id, join_reject_label(error));
             if join_send
                 .write_all(&[join_error_code(&error)])
                 .await
@@ -824,6 +828,7 @@ async fn handle_connection(
             let response = state.lookup_directory(connection.remote_address().ip(), &lookup);
             match response {
                 Ok(mut invitation) => {
+                    log_connection_event("directory_lookup", connection_id, "found");
                     let length = invitation.len() as u16;
                     let sent = join_send.write_all(&[DIRECTORY_LOOKUP_FOUND]).await.is_ok()
                         && join_send.write_all(&length.to_be_bytes()).await.is_ok()
@@ -834,6 +839,11 @@ async fn handle_connection(
                     }
                 }
                 Err(status) => {
+                    log_connection_event(
+                        "directory_lookup",
+                        connection_id,
+                        directory_status_label(status),
+                    );
                     if join_send.write_all(&[status]).await.is_ok() {
                         let _ = join_send.finish();
                     }
@@ -848,6 +858,15 @@ async fn handle_connection(
     let replaced = match state.attach_participant(&join, connection_id, connection.clone()) {
         Ok(replaced) => replaced,
         Err(error) => {
+            log_session_event(
+                "join_rejected",
+                connection_id,
+                join.session_id(),
+                join.role(),
+                None,
+                None,
+                relay_error_label(&error),
+            );
             if join_send
                 .write_all(&[relay_error_code(&error)])
                 .await
@@ -859,6 +878,19 @@ async fn handle_connection(
             return;
         }
     };
+    log_session_event(
+        "participant_joined",
+        connection_id,
+        join.session_id(),
+        join.role(),
+        None,
+        None,
+        if replaced.is_some() {
+            "replaced_previous_connection"
+        } else {
+            "attached"
+        },
+    );
     if let Some(previous) = replaced {
         previous.close(
             quinn::VarInt::from_u32(4),
@@ -906,6 +938,15 @@ async fn handle_connection(
             _ = connection.closed() => break,
         }
     }
+    log_session_event(
+        "participant_disconnected",
+        connection_id,
+        session_id,
+        role,
+        None,
+        None,
+        "transport_ended",
+    );
     state.remove_connection(session_id, connection_id);
 }
 
@@ -917,11 +958,11 @@ async fn forward_reliable(
     role: DeviceRole,
     mut receive: quinn::RecvStream,
 ) {
-    let mut channel = [0; 1];
-    if receive.read_exact(&mut channel).await.is_err() {
+    let mut header = [0; 9];
+    if receive.read_exact(&mut header).await.is_err() {
         return;
     }
-    let Ok(channel) = ChannelKind::try_from(channel[0]) else {
+    let Ok(channel) = ChannelKind::try_from(header[0]) else {
         close_connection(&source, b"unknown channel");
         return;
     };
@@ -929,19 +970,18 @@ async fn forward_reliable(
         close_connection(&source, b"invalid reliable channel");
         return;
     }
-    let Some(peer) = state.peer(session_id, role, connection_id) else {
-        return;
-    };
-    let Ok((mut send, _receive)) = peer.open_bi().await else {
-        return;
-    };
-    if send.write_all(&[channel as u8]).await.is_err() {
-        return;
-    }
+    let target_generation = u64::from_be_bytes(
+        header[1..]
+            .try_into()
+            .expect("reliable target generation header has a fixed length"),
+    );
+    let mut destination: Option<(u64, quinn::SendStream)> = None;
     loop {
         let mut length = [0; 4];
         if receive.read_exact(&mut length).await.is_err() {
-            let _ = send.finish();
+            if let Some((_, mut send)) = destination.take() {
+                let _ = send.finish();
+            }
             return;
         }
         let length = u32::from_be_bytes(length) as usize;
@@ -951,14 +991,171 @@ async fn forward_reliable(
         }
         let mut message = vec![0; length];
         if receive.read_exact(&mut message).await.is_err() {
-            let _ = send.finish();
+            if let Some((_, mut send)) = destination.take() {
+                let _ = send.finish();
+            }
             return;
         }
-        if send.write_all(&length_to_bytes(length)).await.is_err()
-            || send.write_all(&message).await.is_err()
+        if !forward_reliable_message(
+            &state,
+            &source,
+            ReliableRoute {
+                connection_id,
+                session_id,
+                role,
+                channel,
+                target_generation,
+            },
+            &message,
+            &mut destination,
+        )
+        .await
         {
             return;
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReliableRoute {
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    channel: ChannelKind,
+    target_generation: u64,
+}
+
+async fn forward_reliable_message(
+    state: &RelayState,
+    source: &quinn::Connection,
+    route: ReliableRoute,
+    message: &[u8],
+    destination: &mut Option<(u64, quinn::SendStream)>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let peer = state.peer_with_id(route.session_id, route.role, route.connection_id);
+        let Some((peer_id, peer)) = peer else {
+            // The host is the durable member of a managed session. A message
+            // produced after its controller disappeared belongs to that old
+            // encrypted peer and must neither evict the host nor be buffered
+            // for a later controller.
+            if route.role == DeviceRole::Host {
+                log_session_event(
+                    "reliable_stream_rejected",
+                    route.connection_id,
+                    route.session_id,
+                    route.role,
+                    None,
+                    Some(route.channel),
+                    "peer_unavailable",
+                );
+                if let Some((_, mut send)) = destination.take() {
+                    let _ = send.finish();
+                }
+                // This source stream was opened for a controller generation
+                // that no longer exists. End it permanently so later
+                // ciphertext on the same stream cannot bind to a replacement.
+                return false;
+            }
+            if tokio::time::Instant::now() >= deadline || source.close_reason().is_some() {
+                close_connection(source, b"session peer unavailable");
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        };
+
+        if route.target_generation != 0 && route.target_generation != peer_id {
+            log_session_event(
+                "reliable_stream_rejected",
+                route.connection_id,
+                route.session_id,
+                route.role,
+                Some(peer_id),
+                Some(route.channel),
+                "target_generation_mismatch",
+            );
+            if let Some((_, mut send)) = destination.take() {
+                let _ = send.finish();
+            }
+            // The source explicitly addressed a different peer connection.
+            // This encrypted message can never be valid for the replacement.
+            return false;
+        }
+
+        let peer_changed = destination
+            .as_ref()
+            .is_some_and(|(destination_id, _)| *destination_id != peer_id);
+        if peer_changed {
+            log_session_event(
+                "reliable_stream_rejected",
+                route.connection_id,
+                route.session_id,
+                route.role,
+                Some(peer_id),
+                Some(route.channel),
+                "peer_replaced",
+            );
+            if let Some((_, mut send)) = destination.take() {
+                let _ = send.finish();
+            }
+            // Every reliable source stream is cryptographically bound to the
+            // peer it first reached, including a controller's generation-zero
+            // bootstrap stream. Never rebind it to a replacement connection.
+            return false;
+        }
+        if destination.is_none() {
+            let Ok((mut send, _receive)) = peer.open_bi().await else {
+                if route.role == DeviceRole::Host {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if send.write_all(&[route.channel as u8]).await.is_err()
+                || send
+                    .write_all(&route.connection_id.to_be_bytes())
+                    .await
+                    .is_err()
+            {
+                if route.role == DeviceRole::Host {
+                    return false;
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            *destination = Some((peer_id, send));
+            log_session_event(
+                "reliable_stream_bound",
+                route.connection_id,
+                route.session_id,
+                route.role,
+                Some(peer_id),
+                Some(route.channel),
+                "forwarding",
+            );
+        }
+
+        let Some((_, send)) = destination.as_mut() else {
+            continue;
+        };
+        if send
+            .write_all(&length_to_bytes(message.len()))
+            .await
+            .is_ok()
+            && send.write_all(message).await.is_ok()
+        {
+            return true;
+        }
+        *destination = None;
+        if route.role == DeviceRole::Host {
+            // A failed write may coincide with controller replacement. The
+            // ciphertext still belongs to the old controller, so drop it
+            // instead of retrying it against the new connection.
+            return false;
+        }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -970,7 +1167,7 @@ fn forward_datagram(
     role: DeviceRole,
     datagram: bytes::Bytes,
 ) -> bool {
-    if datagram.is_empty() || datagram.len() - 1 > MAX_DATAGRAM_BYTES {
+    if datagram.len() < 9 || datagram.len() - 9 > MAX_DATAGRAM_BYTES {
         close_connection(source, b"datagram too large");
         return false;
     }
@@ -985,14 +1182,133 @@ fn forward_datagram(
         close_connection(source, b"invalid datagram channel");
         return false;
     }
-    if let Some(peer) = state.peer(session_id, role, connection_id) {
-        let _ = peer.send_datagram(datagram);
+    let target_generation = u64::from_be_bytes(
+        datagram[1..9]
+            .try_into()
+            .expect("datagram target generation header has a fixed length"),
+    );
+    if let Some((peer_id, peer)) = state.peer_with_id(session_id, role, connection_id) {
+        if target_generation != 0 && target_generation != peer_id {
+            return true;
+        }
+        let mut forwarded = Vec::with_capacity(datagram.len());
+        forwarded.push(channel as u8);
+        forwarded.extend_from_slice(&connection_id.to_be_bytes());
+        forwarded.extend_from_slice(&datagram[9..]);
+        let _ = peer.send_datagram(forwarded.into());
     }
     true
 }
 
 fn close_connection(connection: &quinn::Connection, reason: &[u8]) {
     connection.close(quinn::VarInt::from_u32(3), reason);
+}
+
+fn log_connection_event(event: &str, connection_id: u64, outcome: &str) {
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    eprintln!(
+        "{{\"schema\":1,\"timestamp_unix_ms\":{timestamp_unix_ms},\"event\":\"{event}\",\"connection_id\":{connection_id},\"outcome\":\"{outcome}\"}}"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_session_event(
+    event: &str,
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    peer_connection_id: Option<u64>,
+    channel: Option<ChannelKind>,
+    outcome: &str,
+) {
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut peer = String::new();
+    if let Some(peer_connection_id) = peer_connection_id {
+        peer = format!(",\"peer_connection_id\":{peer_connection_id}");
+    }
+    let mut lane = String::new();
+    if let Some(channel) = channel {
+        lane = format!(",\"channel\":\"{}\"", channel_label(channel));
+    }
+    eprintln!(
+        "{{\"schema\":1,\"timestamp_unix_ms\":{timestamp_unix_ms},\"event\":\"{event}\",\"session_tag\":\"{}\",\"connection_id\":{connection_id},\"role\":\"{}\"{peer}{lane},\"outcome\":\"{outcome}\"}}",
+        session_tag(session_id),
+        role_label(role),
+    );
+}
+
+fn session_tag(session_id: SessionId) -> String {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(b"desklink-relay-session-tag-v1");
+    hasher.write(session_id.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+const fn role_label(role: DeviceRole) -> &'static str {
+    match role {
+        DeviceRole::Host => "host",
+        DeviceRole::Controller => "controller",
+    }
+}
+
+const fn channel_label(channel: ChannelKind) -> &'static str {
+    match channel {
+        ChannelKind::Control => "control",
+        ChannelKind::Input => "input",
+        ChannelKind::VideoConfig => "video_config",
+        ChannelKind::VideoDatagram => "video_datagram",
+        ChannelKind::CursorDatagram => "cursor_datagram",
+    }
+}
+
+const fn directory_status_label(status: u8) -> &'static str {
+    match status {
+        DIRECTORY_LOOKUP_NOT_FOUND => "not_found",
+        DIRECTORY_LOOKUP_RATE_LIMITED => "rate_limited",
+        DIRECTORY_LOOKUP_MALFORMED => "malformed",
+        _ => "unknown",
+    }
+}
+
+const fn join_reject_label(code: JoinRejectCode) -> &'static str {
+    match code {
+        JoinRejectCode::Malformed => "malformed",
+        JoinRejectCode::TooLarge => "too_large",
+        JoinRejectCode::SessionNotFound => "session_not_found",
+        JoinRejectCode::SessionOccupied => "session_occupied",
+        JoinRejectCode::AuthenticationMismatch => "authentication_mismatch",
+        JoinRejectCode::RoleMismatch => "role_mismatch",
+        JoinRejectCode::Internal => "internal",
+        JoinRejectCode::ConnectionLimit => "connection_limit",
+        JoinRejectCode::SessionLimit => "session_limit",
+        JoinRejectCode::DirectoryConflict => "directory_conflict",
+    }
+}
+
+const fn relay_error_label(error: &RelayError) -> &'static str {
+    match error {
+        RelayError::SessionOccupied => "session_occupied",
+        RelayError::SessionNotFound => "session_not_found",
+        RelayError::AuthenticationMismatch => "authentication_mismatch",
+        RelayError::RoleMismatch => "role_mismatch",
+        RelayError::MalformedJoin => "malformed_join",
+        RelayError::JoinTooLarge => "join_too_large",
+        RelayError::ReliableMessageTooLarge => "reliable_message_too_large",
+        RelayError::DatagramTooLarge => "datagram_too_large",
+        RelayError::UnknownChannel => "unknown_channel",
+        RelayError::PeerUnavailable => "peer_unavailable",
+        RelayError::InvalidConfig(_) => "invalid_config",
+        RelayError::Transport(_) => "transport",
+        RelayError::ConnectionLimitReached => "connection_limit",
+        RelayError::SessionLimitReached => "session_limit",
+        RelayError::DirectoryConflict => "directory_conflict",
+    }
 }
 
 fn length_to_bytes(length: usize) -> [u8; 4] {

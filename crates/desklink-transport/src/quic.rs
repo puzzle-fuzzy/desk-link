@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
@@ -28,29 +28,43 @@ struct ClientInner {
     connection: quinn::Connection,
     joined: AtomicBool,
     join_lock: Mutex<()>,
-    control: Mutex<Option<quinn::SendStream>>,
-    input: Mutex<Option<quinn::SendStream>>,
-    video_config: Mutex<Option<quinn::SendStream>>,
+    control: Mutex<Option<ReliableSendStream>>,
+    input: Mutex<Option<ReliableSendStream>>,
+    video_config: Mutex<Option<ReliableSendStream>>,
+    active_peer_generation: Arc<AtomicU64>,
     events: InboundReceivers,
+}
+
+struct ReliableSendStream {
+    peer_generation: u64,
+    stream: quinn::SendStream,
+}
+
+struct InboundEvent {
+    peer_generation: Option<u64>,
+    event: TransportEvent,
 }
 
 #[derive(Clone)]
 struct InboundSenders {
-    control: mpsc::Sender<TransportEvent>,
-    input: mpsc::Sender<TransportEvent>,
-    video_config: mpsc::Sender<TransportEvent>,
-    video_datagram: mpsc::Sender<TransportEvent>,
-    cursor_datagram: mpsc::Sender<TransportEvent>,
-    closed: mpsc::Sender<TransportEvent>,
+    control: mpsc::Sender<InboundEvent>,
+    input: mpsc::Sender<InboundEvent>,
+    video_config: mpsc::Sender<InboundEvent>,
+    video_datagram: mpsc::Sender<InboundEvent>,
+    cursor_datagram: mpsc::Sender<InboundEvent>,
+    closed: mpsc::Sender<InboundEvent>,
+    active_peer_generation: Arc<AtomicU64>,
 }
 
 struct InboundReceivers {
-    control: Mutex<mpsc::Receiver<TransportEvent>>,
-    input: Mutex<mpsc::Receiver<TransportEvent>>,
-    video_config: Mutex<mpsc::Receiver<TransportEvent>>,
-    video_datagram: Mutex<mpsc::Receiver<TransportEvent>>,
-    cursor_datagram: Mutex<mpsc::Receiver<TransportEvent>>,
-    closed: Mutex<mpsc::Receiver<TransportEvent>>,
+    control: Mutex<mpsc::Receiver<InboundEvent>>,
+    pending_control: Mutex<Option<InboundEvent>>,
+    input: Mutex<mpsc::Receiver<InboundEvent>>,
+    video_config: Mutex<mpsc::Receiver<InboundEvent>>,
+    video_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
+    cursor_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
+    closed: Mutex<mpsc::Receiver<InboundEvent>>,
+    active_peer_generation: Arc<AtomicU64>,
     control_open: AtomicBool,
     input_open: AtomicBool,
     video_config_open: AtomicBool,
@@ -69,20 +83,23 @@ enum LanePoll {
 
 impl InboundReceivers {
     fn new(
-        control: mpsc::Receiver<TransportEvent>,
-        input: mpsc::Receiver<TransportEvent>,
-        video_config: mpsc::Receiver<TransportEvent>,
-        video_datagram: mpsc::Receiver<TransportEvent>,
-        cursor_datagram: mpsc::Receiver<TransportEvent>,
-        closed: mpsc::Receiver<TransportEvent>,
+        control: mpsc::Receiver<InboundEvent>,
+        input: mpsc::Receiver<InboundEvent>,
+        video_config: mpsc::Receiver<InboundEvent>,
+        video_datagram: mpsc::Receiver<InboundEvent>,
+        cursor_datagram: mpsc::Receiver<InboundEvent>,
+        closed: mpsc::Receiver<InboundEvent>,
+        active_peer_generation: Arc<AtomicU64>,
     ) -> Self {
         Self {
             control: Mutex::new(control),
+            pending_control: Mutex::new(None),
             input: Mutex::new(input),
             video_config: Mutex::new(video_config),
             video_datagram: Mutex::new(video_datagram),
             cursor_datagram: Mutex::new(cursor_datagram),
             closed: Mutex::new(closed),
+            active_peer_generation,
             control_open: AtomicBool::new(true),
             input_open: AtomicBool::new(true),
             video_config_open: AtomicBool::new(true),
@@ -114,7 +131,7 @@ impl InboundReceivers {
         }
     }
 
-    fn receiver(&self, lane: usize) -> &Mutex<mpsc::Receiver<TransportEvent>> {
+    fn receiver(&self, lane: usize) -> &Mutex<mpsc::Receiver<InboundEvent>> {
         match lane {
             0 => &self.control,
             1 => &self.input,
@@ -130,10 +147,26 @@ impl InboundReceivers {
         let Ok(mut receiver) = self.receiver(lane).try_lock() else {
             return LanePoll::Locked;
         };
-        match receiver.try_recv() {
-            Ok(event) => LanePoll::Event(event),
-            Err(mpsc::error::TryRecvError::Empty) => LanePoll::Empty,
-            Err(mpsc::error::TryRecvError::Disconnected) => LanePoll::Closed,
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if let Some(event) = self.current_event(event) {
+                        return LanePoll::Event(event);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return LanePoll::Empty,
+                Err(mpsc::error::TryRecvError::Disconnected) => return LanePoll::Closed,
+            }
+        }
+    }
+
+    fn current_event(&self, event: InboundEvent) -> Option<TransportEvent> {
+        if event.peer_generation.is_some_and(|generation| {
+            generation != self.active_peer_generation.load(Ordering::Acquire)
+        }) {
+            None
+        } else {
+            Some(event.event)
         }
     }
 
@@ -199,7 +232,9 @@ impl QuicClient {
             video_datagram: video_datagram_sender,
             cursor_datagram: cursor_datagram_sender,
             closed: closed_sender,
+            active_peer_generation: Arc::new(AtomicU64::new(0)),
         };
+        let active_peer_generation = inbound_senders.active_peer_generation.clone();
         let inner = Arc::new(ClientInner {
             connection: connection.clone(),
             joined: AtomicBool::new(false),
@@ -207,6 +242,7 @@ impl QuicClient {
             control: Mutex::new(None),
             input: Mutex::new(None),
             video_config: Mutex::new(None),
+            active_peer_generation: active_peer_generation.clone(),
             events: InboundReceivers::new(
                 control_receiver,
                 input_receiver,
@@ -214,6 +250,7 @@ impl QuicClient {
                 video_datagram_receiver,
                 cursor_datagram_receiver,
                 closed_receiver,
+                active_peer_generation,
             ),
         });
         tokio::spawn(read_connection(connection, inbound_senders));
@@ -309,23 +346,71 @@ impl QuicClient {
     }
 
     pub async fn send_control(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.send_reliable(ChannelKind::Control, bytes).await
+        self.send_reliable(ChannelKind::Control, None, bytes).await
+    }
+
+    pub async fn send_control_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_reliable(ChannelKind::Control, Some(expected_generation), bytes)
+            .await
     }
 
     pub async fn send_input(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.send_reliable(ChannelKind::Input, bytes).await
+        self.send_reliable(ChannelKind::Input, None, bytes).await
     }
 
     pub async fn send_video_config(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.send_reliable(ChannelKind::VideoConfig, bytes).await
+        self.send_reliable(ChannelKind::VideoConfig, None, bytes)
+            .await
+    }
+
+    pub async fn send_video_config_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_reliable(ChannelKind::VideoConfig, Some(expected_generation), bytes)
+            .await
+    }
+
+    /// Ends every reliable stream associated with the current peer without
+    /// closing this client's relay connection. A host can therefore discard a
+    /// failed controller attempt and remain registered for the next one.
+    pub async fn reset_reliable_channels(&self) {
+        finish_reliable_stream(&self.inner.control).await;
+        finish_reliable_stream(&self.inner.input).await;
+        finish_reliable_stream(&self.inner.video_config).await;
     }
 
     pub async fn send_video_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.send_datagram(ChannelKind::VideoDatagram, bytes)
+        self.send_datagram(ChannelKind::VideoDatagram, None, bytes)
+    }
+
+    pub async fn send_video_datagram_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_datagram(ChannelKind::VideoDatagram, Some(expected_generation), bytes)
     }
 
     pub async fn send_cursor_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.send_datagram(ChannelKind::CursorDatagram, bytes)
+        self.send_datagram(ChannelKind::CursorDatagram, None, bytes)
+    }
+
+    pub async fn send_cursor_datagram_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_datagram(
+            ChannelKind::CursorDatagram,
+            Some(expected_generation),
+            bytes,
+        )
     }
 
     pub async fn next_event(&self) -> Result<TransportEvent, TransportError> {
@@ -350,42 +435,42 @@ impl QuicClient {
             }
 
             tokio::select! {
-                event = recv_lane(&self.inner.events.input), if self.inner.events.input_open.load(Ordering::Acquire) => {
+                event = recv_lane(&self.inner.events.input, &self.inner.events.active_peer_generation), if self.inner.events.input_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(1);
                         return Ok(event);
                     }
                     self.inner.events.close_lane(1);
                 }
-                event = recv_lane(&self.inner.events.control), if self.inner.events.control_open.load(Ordering::Acquire) => {
+                event = recv_lane(&self.inner.events.control, &self.inner.events.active_peer_generation), if self.inner.events.control_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(0);
                         return Ok(event);
                     }
                     self.inner.events.close_lane(0);
                 }
-                event = recv_lane(&self.inner.events.video_config), if self.inner.events.video_config_open.load(Ordering::Acquire) => {
+                event = recv_lane(&self.inner.events.video_config, &self.inner.events.active_peer_generation), if self.inner.events.video_config_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(2);
                         return Ok(event);
                     }
                     self.inner.events.close_lane(2);
                 }
-                event = recv_lane(&self.inner.events.video_datagram), if self.inner.events.video_datagram_open.load(Ordering::Acquire) => {
+                event = recv_lane(&self.inner.events.video_datagram, &self.inner.events.active_peer_generation), if self.inner.events.video_datagram_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(3);
                         return Ok(event);
                     }
                     self.inner.events.close_lane(3);
                 }
-                event = recv_lane(&self.inner.events.cursor_datagram), if self.inner.events.cursor_datagram_open.load(Ordering::Acquire) => {
+                event = recv_lane(&self.inner.events.cursor_datagram, &self.inner.events.active_peer_generation), if self.inner.events.cursor_datagram_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(4);
                         return Ok(event);
                     }
                     self.inner.events.close_lane(4);
                 }
-                event = recv_lane(&self.inner.events.closed), if self.inner.events.closed_open.load(Ordering::Acquire) => {
+                event = recv_lane(&self.inner.events.closed, &self.inner.events.active_peer_generation), if self.inner.events.closed_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(5);
                         return Ok(event);
@@ -397,48 +482,160 @@ impl QuicClient {
     }
 
     pub async fn next_control(&self) -> Result<Vec<u8>, TransportError> {
-        receive_payload(&self.inner.events.control, |event| match event {
-            TransportEvent::Control(bytes) => Some(bytes),
-            _ => None,
-        })
-        .await
+        self.next_control_with_generation()
+            .await
+            .map(|(_, payload)| payload)
+    }
+
+    /// Receives the next control payload together with the relay connection
+    /// generation that produced it. Durable hosts use this to bind a Noise
+    /// session to exactly one controller connection.
+    pub async fn next_control_with_generation(&self) -> Result<(u64, Vec<u8>), TransportError> {
+        let event = self.next_current_control_event().await?;
+        let generation = event.peer_generation.ok_or(TransportError::Malformed)?;
+        match event.event {
+            TransportEvent::Control(payload) => Ok((generation, payload)),
+            TransportEvent::PeerDisconnected { .. } => Err(TransportError::PeerDisconnected),
+            _ => Err(TransportError::Malformed),
+        }
+    }
+
+    /// Receives control data only from `expected_generation`. If a replacement
+    /// peer has already sent data, the newer event is preserved for the next
+    /// host runtime instead of being consumed by the old secure session.
+    pub async fn next_control_for_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<Vec<u8>, TransportError> {
+        loop {
+            let event = self.next_current_control_event().await?;
+            let generation = event.peer_generation.ok_or(TransportError::Malformed)?;
+            if generation > expected_generation {
+                *self.inner.events.pending_control.lock().await = Some(event);
+                return Err(TransportError::PeerReplaced);
+            }
+            if generation < expected_generation {
+                continue;
+            }
+            return match event.event {
+                TransportEvent::Control(payload) => Ok(payload),
+                TransportEvent::PeerDisconnected { .. } => Err(TransportError::PeerDisconnected),
+                _ => Err(TransportError::Malformed),
+            };
+        }
     }
 
     pub async fn next_input(&self) -> Result<Vec<u8>, TransportError> {
-        receive_payload(&self.inner.events.input, |event| match event {
-            TransportEvent::Input(bytes) => Some(bytes),
-            _ => None,
-        })
+        receive_payload(
+            &self.inner.events.input,
+            &self.inner.events.active_peer_generation,
+            |event| match event {
+                TransportEvent::Input(bytes) => Some(bytes),
+                _ => None,
+            },
+        )
         .await
     }
 
+    pub async fn next_input_for_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<Vec<u8>, TransportError> {
+        loop {
+            let event = receive_current_inbound(
+                &self.inner.events.input,
+                &self.inner.events.active_peer_generation,
+            )
+            .await
+            .ok_or(TransportError::Closed)?;
+            let generation = event.peer_generation.ok_or(TransportError::Malformed)?;
+            if generation > expected_generation {
+                return Err(TransportError::PeerReplaced);
+            }
+            if generation < expected_generation {
+                continue;
+            }
+            return match event.event {
+                TransportEvent::Input(payload) => Ok(payload),
+                TransportEvent::PeerDisconnected { .. } => Err(TransportError::PeerDisconnected),
+                _ => Err(TransportError::Malformed),
+            };
+        }
+    }
+
+    pub async fn next_closed_reason(&self) -> String {
+        match recv_lane(
+            &self.inner.events.closed,
+            &self.inner.events.active_peer_generation,
+        )
+        .await
+        {
+            Some(TransportEvent::Closed { reason }) => reason,
+            _ => "transport connection closed".to_owned(),
+        }
+    }
+
     pub async fn next_video_config(&self) -> Result<Vec<u8>, TransportError> {
-        receive_payload(&self.inner.events.video_config, |event| match event {
-            TransportEvent::VideoConfig(bytes) => Some(bytes),
-            _ => None,
-        })
+        receive_payload(
+            &self.inner.events.video_config,
+            &self.inner.events.active_peer_generation,
+            |event| match event {
+                TransportEvent::VideoConfig(bytes) => Some(bytes),
+                _ => None,
+            },
+        )
         .await
     }
 
     pub async fn next_video_datagram(&self) -> Result<Vec<u8>, TransportError> {
-        receive_payload(&self.inner.events.video_datagram, |event| match event {
-            TransportEvent::VideoDatagram(bytes) => Some(bytes),
-            _ => None,
-        })
+        receive_payload(
+            &self.inner.events.video_datagram,
+            &self.inner.events.active_peer_generation,
+            |event| match event {
+                TransportEvent::VideoDatagram(bytes) => Some(bytes),
+                _ => None,
+            },
+        )
         .await
     }
 
     pub async fn next_cursor_datagram(&self) -> Result<Vec<u8>, TransportError> {
-        receive_payload(&self.inner.events.cursor_datagram, |event| match event {
-            TransportEvent::CursorDatagram(bytes) => Some(bytes),
-            _ => None,
-        })
+        receive_payload(
+            &self.inner.events.cursor_datagram,
+            &self.inner.events.active_peer_generation,
+            |event| match event {
+                TransportEvent::CursorDatagram(bytes) => Some(bytes),
+                _ => None,
+            },
+        )
         .await
+    }
+
+    async fn next_current_control_event(&self) -> Result<InboundEvent, TransportError> {
+        if let Some(event) = self.inner.events.pending_control.lock().await.take()
+            && !event.peer_generation.is_some_and(|generation| {
+                generation
+                    != self
+                        .inner
+                        .events
+                        .active_peer_generation
+                        .load(Ordering::Acquire)
+            })
+        {
+            return Ok(event);
+        }
+        receive_current_inbound(
+            &self.inner.events.control,
+            &self.inner.events.active_peer_generation,
+        )
+        .await
+        .ok_or(TransportError::Closed)
     }
 
     async fn send_reliable(
         &self,
         channel: ChannelKind,
+        expected_generation: Option<u64>,
         bytes: Vec<u8>,
     ) -> Result<(), TransportError> {
         if bytes.len() > MAX_RELIABLE_MESSAGE_BYTES {
@@ -457,6 +654,22 @@ impl QuicClient {
             }
         };
         let mut stream = stream_lock.lock().await;
+        let active_generation = self.inner.active_peer_generation.load(Ordering::Acquire);
+        let peer_generation = expected_generation.unwrap_or(active_generation);
+        if expected_generation.is_some() && peer_generation != active_generation {
+            return Err(TransportError::PeerReplaced);
+        }
+        if let Some(outbound) = stream.as_mut() {
+            if outbound.peer_generation == 0 && peer_generation != 0 {
+                // Controllers open their first stream before the host has sent
+                // anything back, so generation zero means "the current peer"
+                // rather than an obsolete peer.
+                outbound.peer_generation = peer_generation;
+            } else if outbound.peer_generation != peer_generation {
+                let _ = outbound.stream.finish();
+                *stream = None;
+            }
+        }
         if stream.is_none() {
             let (mut send, _receive) = self
                 .inner
@@ -467,24 +680,42 @@ impl QuicClient {
             send.write_all(&[channel as u8])
                 .await
                 .map_err(map_write_error)?;
-            *stream = Some(send);
+            send.write_all(&peer_generation.to_be_bytes())
+                .await
+                .map_err(map_write_error)?;
+            *stream = Some(ReliableSendStream {
+                peer_generation,
+                stream: send,
+            });
         }
         let Some(outbound) = stream.as_mut() else {
             return Err(TransportError::Closed);
         };
+        if expected_generation.is_some()
+            && self.inner.active_peer_generation.load(Ordering::Acquire) != peer_generation
+        {
+            let _ = outbound.stream.finish();
+            *stream = None;
+            return Err(TransportError::PeerReplaced);
+        }
         let length = (bytes.len() as u32).to_be_bytes();
-        if let Err(error) = outbound.write_all(&length).await {
+        if let Err(error) = outbound.stream.write_all(&length).await {
             *stream = None;
             return Err(map_write_error(error));
         }
-        if let Err(error) = outbound.write_all(&bytes).await {
+        if let Err(error) = outbound.stream.write_all(&bytes).await {
             *stream = None;
             return Err(map_write_error(error));
         }
         Ok(())
     }
 
-    fn send_datagram(&self, channel: ChannelKind, bytes: Vec<u8>) -> Result<(), TransportError> {
+    fn send_datagram(
+        &self,
+        channel: ChannelKind,
+        expected_generation: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
         if bytes.len() > MAX_DATAGRAM_BYTES {
             return Err(TransportError::MessageTooLarge {
                 actual: bytes.len(),
@@ -492,8 +723,14 @@ impl QuicClient {
             });
         }
         self.ensure_joined()?;
-        let mut frame = Vec::with_capacity(bytes.len() + 1);
+        let active_generation = self.inner.active_peer_generation.load(Ordering::Acquire);
+        let peer_generation = expected_generation.unwrap_or(active_generation);
+        if expected_generation.is_some() && peer_generation != active_generation {
+            return Err(TransportError::PeerReplaced);
+        }
+        let mut frame = Vec::with_capacity(bytes.len() + 9);
         frame.push(channel as u8);
+        frame.extend_from_slice(&peer_generation.to_be_bytes());
         frame.extend_from_slice(&bytes);
         self.inner
             .connection
@@ -507,6 +744,13 @@ impl QuicClient {
         } else {
             Err(TransportError::NotJoined)
         }
+    }
+}
+
+async fn finish_reliable_stream(stream: &Mutex<Option<ReliableSendStream>>) {
+    let mut stream = stream.lock().await;
+    if let Some(mut stream) = stream.take() {
+        let _ = stream.stream.finish();
     }
 }
 
@@ -566,15 +810,39 @@ fn map_datagram_error(error: quinn::SendDatagramError) -> TransportError {
     }
 }
 
-async fn recv_lane(receiver: &Mutex<mpsc::Receiver<TransportEvent>>) -> Option<TransportEvent> {
-    receiver.lock().await.recv().await
+async fn recv_lane(
+    receiver: &Mutex<mpsc::Receiver<InboundEvent>>,
+    active_peer_generation: &AtomicU64,
+) -> Option<TransportEvent> {
+    receive_current_inbound(receiver, active_peer_generation)
+        .await
+        .map(|event| event.event)
+}
+
+async fn receive_current_inbound(
+    receiver: &Mutex<mpsc::Receiver<InboundEvent>>,
+    active_peer_generation: &AtomicU64,
+) -> Option<InboundEvent> {
+    let mut receiver = receiver.lock().await;
+    loop {
+        let event = receiver.recv().await?;
+        if event
+            .peer_generation
+            .is_some_and(|generation| generation != active_peer_generation.load(Ordering::Acquire))
+        {
+            continue;
+        }
+        return Some(event);
+    }
 }
 
 async fn receive_payload(
-    receiver: &Mutex<mpsc::Receiver<TransportEvent>>,
+    receiver: &Mutex<mpsc::Receiver<InboundEvent>>,
+    active_peer_generation: &AtomicU64,
     project: fn(TransportEvent) -> Option<Vec<u8>>,
 ) -> Result<Vec<u8>, TransportError> {
-    match recv_lane(receiver).await {
+    match recv_lane(receiver, active_peer_generation).await {
+        Some(TransportEvent::PeerDisconnected { .. }) => Err(TransportError::PeerDisconnected),
         Some(event) => project(event).ok_or(TransportError::Malformed),
         None => Err(TransportError::Closed),
     }
@@ -598,7 +866,12 @@ async fn read_connection(connection: quinn::Connection, events: InboundSenders) 
                 };
                 match decode_datagram(datagram.as_ref()) {
                     Ok(event) => {
-                        let sender = match &event {
+                        if let Some(peer_generation) = event.peer_generation {
+                            events
+                                .active_peer_generation
+                                .fetch_max(peer_generation, Ordering::AcqRel);
+                        }
+                        let sender = match &event.event {
                             TransportEvent::VideoDatagram(_) => &events.video_datagram,
                             TransportEvent::CursorDatagram(_) => &events.cursor_datagram,
                             _ => unreachable!(),
@@ -623,9 +896,12 @@ async fn read_connection(connection: quinn::Connection, events: InboundSenders) 
     }
 }
 
-fn emit_closed(events: &mpsc::Sender<TransportEvent>, reason: impl Into<String>) {
-    let _ = events.try_send(TransportEvent::Closed {
-        reason: reason.into(),
+fn emit_closed(events: &mpsc::Sender<InboundEvent>, reason: impl Into<String>) {
+    let _ = events.try_send(InboundEvent {
+        peer_generation: None,
+        event: TransportEvent::Closed {
+            reason: reason.into(),
+        },
     });
 }
 
@@ -634,8 +910,8 @@ async fn read_reliable_stream(
     mut receive: quinn::RecvStream,
     events: InboundSenders,
 ) {
-    let mut channel = [0; 1];
-    match receive.read_exact(&mut channel).await {
+    let mut header = [0; 9];
+    match receive.read_exact(&mut header).await {
         Ok(()) => {}
         Err(quinn::ReadExactError::FinishedEarly(0)) => {
             let _ = receive.stop(quinn::VarInt::from_u32(1));
@@ -648,7 +924,7 @@ async fn read_reliable_stream(
             return;
         }
     }
-    let Ok(channel) = ChannelKind::try_from(channel[0]) else {
+    let Ok(channel) = ChannelKind::try_from(header[0]) else {
         let _ = receive.stop(quinn::VarInt::from_u32(1));
         connection.close(quinn::VarInt::from_u32(3), b"unknown reliable channel");
         emit_closed(&events.closed, "unknown reliable channel");
@@ -660,6 +936,20 @@ async fn read_reliable_stream(
         emit_closed(&events.closed, "invalid reliable channel");
         return;
     }
+    let peer_generation = u64::from_be_bytes(
+        header[1..]
+            .try_into()
+            .expect("reliable generation header has a fixed length"),
+    );
+    if peer_generation == 0 {
+        let _ = receive.stop(quinn::VarInt::from_u32(1));
+        connection.close(quinn::VarInt::from_u32(3), b"invalid peer generation");
+        emit_closed(&events.closed, "invalid peer generation");
+        return;
+    }
+    events
+        .active_peer_generation
+        .fetch_max(peer_generation, Ordering::AcqRel);
     let sender = match channel {
         ChannelKind::Control => events.control,
         ChannelKind::Input => events.input,
@@ -671,7 +961,15 @@ async fn read_reliable_stream(
         let mut length = [0; 4];
         match receive.read_exact(&mut length).await {
             Ok(()) => {}
-            Err(quinn::ReadExactError::FinishedEarly(0)) if message_seen => return,
+            Err(quinn::ReadExactError::FinishedEarly(0)) if message_seen => {
+                let _ = sender
+                    .send(InboundEvent {
+                        peer_generation: Some(peer_generation),
+                        event: TransportEvent::PeerDisconnected { channel },
+                    })
+                    .await;
+                return;
+            }
             Err(_) => {
                 let _ = receive.stop(quinn::VarInt::from_u32(1));
                 emit_closed(&events.closed, "malformed reliable message");
@@ -700,21 +998,36 @@ async fn read_reliable_stream(
             ChannelKind::VideoConfig => TransportEvent::VideoConfig(bytes),
             ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => unreachable!(),
         };
-        if sender.send(event).await.is_err() {
+        if sender
+            .send(InboundEvent {
+                peer_generation: Some(peer_generation),
+                event,
+            })
+            .await
+            .is_err()
+        {
             return;
         }
         message_seen = true;
     }
 }
 
-fn decode_datagram(bytes: &[u8]) -> Result<TransportEvent, ()> {
-    if bytes.is_empty() || bytes.len() - 1 > MAX_DATAGRAM_BYTES {
+fn decode_datagram(bytes: &[u8]) -> Result<InboundEvent, ()> {
+    if bytes.len() < 9 || bytes.len() - 9 > MAX_DATAGRAM_BYTES {
         return Err(());
     }
-    let payload = bytes[1..].to_vec();
-    match ChannelKind::try_from(bytes[0]) {
-        Ok(ChannelKind::VideoDatagram) => Ok(TransportEvent::VideoDatagram(payload)),
-        Ok(ChannelKind::CursorDatagram) => Ok(TransportEvent::CursorDatagram(payload)),
-        _ => Err(()),
+    let peer_generation = u64::from_be_bytes(bytes[1..9].try_into().map_err(|_| ())?);
+    if peer_generation == 0 {
+        return Err(());
     }
+    let payload = bytes[9..].to_vec();
+    let event = match ChannelKind::try_from(bytes[0]) {
+        Ok(ChannelKind::VideoDatagram) => TransportEvent::VideoDatagram(payload),
+        Ok(ChannelKind::CursorDatagram) => TransportEvent::CursorDatagram(payload),
+        _ => return Err(()),
+    };
+    Ok(InboundEvent {
+        peer_generation: Some(peer_generation),
+        event,
+    })
 }

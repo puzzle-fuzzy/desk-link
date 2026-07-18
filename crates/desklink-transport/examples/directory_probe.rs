@@ -69,8 +69,50 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(io::Error::other("directory lookup returned a different invitation").into());
     }
 
+    // A successful directory response alone does not prove that an actual remote-control
+    // session can exchange messages in both directions. Exercise the exact join and reliable
+    // control lane used by the Windows host and controller so production relay regressions are
+    // caught before an installer is handed to users.
+    let controller =
+        QuicClient::connect(QuicClientConfig::new(relay_address, server_name.clone())?).await?;
+    controller
+        .join(RelayJoin::controller_with_participant(
+            SessionId::from_bytes(nonce_bytes),
+            authentication,
+            [0x5a; 16],
+        ))
+        .await?;
+    controller
+        .send_control(b"controller-hello".to_vec())
+        .await?;
+    let controller_hello =
+        tokio::time::timeout(std::time::Duration::from_secs(5), host.next_control())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "controller-to-host relay timed out",
+                )
+            })??;
+    if controller_hello != b"controller-hello" {
+        return Err(io::Error::other("controller-to-host relay payload changed").into());
+    }
+    host.send_control(b"host-hello".to_vec()).await?;
+    let host_hello =
+        tokio::time::timeout(std::time::Duration::from_secs(5), controller.next_control())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "host-to-controller relay timed out",
+                )
+            })??;
+    if host_hello != b"host-hello" {
+        return Err(io::Error::other("host-to-controller relay payload changed").into());
+    }
+
     println!(
-        "DeskLink relay directory probe passed: {relay_address} ({server_name}) in {} ms",
+        "DeskLink relay directory and bidirectional control probe passed: {relay_address} ({server_name}) in {} ms",
         started.elapsed().as_millis().max(1)
     );
     Ok(())

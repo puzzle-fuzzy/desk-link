@@ -333,6 +333,196 @@ async fn same_controller_identity_replaces_its_stale_connection_without_waiting_
 }
 
 #[tokio::test]
+async fn controller_disconnect_keeps_host_online_and_rebinds_reliable_lanes() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(25);
+    let host_id = [11; 16];
+    let controller_id = [12; 16];
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(RelayJoin::host_with_participant(
+            session_id, [6; 32], host_id,
+        ))
+        .await
+        .unwrap();
+    let first_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    first_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            [6; 32],
+            controller_id,
+        ))
+        .await
+        .unwrap();
+
+    // Open and use both cached control streams before simulating an interrupted controller.
+    first_controller
+        .send_control(b"first-controller".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&host_client).await,
+        TransportEvent::Control(b"first-controller".to_vec())
+    );
+    host_client
+        .send_control(b"first-host".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&first_controller).await,
+        TransportEvent::Control(b"first-host".to_vec())
+    );
+    drop(first_controller);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resumed_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    resumed_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            [6; 32],
+            controller_id,
+        ))
+        .await
+        .unwrap();
+
+    // A delayed host response still sitting on the old controller's source
+    // stream must not be replayed into the replacement controller.
+    host_client
+        .send_control(b"stale-first-host".to_vec())
+        .await
+        .unwrap();
+    host_client
+        .send_control(b"stale-second-host".to_vec())
+        .await
+        .unwrap();
+    host_client
+        .send_video_datagram(b"stale-host-video".to_vec())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), resumed_controller.next_event())
+            .await
+            .is_err(),
+        "replacement controller received reliable or datagram ciphertext from the old peer generation"
+    );
+
+    let disconnected = tokio::time::timeout(Duration::from_secs(2), host_client.next_event())
+        .await
+        .expect("the host did not observe its controller disconnect")
+        .expect("the host transport unexpectedly closed");
+    assert_eq!(
+        disconnected,
+        TransportEvent::PeerDisconnected {
+            channel: desklink_transport::ChannelKind::Control
+        }
+    );
+    host_client.reset_reliable_channels().await;
+
+    resumed_controller
+        .send_control(b"resumed-controller".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&host_client).await,
+        TransportEvent::Control(b"resumed-controller".to_vec())
+    );
+    host_client
+        .send_control(b"resumed-host".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&resumed_controller).await,
+        TransportEvent::Control(b"resumed-host".to_vec())
+    );
+    host_client
+        .send_video_datagram(b"resumed-host-video".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&resumed_controller).await,
+        TransportEvent::VideoDatagram(b"resumed-host-video".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn replacement_controller_supersedes_stale_disconnect_and_rotates_host_stream() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(26);
+    let host_id = [13; 16];
+    let controller_id = [14; 16];
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(RelayJoin::host_with_participant(
+            session_id, [7; 32], host_id,
+        ))
+        .await
+        .unwrap();
+    let first_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    first_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            [7; 32],
+            controller_id,
+        ))
+        .await
+        .unwrap();
+
+    first_controller
+        .send_control(b"first-controller".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&host_client).await,
+        TransportEvent::Control(b"first-controller".to_vec())
+    );
+    host_client
+        .send_control(b"first-host".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&first_controller).await,
+        TransportEvent::Control(b"first-host".to_vec())
+    );
+    drop(first_controller);
+
+    let resumed_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    resumed_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            [7; 32],
+            controller_id,
+        ))
+        .await
+        .unwrap();
+    resumed_controller
+        .send_control(b"resumed-controller".to_vec())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(
+        next_event(&host_client).await,
+        TransportEvent::Control(b"resumed-controller".to_vec()),
+        "the old stream's disconnect must not terminate the replacement handshake"
+    );
+    host_client
+        .send_control(b"resumed-host".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&resumed_controller).await,
+        TransportEvent::Control(b"resumed-host".to_vec()),
+        "the host must automatically rotate its cached stream to the new controller generation"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), host_client.next_event())
+            .await
+            .is_err(),
+        "a stale disconnect escaped the transport generation filter"
+    );
+}
+
+#[tokio::test]
 async fn relay_enforces_connection_and_session_admission_caps() {
     let connection_limited = spawn_test_relay_with_config(RelayConfig {
         max_connections: 1,
@@ -580,6 +770,7 @@ async fn malformed_reliable_stream_is_closed_without_allocating_an_oversized_mes
 
     let (mut send, _receive) = host_connection.open_bi().await.unwrap();
     send.write_all(&[1]).await.unwrap();
+    send.write_all(&0_u64.to_be_bytes()).await.unwrap();
     send.write_all(&((MAX_RELIABLE_MESSAGE_BYTES as u32) + 1).to_be_bytes())
         .await
         .unwrap();
@@ -600,7 +791,7 @@ async fn malformed_datagram_channel_is_closed_without_payload_inspection() {
         .unwrap();
 
     host_connection
-        .send_datagram(bytes::Bytes::from_static(&[99, 0]))
+        .send_datagram(bytes::Bytes::from_static(&[99, 0, 0, 0, 0, 0, 0, 0, 0]))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), host_connection.closed())
         .await

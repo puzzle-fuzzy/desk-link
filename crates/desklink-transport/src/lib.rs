@@ -530,6 +530,7 @@ pub enum TransportEvent {
     VideoConfig(Vec<u8>),
     VideoDatagram(Vec<u8>),
     CursorDatagram(Vec<u8>),
+    PeerDisconnected { channel: ChannelKind },
     Closed { reason: String },
 }
 
@@ -558,6 +559,10 @@ pub enum TransportError {
     Datagram(String),
     #[error("transport connection closed")]
     Closed,
+    #[error("the remote session peer disconnected")]
+    PeerDisconnected,
+    #[error("the remote session peer was replaced by a newer connection")]
+    PeerReplaced,
     #[error("device is offline or the temporary password is incorrect")]
     DirectoryNotFound,
     #[error("too many device lookup attempts; try again later")]
