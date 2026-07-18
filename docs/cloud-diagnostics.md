@@ -55,3 +55,9 @@ sudo -u desklink-diagnostics env DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink
 ```
 
 服务器每小时生成一次滚动 24 小时健康报告，文件为 `/var/lib/desklink-diagnostics/health-report.json`，权限仅限诊断服务账户和 root。任一错误会要求关注；没有错误但达到三个警告会话时同样标记 `requires_attention: true`。报告最多保留最近 100 个异常会话，不公开到网站。
+
+本地已加载 SSH 密钥时，可以只读取基础设施状态和聚合计数，不下载异常会话明细：
+
+```text
+python scripts/audit-managed-diagnostics.py
+```
