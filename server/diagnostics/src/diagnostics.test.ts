@@ -53,6 +53,43 @@ describe("signed diagnostic ingestion", () => {
     });
     expect(() => verifyBatch(secret.body, secret.headers, secret.now)).toThrow("diagnostic text field reason is unsafe");
   });
+
+  test("accepts bounded renderer and input queue metrics", () => {
+    const now = Date.now();
+    const fixture = signedFixture({
+      events: [
+        eventFixture({
+          event: "controller_render_metrics",
+          level: "info",
+          stream_id: 4,
+          received_frames: 90,
+          submitted_frames: 88,
+          displayed_frames: 86,
+          malformed_frames: 1,
+          decoder_recoveries: 1,
+          first_frame_ms: 620,
+        }, now),
+        eventFixture({
+          event: "controller_video_metrics",
+          level: "info",
+          received_video_packets: 220,
+          dropped_video_packets: 2,
+          completed_frames: 90,
+          input_backpressure_count: 0,
+        }, now + 1),
+      ],
+    });
+    const verified = verifyBatch(fixture.body, fixture.headers, fixture.now);
+    expect(verified.batch.events[0]).toMatchObject({
+      event: "controller_render_metrics",
+      displayed_frames: 86,
+      first_frame_ms: 620,
+    });
+    expect(verified.batch.events[1]).toMatchObject({
+      event: "controller_video_metrics",
+      input_backpressure_count: 0,
+    });
+  });
 });
 
 function signedFixture(overrides: Record<string, unknown> = {}) {

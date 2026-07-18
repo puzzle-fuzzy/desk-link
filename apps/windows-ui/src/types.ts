@@ -200,6 +200,16 @@ export interface ControllerInput {
   modifiers?: number;
 }
 
+export interface ControllerRenderMetrics {
+  streamId: number;
+  receivedFrames: number;
+  submittedFrames: number;
+  displayedFrames: number;
+  malformedFrames: number;
+  decoderRecoveries: number;
+  firstFrameMs: number | null;
+}
+
 export interface ControllerVideoConfigSignal {
   kind: "videoConfig";
   streamId: number;

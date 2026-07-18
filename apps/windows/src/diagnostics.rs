@@ -112,6 +112,16 @@ pub enum DiagnosticEvent {
         received_video_packets: u64,
         dropped_video_packets: u64,
         completed_frames: u64,
+        input_backpressure_count: u64,
+    },
+    ControllerRenderMetrics {
+        stream_id: u64,
+        received_frames: u64,
+        submitted_frames: u64,
+        displayed_frames: u64,
+        malformed_frames: u64,
+        decoder_recoveries: u32,
+        first_frame_ms: Option<u64>,
     },
 }
 
@@ -362,9 +372,25 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             received_video_packets,
             dropped_video_packets,
             completed_frames,
+            input_backpressure_count,
         } => format!(
-            "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt},\"received_video_packets\":{received_video_packets},\"dropped_video_packets\":{dropped_video_packets},\"completed_frames\":{completed_frames}"
+            "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt},\"received_video_packets\":{received_video_packets},\"dropped_video_packets\":{dropped_video_packets},\"completed_frames\":{completed_frames},\"input_backpressure_count\":{input_backpressure_count}"
         ),
+        DiagnosticEvent::ControllerRenderMetrics {
+            stream_id,
+            received_frames,
+            submitted_frames,
+            displayed_frames,
+            malformed_frames,
+            decoder_recoveries,
+            first_frame_ms,
+        } => {
+            let first_frame_ms = first_frame_ms
+                .map_or_else(String::new, |value| format!(",\"first_frame_ms\":{value}"));
+            format!(
+                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries}{first_frame_ms}"
+            )
+        }
     };
     format!("{{\"schema\":1,\"timestamp_unix_ms\":{timestamp_unix_ms},{fields}}}\n")
 }
@@ -618,6 +644,7 @@ mod tests {
                 received_video_packets: 1_200,
                 dropped_video_packets: 4,
                 completed_frames: 87,
+                input_backpressure_count: 3,
             })
             .unwrap();
 
@@ -626,6 +653,32 @@ mod tests {
         assert!(contents.contains("\"received_video_packets\":1200"));
         assert!(contents.contains("\"dropped_video_packets\":4"));
         assert!(contents.contains("\"completed_frames\":87"));
+        assert!(contents.contains("\"input_backpressure_count\":3"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn controller_render_metrics_separate_received_decoded_and_displayed_frames() {
+        let path = temporary_log_path("controller-render");
+        let logger = DiagnosticLog::new(&path);
+        logger
+            .record(&DiagnosticEvent::ControllerRenderMetrics {
+                stream_id: 7,
+                received_frames: 90,
+                submitted_frames: 86,
+                displayed_frames: 82,
+                malformed_frames: 1,
+                decoder_recoveries: 2,
+                first_frame_ms: Some(740),
+            })
+            .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"event\":\"controller_render_metrics\""));
+        assert!(contents.contains("\"stream_id\":7"));
+        assert!(contents.contains("\"displayed_frames\":82"));
+        assert!(contents.contains("\"decoder_recoveries\":2"));
+        assert!(contents.contains("\"first_frame_ms\":740"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

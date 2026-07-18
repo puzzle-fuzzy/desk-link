@@ -56,6 +56,8 @@ sudo -u desklink-diagnostics env DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink
 
 服务器每小时生成一次滚动 24 小时健康报告，文件为 `/var/lib/desklink-diagnostics/health-report.json`，权限仅限诊断服务账户和 root。任一错误会要求关注；没有错误但达到三个警告会话时同样标记 `requires_attention: true`。报告最多保留最近 100 个异常会话，不公开到网站。
 
+Windows 控制端会分别记录传输完成帧、前端收到帧、实际显示帧、首帧耗时、解码器恢复次数和输入队列等待次数。所有字段都是计数或耗时，不包含画面、键盘内容、设备密码或完整设备身份；服务器据此区分采集失败、传输失败、控制端黑屏、解码不稳定和输入拥塞。
+
 本地已加载 SSH 密钥时，可以只读取基础设施状态和聚合计数，不下载异常会话明细：
 
 ```text

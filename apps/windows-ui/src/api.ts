@@ -4,6 +4,7 @@ import type {
   ConnectionSettingsInput,
   ControllerDeviceInput,
   ControllerInput,
+  ControllerRenderMetrics,
   ControllerSignal,
   ControllerSnapshot,
   DiagnosticExportResult,
@@ -153,6 +154,10 @@ export function sendControllerText(text: string): Promise<void> {
 
 export function requestControllerKeyframe(): Promise<void> {
   return invoke<void>("request_controller_keyframe");
+}
+
+export function reportControllerRenderMetrics(metrics: ControllerRenderMetrics): Promise<void> {
+  return invoke<void>("report_controller_render_metrics", { metrics });
 }
 
 export function openGithubRepository(): Promise<void> {

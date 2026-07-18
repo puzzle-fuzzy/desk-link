@@ -20,7 +20,11 @@ export interface SessionFinding {
     | "reconnect_oscillation"
     | "approval_incomplete"
     | "no_completed_frame"
+    | "no_displayed_frame"
     | "high_video_loss"
+    | "decoder_instability"
+    | "input_backpressure"
+    | "slow_first_frame"
     | "incomplete_evidence";
   severity: FindingSeverity;
   title: string;
@@ -42,6 +46,15 @@ export interface SessionAnalysis {
     dropped_packets: number;
     completed_frames: number;
     loss_percent: number | null;
+    input_backpressure_count: number;
+  };
+  render: {
+    received_frames: number;
+    submitted_frames: number;
+    displayed_frames: number;
+    malformed_frames: number;
+    decoder_recoveries: number;
+    first_frame_ms: number | null;
   };
   stop_reason_kinds: string[];
   outcome: "healthy" | "warning" | "error" | "incomplete";
@@ -73,11 +86,25 @@ interface VideoAttempt {
   received: number;
   dropped: number;
   completed: number;
+  inputBackpressure: number;
+}
+
+interface RenderStream {
+  received: number;
+  submitted: number;
+  displayed: number;
+  malformed: number;
+  recoveries: number;
+  firstFrameMs: number | null;
+  samples: number;
 }
 
 const OSCILLATION_RETRY_COUNT = 4;
 const HIGH_LOSS_MINIMUM_PACKETS = 100;
 const HIGH_LOSS_PERCENT = 10;
+const DECODER_RECOVERY_WARNING = 3;
+const INPUT_BACKPRESSURE_WARNING = 5;
+const SLOW_FIRST_FRAME_MS = 5_000;
 const STALE_SESSION_MS = 2 * 60 * 1_000;
 
 export function analyzeDiagnosticRows(
@@ -141,13 +168,27 @@ function analyzeSession(
   const controllerStopped = events.filter((event) => event.event === "controller_stopped");
   const hostStopped = events.filter((event) => event.event === "host_stopped");
   const videoAttempts = videoByAttempt(events);
+  const renderStreams = renderByStream(events);
   const video = [...videoAttempts.values()].reduce(
     (total, attempt) => ({
       received: total.received + attempt.received,
       dropped: total.dropped + attempt.dropped,
       completed: total.completed + attempt.completed,
+      inputBackpressure: total.inputBackpressure + attempt.inputBackpressure,
     }),
-    { received: 0, dropped: 0, completed: 0 },
+    { received: 0, dropped: 0, completed: 0, inputBackpressure: 0 },
+  );
+  const render = [...renderStreams.values()].reduce(
+    (total, stream) => ({
+      received: total.received + stream.received,
+      submitted: total.submitted + stream.submitted,
+      displayed: total.displayed + stream.displayed,
+      malformed: total.malformed + stream.malformed,
+      recoveries: total.recoveries + stream.recoveries,
+      firstFrameMs: maximumOptional(total.firstFrameMs, stream.firstFrameMs),
+      samples: total.samples + stream.samples,
+    }),
+    { received: 0, submitted: 0, displayed: 0, malformed: 0, recoveries: 0, firstFrameMs: null as number | null, samples: 0 },
   );
   const packetTotal = video.received + video.dropped;
   const lossPercent = packetTotal > 0 ? roundPercent(video.dropped, packetTotal) : null;
@@ -206,6 +247,14 @@ function analyzeSession(
         : "连接已建立但没有收到可组成画面的媒体数据，优先检查主机采集与编码。",
     });
   }
+  if (video.completed > 0 && render.received > 0 && render.displayed === 0 && render.samples >= 2) {
+    findings.push({
+      code: "no_displayed_frame",
+      severity: "error",
+      title: "控制端没有显示远程画面",
+      detail: `传输端已完成 ${video.completed} 帧、界面已收到 ${render.received} 帧，但连续诊断仍未显示画面。`,
+    });
+  }
   if (packetTotal >= HIGH_LOSS_MINIMUM_PACKETS && lossPercent !== null && lossPercent >= HIGH_LOSS_PERCENT) {
     findings.push({
       code: "high_video_loss",
@@ -214,8 +263,37 @@ function analyzeSession(
       detail: `累计视频丢包率为 ${lossPercent.toFixed(1)}%，超过 ${HIGH_LOSS_PERCENT}% 阈值。`,
     });
   }
+  if (render.recoveries >= DECODER_RECOVERY_WARNING || render.malformed >= 60) {
+    findings.push({
+      code: "decoder_instability",
+      severity: "warning",
+      title: "本机视频解码不稳定",
+      detail: `解码器恢复 ${render.recoveries} 次，异常视频帧 ${render.malformed} 个。`,
+    });
+  }
+  if (video.inputBackpressure >= INPUT_BACKPRESSURE_WARNING) {
+    findings.push({
+      code: "input_backpressure",
+      severity: "warning",
+      title: "远程输入队列出现拥塞",
+      detail: `输入队列累计等待 ${video.inputBackpressure} 次，需要检查控制事件频率或控制通道延迟。`,
+    });
+  }
+  if (render.firstFrameMs !== null && render.firstFrameMs >= SLOW_FIRST_FRAME_MS) {
+    findings.push({
+      code: "slow_first_frame",
+      severity: "warning",
+      title: "远程画面首帧较慢",
+      detail: `从收到视频配置到显示第一帧耗时 ${render.firstFrameMs} 毫秒。`,
+    });
+  }
 
-  if (connectedCount > 0 && video.completed > 0 && !findings.some(isAlertFinding)) {
+  if (
+    connectedCount > 0
+    && video.completed > 0
+    && (render.samples === 0 || render.displayed > 0)
+    && !findings.some(isAlertFinding)
+  ) {
     findings.push({
       code: "healthy_video",
       severity: "info",
@@ -255,6 +333,15 @@ function analyzeSession(
       dropped_packets: video.dropped,
       completed_frames: video.completed,
       loss_percent: lossPercent,
+      input_backpressure_count: video.inputBackpressure,
+    },
+    render: {
+      received_frames: render.received,
+      submitted_frames: render.submitted,
+      displayed_frames: render.displayed,
+      malformed_frames: render.malformed,
+      decoder_recoveries: render.recoveries,
+      first_frame_ms: render.firstFrameMs,
     },
     stop_reason_kinds: [...new Set(stopReasonKinds)].sort(),
     outcome,
@@ -267,14 +354,51 @@ function videoByAttempt(events: ParsedEvent[]): Map<number, VideoAttempt> {
   for (const event of events) {
     if (event.event !== "controller_video_metrics") continue;
     const attemptId = safeInteger(event.payload.attempt) ?? 0;
-    const current = attempts.get(attemptId) ?? { received: 0, dropped: 0, completed: 0 };
+    const current = attempts.get(attemptId) ?? { received: 0, dropped: 0, completed: 0, inputBackpressure: 0 };
     attempts.set(attemptId, {
       received: Math.max(current.received, safeInteger(event.payload.received_video_packets) ?? 0),
       dropped: Math.max(current.dropped, safeInteger(event.payload.dropped_video_packets) ?? 0),
       completed: Math.max(current.completed, safeInteger(event.payload.completed_frames) ?? 0),
+      inputBackpressure: Math.max(
+        current.inputBackpressure,
+        safeInteger(event.payload.input_backpressure_count) ?? 0,
+      ),
     });
   }
   return attempts;
+}
+
+function renderByStream(events: ParsedEvent[]): Map<number, RenderStream> {
+  const streams = new Map<number, RenderStream>();
+  for (const event of events) {
+    if (event.event !== "controller_render_metrics") continue;
+    const streamId = safeInteger(event.payload.stream_id) ?? 0;
+    const current = streams.get(streamId) ?? {
+      received: 0,
+      submitted: 0,
+      displayed: 0,
+      malformed: 0,
+      recoveries: 0,
+      firstFrameMs: null,
+      samples: 0,
+    };
+    streams.set(streamId, {
+      received: Math.max(current.received, safeInteger(event.payload.received_frames) ?? 0),
+      submitted: Math.max(current.submitted, safeInteger(event.payload.submitted_frames) ?? 0),
+      displayed: Math.max(current.displayed, safeInteger(event.payload.displayed_frames) ?? 0),
+      malformed: Math.max(current.malformed, safeInteger(event.payload.malformed_frames) ?? 0),
+      recoveries: Math.max(current.recoveries, safeInteger(event.payload.decoder_recoveries) ?? 0),
+      firstFrameMs: maximumOptional(current.firstFrameMs, safeInteger(event.payload.first_frame_ms)),
+      samples: current.samples + 1,
+    });
+  }
+  return streams;
+}
+
+function maximumOptional(left: number | null, right: number | null): number | null {
+  if (left === null) return right;
+  if (right === null) return left;
+  return Math.max(left, right);
 }
 
 function parsePayload(value: string): Record<string, unknown> {

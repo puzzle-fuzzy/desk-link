@@ -21,6 +21,15 @@ describe("correlated diagnostic analysis", () => {
         dropped_video_packets: 3,
         completed_frames: 110,
       }),
+      event("controller_render_metrics", 20_100, {
+        stream_id: 2,
+        received_frames: 110,
+        submitted_frames: 108,
+        displayed_frames: 105,
+        malformed_frames: 0,
+        decoder_recoveries: 1,
+        first_frame_ms: 740,
+      }),
     ];
     const report = analyzeDiagnosticRows(rows, 24, NOW);
     expect(report.summary).toMatchObject({ sessions: 1, healthy: 1, warning: 0, error: 0 });
@@ -29,6 +38,15 @@ describe("correlated diagnostic analysis", () => {
       dropped_packets: 3,
       completed_frames: 110,
       loss_percent: 1.35,
+      input_backpressure_count: 0,
+    });
+    expect(report.sessions[0]?.render).toEqual({
+      received_frames: 110,
+      submitted_frames: 108,
+      displayed_frames: 105,
+      malformed_frames: 0,
+      decoder_recoveries: 1,
+      first_frame_ms: 740,
     });
     expect(report.sessions[0]?.findings[0]?.code).toBe("healthy_video");
   });
@@ -69,6 +87,68 @@ describe("correlated diagnostic analysis", () => {
     const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
     expect(session.outcome).toBe("warning");
     expect(session.findings.map((finding) => finding.code)).toEqual(["approval_incomplete"]);
+  });
+
+  test("separates renderer failure, decoder recovery and input congestion", () => {
+    const rows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 10_000, {
+        attempt: 1,
+        received_video_packets: 200,
+        dropped_video_packets: 0,
+        completed_frames: 80,
+        input_backpressure_count: 7,
+      }),
+      event("controller_render_metrics", 10_100, {
+        stream_id: 1,
+        received_frames: 40,
+        submitted_frames: 38,
+        displayed_frames: 0,
+        malformed_frames: 0,
+        decoder_recoveries: 1,
+      }),
+      event("controller_render_metrics", 20_100, {
+        stream_id: 1,
+        received_frames: 80,
+        submitted_frames: 76,
+        displayed_frames: 0,
+        malformed_frames: 2,
+        decoder_recoveries: 3,
+      }),
+    ];
+    const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
+    expect(session.outcome).toBe("error");
+    expect(session.findings.map((finding) => finding.code)).toEqual([
+      "no_displayed_frame",
+      "decoder_instability",
+      "input_backpressure",
+    ]);
+    expect(session.render.displayed_frames).toBe(0);
+    expect(session.video.input_backpressure_count).toBe(7);
+  });
+
+  test("flags a slow first displayed frame without calling the session broken", () => {
+    const rows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 10_000, {
+        attempt: 1,
+        received_video_packets: 100,
+        dropped_video_packets: 0,
+        completed_frames: 40,
+      }),
+      event("controller_render_metrics", 10_100, {
+        stream_id: 1,
+        received_frames: 40,
+        submitted_frames: 40,
+        displayed_frames: 38,
+        malformed_frames: 0,
+        decoder_recoveries: 0,
+        first_frame_ms: 6_200,
+      }),
+    ];
+    const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
+    expect(session.outcome).toBe("warning");
+    expect(session.findings.map((finding) => finding.code)).toEqual(["slow_first_frame"]);
   });
 
   test("keeps uncorrelated rows out of session conclusions", () => {

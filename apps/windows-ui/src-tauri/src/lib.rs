@@ -47,8 +47,8 @@ use apps_windows::{
     window::WindowsLocalApprovalDialog,
 };
 use controller::{
-    ControllerDeviceInput, ControllerInput, ControllerManager, ControllerSignal,
-    ControllerSnapshot, SavedDeviceInput, SavedDeviceRenameInput,
+    ControllerDeviceInput, ControllerInput, ControllerManager, ControllerRenderMetrics,
+    ControllerSignal, ControllerSnapshot, SavedDeviceInput, SavedDeviceRenameInput,
 };
 use host::{HostApprovalSummary, HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
 use rand_core::{OsRng, RngCore};
@@ -394,6 +394,14 @@ async fn send_controller_text(
 #[tauri::command]
 async fn request_controller_keyframe(manager: State<'_, ControllerManager>) -> Result<(), String> {
     manager.request_keyframe().await
+}
+
+#[tauri::command]
+fn report_controller_render_metrics(
+    manager: State<'_, ControllerManager>,
+    metrics: ControllerRenderMetrics,
+) -> Result<(), String> {
+    manager.record_render_metrics(metrics)
 }
 
 #[tauri::command]
@@ -1234,6 +1242,7 @@ pub fn run() {
             send_controller_input,
             send_controller_text,
             request_controller_keyframe,
+            report_controller_render_metrics,
             open_github_repository,
             select_controller_display,
             disconnect_controller,

@@ -280,6 +280,18 @@ pub struct ControllerDisplaySummary {
     primary: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerRenderMetrics {
+    stream_id: u64,
+    received_frames: u64,
+    submitted_frames: u64,
+    displayed_frames: u64,
+    malformed_frames: u64,
+    decoder_recoveries: u32,
+    first_frame_ms: Option<u64>,
+}
+
 enum ControllerCommand {
     Input(InputEvent),
     Text(String),
@@ -300,6 +312,7 @@ pub struct ControllerManager {
     operation_lock: Arc<AsyncMutex<()>>,
     operation_generation: Arc<AtomicU64>,
     recent_cancellation: Arc<Mutex<Option<Instant>>>,
+    input_backpressure_count: Arc<AtomicU64>,
 }
 
 impl Default for ControllerManager {
@@ -310,6 +323,7 @@ impl Default for ControllerManager {
             operation_lock: Arc::new(AsyncMutex::new(())),
             operation_generation: Arc::new(AtomicU64::new(0)),
             recent_cancellation: Arc::new(Mutex::new(None)),
+            input_backpressure_count: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -531,6 +545,7 @@ impl ControllerManager {
         self.ensure_current(generation)?;
         self.stop_current().await;
         self.ensure_current(generation)?;
+        self.input_backpressure_count.store(0, Ordering::Relaxed);
         self.publish_if_current(generation, &signals, ControllerRuntimeSummary::connecting());
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (cancellation, cancellation_receiver) = watch::channel(false);
@@ -591,10 +606,45 @@ impl ControllerManager {
         // silently discard a button/key release and leave the remote computer
         // with a logically stuck input state. The WebView dispatcher already
         // permits only one input IPC call in flight.
+        if matches!(&command, ControllerCommand::Input(_)) && commands.capacity() == 0 {
+            self.input_backpressure_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         commands
             .send(command)
             .await
             .map_err(|_| "远程控制会话已结束，无法继续发送输入。".to_owned())
+    }
+
+    pub fn record_render_metrics(&self, metrics: ControllerRenderMetrics) -> Result<(), String> {
+        let active_stream = self
+            .status
+            .lock()
+            .map_err(|_| "DeskLink 无法读取当前远程画面状态。".to_owned())?
+            .stream_id;
+        if active_stream != Some(metrics.stream_id) {
+            return Ok(());
+        }
+        if metrics.submitted_frames > metrics.received_frames
+            || metrics.displayed_frames > metrics.submitted_frames
+            || metrics
+                .first_frame_ms
+                .is_some_and(|value| value > 10 * 60 * 1_000)
+        {
+            return Err("远程画面指标无效。".to_owned());
+        }
+        DiagnosticLog::controller_for_current_user()
+            .map_err(|_| "DeskLink 无法打开控制端诊断记录。".to_owned())?
+            .record(&DiagnosticEvent::ControllerRenderMetrics {
+                stream_id: metrics.stream_id,
+                received_frames: metrics.received_frames,
+                submitted_frames: metrics.submitted_frames,
+                displayed_frames: metrics.displayed_frames,
+                malformed_frames: metrics.malformed_frames,
+                decoder_recoveries: metrics.decoder_recoveries,
+                first_frame_ms: metrics.first_frame_ms,
+            })
+            .map_err(|_| "DeskLink 无法记录远程画面指标。".to_owned())
     }
 
     pub async fn disconnect(&self) -> Result<ControllerSnapshot, String> {
@@ -1043,6 +1093,9 @@ async fn run_controller(
                             received_video_packets: metrics.received_video_packets,
                             dropped_video_packets: metrics.dropped_video_packets,
                             completed_frames: metrics.completed_frames,
+                            input_backpressure_count: manager
+                                .input_backpressure_count
+                                .load(Ordering::Relaxed),
                         });
                     }
                     last_diagnostic_metrics = Instant::now();

@@ -8,6 +8,7 @@ import {
   getControllerSnapshot,
   reconnectController,
   renameSavedDevice,
+  reportControllerRenderMetrics,
   requestControllerKeyframe,
   selectControllerDisplay,
   sendControllerInput,
@@ -77,6 +78,11 @@ let receivedVideoFrames = 0;
 let submittedVideoFrames = 0;
 let relayCompletedFrames = 0;
 let malformedVideoFrames = 0;
+let decoderRecoveries = 0;
+let consecutiveDecoderStalls = 0;
+let videoConfigReceivedAtMs: number | null = null;
+let firstFrameMs: number | null = null;
+let lastRenderMetricsReportedAtMs = 0;
 let pointerFrame: number | null = null;
 let remoteResizeObserver: ResizeObserver | null = null;
 let remoteCanvasBounds: DOMRectReadOnly | null = null;
@@ -96,6 +102,20 @@ let renameDeviceId: string | null = null;
 let renameDraft = "";
 let renameBusy = false;
 const inputDispatcher = new RemoteInputDispatcher(sendControllerInput);
+
+function resetVideoTelemetry(): void {
+  pendingVideoKeyframe = null;
+  receivedVideoFrames = 0;
+  submittedVideoFrames = 0;
+  relayCompletedFrames = 0;
+  malformedVideoFrames = 0;
+  decodedFrames = 0;
+  decoderRecoveries = 0;
+  consecutiveDecoderStalls = 0;
+  videoConfigReceivedAtMs = null;
+  firstFrameMs = null;
+  lastRenderMetricsReportedAtMs = 0;
+}
 
 export async function initializeController(renderer: RenderRequest): Promise<void> {
   requestRender = renderer;
@@ -611,12 +631,7 @@ async function beginConnection(
   attemptTarget = target;
   videoConfig = null;
   failedVideoConfig = null;
-  pendingVideoKeyframe = null;
-  receivedVideoFrames = 0;
-  submittedVideoFrames = 0;
-  relayCompletedFrames = 0;
-  malformedVideoFrames = 0;
-  decodedFrames = 0;
+  resetVideoTelemetry();
   prepareControllerRender();
   const generation = ++channelGeneration;
   const channels = createControllerChannels(
@@ -678,12 +693,7 @@ async function cancelConnection(): Promise<void> {
   cancelling = true;
   prepareControllerRender();
   videoConfig = null;
-  pendingVideoKeyframe = null;
-  receivedVideoFrames = 0;
-  submittedVideoFrames = 0;
-  relayCompletedFrames = 0;
-  malformedVideoFrames = 0;
-  decodedFrames = 0;
+  resetVideoTelemetry();
   activeChannels = null;
   feedback = { tone: "info", message: wasConnected ? "正在断开远程控制…" : "正在取消本次连接…" };
   requestRender();
@@ -809,12 +819,7 @@ function handleSignal(signal: ControllerSignal): void {
       if (signal.runtime.state !== "connected") {
         videoConfig = null;
         failedVideoConfig = null;
-        pendingVideoKeyframe = null;
-        receivedVideoFrames = 0;
-        submittedVideoFrames = 0;
-        relayCompletedFrames = 0;
-        malformedVideoFrames = 0;
-        decodedFrames = 0;
+        resetVideoTelemetry();
         remoteDisplays = [];
         activeRemoteDisplayId = null;
         pendingRemoteDisplayId = null;
@@ -833,12 +838,8 @@ function handleSignal(signal: ControllerSignal): void {
     case "videoConfig": {
       const changed = !videoConfig || videoConfigKey(videoConfig) !== videoConfigKey(signal);
       if (changed) {
-        decodedFrames = 0;
-        receivedVideoFrames = 0;
-        submittedVideoFrames = 0;
-        relayCompletedFrames = 0;
-        malformedVideoFrames = 0;
-        pendingVideoKeyframe = null;
+        resetVideoTelemetry();
+        videoConfigReceivedAtMs = Date.now();
       }
       videoConfig = signal;
       if (changed || !document.querySelector("[data-remote-canvas]")) {
@@ -869,6 +870,7 @@ function handleSignal(signal: ControllerSignal): void {
         element.textContent = `${videoConfig.width} × ${videoConfig.height} · 中继 ${signal.completedFrames} 帧 · 前端 ${receivedVideoFrames} 帧 · 显示 ${decodedFrames} 帧 · 丢包率 ${loss.toFixed(1)}%`;
       }
       updateVideoStartingMessage();
+      reportRenderMetrics();
       break;
     }
   }
@@ -1067,10 +1069,17 @@ function startVideoDecoder(
             }
             try {
               context.drawImage(nextFrame, 0, 0, canvas.width, canvas.height);
+              if (decodedFrames === 0 && videoConfigReceivedAtMs !== null) {
+                firstFrameMs = Math.max(0, Date.now() - videoConfigReceivedAtMs);
+              }
               decodedFrames += 1;
+              consecutiveDecoderStalls = 0;
               const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
               if (waiting) {
                 waiting.hidden = true;
+              }
+              if (decodedFrames === 1) {
+                reportRenderMetrics(true);
               }
             } catch {
               fallbackOrFailVideo(configKey, preference);
@@ -1119,6 +1128,9 @@ function armDecoderStallWatch(): void {
   const generation = decoderGeneration;
   const configKey = videoConfig ? videoConfigKey(videoConfig) : "";
   const preference = decoderPreference;
+  // Compare against the frame count at every arm. Keeping the original
+  // session baseline would only detect a stall before the first frame.
+  decoderRenderedBaseline = decodedFrames;
   decoderStallTimer = window.setTimeout(() => {
     decoderStallTimer = null;
     if (
@@ -1138,11 +1150,23 @@ function fallbackOrFailVideo(configKey: string, preference: "hardware" | "softwa
   if (decoderPreference !== preference) {
     return;
   }
+  decoderRecoveries += 1;
+  consecutiveDecoderStalls += 1;
+  reportRenderMetrics(true);
   if (preference === "hardware") {
     const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
     const context = canvas?.getContext("2d", { alpha: false });
     if (canvas && context) {
       decoderPreference = "software";
+      queueMicrotask(() => startVideoDecoder(canvas, context, configKey, "software"));
+      return;
+    }
+  }
+  if (consecutiveDecoderStalls <= 2) {
+    const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
+    const context = canvas?.getContext("2d", { alpha: false });
+    if (canvas && context) {
+      releaseVideoDecoder();
       queueMicrotask(() => startVideoDecoder(canvas, context, configKey, "software"));
       return;
     }
@@ -1155,6 +1179,28 @@ function fallbackOrFailVideo(configKey: string, preference: "hardware" | "softwa
       : "尚未收到远程视频画面，请刷新画面或重新连接主机。",
   };
   queueMicrotask(requestRender);
+}
+
+function reportRenderMetrics(force = false): void {
+  if (!videoConfig) {
+    return;
+  }
+  const now = Date.now();
+  if (!force && now - lastRenderMetricsReportedAtMs < 10_000) {
+    return;
+  }
+  lastRenderMetricsReportedAtMs = now;
+  void reportControllerRenderMetrics({
+    streamId: videoConfig.streamId,
+    receivedFrames: receivedVideoFrames,
+    submittedFrames: submittedVideoFrames,
+    displayedFrames: decodedFrames,
+    malformedFrames: malformedVideoFrames,
+    decoderRecoveries,
+    firstFrameMs,
+  }).catch(() => {
+    // Diagnostics must never interrupt a live remote-control session.
+  });
 }
 
 function clearDecoderStallTimer(): void {
