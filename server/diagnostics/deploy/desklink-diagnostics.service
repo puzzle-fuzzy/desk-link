@@ -11,7 +11,7 @@ WorkingDirectory=/opt/desklink-diagnostics/current
 Environment=DESKLINK_DIAGNOSTICS_ADDR=127.0.0.1
 Environment=DESKLINK_DIAGNOSTICS_PORT=3411
 Environment=DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink-diagnostics/diagnostics.sqlite
-ExecStart=/usr/local/bin/bun run src/index.ts
+ExecStart=/opt/desklink-diagnostics/bin/bun run src/index.ts
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true

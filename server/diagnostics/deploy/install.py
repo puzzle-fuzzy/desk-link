@@ -16,6 +16,8 @@ import urllib.request
 
 RELEASES = Path("/opt/desklink-diagnostics/releases")
 CURRENT = Path("/opt/desklink-diagnostics/current")
+BIN_DIRECTORY = Path("/opt/desklink-diagnostics/bin")
+BUN_EXECUTABLE = BIN_DIRECTORY / "bun"
 STATE = Path("/var/lib/desklink-diagnostics")
 SERVICE = Path("/etc/systemd/system/desklink-diagnostics.service")
 NGINX_SITE = Path("/etc/nginx/conf.d/p2p.yxswy.com.conf")
@@ -44,6 +46,17 @@ def ensure_user() -> None:
                 "desklink-diagnostics",
             ]
         )
+
+
+def install_bun_runtime() -> None:
+    source = Path(os.path.realpath("/usr/local/bin/bun"))
+    if not source.is_file():
+        raise RuntimeError("server Bun runtime was not found")
+    BIN_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    temporary = BUN_EXECUTABLE.with_suffix(".tmp")
+    shutil.copy2(source, temporary)
+    os.chmod(temporary, 0o755)
+    os.replace(temporary, BUN_EXECUTABLE)
 
 
 def safe_extract(archive: Path, destination: Path) -> None:
@@ -113,6 +126,7 @@ def install(archive: Path, release_id: str) -> dict[str, str]:
         raise
 
     ensure_user()
+    install_bun_runtime()
     STATE.mkdir(parents=True, exist_ok=True)
     account = pwd.getpwnam("desklink-diagnostics")
     os.chown(STATE, account.pw_uid, account.pw_gid)
