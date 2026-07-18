@@ -601,6 +601,25 @@ fn second_controller_is_rejected_by_the_session_table() {
 }
 
 #[test]
+fn capacity_snapshot_contains_only_aggregate_counts_and_limits() {
+    let table = RelaySessionTable::new(RelayConfig {
+        max_connections: 8,
+        max_sessions: 4,
+        ..RelayConfig::default()
+    });
+    table.attach_host(session(27), connection(1)).unwrap();
+    table.attach_controller(session(27), connection(2)).unwrap();
+    table.attach_host(session(28), connection(3)).unwrap();
+
+    let snapshot = table.capacity_snapshot(3);
+    assert_eq!(snapshot.active_sessions, 2);
+    assert_eq!(snapshot.attached_participants, 3);
+    assert_eq!(snapshot.accepted_connections, 3);
+    assert_eq!(snapshot.max_sessions, 4);
+    assert_eq!(snapshot.max_connections, 8);
+}
+
+#[test]
 fn session_expiry_and_precise_detach_are_deterministic() {
     let config = RelayConfig {
         session_ttl: Duration::from_secs(10),

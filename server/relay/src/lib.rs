@@ -87,6 +87,15 @@ pub struct RelaySessionTable {
     config: RelayConfig,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayCapacitySnapshot {
+    pub active_sessions: usize,
+    pub attached_participants: usize,
+    pub accepted_connections: usize,
+    pub max_sessions: usize,
+    pub max_connections: usize,
+}
+
 struct SessionRecord {
     created_at: Instant,
     expires_at: Instant,
@@ -238,6 +247,29 @@ impl RelaySessionTable {
             sessions.remove(&expired_session.session_id);
         }
         expired
+    }
+
+    pub fn capacity_snapshot(&self, accepted_connections: usize) -> RelayCapacitySnapshot {
+        let now = Instant::now();
+        let sessions = self.lock_sessions();
+        let active_sessions = sessions
+            .values()
+            .filter(|session| session.expires_at > now)
+            .count();
+        let attached_participants = sessions
+            .values()
+            .filter(|session| session.expires_at > now)
+            .map(|session| {
+                usize::from(session.host.is_some()) + usize::from(session.controller.is_some())
+            })
+            .sum();
+        RelayCapacitySnapshot {
+            active_sessions,
+            attached_participants,
+            accepted_connections,
+            max_sessions: self.config.max_sessions,
+            max_connections: self.config.max_connections,
+        }
     }
 
     pub fn has_connection(&self, session_id: SessionId, connection_id: u64) -> bool {
@@ -751,6 +783,14 @@ impl RelayServer {
 
     pub fn session_table(&self) -> RelaySessionTable {
         self.state.sessions.clone()
+    }
+
+    pub fn capacity_snapshot(&self) -> RelayCapacitySnapshot {
+        self.state.sessions.capacity_snapshot(
+            self.state
+                .active_connections
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     pub fn close(&self) {

@@ -20,6 +20,7 @@ const MAX_SESSION_TTL_S: u64 = 2_592_000;
 const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
 const DEFAULT_MAX_SESSIONS: usize = 1_024;
 const MAX_CONFIGURED_LIMIT: usize = 100_000;
+const CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 fn development_server_config() -> Result<ServerConfig, Box<dyn Error + Send + Sync>> {
     let server_name =
@@ -159,6 +160,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let address = relay_address()?;
     let relay = Arc::new(RelayServer::bind(address, server_config()?, relay_config()?).await?);
     eprintln!("DeskLink relay listening on {}", relay.local_addr()?);
+    let metrics_relay = relay.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CAPACITY_LOG_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let snapshot = metrics_relay.capacity_snapshot();
+            eprintln!(
+                "relay_capacity active_sessions={} attached_participants={} accepted_connections={} max_sessions={} max_connections={}",
+                snapshot.active_sessions,
+                snapshot.attached_participants,
+                snapshot.accepted_connections,
+                snapshot.max_sessions,
+                snapshot.max_connections,
+            );
+        }
+    });
     relay.run().await?;
     Ok(())
 }
