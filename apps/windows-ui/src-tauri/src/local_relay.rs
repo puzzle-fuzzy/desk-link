@@ -9,7 +9,6 @@ use serde::Serialize;
 
 pub const MANAGED_RELAY_ADDRESS: &str = "101.35.246.159:4433";
 pub const MANAGED_RELAY_SERVER_NAME: &str = "turn.p2p.yxswy.com";
-const PAIRING_PACKAGE_HEADER: &str = "DESKLINK-PAIR-1";
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize)]
@@ -71,7 +70,7 @@ pub async fn probe(
     server_name: &str,
 ) -> Result<RelayProbeResult, String> {
     let config = client_config(relay_address, server_name)
-        .map_err(|_| "中继地址或 TLS 服务器名称无效，请检查连接码是否完整。".to_owned())?;
+        .map_err(|_| "中继地址或 TLS 服务器名称无效，请检查中继设置。".to_owned())?;
     let started = Instant::now();
     match tokio::time::timeout(RELAY_PROBE_TIMEOUT, QuicClient::connect(config)).await {
         Ok(Ok(client)) => {
@@ -90,19 +89,11 @@ pub async fn probe(
     }
 }
 
-pub fn pairing_package(settings: &HostConnectionSettings, invitation: &str) -> String {
-    format!(
-        "{PAIRING_PACKAGE_HEADER}\n{}\n{}\n{invitation}",
-        settings.relay_address(),
-        settings.server_name()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use apps_windows::configuration::HostConnectionSettings;
 
-    use super::{MANAGED_RELAY_ADDRESS, MANAGED_RELAY_SERVER_NAME, pairing_package, status};
+    use super::{MANAGED_RELAY_ADDRESS, MANAGED_RELAY_SERVER_NAME, status};
 
     fn managed_settings() -> HostConnectionSettings {
         HostConnectionSettings::from_text(
@@ -122,12 +113,5 @@ mod tests {
         assert_eq!(summary.mode, "external");
         assert_eq!(summary.state, "ready");
         assert!(summary.title.contains("公网中继"));
-    }
-
-    #[test]
-    fn pairing_package_carries_the_tls_verified_public_endpoint() {
-        let package = pairing_package(&managed_settings(), "signed-invitation");
-        assert!(package.starts_with("DESKLINK-PAIR-1\n101.35.246.159:4433\n"));
-        assert!(package.contains(MANAGED_RELAY_SERVER_NAME));
     }
 }

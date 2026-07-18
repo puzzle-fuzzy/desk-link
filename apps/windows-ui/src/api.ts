@@ -2,7 +2,6 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 import type {
   ConnectionSettingsInput,
-  ControllerConnectionInput,
   ControllerDeviceInput,
   ControllerInput,
   ControllerSignal,
@@ -15,15 +14,29 @@ import type {
   RelayProbeResult,
   RevocationResult,
   SavedDeviceInput,
+  SavedDeviceRenameInput,
+  WindowsPreferencesSummary,
 } from "./types";
 
 export interface ControllerChannels {
   signals: Channel<ControllerSignal>;
-  video: Channel<ArrayBuffer | Uint8Array | number[]>;
+  video: Channel<ArrayBuffer | ArrayBufferView | number[]>;
 }
 
 export function getHostSnapshot(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("get_host_snapshot");
+}
+
+export function getWindowsPreferences(): Promise<WindowsPreferencesSummary> {
+  return invoke<WindowsPreferencesSummary>("get_windows_preferences");
+}
+
+export function setLaunchAtLogin(enabled: boolean): Promise<WindowsPreferencesSummary> {
+  return invoke<WindowsPreferencesSummary>("set_launch_at_login", { enabled });
+}
+
+export function quitDeskLink(): Promise<void> {
+  return invoke<void>("quit_desklink");
 }
 
 export function restartHost(): Promise<HostSnapshot> {
@@ -84,19 +97,21 @@ export function getControllerSnapshot(): Promise<ControllerSnapshot> {
 
 export function createControllerChannels(
   onSignal: (signal: ControllerSignal) => void,
-  onVideo: (payload: ArrayBuffer | Uint8Array | number[]) => void,
+  onVideo: (payload: ArrayBuffer | ArrayBufferView | number[]) => void,
+  onVideoError?: (error: unknown) => void,
 ): ControllerChannels {
   return {
     signals: new Channel<ControllerSignal>(onSignal),
-    video: new Channel<ArrayBuffer | Uint8Array | number[]>(onVideo),
+    video: new Channel<ArrayBuffer | ArrayBufferView | number[]>((payload) => {
+      try {
+        onVideo(payload);
+      } catch (error) {
+        // Tauri advances a channel only after its callback returns. Never let one
+        // malformed frame permanently block all following video messages.
+        onVideoError?.(error);
+      }
+    }),
   };
-}
-
-export function connectController(
-  input: ControllerConnectionInput,
-  channels: ControllerChannels,
-): Promise<ControllerSnapshot> {
-  return invoke<ControllerSnapshot>("connect_controller", { input, ...channels });
 }
 
 export function connectDevice(
@@ -131,16 +146,24 @@ export function requestControllerKeyframe(): Promise<void> {
   return invoke<void>("request_controller_keyframe");
 }
 
+export function openGithubRepository(): Promise<void> {
+  return invoke<void>("open_github_repository");
+}
+
+export function selectControllerDisplay(displayId: number): Promise<void> {
+  return invoke<void>("select_controller_display", { displayId });
+}
+
 export function disconnectController(): Promise<ControllerSnapshot> {
   return invoke<ControllerSnapshot>("disconnect_controller");
 }
 
-export function forgetController(): Promise<ControllerSnapshot> {
-  return invoke<ControllerSnapshot>("forget_controller");
-}
-
 export function forgetSavedDevice(input: SavedDeviceInput): Promise<ControllerSnapshot> {
   return invoke<ControllerSnapshot>("forget_saved_device", { input });
+}
+
+export function renameSavedDevice(input: SavedDeviceRenameInput): Promise<ControllerSnapshot> {
+  return invoke<ControllerSnapshot>("rename_saved_device", { input });
 }
 
 export function clearSavedDevices(): Promise<ControllerSnapshot> {

@@ -8,14 +8,15 @@ use std::{
 
 use apps_windows::{
     controller_settings::{ControllerConnectionSettings, WindowsControllerConnectionStore},
+    diagnostics::{ControllerDiagnosticStage, DiagnosticEvent, DiagnosticLog},
     identity::WindowsIdentityStore,
-    recent_access::{RecentAccessEntry, WindowsRecentAccessStore},
+    recent_access::{RecentAccessEntry, WindowsRecentAccessError, WindowsRecentAccessStore},
 };
-use desklink_crypto::{PAIRING_INVITE_BYTES, PairingCode, PairingInvite};
+use desklink_crypto::{PairingCode, PairingInvite};
 use desklink_ffi::{ControllerError, ControllerEvent, ControllerRuntime};
 use desklink_protocol::{
-    FrameFlags, InputEvent, KeyCode, MAX_POINTER_COORDINATE, MAX_WHEEL_DELTA, Modifiers,
-    MouseButton, Platform,
+    AccessDenialReason, ControlMessage, FrameFlags, InputEvent, KeyCode, MAX_POINTER_COORDINATE,
+    MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -32,8 +33,11 @@ const FRAME_PREFIX_BYTES: usize = 17;
 const MAX_TEXT_INPUT_CHARACTERS: usize = 256;
 const MAX_TEXT_INPUT_BYTES: usize = 1_024;
 const RECENT_CANCELLATION_WINDOW: Duration = Duration::from_secs(15);
+const RECONNECT_BUDGET_RESET_AFTER: Duration = Duration::from_secs(30);
 const DIRECTORY_RECOVERY_DELAYS: [Duration; 2] =
     [Duration::from_millis(500), Duration::from_millis(1_250)];
+const DIRECTORY_TRANSPORT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(350), Duration::from_millis(900)];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +89,19 @@ impl ControllerRuntimeSummary {
         }
     }
 
+    fn finding_after_interruption(retry: usize, delay: Duration) -> Self {
+        Self {
+            state: "finding",
+            title: "正在恢复设备查询".to_owned(),
+            detail: format!(
+                "中继查询刚刚中断，DeskLink 将在 {} 毫秒后使用新连接重试（{retry}/{}）。",
+                delay.as_millis(),
+                DIRECTORY_TRANSPORT_RETRY_DELAYS.len()
+            ),
+            stream_id: None,
+        }
+    }
+
     fn waiting_for_approval() -> Self {
         Self {
             state: "waitingApproval",
@@ -128,6 +145,7 @@ impl ControllerRuntimeSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedControllerConnectionSummary {
+    pub device_id: String,
     pub relay_address: String,
     pub server_name: String,
     pub host_device_id: String,
@@ -146,14 +164,6 @@ pub struct ControllerSnapshot {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ControllerConnectionInput {
-    relay_address: String,
-    server_name: String,
-    invitation: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ControllerDeviceInput {
     device_id: String,
     temporary_password: String,
@@ -165,10 +175,18 @@ pub struct SavedDeviceInput {
     device_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDeviceRenameInput {
+    device_id: String,
+    alias: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedDeviceCredentialSummary {
     pub device_id: String,
+    pub alias: Option<String>,
     pub persistent: bool,
     pub last_used_unix_s: u64,
 }
@@ -176,12 +194,6 @@ pub struct SavedDeviceCredentialSummary {
 impl Drop for ControllerDeviceInput {
     fn drop(&mut self) {
         self.temporary_password.zeroize();
-    }
-}
-
-impl Drop for ControllerConnectionInput {
-    fn drop(&mut self) {
-        self.invitation.zeroize();
     }
 }
 
@@ -252,12 +264,26 @@ pub enum ControllerSignal {
         dropped_video_packets: u64,
         completed_frames: u64,
     },
+    Displays {
+        displays: Vec<ControllerDisplaySummary>,
+        active_display_id: u32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerDisplaySummary {
+    id: u32,
+    width: u16,
+    height: u16,
+    primary: bool,
 }
 
 enum ControllerCommand {
     Input(InputEvent),
     Text(String),
     RequestKeyframe,
+    SelectDisplay(u32),
     Stop,
 }
 
@@ -295,19 +321,6 @@ impl ControllerManager {
             .unwrap_or_else(|_| {
                 ControllerRuntimeSummary::stopped("DeskLink 无法读取控制端状态，请重新启动应用。")
             })
-    }
-
-    pub async fn connect_invitation(
-        &self,
-        input: ControllerConnectionInput,
-        signals: Channel<ControllerSignal>,
-        video: Channel<Response>,
-    ) -> Result<ControllerSnapshot, String> {
-        let generation = self.begin_operation();
-        let settings = settings_from_invitation(input)?;
-        self.start(generation, settings, true, signals, video)
-            .await?;
-        load_snapshot(self.snapshot())
     }
 
     pub async fn connect_device(
@@ -371,27 +384,52 @@ impl ControllerManager {
                 crate::local_relay::MANAGED_RELAY_SERVER_NAME,
             )
             .map_err(|_| "DeskLink 无法准备安全中继连接。".to_owned())?;
-            let client = QuicClient::connect(config)
-                .await
-                .map_err(|_| "无法连接 DeskLink 中继服务器，请检查网络后重试。".to_owned())?;
             let lookup = RelayDirectoryLookup::new(device_id, *password.as_bytes())
                 .map_err(|_| "设备 ID 或访问密码格式无效。".to_owned())?;
-            let mut retry = 0;
+            let mut availability_retry = 0;
+            let mut transport_retry = 0;
             let mut invitation = loop {
-                match client.lookup_directory(lookup.clone()).await {
-                    Ok(invitation) => break invitation,
-                    Err(TransportError::DirectoryNotFound)
-                        if recover_after_cancel && retry < DIRECTORY_RECOVERY_DELAYS.len() =>
+                self.ensure_current(generation)?;
+                let client = match QuicClient::connect(config.clone()).await {
+                    Ok(client) => client,
+                    Err(error)
+                        if directory_transport_error_is_retryable(&error)
+                            && transport_retry < DIRECTORY_TRANSPORT_RETRY_DELAYS.len() =>
                     {
-                        let delay = DIRECTORY_RECOVERY_DELAYS[retry];
-                        retry += 1;
+                        let delay = DIRECTORY_TRANSPORT_RETRY_DELAYS[transport_retry];
+                        transport_retry += 1;
                         self.publish_if_current(
                             generation,
                             &signals,
-                            ControllerRuntimeSummary::finding_after_cancel(retry, delay),
+                            ControllerRuntimeSummary::finding_after_interruption(
+                                transport_retry,
+                                delay,
+                            ),
                         );
                         tokio::time::sleep(delay).await;
-                        self.ensure_current(generation)?;
+                        continue;
+                    }
+                    Err(error) => return Err(directory_transport_error_message(&error).to_owned()),
+                };
+                let result = client.lookup_directory(lookup.clone()).await;
+                drop(client);
+                match result {
+                    Ok(invitation) => break invitation,
+                    Err(TransportError::DirectoryNotFound)
+                        if recover_after_cancel
+                            && availability_retry < DIRECTORY_RECOVERY_DELAYS.len() =>
+                    {
+                        let delay = DIRECTORY_RECOVERY_DELAYS[availability_retry];
+                        availability_retry += 1;
+                        self.publish_if_current(
+                            generation,
+                            &signals,
+                            ControllerRuntimeSummary::finding_after_cancel(
+                                availability_retry,
+                                delay,
+                            ),
+                        );
+                        tokio::time::sleep(delay).await;
                     }
                     Err(TransportError::DirectoryNotFound) => {
                         return Err(source.not_found_message(recover_after_cancel).to_owned());
@@ -399,12 +437,27 @@ impl ControllerManager {
                     Err(TransportError::DirectoryRateLimited) => {
                         return Err("尝试次数过多，请等待一分钟后再试。".to_owned());
                     }
-                    Err(_) => {
-                        return Err("设备查询暂时失败，请检查网络后重试。".to_owned());
+                    Err(error)
+                        if directory_transport_error_is_retryable(&error)
+                            && transport_retry < DIRECTORY_TRANSPORT_RETRY_DELAYS.len() =>
+                    {
+                        let delay = DIRECTORY_TRANSPORT_RETRY_DELAYS[transport_retry];
+                        transport_retry += 1;
+                        self.publish_if_current(
+                            generation,
+                            &signals,
+                            ControllerRuntimeSummary::finding_after_interruption(
+                                transport_retry,
+                                delay,
+                            ),
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => {
+                        return Err(directory_transport_error_message(&error).to_owned());
                     }
                 }
             };
-            drop(client);
             let invite = match PairingInvite::decode(&invitation, now_unix_s()) {
                 Ok(invite) => invite,
                 Err(_) => {
@@ -499,30 +552,42 @@ impl ControllerManager {
         Ok(())
     }
 
-    pub fn send_input(&self, input: ControllerInput) -> Result<(), String> {
+    pub async fn send_input(&self, input: ControllerInput) -> Result<(), String> {
         self.send(ControllerCommand::Input(parse_input(input)?))
+            .await
     }
 
-    pub fn send_text(&self, text: String) -> Result<(), String> {
+    pub async fn send_text(&self, text: String) -> Result<(), String> {
         validate_text_input(&text)?;
-        self.send(ControllerCommand::Text(text))
+        self.send(ControllerCommand::Text(text)).await
     }
 
-    pub fn request_keyframe(&self) -> Result<(), String> {
-        self.send(ControllerCommand::RequestKeyframe)
+    pub async fn request_keyframe(&self) -> Result<(), String> {
+        self.send(ControllerCommand::RequestKeyframe).await
     }
 
-    fn send(&self, command: ControllerCommand) -> Result<(), String> {
-        let worker = self
+    pub async fn select_display(&self, display_id: u32) -> Result<(), String> {
+        self.send(ControllerCommand::SelectDisplay(display_id))
+            .await
+    }
+
+    async fn send(&self, command: ControllerCommand) -> Result<(), String> {
+        let commands = self
             .worker
             .lock()
-            .map_err(|_| "DeskLink 无法访问控制端任务。".to_owned())?;
-        worker
+            .map_err(|_| "DeskLink 无法访问控制端任务。".to_owned())?
             .as_ref()
             .ok_or_else(|| "当前没有正在运行的远程控制会话。".to_owned())?
             .commands
-            .try_send(command)
-            .map_err(|_| "控制输入队列暂时不可用。".to_owned())
+            .clone();
+        // Applying backpressure here is important: a full queue must never
+        // silently discard a button/key release and leave the remote computer
+        // with a logically stuck input state. The WebView dispatcher already
+        // permits only one input IPC call in flight.
+        commands
+            .send(command)
+            .await
+            .map_err(|_| "远程控制会话已结束，无法继续发送输入。".to_owned())
     }
 
     pub async fn disconnect(&self) -> Result<ControllerSnapshot, String> {
@@ -534,28 +599,50 @@ impl ControllerManager {
         load_snapshot(self.snapshot())
     }
 
-    pub async fn forget_saved(&self) -> Result<ControllerSnapshot, String> {
-        self.cancel_operations();
-        let _operation = self.operation_lock.lock().await;
-        self.stop_current().await;
-        WindowsControllerConnectionStore::for_current_user()
-            .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?
-            .clear()
-            .map_err(|_| "DeskLink 无法移除已保存的控制端连接。".to_owned())?;
-        self.set_status(ControllerRuntimeSummary::idle());
-        load_snapshot(self.snapshot())
-    }
-
     pub async fn forget_saved_device(
         &self,
         input: SavedDeviceInput,
     ) -> Result<ControllerSnapshot, String> {
         let device_id =
             crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
+        self.cancel_operations();
+        let _operation = self.operation_lock.lock().await;
+        self.stop_current().await;
         WindowsRecentAccessStore::for_current_user()
             .map_err(|_| "当前 Windows 账户无法使用已保存的设备密码。".to_owned())?
             .remove(device_id)
             .map_err(|_| "DeskLink 无法移除已保存的设备密码。".to_owned())?;
+        let connection_store = WindowsControllerConnectionStore::for_current_user()
+            .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?;
+        let matches_saved_connection = connection_store
+            .load()
+            .map_err(|_| "无法打开已保存的控制端连接。".to_owned())?
+            .is_some_and(|settings| {
+                crate::device_directory::public_device_id(settings.host_device_id()) == device_id
+            });
+        if matches_saved_connection {
+            connection_store
+                .clear()
+                .map_err(|_| "DeskLink 无法移除已保存的控制端连接。".to_owned())?;
+        }
+        self.set_status(ControllerRuntimeSummary::idle());
+        load_snapshot(self.snapshot())
+    }
+
+    pub async fn rename_saved_device(
+        &self,
+        input: SavedDeviceRenameInput,
+    ) -> Result<ControllerSnapshot, String> {
+        let device_id =
+            crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
+        let _operation = self.operation_lock.lock().await;
+        WindowsRecentAccessStore::for_current_user()
+            .map_err(|_| "当前 Windows 账户无法使用已保存的设备信息。".to_owned())?
+            .rename(device_id, &input.alias)
+            .map_err(|error| match error {
+                WindowsRecentAccessError::InvalidAlias => error.to_string(),
+                _ => "DeskLink 无法保存设备名称，请检查当前账户的数据目录。".to_owned(),
+            })?;
         load_snapshot(self.snapshot())
     }
 
@@ -658,12 +745,47 @@ impl ControllerManager {
     }
 }
 
+fn directory_transport_error_is_retryable(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::Connection(_)
+            | TransportError::ConnectionLimit
+            | TransportError::Stream(_)
+            | TransportError::Closed
+            | TransportError::JoinRejected(
+                JoinRejectCode::Internal
+                    | JoinRejectCode::ConnectionLimit
+                    | JoinRejectCode::SessionLimit
+            )
+    )
+}
+
+fn directory_transport_error_message(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::ConnectionLimit
+        | TransportError::JoinRejected(
+            JoinRejectCode::Internal
+            | JoinRejectCode::ConnectionLimit
+            | JoinRejectCode::SessionLimit,
+        ) => "中继服务器当前繁忙，DeskLink 已自动重试，请稍后再试。",
+        TransportError::Malformed => "中继服务器返回了不兼容的设备查询响应，请更新两台电脑后重试。",
+        TransportError::InvalidConfig(_) => "DeskLink 内置中继配置无效，请重新安装最新版本。",
+        TransportError::Connection(_) | TransportError::Stream(_) | TransportError::Closed => {
+            "设备查询连接连续中断。请确认两台电脑均为最新版本，并保持目标电脑上的 DeskLink 在线。"
+        }
+        _ => "设备查询未能完成，请确认目标电脑在线并重新检查设备 ID 和访问密码。",
+    }
+}
+
 pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnapshot, String> {
     let store = WindowsControllerConnectionStore::for_current_user()
         .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?;
     let (saved_connection, connection_error) = match store.load() {
         Ok(settings) => (
             settings.map(|settings| SavedControllerConnectionSummary {
+                device_id: crate::device_directory::format_device_id(
+                    crate::device_directory::public_device_id(settings.host_device_id()),
+                ),
                 relay_address: settings.relay_address_text(),
                 server_name: settings.server_name().to_owned(),
                 host_device_id: hex(&settings.host_device_id()),
@@ -704,58 +826,10 @@ pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnap
 fn saved_device_summary(entry: &RecentAccessEntry) -> SavedDeviceCredentialSummary {
     SavedDeviceCredentialSummary {
         device_id: crate::device_directory::format_device_id(entry.device_id()),
+        alias: entry.alias().map(str::to_owned),
         persistent: entry.is_persistent(),
         last_used_unix_s: entry.last_used_unix_s(),
     }
-}
-
-pub fn migrate_legacy_local_connection() -> Result<bool, String> {
-    let store = WindowsControllerConnectionStore::for_current_user()
-        .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?;
-    let Some(existing) = store
-        .load()
-        .map_err(|_| "无法打开已保存的控制端连接。".to_owned())?
-    else {
-        return Ok(false);
-    };
-    if !existing.relay_address().ip().is_loopback()
-        || !matches!(existing.server_name(), "localhost" | "desklink-lan")
-    {
-        return Ok(false);
-    }
-    let migrated = ControllerConnectionSettings::from_parts(
-        crate::local_relay::MANAGED_RELAY_ADDRESS,
-        crate::local_relay::MANAGED_RELAY_SERVER_NAME,
-        existing.session_id(),
-        *existing.authentication(),
-        existing.host_device_id(),
-        existing.host_verify_key(),
-    )
-    .map_err(|_| "无法迁移旧版控制端连接。".to_owned())?;
-    store
-        .save(&migrated)
-        .map_err(|_| "无法保存迁移后的控制端连接。".to_owned())?;
-    Ok(true)
-}
-
-fn settings_from_invitation(
-    input: ControllerConnectionInput,
-) -> Result<ControllerConnectionSettings, String> {
-    let encoded = input.invitation.trim();
-    if encoded.len() != PAIRING_INVITE_BYTES * 2
-        || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("配对邀请必须正好包含 362 位十六进制字符。".to_owned());
-    }
-    let mut bytes = [0u8; PAIRING_INVITE_BYTES];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
-    }
-    let invite = PairingInvite::decode(&bytes, now_unix_s())
-        .map_err(|_| "配对邀请无效、已被修改或已过期。".to_owned())?;
-    bytes.zeroize();
-    ControllerConnectionSettings::from_invite(&input.relay_address, &input.server_name, &invite)
-        .map_err(|error| error.to_string())
 }
 
 async fn run_controller(
@@ -766,25 +840,53 @@ async fn run_controller(
     signals: Channel<ControllerSignal>,
     video: Channel<Response>,
 ) {
+    let diagnostics = DiagnosticLog::controller_for_current_user().ok();
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+    let mut attempt = 0_u32;
     'connect: loop {
-        let connection = connect_once(&manager, &settings, &signals);
+        attempt = attempt.saturating_add(1);
+        record_controller_diagnostic(
+            diagnostics.as_ref(),
+            ControllerDiagnosticStage::Connecting,
+            attempt,
+            None,
+            None,
+            None,
+        );
+        let connection = connect_once(&manager, &settings, &signals, diagnostics.as_ref(), attempt);
         tokio::pin!(connection);
         let mut runtime = loop {
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(ControllerCommand::Stop) | None => {
+                        record_controller_diagnostic(
+                            diagnostics.as_ref(),
+                            ControllerDiagnosticStage::Cancelled,
+                            attempt,
+                            None,
+                            None,
+                            None,
+                        );
                         manager.set_status(ControllerRuntimeSummary::idle());
                         return;
                     }
                     Some(ControllerCommand::Input(_))
                     | Some(ControllerCommand::Text(_))
-                    | Some(ControllerCommand::RequestKeyframe) => {}
+                    | Some(ControllerCommand::RequestKeyframe)
+                    | Some(ControllerCommand::SelectDisplay(_)) => {}
                 },
                 result = &mut connection => match result {
                     Ok(runtime) => break runtime,
                     Err(failure) => {
-                        if !schedule_failure(&manager, &signals, &mut schedule, failure, &mut commands).await {
+                        if !schedule_failure(
+                            &manager,
+                            &signals,
+                            &mut schedule,
+                            failure,
+                            &mut commands,
+                            diagnostics.as_ref(),
+                            attempt,
+                        ).await {
                             return;
                         }
                         continue 'connect;
@@ -794,10 +896,13 @@ async fn run_controller(
         };
 
         let mut stable = false;
+        let mut stable_since = None;
         let mut last_metrics = Instant::now();
+        let mut last_diagnostic_metrics = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
         let failure = loop {
             tokio::select! {
-                biased;
                 command = commands.recv() => match command {
                     Some(ControllerCommand::Input(input)) => {
                         if let Err(error) = runtime.send_input(input).await {
@@ -816,15 +921,38 @@ async fn run_controller(
                             break ConnectFailure::from_controller(error);
                         }
                     }
+                    Some(ControllerCommand::SelectDisplay(display_id)) => {
+                        if let Err(error) = runtime.select_display(display_id).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
                     Some(ControllerCommand::Stop) | None => {
+                        record_controller_diagnostic(
+                            diagnostics.as_ref(),
+                            ControllerDiagnosticStage::Cancelled,
+                            attempt,
+                            None,
+                            None,
+                            None,
+                        );
                         manager.set_status(ControllerRuntimeSummary::idle());
                         return;
                     }
                 },
                 event = runtime.next_event() => match event {
                     Ok(ControllerEvent::VideoConfig(config)) => {
+                        if !stable {
+                            record_controller_diagnostic(
+                                diagnostics.as_ref(),
+                                ControllerDiagnosticStage::Connected,
+                                attempt,
+                                None,
+                                None,
+                                None,
+                            );
+                        }
                         stable = true;
-                        schedule.reset();
+                        stable_since.get_or_insert_with(Instant::now);
                         if save_after_approval {
                             if WindowsControllerConnectionStore::for_current_user()
                                 .and_then(|store| store.save(&settings))
@@ -869,6 +997,23 @@ async fn run_controller(
                             visible: cursor.visible,
                         });
                     }
+                    Ok(ControllerEvent::Control(ControlMessage::DisplayList {
+                        displays,
+                        active_display_id,
+                    })) => {
+                        let _ = signals.send(ControllerSignal::Displays {
+                            displays: displays
+                                .into_iter()
+                                .map(|display| ControllerDisplaySummary {
+                                    id: display.id,
+                                    width: display.width,
+                                    height: display.height,
+                                    primary: display.primary,
+                                })
+                                .collect(),
+                            active_display_id,
+                        });
+                    }
                     Ok(ControllerEvent::Control(_)) => {}
                     Ok(ControllerEvent::Closed { reason }) => {
                         break ConnectFailure::retryable(format!("transport closed: {reason}"));
@@ -883,22 +1028,50 @@ async fn run_controller(
                     dropped_video_packets: metrics.dropped_video_packets,
                     completed_frames: metrics.completed_frames,
                 });
+                if last_diagnostic_metrics.elapsed() >= Duration::from_secs(10) {
+                    if let Some(diagnostics) = diagnostics.as_ref() {
+                        let _ = diagnostics.record(&DiagnosticEvent::ControllerVideoMetrics {
+                            attempt,
+                            received_video_packets: metrics.received_video_packets,
+                            dropped_video_packets: metrics.dropped_video_packets,
+                            completed_frames: metrics.completed_frames,
+                        });
+                    }
+                    last_diagnostic_metrics = Instant::now();
+                }
                 last_metrics = Instant::now();
             }
         };
-        if stable {
+        if stable_since.is_some_and(|started| session_earned_fresh_retry_budget(started.elapsed()))
+        {
             schedule.reset();
         }
-        if !schedule_failure(&manager, &signals, &mut schedule, failure, &mut commands).await {
+        if !schedule_failure(
+            &manager,
+            &signals,
+            &mut schedule,
+            failure,
+            &mut commands,
+            diagnostics.as_ref(),
+            attempt,
+        )
+        .await
+        {
             return;
         }
     }
+}
+
+fn session_earned_fresh_retry_budget(connected_for: Duration) -> bool {
+    connected_for >= RECONNECT_BUDGET_RESET_AFTER
 }
 
 async fn connect_once(
     manager: &ControllerManager,
     settings: &ControllerConnectionSettings,
     signals: &Channel<ControllerSignal>,
+    diagnostics: Option<&DiagnosticLog>,
+    attempt: u32,
 ) -> Result<ControllerRuntime, ConnectFailure> {
     manager.publish(signals, ControllerRuntimeSummary::connecting());
     let config =
@@ -907,6 +1080,14 @@ async fn connect_once(
     let client = QuicClient::connect(config)
         .await
         .map_err(ConnectFailure::from_transport)?;
+    record_controller_diagnostic(
+        diagnostics,
+        ControllerDiagnosticStage::RelayConnected,
+        attempt,
+        None,
+        None,
+        None,
+    );
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| ConnectFailure::permanent("控制端身份存储不可用"))?
         .load_or_create(&mut OsRng)
@@ -919,74 +1100,189 @@ async fn connect_once(
         ))
         .await
         .map_err(ConnectFailure::from_transport)?;
-    manager.publish(signals, ControllerRuntimeSummary::waiting_for_approval());
-    ControllerRuntime::connect_for_platform(
+    record_controller_diagnostic(
+        diagnostics,
+        ControllerDiagnosticStage::RelayJoined,
+        attempt,
+        None,
+        None,
+        None,
+    );
+    let runtime = ControllerRuntime::connect_for_platform_with_observer(
         client,
         identity,
         settings.host_verify_key(),
         Platform::Windows,
+        || {
+            record_controller_diagnostic(
+                diagnostics,
+                ControllerDiagnosticStage::WaitingForApproval,
+                attempt,
+                None,
+                None,
+                None,
+            );
+            manager.publish(signals, ControllerRuntimeSummary::waiting_for_approval());
+        },
     )
     .await
-    .map_err(ConnectFailure::from_controller)
+    .map_err(ConnectFailure::from_controller)?;
+    record_controller_diagnostic(
+        diagnostics,
+        ControllerDiagnosticStage::SecureSessionReady,
+        attempt,
+        None,
+        None,
+        None,
+    );
+    Ok(runtime)
 }
 
 struct ConnectFailure {
     retryable: bool,
     detail: &'static str,
+    kind: &'static str,
+    technical_reason: String,
 }
 
 impl ConnectFailure {
-    fn permanent(_reason: impl Into<String>) -> Self {
+    fn with_reason(
+        retryable: bool,
+        detail: &'static str,
+        kind: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
-            retryable: false,
-            detail: "已保存的身份或连接与主机不匹配，请重新配对此电脑。",
+            retryable,
+            detail,
+            kind,
+            technical_reason: reason.into(),
         }
     }
 
-    fn retryable(_reason: impl Into<String>) -> Self {
-        Self {
-            retryable: true,
-            detail: "中继服务器或主机暂时不可用。",
-        }
+    fn permanent(reason: impl Into<String>) -> Self {
+        Self::with_reason(
+            false,
+            "已保存的身份或连接与主机不匹配，请重新配对此电脑。",
+            "permanent",
+            reason,
+        )
+    }
+
+    fn retryable(reason: impl Into<String>) -> Self {
+        Self::with_reason(
+            true,
+            "中继服务器或主机暂时不可用。",
+            "transport_unavailable",
+            reason,
+        )
     }
 
     fn from_transport(error: TransportError) -> Self {
+        let technical_reason = error.to_string();
         match error {
-            TransportError::JoinRejected(JoinRejectCode::SessionNotFound) => Self {
-                retryable: true,
-                detail: "主机配对会话尚未就绪或连接码已经失效，请在主机上重新创建连接码。",
-            },
-            TransportError::JoinRejected(JoinRejectCode::SessionOccupied) => Self {
-                retryable: true,
-                detail: "此会话已有控制端连接，请先断开原控制端后再试。",
-            },
+            TransportError::JoinRejected(JoinRejectCode::SessionNotFound) => Self::with_reason(
+                true,
+                "主机连接窗口尚未就绪或临时密码已经失效，请在主机上重新生成临时密码。",
+                "session_not_found",
+                technical_reason,
+            ),
+            TransportError::JoinRejected(JoinRejectCode::SessionOccupied) => Self::with_reason(
+                true,
+                "此会话已有控制端连接，请先断开原控制端后再试。",
+                "session_occupied",
+                technical_reason,
+            ),
             TransportError::JoinRejected(
                 JoinRejectCode::ConnectionLimit | JoinRejectCode::SessionLimit,
             )
-            | TransportError::ConnectionLimit => Self {
-                retryable: true,
-                detail: "中继服务器当前连接数量已满，请稍后重试。",
-            },
-            TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch) => Self {
-                retryable: false,
-                detail: "连接码与主机的中继会话不匹配，请从主机重新复制完整连接码。",
-            },
-            TransportError::InvalidConfig(_) => Self {
-                retryable: false,
-                detail: "中继地址或 TLS 服务器名称无效，请重新复制完整连接码。",
-            },
+            | TransportError::ConnectionLimit => Self::with_reason(
+                true,
+                "中继服务器当前连接数量已满，请稍后重试。",
+                "relay_capacity",
+                technical_reason,
+            ),
+            TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch) => {
+                Self::with_reason(
+                    false,
+                    "连接请求与主机的中继会话不匹配，请在主机上重新生成临时密码。",
+                    "authentication_mismatch",
+                    technical_reason,
+                )
+            }
+            TransportError::InvalidConfig(_) => Self::with_reason(
+                false,
+                "目标主机的中继设置无效，请在主机上重新生成临时密码。",
+                "invalid_relay_config",
+                technical_reason,
+            ),
             TransportError::Connection(_)
             | TransportError::Stream(_)
             | TransportError::Datagram(_)
             | TransportError::Closed
+            | TransportError::PeerDisconnected
+            | TransportError::PeerReplaced
             | TransportError::JoinRejected(JoinRejectCode::Internal) => {
-                Self::retryable("transport unavailable")
+                Self::retryable(technical_reason)
             }
-            _ => Self::permanent("invalid relay response"),
+            _ => Self::permanent(technical_reason),
         }
     }
 
     fn from_controller(error: ControllerError) -> Self {
+        let technical_reason = error.to_string();
+        if let ControllerError::AccessDenied(reason) = error {
+            return match reason {
+                AccessDenialReason::ApprovalRejected => Self::with_reason(
+                    false,
+                    "主机已拒绝本次控制请求。需要连接时，请重新发起并在主机上允许。",
+                    "approval_rejected",
+                    technical_reason,
+                ),
+                AccessDenialReason::ApprovalExpired => Self::with_reason(
+                    false,
+                    "主机确认请求已过期，请重新连接并及时在主机上允许。",
+                    "approval_expired",
+                    technical_reason,
+                ),
+                AccessDenialReason::ControllerNotTrusted => Self::with_reason(
+                    false,
+                    "主机不再信任此控制端，请在主机上重新配对或启用固定密码后再试。",
+                    "controller_not_trusted",
+                    technical_reason,
+                ),
+                AccessDenialReason::ControllerIdentityChanged => Self::with_reason(
+                    false,
+                    "此电脑的安全身份已变化，主机拒绝了旧信任。请在主机上核对警告并重新允许。",
+                    "controller_identity_changed",
+                    technical_reason,
+                ),
+                AccessDenialReason::HostUnavailable => Self::with_reason(
+                    false,
+                    "主机已批准连接，但当前无法启动屏幕采集。请解锁主机屏幕、退出远程桌面或兼容模式后重试。",
+                    "host_unavailable",
+                    technical_reason,
+                ),
+                AccessDenialReason::HostCaptureFailed => Self::with_reason(
+                    false,
+                    "主机已批准连接，但屏幕采集在首帧阶段失败。请解锁主机、退出 Windows 远程桌面，并更新显示驱动后重试。",
+                    "host_capture_failed",
+                    technical_reason,
+                ),
+                AccessDenialReason::HostEncoderFailed => Self::with_reason(
+                    false,
+                    "主机已批准连接，但 Windows 视频编码器启动失败。请更新 Windows、媒体组件和显示驱动后重试。",
+                    "host_encoder_failed",
+                    technical_reason,
+                ),
+                AccessDenialReason::HostInputFailed => Self::with_reason(
+                    false,
+                    "主机已建立画面连接，但 Windows 无法注入鼠标或键盘输入。请在主机上重新启动 DeskLink 后重试。",
+                    "host_input_failed",
+                    technical_reason,
+                ),
+            };
+        }
         let retryable = matches!(
             error,
             ControllerError::HandshakeTimeout
@@ -997,12 +1293,14 @@ impl ConnectFailure {
                         | TransportError::Stream(_)
                         | TransportError::Datagram(_)
                         | TransportError::Closed
+                        | TransportError::PeerDisconnected
+                        | TransportError::PeerReplaced
                 )
         );
         if retryable {
-            Self::retryable(error.to_string())
+            Self::retryable(technical_reason)
         } else {
-            Self::permanent(error.to_string())
+            Self::permanent(technical_reason)
         }
     }
 }
@@ -1013,13 +1311,31 @@ async fn schedule_failure(
     schedule: &mut ReconnectSchedule,
     failure: ConnectFailure,
     commands: &mut mpsc::Receiver<ControllerCommand>,
+    diagnostics: Option<&DiagnosticLog>,
+    attempt: u32,
 ) -> bool {
     if !failure.retryable {
+        record_controller_diagnostic(
+            diagnostics,
+            ControllerDiagnosticStage::Stopped,
+            attempt,
+            None,
+            None,
+            Some(&format!("{}: {}", failure.kind, failure.technical_reason)),
+        );
         manager.publish(signals, ControllerRuntimeSummary::stopped(failure.detail));
         return false;
     }
     match schedule.next(now_unix_s()) {
         ReconnectDecision::RetryAfter { retry, delay } => {
+            record_controller_diagnostic(
+                diagnostics,
+                ControllerDiagnosticStage::RetryScheduled,
+                attempt,
+                Some(retry),
+                Some(delay),
+                Some(&format!("{}: {}", failure.kind, failure.technical_reason)),
+            );
             manager.publish(
                 signals,
                 ControllerRuntimeSummary::reconnecting(retry, schedule.max_retries(), delay),
@@ -1030,18 +1346,35 @@ async fn schedule_failure(
                 tokio::select! {
                     command = commands.recv() => match command {
                         Some(ControllerCommand::Stop) | None => {
+                            record_controller_diagnostic(
+                                diagnostics,
+                                ControllerDiagnosticStage::Cancelled,
+                                attempt,
+                                Some(retry),
+                                None,
+                                None,
+                            );
                             manager.set_status(ControllerRuntimeSummary::idle());
                             return false;
                         }
                         Some(ControllerCommand::Input(_))
                         | Some(ControllerCommand::Text(_))
-                        | Some(ControllerCommand::RequestKeyframe) => {}
+                        | Some(ControllerCommand::RequestKeyframe)
+                        | Some(ControllerCommand::SelectDisplay(_)) => {}
                     },
                     () = &mut sleep => return true,
                 }
             }
         }
         ReconnectDecision::Exhausted | ReconnectDecision::SessionExpired => {
+            record_controller_diagnostic(
+                diagnostics,
+                ControllerDiagnosticStage::Stopped,
+                attempt,
+                None,
+                None,
+                Some(&format!("{}: {}", failure.kind, failure.technical_reason)),
+            );
             manager.publish(
                 signals,
                 ControllerRuntimeSummary::stopped(
@@ -1051,6 +1384,26 @@ async fn schedule_failure(
             false
         }
     }
+}
+
+fn record_controller_diagnostic(
+    diagnostics: Option<&DiagnosticLog>,
+    stage: ControllerDiagnosticStage,
+    attempt: u32,
+    retry: Option<u32>,
+    delay: Option<Duration>,
+    reason: Option<&str>,
+) {
+    let Some(diagnostics) = diagnostics else {
+        return;
+    };
+    let _ = diagnostics.record(&DiagnosticEvent::ControllerConnection {
+        stage,
+        attempt,
+        retry,
+        delay,
+        reason: reason.map(str::to_owned),
+    });
 }
 
 async fn send_text_input(runtime: &ControllerRuntime, text: &str) -> Result<(), ControllerError> {
@@ -1186,15 +1539,6 @@ fn required_point(x: Option<i32>, y: Option<i32>) -> Result<(i32, i32), String> 
     Ok((x, y))
 }
 
-fn hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        b'A'..=b'F' => value - b'A' + 10,
-        _ => 0,
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1212,11 +1556,15 @@ fn now_unix_s() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        ConnectFailure, ControllerInput, ControllerManager, ControllerRuntimeSummary, parse_input,
-        validate_text_input,
+        ConnectFailure, ControllerInput, ControllerManager, ControllerRuntimeSummary,
+        directory_transport_error_is_retryable, directory_transport_error_message, parse_input,
+        session_earned_fresh_retry_budget, validate_text_input,
     };
-    use desklink_protocol::{InputEvent, KeyCode, Modifiers};
+    use desklink_ffi::ControllerError;
+    use desklink_protocol::{AccessDenialReason, InputEvent, KeyCode, Modifiers};
     use desklink_transport::{JoinRejectCode, TransportError};
 
     fn empty_input(kind: &str) -> ControllerInput {
@@ -1313,6 +1661,47 @@ mod tests {
 
         assert!(failure.retryable);
         assert!(failure.detail.contains("中继服务器或主机"));
+        assert_eq!(failure.kind, "transport_unavailable");
+        assert!(failure.technical_reason.contains("timed out"));
+    }
+
+    #[test]
+    fn host_capture_failure_stops_the_retry_loop_with_actionable_copy() {
+        let failure = ConnectFailure::from_controller(ControllerError::AccessDenied(
+            AccessDenialReason::HostUnavailable,
+        ));
+
+        assert!(!failure.retryable);
+        assert!(failure.detail.contains("屏幕采集"));
+        assert!(failure.detail.contains("解锁"));
+    }
+
+    #[test]
+    fn post_approval_backend_failures_stop_blind_retries_with_exact_copy() {
+        let capture = ConnectFailure::from_controller(ControllerError::AccessDenied(
+            AccessDenialReason::HostCaptureFailed,
+        ));
+        let encoder = ConnectFailure::from_controller(ControllerError::AccessDenied(
+            AccessDenialReason::HostEncoderFailed,
+        ));
+
+        assert!(!capture.retryable);
+        assert_eq!(capture.kind, "host_capture_failed");
+        assert!(capture.detail.contains("首帧"));
+        assert!(!encoder.retryable);
+        assert_eq!(encoder.kind, "host_encoder_failed");
+        assert!(encoder.detail.contains("视频编码器"));
+    }
+
+    #[test]
+    fn directory_query_retries_interruptions_but_reports_protocol_incompatibility() {
+        let interrupted = TransportError::Connection("stream finished early".to_owned());
+        assert!(directory_transport_error_is_retryable(&interrupted));
+        assert!(directory_transport_error_message(&interrupted).contains("连续中断"));
+
+        let incompatible = TransportError::Malformed;
+        assert!(!directory_transport_error_is_retryable(&incompatible));
+        assert!(directory_transport_error_message(&incompatible).contains("不兼容"));
     }
 
     #[test]
@@ -1359,5 +1748,12 @@ mod tests {
         manager.set_status(ControllerRuntimeSummary::idle());
         manager.remember_active_cancellation();
         assert!(!manager.take_recent_cancellation());
+    }
+
+    #[test]
+    fn brief_connections_do_not_restore_an_exhausted_retry_budget() {
+        assert!(!session_earned_fresh_retry_budget(Duration::from_secs(1)));
+        assert!(!session_earned_fresh_retry_budget(Duration::from_secs(29)));
+        assert!(session_earned_fresh_retry_budget(Duration::from_secs(30)));
     }
 }

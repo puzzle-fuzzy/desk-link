@@ -1,6 +1,33 @@
 export const MAX_POINTER_COORDINATE = 1_000_000;
 export const MAX_WHEEL_DELTA = 1_200;
 
+export type PointerBounds = Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">;
+
+export function normalizedPointerPosition(
+  clientX: number,
+  clientY: number,
+  bounds: PointerBounds,
+): { x: number; y: number } | null {
+  const right = bounds.left + bounds.width;
+  const bottom = bounds.top + bounds.height;
+  if (
+    bounds.width <= 0
+    || bounds.height <= 0
+    || clientX < bounds.left
+    || clientX > right
+    || clientY < bounds.top
+    || clientY > bottom
+  ) {
+    return null;
+  }
+  const x = Math.max(0, Math.min(1, (clientX - bounds.left) / bounds.width));
+  const y = Math.max(0, Math.min(1, (clientY - bounds.top) / bounds.height));
+  return {
+    x: Math.round(x * MAX_POINTER_COORDINATE),
+    y: Math.round(y * MAX_POINTER_COORDINATE),
+  };
+}
+
 const NAMED_KEYS: Readonly<Record<string, string>> = {
   Enter: "enter",
   Escape: "escape",
