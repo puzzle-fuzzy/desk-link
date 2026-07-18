@@ -37,87 +37,30 @@ struct HostHomeView: View {
 
     private var overview: some View {
         VStack(alignment: .leading, spacing: 16) {
-            DeskLinkPanel(background: statusBackground) {
-                HStack(alignment: .center, spacing: 24) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 9) {
-                            DeskLinkStatusLight(color: statusColor)
-                            Text("这台 Mac")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
-                        }
-                        Text(statusTitle)
-                            .font(.system(size: 24, weight: .semibold))
-                            .foregroundStyle(DeskLinkPalette.ink)
-                        Text(statusDetail)
-                            .font(.system(size: 14))
-                            .foregroundStyle(DeskLinkPalette.secondaryInk)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 12)
-                    HStack(spacing: 8) {
-                        if bridge.pairingInvite == nil {
-                            Button("创建连接码") { bridge.createInvite() }
-                                .buttonStyle(DeskLinkPrimaryButtonStyle())
-                                .disabled(!bridge.permissions.canCaptureAndControl)
-                        } else {
-                            Button("复制连接码") { bridge.copyInviteToPasteboard() }
-                                .buttonStyle(DeskLinkPrimaryButtonStyle())
-                        }
-                        Button("刷新状态") { bridge.refreshPermissions() }
-                            .buttonStyle(DeskLinkSecondaryButtonStyle())
-                        if hostIsActive {
-                            Button("停止共享") { bridge.stop() }
-                                .buttonStyle(DeskLinkSecondaryButtonStyle())
-                        }
-                    }
+            pageHeading(
+                "设置 / 诊断",
+                detail: "检查本机共享权限、已批准设备和运行信息。"
+            )
+
+            DeskLinkPanel {
+                VStack(spacing: 0) {
+                    permissionRow(
+                        title: "屏幕录制",
+                        detail: "允许 DeskLink 读取此 Mac 的画面。",
+                        granted: bridge.permissions.screenRecording == .granted,
+                        request: bridge.requestScreenRecording,
+                        settingsURL: bridge.permissions.screenRecordingSettingsURL
+                    )
+                    Divider().padding(.vertical, 14)
+                    permissionRow(
+                        title: "辅助功能",
+                        detail: "允许已批准设备发送键盘与鼠标输入。",
+                        granted: bridge.permissions.accessibility == .granted,
+                        request: bridge.requestAccessibility,
+                        settingsURL: bridge.permissions.accessibilitySettingsURL
+                    )
                 }
             }
-
-            if !bridge.permissions.canCaptureAndControl {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .foregroundStyle(DeskLinkPalette.warning)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("需要完成 macOS 权限设置")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("请在“本机连接”中允许屏幕录制与辅助功能，然后才能创建连接码。")
-                            .font(.system(size: 12))
-                            .foregroundStyle(DeskLinkPalette.secondaryInk)
-                    }
-                    Spacer()
-                }
-                .padding(14)
-                .background(DeskLinkPalette.warningSurface, in: RoundedRectangle(cornerRadius: 8))
-            }
-
-            if let approval = bridge.pendingApproval {
-                ApprovalView(bridge: bridge, approval: approval)
-            }
-
-            HStack(spacing: 0) {
-                fact(
-                    title: "连接方式",
-                    value: "DeskLink 公网中继",
-                    detail: "支持不同网络中的两台设备"
-                )
-                Divider()
-                fact(
-                    title: "系统权限",
-                    value: bridge.permissions.canCaptureAndControl ? "已启用" : "需要设置",
-                    detail: "屏幕录制与远程输入"
-                )
-                Divider()
-                fact(
-                    title: "已批准设备",
-                    value: String(bridge.trustedControllers.count),
-                    detail: "可重新连接此 Mac 的设备"
-                )
-            }
-            .frame(minHeight: 94)
-            .background(DeskLinkPalette.subtle)
-            .overlay(alignment: .top) { Rectangle().fill(DeskLinkPalette.border).frame(height: 1) }
-            .overlay(alignment: .bottom) { Rectangle().fill(DeskLinkPalette.border).frame(height: 1) }
 
             DeskLinkPanel {
                 VStack(alignment: .leading, spacing: 14) {
@@ -149,14 +92,18 @@ struct HostHomeView: View {
 
             DeskLinkPanel {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("本机运行状态")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(DeskLinkPalette.ink)
-                    HStack(spacing: 24) {
-                        metric("视频数据包", value: bridge.metrics.sentVideoPackets)
-                        metric("输入事件", value: bridge.metrics.receivedInputEvents)
-                        metric("关键帧请求", value: bridge.metrics.keyframeRequests)
+                    Text("仅在诊断时展开")
+                        .font(.system(size: 12))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                    DisclosureGroup("运行指标") {
+                        HStack(spacing: 24) {
+                            metric("视频数据包", value: bridge.metrics.sentVideoPackets)
+                            metric("输入事件", value: bridge.metrics.receivedInputEvents)
+                            metric("关键帧请求", value: bridge.metrics.keyframeRequests)
+                        }
+                        .padding(.top, 8)
                     }
+                    .font(.system(size: 12, weight: .semibold))
                 }
             }
 
@@ -169,8 +116,8 @@ struct HostHomeView: View {
     private var connection: some View {
         VStack(alignment: .leading, spacing: 16) {
             pageHeading(
-                "本机连接",
-                detail: "完成两项 macOS 权限设置，并创建供另一台设备使用的连接码。"
+                "共享此设备",
+                detail: "需要让别人控制这台 Mac 时，先完成权限检查并生成连接码。"
             )
 
             DeskLinkPanel {
@@ -217,15 +164,12 @@ struct HostHomeView: View {
                     } else {
                         Button("复制连接码") { bridge.copyInviteToPasteboard() }
                             .buttonStyle(DeskLinkPrimaryButtonStyle())
-                        Button("取消连接码") { bridge.stop() }
+                        Button("停止共享") { bridge.stop() }
                             .buttonStyle(DeskLinkSecondaryButtonStyle())
                     }
                 }
             }
 
-            if let approval = bridge.pendingApproval {
-                ApprovalView(bridge: bridge, approval: approval)
-            }
             if let error = bridge.lastError {
                 DeskLinkErrorView(message: error)
             }
@@ -244,7 +188,7 @@ struct HostHomeView: View {
                         Text("还没有已批准设备")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(DeskLinkPalette.ink)
-                        Text("请先在“本机连接”创建连接码，然后在另一台设备发起连接并在此 Mac 上批准。")
+                        Text("请先在“共享此设备”创建连接码，然后在另一台设备发起连接并在此 Mac 上批准。")
                             .font(.system(size: 13))
                             .foregroundStyle(DeskLinkPalette.secondaryInk)
                     }
@@ -292,22 +236,6 @@ struct HostHomeView: View {
                 .font(.system(size: 13))
                 .foregroundStyle(DeskLinkPalette.secondaryInk)
         }
-    }
-
-    private func fact(title: String, value: String, detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(DeskLinkPalette.mutedInk)
-            Text(value)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(DeskLinkPalette.ink)
-            Text(detail)
-                .font(.system(size: 11))
-                .foregroundStyle(DeskLinkPalette.mutedInk)
-        }
-        .padding(.horizontal, 18)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func permissionRow(
@@ -364,65 +292,6 @@ struct HostHomeView: View {
             Text(title)
                 .font(.system(size: 11))
                 .foregroundStyle(DeskLinkPalette.mutedInk)
-        }
-    }
-
-    private var statusTitle: String {
-        switch bridge.state {
-        case .idle, .closed:
-            bridge.permissions.canCaptureAndControl ? "可以接收远程连接" : "需要完成系统权限"
-        case .connecting: "正在等待另一台设备"
-        case .waitingForApproval: "有设备等待批准"
-        case .negotiating: "正在建立安全会话"
-        case .connected: "此 Mac 正在被控制"
-        case .stopping: "正在停止共享"
-        case .failed: "本机连接已停止"
-        }
-    }
-
-    private var statusDetail: String {
-        switch bridge.state {
-        case .idle, .closed:
-            bridge.permissions.canCaptureAndControl
-                ? "创建连接码后，可在另一台 Windows 或 Mac 设备上发起连接。"
-                : "允许屏幕录制与辅助功能后，DeskLink 才能共享画面和接收输入。"
-        case .connecting: "连接码已经创建，DeskLink 正在等待控制端加入中继会话。"
-        case .waitingForApproval: "请核对设备身份后决定是否允许此次控制。"
-        case .negotiating: "身份已经确认，正在协商画面与输入能力。"
-        case .connected: "远程画面和输入通道已启用，可随时停止共享或撤销设备。"
-        case .stopping: "DeskLink 正在释放画面、输入和中继连接。"
-        case .failed(let message): deskLinkChineseError(message)
-        }
-    }
-
-    private var statusColor: Color {
-        switch bridge.state {
-        case .connected: DeskLinkPalette.success
-        case .connecting, .waitingForApproval, .negotiating, .stopping: DeskLinkPalette.info
-        case .failed: DeskLinkPalette.error
-        case .idle, .closed:
-            bridge.permissions.canCaptureAndControl ? DeskLinkPalette.success : DeskLinkPalette.warning
-        }
-    }
-
-    private var statusBackground: Color {
-        switch bridge.state {
-        case .connected: DeskLinkPalette.successSurface
-        case .failed: DeskLinkPalette.errorSurface
-        case .connecting, .waitingForApproval, .negotiating, .stopping: DeskLinkPalette.infoSurface
-        case .idle, .closed:
-            bridge.permissions.canCaptureAndControl ? DeskLinkPalette.successSurface : DeskLinkPalette.warningSurface
-        }
-    }
-
-    private var hostIsActive: Bool {
-        !matchesInactive(bridge.state)
-    }
-
-    private func matchesInactive(_ state: HostState) -> Bool {
-        switch state {
-        case .idle, .closed, .failed: true
-        default: false
         }
     }
 

@@ -2,33 +2,22 @@ import SwiftUI
 
 struct ControllerHomeView: View {
     @ObservedObject var bridge: ControllerBridge
+    let openSharing: () -> Void
     @State private var savedHosts: [SavedHost] = []
     @State private var storeError: String?
     private let savedHostStore = SavedHostStore()
 
+    init(bridge: ControllerBridge, openSharing: @escaping () -> Void = {}) {
+        self.bridge = bridge
+        self.openSharing = openSharing
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                DeskLinkPanel(background: statusBackground) {
-                    HStack(alignment: .center, spacing: 24) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(spacing: 9) {
-                                DeskLinkStatusLight(color: statusColor)
-                                Text("控制端")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(DeskLinkPalette.secondaryInk)
-                            }
-                            Text(statusTitle)
-                                .font(.system(size: 24, weight: .semibold))
-                                .foregroundStyle(DeskLinkPalette.ink)
-                            Text(statusDetail)
-                                .font(.system(size: 14))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
-                        }
-                        Spacer(minLength: 12)
-                        ConnectView(bridge: bridge)
-                    }
-                }
+                pageHeading("连接设备", detail: "输入连接码，开始控制另一台设备")
+
+                ConnectView(bridge: bridge)
 
                 DeskLinkPanel {
                     VStack(alignment: .leading, spacing: 14) {
@@ -89,27 +78,51 @@ struct ControllerHomeView: View {
                     }
                 }
 
-                if let verifyKey = bridge.controllerVerifyKeyHex {
-                    DisclosureGroup("此 Mac 的控制端校验信息") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("仅在排查设备身份问题时使用。")
-                                .font(.system(size: 11))
-                                .foregroundStyle(DeskLinkPalette.mutedInk)
-                            Text(verifyKey)
-                                .font(.system(size: 11, design: .monospaced))
+                DeskLinkPanel {
+                    HStack(alignment: .center, spacing: 16) {
+                        Image(systemName: "macbook.and.iphone")
+                            .font(.system(size: 20))
+                            .foregroundStyle(DeskLinkPalette.secondaryInk)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("允许别人连接此设备")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(DeskLinkPalette.ink)
+                            Text("需要共享这台 Mac 时，先检查权限并生成连接码。")
+                                .font(.system(size: 12))
                                 .foregroundStyle(DeskLinkPalette.secondaryInk)
-                                .textSelection(.enabled)
                         }
-                        .padding(.top, 8)
+                        Spacer()
+                        Button("共享此设备", action: openSharing)
+                            .buttonStyle(DeskLinkSecondaryButtonStyle())
                     }
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(14)
-                    .background(DeskLinkPalette.subtle, in: RoundedRectangle(cornerRadius: 8))
                 }
 
-                DiagnosticsView(bridge: bridge)
+                DisclosureGroup("连接诊断") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        DiagnosticsView(bridge: bridge)
 
-                if let error = bridge.lastError ?? storeError {
+                        if let verifyKey = bridge.controllerVerifyKeyHex {
+                            DisclosureGroup("此 Mac 的控制端校验信息") {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("仅在排查设备身份问题时使用。")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(DeskLinkPalette.mutedInk)
+                                    Text(verifyKey)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                                        .textSelection(.enabled)
+                                }
+                                .padding(.top, 8)
+                            }
+                        }
+                    }
+                    .padding(.top, 8)
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .padding(14)
+                .background(DeskLinkPalette.subtle, in: RoundedRectangle(cornerRadius: 8))
+
+                if let error = bridge.userFacingError.isEmpty ? storeError : bridge.userFacingError {
                     DeskLinkErrorView(message: error)
                 }
             }
@@ -128,56 +141,14 @@ struct ControllerHomeView: View {
         }
     }
 
-    private var statusTitle: String {
-        switch bridge.state {
-        case .idle, .closed: "选择要控制的设备"
-        case .pairing: "等待另一台设备批准"
-        case .connecting: "正在建立安全连接"
-        case .connected: "远程控制已连接"
-        case .reconnecting: "正在恢复连接"
-        case .recovering: "正在恢复远程画面"
-        case .frozen: "远程画面已暂停"
-        case .failed: "连接未建立"
-        }
-    }
-
-    private var statusDetail: String {
-        switch bridge.state {
-        case .idle, .closed:
-            "粘贴另一台设备创建的连接码，或从已保存列表直接重新连接。"
-        case .pairing:
-            "请回到被控制设备，核对身份并批准此 Mac。"
-        case .connecting:
-            "DeskLink 正在连接中继并验证另一台设备的身份。"
-        case .connected:
-            "远程画面和输入通道已经启用。"
-        case .reconnecting:
-            "网络连接暂时中断，DeskLink 会自动恢复。"
-        case .recovering:
-            "连接仍然安全，正在等待新的关键帧。"
-        case .frozen:
-            "没有收到可显示的新画面，请请求关键帧或重新连接。"
-        case .failed(let message):
-            deskLinkChineseError(message)
-        }
-    }
-
-    private var statusColor: Color {
-        switch bridge.state {
-        case .connected: DeskLinkPalette.success
-        case .pairing, .connecting, .reconnecting, .recovering: DeskLinkPalette.info
-        case .frozen: DeskLinkPalette.warning
-        case .failed: DeskLinkPalette.error
-        case .idle, .closed: DeskLinkPalette.success
-        }
-    }
-
-    private var statusBackground: Color {
-        switch bridge.state {
-        case .connected, .idle, .closed: DeskLinkPalette.successSurface
-        case .pairing, .connecting, .reconnecting, .recovering: DeskLinkPalette.infoSurface
-        case .frozen: DeskLinkPalette.warningSurface
-        case .failed: DeskLinkPalette.errorSurface
+    private func pageHeading(_ title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(DeskLinkPalette.ink)
+            Text(detail)
+                .font(.system(size: 13))
+                .foregroundStyle(DeskLinkPalette.secondaryInk)
         }
     }
 

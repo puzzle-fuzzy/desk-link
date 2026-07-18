@@ -1,6 +1,24 @@
 import { describe, expect, test } from "bun:test";
 
-import { nextTabIndex } from "./navigation";
+import {
+  DESKTOP_NAV_ITEMS,
+  navigationViewFor,
+  nextTabIndex,
+} from "./navigation";
+
+test("uses remote tasks as the shared desktop navigation", () => {
+  expect(DESKTOP_NAV_ITEMS.map((item) => item.label)).toEqual([
+    "连接设备",
+    "共享此设备",
+    "已批准设备",
+    "设置 / 诊断",
+  ]);
+});
+
+test("keeps pairing and fixed access as secondary pages", () => {
+  expect(navigationViewFor("pairing")).toBe("connection");
+  expect(navigationViewFor("fixedAccess")).toBe("settings");
+});
 
 describe("keyboard tab navigation", () => {
   test("moves between adjacent tabs and wraps at both ends", () => {

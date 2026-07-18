@@ -164,7 +164,7 @@ export function renderControllerView(): string {
       ${feedback ? renderFeedback(feedback) : ""}
       <div class="controller-heading">
         <div>
-          <h1>控制其他电脑</h1>
+          <h1>连接设备</h1>
           <p>输入对方电脑显示的设备 ID 和访问密码，然后在对方电脑上确认连接。</p>
         </div>
         ${renderRuntimeBadge()}

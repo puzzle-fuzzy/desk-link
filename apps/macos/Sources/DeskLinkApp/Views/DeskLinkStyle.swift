@@ -1,10 +1,10 @@
 import SwiftUI
 
 enum DeskLinkSection: String, CaseIterable, Identifiable {
-    case overview = "本机状态"
-    case controller = "控制另一台"
-    case connection = "本机连接"
+    case connect = "连接设备"
+    case share = "共享此设备"
     case devices = "已批准设备"
+    case settings = "设置 / 诊断"
 
     var id: Self { self }
 }
@@ -32,16 +32,21 @@ enum DeskLinkPalette {
 
 struct DeskLinkShell<Content: View>: View {
     @Binding var selection: DeskLinkSection
-    let needsAttention: Bool
+    @ObservedObject var host: HostBridge
+    @ObservedObject var controller: ControllerBridge
     let content: () -> Content
+
+    @State private var isShowingHostStatus = false
 
     init(
         selection: Binding<DeskLinkSection>,
-        needsAttention: Bool,
+        host: HostBridge,
+        controller: ControllerBridge,
         @ViewBuilder content: @escaping () -> Content
     ) {
         _selection = selection
-        self.needsAttention = needsAttention
+        self.host = host
+        self.controller = controller
         self.content = content
     }
 
@@ -58,12 +63,33 @@ struct DeskLinkShell<Content: View>: View {
                         .foregroundStyle(DeskLinkPalette.mutedInk)
                 }
                 Spacer()
-                Label(
-                    needsAttention ? "需要检查连接" : "钥匙串保护已启用",
-                    systemImage: needsAttention ? "exclamationmark.circle" : "checkmark.circle"
-                )
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(needsAttention ? DeskLinkPalette.warning : DeskLinkPalette.success)
+                Button {
+                    isShowingHostStatus = true
+                } label: {
+                    let status = deskLinkHostStatus(
+                        for: host.state,
+                        permissions: host.permissions,
+                        hasPendingApproval: host.pendingApproval != nil,
+                        lastError: host.lastError
+                    )
+                    Label(status.title, systemImage: status.systemImage)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(color(for: status.tone))
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $isShowingHostStatus) {
+                    DeskLinkHostStatusPopover(
+                        host: host,
+                        openSettings: {
+                            isShowingHostStatus = false
+                            selection = .settings
+                        },
+                        openSharing: {
+                            isShowingHostStatus = false
+                            selection = .share
+                        }
+                    )
+                }
             }
             .padding(.horizontal, 28)
             .frame(height: 65)
@@ -105,6 +131,15 @@ struct DeskLinkShell<Content: View>: View {
         }
         .frame(minWidth: 760, minHeight: 560)
         .background(DeskLinkPalette.surface)
+    }
+
+    private func color(for tone: DeskLinkHostStatusTone) -> Color {
+        switch tone {
+        case .ready: DeskLinkPalette.success
+        case .attention: DeskLinkPalette.warning
+        case .idle: DeskLinkPalette.mutedInk
+        case .working: DeskLinkPalette.info
+        }
     }
 }
 

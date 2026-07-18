@@ -81,7 +81,7 @@ python scripts/verify-managed-relay.py
 
 ## 两台 Windows 电脑使用
 
-两台电脑安装同一个 DeskLink 安装包。被控制电脑启用远程连接并生成临时密码或固定密码；控制电脑输入设备 ID 和访问密码后发起安全连接，再由主机核对完整身份并批准。
+两台电脑安装同一个 DeskLink 安装包。被控制电脑点击“启用远程连接”并生成临时密码或固定密码；控制电脑在“连接设备”中输入设备 ID 和访问密码，再由主机核对完整身份并批准。
 
 完整步骤、输入范围与故障处理见 [`docs/windows-two-pc-setup.md`](docs/windows-two-pc-setup.md)。
 
@@ -120,7 +120,9 @@ open dist/macos/DeskLink.app
 
 `build-macos-arm64.sh --check` 会先构建 `aarch64-apple-darwin` Rust FFI，再构建 arm64 Swift release executable，生成 `dist/macos/DeskLink.app`，并检查可执行文件架构、bundle identifier、Screen Recording 声明和最低系统版本。`verify-macos-runtime.sh` 运行 Rust FFI、local-relay fake-media 端到端测试与 Swift arm64 测试。
 
-macOS 保持独立的 SwiftUI 页面和平台权限流程，共享协议与 Rust 核心，但不作为 Windows 1.0 发布门禁。Apple 平台的页面结构和双机验收在 Apple Silicon 设备上单独维护。
+macOS 主窗口与 Windows 使用同一套 remote-task-first 中文页面结构：`连接设备`、`最近设备`、`共享此设备`、`已批准设备` 和 `设置 / 诊断`。控制端在“连接设备”粘贴连接码或选择最近设备；主机在“共享此设备”授予屏幕录制与辅助功能权限、创建连接码，并在本机核对控制端身份后批准。
+
+当前仓库没有 `apps/ios` 客户端工程，因此 iOS 本轮只有统一页面契约，没有可执行产物。iOS 默认进入“连接设备”，可使用底部导航或 sheet；“共享此设备”不得渲染成可执行的 iOS 被控入口。
 
 长期身份、可信控制端和已批准 host 的重连材料保存在当前用户 Apple Keychain。邀请仅应通过可信渠道传递；身份更换、撤销、邀请过期或凭据变化后，应重新创建邀请并配对。
 
