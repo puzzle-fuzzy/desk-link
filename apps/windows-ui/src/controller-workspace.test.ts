@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
 
-import { CONTROLLER_CONNECTION_ENTRIES } from "./controller-workspace";
+import {
+  CONTROLLER_CONNECTION_ENTRIES,
+  deviceCredentialsEntryOpenAttribute,
+} from "./controller-workspace";
 
 test("makes connection code primary and device credentials secondary", () => {
   expect(CONTROLLER_CONNECTION_ENTRIES.map((entry) => entry.id)).toEqual([
@@ -16,4 +19,9 @@ test("makes connection code primary and device credentials secondary", () => {
     priority: "secondary",
     title: "使用设备 ID 和密码",
   });
+});
+
+test("opens device credentials when a saved device needs a password update", () => {
+  expect(deviceCredentialsEntryOpenAttribute(false)).toBe("");
+  expect(deviceCredentialsEntryOpenAttribute(true)).toBe(" open");
 });

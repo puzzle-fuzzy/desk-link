@@ -37,7 +37,10 @@ import type {
   ControllerVideoConfigSignal,
 } from "./types";
 import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
-import { CONTROLLER_CONNECTION_ENTRIES } from "./controller-workspace";
+import {
+  CONTROLLER_CONNECTION_ENTRIES,
+  deviceCredentialsEntryOpenAttribute,
+} from "./controller-workspace";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -64,6 +67,7 @@ let requestRender: RenderRequest = () => {};
 let decodedFrames = 0;
 let textSending = false;
 let failedVideoConfig: string | null = null;
+let deviceCredentialsEntryOpen = false;
 
 export async function initializeController(renderer: RenderRequest): Promise<void> {
   requestRender = renderer;
@@ -156,6 +160,7 @@ export function bindControllerInteractions(): void {
       }
       deviceIdDraft = formatDeviceId(selected);
       temporaryPasswordDraft = "";
+      deviceCredentialsEntryOpen = true;
       feedback = { tone: "info", message: "请输入主机当前显示的新密码；验证成功后会替换已保存密码。" };
       requestRender();
       window.setTimeout(() => document.querySelector<HTMLInputElement>("[data-controller-password]")?.focus(), 0);
@@ -342,7 +347,7 @@ function renderConnectionPanel(): string {
         </aside>
       </div>
       ${renderSavedDevices(isWorking)}
-      <details class="controller-legacy-panel">
+      <details class="controller-legacy-panel"${deviceCredentialsEntryOpenAttribute(deviceCredentialsEntryOpen)}>
         <summary>${deviceCredentialsEntry.title}（其他方式）</summary>
         <div class="controller-legacy-content">
           <p>没有连接码时，可以输入主机显示的设备 ID，以及临时密码或固定密码。</p>
@@ -773,6 +778,7 @@ function handleSignal(signal: ControllerSignal): void {
       }
       if (signal.runtime.state === "connected") {
         temporaryPasswordDraft = "";
+        deviceCredentialsEntryOpen = false;
       }
       requestRender();
       break;

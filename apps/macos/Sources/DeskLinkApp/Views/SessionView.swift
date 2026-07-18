@@ -1,6 +1,12 @@
 import CoreVideo
 import SwiftUI
 
+let deskLinkSessionSafetyCopy = "退出窗口前，DeskLink 会释放所有按键与鼠标状态。"
+
+func deskLinkSessionStatusText(for state: ConnectionState) -> String {
+    deskLinkConnectionStatus(for: state).title
+}
+
 struct SessionView: View {
     @ObservedObject var bridge: ControllerBridge
 
@@ -53,11 +59,16 @@ struct SessionView: View {
 
             Rectangle().fill(DeskLinkPalette.border).frame(height: 1)
 
-            HStack {
-                Text("已接收 \(bridge.metrics.receivedFrames) 帧")
-                Text("已丢弃 \(bridge.metrics.droppedFrames) 帧")
+            HStack(alignment: .top) {
+                DisclosureGroup("会话诊断") {
+                    HStack {
+                        Text("已接收 \(bridge.metrics.receivedFrames) 帧")
+                        Text("已丢弃 \(bridge.metrics.droppedFrames) 帧")
+                    }
+                    .padding(.top, 4)
+                }
                 Spacer()
-                Text("退出窗口前，DeskLink 会释放所有按键与鼠标状态。")
+                Text(deskLinkSessionSafetyCopy)
             }
             .font(.system(size: 11))
             .foregroundStyle(DeskLinkPalette.mutedInk)
@@ -75,13 +86,7 @@ struct SessionView: View {
     }
 
     private var statusText: String {
-        switch bridge.state {
-        case let .connected(streamID): "已连接，视频流 \(streamID)"
-        case .reconnecting: "正在恢复连接"
-        case .recovering: "正在恢复画面"
-        case .frozen: "远程画面已暂停"
-        default: "正在准备远程画面"
-        }
+        deskLinkSessionStatusText(for: bridge.state)
     }
 
     private var videoPlaceholder: String {

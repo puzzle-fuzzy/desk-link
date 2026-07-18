@@ -108,4 +108,23 @@ final class DeskLinkNavigationTests: XCTestCase {
             XCTAssertEqual(deskLinkConnectionStatus(for: state).title, expectedTitle)
         }
     }
+
+    func testActiveSessionUsesConnectionStatusTitlesWithoutStreamDetails() {
+        let cases: [(ConnectionState, String)] = [
+            (.connected(streamID: 7), "已连接"),
+            (.reconnecting, "正在恢复连接"),
+            (.recovering, "正在恢复连接"),
+            (.frozen, "画面暂时冻结"),
+            (.failed("relay unavailable"), "连接失败"),
+        ]
+
+        for (state, expectedTitle) in cases {
+            XCTAssertEqual(deskLinkSessionStatusText(for: state), expectedTitle)
+        }
+    }
+
+    func testActiveSessionKeepsOnlyReleaseSafetyCopyOutsideDiagnostics() {
+        XCTAssertEqual(deskLinkSessionSafetyCopy, "退出窗口前，DeskLink 会释放所有按键与鼠标状态。")
+        XCTAssertFalse(deskLinkSessionSafetyCopy.contains("帧"))
+    }
 }

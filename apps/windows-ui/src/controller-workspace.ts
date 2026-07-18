@@ -19,3 +19,7 @@ export const CONTROLLER_CONNECTION_ENTRIES = [
     action: "查找并连接设备",
   },
 ] as const satisfies ReadonlyArray<ControllerConnectionEntry>;
+
+export function deviceCredentialsEntryOpenAttribute(isOpen: boolean): string {
+  return isOpen ? " open" : "";
+}
