@@ -1,6 +1,13 @@
 import AppKit
 import SwiftUI
 
+func deskLinkApprovalForWindowPresentation(
+    _ approval: HostApproval?,
+    controllerState _: ConnectionState
+) -> HostApproval? {
+    approval
+}
+
 @MainActor
 private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
     weak var controller: ControllerBridge?
@@ -63,6 +70,12 @@ struct DeskLinkApp: App {
                     }
                 }
             }
+            .sheet(item: pendingApproval) { approval in
+                ApprovalView(bridge: host, approval: approval)
+                    .padding(24)
+                    .frame(minWidth: 520)
+                    .interactiveDismissDisabled()
+            }
             .onAppear { lifecycle.configure(controller: controller, host: host) }
             .onDisappear {
                 host.shutdown()
@@ -70,6 +83,18 @@ struct DeskLinkApp: App {
                 controller.disconnect()
             }
         }
+    }
+
+    private var pendingApproval: Binding<HostApproval?> {
+        Binding(
+            get: {
+                deskLinkApprovalForWindowPresentation(
+                    host.pendingApproval,
+                    controllerState: controller.state
+                )
+            },
+            set: { _ in }
+        )
     }
 
     private func isControllerSessionState(_ state: ConnectionState) -> Bool {

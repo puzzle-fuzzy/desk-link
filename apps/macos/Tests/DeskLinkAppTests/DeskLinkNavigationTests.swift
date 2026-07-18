@@ -127,4 +127,28 @@ final class DeskLinkNavigationTests: XCTestCase {
         XCTAssertEqual(deskLinkSessionSafetyCopy, "退出窗口前，DeskLink 会释放所有按键与鼠标状态。")
         XCTAssertFalse(deskLinkSessionSafetyCopy.contains("帧"))
     }
+
+    func testWindowApprovalPresenterRemainsAvailableDuringControllerSessions() {
+        let approval = HostApproval(
+            id: UUID(),
+            fingerprint: "controller-fingerprint",
+            controllerDeviceID: [0x01],
+            controllerVerifyKey: [0x02]
+        )
+
+        let sessionStates: [ConnectionState] = [
+            .connected(streamID: 7),
+            .reconnecting,
+            .recovering,
+            .frozen,
+        ]
+
+        for state in sessionStates {
+            XCTAssertEqual(
+                deskLinkApprovalForWindowPresentation(approval, controllerState: state),
+                approval,
+                "A host approval must remain presentable while \(state) replaces the shell with SessionView."
+            )
+        }
+    }
 }

@@ -131,19 +131,6 @@ struct DeskLinkShell<Content: View>: View {
         }
         .frame(minWidth: 760, minHeight: 560)
         .background(DeskLinkPalette.surface)
-        .sheet(item: pendingApproval) { approval in
-            ApprovalView(bridge: host, approval: approval)
-                .padding(24)
-                .frame(minWidth: 520)
-                .interactiveDismissDisabled()
-        }
-    }
-
-    private var pendingApproval: Binding<HostApproval?> {
-        Binding(
-            get: { host.pendingApproval },
-            set: { _ in }
-        )
     }
 
     private func color(for tone: DeskLinkHostStatusTone) -> Color {
