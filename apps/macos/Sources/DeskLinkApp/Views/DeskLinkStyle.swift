@@ -66,7 +66,12 @@ struct DeskLinkShell<Content: View>: View {
                 Button {
                     isShowingHostStatus = true
                 } label: {
-                    let status = deskLinkHostStatus(for: host.state, lastError: host.lastError)
+                    let status = deskLinkHostStatus(
+                        for: host.state,
+                        permissions: host.permissions,
+                        hasPendingApproval: host.pendingApproval != nil,
+                        lastError: host.lastError
+                    )
                     Label(status.title, systemImage: status.systemImage)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(color(for: status.tone))
@@ -75,8 +80,14 @@ struct DeskLinkShell<Content: View>: View {
                 .popover(isPresented: $isShowingHostStatus) {
                     DeskLinkHostStatusPopover(
                         host: host,
-                        openSettings: { selection = .settings },
-                        openSharing: { selection = .share }
+                        openSettings: {
+                            isShowingHostStatus = false
+                            selection = .settings
+                        },
+                        openSharing: {
+                            isShowingHostStatus = false
+                            selection = .share
+                        }
                     )
                 }
             }
@@ -120,6 +131,19 @@ struct DeskLinkShell<Content: View>: View {
         }
         .frame(minWidth: 760, minHeight: 560)
         .background(DeskLinkPalette.surface)
+        .sheet(item: pendingApproval) { approval in
+            ApprovalView(bridge: host, approval: approval)
+                .padding(24)
+                .frame(minWidth: 520)
+                .interactiveDismissDisabled()
+        }
+    }
+
+    private var pendingApproval: Binding<HostApproval?> {
+        Binding(
+            get: { host.pendingApproval },
+            set: { _ in }
+        )
     }
 
     private func color(for tone: DeskLinkHostStatusTone) -> Color {

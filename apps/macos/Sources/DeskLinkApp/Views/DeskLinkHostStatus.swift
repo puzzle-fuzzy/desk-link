@@ -22,12 +22,44 @@ struct DeskLinkHostStatus: Equatable {
     }
 }
 
-func deskLinkHostStatus(for state: HostState, lastError: String?) -> DeskLinkHostStatus {
+func deskLinkHostStatus(
+    for state: HostState,
+    permissions: MacPermissionSnapshot,
+    hasPendingApproval: Bool,
+    lastError: String?
+) -> DeskLinkHostStatus {
     if lastError != nil {
         return DeskLinkHostStatus(
             title: "需要处理",
             detail: "打开设置检查本机共享权限",
             tone: .attention
+        )
+    }
+
+    if !permissions.canCaptureAndControl {
+        let detail: String
+        switch (permissions.screenRecording, permissions.accessibility) {
+        case (.denied, .denied):
+            detail = "在系统设置中允许屏幕录制与辅助功能"
+        case (.denied, .granted):
+            detail = "在系统设置中允许屏幕录制"
+        case (.granted, .denied):
+            detail = "在系统设置中允许辅助功能"
+        case (.granted, .granted):
+            detail = "打开设置检查本机共享权限"
+        }
+        return DeskLinkHostStatus(
+            title: "需要处理",
+            detail: detail,
+            tone: .attention
+        )
+    }
+
+    if hasPendingApproval {
+        return DeskLinkHostStatus(
+            title: "等待确认",
+            detail: "有设备请求控制这台 Mac，请允许或拒绝",
+            tone: .working
         )
     }
 
@@ -46,8 +78,8 @@ func deskLinkHostStatus(for state: HostState, lastError: String?) -> DeskLinkHos
         )
     case .connected:
         return DeskLinkHostStatus(
-            title: "本机可被连接",
-            detail: "共享已准备好，等待远程控制请求",
+            title: "正在共享本机",
+            detail: "远程设备正在查看并控制这台 Mac",
             tone: .ready
         )
     case .failed:
@@ -59,13 +91,32 @@ func deskLinkHostStatus(for state: HostState, lastError: String?) -> DeskLinkHos
     }
 }
 
+func deskLinkHostStatus(for state: HostState, lastError: String?) -> DeskLinkHostStatus {
+    deskLinkHostStatus(
+        for: state,
+        permissions: MacPermissionSnapshot(
+            screenRecording: .granted,
+            accessibility: .granted,
+            screenRecordingSettingsURL: MacPermissions.screenRecordingSettingsURL,
+            accessibilitySettingsURL: MacPermissions.accessibilitySettingsURL
+        ),
+        hasPendingApproval: false,
+        lastError: lastError
+    )
+}
+
 struct DeskLinkHostStatusPopover: View {
     @ObservedObject var host: HostBridge
     let openSettings: () -> Void
     let openSharing: () -> Void
 
     var body: some View {
-        let status = deskLinkHostStatus(for: host.state, lastError: host.lastError)
+        let status = deskLinkHostStatus(
+            for: host.state,
+            permissions: host.permissions,
+            hasPendingApproval: host.pendingApproval != nil,
+            lastError: host.lastError
+        )
 
         VStack(alignment: .leading, spacing: 12) {
             Text("本机共享")

@@ -62,10 +62,6 @@ struct HostHomeView: View {
                 }
             }
 
-            if let approval = bridge.pendingApproval {
-                ApprovalView(bridge: bridge, approval: approval)
-            }
-
             DeskLinkPanel {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack(alignment: .firstTextBaseline) {
@@ -96,10 +92,7 @@ struct HostHomeView: View {
 
             DeskLinkPanel {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("运行指标")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(DeskLinkPalette.ink)
-                    Text("视频 \(bridge.metrics.sentVideoPackets) · 输入 \(bridge.metrics.receivedInputEvents) · 关键帧 \(bridge.metrics.keyframeRequests)")
+                    Text("仅在诊断时展开")
                         .font(.system(size: 12))
                         .foregroundStyle(DeskLinkPalette.secondaryInk)
                     DisclosureGroup("运行指标") {
@@ -177,9 +170,6 @@ struct HostHomeView: View {
                 }
             }
 
-            if let approval = bridge.pendingApproval {
-                ApprovalView(bridge: bridge, approval: approval)
-            }
             if let error = bridge.lastError {
                 DeskLinkErrorView(message: error)
             }

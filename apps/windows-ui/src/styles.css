@@ -198,6 +198,14 @@ select:focus-visible {
   color: var(--warning);
 }
 
+.host-status-chip--working {
+  color: var(--info);
+}
+
+.host-status-chip--ready {
+  color: var(--success);
+}
+
 .section-nav {
   display: flex;
   gap: 26px;

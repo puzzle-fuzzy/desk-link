@@ -44,6 +44,7 @@ import {
 } from "./navigation";
 import { LatestRequest } from "./latest-request";
 import { escapeHtml } from "./html";
+import { hostStatusSummary } from "./host-status";
 
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
 
@@ -170,13 +171,8 @@ function renderHeader(): string {
 }
 
 function renderHostStatusChip(state: HostSnapshot): string {
-  const attention = Boolean(state.connectionError || state.trustedError || state.fixedPasswordError);
-  const title = attention
-    ? "需要处理"
-    : state.connection
-      ? "本机可被连接"
-      : "未开启共享";
-  return `<button class="host-status-chip host-status-chip--${attention ? "attention" : "quiet"}" type="button" data-open-overview aria-label="${title}，打开设置 / 诊断">${title}</button>`;
+  const status = hostStatusSummary(state);
+  return `<button class="host-status-chip host-status-chip--${status.tone}" type="button" data-open-overview aria-label="${escapeHtml(status.title)}，${escapeHtml(status.detail)}，打开设置 / 诊断">${escapeHtml(status.title)}</button>`;
 }
 
 function renderNavigation(): string {

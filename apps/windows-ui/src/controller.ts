@@ -37,6 +37,7 @@ import type {
   ControllerVideoConfigSignal,
 } from "./types";
 import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
+import { CONTROLLER_CONNECTION_ENTRIES } from "./controller-workspace";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -278,6 +279,7 @@ function renderRuntimeBadge(): string {
 }
 
 function renderConnectionPanel(): string {
+  const [connectionCodeEntry, deviceCredentialsEntry] = CONTROLLER_CONNECTION_ENTRIES;
   const saved = snapshot?.savedConnection;
   const connectionState = snapshot?.runtime.state ?? "idle";
   const connectionActive = busy || isActiveConnectionState(connectionState);
@@ -298,55 +300,38 @@ function renderConnectionPanel(): string {
     <div class="connection-workspace">
       <div class="controller-connect-grid">
         <section class="controller-card controller-card--primary">
-        <div class="controller-card-heading">
-          <div><h2>连接远程设备</h2><p>输入另一台电脑显示的本机 ID，以及临时密码或固定密码。</p></div>
-        </div>
-        <form class="controller-form controller-device-form" data-controller-device-form>
-          <label class="field device-credential-field">
-            <span>设备 ID</span>
-            <input
-              class="device-id-input"
-              name="deviceId"
-              data-controller-device-id
-              value="${escapeHtml(deviceIdDraft)}"
-              inputmode="numeric"
-              maxlength="15"
-              placeholder="123 456 789 012"
-              aria-describedby="controller-device-hint"
-              required
-              autocomplete="off"
-              spellcheck="false"
-              ${isWorking ? "disabled" : ""}
-            >
-          </label>
-          <label class="field device-credential-field">
-            <span>访问密码</span>
-            <input
-              class="temporary-password-input"
-              name="temporaryPassword"
-              data-controller-password
-              value="${escapeHtml(temporaryPasswordDraft)}"
-              maxlength="8"
-              placeholder="8 位访问密码"
-              aria-describedby="controller-device-hint"
-              required
-              autocomplete="one-time-code"
-              autocapitalize="characters"
-              spellcheck="false"
-              ${isWorking ? "disabled" : ""}
-            >
-          </label>
-          <p class="controller-device-hint" id="controller-device-hint">可以使用主机刚生成的临时密码，或主机已启用的固定密码。</p>
-          <div class="controller-form-actions">
-            <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
-              ${connectionActive ? `<span class="button-spinner" aria-hidden="true"></span> ${escapeHtml(connectionActionLabel(connectionState))}` : connectionState === "stopped" || retryAvailable ? "重新尝试" : "查找并连接设备"}
-            </button>
-            ${connectionActive || cancelling
-              ? `<button class="button button--secondary" type="button" data-controller-cancel ${cancelling ? "disabled" : ""}>${cancelling ? "正在取消…" : "取消连接"}</button>`
-              : ""}
-            <span>${connectionActive ? "取消后仍会保留已输入的 ID 和密码，方便再次尝试。" : "找到设备后，主机会显示本次控制请求。"}</span>
+          <div class="controller-card-heading">
+            <div><h2>${connectionCodeEntry.title}</h2><p>粘贴另一台电脑生成的完整连接码，DeskLink 会自动识别连接地址。</p></div>
           </div>
-        </form>
+          <form class="controller-form" data-controller-legacy-form>
+            <label class="field">
+              <span>连接码</span>
+              <textarea name="invitation" data-controller-invitation rows="4" maxlength="1024" placeholder="在这里粘贴完整连接码" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>${escapeHtml(invitationDraft)}</textarea>
+            </label>
+            <div class="connection-code-status connection-code-status--${codeStatus.tone}" data-controller-code-status role="status">
+              <span aria-hidden="true"></span><p>${escapeHtml(codeStatus.text)}</p>
+            </div>
+            <details class="controller-network-details">
+              <summary>高级连接设置</summary>
+              <div class="field-grid field-grid--controller">
+                <label class="field">
+                  <span>中继地址</span>
+                  <input name="relayAddress" data-controller-relay-address value="${escapeHtml(recognizedCode?.relayAddress ?? relayDraft)}" placeholder="relay.example.com:4433" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
+                </label>
+                <label class="field">
+                  <span>TLS 服务器名称</span>
+                  <input name="serverName" data-controller-server-name value="${escapeHtml(recognizedCode?.serverName ?? serverNameDraft)}" placeholder="relay.example.com" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
+                </label>
+              </div>
+            </details>
+            <div class="controller-form-actions">
+              <button class="button button--primary" type="submit" ${isWorking ? "disabled" : ""}>${connectionCodeEntry.action}</button>
+              ${connectionActive || cancelling
+                ? `<button class="button button--secondary" type="button" data-controller-cancel ${cancelling ? "disabled" : ""}>${cancelling ? "正在取消…" : "取消连接"}</button>`
+                : ""}
+              <button class="button button--secondary" type="button" data-controller-probe ${isWorking ? "disabled" : ""}>${checkingRelay ? "正在检测…" : "检测中继网络"}</button>
+            </div>
+          </form>
         </section>
 
         <aside class="controller-card controller-card--saved">
@@ -357,42 +342,59 @@ function renderConnectionPanel(): string {
         </aside>
       </div>
       ${renderSavedDevices(isWorking)}
-    </div>
-    <details class="controller-legacy-panel" ${invitationDraft.trim() && !recognizedCode ? "open" : ""}>
-      <summary>使用旧版连接码</summary>
-      <div class="controller-legacy-content">
-        <p>仅用于连接尚未升级到设备 ID 的旧版 DeskLink。</p>
-        <form class="controller-form" data-controller-legacy-form>
-          <label class="field">
-            <span>旧版连接码</span>
-            <textarea name="invitation" data-controller-invitation rows="4" maxlength="1024" placeholder="粘贴完整连接码" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>${escapeHtml(invitationDraft)}</textarea>
-          </label>
-          <div class="connection-code-status connection-code-status--${codeStatus.tone}" data-controller-code-status role="status">
-            <span aria-hidden="true"></span><p>${escapeHtml(codeStatus.text)}</p>
-          </div>
-          <details class="controller-network-details">
-            <summary>高级连接设置</summary>
-            <div class="field-grid field-grid--controller">
-              <label class="field">
-                <span>中继地址</span>
-                <input name="relayAddress" data-controller-relay-address value="${escapeHtml(recognizedCode?.relayAddress ?? relayDraft)}" placeholder="relay.example.com:4433" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
-              </label>
-              <label class="field">
-                <span>TLS 服务器名称</span>
-                <input name="serverName" data-controller-server-name value="${escapeHtml(recognizedCode?.serverName ?? serverNameDraft)}" placeholder="relay.example.com" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
-              </label>
+      <details class="controller-legacy-panel">
+        <summary>${deviceCredentialsEntry.title}（其他方式）</summary>
+        <div class="controller-legacy-content">
+          <p>没有连接码时，可以输入主机显示的设备 ID，以及临时密码或固定密码。</p>
+          <form class="controller-form controller-device-form" data-controller-device-form>
+            <label class="field device-credential-field">
+              <span>设备 ID</span>
+              <input
+                class="device-id-input"
+                name="deviceId"
+                data-controller-device-id
+                value="${escapeHtml(deviceIdDraft)}"
+                inputmode="numeric"
+                maxlength="15"
+                placeholder="123 456 789 012"
+                aria-describedby="controller-device-hint"
+                required
+                autocomplete="off"
+                spellcheck="false"
+                ${isWorking ? "disabled" : ""}
+              >
+            </label>
+            <label class="field device-credential-field">
+              <span>访问密码</span>
+              <input
+                class="temporary-password-input"
+                name="temporaryPassword"
+                data-controller-password
+                value="${escapeHtml(temporaryPasswordDraft)}"
+                maxlength="8"
+                placeholder="8 位访问密码"
+                aria-describedby="controller-device-hint"
+                required
+                autocomplete="one-time-code"
+                autocapitalize="characters"
+                spellcheck="false"
+                ${isWorking ? "disabled" : ""}
+              >
+            </label>
+            <p class="controller-device-hint" id="controller-device-hint">可以使用主机刚生成的临时密码，或主机已启用的固定密码。</p>
+            <div class="controller-form-actions">
+              <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
+                ${connectionActive ? `<span class="button-spinner" aria-hidden="true"></span> ${escapeHtml(connectionActionLabel(connectionState))}` : connectionState === "stopped" || retryAvailable ? "重新尝试" : deviceCredentialsEntry.action}
+              </button>
+              <span>${connectionActive ? "取消后仍会保留已输入的 ID 和密码，方便再次尝试。" : "找到设备后，主机会显示本次控制请求。"}</span>
             </div>
-          </details>
-          <div class="controller-form-actions">
-            <button class="button button--secondary" type="submit" ${isWorking ? "disabled" : ""}>使用连接码</button>
-            <button class="button button--secondary" type="button" data-controller-probe ${isWorking ? "disabled" : ""}>${checkingRelay ? "正在检测…" : "检测中继网络"}</button>
-          </div>
-        </form>
+          </form>
+        </div>
+      </details>
+      <div class="controller-security-note">
+        <span class="security-note-mark" aria-hidden="true"></span>
+        <div><strong>连接仍需主机确认</strong><p>连接码或设备 ID 只用于找到主机，远程画面和输入经过端到端加密；新控制端必须在主机上获得本地批准。</p></div>
       </div>
-    </details>
-    <div class="controller-security-note">
-      <span class="security-note-mark" aria-hidden="true"></span>
-      <div><strong>连接仍需主机确认</strong><p>设备 ID 只用于查找在线主机，远程画面和输入经过端到端加密；新控制端必须在主机上获得本地批准。</p></div>
     </div>
   `;
 }
