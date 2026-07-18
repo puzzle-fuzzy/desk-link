@@ -2,7 +2,7 @@
 mod windows {
     use std::{
         net::SocketAddr,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, OnceLock},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -10,12 +10,13 @@ mod windows {
         ControllerAuthorization, ControllerAuthorizer, HostLifecycleEvent, HostRuntimeError,
         HostSupervisor, HostSupervisorError,
     };
-    use desklink_crypto::{DeviceIdentity, PeerIdentity, SessionId};
+    use desklink_crypto::{DeviceIdentity, PairingInvite, PeerIdentity, SessionId};
     use desklink_ffi::{ControllerEvent, ControllerRuntime};
     use desklink_relay::{RelayConfig, RelayServer};
     use desklink_session::ReconnectPolicy;
     use desklink_transport::{
-        JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError,
+        JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryLookup,
+        RelayDirectoryRegistration, RelayJoin, TransportError,
     };
     use ed25519_dalek::VerifyingKey;
     use quinn::ServerConfig;
@@ -116,6 +117,11 @@ mod windows {
 
     struct ExpectedController(VerifyingKey);
 
+    fn host_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     impl ControllerAuthorizer for ExpectedController {
         fn pinned_verify_key(&self) -> Option<VerifyingKey> {
             Some(self.0)
@@ -199,6 +205,7 @@ mod windows {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_host_becomes_available_without_waiting_for_a_controller() {
+        let _serial = host_test_lock().lock().await;
         let tls = TestTls::new();
         let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -241,7 +248,9 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires access to the interactive Windows desktop"]
     async fn repeated_relay_restarts_rebuild_host_runtime_with_fresh_streams() {
+        let _serial = host_test_lock().lock().await;
         let tls = TestTls::new();
         let first_relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let address = first_relay.address;
@@ -341,7 +350,241 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires access to the interactive Windows desktop"]
+    async fn repeated_controller_disconnects_rearm_host_without_stopping() {
+        let _serial = host_test_lock().lock().await;
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let session_id = SessionId::from_bytes([141; 16]);
+        let authentication = [142; 32];
+        let host = DeviceIdentity::from_secret_key([143; 16], &[144; 32]);
+        let host_key = host.verify_key();
+        let controller_secret = [146; 32];
+        let controller_key =
+            DeviceIdentity::from_secret_key([145; 16], &controller_secret).verify_key();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observer_events = events.clone();
+        let observer = Arc::new(move |event| observer_events.lock().unwrap().push(event));
+        let host_task = tokio::spawn(
+            supervisor(
+                tls.client_config(relay.address),
+                session_id,
+                authentication,
+                host,
+                controller_key,
+                None,
+            )
+            .with_reconnect_policy(
+                ReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(100), 20)
+                    .unwrap(),
+            )
+            .with_observer(observer)
+            .run(),
+        );
+
+        let mut previous_stream = 0;
+        for cycle in 0..5 {
+            let mut controller = connect_controller(
+                &tls,
+                relay.address,
+                session_id,
+                authentication,
+                DeviceIdentity::from_secret_key([145; 16], &controller_secret),
+                host_key,
+            )
+            .await;
+            let stream = next_video_config(&mut controller).await;
+            assert!(
+                stream > previous_stream,
+                "cycle {cycle} reused an old stream ID"
+            );
+            previous_stream = stream;
+            drop(controller);
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let available = events.lock().unwrap().iter().any(|event| {
+                        matches!(
+                            event,
+                            HostLifecycleEvent::Available { stream_id } if *stream_id > stream
+                        )
+                    });
+                    if available {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("host did not re-register after the controller disconnected");
+        }
+
+        {
+            let recorded = events.lock().unwrap();
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|event| matches!(event, HostLifecycleEvent::Connected { .. }))
+                    .count(),
+                5
+            );
+            assert!(
+                recorded
+                    .iter()
+                    .all(|event| !matches!(event, HostLifecycleEvent::Stopped { .. }))
+            );
+            assert!(
+                recorded
+                    .iter()
+                    .all(|event| !matches!(event, HostLifecycleEvent::Reconnecting { .. })),
+                "controller disconnects must not take the host relay registration offline"
+            );
+        }
+
+        host_task.abort();
+        let _ = host_task.await;
+        relay.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires access to the interactive Windows desktop"]
+    async fn fixed_password_directory_flow_survives_disconnect_and_reconnect() {
+        let _serial = host_test_lock().lock().await;
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let session_id = SessionId::from_bytes([151; 16]);
+        let authentication = [152; 32];
+        let host = DeviceIdentity::from_secret_key([153; 16], &[154; 32]);
+        let host_key = host.verify_key();
+        let controller_secret = [156; 32];
+        let controller_key =
+            DeviceIdentity::from_secret_key([155; 16], &controller_secret).verify_key();
+        let invite = PairingInvite::for_persistent_connection(&host, session_id, authentication);
+        let encoded_invite = invite.encode().unwrap();
+        let directory_id = 959_282_312_055;
+        let access_code = *b"ABCDEFGH";
+        let registration = RelayDirectoryRegistration::new(
+            directory_id,
+            access_code,
+            encoded_invite.as_bytes().to_vec(),
+            0,
+        )
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observer_events = events.clone();
+        let observer = Arc::new(move |event| observer_events.lock().unwrap().push(event));
+        let host_task = tokio::spawn(
+            supervisor(
+                tls.client_config(relay.address),
+                session_id,
+                authentication,
+                host,
+                controller_key,
+                None,
+            )
+            .with_directory_registration(registration)
+            .with_reconnect_policy(
+                ReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(100), 20)
+                    .unwrap(),
+            )
+            .with_observer(observer)
+            .run(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, HostLifecycleEvent::Available { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixed-password host never became available");
+
+        let lookup_client = QuicClient::connect(tls.client_config(relay.address))
+            .await
+            .unwrap();
+        let invitation = lookup_client
+            .lookup_directory(RelayDirectoryLookup::new(directory_id, access_code).unwrap())
+            .await
+            .unwrap();
+        let decoded = PairingInvite::decode(&invitation, now_unix_s()).unwrap();
+        assert!(decoded.is_persistent());
+        assert_eq!(decoded.session_id(), session_id);
+        assert_eq!(decoded.host_verify_key(), host_key);
+
+        let mut first = connect_controller(
+            &tls,
+            relay.address,
+            decoded.session_id(),
+            *decoded.relay_authentication(),
+            DeviceIdentity::from_secret_key([155; 16], &controller_secret),
+            decoded.host_verify_key(),
+        )
+        .await;
+        let first_stream = next_video_config(&mut first).await;
+        drop(first);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if events.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        HostLifecycleEvent::Available { stream_id } if *stream_id > first_stream
+                    )
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixed-password host did not republish after disconnect");
+
+        let lookup_client = QuicClient::connect(tls.client_config(relay.address))
+            .await
+            .unwrap();
+        let invitation = lookup_client
+            .lookup_directory(RelayDirectoryLookup::new(directory_id, access_code).unwrap())
+            .await
+            .unwrap();
+        let decoded = PairingInvite::decode(&invitation, now_unix_s()).unwrap();
+        let mut second = connect_controller(
+            &tls,
+            relay.address,
+            decoded.session_id(),
+            *decoded.relay_authentication(),
+            DeviceIdentity::from_secret_key([155; 16], &controller_secret),
+            decoded.host_verify_key(),
+        )
+        .await;
+        assert!(next_video_config(&mut second).await > first_stream);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event, HostLifecycleEvent::Stopped { .. }))
+        );
+
+        host_task.abort();
+        let _ = host_task.await;
+        drop(second);
+        relay.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires access to the interactive Windows desktop"]
     async fn malformed_controller_attempt_does_not_stop_the_host_service() {
+        let _serial = host_test_lock().lock().await;
         let tls = TestTls::new();
         let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let session_id = SessionId::from_bytes([131; 16]);
@@ -387,21 +630,14 @@ mod windows {
             }
         };
         malformed.send_control(vec![0xff]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event, HostLifecycleEvent::Reconnecting { .. }))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("host did not rearm after the malformed controller request");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            events.lock().unwrap().iter().all(|event| !matches!(
+                event,
+                HostLifecycleEvent::Reconnecting { .. } | HostLifecycleEvent::Stopped { .. }
+            )),
+            "a malformed peer attempt must not change the durable host status"
+        );
         drop(malformed);
 
         let mut valid = connect_controller(
@@ -413,13 +649,13 @@ mod windows {
             host_key,
         )
         .await;
-        assert!(next_video_config(&mut valid).await > 1);
+        assert!(next_video_config(&mut valid).await >= 1);
         {
             let recorded = events.lock().unwrap();
             assert!(
                 recorded
                     .iter()
-                    .any(|event| matches!(event, HostLifecycleEvent::Reconnecting { .. }))
+                    .all(|event| !matches!(event, HostLifecycleEvent::Reconnecting { .. }))
             );
             assert!(
                 recorded
@@ -436,6 +672,7 @@ mod windows {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authentication_mismatch_fails_without_retrying() {
+        let _serial = host_test_lock().lock().await;
         let tls = TestTls::new();
         let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let session_id = SessionId::from_bytes([121; 16]);
@@ -468,8 +705,16 @@ mod windows {
         relay.shutdown().await;
     }
 
+    fn now_unix_s() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn occupied_normal_session_keeps_recovering_while_pairing_honors_expiry() {
+        let _serial = host_test_lock().lock().await;
         let tls = TestTls::new();
         let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
         let session_id = SessionId::from_bytes([131; 16]);

@@ -725,7 +725,11 @@ async fn negotiate_controller(
                 ControlMessage::Capabilities(_) => {
                     return Err(HostError::InvalidControllerCapabilities);
                 }
-                ControlMessage::Hello { .. } | ControlMessage::RequestKeyframe { .. } => {}
+                ControlMessage::Hello { .. }
+                | ControlMessage::RequestKeyframe { .. }
+                | ControlMessage::AccessDenied { .. }
+                | ControlMessage::DisplayList { .. }
+                | ControlMessage::SelectDisplay { .. } => {}
             }
         }
     };
@@ -783,8 +787,11 @@ async fn run_connected(
                         metrics.received_input_events = metrics.received_input_events.saturating_add(1);
                         emit_nonterminal(events, HostEvent::Input(input.event));
                     }
-                    TransportEvent::Closed { reason } => return Err(HostError::Transport(format!("transport closed: {reason}"))),
-                    TransportEvent::VideoConfig(_) | TransportEvent::VideoDatagram(_) | TransportEvent::CursorDatagram(_) => {
+            TransportEvent::Closed { reason } => return Err(HostError::Transport(format!("transport closed: {reason}"))),
+            TransportEvent::PeerDisconnected { .. } => {
+                return Err(HostError::Transport("controller disconnected".to_owned()));
+            }
+            TransportEvent::VideoConfig(_) | TransportEvent::VideoDatagram(_) | TransportEvent::CursorDatagram(_) => {
                         return Err(HostError::Protocol(
                             "controller sent data on a host-only transport lane".into(),
                         ));

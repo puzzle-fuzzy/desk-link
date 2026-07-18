@@ -24,11 +24,16 @@ use zeroize::Zeroize;
 use crate::storage::local_app_data_path;
 
 pub const MAX_RECENT_ACCESS_ENTRIES: usize = 5;
+pub const MAX_DEVICE_ALIAS_CHARACTERS: usize = 32;
 
-const RECENT_ACCESS_MAGIC: &[u8; 8] = b"DLRAV1\0\0";
-const ENTRY_BYTES: usize = 8 + 8 + 1 + 8;
-const MAX_PLAINTEXT_BYTES: usize =
-    RECENT_ACCESS_MAGIC.len() + 1 + ENTRY_BYTES * MAX_RECENT_ACCESS_ENTRIES;
+const RECENT_ACCESS_MAGIC_V1: &[u8; 8] = b"DLRAV1\0\0";
+const RECENT_ACCESS_MAGIC_V2: &[u8; 8] = b"DLRAV2\0\0";
+const ENTRY_V1_BYTES: usize = 8 + 8 + 1 + 8;
+const ENTRY_V2_FIXED_BYTES: usize = ENTRY_V1_BYTES + 1;
+const MAX_DEVICE_ALIAS_BYTES: usize = 96;
+const MAX_PLAINTEXT_BYTES: usize = RECENT_ACCESS_MAGIC_V2.len()
+    + 1
+    + (ENTRY_V2_FIXED_BYTES + MAX_DEVICE_ALIAS_BYTES) * MAX_RECENT_ACCESS_ENTRIES;
 const MAX_PROTECTED_BYTES: usize = 4_096;
 
 #[derive(Debug, Error)]
@@ -43,6 +48,8 @@ pub enum WindowsRecentAccessError {
     CorruptProtectedData,
     #[error("已保存设备数据格式无效")]
     CorruptStore,
+    #[error("设备名称最多 32 个字符，且不能包含控制字符")]
+    InvalidAlias,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +58,7 @@ pub struct RecentAccessEntry {
     password: PairingCode,
     persistent: bool,
     last_used_unix_s: u64,
+    alias: Option<String>,
 }
 
 impl RecentAccessEntry {
@@ -68,6 +76,7 @@ impl RecentAccessEntry {
             password,
             persistent,
             last_used_unix_s,
+            alias: None,
         })
     }
 
@@ -85,6 +94,10 @@ impl RecentAccessEntry {
 
     pub const fn last_used_unix_s(&self) -> u64 {
         self.last_used_unix_s
+    }
+
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
     }
 }
 
@@ -138,12 +151,34 @@ impl WindowsRecentAccessStore {
         persistent: bool,
         last_used_unix_s: u64,
     ) -> Result<(), WindowsRecentAccessError> {
-        let entry = RecentAccessEntry::new(device_id, password, persistent, last_used_unix_s)?;
         let mut entries = self.load()?;
+        let alias = entries
+            .iter()
+            .find(|existing| existing.device_id == device_id)
+            .and_then(|existing| existing.alias.clone());
+        let mut entry = RecentAccessEntry::new(device_id, password, persistent, last_used_unix_s)?;
+        entry.alias = alias;
         entries.retain(|existing| existing.device_id != device_id);
         entries.insert(0, entry);
         entries.truncate(MAX_RECENT_ACCESS_ENTRIES);
         self.save_all(&entries)
+    }
+
+    pub fn rename(&self, device_id: u64, alias: &str) -> Result<bool, WindowsRecentAccessError> {
+        let alias = normalize_alias(alias)?;
+        let mut entries = self.load()?;
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.device_id == device_id)
+        else {
+            return Ok(false);
+        };
+        if entry.alias == alias {
+            return Ok(false);
+        }
+        entry.alias = alias;
+        self.save_all(&entries)?;
+        Ok(true)
     }
 
     pub fn remove(&self, device_id: u64) -> Result<bool, WindowsRecentAccessError> {
@@ -197,8 +232,12 @@ fn encode(entries: &[RecentAccessEntry]) -> Result<Vec<u8>, WindowsRecentAccessE
         return Err(WindowsRecentAccessError::CorruptStore);
     }
     let mut device_ids = HashSet::with_capacity(entries.len());
-    let mut bytes = Vec::with_capacity(RECENT_ACCESS_MAGIC.len() + 1 + entries.len() * ENTRY_BYTES);
-    bytes.extend_from_slice(RECENT_ACCESS_MAGIC);
+    let mut bytes = Vec::with_capacity(
+        RECENT_ACCESS_MAGIC_V2.len()
+            + 1
+            + entries.len() * (ENTRY_V2_FIXED_BYTES + MAX_DEVICE_ALIAS_BYTES),
+    );
+    bytes.extend_from_slice(RECENT_ACCESS_MAGIC_V2);
     bytes.push(u8::try_from(entries.len()).map_err(|_| WindowsRecentAccessError::CorruptStore)?);
     for entry in entries {
         if entry.device_id == 0 || !device_ids.insert(entry.device_id) {
@@ -209,64 +248,144 @@ fn encode(entries: &[RecentAccessEntry]) -> Result<Vec<u8>, WindowsRecentAccessE
         bytes.extend_from_slice(entry.password.as_bytes());
         bytes.push(u8::from(entry.persistent));
         bytes.extend_from_slice(&entry.last_used_unix_s.to_be_bytes());
+        let alias = entry.alias.as_deref().unwrap_or_default();
+        let normalized = normalize_alias(alias)?;
+        if normalized.as_deref().unwrap_or_default() != alias {
+            bytes.zeroize();
+            return Err(WindowsRecentAccessError::InvalidAlias);
+        }
+        bytes.push(u8::try_from(alias.len()).map_err(|_| WindowsRecentAccessError::InvalidAlias)?);
+        bytes.extend_from_slice(alias.as_bytes());
     }
     Ok(bytes)
 }
 
 fn decode(bytes: &[u8]) -> Result<Vec<RecentAccessEntry>, WindowsRecentAccessError> {
-    if bytes.len() < RECENT_ACCESS_MAGIC.len() + 1
-        || bytes.len() > MAX_PLAINTEXT_BYTES
-        || &bytes[..RECENT_ACCESS_MAGIC.len()] != RECENT_ACCESS_MAGIC
-    {
+    if bytes.len() < RECENT_ACCESS_MAGIC_V2.len() + 1 || bytes.len() > MAX_PLAINTEXT_BYTES {
         return Err(WindowsRecentAccessError::CorruptStore);
     }
-    let count = usize::from(bytes[RECENT_ACCESS_MAGIC.len()]);
-    if count > MAX_RECENT_ACCESS_ENTRIES
-        || bytes.len() != RECENT_ACCESS_MAGIC.len() + 1 + count * ENTRY_BYTES
-    {
-        return Err(WindowsRecentAccessError::CorruptStore);
+    if &bytes[..RECENT_ACCESS_MAGIC_V1.len()] == RECENT_ACCESS_MAGIC_V1 {
+        decode_v1(bytes)
+    } else if &bytes[..RECENT_ACCESS_MAGIC_V2.len()] == RECENT_ACCESS_MAGIC_V2 {
+        decode_v2(bytes)
+    } else {
+        Err(WindowsRecentAccessError::CorruptStore)
     }
+}
 
+fn decode_v1(bytes: &[u8]) -> Result<Vec<RecentAccessEntry>, WindowsRecentAccessError> {
+    let count = usize::from(bytes[RECENT_ACCESS_MAGIC_V1.len()]);
+    if count > MAX_RECENT_ACCESS_ENTRIES
+        || bytes.len() != RECENT_ACCESS_MAGIC_V1.len() + 1 + count * ENTRY_V1_BYTES
+    {
+        return Err(WindowsRecentAccessError::CorruptStore);
+    }
     let mut entries = Vec::with_capacity(count);
     let mut device_ids = HashSet::with_capacity(count);
-    let mut offset = RECENT_ACCESS_MAGIC.len() + 1;
+    let mut offset = RECENT_ACCESS_MAGIC_V1.len() + 1;
     for _ in 0..count {
-        let device_id = u64::from_be_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .map_err(|_| WindowsRecentAccessError::CorruptStore)?,
-        );
-        offset += 8;
+        let (device_id, password, persistent, last_used_unix_s) =
+            decode_entry_fields(bytes, &mut offset)?;
         if device_id == 0 || !device_ids.insert(device_id) {
             return Err(WindowsRecentAccessError::CorruptStore);
         }
-        let password = PairingCode::from_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .map_err(|_| WindowsRecentAccessError::CorruptStore)?,
-        )
-        .map_err(|_| WindowsRecentAccessError::CorruptStore)?;
-        offset += 8;
-        let persistent = match bytes[offset] {
-            0 => false,
-            1 => true,
-            _ => return Err(WindowsRecentAccessError::CorruptStore),
-        };
-        offset += 1;
-        let last_used_unix_s = u64::from_be_bytes(
-            bytes[offset..offset + 8]
-                .try_into()
-                .map_err(|_| WindowsRecentAccessError::CorruptStore)?,
-        );
-        offset += 8;
         entries.push(RecentAccessEntry {
             device_id,
             password,
             persistent,
             last_used_unix_s,
+            alias: None,
         });
     }
     Ok(entries)
+}
+
+fn decode_v2(bytes: &[u8]) -> Result<Vec<RecentAccessEntry>, WindowsRecentAccessError> {
+    let count = usize::from(bytes[RECENT_ACCESS_MAGIC_V2.len()]);
+    if count > MAX_RECENT_ACCESS_ENTRIES {
+        return Err(WindowsRecentAccessError::CorruptStore);
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut device_ids = HashSet::with_capacity(count);
+    let mut offset = RECENT_ACCESS_MAGIC_V2.len() + 1;
+    for _ in 0..count {
+        let (device_id, password, persistent, last_used_unix_s) =
+            decode_entry_fields(bytes, &mut offset)?;
+        if device_id == 0 || !device_ids.insert(device_id) {
+            return Err(WindowsRecentAccessError::CorruptStore);
+        }
+        let alias_len = usize::from(read_array::<1>(bytes, &mut offset)?[0]);
+        if alias_len > MAX_DEVICE_ALIAS_BYTES {
+            return Err(WindowsRecentAccessError::CorruptStore);
+        }
+        let alias_end = offset
+            .checked_add(alias_len)
+            .ok_or(WindowsRecentAccessError::CorruptStore)?;
+        let alias_bytes = bytes
+            .get(offset..alias_end)
+            .ok_or(WindowsRecentAccessError::CorruptStore)?;
+        offset = alias_end;
+        let alias =
+            std::str::from_utf8(alias_bytes).map_err(|_| WindowsRecentAccessError::CorruptStore)?;
+        let alias = normalize_alias(alias).map_err(|_| WindowsRecentAccessError::CorruptStore)?;
+        entries.push(RecentAccessEntry {
+            device_id,
+            password,
+            persistent,
+            last_used_unix_s,
+            alias,
+        });
+    }
+    if offset != bytes.len() {
+        return Err(WindowsRecentAccessError::CorruptStore);
+    }
+    Ok(entries)
+}
+
+fn decode_entry_fields(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<(u64, PairingCode, bool, u64), WindowsRecentAccessError> {
+    let device_id = u64::from_be_bytes(read_array(bytes, offset)?);
+    let password = PairingCode::from_bytes(read_array(bytes, offset)?)
+        .map_err(|_| WindowsRecentAccessError::CorruptStore)?;
+    let persistent = match read_array::<1>(bytes, offset)?[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(WindowsRecentAccessError::CorruptStore),
+    };
+    let last_used_unix_s = u64::from_be_bytes(read_array(bytes, offset)?);
+    Ok((device_id, password, persistent, last_used_unix_s))
+}
+
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<[u8; N], WindowsRecentAccessError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(WindowsRecentAccessError::CorruptStore)?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(WindowsRecentAccessError::CorruptStore)?
+        .try_into()
+        .map_err(|_| WindowsRecentAccessError::CorruptStore)?;
+    *offset = end;
+    Ok(value)
+}
+
+fn normalize_alias(alias: &str) -> Result<Option<String>, WindowsRecentAccessError> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Ok(None);
+    }
+    if alias.len() > MAX_DEVICE_ALIAS_BYTES
+        || alias.chars().count() > MAX_DEVICE_ALIAS_CHARACTERS
+        || alias.chars().any(char::is_control)
+    {
+        return Err(WindowsRecentAccessError::InvalidAlias);
+    }
+    Ok(Some(alias.to_owned()))
 }
 
 fn protect(plaintext: &[u8]) -> Result<Vec<u8>, WindowsRecentAccessError> {
@@ -386,16 +505,23 @@ mod tests {
         store
             .remember(202, password(b"23456789"), false, 20)
             .unwrap();
+        assert!(store.rename(202, "办公室电脑").unwrap());
 
         let protected = fs::read(directory.join("recent-access.bin")).unwrap();
         assert!(!protected.windows(8).any(|window| window == b"ABCDEFGH"));
         assert!(!protected.windows(8).any(|window| window == b"23456789"));
+        assert!(
+            !protected
+                .windows("办公室电脑".len())
+                .any(|window| window == "办公室电脑".as_bytes())
+        );
 
         let entries = store.load().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].device_id(), 202);
         assert_eq!(entries[0].password().as_bytes(), b"23456789");
         assert!(!entries[0].is_persistent());
+        assert_eq!(entries[0].alias(), Some("办公室电脑"));
         assert_eq!(entries[1].device_id(), 101);
         assert!(entries[1].is_persistent());
         let _ = fs::remove_dir_all(directory);
@@ -424,6 +550,16 @@ mod tests {
         assert_eq!(entries[0].password().as_bytes(), b"23456789");
         assert!(!entries[0].is_persistent());
 
+        assert!(store.rename(5, "家里电脑").unwrap());
+        store.remember(5, password(b"ABCDEFGH"), true, 101).unwrap();
+        let renamed = store.find(5).unwrap().unwrap();
+        assert_eq!(renamed.alias(), Some("家里电脑"));
+        assert!(renamed.is_persistent());
+        assert!(matches!(
+            store.rename(5, "包含\n换行"),
+            Err(WindowsRecentAccessError::InvalidAlias)
+        ));
+
         assert!(store.remove(6).unwrap());
         assert!(!store.remove(999).unwrap());
         assert!(store.find(6).unwrap().is_none());
@@ -436,20 +572,40 @@ mod tests {
         let second = RecentAccessEntry::new(2, password(b"23456789"), false, 20).unwrap();
         let mut bytes = encode(&[first, second]).unwrap();
 
-        let second_device_offset = RECENT_ACCESS_MAGIC.len() + 1 + ENTRY_BYTES;
+        let second_device_offset = RECENT_ACCESS_MAGIC_V2.len() + 1 + ENTRY_V2_FIXED_BYTES;
         bytes[second_device_offset..second_device_offset + 8].copy_from_slice(&1_u64.to_be_bytes());
         assert!(matches!(
             decode(&bytes),
             Err(WindowsRecentAccessError::CorruptStore)
         ));
 
-        let first_flag_offset = RECENT_ACCESS_MAGIC.len() + 1 + 8 + 8;
+        let first_flag_offset = RECENT_ACCESS_MAGIC_V2.len() + 1 + 8 + 8;
         bytes[second_device_offset..second_device_offset + 8].copy_from_slice(&2_u64.to_be_bytes());
         bytes[first_flag_offset] = 2;
         assert!(matches!(
             decode(&bytes),
             Err(WindowsRecentAccessError::CorruptStore)
         ));
+        bytes.zeroize();
+    }
+
+    #[test]
+    fn decoder_keeps_v1_records_compatible_without_aliases() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(RECENT_ACCESS_MAGIC_V1);
+        bytes.push(1);
+        bytes.extend_from_slice(&42_u64.to_be_bytes());
+        bytes.extend_from_slice(b"ABCDEFGH");
+        bytes.push(1);
+        bytes.extend_from_slice(&99_u64.to_be_bytes());
+
+        let entries = decode(&bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].device_id(), 42);
+        assert_eq!(entries[0].password().as_bytes(), b"ABCDEFGH");
+        assert!(entries[0].is_persistent());
+        assert_eq!(entries[0].last_used_unix_s(), 99);
+        assert_eq!(entries[0].alias(), None);
         bytes.zeroize();
     }
 }

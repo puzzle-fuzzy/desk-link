@@ -36,16 +36,19 @@ use std::{
 };
 
 use apps_windows::{
+    cloud_diagnostics::{DiagnosticUploadSummary, start_background_uploader, upload_all_once},
     configuration::{HostConnectionSettings, WindowsConnectionSettingsStore},
+    diagnostic_sharing::WindowsDiagnosticSharing,
     diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
+    startup::WindowsStartupSettings,
     trusted::WindowsTrustedControllerStore,
     window::WindowsLocalApprovalDialog,
 };
 use controller::{
-    ControllerConnectionInput, ControllerDeviceInput, ControllerInput, ControllerManager,
-    ControllerSignal, ControllerSnapshot, SavedDeviceInput,
+    ControllerDeviceInput, ControllerInput, ControllerManager, ControllerRenderMetrics,
+    ControllerSignal, ControllerSnapshot, SavedDeviceInput, SavedDeviceRenameInput,
 };
 use host::{HostApprovalSummary, HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
 use rand_core::{OsRng, RngCore};
@@ -130,6 +133,32 @@ struct FixedAccessSummary {
     password: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsPreferencesSummary {
+    launch_at_login: bool,
+    diagnostics_sharing_enabled: bool,
+    close_to_tray: bool,
+    interface_language: &'static str,
+    version: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticUploadResult {
+    uploaded_sources: u32,
+    uploaded_events: u32,
+}
+
+impl From<DiagnosticUploadSummary> for DiagnosticUploadResult {
+    fn from(value: DiagnosticUploadSummary) -> Self {
+        Self {
+            uploaded_sources: value.uploaded_sources,
+            uploaded_events: value.uploaded_events,
+        }
+    }
+}
+
 impl Drop for FixedAccessSummary {
     fn drop(&mut self) {
         self.password.zeroize();
@@ -174,6 +203,63 @@ async fn get_host_snapshot(manager: State<'_, HostManager>) -> Result<HostSnapsh
     })
     .await
     .map_err(|_| "DeskLink 无法读取本地状态，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn get_windows_preferences() -> Result<WindowsPreferencesSummary, String> {
+    tauri::async_runtime::spawn_blocking(load_windows_preferences)
+        .await
+        .map_err(|_| "DeskLink 无法读取 Windows 偏好设置，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn set_launch_at_login(enabled: bool) -> Result<WindowsPreferencesSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = WindowsStartupSettings::for_current_executable()
+            .map_err(|_| "DeskLink 无法定位当前安装程序。".to_owned())?;
+        settings
+            .set_enabled(enabled)
+            .map_err(|_| "Windows 未能更新登录启动设置，请检查当前账户权限后重试。".to_owned())?;
+        load_windows_preferences()
+    })
+    .await
+    .map_err(|_| "DeskLink 无法更新 Windows 偏好设置，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn set_diagnostics_sharing(enabled: bool) -> Result<WindowsPreferencesSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        WindowsDiagnosticSharing::for_current_user()
+            .map_err(|_| "DeskLink 无法打开诊断共享设置。".to_owned())?
+            .set_enabled(enabled)
+            .map_err(|_| "Windows 未能保存诊断共享设置，请检查当前账户权限后重试。".to_owned())?;
+        load_windows_preferences()
+    })
+    .await
+    .map_err(|_| "DeskLink 无法更新诊断共享设置，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn upload_diagnostics_now() -> Result<DiagnosticUploadResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        upload_all_once().map(Into::into).map_err(|_| {
+            "暂时无法发送脱敏诊断，请检查网络后重试。DeskLink 会在后台自动补传。".to_owned()
+        })
+    })
+    .await
+    .map_err(|_| "DeskLink 无法启动诊断发送任务，请重试。".to_owned())?
+}
+
+#[tauri::command]
+async fn quit_desklink(
+    app: AppHandle,
+    host_manager: State<'_, HostManager>,
+    controller_manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    controller_manager.request_stop();
+    host_manager.stop().await;
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -237,7 +323,7 @@ async fn probe_relay(input: RelayProbeInput) -> Result<local_relay::RelayProbeRe
         || server_name.len() > 253
         || server_name.chars().any(char::is_control)
     {
-        return Err("TLS 服务器名称无效，请重新复制完整连接码。".to_owned());
+        return Err("TLS 服务器名称无效，请检查中继设置。".to_owned());
     }
     let diagnostics = DiagnosticLog::for_current_user().ok();
     match local_relay::probe(relay_address, server_name).await {
@@ -258,16 +344,6 @@ async fn probe_relay(input: RelayProbeInput) -> Result<local_relay::RelayProbeRe
             Err(message)
         }
     }
-}
-
-#[tauri::command]
-async fn connect_controller(
-    manager: State<'_, ControllerManager>,
-    input: ControllerConnectionInput,
-    signals: Channel<ControllerSignal>,
-    video: Channel<Response>,
-) -> Result<ControllerSnapshot, String> {
-    manager.connect_invitation(input, signals, video).await
 }
 
 #[tauri::command]
@@ -300,21 +376,64 @@ async fn reconnect_controller(
 }
 
 #[tauri::command]
-fn send_controller_input(
+async fn send_controller_input(
     manager: State<'_, ControllerManager>,
     input: ControllerInput,
 ) -> Result<(), String> {
-    manager.send_input(input)
+    manager.send_input(input).await
 }
 
 #[tauri::command]
-fn send_controller_text(manager: State<'_, ControllerManager>, text: String) -> Result<(), String> {
-    manager.send_text(text)
+async fn send_controller_text(
+    manager: State<'_, ControllerManager>,
+    text: String,
+) -> Result<(), String> {
+    manager.send_text(text).await
 }
 
 #[tauri::command]
-fn request_controller_keyframe(manager: State<'_, ControllerManager>) -> Result<(), String> {
-    manager.request_keyframe()
+async fn request_controller_keyframe(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    manager.request_keyframe().await
+}
+
+#[tauri::command]
+fn report_controller_render_metrics(
+    manager: State<'_, ControllerManager>,
+    metrics: ControllerRenderMetrics,
+) -> Result<(), String> {
+    manager.record_render_metrics(metrics)
+}
+
+#[tauri::command]
+fn open_github_repository() -> Result<(), String> {
+    use windows::{
+        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        core::w,
+    };
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("https://github.com/puzzle-fuzzy/desk-link"),
+            w!(""),
+            w!(""),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err("Windows 无法打开 DeskLink 的 GitHub 页面。".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn select_controller_display(
+    manager: State<'_, ControllerManager>,
+    display_id: u32,
+) -> Result<(), String> {
+    manager.select_display(display_id).await
 }
 
 #[tauri::command]
@@ -325,18 +444,19 @@ async fn disconnect_controller(
 }
 
 #[tauri::command]
-async fn forget_controller(
-    manager: State<'_, ControllerManager>,
-) -> Result<ControllerSnapshot, String> {
-    manager.forget_saved().await
-}
-
-#[tauri::command]
 async fn forget_saved_device(
     manager: State<'_, ControllerManager>,
     input: SavedDeviceInput,
 ) -> Result<ControllerSnapshot, String> {
     manager.forget_saved_device(input).await
+}
+
+#[tauri::command]
+async fn rename_saved_device(
+    manager: State<'_, ControllerManager>,
+    input: SavedDeviceRenameInput,
+) -> Result<ControllerSnapshot, String> {
+    manager.rename_saved_device(input).await
 }
 
 #[tauri::command]
@@ -1005,37 +1125,22 @@ fn create_managed_connection() -> Result<(), String> {
         .map_err(|_| "DeskLink 无法加密保存本机连接。".to_owned())
 }
 
-fn migrate_legacy_local_connection() -> Result<bool, String> {
-    let store = WindowsConnectionSettingsStore::for_current_user()
-        .map_err(|_| "当前 Windows 账户无法使用连接设置。".to_owned())?;
-    let Some(existing) = store
-        .load()
-        .map_err(|_| "无法打开已保存的连接设置。".to_owned())?
-    else {
-        return Ok(false);
-    };
-    if !is_legacy_local_connection(&existing) {
-        return Ok(false);
-    }
-    let authentication = Zeroizing::new(hex(existing.authentication()));
-    let migrated = HostConnectionSettings::from_text(
-        local_relay::MANAGED_RELAY_ADDRESS,
-        local_relay::MANAGED_RELAY_SERVER_NAME,
-        &hex(existing.session_id().as_bytes()),
-        authentication.as_str(),
-        None,
-        &existing.stream_id().to_string(),
-    )
-    .map_err(|_| "无法迁移旧版局域网连接。".to_owned())?;
-    store
-        .save(&migrated)
-        .map_err(|_| "无法保存迁移后的公网中继连接。".to_owned())?;
-    Ok(true)
-}
-
-fn is_legacy_local_connection(settings: &HostConnectionSettings) -> bool {
-    settings.relay_address().ip().is_loopback()
-        && matches!(settings.server_name(), "localhost" | "desklink-lan")
+fn load_windows_preferences() -> Result<WindowsPreferencesSummary, String> {
+    let launch_at_login = WindowsStartupSettings::for_current_executable()
+        .map_err(|_| "DeskLink 无法定位当前安装程序。".to_owned())?
+        .is_enabled()
+        .map_err(|_| "Windows 登录启动设置当前不可用。".to_owned())?;
+    let diagnostics_sharing_enabled = WindowsDiagnosticSharing::for_current_user()
+        .map_err(|_| "DeskLink 无法打开诊断共享设置。".to_owned())?
+        .is_enabled()
+        .map_err(|_| "诊断共享设置当前不可用。".to_owned())?;
+    Ok(WindowsPreferencesSummary {
+        launch_at_login,
+        diagnostics_sharing_enabled,
+        close_to_tray: true,
+        interface_language: "简体中文",
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1079,26 +1184,8 @@ pub fn run() {
             if let Some(diagnostics) = diagnostics.as_ref() {
                 let _ = diagnostics.record(&DiagnosticEvent::ControlSurfaceStarted);
             }
+            start_background_uploader();
             setup_tray(app)?;
-            let migration = migrate_legacy_local_connection().and_then(|host_migrated| {
-                controller::migrate_legacy_local_connection()
-                    .map(|controller_migrated| host_migrated || controller_migrated)
-            });
-            match migration {
-                Ok(true) => {
-                    if let Some(diagnostics) = diagnostics.as_ref() {
-                        let _ = diagnostics.record(&DiagnosticEvent::OperationSucceeded(
-                            DiagnosticOperation::ConnectionMigration,
-                        ));
-                    }
-                }
-                Ok(false) => {}
-                Err(error) => record_operation_failure(
-                    diagnostics.as_ref(),
-                    DiagnosticOperation::ConnectionMigration,
-                    &error,
-                ),
-            }
             let manager = app.state::<HostManager>().inner().clone();
             #[cfg(windows)]
             match power::install(app.handle(), manager.clone()) {
@@ -1130,6 +1217,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_host_snapshot,
+            get_windows_preferences,
+            set_launch_at_login,
+            set_diagnostics_sharing,
+            upload_diagnostics_now,
+            quit_desklink,
             respond_host_approval,
             restart_host,
             save_connection_settings,
@@ -1146,14 +1238,16 @@ pub fn run() {
             connect_device,
             connect_saved_device,
             clear_saved_devices,
-            connect_controller,
             reconnect_controller,
             send_controller_input,
             send_controller_text,
             request_controller_keyframe,
+            report_controller_render_metrics,
+            open_github_repository,
+            select_controller_display,
             disconnect_controller,
-            forget_controller,
-            forget_saved_device
+            forget_saved_device,
+            rename_saved_device
         ])
         .build(tauri::generate_context!())
         .expect("DeskLink could not start its control surface");

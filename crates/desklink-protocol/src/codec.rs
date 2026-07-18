@@ -32,11 +32,20 @@ pub enum ProtocolError {
     TimestampOutsideWindow,
     #[error("invalid input event")]
     InvalidInput,
+    #[error("invalid remote display list")]
+    InvalidDisplayList,
 }
 
 pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
     if let ControlMessage::Capabilities(capabilities) = message {
         capabilities.validate()?;
+    }
+    if let ControlMessage::DisplayList {
+        displays,
+        active_display_id,
+    } = message
+    {
+        validate_display_list(displays, *active_display_id)?;
     }
     let bytes = postcard::to_allocvec(message).map_err(|_| ProtocolError::Malformed)?;
     bounded(bytes, MAX_CONTROL_MESSAGE_BYTES)
@@ -47,7 +56,40 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
     if let ControlMessage::Capabilities(capabilities) = &message {
         capabilities.validate()?;
     }
+    if let ControlMessage::DisplayList {
+        displays,
+        active_display_id,
+    } = &message
+    {
+        validate_display_list(displays, *active_display_id)?;
+    }
     Ok(message)
+}
+
+fn validate_display_list(
+    displays: &[crate::RemoteDisplay],
+    active_display_id: u32,
+) -> Result<(), ProtocolError> {
+    if displays.is_empty()
+        || displays.len() > 16
+        || !displays
+            .iter()
+            .any(|display| display.id == active_display_id)
+        || displays
+            .iter()
+            .any(|display| display.width == 0 || display.height == 0)
+    {
+        return Err(ProtocolError::InvalidDisplayList);
+    }
+    for (index, display) in displays.iter().enumerate() {
+        if displays[..index]
+            .iter()
+            .any(|previous| previous.id == display.id)
+        {
+            return Err(ProtocolError::InvalidDisplayList);
+        }
+    }
+    Ok(())
 }
 pub fn encode_noise_handshake(handshake: &NoiseHandshake) -> Result<Vec<u8>, ProtocolError> {
     validate_noise_handshake(handshake)?;
@@ -100,10 +142,20 @@ pub fn encode_input(input: &InputEnvelope) -> Result<Vec<u8>, ProtocolError> {
         MAX_CONTROL_MESSAGE_BYTES,
     )
 }
-pub fn decode_input(bytes: &[u8], now_us: u64) -> Result<InputEnvelope, ProtocolError> {
+/// Decodes and structurally validates an input envelope without comparing its
+/// wall-clock timestamp to the local machine. Authenticated sessions use this
+/// entry point so they can establish a per-session clock offset before applying
+/// freshness checks; two Windows computers are not guaranteed to have clocks
+/// synchronized to within a second.
+pub fn decode_session_input(bytes: &[u8]) -> Result<InputEnvelope, ProtocolError> {
     ensure(bytes, MAX_CONTROL_MESSAGE_BYTES)?;
     let input: InputEnvelope = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
     validate_input(&input)?;
+    Ok(input)
+}
+
+pub fn decode_input(bytes: &[u8], now_us: u64) -> Result<InputEnvelope, ProtocolError> {
+    let input = decode_session_input(bytes)?;
     if input.timestamp_us < now_us.saturating_sub(MAX_INPUT_AGE_US)
         || input.timestamp_us > now_us.saturating_add(MAX_INPUT_FUTURE_SKEW_US)
     {

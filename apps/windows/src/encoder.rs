@@ -294,16 +294,6 @@ mod native {
     use windows::{
         Win32::{
             Foundation::{RPC_E_CHANGED_MODE, VARIANT_FALSE, VARIANT_TRUE},
-            Graphics::{
-                Direct3D11::{
-                    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-                    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Texture2D,
-                },
-                Dxgi::Common::{
-                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-                    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                },
-            },
             Media::MediaFoundation::{
                 CMSH264EncoderMFT, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
                 CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaType, IMFSample, IMFTransform,
@@ -597,61 +587,19 @@ mod native {
         target_width: u32,
         target_height: u32,
     ) -> Result<Vec<u8>, EncoderError> {
-        let texture = &frame.texture;
-        let mut description = D3D11_TEXTURE2D_DESC::default();
-        unsafe { texture.GetDesc(&mut description) };
-        if description.Width != frame.width || description.Height != frame.height {
-            return Err(EncoderError::InvalidFrame);
-        }
-        let order = match description.Format {
-            DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => PixelOrder::Bgra,
-            DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => PixelOrder::Rgba,
-            format => {
-                return Err(EncoderError::Native(format!(
-                    "unsupported desktop texture format: {format:?}"
-                )));
-            }
-        };
-        let device = unsafe { texture.GetDevice() }
-            .map_err(|error| native_error("get desktop texture device", error))?;
-        let context = unsafe { device.GetImmediateContext() }
-            .map_err(|error| native_error("get D3D11 immediate context", error))?;
-        description.Usage = D3D11_USAGE_STAGING;
-        description.BindFlags = 0;
-        description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-        description.MiscFlags = 0;
-        let mut staging: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&description, None, Some(&mut staging)) }
-            .map_err(|error| native_error("create desktop staging texture", error))?;
-        let staging = staging
-            .ok_or_else(|| EncoderError::Native("D3D11 did not return a staging texture".into()))?;
-        unsafe { context.CopyResource(&staging, texture) };
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-            .map_err(|error| native_error("map desktop staging texture", error))?;
-        let row_pitch = mapped.RowPitch as usize;
-        let required_bytes = row_pitch
-            .checked_mul(frame.height.saturating_sub(1) as usize)
-            .and_then(|bytes| bytes.checked_add(frame.width as usize * 4))
-            .ok_or(EncoderError::FrameTooLarge);
-        let converted = required_bytes.and_then(|required_bytes| {
-            if mapped.pData.is_null() {
-                return Err(EncoderError::InvalidFrame);
-            }
-            let pixels =
-                unsafe { slice::from_raw_parts(mapped.pData.cast::<u8>(), required_bytes) };
-            convert_to_nv12(
-                pixels,
-                frame.width,
-                frame.height,
-                row_pitch,
-                target_width,
-                target_height,
-                order,
-            )
-        });
-        unsafe { context.Unmap(&staging, 0) };
-        converted
+        let row_pitch = usize::try_from(frame.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or(EncoderError::FrameTooLarge)?;
+        convert_to_nv12(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            row_pitch,
+            target_width,
+            target_height,
+            PixelOrder::Bgra,
+        )
     }
 
     fn create_output_type(width: u32, height: u32, fps: u32) -> Result<IMFMediaType, EncoderError> {

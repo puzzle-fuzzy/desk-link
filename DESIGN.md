@@ -69,25 +69,25 @@ components:
 
 **Creative North Star: "The Quiet Control Light"**
 
-DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. Windows and macOS use the same restrained white surface, one burnt-coral action color, four-section navigation, and semantic status colors only where state needs emphasis.
+DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. The Windows app uses a restrained white surface, one burnt-coral action color, three primary destinations, and semantic status colors only where state needs emphasis.
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
 **Key Characteristics:**
 
-- Shared Windows/macOS information architecture with native platform behavior
-- Status-first hierarchy with plain-language recovery detail
+- Task-first hierarchy: controlling another computer is the default workspace
+- Host availability is a compact action dock, never a primary navigation destination
 - Restrained color with explicit semantic states
 - Compact trusted-device management without nested navigation
 - No decorative motion
 
 ## Implementation boundary
 
-The ordinary Windows status, connection, and trusted-device views are implemented as a Tauri 2 control surface using semantic HTML/CSS and Vanilla TypeScript. Rust remains the trust boundary: it owns DPAPI storage, validates all connection input, never returns the saved relay key, and exposes only the minimum Tauri commands and capabilities required by the view.
+The Windows control workspace, host action dock, connection settings, and trusted-device views are implemented as a Tauri 2 control surface using semantic HTML/CSS and Vanilla TypeScript. Rust remains the trust boundary: it owns DPAPI storage, validates all connection input, never returns the saved relay key, and exposes only the minimum Tauri commands and capabilities required by the view.
 
 The Tauri process owns the single-instance application lifetime, native tray, and host supervisor start/stop boundary. Capture, encoding, encrypted transport, input injection, and high-consequence approval or revocation confirmations remain in Rust/Win32. The WebView receives sanitized lifecycle summaries and is a presentation layer, not a replacement for native security or media boundaries.
 
-The macOS surface is implemented with SwiftUI and mirrors the Windows top bar, four navigation sections, status-first hierarchy, flat groups, Chinese copy, and shared semantic colors. SwiftUI owns presentation only; Keychain, Rust FFI, ScreenCaptureKit, VideoToolbox, AppKit input injection, and system permission boundaries retain their platform responsibilities.
+The macOS surface remains a separate SwiftUI implementation. The current release decisions in this document apply to the Windows product surface; platform security, capture, encoding, and input boundaries remain native on both systems.
 
 ## Colors
 
@@ -158,19 +158,21 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Navigation
 
-The tray menu contains “Open DeskLink” and “Exit DeskLink.” Trusted-device management stays in the main window so the tray remains compact. The main window is a single surface, not a sidebar application. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
+The tray menu contains “Open DeskLink” and “Exit DeskLink.” The main window has three primary destinations: “控制其他电脑”, “访问管理”, and “设置”. Controlling another computer is the default. Host availability, device ID, password actions, and connection settings live in a compact dock above that workspace instead of a “本机状态” tab. Pairing, fixed password, and connection settings remain complete secondary pages opened from the dock. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
 
 ### Pairing and Revocation
 
 - Create pairing only after an explicit local action and require saved relay settings plus an available trusted-device store.
-- Show the single signed invitation, its live expiry, and a plain warning that it contains the private relay join secret retained by an approved controller for reconnecting. Never log it or return it as part of routine status refreshes.
-- Clear the WebView copy on cancellation, expiry, revocation restart, or pairing-worker completion; restore normal hosting after cancellation or preparation failure.
+- Show only the public device ID, temporary password, and live expiry. The signed relay invitation stays inside Rust and the managed directory response; never expose it to the WebView or logs.
+- Clear the temporary password from the WebView on cancellation, expiry, revocation restart, or pairing-worker completion; restore normal hosting after cancellation or preparation failure.
 - Pairing approval and trusted-controller revocation use native Win32 Yes/No confirmations with “No” selected by default. The WebView must not imitate or replace that decision boundary.
 - A successful revocation restarts the host immediately so an already-authorized runtime cannot retain access under stale trust.
 
 ### Connection Status
 
 Show the written state, current stream when connected, retry count and delay when recovering, and the last safe error when stopped. Never expose relay authentication or private-key material.
+
+On the healthy Windows control workspace, the host dock shows only availability, device ID, password actions, and connection settings. Relay mode, protection implementation, approved-device counts, and successful diagnostics never appear in the primary workspace. Technical relay parameters remain available only inside the secondary connection-settings page; diagnostics stay in settings unless an actionable warning must appear beside the host dock.
 
 ### Error Feedback and Diagnostics
 
@@ -182,7 +184,7 @@ Show the written state, current stream when connected, retry count and delay whe
 
 ### Runtime Resilience
 
-- On a multi-display Windows desktop, capture the attached output whose desktop coordinates contain `(0, 0)`, which is the Windows primary display. Do not imply that the current build composites the full virtual desktop or supports display switching.
+- On a multi-display Windows desktop, enumerate attached outputs, start on the Windows primary display, and let the controller switch the active captured display from the live-session toolbar. Input coordinates must be mapped through the selected display's desktop rectangle into the full Windows virtual desktop; the current build switches displays rather than compositing them.
 - Register for Windows suspend/resume callbacks independently of the WebView window. Debounce duplicate resume notifications and rebuild the host supervisor so QUIC, Noise, capture, encoding, and input state are all fresh after wake.
 - Resolve current-user storage through the Windows Local AppData known folder rather than depending on a process environment variable.
 - Keep the repeatable Windows acceptance path in `scripts/verify-windows-resilience.py`, including physical capture, repeated relay recovery, power notification registration, and an encrypted hardware-media soak.
@@ -191,7 +193,7 @@ Show the written state, current stream when connected, retry count and delay whe
 
 ### Do:
 
-- **Do** keep the current connection state visible at the top of the window.
+- **Do** keep host availability visible in the compact dock without competing with the control task.
 - **Do** identify trusted controllers with their full device ID and public-key fingerprint before revocation.
 - **Do** preserve keyboard access, DPI scaling, high contrast, and native focus behavior.
 - **Do** keep healthy background operation in the tray and make explicit exit discoverable.
@@ -199,6 +201,7 @@ Show the written state, current stream when connected, retry count and delay whe
 ### Don't:
 
 - **Don't** build an enterprise administration console with dense navigation and irrelevant organization features.
+- **Don't** add “本机状态”, relay explanations, protection summaries, or approved-device counts back to primary navigation or the default workspace.
 - **Don't** use neon gaming or streaming overlays.
 - **Don't** add decorative security gauges, glowing maps, fear-driven warnings, glass surfaces, or gradient text.
 - **Don't** hide background behavior or label irreversible actions only “OK” or “Yes.”

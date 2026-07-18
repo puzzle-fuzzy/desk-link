@@ -4,6 +4,7 @@ use std::{
 };
 
 use apps_windows::{
+    cloud_diagnostics::{DiagnosticSource, set_session_correlation},
     configuration::WindowsConnectionSettingsStore,
     diagnostics::{DiagnosticEvent, DiagnosticLog},
     fixed_access::WindowsFixedAccessStore,
@@ -36,6 +37,7 @@ pub struct HostApprovalSummary {
     pub device_id: String,
     pub fingerprint: String,
     pub expires_at_unix_s: u64,
+    pub identity_changed: bool,
 }
 
 struct PendingApproval {
@@ -80,6 +82,7 @@ impl HostApprovalBroker {
                 device_id: crate::hex(&pending.identity().device_id()),
                 fingerprint: pending.verification_fingerprint(),
                 expires_at_unix_s: pending.expires_at_unix_s(),
+                identity_changed: pending.identity_changed(),
             };
             state.pending = Some(PendingApproval {
                 summary: summary.clone(),
@@ -284,14 +287,12 @@ impl HostRuntimeSummary {
 pub struct PairingSessionSummary {
     pub device_id: String,
     pub temporary_password: String,
-    pub invitation: String,
     pub expires_at_unix_s: u64,
 }
 
 impl Drop for PairingSessionSummary {
     fn drop(&mut self) {
         self.temporary_password.zeroize();
-        self.invitation.zeroize();
     }
 }
 
@@ -621,6 +622,7 @@ fn prepare_host(
     else {
         return Ok(PreparedHost::Unconfigured { diagnostics });
     };
+    let _ = set_session_correlation(DiagnosticSource::Host, connection.session_id());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| HostPreparationFailure::Identity)?
         .load_or_create(&mut OsRng)
@@ -709,6 +711,7 @@ fn prepare_pairing(
         .load()
         .map_err(|_| HostPreparationFailure::ConnectionProtection)?
         .ok_or(HostPreparationFailure::ConnectionProtection)?;
+    let _ = set_session_correlation(DiagnosticSource::Host, connection.session_id());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| HostPreparationFailure::Identity)?
         .load_or_create(&mut OsRng)
@@ -741,11 +744,9 @@ fn prepare_pairing(
             .map_err(|_| HostPreparationFailure::Pairing)?,
     )
     .map_err(|_| HostPreparationFailure::Pairing)?;
-    let invitation = crate::hex(encoded.as_bytes());
     let session = PairingSessionSummary {
         device_id: crate::device_directory::format_device_id(device_id),
         temporary_password: access_code.to_string(),
-        invitation: crate::local_relay::pairing_package(&connection, &invitation),
         expires_at_unix_s: invite.expires_at_unix_s(),
     };
     let session_id = invite.session_id();
@@ -835,6 +836,7 @@ mod tests {
             device_id: "00112233445566778899aabbccddeeff".to_owned(),
             fingerprint: "AA:BB".to_owned(),
             expires_at_unix_s: 500,
+            identity_changed: false,
         };
         broker.state.lock().unwrap().pending = Some(PendingApproval {
             summary: summary.clone(),
@@ -868,6 +870,7 @@ mod tests {
                 device_id: "device".to_owned(),
                 fingerprint: "fingerprint".to_owned(),
                 expires_at_unix_s: 500,
+                identity_changed: false,
             },
             decision: None,
         });

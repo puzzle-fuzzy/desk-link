@@ -4,9 +4,13 @@
 
 pub mod capture;
 #[cfg(windows)]
+pub mod cloud_diagnostics;
+#[cfg(windows)]
 pub mod configuration;
 #[cfg(windows)]
 pub mod controller_settings;
+#[cfg(windows)]
+pub mod diagnostic_sharing;
 pub mod diagnostics;
 pub mod encoder;
 #[cfg(windows)]
@@ -17,6 +21,8 @@ pub mod input;
 #[cfg(windows)]
 pub mod recent_access;
 pub mod runtime;
+#[cfg(windows)]
+pub mod startup;
 mod storage;
 pub mod tray;
 #[cfg(windows)]

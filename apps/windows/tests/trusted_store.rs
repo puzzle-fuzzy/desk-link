@@ -12,12 +12,13 @@ mod windows {
         runtime::{ControllerAuthorization, ControllerAuthorizer},
         trusted::{
             LocalControllerApproval, TrustStatus, WindowsControllerAuthorizer,
-            WindowsPairingAuthorizer, WindowsTrustedControllerError, WindowsTrustedControllerStore,
+            WindowsPairingAuthorizer, WindowsPersistentAccessAuthorizer,
+            WindowsTrustedControllerError, WindowsTrustedControllerStore,
         },
         window::{PairingApprovalGate, PendingController},
     };
     use desklink_crypto::{
-        DeviceIdentity, NoiseInitiator, NoiseResponder, PairingInvite, PeerIdentity,
+        DeviceIdentity, NoiseInitiator, NoiseResponder, PairingInvite, PeerIdentity, SessionId,
     };
 
     fn authenticated_peer(device_id: [u8; 16], secret: [u8; 32], seed: u8) -> PeerIdentity {
@@ -79,7 +80,7 @@ mod windows {
     }
 
     #[test]
-    fn device_id_key_replacement_requires_revoke_and_fresh_approval() {
+    fn device_id_key_replacement_requires_fresh_approval() {
         let (directory, store) = temporary_store("replacement");
         let original = authenticated_peer([10; 16], [11; 32], 12);
         let replacement = authenticated_peer([10; 16], [13; 32], 14);
@@ -96,8 +97,9 @@ mod windows {
             Err(WindowsTrustedControllerError::IdentityConflict)
         ));
 
-        assert!(store.revoke(original_record.fingerprint()).unwrap());
-        let replacement_record = store.trust(approve(replacement, 2_002)).unwrap();
+        let replacement_record = store
+            .replace_after_approval(approve(replacement, 2_002))
+            .unwrap();
         assert_eq!(
             store.status(replacement).unwrap(),
             TrustStatus::Trusted(replacement_record)
@@ -126,13 +128,17 @@ mod windows {
     struct RecordingApproval {
         accept: bool,
         calls: AtomicUsize,
+        identity_changes: AtomicUsize,
     }
 
     struct SharedApproval(Arc<RecordingApproval>);
 
     impl LocalControllerApproval for SharedApproval {
-        fn approve(&self, _pending: PendingController) -> bool {
+        fn approve(&self, pending: PendingController) -> bool {
             self.0.calls.fetch_add(1, Ordering::Relaxed);
+            if pending.identity_changed() {
+                self.0.identity_changes.fetch_add(1, Ordering::Relaxed);
+            }
             self.0.accept
         }
     }
@@ -150,6 +156,7 @@ mod windows {
         let approval = Arc::new(RecordingApproval {
             accept: true,
             calls: AtomicUsize::new(0),
+            identity_changes: AtomicUsize::new(0),
         });
         let authorizer = WindowsPairingAuthorizer::new(
             store.clone(),
@@ -190,6 +197,7 @@ mod windows {
             Box::new(SharedApproval(Arc::new(RecordingApproval {
                 accept: false,
                 calls: AtomicUsize::new(0),
+                identity_changes: AtomicUsize::new(0),
             }))),
         );
         assert_eq!(
@@ -214,5 +222,36 @@ mod windows {
         if directory.exists() {
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn fixed_password_access_prompts_before_replacing_a_changed_controller_key() {
+        let (directory, store) = temporary_store("persistent-key-change");
+        let original = authenticated_peer([50; 16], [51; 32], 52);
+        let replacement = authenticated_peer([50; 16], [53; 32], 54);
+        store.trust(approve(original, 4_000)).unwrap();
+        let approval = Arc::new(RecordingApproval {
+            accept: true,
+            calls: AtomicUsize::new(0),
+            identity_changes: AtomicUsize::new(0),
+        });
+        let authorizer = WindowsPersistentAccessAuthorizer::new(
+            store.clone(),
+            SessionId::from_bytes([55; 16]),
+            Box::new(SharedApproval(approval.clone())),
+        );
+
+        assert_eq!(
+            authorizer.authorize(replacement).unwrap(),
+            ControllerAuthorization::Authorized
+        );
+        assert_eq!(approval.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(approval.identity_changes.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            store.status(replacement).unwrap(),
+            TrustStatus::Trusted(_)
+        ));
+        assert_eq!(store.list().unwrap().len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

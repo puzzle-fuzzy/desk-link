@@ -84,10 +84,78 @@ fn inbound_policy_filters_wrong_stream_requests_and_replayed_input() {
 }
 
 #[test]
+fn inbound_policy_calibrates_different_computer_clocks_without_dropping_input() {
+    let mut policy = HostInboundPolicy::new(9);
+    let first = InputEnvelope {
+        sequence: 1,
+        timestamp_us: 10_000,
+        event: InputEvent::MouseMove { x: 100, y: 200 },
+    };
+    let second = InputEnvelope {
+        sequence: 2,
+        timestamp_us: 26_000,
+        event: InputEvent::MouseMove { x: 300, y: 400 },
+    };
+
+    assert_eq!(
+        policy
+            .decode_input(&encode_input(&first).unwrap(), 8_000_000_000)
+            .unwrap(),
+        Some(first.event)
+    );
+    assert_eq!(
+        policy
+            .decode_input(&encode_input(&second).unwrap(), 8_000_016_000)
+            .unwrap(),
+        Some(second.event)
+    );
+}
+
+#[test]
+fn inbound_policy_reanchors_after_a_wall_clock_jump_instead_of_ending_the_session() {
+    let mut policy = HostInboundPolicy::new(9);
+    let first = InputEnvelope {
+        sequence: 1,
+        timestamp_us: 1_000_000,
+        event: InputEvent::MouseMove { x: 10, y: 20 },
+    };
+    let after_clock_jump = InputEnvelope {
+        sequence: 2,
+        timestamp_us: 101_000_000,
+        event: InputEvent::MouseMove { x: 30, y: 40 },
+    };
+
+    policy
+        .decode_input(&encode_input(&first).unwrap(), 2_000_000)
+        .unwrap();
+    assert_eq!(
+        policy
+            .decode_input(&encode_input(&after_clock_jump).unwrap(), 3_000_000)
+            .unwrap(),
+        Some(after_clock_jump.event)
+    );
+}
+
+#[test]
 fn access_lost_recreates_capture_before_the_next_attempt() {
     let mut capture = RecoveringCapture {
         recoveries: 0,
         errors: VecDeque::from([CaptureError::AccessLost]),
+        recover_error: None,
+    };
+
+    assert!(matches!(
+        next_frame_with_recovery(&mut capture, Duration::from_millis(10)).unwrap(),
+        CaptureOutcome::Recovered
+    ));
+    assert_eq!(capture.recoveries, 1);
+}
+
+#[test]
+fn native_dxgi_failure_rebuilds_capture_before_the_next_attempt() {
+    let mut capture = RecoveringCapture {
+        recoveries: 0,
+        errors: VecDeque::from([CaptureError::Native("device rejected first frame".into())]),
         recover_error: None,
     };
 
@@ -183,7 +251,7 @@ fn host_rearms_after_network_or_peer_session_failures() {
         TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch)
     )));
     assert!(!host_error_is_retryable(&HostRuntimeError::PairingRejected));
-    assert!(!host_error_is_retryable(&HostRuntimeError::Capture(
+    assert!(host_error_is_retryable(&HostRuntimeError::Capture(
         CaptureError::NoDisplay
     )));
 }

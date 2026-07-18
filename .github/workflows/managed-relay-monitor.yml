@@ -25,3 +25,12 @@ jobs:
 
       - name: Verify production TLS and QUIC handshake
         run: python scripts/verify-managed-relay.py
+
+      - name: Preserve probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-relay-probe-${{ github.run_id }}
+          path: dist/windows/managed-relay-verification.json
+          if-no-files-found: warn
+          retention-days: 14

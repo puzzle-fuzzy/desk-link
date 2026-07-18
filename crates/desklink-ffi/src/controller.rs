@@ -10,10 +10,10 @@ use desklink_crypto::{
     CryptoError, DeviceIdentity, NoiseInitiator, SecureLane, SecureRole, SecureSession,
 };
 use desklink_protocol::{
-    Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, InputEnvelope, InputEvent,
-    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, VideoConfig,
-    decode_control, decode_cursor_update, decode_noise_handshake, decode_video_config,
-    decode_video_packet, encode_control, encode_input, encode_noise_handshake,
+    AccessDenialReason, Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole,
+    InputEnvelope, InputEvent, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform,
+    ProtocolError, VideoConfig, decode_control, decode_cursor_update, decode_noise_handshake,
+    decode_video_config, decode_video_packet, encode_control, encode_input, encode_noise_handshake,
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{QuicClient, TransportError, TransportEvent};
@@ -51,6 +51,8 @@ pub enum ControllerError {
     NoActiveStream,
     #[error("host sent data on a controller-only transport lane")]
     UnexpectedTransportLane,
+    #[error("the host denied remote-control access: {0:?}")]
+    AccessDenied(AccessDenialReason),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,10 +116,22 @@ impl ControllerRuntime {
         expected_host: VerifyingKey,
         platform: Platform,
     ) -> Result<Self, ControllerError> {
+        Self::connect_for_platform_with_observer(client, identity, expected_host, platform, || {})
+            .await
+    }
+
+    pub async fn connect_for_platform_with_observer(
+        client: QuicClient,
+        identity: DeviceIdentity,
+        expected_host: VerifyingKey,
+        platform: Platform,
+        on_encrypted: impl FnOnce(),
+    ) -> Result<Self, ControllerError> {
         let client = Arc::new(client);
         let secure = Arc::new(Mutex::new(
             perform_noise_handshake(&client, identity, expected_host).await?,
         ));
+        on_encrypted();
         negotiate_host(&client, &secure, platform).await?;
         Ok(Self {
             client,
@@ -163,12 +177,23 @@ impl ControllerRuntime {
         self.request_keyframe_for(stream_id).await
     }
 
+    pub async fn select_display(&self, display_id: u32) -> Result<(), ControllerError> {
+        let plaintext = encode_control(&ControlMessage::SelectDisplay { display_id })?;
+        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
+        self.client.send_control(ciphertext).await?;
+        Ok(())
+    }
+
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
         loop {
             match self.client.next_event().await? {
                 TransportEvent::Control(ciphertext) => {
                     let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
-                    return Ok(ControllerEvent::Control(decode_control(&plaintext)?));
+                    let message = decode_control(&plaintext)?;
+                    if let ControlMessage::AccessDenied { reason } = message {
+                        return Err(ControllerError::AccessDenied(reason));
+                    }
+                    return Ok(ControllerEvent::Control(message));
                 }
                 TransportEvent::Input(_) => {
                     return Err(ControllerError::UnexpectedTransportLane);
@@ -269,6 +294,11 @@ impl ControllerRuntime {
                         continue;
                     }
                     return Ok(ControllerEvent::Cursor(cursor));
+                }
+                TransportEvent::PeerDisconnected { channel } => {
+                    return Ok(ControllerEvent::Closed {
+                        reason: format!("远端会话已断开（{channel:?}）"),
+                    });
                 }
                 TransportEvent::Closed { reason } => {
                     return Ok(ControllerEvent::Closed { reason });
@@ -373,7 +403,13 @@ async fn negotiate_host(
                 ControlMessage::Capabilities(_) => {
                     return Err(ControllerError::InvalidHostCapabilities);
                 }
-                ControlMessage::Hello { .. } | ControlMessage::RequestKeyframe { .. } => {}
+                ControlMessage::AccessDenied { reason } => {
+                    return Err(ControllerError::AccessDenied(reason));
+                }
+                ControlMessage::Hello { .. }
+                | ControlMessage::RequestKeyframe { .. }
+                | ControlMessage::DisplayList { .. }
+                | ControlMessage::SelectDisplay { .. } => {}
             }
         }
     };

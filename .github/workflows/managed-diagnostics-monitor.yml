@@ -1,0 +1,35 @@
+name: Managed diagnostics monitor
+
+on:
+  schedule:
+    - cron: "23,53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-diagnostics-monitor
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: server/diagnostics
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install frozen dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify signed HTTPS ingestion
+        run: bun run probe:managed

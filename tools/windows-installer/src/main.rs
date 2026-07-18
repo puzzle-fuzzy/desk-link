@@ -16,7 +16,9 @@ mod windows_installer {
     };
 
     use crate::APPLICATION_PAYLOAD;
-    use desklink_delivery_layout::{InstallLayout, PRODUCT_NAME, PRODUCT_VERSION};
+    use desklink_delivery_layout::{
+        InstallLayout, PRODUCT_NAME, PRODUCT_VERSION, compare_release_versions,
+    };
     use windows::{
         Win32::{
             Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, LPARAM, WPARAM},
@@ -31,8 +33,8 @@ mod windows_installer {
                 },
                 Registry::{
                     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
-                    REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
-                    RegSetValueExW,
+                    REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
+                    RegDeleteValueW, RegGetValueW, RegSetValueExW,
                 },
                 Threading::{
                     OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_ACCESS_RIGHTS,
@@ -152,6 +154,7 @@ mod windows_installer {
                 "此开发版安装器不包含 DeskLink 应用程序文件",
             ));
         }
+        refuse_downgrade()?;
         let upgrading = layout.application.is_file() || layout.legacy_host.is_file();
         if !options.quiet {
             let verb = if upgrading { "升级" } else { "安装" };
@@ -439,6 +442,70 @@ mod windows_installer {
         set_registry_dword(UNINSTALL_KEY, "NoRepair", 1)?;
         let estimated_kib = payload_size.div_ceil(1024).min(u32::MAX as usize) as u32;
         set_registry_dword(UNINSTALL_KEY, "EstimatedSize", estimated_kib)
+    }
+
+    fn refuse_downgrade() -> io::Result<()> {
+        let Some(installed_version) = read_registry_string(UNINSTALL_KEY, "DisplayVersion")? else {
+            return Ok(());
+        };
+        if compare_release_versions(&installed_version, PRODUCT_VERSION)
+            == Some(std::cmp::Ordering::Greater)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "当前电脑已安装较新的 DeskLink {installed_version}，不能用 {PRODUCT_VERSION} 覆盖。请使用不低于已安装版本的安装包。"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_registry_string(subkey: &str, name: &str) -> io::Result<Option<String>> {
+        let subkey = wide(subkey);
+        let name = wide(name);
+        let mut byte_count = 0u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                None,
+                Some(&mut byte_count),
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        status.ok().map_err(windows_error_to_io)?;
+        if byte_count == 0 || byte_count > 512 || !byte_count.is_multiple_of(2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "已安装版本信息无效",
+            ));
+        }
+        let mut data = vec![0u16; (byte_count as usize).div_ceil(2)];
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(data.as_mut_ptr().cast()),
+                Some(&mut byte_count),
+            )
+        };
+        status.ok().map_err(windows_error_to_io)?;
+        data.truncate(byte_count as usize / 2);
+        if data.last() == Some(&0) {
+            data.pop();
+        }
+        String::from_utf16(&data)
+            .map(Some)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "已安装版本信息不是有效文本"))
     }
 
     fn set_registry_string(subkey: &str, name: &str, value: &str) -> io::Result<()> {

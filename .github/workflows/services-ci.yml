@@ -1,0 +1,45 @@
+name: Backend services CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/diagnostics/**"
+      - ".github/workflows/services-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "server/diagnostics/**"
+      - ".github/workflows/services-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-services-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: server/diagnostics
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install frozen dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test signed ingestion and storage
+        run: bun test
+
+      - name: Type-check service
+        run: bun run typecheck

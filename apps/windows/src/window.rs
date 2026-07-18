@@ -25,6 +25,7 @@ pub struct PendingController {
     session_id: SessionId,
     identity: PeerIdentity,
     expires_at_unix_s: u64,
+    identity_changed: bool,
 }
 
 impl PendingController {
@@ -38,6 +39,15 @@ impl PendingController {
 
     pub const fn expires_at_unix_s(&self) -> u64 {
         self.expires_at_unix_s
+    }
+
+    pub const fn identity_changed(&self) -> bool {
+        self.identity_changed
+    }
+
+    pub fn mark_identity_changed(mut self) -> Self {
+        self.identity_changed = true;
+        self
     }
 
     /// Full, non-secret Ed25519 public-key fingerprint for local confirmation.
@@ -66,17 +76,23 @@ fn grouped_hex(bytes: &[u8]) -> String {
 }
 
 pub fn controller_approval_prompt(pending: PendingController) -> String {
+    let identity_warning = if pending.identity_changed() {
+        "\n\n安全警告：这台设备使用了与上次不同的身份密钥。只有在对方确实重装或重置过 DeskLink，且你核对过新指纹时才批准。批准会替换旧密钥。"
+    } else {
+        ""
+    };
     format!(
         "DeskLink 收到一项已通过身份验证的远程控制请求。\n\n\
          设备 ID：\n{}\n\n\
          Ed25519 公钥指纹：\n{}\n\n\
          会话 ID：\n{}\n\n\
          请求过期时间（Unix）：{}。\n\n\
-         仅当你确认这是自己的控制端时才批准。批准后，对方将获得屏幕查看和输入控制权限。",
+         仅当你确认这是自己的控制端时才批准。批准后，对方将获得屏幕查看和输入控制权限。{}",
         grouped_hex(&pending.identity().device_id()),
         pending.verification_fingerprint(),
         grouped_hex(pending.session_id().as_bytes()),
         pending.expires_at_unix_s(),
+        identity_warning,
     )
 }
 
@@ -209,6 +225,7 @@ impl PairingApprovalGate {
             session_id: invite.session_id(),
             identity,
             expires_at_unix_s: invite.expires_at_unix_s(),
+            identity_changed: false,
         };
         self.pending = Some(pending);
         Ok(pending)
@@ -304,6 +321,7 @@ impl PersistentApprovalGate {
             session_id: self.session_id,
             identity,
             expires_at_unix_s: now_unix_s.saturating_add(ttl_s),
+            identity_changed: false,
         };
         self.pending = Some(pending);
         Ok(pending)

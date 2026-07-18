@@ -56,6 +56,7 @@ export interface HostApprovalSummary {
   deviceId: string;
   fingerprint: string;
   expiresAtUnixS: number;
+  identityChanged: boolean;
 }
 
 export interface HostSnapshot {
@@ -80,7 +81,6 @@ export interface HostSnapshot {
 export interface PairingSessionSummary {
   deviceId: string;
   temporaryPassword: string;
-  invitation: string;
   expiresAtUnixS: number;
 }
 
@@ -121,6 +121,19 @@ export interface DiagnosticExportResult {
   checkCount: number;
 }
 
+export interface WindowsPreferencesSummary {
+  launchAtLogin: boolean;
+  diagnosticsSharingEnabled: boolean;
+  closeToTray: boolean;
+  interfaceLanguage: string;
+  version: string;
+}
+
+export interface DiagnosticUploadResult {
+  uploadedSources: number;
+  uploadedEvents: number;
+}
+
 export type ControllerRuntimeState =
   | "idle"
   | "finding"
@@ -138,6 +151,7 @@ export interface ControllerRuntimeSummary {
 }
 
 export interface SavedControllerConnectionSummary {
+  deviceId: string;
   relayAddress: string;
   serverName: string;
   hostDeviceId: string;
@@ -146,8 +160,14 @@ export interface SavedControllerConnectionSummary {
 
 export interface SavedDeviceCredentialSummary {
   deviceId: string;
+  alias: string | null;
   persistent: boolean;
   lastUsedUnixS: number;
+}
+
+export interface SavedDeviceRenameInput {
+  deviceId: string;
+  alias: string;
 }
 
 export interface ControllerSnapshot {
@@ -156,12 +176,6 @@ export interface ControllerSnapshot {
   connectionError: string | null;
   savedDevices: SavedDeviceCredentialSummary[];
   savedDevicesError: string | null;
-}
-
-export interface ControllerConnectionInput {
-  relayAddress: string;
-  serverName: string;
-  invitation: string;
 }
 
 export interface ControllerDeviceInput {
@@ -186,6 +200,16 @@ export interface ControllerInput {
   modifiers?: number;
 }
 
+export interface ControllerRenderMetrics {
+  streamId: number;
+  receivedFrames: number;
+  submittedFrames: number;
+  displayedFrames: number;
+  malformedFrames: number;
+  decoderRecoveries: number;
+  firstFrameMs: number | null;
+}
+
 export interface ControllerVideoConfigSignal {
   kind: "videoConfig";
   streamId: number;
@@ -195,9 +219,21 @@ export interface ControllerVideoConfigSignal {
   sequenceHeader: number[];
 }
 
+export interface RemoteDisplaySummary {
+  id: number;
+  width: number;
+  height: number;
+  primary: boolean;
+}
+
 export type ControllerSignal =
   | { kind: "status"; runtime: ControllerRuntimeSummary }
   | ControllerVideoConfigSignal
+  | {
+      kind: "displays";
+      displays: RemoteDisplaySummary[];
+      activeDisplayId: number;
+    }
   | {
       kind: "cursor";
       streamId: number;

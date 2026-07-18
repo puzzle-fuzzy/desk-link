@@ -1,20 +1,68 @@
 use desklink_protocol::{
-    Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEnvelope,
-    InputEvent, MAX_CONTROL_MESSAGE_BYTES, MAX_CURSOR_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES,
-    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_NOISE_HANDSHAKE_BYTES, MAX_VIDEO_CHUNKS,
-    MAX_VIDEO_CONFIG_BYTES, MAX_WHEEL_DELTA, Modifiers, NoiseHandshake, NoiseHandshakeStep,
-    PROTOCOL_VERSION, Platform, ProtocolError, VideoConfig, VideoFrameHeader, VideoPacket,
-    decode_control, decode_cursor_update, decode_input, decode_noise_handshake,
-    decode_video_config, decode_video_header, decode_video_packet, encode_control,
-    encode_cursor_update, encode_input, encode_noise_handshake, encode_video_config,
-    encode_video_header, encode_video_packet,
+    AccessDenialReason, Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole,
+    FrameFlags, InputEnvelope, InputEvent, MAX_CONTROL_MESSAGE_BYTES, MAX_CURSOR_MESSAGE_BYTES,
+    MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US,
+    MAX_NOISE_HANDSHAKE_BYTES, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_WHEEL_DELTA,
+    Modifiers, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError,
+    RemoteDisplay, VideoConfig, VideoFrameHeader, VideoPacket, decode_control,
+    decode_cursor_update, decode_input, decode_noise_handshake, decode_video_config,
+    decode_video_header, decode_video_packet, encode_control, encode_cursor_update, encode_input,
+    encode_noise_handshake, encode_video_config, encode_video_header, encode_video_packet,
 };
+
+#[test]
+fn display_list_and_selection_round_trip() {
+    let list = ControlMessage::DisplayList {
+        displays: vec![
+            RemoteDisplay {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                primary: true,
+            },
+            RemoteDisplay {
+                id: 1,
+                width: 2560,
+                height: 1440,
+                primary: false,
+            },
+        ],
+        active_display_id: 0,
+    };
+    let encoded = encode_control(&list).expect("encode display list");
+    assert_eq!(decode_control(&encoded).expect("decode display list"), list);
+
+    let selection = ControlMessage::SelectDisplay { display_id: 1 };
+    let encoded = encode_control(&selection).expect("encode display selection");
+    assert_eq!(
+        decode_control(&encoded).expect("decode display selection"),
+        selection
+    );
+}
 
 #[test]
 fn control_message_round_trips() {
     let message = ControlMessage::RequestKeyframe { stream_id: 7 };
     let encoded = encode_control(&message).expect("encode");
     assert_eq!(decode_control(&encoded).expect("decode"), message);
+}
+
+#[test]
+fn encrypted_access_denial_reason_round_trips() {
+    for reason in [
+        AccessDenialReason::ApprovalRejected,
+        AccessDenialReason::ApprovalExpired,
+        AccessDenialReason::ControllerNotTrusted,
+        AccessDenialReason::ControllerIdentityChanged,
+        AccessDenialReason::HostUnavailable,
+        AccessDenialReason::HostCaptureFailed,
+        AccessDenialReason::HostEncoderFailed,
+        AccessDenialReason::HostInputFailed,
+    ] {
+        let message = ControlMessage::AccessDenied { reason };
+        let encoded = encode_control(&message).expect("encode");
+        assert_eq!(decode_control(&encoded).expect("decode"), message);
+    }
 }
 
 #[test]

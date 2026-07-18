@@ -1,0 +1,20 @@
+[Unit]
+Description=DeskLink diagnostics privacy-preserving session analysis
+After=desklink-diagnostics.service
+
+[Service]
+Type=oneshot
+User=desklink-diagnostics
+Group=desklink-diagnostics
+WorkingDirectory=/opt/desklink-diagnostics/current
+Environment=DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink-diagnostics/diagnostics.sqlite
+Environment=DESKLINK_DIAGNOSTICS_HEALTH_REPORT=/var/lib/desklink-diagnostics/health-report.json
+ExecStart=/opt/desklink-diagnostics/bin/bun run src/write-health-report.ts
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/desklink-diagnostics
+MemoryMax=128M
+TasksMax=64

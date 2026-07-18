@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { clampWheel, keyboardKey, keyboardModifiers, mouseButton } from "./remote-input";
+import {
+  clampWheel,
+  keyboardKey,
+  keyboardModifiers,
+  mouseButton,
+  normalizedPointerPosition,
+} from "./remote-input";
 
 describe("remote keyboard mapping", () => {
   test("covers Windows navigation and function keys", () => {
@@ -31,5 +37,21 @@ describe("remote pointer mapping", () => {
   test("bounds wheel bursts before crossing the IPC boundary", () => {
     expect(clampWheel(10_000)).toBe(1_200);
     expect(clampWheel(-10_000)).toBe(-1_200);
+  });
+
+  test("maps the actual canvas instead of the surrounding letterbox", () => {
+    const canvas = { left: 240, top: 90, width: 960, height: 540 };
+    expect(normalizedPointerPosition(240, 90, canvas)).toEqual({ x: 0, y: 0 });
+    expect(normalizedPointerPosition(720, 360, canvas)).toEqual({ x: 500_000, y: 500_000 });
+    expect(normalizedPointerPosition(1_200, 630, canvas)).toEqual({ x: 1_000_000, y: 1_000_000 });
+    expect(normalizedPointerPosition(200, 360, canvas)).toBeNull();
+  });
+
+  test("keeps fractional high-DPI canvas bounds accurate", () => {
+    const canvas = { left: 18.25, top: 42.5, width: 1365.5, height: 768.25 };
+    expect(normalizedPointerPosition(701, 426.625, canvas)).toEqual({
+      x: 500_000,
+      y: 500_000,
+    });
   });
 });

@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use bytes::Bytes;
 use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
@@ -16,6 +15,8 @@ struct MockRelay {
     client_config: quinn::ClientConfig,
     task: tokio::task::JoinHandle<()>,
 }
+
+const MOCK_PEER_GENERATION: u64 = 1;
 
 impl Drop for MockRelay {
     fn drop(&mut self) {
@@ -86,8 +87,8 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
                     let connection = connection.clone();
                     tokio::spawn(async move {
                         let mut recv = recv;
-                        let mut channel = [0; 1];
-                        if recv.read_exact(&mut channel).await.is_err() {
+                        let mut header = [0; 9];
+                        if recv.read_exact(&mut header).await.is_err() {
                             return;
                         }
                         loop {
@@ -106,7 +107,11 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
                             let Ok((mut send, _recv)) = connection.open_bi().await else {
                                 return;
                             };
-                            if send.write_all(&channel).await.is_err()
+                            if send.write_all(&header[..1]).await.is_err()
+                                || send
+                                    .write_all(&MOCK_PEER_GENERATION.to_be_bytes())
+                                    .await
+                                    .is_err()
                                 || send.write_all(&(length as u32).to_be_bytes()).await.is_err()
                                 || send.write_all(&message).await.is_err()
                             {
@@ -118,7 +123,14 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
                 }
                 datagram = connection.read_datagram() => {
                     let Ok(datagram) = datagram else { return; };
-                    let _ = connection.send_datagram(datagram);
+                    if datagram.len() < 9 {
+                        return;
+                    }
+                    let mut forwarded = Vec::with_capacity(datagram.len());
+                    forwarded.push(datagram[0]);
+                    forwarded.extend_from_slice(&MOCK_PEER_GENERATION.to_be_bytes());
+                    forwarded.extend_from_slice(&datagram[9..]);
+                    let _ = connection.send_datagram(forwarded.into());
                 }
             }
         }
@@ -186,15 +198,15 @@ async fn spawn_stalled_control_relay() -> MockRelay {
             tokio::select! {
                 accepted = connection.accept_bi() => {
                     let Ok((_send, mut receive)) = accepted else { break; };
-                    let mut channel = [0; 1];
-                    if receive.read_exact(&mut channel).await.is_err() {
+                    let mut header = [0; 9];
+                    if receive.read_exact(&mut header).await.is_err() {
                         continue;
                     }
-                    if channel[0] == 1 {
+                    if header[0] == 1 {
                         held_control_streams.push(receive);
                         continue;
                     }
-                    if channel[0] != 2 {
+                    if header[0] != 2 {
                         continue;
                     }
                     let connection = connection.clone();
@@ -208,6 +220,10 @@ async fn spawn_stalled_control_relay() -> MockRelay {
                             return;
                         };
                         if send.write_all(&[2]).await.is_err()
+                            || send
+                                .write_all(&MOCK_PEER_GENERATION.to_be_bytes())
+                                .await
+                                .is_err()
                             || send.write_all(&(length as u32).to_be_bytes()).await.is_err()
                             || send.write_all(&message).await.is_err()
                         {
@@ -230,7 +246,10 @@ async fn spawn_stalled_control_relay() -> MockRelay {
 }
 
 async fn spawn_malformed_peer_relay() -> MockRelay {
-    spawn_peer_relay_with_reliable_prefix(vec![1, 0, 0, 0, 1]).await
+    let mut prefix = vec![1];
+    prefix.extend_from_slice(&MOCK_PEER_GENERATION.to_be_bytes());
+    prefix.extend_from_slice(&1_u32.to_be_bytes());
+    spawn_peer_relay_with_reliable_prefix(prefix).await
 }
 
 async fn spawn_peer_relay_with_reliable_prefix(prefix: Vec<u8>) -> MockRelay {
@@ -339,8 +358,8 @@ async fn spawn_video_flood_relay() -> MockRelay {
         let Ok((_send, mut receive)) = connection.accept_bi().await else {
             return;
         };
-        let mut channel = [0; 1];
-        if receive.read_exact(&mut channel).await.is_err() || channel[0] != 2 {
+        let mut header = [0; 9];
+        if receive.read_exact(&mut header).await.is_err() || header[0] != 2 {
             return;
         }
         if receive.read_exact(&mut length).await.is_err() {
@@ -352,7 +371,11 @@ async fn spawn_video_flood_relay() -> MockRelay {
             return;
         }
         for _ in 0..256 {
-            let _ = connection.send_datagram(Bytes::from_static(&[4, 0xaa]));
+            let mut datagram = Vec::with_capacity(10);
+            datagram.push(4);
+            datagram.extend_from_slice(&MOCK_PEER_GENERATION.to_be_bytes());
+            datagram.push(0xaa);
+            let _ = connection.send_datagram(datagram.into());
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -360,7 +383,8 @@ async fn spawn_video_flood_relay() -> MockRelay {
         let Ok((mut send, _receive)) = connection.open_bi().await else {
             return;
         };
-        let _ = send.write_all(&channel).await;
+        let _ = send.write_all(&header[..1]).await;
+        let _ = send.write_all(&MOCK_PEER_GENERATION.to_be_bytes()).await;
         let _ = send.write_all(&(length as u32).to_be_bytes()).await;
         let _ = send.write_all(&message).await;
         let _ = send.finish();
@@ -423,6 +447,9 @@ async fn spawn_input_flood_with_control_relay() -> MockRelay {
         };
         let input = [0xaa];
         let _ = input_send.write_all(&[2]).await;
+        let _ = input_send
+            .write_all(&MOCK_PEER_GENERATION.to_be_bytes())
+            .await;
         for sequence in 0..256u16 {
             let _ = input_send.write_all(&1u32.to_be_bytes()).await;
             let _ = input_send.write_all(&[sequence as u8]).await;
@@ -433,6 +460,9 @@ async fn spawn_input_flood_with_control_relay() -> MockRelay {
             return;
         };
         let _ = control_send.write_all(&[1]).await;
+        let _ = control_send
+            .write_all(&MOCK_PEER_GENERATION.to_be_bytes())
+            .await;
         let _ = control_send.write_all(&1u32.to_be_bytes()).await;
         let _ = control_send.write_all(&input).await;
         let _ = control_send.finish();
@@ -672,7 +702,9 @@ async fn empty_reliable_stream_emits_a_closed_event() {
 
 #[tokio::test]
 async fn channel_only_reliable_stream_emits_a_closed_event() {
-    let relay = spawn_peer_relay_with_reliable_prefix(vec![1]).await;
+    let mut prefix = vec![1];
+    prefix.extend_from_slice(&MOCK_PEER_GENERATION.to_be_bytes());
+    let relay = spawn_peer_relay_with_reliable_prefix(prefix).await;
     let client = QuicClient::connect(config(&relay)).await.unwrap();
     client.join(join(DeviceRole::Host)).await.unwrap();
 
