@@ -41,3 +41,17 @@ sudo -u desklink-diagnostics env DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink
 ```
 
 已知关联编号时增加 `--correlation <32位编号>`，可以按时间顺序查看同一次连接的主机端和控制端事件。
+
+## 自动会话分析
+
+服务会按关联编号自动识别以下模式：等待主机批准后未进入安全会话、四次及以上重连振荡、连接后没有完整视频帧、视频丢包率超过 10%，以及控制端或主机明确停止。分析不会读取屏幕、输入或访问密码，也不会产生新的公网接口。
+
+手动分析最近 24 小时：
+
+```sh
+cd /opt/desklink-diagnostics/current
+sudo -u desklink-diagnostics env DESKLINK_DIAGNOSTICS_DATABASE=/var/lib/desklink-diagnostics/diagnostics.sqlite \
+  /opt/desklink-diagnostics/bin/bun run src/analyze.ts --hours 24
+```
+
+服务器每小时生成一次滚动 24 小时健康报告，文件为 `/var/lib/desklink-diagnostics/health-report.json`，权限仅限诊断服务账户和 root。任一错误会要求关注；没有错误但达到三个警告会话时同样标记 `requires_attention: true`。报告最多保留最近 100 个异常会话，不公开到网站。

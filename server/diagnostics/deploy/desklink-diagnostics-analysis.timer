@@ -1,0 +1,12 @@
+[Unit]
+Description=Generate the rolling DeskLink diagnostics health report
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=2min
+Persistent=true
+Unit=desklink-diagnostics-analysis.service
+
+[Install]
+WantedBy=timers.target

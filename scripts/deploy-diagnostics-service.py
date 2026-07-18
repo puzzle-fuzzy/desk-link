@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 import subprocess
 import tarfile
@@ -43,6 +44,29 @@ def build_archive(destination: Path) -> None:
                 archive.add(path, arcname=relative.as_posix(), recursive=False)
 
 
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def upload(source: Path, host: str, common: list[str], destination: str) -> None:
+    with source.open("rb") as payload:
+        subprocess.run(
+            ["ssh", *common, host, "dd", f"of={destination}", "status=none"],
+            cwd=ROOT,
+            stdin=payload,
+            check=True,
+        )
+    remote_digest = run(
+        ["ssh", *common, host, "sha256sum", destination], capture=True
+    ).split()[0]
+    if remote_digest != sha256(source):
+        raise RuntimeError(f"uploaded file checksum does not match: {source.name}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="root@101.35.246.159")
@@ -61,14 +85,12 @@ def main() -> None:
         remote_archive = f"/tmp/{archive.name}"
         remote_installer = f"/tmp/desklink-diagnostics-install-{release_id}.py"
         common = ["-o", "BatchMode=yes", "-i", str(arguments.identity)]
-        run(["scp", *common, str(archive), f"{arguments.host}:{remote_archive}"])
-        run(
-            [
-                "scp",
-                *common,
-                str(SOURCE / "deploy" / "install.py"),
-                f"{arguments.host}:{remote_installer}",
-            ]
+        upload(archive, arguments.host, common, remote_archive)
+        upload(
+            SOURCE / "deploy" / "install.py",
+            arguments.host,
+            common,
+            remote_installer,
         )
         run(
             [

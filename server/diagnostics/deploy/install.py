@@ -20,6 +20,8 @@ BIN_DIRECTORY = Path("/opt/desklink-diagnostics/bin")
 BUN_EXECUTABLE = BIN_DIRECTORY / "bun"
 STATE = Path("/var/lib/desklink-diagnostics")
 SERVICE = Path("/etc/systemd/system/desklink-diagnostics.service")
+ANALYSIS_SERVICE = Path("/etc/systemd/system/desklink-diagnostics-analysis.service")
+ANALYSIS_TIMER = Path("/etc/systemd/system/desklink-diagnostics-analysis.timer")
 NGINX_SITE = Path("/etc/nginx/conf.d/p2p.yxswy.com.conf")
 NGINX_RATE = Path("/etc/nginx/conf.d/desklink-diagnostics-rate.conf")
 BEGIN_MARKER = "    # BEGIN DESKLINK DIAGNOSTICS"
@@ -105,6 +107,8 @@ def install(archive: Path, release_id: str) -> dict[str, str]:
         release / "package.json",
         release / "src/index.ts",
         release / "deploy/desklink-diagnostics.service",
+        release / "deploy/desklink-diagnostics-analysis.service",
+        release / "deploy/desklink-diagnostics-analysis.timer",
         release / "deploy/nginx-location.conf",
     ]
     if any(not path.is_file() for path in required):
@@ -141,16 +145,33 @@ def install(archive: Path, release_id: str) -> dict[str, str]:
     temporary_link.symlink_to(release)
     os.replace(temporary_link, CURRENT)
     shutil.copy2(release / "deploy/desklink-diagnostics.service", SERVICE)
+    shutil.copy2(
+        release / "deploy/desklink-diagnostics-analysis.service",
+        ANALYSIS_SERVICE,
+    )
+    shutil.copy2(
+        release / "deploy/desklink-diagnostics-analysis.timer",
+        ANALYSIS_TIMER,
+    )
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "desklink-diagnostics.service"])
+    run(["systemctl", "enable", "--now", "desklink-diagnostics-analysis.timer"])
     run(["systemctl", "restart", "desklink-diagnostics.service"])
     run(["systemctl", "is-active", "--quiet", "desklink-diagnostics.service"])
     run(["nginx", "-s", "reload"])
     with urllib.request.urlopen("http://127.0.0.1:3411/health", timeout=5) as response:
         if response.status != 200:
             raise RuntimeError("diagnostics health check failed")
+    run(["systemctl", "start", "desklink-diagnostics-analysis.service"])
+    if not (STATE / "health-report.json").is_file():
+        raise RuntimeError("diagnostics health report was not generated")
     archive.unlink(missing_ok=True)
-    return {"release": release_id, "service": "active", "health": "ok"}
+    return {
+        "release": release_id,
+        "service": "active",
+        "health": "ok",
+        "analysis_timer": "active",
+    }
 
 
 def main() -> None:
