@@ -28,6 +28,8 @@ python scripts/deploy-diagnostics-service.py
 
 部署脚本创建不可变版本目录、原子切换 `current`、安装受限 systemd 服务、校验 Nginx 后再重载，并执行本机健康检查。
 
+GitHub Actions 每半小时从外部生成临时 Ed25519 身份并提交一个签名探针批次，同时验证公网 HTTPS、签名校验、字段验证和服务端写入路径。
+
 ## 排查查询
 
 通过 SSH 在服务器上查询最近 24 小时的 warning/error：
