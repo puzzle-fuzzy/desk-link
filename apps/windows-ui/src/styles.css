@@ -186,6 +186,18 @@ select:focus-visible {
   color: var(--warning);
 }
 
+.host-status-chip {
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.host-status-chip--attention {
+  color: var(--warning);
+}
+
 .section-nav {
   display: flex;
   gap: 26px;
@@ -884,6 +896,10 @@ select:focus-visible {
   padding: 20px 24px;
   border-radius: var(--radius-lg);
   background: var(--surface);
+}
+
+.diagnostic-disclosure {
+  border-top: 1px solid var(--border);
 }
 
 .diagnostic-actions {
@@ -2195,6 +2211,17 @@ select:focus-visible {
   width: min(100%, 1260px);
   margin: 0 auto;
   animation: none;
+}
+
+.connection-workspace {
+  max-width: 920px;
+  margin: 0 auto;
+}
+
+.share-device-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
 }
 
 .controller-stack > .feedback {

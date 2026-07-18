@@ -36,11 +36,15 @@ import {
   MANAGED_RELAY_SERVER_NAME,
   isManagedRelay,
 } from "./product-config";
-import { nextTabIndex } from "./navigation";
+import {
+  DESKTOP_NAV_ITEMS,
+  navigationViewFor,
+  nextTabIndex,
+  type DeskLinkView,
+} from "./navigation";
 import { LatestRequest } from "./latest-request";
 import { escapeHtml } from "./html";
 
-type View = "overview" | "controller" | "connection" | "devices" | "pairing" | "fixedAccess";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
 
 const applicationRoot = document.querySelector<HTMLElement>("#app");
@@ -50,8 +54,8 @@ if (!applicationRoot) {
 const app: HTMLElement = applicationRoot;
 
 let snapshot: HostSnapshot | null = null;
-let activeView: View = "overview";
-let renderedView: View | null = null;
+let activeView: DeskLinkView = "controller";
+let renderedView: DeskLinkView | null = null;
 let loading = true;
 let saving = false;
 let managedSetupBusy = false;
@@ -151,10 +155,6 @@ function focusNewApproval(): void {
 }
 
 function renderHeader(): string {
-  const protectionCopy = snapshot?.connectionError || snapshot?.trustedError || snapshot?.fixedPasswordError
-    ? "需要检查本地保护"
-    : "Windows 保护已启用";
-  const protectionTone = snapshot?.connectionError || snapshot?.trustedError || snapshot?.fixedPasswordError ? "attention" : "secure";
   return `
     <header class="topbar">
       <div class="product-lockup" aria-label="DeskLink Windows 远程桌面">
@@ -164,26 +164,26 @@ function renderHeader(): string {
           <span>Windows 远程桌面</span>
         </div>
       </div>
-      <div class="protection-state protection-state--${protectionTone}">
-        <span class="protection-glyph" aria-hidden="true"></span>
-        ${protectionCopy}
-      </div>
+      ${snapshot ? renderHostStatusChip(snapshot) : ""}
     </header>
   `;
 }
 
+function renderHostStatusChip(state: HostSnapshot): string {
+  const attention = Boolean(state.connectionError || state.trustedError || state.fixedPasswordError);
+  const title = attention
+    ? "需要处理"
+    : state.connection
+      ? "本机可被连接"
+      : "未开启共享";
+  return `<button class="host-status-chip host-status-chip--${attention ? "attention" : "quiet"}" type="button" data-open-overview aria-label="${title}，打开设置 / 诊断">${title}</button>`;
+}
+
 function renderNavigation(): string {
-  const activeNavigationView = activeView === "pairing" ? "devices" : activeView;
-  const items: Array<{ id: View; label: string }> = [
-    { id: "overview", label: "本机状态" },
-    { id: "controller", label: "控制另一台" },
-    { id: "connection", label: "本机连接" },
-    { id: "devices", label: "已批准设备" },
-    { id: "fixedAccess", label: "访问密码" },
-  ];
+  const activeNavigationView = navigationViewFor(activeView);
   return `
     <nav class="section-nav" aria-label="DeskLink 功能导航" role="tablist">
-      ${items
+      ${DESKTOP_NAV_ITEMS
         .map(
           ({ id, label }) => `
             <button
@@ -284,13 +284,19 @@ function renderOverview(state: HostSnapshot): string {
   ];
   return `
     <div class="overview-stack">
+      <header class="page-heading overview-heading">
+        <div>
+          <h1>设置 / 诊断</h1>
+          <p>管理本机共享、访问权限和连接诊断。</p>
+        </div>
+      </header>
       <section class="status-panel status-panel--${state.readiness}" aria-labelledby="status-heading">
         <div class="status-copy">
           <div class="status-label">
             <span class="status-light" aria-hidden="true"></span>
             这台电脑
           </div>
-          <h1 id="status-heading">${escapeHtml(statusTitle)}</h1>
+          <h2 id="status-heading">${escapeHtml(statusTitle)}</h2>
           <p>${escapeHtml(statusDetail)}</p>
         </div>
         <div class="status-actions">
@@ -391,14 +397,14 @@ function renderNextStep(state: HostSnapshot): string {
   const detail = !state.connection
     ? "DeskLink 会生成受保护的连接凭据并使用已部署的公网中继，无需填写网络参数。"
     : approvalStoreUnavailable
-      ? "DeskLink 暂时无法安全读取已批准设备，请重新读取本机状态后再创建连接码。"
+      ? "DeskLink 暂时无法安全读取已批准设备，请重新读取设置 / 诊断状态后再创建连接码。"
     : state.pairingActive
-        ? "打开另一台电脑的“控制另一台”页面，输入本机 ID 和临时密码。"
+        ? "打开另一台电脑的“连接设备”页面，输入本机 ID 和临时密码。"
         : "临时密码有效时间很短；找到本机后，仍需在这台电脑上确认连接请求。";
   const action = !state.connection
     ? `<button class="button button--primary" type="button" data-setup-managed ${managedSetupBusy ? "disabled" : ""}>${managedSetupBusy ? "正在启用…" : "启用远程连接"}</button>`
     : approvalStoreUnavailable
-      ? '<button class="button button--primary" type="button" data-refresh>重新读取本机状态</button>'
+      ? '<button class="button button--primary" type="button" data-refresh>重新读取设置 / 诊断状态</button>'
     : state.pairingActive
       ? '<button class="button button--primary" type="button" data-open-pairing>查看临时密码</button>'
       : '<button class="button button--primary" type="button" data-start-pairing>生成临时密码</button>';
@@ -459,7 +465,7 @@ function renderDiagnosticSummary(state: HostSnapshot): string {
     )
     .join("");
   return `
-    <section class="diagnostic-summary" aria-labelledby="diagnostic-summary-heading">
+    <section class="diagnostic-summary diagnostic-disclosure" aria-labelledby="diagnostic-summary-heading">
       <div class="section-heading">
         <div>
           <h2 id="diagnostic-summary-heading">双机连接诊断</h2>
@@ -571,7 +577,7 @@ function renderConnection(state: HostSnapshot): string {
     <div class="page-layout page-layout--form">
       <header class="page-heading">
         <div>
-          <h1>本机连接</h1>
+          <h1>共享此设备</h1>
           <p>保存后，这台电脑才能创建连接码并等待另一台电脑连接。</p>
         </div>
         <div class="page-actions">
@@ -581,7 +587,7 @@ function renderConnection(state: HostSnapshot): string {
 
       ${state.connectionError ? renderStateWarnings(state) : ""}
 
-      <div class="connection-guidance">
+      <div class="connection-guidance share-device-card">
         <span class="connection-guidance-mark" aria-hidden="true"></span>
         <div>
           <strong>${state.connection && isManagedRelay(state.connection.relayAddress, state.connection.serverName) ? "正在使用 DeskLink 公网中继" : "默认使用 DeskLink 公网中继"}</strong>
@@ -687,10 +693,10 @@ function renderConnection(state: HostSnapshot): string {
 
         <div class="form-actions field--wide">
           <button class="button button--primary" type="submit" ${saving ? "disabled" : ""} ${saving ? 'aria-busy="true"' : ""}>
-            ${saving ? "正在保存本机连接…" : "保存本机连接"}
+            ${saving ? "正在保存共享设置…" : "保存共享设置"}
           </button>
           <button class="button button--secondary" type="button" data-cancel-connection ${saving ? "disabled" : ""}>
-            返回本机状态
+            返回设置 / 诊断
           </button>
         </div>
       </form>
@@ -817,7 +823,7 @@ function renderPairing(state: HostSnapshot): string {
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
         <div>
-          <button class="back-button" type="button" data-open-overview aria-label="返回本机状态">← 本机状态</button>
+          <button class="back-button" type="button" data-open-overview aria-label="返回设置 / 诊断">← 设置 / 诊断</button>
           <h1>允许另一台电脑连接</h1>
           <p>在另一台电脑输入下面的设备 ID 和临时密码。</p>
         </div>
@@ -850,7 +856,7 @@ function renderPairing(state: HostSnapshot): string {
                 </div>
               </div>
               <ol class="pairing-steps" aria-label="连接步骤">
-                <li><span>1</span><p>在另一台电脑打开“控制另一台”</p></li>
+                <li><span>1</span><p>在另一台电脑打开“连接设备”</p></li>
                 <li><span>2</span><p>输入设备 ID 和临时密码</p></li>
                 <li><span>3</span><p>回到本机确认连接请求</p></li>
               </ol>
@@ -905,7 +911,7 @@ function renderFixedAccess(state: HostSnapshot): string {
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
         <div>
-          <button class="back-button" type="button" data-open-overview aria-label="返回本机状态">← 本机状态</button>
+          <button class="back-button" type="button" data-open-overview aria-label="返回设置 / 诊断">← 设置 / 诊断</button>
           <h1>固定访问密码</h1>
           <p>适合经常从自己的另一台电脑连接本机，无需每次重新生成临时密码。</p>
         </div>
@@ -1101,7 +1107,7 @@ function bindInteractions(): void {
       if (activeView === "fixedAccess") {
         clearFixedAccessSecrets();
       }
-      activeView = button.dataset.view as View;
+      activeView = button.dataset.view as DeskLinkView;
       if (activeView === "connection") {
         connectionDraft = null;
         connectionAdvancedOpen = false;

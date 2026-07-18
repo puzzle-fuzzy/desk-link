@@ -108,8 +108,8 @@ export function renderControllerView(): string {
       ${feedback ? renderFeedback(feedback) : ""}
       <div class="controller-heading">
         <div>
-          <h1>连接另一台电脑</h1>
-          <p>输入主机上显示的设备 ID 和访问密码，然后在主机上确认连接。</p>
+          <h1>连接设备</h1>
+          <p>粘贴连接码，开始控制另一台电脑。</p>
         </div>
         ${renderRuntimeBadge()}
       </div>
@@ -295,8 +295,9 @@ function renderConnectionPanel(): string {
       ? { tone: "ready", text: `已识别连接码，将连接 ${recognizedCode.relayAddress}。` }
       : { tone: "attention", text: "连接码尚不完整，请回到另一台电脑重新复制完整内容。" };
   return `
-    <div class="controller-connect-grid">
-      <section class="controller-card controller-card--primary">
+    <div class="connection-workspace">
+      <div class="controller-connect-grid">
+        <section class="controller-card controller-card--primary">
         <div class="controller-card-heading">
           <div><h2>连接远程设备</h2><p>输入另一台电脑显示的本机 ID，以及临时密码或固定密码。</p></div>
         </div>
@@ -346,16 +347,17 @@ function renderConnectionPanel(): string {
             <span>${connectionActive ? "取消后仍会保留已输入的 ID 和密码，方便再次尝试。" : "找到设备后，主机会显示本次控制请求。"}</span>
           </div>
         </form>
-      </section>
+        </section>
 
-      <aside class="controller-card controller-card--saved">
-        <div class="controller-card-heading">
-          <div><h2>重新连接已批准电脑</h2><p>首次批准后，可以直接从这里重新连接。</p></div>
-        </div>
-        ${saved ? renderSavedConnection(isWorking) : renderNoSavedConnection()}
-      </aside>
+        <aside class="controller-card controller-card--saved">
+          <div class="controller-card-heading">
+            <div><h2>重新连接已批准电脑</h2><p>首次批准后，可以直接从这里重新连接。</p></div>
+          </div>
+          ${saved ? renderSavedConnection(isWorking) : renderNoSavedConnection()}
+        </aside>
+      </div>
+      ${renderSavedDevices(isWorking)}
     </div>
-    ${renderSavedDevices(isWorking)}
     <details class="controller-legacy-panel" ${invitationDraft.trim() && !recognizedCode ? "open" : ""}>
       <summary>使用旧版连接码</summary>
       <div class="controller-legacy-content">

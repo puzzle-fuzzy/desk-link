@@ -1,3 +1,18 @@
+export type DeskLinkView = "overview" | "controller" | "connection" | "devices" | "pairing" | "fixedAccess";
+
+export const DESKTOP_NAV_ITEMS: ReadonlyArray<{ id: DeskLinkView; label: string }> = [
+  { id: "controller", label: "连接设备" },
+  { id: "connection", label: "共享此设备" },
+  { id: "devices", label: "已批准设备" },
+  { id: "overview", label: "设置 / 诊断" },
+];
+
+export function navigationViewFor(view: DeskLinkView): DeskLinkView {
+  if (view === "pairing") return "connection";
+  if (view === "fixedAccess") return "overview";
+  return view;
+}
+
 export type TabNavigationKey = "ArrowLeft" | "ArrowRight" | "Home" | "End";
 
 export function nextTabIndex(
