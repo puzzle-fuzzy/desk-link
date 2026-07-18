@@ -6,6 +6,34 @@ const MAX_PENDING_FRAMES: usize = 2;
 const DEFAULT_VIDEO_BITRATE: u32 = 4_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct H264EncoderSettings {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+}
+
+impl Default for H264EncoderSettings {
+    fn default() -> Self {
+        Self {
+            max_width: MAX_ENCODE_WIDTH,
+            max_height: MAX_ENCODE_HEIGHT,
+            fps: 30,
+            bitrate: DEFAULT_VIDEO_BITRATE,
+        }
+    }
+}
+
+impl H264EncoderSettings {
+    pub fn validate(self) -> Result<Self, EncoderError> {
+        if self.max_width < 2 || self.max_height < 2 || self.fps == 0 || self.bitrate == 0 {
+            return Err(EncoderError::InvalidDimensions);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PixelOrder {
     Bgra,
     Rgba,
@@ -32,22 +60,31 @@ pub enum EncoderError {
 }
 
 pub fn fit_h264_dimensions(width: u32, height: u32) -> Result<(u32, u32), EncoderError> {
-    if width < 2 || height < 2 {
+    fit_h264_dimensions_with_limit(width, height, MAX_ENCODE_WIDTH, MAX_ENCODE_HEIGHT)
+}
+
+pub fn fit_h264_dimensions_with_limit(
+    width: u32,
+    height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(u32, u32), EncoderError> {
+    if width < 2 || height < 2 || max_width < 2 || max_height < 2 {
         return Err(EncoderError::InvalidDimensions);
     }
 
-    let (width, height) = if u64::from(width) * u64::from(MAX_ENCODE_HEIGHT)
-        >= u64::from(height) * u64::from(MAX_ENCODE_WIDTH)
-        && width > MAX_ENCODE_WIDTH
+    let (width, height) = if u64::from(width) * u64::from(max_height)
+        >= u64::from(height) * u64::from(max_width)
+        && width > max_width
     {
         (
-            MAX_ENCODE_WIDTH,
-            (u64::from(height) * u64::from(MAX_ENCODE_WIDTH) / u64::from(width)) as u32,
+            max_width,
+            (u64::from(height) * u64::from(max_width) / u64::from(width)) as u32,
         )
-    } else if height > MAX_ENCODE_HEIGHT {
+    } else if height > max_height {
         (
-            (u64::from(width) * u64::from(MAX_ENCODE_HEIGHT) / u64::from(height)) as u32,
-            MAX_ENCODE_HEIGHT,
+            (u64::from(width) * u64::from(max_height) / u64::from(height)) as u32,
+            max_height,
         )
     } else {
         (width, height)
@@ -161,6 +198,9 @@ pub struct H264Encoder {
     width: u32,
     height: u32,
     fps: u32,
+    bitrate: u32,
+    max_width: u32,
+    max_height: u32,
     frame_id: u64,
     config_version: u32,
     #[cfg(windows)]
@@ -179,16 +219,43 @@ struct PendingFrame {
 
 impl H264Encoder {
     pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, EncoderError> {
-        if fit_h264_dimensions(width, height)? != (width, height) || fps == 0 {
+        let settings = H264EncoderSettings {
+            fps,
+            ..H264EncoderSettings::default()
+        }
+        .validate()?;
+        if fit_h264_dimensions(width, height)? != (width, height) {
+            return Err(EncoderError::InvalidDimensions);
+        }
+        Self::new_with_settings(width, height, settings)
+    }
+
+    pub fn new_with_settings(
+        source_width: u32,
+        source_height: u32,
+        settings: H264EncoderSettings,
+    ) -> Result<Self, EncoderError> {
+        let settings = settings.validate()?;
+        let (width, height) = fit_h264_dimensions_with_limit(
+            source_width,
+            source_height,
+            settings.max_width,
+            settings.max_height,
+        )?;
+        if width == 0 || height == 0 {
             return Err(EncoderError::InvalidDimensions);
         }
         #[cfg(windows)]
         {
-            let backend = native::MediaFoundationEncoder::new(width, height, fps)?;
+            let backend =
+                native::MediaFoundationEncoder::new(width, height, settings.fps, settings.bitrate)?;
             Ok(Self {
                 width,
                 height,
-                fps,
+                fps: settings.fps,
+                bitrate: settings.bitrate,
+                max_width: settings.max_width,
+                max_height: settings.max_height,
                 frame_id: 0,
                 config_version: 1,
                 pending_frames: std::collections::VecDeque::new(),
@@ -198,7 +265,7 @@ impl H264Encoder {
 
         #[cfg(not(windows))]
         {
-            let _ = (width, height, fps);
+            let _ = (width, height, settings);
             return Err(EncoderError::BackendUnavailable);
         }
     }
@@ -208,7 +275,12 @@ impl H264Encoder {
         frame: CapturedFrame,
         force_keyframe: bool,
     ) -> Result<EncodedFrame, EncoderError> {
-        let target_dimensions = fit_h264_dimensions(frame.width, frame.height)?;
+        let target_dimensions = fit_h264_dimensions_with_limit(
+            frame.width,
+            frame.height,
+            self.max_width,
+            self.max_height,
+        )?;
         if target_dimensions != (self.width, self.height) {
             self.rebuild(target_dimensions.0, target_dimensions.1)?;
         }
@@ -267,17 +339,50 @@ impl H264Encoder {
     }
 
     pub fn rebuild(&mut self, width: u32, height: u32) -> Result<(), EncoderError> {
-        if fit_h264_dimensions(width, height)? != (width, height) {
+        if fit_h264_dimensions_with_limit(width, height, self.max_width, self.max_height)?
+            != (width, height)
+        {
             return Err(EncoderError::InvalidDimensions);
         }
         #[cfg(windows)]
         {
-            let backend = native::MediaFoundationEncoder::new(width, height, self.fps)?;
+            let backend =
+                native::MediaFoundationEncoder::new(width, height, self.fps, self.bitrate)?;
             self.backend = backend;
             self.pending_frames.clear();
         }
         self.width = width;
         self.height = height;
+        self.config_version = self.config_version.wrapping_add(1).max(1);
+        Ok(())
+    }
+
+    pub fn reconfigure_for_source(
+        &mut self,
+        source_width: u32,
+        source_height: u32,
+        settings: H264EncoderSettings,
+    ) -> Result<(), EncoderError> {
+        let settings = settings.validate()?;
+        let (width, height) = fit_h264_dimensions_with_limit(
+            source_width,
+            source_height,
+            settings.max_width,
+            settings.max_height,
+        )?;
+        #[cfg(windows)]
+        {
+            let backend =
+                native::MediaFoundationEncoder::new(width, height, settings.fps, settings.bitrate)?;
+            self.backend = backend;
+            self.pending_frames.clear();
+        }
+        self.width = width;
+        self.height = height;
+        self.fps = settings.fps;
+        self.bitrate = settings.bitrate;
+        self.max_width = settings.max_width;
+        self.max_height = settings.max_height;
         self.config_version = self.config_version.wrapping_add(1).max(1);
         Ok(())
     }
@@ -318,7 +423,7 @@ mod native {
         core::Interface,
     };
 
-    use super::{CapturedFrame, DEFAULT_VIDEO_BITRATE, EncoderError, PixelOrder, convert_to_nv12};
+    use super::{CapturedFrame, EncoderError, PixelOrder, convert_to_nv12};
 
     pub struct EncodedOutput {
         pub access_unit: Vec<u8>,
@@ -374,7 +479,7 @@ mod native {
     }
 
     impl MediaFoundationEncoder {
-        pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, EncoderError> {
+        pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self, EncoderError> {
             let runtime = NativeRuntime::start()?;
             let transform: IMFTransform = unsafe {
                 CoCreateInstance(
@@ -384,7 +489,7 @@ mod native {
                 )
             }
             .map_err(|error| native_error("create H.264 MFT", error))?;
-            let output_type = create_output_type(width, height, fps)?;
+            let output_type = create_output_type(width, height, fps, bitrate)?;
             let input_type = create_input_type(width, height, fps)?;
             let codec_api = transform.cast::<ICodecAPI>().ok();
             unsafe {
@@ -602,7 +707,12 @@ mod native {
         )
     }
 
-    fn create_output_type(width: u32, height: u32, fps: u32) -> Result<IMFMediaType, EncoderError> {
+    fn create_output_type(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<IMFMediaType, EncoderError> {
         let media_type = unsafe { MFCreateMediaType() }
             .map_err(|error| native_error("create H.264 output media type", error))?;
         unsafe { media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }
@@ -619,7 +729,7 @@ mod native {
             media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
         }
         .map_err(|error| native_error("set H.264 interlace mode", error))?;
-        unsafe { media_type.SetUINT32(&MF_MT_AVG_BITRATE, DEFAULT_VIDEO_BITRATE) }
+        unsafe { media_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate) }
             .map_err(|error| native_error("set H.264 bitrate", error))?;
         unsafe { media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32) }
             .map_err(|error| native_error("set H.264 profile", error))?;

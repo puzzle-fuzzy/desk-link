@@ -1217,7 +1217,7 @@ fn forward_datagram(
     };
     if !matches!(
         channel,
-        ChannelKind::VideoDatagram | ChannelKind::CursorDatagram
+        ChannelKind::VideoDatagram | ChannelKind::CursorDatagram | ChannelKind::AudioDatagram
     ) {
         close_connection(source, b"invalid datagram channel");
         return false;
@@ -1304,6 +1304,8 @@ const fn channel_label(channel: ChannelKind) -> &'static str {
         ChannelKind::VideoConfig => "video_config",
         ChannelKind::VideoDatagram => "video_datagram",
         ChannelKind::CursorDatagram => "cursor_datagram",
+        ChannelKind::Transfer => "transfer",
+        ChannelKind::AudioDatagram => "audio_datagram",
     }
 }
 

@@ -407,6 +407,10 @@ fn secure_session_isolates_lanes_and_accepts_datagram_reordering() {
         .seal(SecureLane::VideoDatagram, b"second")
         .unwrap();
     let control = initiator.seal(SecureLane::Control, b"control").unwrap();
+    let transfer = initiator.seal(SecureLane::Transfer, b"file chunk").unwrap();
+    let audio = initiator
+        .seal(SecureLane::AudioDatagram, b"audio frame")
+        .unwrap();
 
     assert_eq!(
         responder.open(SecureLane::VideoDatagram, &second).unwrap(),
@@ -419,6 +423,14 @@ fn secure_session_isolates_lanes_and_accepts_datagram_reordering() {
     assert_eq!(
         responder.open(SecureLane::Control, &control).unwrap(),
         b"control"
+    );
+    assert_eq!(
+        responder.open(SecureLane::Transfer, &transfer).unwrap(),
+        b"file chunk"
+    );
+    assert_eq!(
+        responder.open(SecureLane::AudioDatagram, &audio).unwrap(),
+        b"audio frame"
     );
 }
 

@@ -2,6 +2,7 @@
 // only by the real Windows backends are intentionally inactive on those targets.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+pub mod audio;
 pub mod capture;
 #[cfg(windows)]
 pub mod cloud_diagnostics;
@@ -24,6 +25,7 @@ pub mod runtime;
 #[cfg(windows)]
 pub mod startup;
 mod storage;
+pub mod transfer;
 pub mod tray;
 #[cfg(windows)]
 pub mod trusted;

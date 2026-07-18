@@ -1,10 +1,11 @@
 use crate::{
-    Codec, ControlMessage, CursorUpdate, FrameFlags, InputEnvelope, InputEvent,
-    MAX_CONTROL_MESSAGE_BYTES, MAX_CURSOR_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES,
-    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_MVP_HEIGHT, MAX_MVP_WIDTH,
-    MAX_NOISE_HANDSHAKE_BYTES, MAX_POINTER_COORDINATE, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES,
-    MAX_VIDEO_PACKET_BYTES, MAX_WHEEL_DELTA, NoiseHandshake, PROTOCOL_VERSION, VideoConfig,
-    VideoFrameHeader, VideoPacket,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioCodec, AudioPacket, Codec, ControlMessage,
+    CursorUpdate, FrameFlags, InputEnvelope, InputEvent, MAX_AUDIO_PACKET_BYTES,
+    MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_CURSOR_MESSAGE_BYTES,
+    MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_MVP_HEIGHT,
+    MAX_MVP_WIDTH, MAX_NOISE_HANDSHAKE_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES, MAX_POINTER_COORDINATE,
+    MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_BYTES, MAX_WHEEL_DELTA,
+    NoiseHandshake, PROTOCOL_VERSION, TransferMessage, VideoConfig, VideoFrameHeader, VideoPacket,
 };
 use thiserror::Error;
 
@@ -28,12 +29,16 @@ pub enum ProtocolError {
     InvalidVideoConfig,
     #[error("invalid cursor update")]
     InvalidCursor,
+    #[error("invalid audio packet")]
+    InvalidAudio,
     #[error("input timestamp is outside the accepted window")]
     TimestampOutsideWindow,
     #[error("invalid input event")]
     InvalidInput,
     #[error("invalid remote display list")]
     InvalidDisplayList,
+    #[error("invalid clipboard or file transfer message")]
+    InvalidTransfer,
 }
 
 pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
@@ -64,6 +69,67 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
         validate_display_list(displays, *active_display_id)?;
     }
     Ok(message)
+}
+
+pub fn encode_transfer(message: &TransferMessage) -> Result<Vec<u8>, ProtocolError> {
+    validate_transfer(message)?;
+    bounded(
+        postcard::to_allocvec(message).map_err(|_| ProtocolError::Malformed)?,
+        crate::MAX_TRANSFER_MESSAGE_BYTES,
+    )
+}
+
+pub fn decode_transfer(bytes: &[u8]) -> Result<TransferMessage, ProtocolError> {
+    ensure(bytes, crate::MAX_TRANSFER_MESSAGE_BYTES)?;
+    let message = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    validate_transfer(&message)?;
+    Ok(message)
+}
+
+fn validate_transfer(message: &TransferMessage) -> Result<(), ProtocolError> {
+    use TransferMessage::*;
+
+    let valid_id = |id: &[u8; 16]| id.iter().any(|byte| *byte != 0);
+    let valid = match message {
+        ClipboardSet { request_id, text } | ClipboardData { request_id, text } => {
+            *request_id != 0 && text.len() <= crate::MAX_CLIPBOARD_TEXT_BYTES
+        }
+        ClipboardRequest { request_id }
+        | ClipboardResult { request_id, .. }
+        | FileSelectionRequest { request_id }
+        | FileSelectionCancel { request_id }
+        | FileSelectionResult { request_id, .. } => *request_id != 0,
+        FileOffer {
+            transfer_id,
+            name,
+            size,
+        } => {
+            valid_id(transfer_id)
+                && *size <= crate::MAX_TRANSFER_FILE_BYTES
+                && crate::is_valid_transfer_file_name(name)
+        }
+        FileDecision { transfer_id, .. }
+        | FileComplete { transfer_id, .. }
+        | FileResult { transfer_id, .. }
+        | Cancel { transfer_id } => valid_id(transfer_id),
+        FileChunk {
+            transfer_id,
+            offset,
+            bytes,
+        } => {
+            valid_id(transfer_id)
+                && !bytes.is_empty()
+                && bytes.len() <= crate::MAX_TRANSFER_CHUNK_BYTES
+                && offset
+                    .checked_add(bytes.len() as u64)
+                    .is_some_and(|end| end <= crate::MAX_TRANSFER_FILE_BYTES)
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidTransfer)
+    }
 }
 
 fn validate_display_list(
@@ -124,6 +190,19 @@ pub fn decode_cursor_update(bytes: &[u8]) -> Result<CursorUpdate, ProtocolError>
     validate_cursor_update(&cursor)?;
     Ok(cursor)
 }
+pub fn encode_audio_packet(packet: &AudioPacket) -> Result<Vec<u8>, ProtocolError> {
+    validate_audio_packet(packet)?;
+    bounded(
+        postcard::to_allocvec(packet).map_err(|_| ProtocolError::Malformed)?,
+        MAX_AUDIO_PACKET_BYTES,
+    )
+}
+pub fn decode_audio_packet(bytes: &[u8]) -> Result<AudioPacket, ProtocolError> {
+    ensure(bytes, MAX_AUDIO_PACKET_BYTES)?;
+    let packet = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    validate_audio_packet(&packet)?;
+    Ok(packet)
+}
 pub fn encode_video_header(header: &VideoFrameHeader) -> Result<Vec<u8>, ProtocolError> {
     validate_video_header(header)?;
     postcard::to_allocvec(header).map_err(|_| ProtocolError::Malformed)
@@ -173,7 +252,13 @@ fn validate_input(input: &InputEnvelope) -> Result<(), ProtocolError> {
             InputEvent::MouseButton { .. } => true,
             InputEvent::Key {
                 code, modifiers, ..
-            } => code.is_valid() && modifiers.is_valid(),
+            } => {
+                code.is_valid()
+                    && modifiers.is_valid()
+                    && code
+                        .modifier_mask()
+                        .is_none_or(|own_modifier| !modifiers.contains(own_modifier))
+            }
             InputEvent::MouseWheel { delta_x, delta_y } => {
                 (*delta_x != 0 || *delta_y != 0)
                     && (-MAX_WHEEL_DELTA..=MAX_WHEEL_DELTA).contains(delta_x)
@@ -273,6 +358,34 @@ fn validate_cursor_update(cursor: &CursorUpdate) -> Result<(), ProtocolError> {
         || !(0..=1_000_000).contains(&cursor.y_millionths)
     {
         return Err(ProtocolError::InvalidCursor);
+    }
+    Ok(())
+}
+
+fn validate_audio_packet(packet: &AudioPacket) -> Result<(), ProtocolError> {
+    if packet.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(packet.protocol_version));
+    }
+    if packet.stream_id == 0
+        || packet.sequence == 0
+        || packet.capture_timestamp_us == 0
+        || packet.sample_rate != AUDIO_SAMPLE_RATE
+        || packet.channels != AUDIO_CHANNELS
+    {
+        return Err(ProtocolError::InvalidAudio);
+    }
+    let valid_payload = match packet.codec {
+        AudioCodec::PcmS16Le => {
+            !packet.payload.is_empty()
+                && packet.payload.len() <= MAX_AUDIO_PAYLOAD_BYTES
+                && packet.payload.len().is_multiple_of(2)
+        }
+        AudioCodec::Opus => {
+            !packet.payload.is_empty() && packet.payload.len() <= MAX_OPUS_AUDIO_PAYLOAD_BYTES
+        }
+    };
+    if !valid_payload {
+        return Err(ProtocolError::InvalidAudio);
     }
     Ok(())
 }

@@ -2595,7 +2595,9 @@ select:focus-visible {
   gap: 6px;
 }
 
-.remote-display-picker {
+.remote-display-picker,
+.remote-quality-picker,
+.remote-scale-picker {
   display: inline-flex;
   min-height: 30px;
   align-items: center;
@@ -2607,13 +2609,17 @@ select:focus-visible {
   color: oklch(0.78 0.008 250);
 }
 
-.remote-display-picker .app-icon {
+.remote-display-picker .app-icon,
+.remote-quality-picker .app-icon,
+.remote-scale-picker .app-icon {
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
 }
 
-.remote-display-picker select {
+.remote-display-picker select,
+.remote-quality-picker select,
+.remote-scale-picker select {
   max-width: 190px;
   border: 0;
   outline: 0;
@@ -2625,14 +2631,48 @@ select:focus-visible {
   cursor: pointer;
 }
 
-.remote-display-picker select:disabled {
+.remote-quality-picker select {
+  max-width: 48px;
+}
+
+.remote-scale-picker select {
+  max-width: 42px;
+}
+
+.remote-display-picker select:disabled,
+.remote-quality-picker select:disabled,
+.remote-scale-picker select:disabled {
   cursor: wait;
   opacity: 0.65;
 }
 
-.remote-display-picker option {
+.remote-display-picker option,
+.remote-quality-picker option,
+.remote-scale-picker option {
   background: oklch(0.2 0.012 250);
   color: oklch(0.94 0.006 250);
+}
+
+.remote-display-switch-status {
+  max-width: 190px;
+  overflow: hidden;
+  color: oklch(0.76 0.01 250);
+  font-size: 10.5px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-display-switch-status[data-tone="pending"] {
+  color: oklch(0.78 0.09 70);
+}
+
+.remote-display-switch-status[data-tone="success"] {
+  color: oklch(0.78 0.13 145);
+}
+
+.remote-display-switch-status[data-tone="error"] {
+  color: oklch(0.74 0.13 25);
 }
 
 .toolbar-button {
@@ -2655,8 +2695,391 @@ select:focus-visible {
   background: oklch(0.28 0.013 250);
 }
 
+.toolbar-button--active {
+  border-color: oklch(0.65 0.1 55);
+  background: oklch(0.31 0.045 55);
+  color: oklch(0.95 0.02 55);
+}
+
+.toolbar-button--active:hover {
+  border-color: oklch(0.72 0.11 55);
+  background: oklch(0.35 0.05 55);
+}
+
+.toolbar-button--has-activity {
+  border-color: oklch(0.5 0.055 55);
+}
+
+.remote-transfer-activity {
+  display: inline-grid;
+  min-width: 15px;
+  height: 15px;
+  place-items: center;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: oklch(0.76 0.14 55);
+  color: oklch(0.2 0.02 55);
+  font-size: 8.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.remote-transfer-activity:empty {
+  min-width: 7px;
+  width: 7px;
+  height: 7px;
+  padding: 0;
+}
+
+.remote-transfer-activity[data-state="success"] {
+  background: oklch(0.7 0.14 145);
+  color: oklch(0.18 0.02 145);
+}
+
+.remote-transfer-activity[data-state="error"] {
+  background: oklch(0.64 0.17 25);
+  color: oklch(0.97 0.006 25);
+}
+
+.remote-transfer-activity[hidden] {
+  display: none;
+}
+
+.toolbar-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
 .toolbar-button--danger {
   color: oklch(0.8 0.1 25);
+}
+
+.toolbar-button--quiet {
+  background: transparent;
+}
+
+.remote-transfer-panel {
+  padding: 11px 12px;
+  border-bottom: 1px solid oklch(0.29 0.014 250);
+  background: oklch(0.165 0.012 250);
+  color: oklch(0.9 0.008 250);
+}
+
+.remote-transfer-panel[hidden],
+.remote-transfer-status[hidden] {
+  display: none;
+}
+
+.remote-transfer-heading,
+.remote-transfer-heading > div:first-child,
+.remote-transfer-actions,
+.remote-transfer-status,
+.remote-transfer-status--file > div {
+  display: flex;
+  align-items: center;
+}
+
+.remote-transfer-heading {
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.remote-transfer-heading > div:first-child {
+  min-width: 0;
+  gap: 9px;
+}
+
+.remote-transfer-heading > div:first-child > .app-icon {
+  width: 17px;
+  height: 17px;
+  color: oklch(0.75 0.11 55);
+}
+
+.remote-transfer-heading strong,
+.remote-transfer-heading small,
+.remote-transfer-status strong,
+.remote-transfer-status span,
+.remote-transfer-status small {
+  display: block;
+}
+
+.remote-transfer-heading strong {
+  font-size: 11.5px;
+}
+
+.remote-transfer-heading small {
+  margin-top: 2px;
+  color: oklch(0.66 0.012 250);
+  font-size: 10px;
+}
+
+.remote-transfer-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.remote-file-drop-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  color: oklch(0.72 0.012 250);
+  font-size: 10px;
+}
+
+.remote-file-drop-hint > span,
+.remote-downloads-action {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.remote-downloads-action[hidden] {
+  display: none;
+}
+
+.remote-downloads-action small {
+  overflow: hidden;
+  max-width: 32ch;
+  color: oklch(0.7 0.012 250);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-file-drop-hint .app-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.remote-transfer-statuses {
+  display: grid;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.remote-transfer-status {
+  min-height: 34px;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid oklch(0.32 0.014 250);
+  border-radius: var(--radius-sm);
+  background: oklch(0.205 0.012 250);
+}
+
+.remote-transfer-status strong {
+  overflow: hidden;
+  max-width: 230px;
+  color: oklch(0.91 0.008 250);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-transfer-status span {
+  color: oklch(0.68 0.012 250);
+  font-size: 10px;
+}
+
+.remote-transfer-status small {
+  color: oklch(0.61 0.012 250);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.remote-transfer-status[data-state="completed"] {
+  border-color: oklch(0.46 0.09 145);
+}
+
+.remote-transfer-status[data-state="failed"],
+.remote-transfer-status[data-state="rejected"] {
+  border-color: oklch(0.48 0.1 25);
+}
+
+.remote-transfer-status--file {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(100px, 240px) auto auto;
+}
+
+.remote-transfer-status--file > div {
+  min-width: 0;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  gap: 8px;
+}
+
+.remote-transfer-status progress {
+  width: 100%;
+  height: 5px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: oklch(0.28 0.012 250);
+  accent-color: oklch(0.68 0.14 55);
+}
+
+.remote-transfer-status progress::-webkit-progress-bar {
+  background: oklch(0.28 0.012 250);
+}
+
+.remote-transfer-status progress::-webkit-progress-value {
+  background: oklch(0.68 0.14 55);
+}
+
+.remote-transfer-ledger {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.remote-transfer-list {
+  min-width: 0;
+  padding-top: 7px;
+  border-top: 1px solid oklch(0.3 0.014 250);
+}
+
+.remote-transfer-list[hidden] {
+  display: none;
+}
+
+.remote-transfer-list-heading,
+.remote-transfer-list li,
+.remote-transfer-list li > span,
+.remote-transfer-list li > span > span {
+  display: flex;
+  align-items: center;
+}
+
+.remote-transfer-list-heading {
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 3px;
+}
+
+.remote-transfer-list-heading > span {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.remote-transfer-list-heading strong {
+  color: oklch(0.88 0.008 250);
+  font-size: 10.5px;
+}
+
+.remote-transfer-list-heading button,
+.remote-transfer-list li > button {
+  padding: 3px 5px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: oklch(0.73 0.012 250);
+  font-size: 9.5px;
+  cursor: pointer;
+}
+
+.remote-transfer-list-heading button:hover,
+.remote-transfer-list li > button:hover {
+  background: oklch(0.27 0.013 250);
+  color: oklch(0.94 0.006 250);
+}
+
+.remote-transfer-list ul {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.remote-transfer-list li {
+  min-width: 0;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 3px;
+}
+
+.remote-transfer-list li > span {
+  min-width: 0;
+  gap: 7px;
+}
+
+.remote-transfer-list li > span > .app-icon {
+  width: 13px;
+  height: 13px;
+  color: oklch(0.72 0.1 55);
+}
+
+.remote-transfer-list li > span > span {
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.remote-transfer-list li strong {
+  overflow: hidden;
+  color: oklch(0.88 0.008 250);
+  font-size: 10px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-transfer-list li small,
+.remote-transfer-more {
+  flex: 0 0 auto;
+  color: oklch(0.69 0.012 250);
+  font-size: 9.5px;
+}
+
+.remote-transfer-list li[data-state="completed"] > span > .app-icon {
+  color: oklch(0.72 0.12 145);
+}
+
+.remote-transfer-list li[data-state="failed"] > span > .app-icon,
+.remote-transfer-list li[data-state="rejected"] > span > .app-icon {
+  color: oklch(0.72 0.13 25);
+}
+
+.remote-file-drop-overlay {
+  position: absolute;
+  z-index: 5;
+  inset: 18px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  border: 2px dashed oklch(0.72 0.12 55);
+  border-radius: var(--radius-md);
+  background: color-mix(in oklch, oklch(0.16 0.014 250), transparent 4%);
+  color: oklch(0.94 0.006 250);
+  text-align: center;
+  pointer-events: none;
+  transition: opacity var(--transition);
+}
+
+.remote-file-drop-overlay[hidden] {
+  display: none;
+}
+
+.remote-file-drop-overlay .app-icon {
+  width: 26px;
+  height: 26px;
+  color: oklch(0.78 0.13 55);
+}
+
+.remote-file-drop-overlay strong {
+  font-size: 13px;
+}
+
+.remote-file-drop-overlay span {
+  color: oklch(0.75 0.012 250);
+  font-size: 10.5px;
 }
 
 .remote-text-entry {
@@ -2712,21 +3135,54 @@ select:focus-visible {
   box-shadow: inset 0 0 0 2px var(--focus);
 }
 
-.remote-viewport:fullscreen {
+.remote-session:fullscreen {
   width: 100vw;
   height: 100vh;
+  display: flex;
+  flex-direction: column;
+  border: 0;
   border-radius: 0;
   background: black;
 }
 
+.remote-session:fullscreen .remote-viewport {
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
 .remote-canvas {
   display: block;
+  min-width: 0;
+  min-height: 0;
   width: auto;
   max-width: 100%;
   height: auto;
   max-height: 100%;
   background: black;
   image-rendering: auto;
+}
+
+.remote-viewport[data-scale-mode="actual"] {
+  place-items: start;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: oklch(0.43 0.012 250) oklch(0.17 0.012 250);
+  scrollbar-width: thin;
+}
+
+.remote-viewport[data-scale-mode="actual"] .remote-canvas {
+  max-width: none;
+  max-height: none;
+}
+
+.remote-viewport[data-interaction-mode="pan"] {
+  cursor: grab;
+}
+
+.remote-viewport[data-interaction-mode="pan"][data-panning="true"] {
+  cursor: grabbing;
 }
 
 .remote-video-starting {
@@ -2792,7 +3248,8 @@ select:focus-visible {
 }
 
 .remote-viewport:focus .remote-focus-hint,
-.remote-viewport:hover .remote-focus-hint {
+.remote-viewport:hover .remote-focus-hint,
+.remote-viewport[data-interaction-mode="pan"] .remote-focus-hint {
   opacity: 1;
 }
 
@@ -2814,6 +3271,19 @@ select:focus-visible {
   font-size: 11px;
 }
 
+@media (max-width: 1120px) {
+  .remote-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .remote-toolbar-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+}
+
 @media (max-width: 900px) {
   .controller-heading {
     align-items: flex-start;
@@ -2830,18 +3300,31 @@ select:focus-visible {
     row-gap: 12px;
   }
 
-  .remote-toolbar {
+  .remote-text-entry {
+    grid-template-columns: 1fr auto auto;
+  }
+
+  .remote-transfer-heading {
     align-items: flex-start;
     flex-direction: column;
   }
 
-  .remote-toolbar-actions {
+  .remote-transfer-actions {
     width: 100%;
-    flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
-  .remote-text-entry {
-    grid-template-columns: 1fr auto auto;
+  .remote-transfer-status--file {
+    grid-template-columns: 1fr auto;
+  }
+
+  .remote-transfer-status--file progress {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .remote-transfer-ledger {
+    grid-template-columns: 1fr;
   }
 
   .remote-text-entry label {

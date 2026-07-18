@@ -1,6 +1,6 @@
 [package]
 name = "desklink-windows-ui"
-version = "0.1.26"
+version = "0.1.41"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,6 +25,7 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [target.'cfg(windows)'.dependencies]
 apps-windows = { package = "desklink-windows", path = "../../windows" }
+blake2 = "0.10"
 desklink-crypto.workspace = true
 desklink-ffi.workspace = true
 desklink-protocol.workspace = true
@@ -42,6 +43,7 @@ windows = { version = "0.61", features = [
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
   "Win32_System_Power",
+  "Win32_System_Com",
   "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",

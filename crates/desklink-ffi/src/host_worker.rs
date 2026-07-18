@@ -13,8 +13,8 @@ use desklink_crypto::{
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, NoiseHandshake,
     NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
-    decode_cursor_update, decode_input, decode_noise_handshake, encode_control,
-    encode_noise_handshake, encode_video_config, encode_video_packet,
+    decode_cursor_update, decode_input, decode_noise_handshake, decode_transfer, encode_control,
+    encode_noise_handshake, encode_transfer, encode_video_config, encode_video_packet,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin, TransportError, TransportEvent};
@@ -729,7 +729,12 @@ async fn negotiate_controller(
                 | ControlMessage::RequestKeyframe { .. }
                 | ControlMessage::AccessDenied { .. }
                 | ControlMessage::DisplayList { .. }
-                | ControlMessage::SelectDisplay { .. } => {}
+                | ControlMessage::SelectDisplay { .. }
+                | ControlMessage::SetAudioEnabled { .. }
+                | ControlMessage::AudioState { .. }
+                | ControlMessage::SetVideoQuality { .. }
+                | ControlMessage::VideoQualityState { .. }
+                | ControlMessage::VideoNetworkFeedback { .. } => {}
             }
         }
     };
@@ -787,11 +792,19 @@ async fn run_connected(
                         metrics.received_input_events = metrics.received_input_events.saturating_add(1);
                         emit_nonterminal(events, HostEvent::Input(input.event));
                     }
+                    TransportEvent::Transfer(ciphertext) => {
+                        let plaintext = secure.open(SecureLane::Transfer, &ciphertext).map_err(crypto_error)?;
+                        let message = decode_transfer(&plaintext).map_err(protocol_error)?;
+                        emit_nonterminal(events, HostEvent::Transfer(message));
+                    }
             TransportEvent::Closed { reason } => return Err(HostError::Transport(format!("transport closed: {reason}"))),
             TransportEvent::PeerDisconnected { .. } => {
                 return Err(HostError::Transport("controller disconnected".to_owned()));
             }
-            TransportEvent::VideoConfig(_) | TransportEvent::VideoDatagram(_) | TransportEvent::CursorDatagram(_) => {
+            TransportEvent::VideoConfig(_)
+            | TransportEvent::VideoDatagram(_)
+            | TransportEvent::CursorDatagram(_)
+            | TransportEvent::AudioDatagram(_) => {
                         return Err(HostError::Protocol(
                             "controller sent data on a host-only transport lane".into(),
                         ));
@@ -903,6 +916,17 @@ async fn handle_command(
                 .map_err(crypto_error)?;
             client
                 .send_cursor_datagram(ciphertext)
+                .await
+                .map_err(transport_error)?;
+            Ok(true)
+        }
+        HostCommand::SendTransfer(message) => {
+            let plaintext = encode_transfer(&message).map_err(protocol_error)?;
+            let ciphertext = secure
+                .seal(SecureLane::Transfer, &plaintext)
+                .map_err(crypto_error)?;
+            client
+                .send_transfer(ciphertext)
                 .await
                 .map_err(transport_error)?;
             Ok(true)

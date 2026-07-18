@@ -1,4 +1,7 @@
-use apps_windows::encoder::{EncoderError, PixelOrder, convert_to_nv12, fit_h264_dimensions};
+use apps_windows::encoder::{
+    EncoderError, H264EncoderSettings, PixelOrder, convert_to_nv12, fit_h264_dimensions,
+    fit_h264_dimensions_with_limit,
+};
 
 #[test]
 fn fits_large_frames_inside_level_safe_bounds_without_distortion() {
@@ -9,6 +12,42 @@ fn fits_large_frames_inside_level_safe_bounds_without_distortion() {
         fit_h264_dimensions(1, 1),
         Err(EncoderError::InvalidDimensions)
     );
+}
+
+#[test]
+fn quality_limits_preserve_aspect_ratio_and_even_dimensions() {
+    assert_eq!(
+        fit_h264_dimensions_with_limit(2560, 1440, 1280, 720),
+        Ok((1280, 720))
+    );
+    assert_eq!(
+        fit_h264_dimensions_with_limit(1365, 768, 1280, 720),
+        Ok((1278, 720))
+    );
+    assert_eq!(
+        fit_h264_dimensions_with_limit(1080, 1920, 1280, 720),
+        Ok((404, 720))
+    );
+}
+
+#[test]
+fn encoder_settings_reject_zero_values() {
+    for settings in [
+        H264EncoderSettings {
+            fps: 0,
+            ..H264EncoderSettings::default()
+        },
+        H264EncoderSettings {
+            bitrate: 0,
+            ..H264EncoderSettings::default()
+        },
+        H264EncoderSettings {
+            max_width: 1,
+            ..H264EncoderSettings::default()
+        },
+    ] {
+        assert_eq!(settings.validate(), Err(EncoderError::InvalidDimensions));
+    }
 }
 
 #[test]

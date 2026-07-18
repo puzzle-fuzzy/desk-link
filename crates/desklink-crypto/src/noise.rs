@@ -329,10 +329,12 @@ pub enum SecureLane {
     VideoConfig = 2,
     VideoDatagram = 3,
     CursorDatagram = 4,
+    Transfer = 5,
+    AudioDatagram = 6,
 }
 
 impl SecureLane {
-    const COUNT: usize = 5;
+    const COUNT: usize = 7;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Control,
@@ -340,6 +342,8 @@ impl SecureLane {
         Self::VideoConfig,
         Self::VideoDatagram,
         Self::CursorDatagram,
+        Self::Transfer,
+        Self::AudioDatagram,
     ];
 
     const fn index(self) -> usize {

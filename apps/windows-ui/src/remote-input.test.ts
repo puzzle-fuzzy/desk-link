@@ -3,9 +3,11 @@ import { describe, expect, test } from "bun:test";
 import {
   clampWheel,
   keyboardKey,
+  keyboardModifierMask,
   keyboardModifiers,
   mouseButton,
   normalizedPointerPosition,
+  remoteCursorContentPosition,
 } from "./remote-input";
 
 describe("remote keyboard mapping", () => {
@@ -23,6 +25,19 @@ describe("remote keyboard mapping", () => {
 
   test("encodes modifier bits consistently with the Rust protocol", () => {
     expect(keyboardModifiers({ shiftKey: true, ctrlKey: true, altKey: false, metaKey: true })).toBe(11);
+    expect(keyboardModifierMask("control")).toBe(2);
+    expect(keyboardModifierMask("meta")).toBe(8);
+    expect(keyboardModifiers(
+      { shiftKey: true, ctrlKey: true, altKey: false, metaKey: true },
+      keyboardModifierMask("control") | keyboardModifierMask("meta"),
+    )).toBe(1);
+  });
+
+  test("maps standalone modifiers so mouse operations can keep them pressed", () => {
+    expect(keyboardKey("Control")).toEqual({ key: "control" });
+    expect(keyboardKey("Alt")).toEqual({ key: "alt" });
+    expect(keyboardKey("Shift")).toEqual({ key: "shift" });
+    expect(keyboardKey("Meta")).toEqual({ key: "meta" });
   });
 });
 
@@ -53,5 +68,19 @@ describe("remote pointer mapping", () => {
       x: 500_000,
       y: 500_000,
     });
+  });
+
+  test("keeps the remote cursor aligned while the 1:1 canvas is scrolled", () => {
+    const position = remoteCursorContentPosition(
+      500_000,
+      250_000,
+      { left: -180, top: -60, width: 1920, height: 1080 },
+      { left: 100, top: 40 },
+      300,
+      120,
+    );
+    expect(position).toEqual({ left: 980, top: 290 });
+    expect(position.left - 300 + 100).toBe(-180 + 960);
+    expect(position.top - 120 + 40).toBe(-60 + 270);
   });
 });

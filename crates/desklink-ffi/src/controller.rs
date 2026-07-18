@@ -10,10 +10,12 @@ use desklink_crypto::{
     CryptoError, DeviceIdentity, NoiseInitiator, SecureLane, SecureRole, SecureSession,
 };
 use desklink_protocol::{
-    AccessDenialReason, Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole,
-    InputEnvelope, InputEvent, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform,
-    ProtocolError, VideoConfig, decode_control, decode_cursor_update, decode_noise_handshake,
-    decode_video_config, decode_video_packet, encode_control, encode_input, encode_noise_handshake,
+    AccessDenialReason, AudioPacket, Codec, ControlMessage, CursorUpdate, DeviceCapabilities,
+    DeviceRole, InputEnvelope, InputEvent, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION,
+    Platform, ProtocolError, TransferMessage, VideoConfig, VideoQualityPreference,
+    decode_audio_packet, decode_control, decode_cursor_update, decode_noise_handshake,
+    decode_transfer, decode_video_config, decode_video_packet, encode_control, encode_input,
+    encode_noise_handshake, encode_transfer,
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{QuicClient, TransportError, TransportEvent};
@@ -61,6 +63,8 @@ pub enum ControllerEvent {
     VideoConfig(VideoConfig),
     H264AccessUnit(EncodedFrame),
     Cursor(CursorUpdate),
+    Audio(AudioPacket),
+    Transfer(TransferMessage),
     Closed { reason: String },
 }
 
@@ -99,6 +103,21 @@ pub struct ControllerRuntime {
     keyframe_needed_after_config: bool,
     awaiting_keyframe: bool,
     keyframe_request_outstanding: bool,
+}
+
+#[derive(Clone)]
+pub struct ControllerTransferSender {
+    client: Arc<QuicClient>,
+    secure: Arc<Mutex<SecureSession>>,
+}
+
+impl ControllerTransferSender {
+    pub async fn send(&self, message: TransferMessage) -> Result<(), ControllerError> {
+        let plaintext = encode_transfer(&message)?;
+        let ciphertext = seal(&self.secure, SecureLane::Transfer, &plaintext).await?;
+        self.client.send_transfer(ciphertext).await?;
+        Ok(())
+    }
 }
 
 impl ControllerRuntime {
@@ -184,6 +203,48 @@ impl ControllerRuntime {
         Ok(())
     }
 
+    pub async fn set_audio_enabled(&self, enabled: bool) -> Result<(), ControllerError> {
+        let plaintext = encode_control(&ControlMessage::SetAudioEnabled { enabled })?;
+        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
+        self.client.send_control(ciphertext).await?;
+        Ok(())
+    }
+
+    pub async fn set_video_quality(
+        &self,
+        preference: VideoQualityPreference,
+    ) -> Result<(), ControllerError> {
+        let plaintext = encode_control(&ControlMessage::SetVideoQuality { preference })?;
+        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
+        self.client.send_control(ciphertext).await?;
+        Ok(())
+    }
+
+    pub async fn report_video_network_feedback(
+        &self,
+        received_packets: u32,
+        dropped_packets: u32,
+    ) -> Result<(), ControllerError> {
+        let plaintext = encode_control(&ControlMessage::VideoNetworkFeedback {
+            received_packets,
+            dropped_packets,
+        })?;
+        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
+        self.client.send_control(ciphertext).await?;
+        Ok(())
+    }
+
+    pub async fn send_transfer(&self, message: TransferMessage) -> Result<(), ControllerError> {
+        self.transfer_sender().send(message).await
+    }
+
+    pub fn transfer_sender(&self) -> ControllerTransferSender {
+        ControllerTransferSender {
+            client: self.client.clone(),
+            secure: self.secure.clone(),
+        }
+    }
+
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
         loop {
             match self.client.next_event().await? {
@@ -255,7 +316,14 @@ impl ControllerRuntime {
                         self.drop_video_packet();
                         continue;
                     }
-                    match self.assembler.push(Instant::now(), packet) {
+                    let assembled = self.assembler.push(Instant::now(), packet);
+                    let dropped_chunks = self.assembler.take_dropped_chunks();
+                    if dropped_chunks > 0 {
+                        self.metrics
+                            .dropped_video_packets
+                            .fetch_add(dropped_chunks, Ordering::Relaxed);
+                    }
+                    match assembled {
                         AssembleResult::Pending => {}
                         AssembleResult::Dropped(_) => self.drop_video_packet(),
                         AssembleResult::Complete(frame) => {
@@ -294,6 +362,22 @@ impl ControllerRuntime {
                         continue;
                     }
                     return Ok(ControllerEvent::Cursor(cursor));
+                }
+                TransportEvent::AudioDatagram(ciphertext) => {
+                    let plaintext =
+                        open(&self.secure, SecureLane::AudioDatagram, &ciphertext).await?;
+                    let packet = decode_audio_packet(&plaintext)?;
+                    if self
+                        .active_stream_id()
+                        .is_some_and(|id| id != packet.stream_id)
+                    {
+                        continue;
+                    }
+                    return Ok(ControllerEvent::Audio(packet));
+                }
+                TransportEvent::Transfer(ciphertext) => {
+                    let plaintext = open(&self.secure, SecureLane::Transfer, &ciphertext).await?;
+                    return Ok(ControllerEvent::Transfer(decode_transfer(&plaintext)?));
                 }
                 TransportEvent::PeerDisconnected { channel } => {
                     return Ok(ControllerEvent::Closed {
@@ -409,7 +493,12 @@ async fn negotiate_host(
                 ControlMessage::Hello { .. }
                 | ControlMessage::RequestKeyframe { .. }
                 | ControlMessage::DisplayList { .. }
-                | ControlMessage::SelectDisplay { .. } => {}
+                | ControlMessage::SelectDisplay { .. }
+                | ControlMessage::SetAudioEnabled { .. }
+                | ControlMessage::AudioState { .. }
+                | ControlMessage::SetVideoQuality { .. }
+                | ControlMessage::VideoQualityState { .. }
+                | ControlMessage::VideoNetworkFeedback { .. } => {}
             }
         }
     };

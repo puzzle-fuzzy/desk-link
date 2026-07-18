@@ -198,6 +198,8 @@ mod windows {
                 ControllerEvent::Control(_)
                 | ControllerEvent::H264AccessUnit(_)
                 | ControllerEvent::Cursor(_)
+                | ControllerEvent::Audio(_)
+                | ControllerEvent::Transfer(_)
                 | ControllerEvent::Closed { .. } => {}
             }
         }

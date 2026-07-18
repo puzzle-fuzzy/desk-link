@@ -1,19 +1,38 @@
 mod codec;
 
 pub use codec::{
-    ProtocolError, decode_control, decode_cursor_update, decode_input, decode_noise_handshake,
-    decode_session_input, decode_video_config, decode_video_header, decode_video_packet,
-    encode_control, encode_cursor_update, encode_input, encode_noise_handshake,
+    ProtocolError, decode_audio_packet, decode_control, decode_cursor_update, decode_input,
+    decode_noise_handshake, decode_session_input, decode_transfer, decode_video_config,
+    decode_video_header, decode_video_packet, encode_audio_packet, encode_control,
+    encode_cursor_update, encode_input, encode_noise_handshake, encode_transfer,
     encode_video_config, encode_video_header, encode_video_packet,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::{BitOr, BitOrAssign};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_NOISE_HANDSHAKE_BYTES: usize = 4 * 1024;
 pub const MAX_VIDEO_CONFIG_BYTES: usize = 16 * 1024;
 pub const MAX_CURSOR_MESSAGE_BYTES: usize = 256;
+/// Maximum serialized audio packet before end-to-end packet protection.
+pub const MAX_AUDIO_PACKET_BYTES: usize = 1_120;
+pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: u16 = 1;
+pub const AUDIO_FRAME_SAMPLES: usize = 480;
+/// Maximum 10 ms mono PCM frame size at 48 kHz.
+pub const MAX_AUDIO_PAYLOAD_BYTES: usize = AUDIO_FRAME_SAMPLES * 2;
+/// Conservative ceiling for one compressed 10 ms Opus frame. The production
+/// encoder targets 64 kbit/s (about 80 bytes per frame), while this limit still
+/// permits constrained-VBR bursts without approaching the datagram budget.
+pub const MAX_OPUS_AUDIO_PAYLOAD_BYTES: usize = 512;
+/// Maximum encoded message on the dedicated reliable clipboard/file lane.
+pub const MAX_TRANSFER_MESSAGE_BYTES: usize = 64 * 1024;
+/// Text clipboard limit. This leaves room for encryption and postcard framing.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 48 * 1024;
+pub const MAX_TRANSFER_FILE_NAME_BYTES: usize = 255;
+pub const MAX_TRANSFER_CHUNK_BYTES: usize = 48 * 1024;
+pub const MAX_TRANSFER_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum serialized DeskLink video packet accepted by the QUIC datagram lane.
 pub const MAX_VIDEO_PACKET_BYTES: usize = 1200;
 /// Conservative H.264 chunk size that leaves room for the versioned packet header.
@@ -111,6 +130,26 @@ pub struct CursorUpdate {
     pub visible: bool,
     pub shape_id: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    PcmS16Le,
+    Opus,
+}
+
+/// A self-describing 10 ms system-audio packet carried on an independent,
+/// lossy encrypted datagram lane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AudioPacket {
+    pub protocol_version: u16,
+    pub stream_id: u64,
+    pub sequence: u64,
+    pub capture_timestamp_us: u64,
+    pub codec: AudioCodec,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub payload: Vec<u8>,
+}
 impl VideoPacket {
     pub fn new(header: VideoFrameHeader, payload: Vec<u8>) -> Result<Self, codec::ProtocolError> {
         if payload.len() > MAX_DATAGRAM_PAYLOAD_BYTES as usize {
@@ -128,6 +167,23 @@ impl VideoPacket {
         }
         Ok(Self { header, payload })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VideoQualityPreset {
+    Smooth,
+    Balanced,
+    Sharp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VideoQualityPreference {
+    Automatic,
+    Smooth,
+    Balanced,
+    Sharp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -150,6 +206,148 @@ pub enum ControlMessage {
     SelectDisplay {
         display_id: u32,
     },
+    SetAudioEnabled {
+        enabled: bool,
+    },
+    AudioState {
+        available: bool,
+        enabled: bool,
+    },
+    SetVideoQuality {
+        preference: VideoQualityPreference,
+    },
+    VideoQualityState {
+        preference: VideoQualityPreference,
+        preset: VideoQualityPreset,
+    },
+    VideoNetworkFeedback {
+        received_packets: u32,
+        dropped_packets: u32,
+    },
+}
+
+pub type TransferId = [u8; 16];
+
+/// Explicit clipboard and file operations carried on their own reliable lane.
+/// File contents never share the latency-sensitive input or video streams.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TransferMessage {
+    ClipboardSet {
+        request_id: u64,
+        text: String,
+    },
+    ClipboardRequest {
+        request_id: u64,
+    },
+    ClipboardData {
+        request_id: u64,
+        text: String,
+    },
+    ClipboardResult {
+        request_id: u64,
+        result: TransferResult,
+    },
+    /// Ask the peer to let its local user choose one file to send back.
+    FileSelectionRequest {
+        request_id: u64,
+    },
+    /// Cancel a pending peer-side file selection request.
+    FileSelectionCancel {
+        request_id: u64,
+    },
+    /// Close a peer-side file selection request without a file offer.
+    FileSelectionResult {
+        request_id: u64,
+        result: TransferResult,
+    },
+    FileOffer {
+        transfer_id: TransferId,
+        name: String,
+        size: u64,
+    },
+    FileDecision {
+        transfer_id: TransferId,
+        accepted: bool,
+    },
+    FileChunk {
+        transfer_id: TransferId,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    FileComplete {
+        transfer_id: TransferId,
+        content_hash: [u8; 32],
+    },
+    FileResult {
+        transfer_id: TransferId,
+        result: TransferResult,
+    },
+    Cancel {
+        transfer_id: TransferId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TransferResult {
+    Completed,
+    Rejected,
+    Cancelled,
+    TooLarge,
+    InvalidData,
+    PermissionDenied,
+    IoFailed,
+    Unsupported,
+    Busy,
+}
+
+pub fn is_valid_transfer_file_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_TRANSFER_FILE_NAME_BYTES
+        || name == "."
+        || name == ".."
+        || name.ends_with(['.', ' '])
+        || name.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                )
+        })
+    {
+        return false;
+    }
+
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['.', ' ']);
+    !matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,6 +424,10 @@ pub enum KeyCode {
     PageDown,
     Function(u8),
     CapsLock,
+    Control,
+    Alt,
+    Shift,
+    Meta,
 }
 impl KeyCode {
     pub fn is_valid(&self) -> bool {
@@ -233,6 +435,16 @@ impl KeyCode {
             Self::Character(character) => !character.is_control(),
             Self::Function(number) => (1..=12).contains(number),
             _ => true,
+        }
+    }
+
+    pub const fn modifier_mask(self) -> Option<Modifiers> {
+        match self {
+            Self::Control => Some(Modifiers::CONTROL),
+            Self::Alt => Some(Modifiers::ALT),
+            Self::Shift => Some(Modifiers::SHIFT),
+            Self::Meta => Some(Modifiers::META),
+            _ => None,
         }
     }
 }

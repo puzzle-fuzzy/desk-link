@@ -13,6 +13,11 @@ import sys
 import tomllib
 from pathlib import Path
 
+from windows_native_build_env import (
+    prepare_windows_native_build_environment,
+    prepare_windows_release_environment,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS_UI = ROOT / "apps" / "windows-ui"
@@ -159,6 +164,8 @@ def verify_pe(path: Path) -> dict[str, object]:
 def main() -> int:
     if os.name != "nt":
         raise SystemExit("Windows release verification must run on Windows")
+    prepare_windows_native_build_environment()
+    prepare_windows_release_environment()
     version = verify_versions()
     managed_relay = verify_managed_relay_profile()
     windows_assets = verify_static_windows_assets()

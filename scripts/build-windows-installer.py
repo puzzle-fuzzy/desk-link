@@ -14,6 +14,11 @@ import tomllib
 import time
 from pathlib import Path
 
+from windows_native_build_env import (
+    prepare_windows_native_build_environment,
+    prepare_windows_release_environment,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "x86_64-pc-windows-msvc"
@@ -108,6 +113,8 @@ def sha256(path: Path) -> str:
 def main() -> int:
     if os.name != "nt":
         raise SystemExit("The Windows installer must be built on Windows.")
+    prepare_windows_native_build_environment()
+    prepare_windows_release_environment()
 
     arguments = parse_args()
     package = tomllib.loads(

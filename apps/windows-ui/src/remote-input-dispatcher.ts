@@ -1,6 +1,11 @@
 import type { ControllerInput } from "./types";
 
-type InputSender = (input: ControllerInput) => Promise<void>;
+type InputSender = (input: ControllerInput, streamId: number) => Promise<void>;
+
+interface QueuedInput {
+  input: ControllerInput;
+  streamId: number;
+}
 
 /**
  * Keeps discrete input ordered while collapsing consecutive pointer moves.
@@ -8,7 +13,7 @@ type InputSender = (input: ControllerInput) => Promise<void>;
  * build an unbounded Promise/command backlog on the WebView main thread.
  */
 export class RemoteInputDispatcher {
-  private readonly queue: ControllerInput[] = [];
+  private readonly queue: QueuedInput[] = [];
   private pumping: Promise<void> | null = null;
 
   constructor(
@@ -16,22 +21,31 @@ export class RemoteInputDispatcher {
     private readonly onError: () => void = () => {},
   ) {}
 
-  enqueue(input: ControllerInput): void {
+  enqueue(input: ControllerInput, streamId: number): void {
     const last = this.queue.at(-1);
-    if (input.kind === "mouseMove" && last?.kind === "mouseMove") {
-      this.queue[this.queue.length - 1] = input;
+    const queued = { input, streamId };
+    if (
+      input.kind === "mouseMove"
+      && last?.input.kind === "mouseMove"
+      && last.streamId === streamId
+    ) {
+      this.queue[this.queue.length - 1] = queued;
     } else {
-      this.queue.push(input);
+      this.queue.push(queued);
     }
     this.startPump();
   }
 
   discardPendingMoves(): void {
     for (let index = this.queue.length - 1; index >= 0; index -= 1) {
-      if (this.queue[index]?.kind === "mouseMove") {
+      if (this.queue[index]?.input.kind === "mouseMove") {
         this.queue.splice(index, 1);
       }
     }
+  }
+
+  discardAll(): void {
+    this.queue.length = 0;
   }
 
   async drain(): Promise<void> {
@@ -54,12 +68,12 @@ export class RemoteInputDispatcher {
 
   private async pump(): Promise<void> {
     while (this.queue.length > 0) {
-      const input = this.queue.shift();
-      if (!input) {
+      const queued = this.queue.shift();
+      if (!queued) {
         continue;
       }
       try {
-        await this.sender(input);
+        await this.sender(queued.input, queued.streamId);
       } catch {
         this.onError();
       }

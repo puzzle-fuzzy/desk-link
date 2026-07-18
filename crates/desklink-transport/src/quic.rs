@@ -16,8 +16,9 @@ use crate::{
 
 const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
 const INBOUND_DATAGRAM_QUEUE_CAPACITY: usize = 128;
+const INBOUND_AUDIO_QUEUE_CAPACITY: usize = 8;
 const INBOUND_CLOSED_QUEUE_CAPACITY: usize = 8;
-const INBOUND_LANE_COUNT: usize = 6;
+const INBOUND_LANE_COUNT: usize = 8;
 
 pub struct QuicClient {
     _endpoint: quinn::Endpoint,
@@ -31,6 +32,7 @@ struct ClientInner {
     control: Mutex<Option<ReliableSendStream>>,
     input: Mutex<Option<ReliableSendStream>>,
     video_config: Mutex<Option<ReliableSendStream>>,
+    transfer: Mutex<Option<ReliableSendStream>>,
     active_peer_generation: Arc<AtomicU64>,
     events: InboundReceivers,
 }
@@ -52,6 +54,8 @@ struct InboundSenders {
     video_config: mpsc::Sender<InboundEvent>,
     video_datagram: mpsc::Sender<InboundEvent>,
     cursor_datagram: mpsc::Sender<InboundEvent>,
+    audio_datagram: mpsc::Sender<InboundEvent>,
+    transfer: mpsc::Sender<InboundEvent>,
     closed: mpsc::Sender<InboundEvent>,
     active_peer_generation: Arc<AtomicU64>,
 }
@@ -63,6 +67,8 @@ struct InboundReceivers {
     video_config: Mutex<mpsc::Receiver<InboundEvent>>,
     video_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
     cursor_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
+    audio_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
+    transfer: Mutex<mpsc::Receiver<InboundEvent>>,
     closed: Mutex<mpsc::Receiver<InboundEvent>>,
     active_peer_generation: Arc<AtomicU64>,
     control_open: AtomicBool,
@@ -70,8 +76,21 @@ struct InboundReceivers {
     video_config_open: AtomicBool,
     video_datagram_open: AtomicBool,
     cursor_datagram_open: AtomicBool,
+    audio_datagram_open: AtomicBool,
+    transfer_open: AtomicBool,
     closed_open: AtomicBool,
     next_lane: AtomicUsize,
+}
+
+struct InboundReceiverChannels {
+    control: mpsc::Receiver<InboundEvent>,
+    input: mpsc::Receiver<InboundEvent>,
+    video_config: mpsc::Receiver<InboundEvent>,
+    video_datagram: mpsc::Receiver<InboundEvent>,
+    cursor_datagram: mpsc::Receiver<InboundEvent>,
+    audio_datagram: mpsc::Receiver<InboundEvent>,
+    transfer: mpsc::Receiver<InboundEvent>,
+    closed: mpsc::Receiver<InboundEvent>,
 }
 
 enum LanePoll {
@@ -82,29 +101,25 @@ enum LanePoll {
 }
 
 impl InboundReceivers {
-    fn new(
-        control: mpsc::Receiver<InboundEvent>,
-        input: mpsc::Receiver<InboundEvent>,
-        video_config: mpsc::Receiver<InboundEvent>,
-        video_datagram: mpsc::Receiver<InboundEvent>,
-        cursor_datagram: mpsc::Receiver<InboundEvent>,
-        closed: mpsc::Receiver<InboundEvent>,
-        active_peer_generation: Arc<AtomicU64>,
-    ) -> Self {
+    fn new(channels: InboundReceiverChannels, active_peer_generation: Arc<AtomicU64>) -> Self {
         Self {
-            control: Mutex::new(control),
+            control: Mutex::new(channels.control),
             pending_control: Mutex::new(None),
-            input: Mutex::new(input),
-            video_config: Mutex::new(video_config),
-            video_datagram: Mutex::new(video_datagram),
-            cursor_datagram: Mutex::new(cursor_datagram),
-            closed: Mutex::new(closed),
+            input: Mutex::new(channels.input),
+            video_config: Mutex::new(channels.video_config),
+            video_datagram: Mutex::new(channels.video_datagram),
+            cursor_datagram: Mutex::new(channels.cursor_datagram),
+            audio_datagram: Mutex::new(channels.audio_datagram),
+            transfer: Mutex::new(channels.transfer),
+            closed: Mutex::new(channels.closed),
             active_peer_generation,
             control_open: AtomicBool::new(true),
             input_open: AtomicBool::new(true),
             video_config_open: AtomicBool::new(true),
             video_datagram_open: AtomicBool::new(true),
             cursor_datagram_open: AtomicBool::new(true),
+            audio_datagram_open: AtomicBool::new(true),
+            transfer_open: AtomicBool::new(true),
             closed_open: AtomicBool::new(true),
             next_lane: AtomicUsize::new(0),
         }
@@ -116,6 +131,8 @@ impl InboundReceivers {
             || self.video_config_open.load(Ordering::Acquire)
             || self.video_datagram_open.load(Ordering::Acquire)
             || self.cursor_datagram_open.load(Ordering::Acquire)
+            || self.audio_datagram_open.load(Ordering::Acquire)
+            || self.transfer_open.load(Ordering::Acquire)
             || self.closed_open.load(Ordering::Acquire)
     }
 
@@ -127,6 +144,8 @@ impl InboundReceivers {
             3 => self.video_datagram_open.load(Ordering::Acquire),
             4 => self.cursor_datagram_open.load(Ordering::Acquire),
             5 => self.closed_open.load(Ordering::Acquire),
+            6 => self.transfer_open.load(Ordering::Acquire),
+            7 => self.audio_datagram_open.load(Ordering::Acquire),
             _ => unreachable!("invalid inbound lane index"),
         }
     }
@@ -139,6 +158,8 @@ impl InboundReceivers {
             3 => &self.video_datagram,
             4 => &self.cursor_datagram,
             5 => &self.closed,
+            6 => &self.transfer,
+            7 => &self.audio_datagram,
             _ => unreachable!("invalid inbound lane index"),
         }
     }
@@ -178,6 +199,8 @@ impl InboundReceivers {
             3 => self.video_datagram_open.store(false, Ordering::Release),
             4 => self.cursor_datagram_open.store(false, Ordering::Release),
             5 => self.closed_open.store(false, Ordering::Release),
+            6 => self.transfer_open.store(false, Ordering::Release),
+            7 => self.audio_datagram_open.store(false, Ordering::Release),
             _ => unreachable!("invalid inbound lane index"),
         }
     }
@@ -224,6 +247,9 @@ impl QuicClient {
             mpsc::channel(INBOUND_DATAGRAM_QUEUE_CAPACITY);
         let (cursor_datagram_sender, cursor_datagram_receiver) =
             mpsc::channel(INBOUND_DATAGRAM_QUEUE_CAPACITY);
+        let (audio_datagram_sender, audio_datagram_receiver) =
+            mpsc::channel(INBOUND_AUDIO_QUEUE_CAPACITY);
+        let (transfer_sender, transfer_receiver) = mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
         let (closed_sender, closed_receiver) = mpsc::channel(INBOUND_CLOSED_QUEUE_CAPACITY);
         let inbound_senders = InboundSenders {
             control: control_sender,
@@ -231,6 +257,8 @@ impl QuicClient {
             video_config: video_config_sender,
             video_datagram: video_datagram_sender,
             cursor_datagram: cursor_datagram_sender,
+            audio_datagram: audio_datagram_sender,
+            transfer: transfer_sender,
             closed: closed_sender,
             active_peer_generation: Arc::new(AtomicU64::new(0)),
         };
@@ -242,14 +270,19 @@ impl QuicClient {
             control: Mutex::new(None),
             input: Mutex::new(None),
             video_config: Mutex::new(None),
+            transfer: Mutex::new(None),
             active_peer_generation: active_peer_generation.clone(),
             events: InboundReceivers::new(
-                control_receiver,
-                input_receiver,
-                video_config_receiver,
-                video_datagram_receiver,
-                cursor_datagram_receiver,
-                closed_receiver,
+                InboundReceiverChannels {
+                    control: control_receiver,
+                    input: input_receiver,
+                    video_config: video_config_receiver,
+                    video_datagram: video_datagram_receiver,
+                    cursor_datagram: cursor_datagram_receiver,
+                    audio_datagram: audio_datagram_receiver,
+                    transfer: transfer_receiver,
+                    closed: closed_receiver,
+                },
                 active_peer_generation,
             ),
         });
@@ -376,6 +409,19 @@ impl QuicClient {
             .await
     }
 
+    pub async fn send_transfer(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
+        self.send_reliable(ChannelKind::Transfer, None, bytes).await
+    }
+
+    pub async fn send_transfer_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_reliable(ChannelKind::Transfer, Some(expected_generation), bytes)
+            .await
+    }
+
     /// Ends every reliable stream associated with the current peer without
     /// closing this client's relay connection. A host can therefore discard a
     /// failed controller attempt and remain registered for the next one.
@@ -383,6 +429,7 @@ impl QuicClient {
         finish_reliable_stream(&self.inner.control).await;
         finish_reliable_stream(&self.inner.input).await;
         finish_reliable_stream(&self.inner.video_config).await;
+        finish_reliable_stream(&self.inner.transfer).await;
     }
 
     pub async fn send_video_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
@@ -411,6 +458,18 @@ impl QuicClient {
             Some(expected_generation),
             bytes,
         )
+    }
+
+    pub async fn send_audio_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
+        self.send_datagram(ChannelKind::AudioDatagram, None, bytes)
+    }
+
+    pub async fn send_audio_datagram_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_datagram(ChannelKind::AudioDatagram, Some(expected_generation), bytes)
     }
 
     pub async fn next_event(&self) -> Result<TransportEvent, TransportError> {
@@ -476,6 +535,20 @@ impl QuicClient {
                         return Ok(event);
                     }
                     self.inner.events.close_lane(5);
+                }
+                event = recv_lane(&self.inner.events.transfer, &self.inner.events.active_peer_generation), if self.inner.events.transfer_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(6);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(6);
+                }
+                event = recv_lane(&self.inner.events.audio_datagram, &self.inner.events.active_peer_generation), if self.inner.events.audio_datagram_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(7);
+                        return Ok(event);
+                    }
+                    self.inner.events.close_lane(7);
                 }
             }
         }
@@ -611,6 +684,56 @@ impl QuicClient {
         .await
     }
 
+    pub async fn next_audio_datagram(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(
+            &self.inner.events.audio_datagram,
+            &self.inner.events.active_peer_generation,
+            |event| match event {
+                TransportEvent::AudioDatagram(bytes) => Some(bytes),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    pub async fn next_transfer(&self) -> Result<Vec<u8>, TransportError> {
+        receive_payload(
+            &self.inner.events.transfer,
+            &self.inner.events.active_peer_generation,
+            |event| match event {
+                TransportEvent::Transfer(bytes) => Some(bytes),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    pub async fn next_transfer_for_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<Vec<u8>, TransportError> {
+        loop {
+            let event = receive_current_inbound(
+                &self.inner.events.transfer,
+                &self.inner.events.active_peer_generation,
+            )
+            .await
+            .ok_or(TransportError::Closed)?;
+            let generation = event.peer_generation.ok_or(TransportError::Malformed)?;
+            if generation > expected_generation {
+                return Err(TransportError::PeerReplaced);
+            }
+            if generation < expected_generation {
+                continue;
+            }
+            return match event.event {
+                TransportEvent::Transfer(payload) => Ok(payload),
+                TransportEvent::PeerDisconnected { .. } => Err(TransportError::PeerDisconnected),
+                _ => Err(TransportError::Malformed),
+            };
+        }
+    }
+
     async fn next_current_control_event(&self) -> Result<InboundEvent, TransportError> {
         if let Some(event) = self.inner.events.pending_control.lock().await.take()
             && !event.peer_generation.is_some_and(|generation| {
@@ -649,7 +772,10 @@ impl QuicClient {
             ChannelKind::Control => &self.inner.control,
             ChannelKind::Input => &self.inner.input,
             ChannelKind::VideoConfig => &self.inner.video_config,
-            ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => {
+            ChannelKind::Transfer => &self.inner.transfer,
+            ChannelKind::VideoDatagram
+            | ChannelKind::CursorDatagram
+            | ChannelKind::AudioDatagram => {
                 return Err(TransportError::Malformed);
             }
         };
@@ -874,6 +1000,7 @@ async fn read_connection(connection: quinn::Connection, events: InboundSenders) 
                         let sender = match &event.event {
                             TransportEvent::VideoDatagram(_) => &events.video_datagram,
                             TransportEvent::CursorDatagram(_) => &events.cursor_datagram,
+                            TransportEvent::AudioDatagram(_) => &events.audio_datagram,
                             _ => unreachable!(),
                         };
                         // Datagram delivery is intentionally lossy at this bounded boundary:
@@ -954,7 +1081,10 @@ async fn read_reliable_stream(
         ChannelKind::Control => events.control,
         ChannelKind::Input => events.input,
         ChannelKind::VideoConfig => events.video_config,
-        ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => unreachable!(),
+        ChannelKind::Transfer => events.transfer,
+        ChannelKind::VideoDatagram | ChannelKind::CursorDatagram | ChannelKind::AudioDatagram => {
+            unreachable!()
+        }
     };
     let mut message_seen = false;
     loop {
@@ -996,7 +1126,10 @@ async fn read_reliable_stream(
             ChannelKind::Control => TransportEvent::Control(bytes),
             ChannelKind::Input => TransportEvent::Input(bytes),
             ChannelKind::VideoConfig => TransportEvent::VideoConfig(bytes),
-            ChannelKind::VideoDatagram | ChannelKind::CursorDatagram => unreachable!(),
+            ChannelKind::Transfer => TransportEvent::Transfer(bytes),
+            ChannelKind::VideoDatagram
+            | ChannelKind::CursorDatagram
+            | ChannelKind::AudioDatagram => unreachable!(),
         };
         if sender
             .send(InboundEvent {
@@ -1024,6 +1157,7 @@ fn decode_datagram(bytes: &[u8]) -> Result<InboundEvent, ()> {
     let event = match ChannelKind::try_from(bytes[0]) {
         Ok(ChannelKind::VideoDatagram) => TransportEvent::VideoDatagram(payload),
         Ok(ChannelKind::CursorDatagram) => TransportEvent::CursorDatagram(payload),
+        Ok(ChannelKind::AudioDatagram) => TransportEvent::AudioDatagram(payload),
         _ => return Err(()),
     };
     Ok(InboundEvent {

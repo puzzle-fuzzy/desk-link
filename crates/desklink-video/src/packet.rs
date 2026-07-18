@@ -80,6 +80,7 @@ pub struct FrameAssembler {
     max_frames: usize,
     max_age: Duration,
     frames: BTreeMap<(u64, u64), PartialFrame>,
+    dropped_chunks: u64,
     last_presented: Option<(u64, u64)>,
     active_stream: Option<u64>,
     retired_streams: BTreeSet<u64>,
@@ -92,6 +93,7 @@ impl FrameAssembler {
             max_frames,
             max_age,
             frames: BTreeMap::new(),
+            dropped_chunks: 0,
             last_presented: None,
             active_stream: None,
             retired_streams: BTreeSet::new(),
@@ -154,7 +156,11 @@ impl FrameAssembler {
                 .min_by_key(|(_, frame)| frame.created)
                 .map(|(key, _)| *key)
                 .unwrap();
-            self.frames.remove(&oldest);
+            if let Some(frame) = self.frames.remove(&oldest) {
+                self.dropped_chunks = self
+                    .dropped_chunks
+                    .saturating_add(frame.missing_chunk_count());
+            }
         }
         let index = packet.header.chunk_index;
         let mut chunks = BTreeMap::new();
@@ -196,9 +202,20 @@ impl FrameAssembler {
 
     pub fn expire(&mut self, now: Instant) -> usize {
         let before = self.frames.len();
-        self.frames
-            .retain(|_, frame| now.duration_since(frame.created) < self.max_age);
+        let mut dropped_chunks = 0_u64;
+        self.frames.retain(|_, frame| {
+            let keep = now.duration_since(frame.created) < self.max_age;
+            if !keep {
+                dropped_chunks = dropped_chunks.saturating_add(frame.missing_chunk_count());
+            }
+            keep
+        });
+        self.dropped_chunks = self.dropped_chunks.saturating_add(dropped_chunks);
         before - self.frames.len()
+    }
+
+    pub fn take_dropped_chunks(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped_chunks)
     }
 
     pub fn accept_for_present(&mut self, frame: EncodedFrame) -> bool {
@@ -225,7 +242,15 @@ impl FrameAssembler {
         }
         self.active_stream = Some(stream_id);
         self.frames.clear();
+        self.dropped_chunks = 0;
         self.last_presented = None;
         true
+    }
+}
+
+impl PartialFrame {
+    fn missing_chunk_count(&self) -> u64 {
+        u64::from(self.packet.header.chunk_count)
+            .saturating_sub(u64::try_from(self.chunks.len()).unwrap_or(u64::MAX))
     }
 }

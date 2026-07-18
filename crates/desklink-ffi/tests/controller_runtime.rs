@@ -5,9 +5,10 @@ use desklink_crypto::{
 };
 use desklink_ffi::{ControllerEvent, ControllerRuntime};
 use desklink_protocol::{
-    Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEvent,
-    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
-    decode_input, decode_noise_handshake, encode_control, encode_cursor_update,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioCodec, AudioPacket, Codec, ControlMessage,
+    CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEvent, NoiseHandshake,
+    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control, decode_input,
+    decode_noise_handshake, encode_audio_packet, encode_control, encode_cursor_update,
     encode_noise_handshake, encode_video_config, encode_video_packet,
 };
 use desklink_relay::{RelayConfig, RelayServer};
@@ -79,7 +80,8 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
 
     let mut received_frame = None;
     let mut received_cursor = None;
-    while received_frame.is_none() || received_cursor.is_none() {
+    let mut received_audio = None;
+    while received_frame.is_none() || received_cursor.is_none() || received_audio.is_none() {
         match tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
             .await
             .unwrap()
@@ -87,8 +89,10 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
         {
             ControllerEvent::H264AccessUnit(frame) => received_frame = Some(frame),
             ControllerEvent::Cursor(cursor) => received_cursor = Some(cursor),
+            ControllerEvent::Audio(audio) => received_audio = Some(audio),
             ControllerEvent::Control(_)
             | ControllerEvent::VideoConfig(_)
+            | ControllerEvent::Transfer(_)
             | ControllerEvent::Closed { .. } => {}
         }
     }
@@ -97,6 +101,10 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     assert_eq!(frame.frame_id, 11);
     assert_eq!(frame.data, vec![0x5a; 2_500]);
     assert_eq!(received_cursor.unwrap().stream_id, 9);
+    let audio = received_audio.unwrap();
+    assert_eq!(audio.stream_id, 9);
+    assert_eq!(audio.sequence, 1);
+    assert_eq!(audio.payload, vec![0x2a; 960]);
 
     runtime
         .send_input(InputEvent::MouseWheel {
@@ -236,6 +244,20 @@ async fn run_fake_host(
     })
     .unwrap();
     host.send_cursor_datagram(secure.seal(SecureLane::CursorDatagram, &cursor).unwrap())
+        .await
+        .unwrap();
+    let audio = encode_audio_packet(&AudioPacket {
+        protocol_version: PROTOCOL_VERSION,
+        stream_id: 9,
+        sequence: 1,
+        capture_timestamp_us: 124,
+        codec: AudioCodec::PcmS16Le,
+        sample_rate: AUDIO_SAMPLE_RATE,
+        channels: AUDIO_CHANNELS,
+        payload: vec![0x2a; 960],
+    })
+    .unwrap();
+    host.send_audio_datagram(secure.seal(SecureLane::AudioDatagram, &audio).unwrap())
         .await
         .unwrap();
 

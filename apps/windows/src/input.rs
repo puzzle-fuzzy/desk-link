@@ -446,6 +446,10 @@ mod native {
             )],
             KeyCode::Function(_) => return Err(InputInjectionError::UnsupportedKey),
             KeyCode::CapsLock => vec![spec(VK_CAPITAL, KEYBD_EVENT_FLAGS(0))],
+            KeyCode::Control => vec![spec(VK_CONTROL, KEYBD_EVENT_FLAGS(0))],
+            KeyCode::Alt => vec![spec(VK_MENU, KEYBD_EVENT_FLAGS(0))],
+            KeyCode::Shift => vec![spec(VK_SHIFT, KEYBD_EVENT_FLAGS(0))],
+            KeyCode::Meta => vec![spec(VK_LWIN, KEYEVENTF_EXTENDEDKEY)],
         };
         Ok(specs)
     }
@@ -486,7 +490,14 @@ fn supported_key(code: &KeyCode, modifiers: Modifiers) -> bool {
                 | KeyCode::PageUp
                 | KeyCode::PageDown
                 | KeyCode::CapsLock
+                | KeyCode::Control
+                | KeyCode::Alt
+                | KeyCode::Shift
+                | KeyCode::Meta
         ) || matches!(code, KeyCode::Function(1..=12)))
+        && code
+            .modifier_mask()
+            .is_none_or(|own_modifier| !modifiers.contains(own_modifier))
 }
 
 #[cfg(test)]
@@ -591,6 +602,23 @@ mod tests {
     }
 
     #[test]
+    fn standalone_modifier_keys_are_supported_without_duplicate_self_flags() {
+        for code in [
+            KeyCode::Control,
+            KeyCode::Alt,
+            KeyCode::Shift,
+            KeyCode::Meta,
+        ] {
+            assert!(supported_key(&code, Modifiers::default()));
+            assert!(!supported_key(
+                &code,
+                code.modifier_mask().expect("modifier key mask")
+            ));
+        }
+        assert!(supported_key(&KeyCode::Meta, Modifiers::SHIFT));
+    }
+
+    #[test]
     fn absolute_axis_maps_both_desktop_endpoints_exactly() {
         assert_eq!(absolute_axis(100, 100, 1920), 0);
         assert_eq!(absolute_axis(2019, 100, 1920), 65_535);
@@ -629,6 +657,45 @@ mod tests {
         let (right, bottom) = desktop.absolute_position(NormalizedPoint::new(1.0, 1.0));
         assert!(right > 32_000 && right < 33_000);
         assert_eq!(bottom, 65_535);
+    }
+
+    #[test]
+    fn absolute_position_supports_a_smaller_monitor_above_the_primary() {
+        let desktop = VirtualDesktop::new(
+            DesktopRect::new(320, -900, 1600, 900),
+            DesktopRect::new(0, -900, 2560, 2340),
+        );
+
+        assert_eq!(
+            desktop.absolute_position(NormalizedPoint::new(0.0, 0.0)),
+            (absolute_axis(320, 0, 2560), 0)
+        );
+        assert_eq!(
+            desktop.absolute_position(NormalizedPoint::new(1.0, 1.0)),
+            (absolute_axis(1919, 0, 2560), absolute_axis(-1, -900, 2340))
+        );
+    }
+
+    #[test]
+    fn interrupted_character_key_is_released_by_the_native_boundary() {
+        let desktop = VirtualDesktop::single(DesktopRect::new(0, 0, 1920, 1080));
+        let mut injector = InputInjector::with_backend(desktop, RecordingBackend::default());
+        injector
+            .apply(InputEvent::Key {
+                code: KeyCode::Character('a'),
+                pressed: true,
+                modifiers: Modifiers::CONTROL,
+            })
+            .unwrap();
+
+        assert_eq!(
+            injector.release_all().unwrap(),
+            vec![InputEvent::Key {
+                code: KeyCode::Character('a'),
+                pressed: false,
+                modifiers: Modifiers::CONTROL,
+            }]
+        );
     }
 
     #[test]
