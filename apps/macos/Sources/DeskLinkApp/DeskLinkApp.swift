@@ -35,26 +35,29 @@ struct DeskLinkApp: App {
     @NSApplicationDelegateAdaptor(DeskLinkLifecycleDelegate.self) private var lifecycle
     @StateObject private var controller = ControllerBridge()
     @StateObject private var host = HostBridge()
-    @State private var section: DeskLinkSection = .overview
+    @State private var section: DeskLinkSection = .connect
 
     var body: some Scene {
         WindowGroup {
-            if isControllerSessionState(controller.state) {
-                SessionView(bridge: controller)
-            } else {
-                DeskLinkShell(
-                    selection: $section,
-                    needsAttention: host.lastError != nil || controller.lastError != nil
-                ) {
-                    switch section {
-                    case .overview:
-                        HostHomeView(bridge: host, page: .overview)
-                    case .controller:
-                        ControllerHomeView(bridge: controller)
-                    case .connection:
-                        HostHomeView(bridge: host, page: .connection)
-                    case .devices:
-                        HostHomeView(bridge: host, page: .devices)
+            Group {
+                if isControllerSessionState(controller.state) {
+                    SessionView(bridge: controller)
+                } else {
+                    DeskLinkShell(
+                        selection: $section,
+                        host: host,
+                        controller: controller
+                    ) {
+                        switch section {
+                        case .connect:
+                            ControllerHomeView(bridge: controller)
+                        case .share:
+                            HostHomeView(bridge: host, page: .connection)
+                        case .devices:
+                            HostHomeView(bridge: host, page: .devices)
+                        case .settings:
+                            HostHomeView(bridge: host, page: .overview)
+                        }
                     }
                 }
             }
