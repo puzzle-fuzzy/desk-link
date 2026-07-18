@@ -21,6 +21,17 @@ def load_script():
     return module
 
 
+def load_deploy_script():
+    path = ROOT / "scripts" / "deploy-managed-relay.py"
+    spec = importlib.util.spec_from_file_location("deploy_managed_relay", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class ManagedRelayAuditTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -57,6 +68,21 @@ class ManagedRelayAuditTests(unittest.TestCase):
             ),
             48,
         )
+
+
+class ManagedRelayDeployTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.deploy = load_deploy_script()
+
+    def test_rejects_shell_metacharacters_in_remote_labels(self) -> None:
+        self.assertEqual(
+            self.deploy.validate_remote_value("service", "relay"), "relay"
+        )
+        with self.assertRaises(RuntimeError):
+            self.deploy.validate_remote_value("service", "relay; reboot")
+        with self.assertRaises(RuntimeError):
+            self.deploy.validate_remote_value("path", "relative/compose.yml", absolute=True)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # DeskLink 两台 Windows 电脑使用说明
 
+0.1.25 发布前的完整人工验收见 [windows-0.1.25-two-pc-acceptance.md](windows-0.1.25-two-pc-acceptance.md)。
+
 ## 当前支持范围
 
 同一个 DeskLink Windows 安装包同时包含主机端和控制端。两台 Windows 10/11 x64 电脑安装后，可以由 A 控制 B；如需反向控制，再创建一次反向配对即可。

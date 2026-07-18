@@ -23,6 +23,12 @@ python scripts/audit-managed-relay.py --target root@101.35.246.159 --identity-fi
 python scripts/verify-managed-relay.py
 ```
 
+部署由脚本校验归档 SHA-256，保留旧镜像回滚标签，并在新容器达到健康状态前不判定成功：
+
+```text
+python scripts/deploy-managed-relay.py --target root@101.35.246.159 --identity-file C:\Users\18267\.ssh\p2p-tencent-ed25519
+```
+
 ## 告警与处置
 
 1. 外部探针失败：先确认腾讯云安全组和主机 UDP 4433，再检查容器健康、重启次数和最近日志。

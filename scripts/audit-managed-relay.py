@@ -56,7 +56,9 @@ def ssh_command(arguments: argparse.Namespace, remote_command: str) -> list[str]
     return command
 
 
-def remote(arguments: argparse.Namespace, command: str) -> str:
+def remote(
+    arguments: argparse.Namespace, command: str, *, include_stderr: bool = False
+) -> str:
     completed = subprocess.run(
         ssh_command(arguments, command),
         check=False,
@@ -69,7 +71,10 @@ def remote(arguments: argparse.Namespace, command: str) -> str:
     if completed.returncode != 0:
         detail = completed.stderr.strip()[-500:]
         raise RuntimeError(f"remote audit command failed ({command}): {detail}")
-    return completed.stdout.strip()
+    output = completed.stdout
+    if include_stderr:
+        output += completed.stderr
+    return output.strip()
 
 
 def parse_certificate_expiry(value: str, now: datetime | None = None) -> int:
@@ -141,7 +146,11 @@ def main() -> int:
         remote(arguments, f"openssl x509 -in {arguments.certificate} -noout -enddate")
     )
     disk_percent = parse_disk_percent(remote(arguments, "df -P /"))
-    logs = remote(arguments, f"docker logs --since 5m {arguments.container}")
+    logs = remote(
+        arguments,
+        f"docker logs --since 5m {arguments.container}",
+        include_stderr=True,
+    )
     capacity = parse_capacity(logs)
 
     checks = {
