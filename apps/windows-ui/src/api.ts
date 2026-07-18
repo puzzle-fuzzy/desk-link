@@ -3,7 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ConnectionSettingsInput,
   ControllerDeviceInput,
-  ControllerInput,
+  StreamBoundControllerInput,
   ControllerRenderMetrics,
   ControllerSignal,
   ControllerSnapshot,
@@ -19,10 +19,12 @@ import type {
   SavedDeviceRenameInput,
   WindowsPreferencesSummary,
 } from "./types";
+import type { VideoQualityPreference } from "./types";
 
 export interface ControllerChannels {
   signals: Channel<ControllerSignal>;
   video: Channel<ArrayBuffer | ArrayBufferView | number[]>;
+  audio: Channel<ArrayBuffer | ArrayBufferView | number[]>;
 }
 
 export function getHostSnapshot(): Promise<HostSnapshot> {
@@ -109,6 +111,8 @@ export function createControllerChannels(
   onSignal: (signal: ControllerSignal) => void,
   onVideo: (payload: ArrayBuffer | ArrayBufferView | number[]) => void,
   onVideoError?: (error: unknown) => void,
+  onAudio?: (payload: ArrayBuffer | ArrayBufferView | number[]) => void,
+  onAudioError?: (error: unknown) => void,
 ): ControllerChannels {
   return {
     signals: new Channel<ControllerSignal>(onSignal),
@@ -119,6 +123,15 @@ export function createControllerChannels(
         // Tauri advances a channel only after its callback returns. Never let one
         // malformed frame permanently block all following video messages.
         onVideoError?.(error);
+      }
+    }),
+    audio: new Channel<ArrayBuffer | ArrayBufferView | number[]>((payload) => {
+      try {
+        onAudio?.(payload);
+      } catch (error) {
+        // Audio is optional. A malformed packet must not stall Tauri's channel
+        // or interrupt the live video and input session.
+        onAudioError?.(error);
       }
     }),
   };
@@ -144,12 +157,64 @@ export function reconnectController(
   return invoke<ControllerSnapshot>("reconnect_controller", { ...channels });
 }
 
-export function sendControllerInput(input: ControllerInput): Promise<void> {
+export function sendControllerInput(input: StreamBoundControllerInput): Promise<void> {
   return invoke<void>("send_controller_input", { input });
 }
 
 export function sendControllerText(text: string): Promise<void> {
   return invoke<void>("send_controller_text", { text });
+}
+
+export function setControllerAudioEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("set_controller_audio_enabled", { enabled });
+}
+
+export function setControllerVideoQuality(preference: VideoQualityPreference): Promise<void> {
+  return invoke<void>("set_controller_video_quality", { preference });
+}
+
+export function sendControllerClipboard(): Promise<void> {
+  return invoke<void>("send_controller_clipboard");
+}
+
+export function requestControllerClipboard(): Promise<void> {
+  return invoke<void>("request_controller_clipboard");
+}
+
+export function chooseAndSendControllerFile(): Promise<void> {
+  return invoke<void>("choose_and_send_controller_file");
+}
+
+export function queueControllerFiles(paths: string[]): Promise<void> {
+  return invoke<void>("queue_controller_files", { paths });
+}
+
+export function removeControllerQueuedFile(transferId: string): Promise<void> {
+  return invoke<void>("remove_controller_queued_file", { transferId });
+}
+
+export function clearControllerFileQueue(): Promise<void> {
+  return invoke<void>("clear_controller_file_queue");
+}
+
+export function resumeControllerFileQueue(): Promise<void> {
+  return invoke<void>("resume_controller_file_queue");
+}
+
+export function requestControllerRemoteFile(): Promise<void> {
+  return invoke<void>("request_controller_remote_file");
+}
+
+export function retryControllerFile(): Promise<void> {
+  return invoke<void>("retry_controller_file");
+}
+
+export function cancelControllerFile(): Promise<void> {
+  return invoke<void>("cancel_controller_file");
+}
+
+export function openControllerDownloadsFolder(): Promise<void> {
+  return invoke<void>("open_controller_downloads_folder");
 }
 
 export function requestControllerKeyframe(): Promise<void> {

@@ -200,6 +200,10 @@ export interface ControllerInput {
   modifiers?: number;
 }
 
+export interface StreamBoundControllerInput extends ControllerInput {
+  streamId: number;
+}
+
 export interface ControllerRenderMetrics {
   streamId: number;
   receivedFrames: number;
@@ -226,6 +230,9 @@ export interface RemoteDisplaySummary {
   primary: boolean;
 }
 
+export type VideoQualityPreset = "smooth" | "balanced" | "sharp";
+export type VideoQualityPreference = "automatic" | VideoQualityPreset;
+
 export type ControllerSignal =
   | { kind: "status"; runtime: ControllerRuntimeSummary }
   | ControllerVideoConfigSignal
@@ -247,4 +254,38 @@ export type ControllerSignal =
       receivedVideoPackets: number;
       droppedVideoPackets: number;
       completedFrames: number;
+    }
+  | {
+      kind: "clipboard";
+      state: "sending" | "receiving" | "completed" | "failed";
+      message: string;
+    }
+  | {
+      kind: "fileTransfer";
+      state: "waiting" | "sending" | "receiving" | "verifying" | "completed" | "failed" | "rejected" | "cancelled";
+      direction: "upload" | "download";
+      name: string;
+      transferred: number;
+      total: number;
+      message: string;
+    }
+  | {
+      kind: "fileQueue";
+      paused: boolean;
+      queued: Array<{
+        id: string;
+        name: string;
+        size: number;
+      }>;
+    }
+  | {
+      kind: "audio";
+      state: "enabled" | "muted" | "unavailable";
+      enabled: boolean;
+      message: string;
+    }
+  | {
+      kind: "videoQuality";
+      preference: VideoQualityPreference;
+      preset: VideoQualityPreset;
     };

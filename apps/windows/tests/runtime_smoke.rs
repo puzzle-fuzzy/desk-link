@@ -143,7 +143,10 @@ mod windows {
                 ControllerEvent::VideoConfig(config) => video_config = Some(config),
                 ControllerEvent::H264AccessUnit(access_unit) => frame = Some(access_unit),
                 ControllerEvent::Cursor(update) => cursor = Some(update),
-                ControllerEvent::Control(_) | ControllerEvent::Closed { .. } => {}
+                ControllerEvent::Control(_)
+                | ControllerEvent::Audio(_)
+                | ControllerEvent::Transfer(_)
+                | ControllerEvent::Closed { .. } => {}
             }
         }
         let video_config = video_config.unwrap();
@@ -315,6 +318,8 @@ mod windows {
                     cursors += 1;
                 }
                 ControllerEvent::Control(_) => {}
+                ControllerEvent::Audio(_) => {}
+                ControllerEvent::Transfer(_) => {}
                 ControllerEvent::Closed { reason } => {
                     panic!("secure soak session closed early: {reason}")
                 }

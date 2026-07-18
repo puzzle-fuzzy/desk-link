@@ -1,6 +1,6 @@
 [package]
 name = "desklink-installer"
-version = "0.1.26"
+version = "0.1.41"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

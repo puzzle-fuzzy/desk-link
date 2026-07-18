@@ -1,4 +1,8 @@
 use std::{
+    collections::VecDeque,
+    fs::File,
+    io::Read,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -7,17 +11,22 @@ use std::{
 };
 
 use apps_windows::{
+    audio::RemoteAudioDecoder,
     cloud_diagnostics::{DiagnosticSource, set_session_correlation},
     controller_settings::{ControllerConnectionSettings, WindowsControllerConnectionStore},
     diagnostics::{ControllerDiagnosticStage, DiagnosticEvent, DiagnosticLog},
     identity::WindowsIdentityStore,
     recent_access::{RecentAccessEntry, WindowsRecentAccessError, WindowsRecentAccessStore},
+    transfer::{IncomingFile, OutgoingFile, prepare_outgoing_file},
 };
+use blake2::{Blake2s256, Digest};
 use desklink_crypto::{PairingCode, PairingInvite};
-use desklink_ffi::{ControllerError, ControllerEvent, ControllerRuntime};
+use desklink_ffi::{ControllerError, ControllerEvent, ControllerRuntime, ControllerTransferSender};
 use desklink_protocol::{
-    AccessDenialReason, ControlMessage, FrameFlags, InputEvent, KeyCode, MAX_POINTER_COORDINATE,
-    MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform,
+    AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FrameFlags, InputEvent, KeyCode,
+    MAX_CLIPBOARD_TEXT_BYTES, MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA,
+    Modifiers, MouseButton, Platform, TransferId, TransferMessage, TransferResult,
+    VideoQualityPreference, VideoQualityPreset,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -30,6 +39,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use zeroize::Zeroize;
 
 const COMMAND_CAPACITY: usize = 512;
+const MAX_BUFFERED_POINTER_MOVES: usize = 8;
 const FRAME_PREFIX_BYTES: usize = 17;
 const MAX_TEXT_INPUT_CHARACTERS: usize = 256;
 const MAX_TEXT_INPUT_BYTES: usize = 1_024;
@@ -39,6 +49,115 @@ const DIRECTORY_RECOVERY_DELAYS: [Duration; 2] =
     [Duration::from_millis(500), Duration::from_millis(1_250)];
 const DIRECTORY_TRANSPORT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(350), Duration::from_millis(900)];
+const AUDIO_FRAME_DURATION_US: u64 = 10_000;
+const MAX_FILE_QUEUE_ITEMS: usize = 20;
+
+struct DecodedControllerAudio {
+    stream_id: u64,
+    sequence: u64,
+    capture_timestamp_us: u64,
+    sample_rate: u32,
+    payload: Vec<u8>,
+}
+
+struct ControllerAudioDecoder {
+    opus: Option<RemoteAudioDecoder>,
+    stream_id: Option<u64>,
+    next_sequence: Option<u64>,
+    codec: Option<AudioCodec>,
+}
+
+impl ControllerAudioDecoder {
+    fn new() -> Self {
+        Self {
+            opus: RemoteAudioDecoder::new().ok(),
+            stream_id: None,
+            next_sequence: None,
+            codec: None,
+        }
+    }
+
+    fn decode(&mut self, packet: AudioPacket) -> Vec<DecodedControllerAudio> {
+        if packet.codec == AudioCodec::PcmS16Le {
+            self.stream_id = Some(packet.stream_id);
+            self.next_sequence = Some(packet.sequence.saturating_add(1));
+            self.codec = Some(packet.codec);
+            return vec![DecodedControllerAudio {
+                stream_id: packet.stream_id,
+                sequence: packet.sequence,
+                capture_timestamp_us: packet.capture_timestamp_us,
+                sample_rate: packet.sample_rate,
+                payload: packet.payload,
+            }];
+        }
+
+        let stream_changed =
+            self.stream_id != Some(packet.stream_id) || self.codec != Some(AudioCodec::Opus);
+        if stream_changed {
+            self.reset_opus();
+            self.next_sequence = None;
+        }
+
+        let expected = self.next_sequence;
+        if expected.is_some_and(|expected| packet.sequence < expected) {
+            return Vec::new();
+        }
+        if expected.is_some_and(|expected| packet.sequence > expected.saturating_add(1)) {
+            self.reset_opus();
+        }
+
+        let mut decoded = Vec::with_capacity(2);
+        if expected.is_some_and(|expected| packet.sequence == expected.saturating_add(1)) {
+            if let Some(payload) = self.decode_opus(&packet.payload, true) {
+                decoded.push(DecodedControllerAudio {
+                    stream_id: packet.stream_id,
+                    sequence: packet.sequence.saturating_sub(1),
+                    capture_timestamp_us: packet
+                        .capture_timestamp_us
+                        .saturating_sub(AUDIO_FRAME_DURATION_US)
+                        .max(1),
+                    sample_rate: packet.sample_rate,
+                    payload,
+                });
+            } else {
+                self.reset_opus();
+            }
+        }
+
+        let Some(payload) = self.decode_opus(&packet.payload, false) else {
+            self.reset_opus();
+            self.stream_id = None;
+            self.next_sequence = None;
+            self.codec = None;
+            return Vec::new();
+        };
+        decoded.push(DecodedControllerAudio {
+            stream_id: packet.stream_id,
+            sequence: packet.sequence,
+            capture_timestamp_us: packet.capture_timestamp_us,
+            sample_rate: packet.sample_rate,
+            payload,
+        });
+        self.stream_id = Some(packet.stream_id);
+        self.next_sequence = Some(packet.sequence.saturating_add(1));
+        self.codec = Some(AudioCodec::Opus);
+        decoded
+    }
+
+    fn decode_opus(&mut self, payload: &[u8], fec: bool) -> Option<Vec<u8>> {
+        if self.opus.is_none() {
+            self.opus = RemoteAudioDecoder::new().ok();
+        }
+        self.opus.as_mut()?.decode(payload, fec).ok()
+    }
+
+    fn reset_opus(&mut self) {
+        let reset = self.opus.as_mut().map(RemoteAudioDecoder::reset);
+        if reset.is_some_and(|result| result.is_err()) {
+            self.opus = RemoteAudioDecoder::new().ok();
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,6 +343,7 @@ impl DeviceCredentialSource {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerInput {
+    stream_id: u64,
     kind: String,
     x: Option<i32>,
     y: Option<i32>,
@@ -269,6 +389,31 @@ pub enum ControllerSignal {
         displays: Vec<ControllerDisplaySummary>,
         active_display_id: u32,
     },
+    Clipboard {
+        state: &'static str,
+        message: String,
+    },
+    FileTransfer {
+        state: &'static str,
+        direction: &'static str,
+        name: String,
+        transferred: u64,
+        total: u64,
+        message: String,
+    },
+    FileQueue {
+        queued: Vec<QueuedFileSummary>,
+        paused: bool,
+    },
+    Audio {
+        state: &'static str,
+        enabled: bool,
+        message: String,
+    },
+    VideoQuality {
+        preference: VideoQualityPreference,
+        preset: VideoQualityPreset,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -278,6 +423,14 @@ pub struct ControllerDisplaySummary {
     width: u16,
     height: u16,
     primary: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedFileSummary {
+    id: String,
+    name: String,
+    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,10 +446,54 @@ pub struct ControllerRenderMetrics {
 }
 
 enum ControllerCommand {
-    Input(InputEvent),
+    Input { stream_id: u64, event: InputEvent },
     Text(String),
     RequestKeyframe,
     SelectDisplay(u32),
+    SetAudioEnabled(bool),
+    SetVideoQuality(VideoQualityPreference),
+    SendClipboard(String),
+    RequestClipboard,
+    SendFiles(Vec<OutgoingFile>),
+    RetryFile(OutgoingFile),
+    RemoveQueuedFile(TransferId),
+    ClearFileQueue,
+    ResumeFileQueue,
+    RequestRemoteFile,
+    CancelFile,
+}
+
+fn should_drop_buffered_pointer_move(command: &ControllerCommand, capacity: usize) -> bool {
+    matches!(
+        command,
+        ControllerCommand::Input {
+            event: InputEvent::MouseMove { .. },
+            ..
+        }
+    ) && capacity <= COMMAND_CAPACITY.saturating_sub(MAX_BUFFERED_POINTER_MOVES)
+}
+
+struct OutgoingTransfer {
+    file: OutgoingFile,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct IncomingTransfer {
+    file: IncomingFile,
+    name: String,
+    size: u64,
+    transferred: u64,
+}
+
+#[derive(Clone)]
+enum LastFileAction {
+    Upload(PathBuf),
+    Download,
+}
+
+struct OutgoingFileFailure {
+    transfer_id: TransferId,
+    message: String,
 }
 
 struct ControllerWorker {
@@ -305,10 +502,17 @@ struct ControllerWorker {
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
+struct ControllerOutputChannels {
+    signals: Channel<ControllerSignal>,
+    video: Channel<Response>,
+    audio: Channel<Response>,
+}
+
 #[derive(Clone)]
 pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
     worker: Arc<Mutex<Option<ControllerWorker>>>,
+    last_file_action: Arc<Mutex<Option<LastFileAction>>>,
     operation_lock: Arc<AsyncMutex<()>>,
     operation_generation: Arc<AtomicU64>,
     recent_cancellation: Arc<Mutex<Option<Instant>>>,
@@ -320,6 +524,7 @@ impl Default for ControllerManager {
         Self {
             status: Arc::new(Mutex::new(ControllerRuntimeSummary::idle())),
             worker: Arc::new(Mutex::new(None)),
+            last_file_action: Arc::new(Mutex::new(None)),
             operation_lock: Arc::new(AsyncMutex::new(())),
             operation_generation: Arc::new(AtomicU64::new(0)),
             recent_cancellation: Arc::new(Mutex::new(None)),
@@ -343,6 +548,7 @@ impl ControllerManager {
         input: ControllerDeviceInput,
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
+        audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let device_id =
             crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
@@ -356,6 +562,7 @@ impl ControllerManager {
             DeviceCredentialSource::Entered,
             signals,
             video,
+            audio,
         )
         .await
     }
@@ -365,6 +572,7 @@ impl ControllerManager {
         input: SavedDeviceInput,
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
+        audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let device_id =
             crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
@@ -376,8 +584,15 @@ impl ControllerManager {
         let source = DeviceCredentialSource::Saved {
             persistent: saved.is_persistent(),
         };
-        self.connect_device_credentials(device_id, saved.password().clone(), source, signals, video)
-            .await
+        self.connect_device_credentials(
+            device_id,
+            saved.password().clone(),
+            source,
+            signals,
+            video,
+            audio,
+        )
+        .await
     }
 
     async fn connect_device_credentials(
@@ -387,6 +602,7 @@ impl ControllerManager {
         source: DeviceCredentialSource,
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
+        audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let recover_after_cancel = self.take_recent_cancellation();
         let generation = self.begin_operation();
@@ -511,7 +727,7 @@ impl ControllerManager {
             }
         };
         self.ensure_current(generation)?;
-        self.start(generation, settings, true, signals, video)
+        self.start(generation, settings, true, signals, video, audio)
             .await?;
         load_snapshot(self.snapshot())
     }
@@ -520,6 +736,7 @@ impl ControllerManager {
         &self,
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
+        audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let generation = self.begin_operation();
         let store = WindowsControllerConnectionStore::for_current_user()
@@ -528,7 +745,7 @@ impl ControllerManager {
             .load()
             .map_err(|_| "无法打开已保存的控制端连接。".to_owned())?
             .ok_or_else(|| "没有可供重新连接的已保存 Windows 电脑。".to_owned())?;
-        self.start(generation, settings, false, signals, video)
+        self.start(generation, settings, false, signals, video, audio)
             .await?;
         load_snapshot(self.snapshot())
     }
@@ -540,6 +757,7 @@ impl ControllerManager {
         save_after_approval: bool,
         signals: Channel<ControllerSignal>,
         video: Channel<Response>,
+        audio: Channel<Response>,
     ) -> Result<(), String> {
         let _operation = self.operation_lock.lock().await;
         self.ensure_current(generation)?;
@@ -557,8 +775,11 @@ impl ControllerManager {
                 save_after_approval,
                 receiver,
                 cancellation_receiver,
-                signals,
-                video,
+                ControllerOutputChannels {
+                    signals,
+                    video,
+                    audio,
+                },
             )
             .await;
         });
@@ -575,7 +796,15 @@ impl ControllerManager {
     }
 
     pub async fn send_input(&self, input: ControllerInput) -> Result<(), String> {
-        self.send(ControllerCommand::Input(parse_input(input)?))
+        if input.stream_id == 0 {
+            return Err("远程输入缺少有效的视频流标识。".to_owned());
+        }
+        let stream_id = input.stream_id;
+        let event = parse_input(input)?;
+        if self.active_stream_id() != Some(stream_id) {
+            return Ok(());
+        }
+        self.send(ControllerCommand::Input { stream_id, event })
             .await
     }
 
@@ -593,6 +822,100 @@ impl ControllerManager {
             .await
     }
 
+    pub async fn set_audio_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.send(ControllerCommand::SetAudioEnabled(enabled)).await
+    }
+
+    pub async fn set_video_quality(
+        &self,
+        preference: VideoQualityPreference,
+    ) -> Result<(), String> {
+        self.send(ControllerCommand::SetVideoQuality(preference))
+            .await
+    }
+
+    pub async fn send_clipboard(&self, text: String) -> Result<(), String> {
+        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err("剪贴板文本超过 48 KB，无法发送。".to_owned());
+        }
+        self.send(ControllerCommand::SendClipboard(text)).await
+    }
+
+    pub async fn request_clipboard(&self) -> Result<(), String> {
+        self.send(ControllerCommand::RequestClipboard).await
+    }
+
+    pub async fn send_files(&self, paths: Vec<PathBuf>) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if paths.len() > MAX_FILE_QUEUE_ITEMS {
+            return Err(format!("一次最多添加 {MAX_FILE_QUEUE_ITEMS} 个文件。"));
+        }
+        let prepared = tauri::async_runtime::spawn_blocking(move || {
+            let mut files = Vec::with_capacity(paths.len());
+            for path in paths {
+                if files.iter().any(|file: &OutgoingFile| file.path == path) {
+                    continue;
+                }
+                files.push(prepare_outgoing_file(path)?);
+            }
+            Ok::<_, TransferResult>(files)
+        })
+        .await
+        .map_err(|_| "DeskLink 无法读取所选文件。".to_owned())?
+        .map_err(|result| prepare_file_error_message(result).to_owned())?;
+        self.send(ControllerCommand::SendFiles(prepared)).await
+    }
+
+    pub async fn request_remote_file(&self) -> Result<(), String> {
+        *self
+            .last_file_action
+            .lock()
+            .map_err(|_| "DeskLink 无法保留最近的文件操作。".to_owned())? =
+            Some(LastFileAction::Download);
+        self.send(ControllerCommand::RequestRemoteFile).await
+    }
+
+    pub async fn retry_file(&self) -> Result<(), String> {
+        let action = self
+            .last_file_action
+            .lock()
+            .map_err(|_| "DeskLink 无法读取最近的文件操作。".to_owned())?
+            .clone()
+            .ok_or_else(|| "没有可以重试的文件任务。".to_owned())?;
+        match action {
+            LastFileAction::Upload(path) => {
+                let prepared =
+                    tauri::async_runtime::spawn_blocking(move || prepare_outgoing_file(path))
+                        .await
+                        .map_err(|_| "DeskLink 无法重新读取所选文件。".to_owned())?
+                        .map_err(|result| prepare_file_error_message(result).to_owned())?;
+                self.send(ControllerCommand::RetryFile(prepared)).await
+            }
+            LastFileAction::Download => self.send(ControllerCommand::RequestRemoteFile).await,
+        }
+    }
+
+    pub async fn cancel_file(&self) -> Result<(), String> {
+        self.send(ControllerCommand::CancelFile).await
+    }
+
+    pub async fn remove_queued_file(&self, transfer_id: &str) -> Result<(), String> {
+        self.send(ControllerCommand::RemoveQueuedFile(parse_transfer_id(
+            transfer_id,
+        )?))
+        .await
+    }
+
+    pub async fn clear_file_queue(&self) -> Result<(), String> {
+        self.send(ControllerCommand::ClearFileQueue).await
+    }
+
+    pub async fn resume_file_queue(&self) -> Result<(), String> {
+        self.send(ControllerCommand::ResumeFileQueue).await
+    }
+
     async fn send(&self, command: ControllerCommand) -> Result<(), String> {
         let commands = self
             .worker
@@ -602,11 +925,17 @@ impl ControllerManager {
             .ok_or_else(|| "当前没有正在运行的远程控制会话。".to_owned())?
             .commands
             .clone();
-        // Applying backpressure here is important: a full queue must never
-        // silently discard a button/key release and leave the remote computer
-        // with a logically stuck input state. The WebView dispatcher already
-        // permits only one input IPC call in flight.
-        if matches!(&command, ControllerCommand::Input(_)) && commands.capacity() == 0 {
+        // Pointer motion is replaceable, while button/key releases are not. Keep
+        // the shared command queue almost empty of stale motion so discrete
+        // releases and recovery controls always retain bounded headroom.
+        if should_drop_buffered_pointer_move(&command, commands.capacity()) {
+            self.input_backpressure_count
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        // A full queue must never silently discard a button/key release and
+        // leave the remote computer with a logically stuck input state.
+        if matches!(&command, ControllerCommand::Input { .. }) && commands.capacity() == 0 {
             self.input_backpressure_count
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -614,6 +943,10 @@ impl ControllerManager {
             .send(command)
             .await
             .map_err(|_| "远程控制会话已结束，无法继续发送输入。".to_owned())
+    }
+
+    fn active_stream_id(&self) -> Option<u64> {
+        self.status.lock().ok().and_then(|status| status.stream_id)
     }
 
     pub fn record_render_metrics(&self, metrics: ControllerRenderMetrics) -> Result<(), String> {
@@ -895,13 +1228,21 @@ async fn run_controller(
     mut save_after_approval: bool,
     mut commands: mpsc::Receiver<ControllerCommand>,
     mut cancellation: watch::Receiver<bool>,
-    signals: Channel<ControllerSignal>,
-    video: Channel<Response>,
+    outputs: ControllerOutputChannels,
 ) {
+    let ControllerOutputChannels {
+        signals,
+        video,
+        audio,
+    } = outputs;
     let diagnostics = DiagnosticLog::controller_for_current_user().ok();
     let _ = set_session_correlation(DiagnosticSource::Controller, settings.session_id());
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
     let mut attempt = 0_u32;
+    let mut audio_enabled = true;
+    let mut video_quality = VideoQualityPreference::Sharp;
+    let mut queued_files = VecDeque::<OutgoingFile>::new();
+    let mut file_queue_paused = false;
     'connect: loop {
         attempt = attempt.saturating_add(1);
         record_controller_diagnostic(
@@ -927,10 +1268,25 @@ async fn run_controller(
                         finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
                         return;
                     }
-                    Some(ControllerCommand::Input(_))
+                    Some(ControllerCommand::SetAudioEnabled(enabled)) => {
+                        audio_enabled = enabled;
+                    }
+                    Some(ControllerCommand::SetVideoQuality(preference)) => {
+                        video_quality = preference;
+                    }
+                    Some(ControllerCommand::Input { .. })
                     | Some(ControllerCommand::Text(_))
                     | Some(ControllerCommand::RequestKeyframe)
-                    | Some(ControllerCommand::SelectDisplay(_)) => {}
+                    | Some(ControllerCommand::SelectDisplay(_))
+                    | Some(ControllerCommand::SendClipboard(_))
+                    | Some(ControllerCommand::RequestClipboard)
+                    | Some(ControllerCommand::SendFiles(_))
+                    | Some(ControllerCommand::RetryFile(_))
+                    | Some(ControllerCommand::RemoveQueuedFile(_))
+                    | Some(ControllerCommand::ClearFileQueue)
+                    | Some(ControllerCommand::ResumeFileQueue)
+                    | Some(ControllerCommand::RequestRemoteFile)
+                    | Some(ControllerCommand::CancelFile) => {}
                 },
                 result = &mut connection => match result {
                     Ok(runtime) => break runtime,
@@ -954,14 +1310,95 @@ async fn run_controller(
                 }
             }
         };
+        if let Err(error) = runtime.set_audio_enabled(audio_enabled).await {
+            let failure = ConnectFailure::from_controller(error);
+            if !schedule_failure(
+                &manager,
+                &signals,
+                &mut schedule,
+                failure,
+                ControllerWaitChannels {
+                    commands: &mut commands,
+                    cancellation: &mut cancellation,
+                },
+                diagnostics.as_ref(),
+                attempt,
+            )
+            .await
+            {
+                return;
+            }
+            continue 'connect;
+        }
+        if let Err(error) = runtime.set_video_quality(video_quality).await {
+            let failure = ConnectFailure::from_controller(error);
+            if !schedule_failure(
+                &manager,
+                &signals,
+                &mut schedule,
+                failure,
+                ControllerWaitChannels {
+                    commands: &mut commands,
+                    cancellation: &mut cancellation,
+                },
+                diagnostics.as_ref(),
+                attempt,
+            )
+            .await
+            {
+                return;
+            }
+            continue 'connect;
+        }
 
         let mut stable = false;
         let mut stable_since = None;
+        let mut video_quality_ack_pending = true;
         let mut last_metrics = Instant::now();
+        let mut last_feedback_metrics = runtime.metrics();
         let mut last_diagnostic_metrics = Instant::now()
             .checked_sub(Duration::from_secs(10))
             .unwrap_or_else(Instant::now);
+        let mut next_transfer_request_id = 1_u64;
+        let mut outgoing: Option<OutgoingTransfer> = None;
+        let mut incoming: Option<IncomingTransfer> = None;
+        let mut pending_remote_file_request: Option<u64> = None;
+        let mut audio_decoder = ControllerAudioDecoder::new();
+        let (file_failures, mut pending_file_failures) = mpsc::unbounded_channel();
+        publish_file_queue(&signals, &queued_files, file_queue_paused);
         let failure = loop {
+            if outgoing.is_none()
+                && incoming.is_none()
+                && pending_remote_file_request.is_none()
+                && !file_queue_paused
+                && let Some(file) = queued_files.pop_front()
+            {
+                if let Ok(mut action) = manager.last_file_action.lock() {
+                    *action = Some(LastFileAction::Upload(file.path.clone()));
+                }
+                let offer = TransferMessage::FileOffer {
+                    transfer_id: file.transfer_id,
+                    name: file.name.clone(),
+                    size: file.size,
+                };
+                if let Err(error) = runtime.send_transfer(offer).await {
+                    queued_files.push_front(file);
+                    break ConnectFailure::from_controller(error);
+                }
+                let _ = signals.send(ControllerSignal::FileTransfer {
+                    state: "waiting",
+                    direction: "upload",
+                    name: file.name.clone(),
+                    transferred: 0,
+                    total: file.size,
+                    message: "等待远端确认接收…".to_owned(),
+                });
+                outgoing = Some(OutgoingTransfer {
+                    file,
+                    cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                });
+                publish_file_queue(&signals, &queued_files, file_queue_paused);
+            }
             tokio::select! {
                 changed = cancellation.changed() => {
                     if cancellation_requested(changed, &cancellation) {
@@ -970,8 +1407,11 @@ async fn run_controller(
                     }
                 }
                 command = commands.recv() => match command {
-                    Some(ControllerCommand::Input(input)) => {
-                        if let Err(error) = runtime.send_input(input).await {
+                    Some(ControllerCommand::Input { stream_id, event }) => {
+                        if manager.active_stream_id() != Some(stream_id) {
+                            continue;
+                        }
+                        if let Err(error) = runtime.send_input(event).await {
                             break ConnectFailure::from_controller(error);
                         }
                     }
@@ -990,6 +1430,176 @@ async fn run_controller(
                     Some(ControllerCommand::SelectDisplay(display_id)) => {
                         if let Err(error) = runtime.select_display(display_id).await {
                             break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::SetAudioEnabled(enabled)) => {
+                        audio_enabled = enabled;
+                        if let Err(error) = runtime.set_audio_enabled(enabled).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::SetVideoQuality(preference)) => {
+                        video_quality = preference;
+                        video_quality_ack_pending = true;
+                        if let Err(error) = runtime.set_video_quality(preference).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::SendClipboard(text)) => {
+                        let request_id = next_transfer_request_id;
+                        next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
+                        let _ = signals.send(ControllerSignal::Clipboard {
+                            state: "sending",
+                            message: "正在发送本机剪贴板…".to_owned(),
+                        });
+                        if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardSet {
+                            request_id,
+                            text,
+                        }).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::RequestClipboard) => {
+                        let request_id = next_transfer_request_id;
+                        next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
+                        let _ = signals.send(ControllerSignal::Clipboard {
+                            state: "receiving",
+                            message: "正在读取远端剪贴板…".to_owned(),
+                        });
+                        if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardRequest {
+                            request_id,
+                        }).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::SendFiles(files)) => {
+                        let occupied = queued_files.len() + usize::from(outgoing.is_some());
+                        if files.is_empty() {
+                            continue;
+                        }
+                        if occupied.saturating_add(files.len()) > MAX_FILE_QUEUE_ITEMS {
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: "文件队列".to_owned(),
+                                transferred: 0,
+                                total: 0,
+                                message: format!("发送队列最多保留 {MAX_FILE_QUEUE_ITEMS} 个文件。"),
+                            });
+                            continue;
+                        }
+                        queued_files.extend(files);
+                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                    }
+                    Some(ControllerCommand::RetryFile(file)) => {
+                        if queued_files.len() + usize::from(outgoing.is_some())
+                            >= MAX_FILE_QUEUE_ITEMS
+                        {
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: file.name,
+                                transferred: 0,
+                                total: file.size,
+                                message: "发送队列已满，请先移除一个等待文件。".to_owned(),
+                            });
+                            continue;
+                        }
+                        queued_files.push_front(file);
+                        file_queue_paused = false;
+                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                    }
+                    Some(ControllerCommand::RemoveQueuedFile(transfer_id)) => {
+                        queued_files.retain(|file| file.transfer_id != transfer_id);
+                        if queued_files.is_empty() {
+                            file_queue_paused = false;
+                        }
+                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                    }
+                    Some(ControllerCommand::ClearFileQueue) => {
+                        queued_files.clear();
+                        file_queue_paused = false;
+                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                    }
+                    Some(ControllerCommand::ResumeFileQueue) => {
+                        file_queue_paused = false;
+                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                    }
+                    Some(ControllerCommand::RequestRemoteFile) => {
+                        if outgoing.is_some()
+                            || incoming.is_some()
+                            || pending_remote_file_request.is_some()
+                            || !queued_files.is_empty()
+                        {
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "download",
+                                name: "远端文件".to_owned(),
+                                transferred: 0,
+                                total: 0,
+                                message: "请等待发送队列完成，或先清空等待中的文件。".to_owned(),
+                            });
+                            continue;
+                        }
+                        let request_id = next_transfer_request_id;
+                        next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
+                        if let Err(error) = runtime.send_transfer(
+                            TransferMessage::FileSelectionRequest { request_id },
+                        ).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                        pending_remote_file_request = Some(request_id);
+                        let _ = signals.send(ControllerSignal::FileTransfer {
+                            state: "waiting",
+                            direction: "download",
+                            name: "等待远端选择文件".to_owned(),
+                            transferred: 0,
+                            total: 0,
+                            message: "请在远端电脑上选择要发送的文件…".to_owned(),
+                        });
+                    }
+                    Some(ControllerCommand::CancelFile) => {
+                        if let Some(transfer) = outgoing.take() {
+                            transfer.cancellation.store(true, Ordering::Release);
+                            let _ = runtime.send_transfer(TransferMessage::Cancel {
+                                transfer_id: transfer.file.transfer_id,
+                            }).await;
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "cancelled",
+                                direction: "upload",
+                                name: transfer.file.name,
+                                transferred: 0,
+                                total: transfer.file.size,
+                                message: "文件传输已取消。".to_owned(),
+                            });
+                            if !queued_files.is_empty() {
+                                file_queue_paused = true;
+                                publish_file_queue(&signals, &queued_files, file_queue_paused);
+                            }
+                        } else if let Some(transfer) = incoming.take() {
+                            let _ = runtime.send_transfer(TransferMessage::Cancel {
+                                transfer_id: transfer.file.transfer_id(),
+                            }).await;
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "cancelled",
+                                direction: "download",
+                                name: transfer.name,
+                                transferred: transfer.transferred,
+                                total: transfer.size,
+                                message: "文件接收已取消，未完成的临时文件已删除。".to_owned(),
+                            });
+                        } else if let Some(request_id) = pending_remote_file_request.take() {
+                            let _ = runtime.send_transfer(
+                                TransferMessage::FileSelectionCancel { request_id },
+                            ).await;
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "cancelled",
+                                direction: "download",
+                                name: "远端文件".to_owned(),
+                                transferred: 0,
+                                total: 0,
+                                message: "已取消从远端获取文件。".to_owned(),
+                            });
                         }
                     }
                     None => {
@@ -1055,6 +1665,19 @@ async fn run_controller(
                             visible: cursor.visible,
                         });
                     }
+                    Ok(ControllerEvent::Audio(packet)) => {
+                        const AUDIO_PREFIX_BYTES: usize = 28;
+                        for packet in audio_decoder.decode(packet) {
+                            let mut payload =
+                                Vec::with_capacity(AUDIO_PREFIX_BYTES + packet.payload.len());
+                            payload.extend_from_slice(&packet.stream_id.to_le_bytes());
+                            payload.extend_from_slice(&packet.sequence.to_le_bytes());
+                            payload.extend_from_slice(&packet.capture_timestamp_us.to_le_bytes());
+                            payload.extend_from_slice(&packet.sample_rate.to_le_bytes());
+                            payload.extend_from_slice(&packet.payload);
+                            let _ = audio.send(Response::new(payload));
+                        }
+                    }
                     Ok(ControllerEvent::Control(ControlMessage::DisplayList {
                         displays,
                         active_display_id,
@@ -1072,15 +1695,401 @@ async fn run_controller(
                             active_display_id,
                         });
                     }
+                    Ok(ControllerEvent::Control(ControlMessage::AudioState {
+                        available,
+                        enabled,
+                    })) => {
+                        let (state, message) = if !available {
+                            (
+                                "unavailable",
+                                "远端系统声音当前不可用，画面和控制不受影响。",
+                            )
+                        } else if enabled {
+                            ("enabled", "正在播放远端系统声音。")
+                        } else {
+                            ("muted", "远端系统声音已静音。")
+                        };
+                        let _ = signals.send(ControllerSignal::Audio {
+                            state,
+                            enabled,
+                            message: message.to_owned(),
+                        });
+                    }
+                    Ok(ControllerEvent::Control(ControlMessage::VideoQualityState {
+                        preference,
+                        preset,
+                    })) => {
+                        if video_quality_ack_pending && preference != video_quality {
+                            continue;
+                        }
+                        video_quality_ack_pending = false;
+                        video_quality = preference;
+                        let _ = signals.send(ControllerSignal::VideoQuality {
+                            preference,
+                            preset,
+                        });
+                    }
                     Ok(ControllerEvent::Control(_)) => {}
+                    Ok(ControllerEvent::Transfer(message)) => match message {
+                        TransferMessage::ClipboardData { text, .. } => {
+                            let write = tauri::async_runtime::spawn_blocking(move || {
+                                apps_windows::transfer::write_clipboard_text(&text)
+                            }).await.unwrap_or(Err(TransferResult::IoFailed));
+                            let (state, message) = if write.is_ok() {
+                                ("completed", "远端文本已复制到本机剪贴板。")
+                            } else {
+                                ("failed", "无法写入本机剪贴板，请稍后重试。")
+                            };
+                            let _ = signals.send(ControllerSignal::Clipboard {
+                                state,
+                                message: message.to_owned(),
+                            });
+                        }
+                        TransferMessage::ClipboardResult { result, .. } => {
+                            let completed = result == TransferResult::Completed;
+                            let _ = signals.send(ControllerSignal::Clipboard {
+                                state: if completed { "completed" } else { "failed" },
+                                message: if completed {
+                                    "本机文本已写入远端剪贴板。"
+                                } else {
+                                    transfer_result_message(result)
+                                }.to_owned(),
+                            });
+                        }
+                        TransferMessage::FileSelectionResult { request_id, result } => {
+                            if pending_remote_file_request != Some(request_id) {
+                                continue;
+                            }
+                            pending_remote_file_request = None;
+                            let state = match result {
+                                TransferResult::Cancelled => "cancelled",
+                                TransferResult::Rejected => "rejected",
+                                _ => "failed",
+                            };
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state,
+                                direction: "download",
+                                name: "远端文件".to_owned(),
+                                transferred: 0,
+                                total: 0,
+                                message: transfer_result_message(result).to_owned(),
+                            });
+                        }
+                        TransferMessage::FileOffer { transfer_id, name, size } => {
+                            let requested = pending_remote_file_request.take().is_some();
+                            if !requested || outgoing.is_some() || incoming.is_some() {
+                                if let Err(error) = runtime.send_transfer(
+                                    TransferMessage::FileDecision { transfer_id, accepted: false },
+                                ).await {
+                                    break ConnectFailure::from_controller(error);
+                                }
+                                continue;
+                            }
+                            let incoming_file = tauri::async_runtime::spawn_blocking({
+                                let name = name.clone();
+                                move || IncomingFile::create(transfer_id, name, size)
+                            }).await.unwrap_or(Err(TransferResult::IoFailed));
+                            let accepted = incoming_file.is_ok();
+                            if let Err(error) = runtime.send_transfer(
+                                TransferMessage::FileDecision { transfer_id, accepted },
+                            ).await {
+                                break ConnectFailure::from_controller(error);
+                            }
+                            match incoming_file {
+                                Ok(file) => {
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "receiving",
+                                        direction: "download",
+                                        name: name.clone(),
+                                        transferred: 0,
+                                        total: size,
+                                        message: "正在接收远端文件… 0%".to_owned(),
+                                    });
+                                    incoming = Some(IncomingTransfer {
+                                        file,
+                                        name,
+                                        size,
+                                        transferred: 0,
+                                    });
+                                }
+                                Err(result) => {
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "failed",
+                                        direction: "download",
+                                        name,
+                                        transferred: 0,
+                                        total: size,
+                                        message: transfer_result_message(result).to_owned(),
+                                    });
+                                }
+                            }
+                        }
+                        TransferMessage::FileChunk { transfer_id, offset, bytes } => {
+                            let result = incoming
+                                .as_mut()
+                                .filter(|transfer| transfer.file.transfer_id() == transfer_id)
+                                .ok_or(TransferResult::InvalidData)
+                                .and_then(|transfer| {
+                                    transfer.file.write_chunk(offset, &bytes)?;
+                                    transfer.transferred = offset.saturating_add(bytes.len() as u64);
+                                    Ok((
+                                        transfer.name.clone(),
+                                        transfer.transferred,
+                                        transfer.size,
+                                    ))
+                                });
+                            match result {
+                                Ok((name, transferred, total)) => {
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "receiving",
+                                        direction: "download",
+                                        name,
+                                        transferred,
+                                        total,
+                                        message: format!(
+                                            "正在接收… {}%",
+                                            transfer_percent(transferred, total)
+                                        ),
+                                    });
+                                }
+                                Err(result) => {
+                                    let failed = incoming.take();
+                                    if let Err(error) = runtime.send_transfer(
+                                        TransferMessage::FileResult { transfer_id, result },
+                                    ).await {
+                                        break ConnectFailure::from_controller(error);
+                                    }
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "failed",
+                                        direction: "download",
+                                        name: failed.as_ref().map(|item| item.name.clone())
+                                            .unwrap_or_else(|| "远端文件".to_owned()),
+                                        transferred: failed.as_ref().map_or(0, |item| item.transferred),
+                                        total: failed.as_ref().map_or(0, |item| item.size),
+                                        message: transfer_result_message(result).to_owned(),
+                                    });
+                                }
+                            }
+                        }
+                        TransferMessage::FileComplete { transfer_id, content_hash } => {
+                            let transfer = incoming.take();
+                            let (name, size, result) = match transfer {
+                                Some(transfer) if transfer.file.transfer_id() == transfer_id => {
+                                    let name = transfer.name;
+                                    let size = transfer.size;
+                                    let result = tauri::async_runtime::spawn_blocking(move || {
+                                        transfer.file.finish(content_hash)
+                                    }).await.unwrap_or(Err(TransferResult::IoFailed));
+                                    (name, size, result)
+                                }
+                                Some(transfer) => {
+                                    incoming = Some(transfer);
+                                    ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData))
+                                }
+                                None => ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData)),
+                            };
+                            let transfer_result = match result {
+                                Ok(path) => {
+                                    tauri::async_runtime::spawn_blocking(move || {
+                                        apps_windows::transfer::notify_file_received(&path)
+                                    });
+                                    TransferResult::Completed
+                                }
+                                Err(result) => result,
+                            };
+                            if let Err(error) = runtime.send_transfer(TransferMessage::FileResult {
+                                transfer_id,
+                                result: transfer_result,
+                            }).await {
+                                break ConnectFailure::from_controller(error);
+                            }
+                            let completed = transfer_result == TransferResult::Completed;
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: if completed { "completed" } else { "failed" },
+                                direction: "download",
+                                name,
+                                transferred: if completed { size } else { 0 },
+                                total: size,
+                                message: if completed {
+                                    "文件已保存到本机的“下载”文件夹。"
+                                } else {
+                                    transfer_result_message(transfer_result)
+                                }.to_owned(),
+                            });
+                        }
+                        TransferMessage::FileDecision { transfer_id, accepted } => {
+                            let matches = outgoing.as_ref().is_some_and(|transfer| {
+                                transfer.file.transfer_id == transfer_id
+                            });
+                            if !matches {
+                                continue;
+                            }
+                            if !accepted {
+                                let transfer = outgoing.take().expect("checked outgoing transfer");
+                                let _ = signals.send(ControllerSignal::FileTransfer {
+                                    state: "rejected",
+                                    direction: "upload",
+                                    name: transfer.file.name,
+                                    transferred: 0,
+                                    total: transfer.file.size,
+                                    message: "远端已拒绝接收此文件。".to_owned(),
+                                });
+                                if !queued_files.is_empty() {
+                                    file_queue_paused = true;
+                                    publish_file_queue(
+                                        &signals,
+                                        &queued_files,
+                                        file_queue_paused,
+                                    );
+                                }
+                                continue;
+                            }
+                            let transfer = outgoing.as_ref().expect("checked outgoing transfer");
+                            let sender = runtime.transfer_sender();
+                            let signals = signals.clone();
+                            let cancellation = transfer.cancellation.clone();
+                            let path = transfer.file.path.clone();
+                            let name = transfer.file.name.clone();
+                            let size = transfer.file.size;
+                            let file_failures = file_failures.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(message) = send_outgoing_file(
+                                    sender,
+                                    transfer_id,
+                                    path,
+                                    name.clone(),
+                                    size,
+                                    cancellation,
+                                    signals.clone(),
+                                ).await {
+                                    let _ = file_failures.send(OutgoingFileFailure {
+                                        transfer_id,
+                                        message,
+                                    });
+                                }
+                            });
+                        }
+                        TransferMessage::FileResult { transfer_id, result } => {
+                            if outgoing.as_ref().is_some_and(|transfer| {
+                                transfer.file.transfer_id == transfer_id
+                            }) {
+                                let transfer = outgoing.take().expect("checked outgoing transfer");
+                                transfer.cancellation.store(true, Ordering::Release);
+                                let completed = result == TransferResult::Completed;
+                                let _ = signals.send(ControllerSignal::FileTransfer {
+                                    state: if completed { "completed" } else { "failed" },
+                                    direction: "upload",
+                                    name: transfer.file.name,
+                                    transferred: if completed { transfer.file.size } else { 0 },
+                                    total: transfer.file.size,
+                                    message: if completed {
+                                        "文件已保存到远端的“下载”文件夹。"
+                                    } else {
+                                        transfer_result_message(result)
+                                    }.to_owned(),
+                                });
+                                if !completed && !queued_files.is_empty() {
+                                    file_queue_paused = true;
+                                    publish_file_queue(
+                                        &signals,
+                                        &queued_files,
+                                        file_queue_paused,
+                                    );
+                                }
+                            }
+                        }
+                        TransferMessage::Cancel { transfer_id } => {
+                            if outgoing.as_ref().is_some_and(|transfer| {
+                                transfer.file.transfer_id == transfer_id
+                            }) {
+                                let transfer = outgoing.take().expect("checked outgoing transfer");
+                                transfer.cancellation.store(true, Ordering::Release);
+                                let _ = signals.send(ControllerSignal::FileTransfer {
+                                    state: "cancelled",
+                                    direction: "upload",
+                                    name: transfer.file.name,
+                                    transferred: 0,
+                                    total: transfer.file.size,
+                                    message: "远端已取消文件接收。".to_owned(),
+                                });
+                                if !queued_files.is_empty() {
+                                    file_queue_paused = true;
+                                    publish_file_queue(
+                                        &signals,
+                                        &queued_files,
+                                        file_queue_paused,
+                                    );
+                                }
+                            } else if incoming.as_ref().is_some_and(|transfer| {
+                                transfer.file.transfer_id() == transfer_id
+                            }) {
+                                let transfer = incoming.take().expect("checked incoming transfer");
+                                let _ = signals.send(ControllerSignal::FileTransfer {
+                                    state: "cancelled",
+                                    direction: "download",
+                                    name: transfer.name,
+                                    transferred: transfer.transferred,
+                                    total: transfer.size,
+                                    message: "远端已取消文件发送。".to_owned(),
+                                });
+                            }
+                        }
+                        TransferMessage::ClipboardSet { .. }
+                        | TransferMessage::ClipboardRequest { .. }
+                        | TransferMessage::FileSelectionRequest { .. }
+                        | TransferMessage::FileSelectionCancel { .. } => {}
+                    },
                     Ok(ControllerEvent::Closed { reason }) => {
                         break ConnectFailure::retryable(format!("transport closed: {reason}"));
                     }
                     Err(error) => break ConnectFailure::from_controller(error),
+                },
+                Some(failed) = pending_file_failures.recv() => {
+                    let matches = outgoing.as_ref().is_some_and(|transfer| {
+                        transfer.file.transfer_id == failed.transfer_id
+                    });
+                    if !matches {
+                        continue;
+                    }
+                    let transfer = outgoing.take().expect("checked outgoing transfer");
+                    transfer.cancellation.store(true, Ordering::Release);
+                    let _ = runtime.send_transfer(TransferMessage::Cancel {
+                        transfer_id: transfer.file.transfer_id,
+                    }).await;
+                    let _ = signals.send(ControllerSignal::FileTransfer {
+                        state: "failed",
+                        direction: "upload",
+                        name: transfer.file.name,
+                        transferred: 0,
+                        total: transfer.file.size,
+                        message: failed.message,
+                    });
+                    if !queued_files.is_empty() {
+                        file_queue_paused = true;
+                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                    }
                 }
             }
             if last_metrics.elapsed() >= Duration::from_secs(1) {
                 let metrics = runtime.metrics();
+                let received_packets = metrics
+                    .received_video_packets
+                    .saturating_sub(last_feedback_metrics.received_video_packets);
+                let dropped_packets = metrics
+                    .dropped_video_packets
+                    .saturating_sub(last_feedback_metrics.dropped_video_packets);
+                last_feedback_metrics = metrics;
+                if video_quality == VideoQualityPreference::Automatic
+                    && received_packets.saturating_add(dropped_packets) > 0
+                    && let Err(error) = runtime
+                        .report_video_network_feedback(
+                            u32::try_from(received_packets).unwrap_or(u32::MAX),
+                            u32::try_from(dropped_packets).unwrap_or(u32::MAX),
+                        )
+                        .await
+                {
+                    break ConnectFailure::from_controller(error);
+                }
                 let _ = signals.send(ControllerSignal::Metrics {
                     received_video_packets: metrics.received_video_packets,
                     dropped_video_packets: metrics.dropped_video_packets,
@@ -1103,6 +2112,40 @@ async fn run_controller(
                 last_metrics = Instant::now();
             }
         };
+        if let Some(transfer) = outgoing.take() {
+            transfer.cancellation.store(true, Ordering::Release);
+            let _ = signals.send(ControllerSignal::FileTransfer {
+                state: "failed",
+                direction: "upload",
+                name: transfer.file.name,
+                transferred: 0,
+                total: transfer.file.size,
+                message: "连接中断，文件传输未完成。".to_owned(),
+            });
+            if !queued_files.is_empty() {
+                file_queue_paused = true;
+                publish_file_queue(&signals, &queued_files, file_queue_paused);
+            }
+        }
+        if let Some(transfer) = incoming.take() {
+            let _ = signals.send(ControllerSignal::FileTransfer {
+                state: "failed",
+                direction: "download",
+                name: transfer.name,
+                transferred: transfer.transferred,
+                total: transfer.size,
+                message: "连接中断，文件接收未完成；临时文件已删除。".to_owned(),
+            });
+        } else if pending_remote_file_request.take().is_some() {
+            let _ = signals.send(ControllerSignal::FileTransfer {
+                state: "failed",
+                direction: "download",
+                name: "远端文件".to_owned(),
+                transferred: 0,
+                total: 0,
+                message: "连接中断，远端文件选择未完成。".to_owned(),
+            });
+        }
         if stable_since.is_some_and(|started| session_earned_fresh_retry_budget(started.elapsed()))
         {
             schedule.reset();
@@ -1123,6 +2166,139 @@ async fn run_controller(
         {
             return;
         }
+    }
+}
+
+enum FileReadEvent {
+    Chunk { offset: u64, bytes: Vec<u8> },
+    Complete([u8; 32]),
+    Failed,
+}
+
+async fn send_outgoing_file(
+    sender: ControllerTransferSender,
+    transfer_id: TransferId,
+    path: PathBuf,
+    name: String,
+    size: u64,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
+    signals: Channel<ControllerSignal>,
+) -> Result<(), String> {
+    let (events, mut receiver) = mpsc::channel(2);
+    let producer_cancellation = cancellation.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            let mut file = File::open(path).map_err(|_| ())?;
+            let mut hasher = Blake2s256::new();
+            let mut offset = 0_u64;
+            loop {
+                if producer_cancellation.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let mut bytes = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
+                let read = file.read(&mut bytes).map_err(|_| ())?;
+                if read == 0 {
+                    break;
+                }
+                bytes.truncate(read);
+                hasher.update(&bytes);
+                events
+                    .blocking_send(FileReadEvent::Chunk { offset, bytes })
+                    .map_err(|_| ())?;
+                offset = offset.checked_add(read as u64).ok_or(())?;
+            }
+            if offset != size {
+                return Err(());
+            }
+            let hash: [u8; 32] = hasher.finalize().into();
+            events
+                .blocking_send(FileReadEvent::Complete(hash))
+                .map_err(|_| ())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = events.blocking_send(FileReadEvent::Failed);
+        }
+    });
+
+    while let Some(event) = receiver.recv().await {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match event {
+            FileReadEvent::Chunk { offset, bytes } => {
+                let transferred = offset.saturating_add(bytes.len() as u64);
+                sender
+                    .send(TransferMessage::FileChunk {
+                        transfer_id,
+                        offset,
+                        bytes,
+                    })
+                    .await
+                    .map_err(|_| "发送文件时连接中断。".to_owned())?;
+                let _ = signals.send(ControllerSignal::FileTransfer {
+                    state: "sending",
+                    direction: "upload",
+                    name: name.clone(),
+                    transferred,
+                    total: size,
+                    message: format!("正在发送… {}%", transfer_percent(transferred, size)),
+                });
+            }
+            FileReadEvent::Complete(content_hash) => {
+                sender
+                    .send(TransferMessage::FileComplete {
+                        transfer_id,
+                        content_hash,
+                    })
+                    .await
+                    .map_err(|_| "发送完成确认时连接中断。".to_owned())?;
+                let _ = signals.send(ControllerSignal::FileTransfer {
+                    state: "verifying",
+                    direction: "upload",
+                    name,
+                    transferred: size,
+                    total: size,
+                    message: "发送完成，等待远端校验文件…".to_owned(),
+                });
+                return Ok(());
+            }
+            FileReadEvent::Failed => return Err("无法继续读取所选文件。".to_owned()),
+        }
+    }
+    Err("文件读取任务意外停止。".to_owned())
+}
+
+fn transfer_percent(transferred: u64, total: u64) -> u64 {
+    if total == 0 {
+        100
+    } else {
+        transferred
+            .saturating_mul(100)
+            .saturating_div(total)
+            .min(100)
+    }
+}
+
+fn transfer_result_message(result: TransferResult) -> &'static str {
+    match result {
+        TransferResult::Completed => "操作已完成。",
+        TransferResult::Rejected => "远端已拒绝此操作。",
+        TransferResult::Cancelled => "操作已取消。",
+        TransferResult::TooLarge => "内容超过 DeskLink 当前允许的大小。",
+        TransferResult::InvalidData => "内容校验失败，未保存文件。",
+        TransferResult::PermissionDenied => "Windows 拒绝访问剪贴板或下载文件夹。",
+        TransferResult::IoFailed => "读写内容失败，请检查 Windows 权限和磁盘空间。",
+        TransferResult::Unsupported => "远端暂不支持此操作。",
+        TransferResult::Busy => "另一项文件传输正在进行，请稍后重试。",
+    }
+}
+
+fn prepare_file_error_message(result: TransferResult) -> &'static str {
+    match result {
+        TransferResult::TooLarge => "单个文件不能超过 256 MB。",
+        TransferResult::InvalidData => "请选择文件名有效的普通文件，而不是文件夹。",
+        _ => "无法读取所选文件，请检查文件权限后重试。",
     }
 }
 
@@ -1590,45 +2766,56 @@ fn parse_input(input: ControllerInput) -> Result<InputEvent, String> {
             if !modifiers.is_valid() {
                 return Err("键盘修饰键状态无效。".to_owned());
             }
+            let code = match input.key.as_deref() {
+                Some("character") => {
+                    let value = input
+                        .character
+                        .as_deref()
+                        .and_then(|value| {
+                            let mut chars = value.chars();
+                            let character = chars.next()?;
+                            chars.next().is_none().then_some(character)
+                        })
+                        .ok_or_else(|| "键盘字符无效。".to_owned())?;
+                    KeyCode::Character(value)
+                }
+                Some("enter") => KeyCode::Enter,
+                Some("escape") => KeyCode::Escape,
+                Some("backspace") => KeyCode::Backspace,
+                Some("tab") => KeyCode::Tab,
+                Some("arrowUp") => KeyCode::ArrowUp,
+                Some("arrowDown") => KeyCode::ArrowDown,
+                Some("arrowLeft") => KeyCode::ArrowLeft,
+                Some("arrowRight") => KeyCode::ArrowRight,
+                Some("delete") => KeyCode::Delete,
+                Some("insert") => KeyCode::Insert,
+                Some("home") => KeyCode::Home,
+                Some("end") => KeyCode::End,
+                Some("pageUp") => KeyCode::PageUp,
+                Some("pageDown") => KeyCode::PageDown,
+                Some("capsLock") => KeyCode::CapsLock,
+                Some("control") => KeyCode::Control,
+                Some("alt") => KeyCode::Alt,
+                Some("shift") => KeyCode::Shift,
+                Some("meta") => KeyCode::Meta,
+                Some(value) if value.starts_with('f') => {
+                    let number = value[1..]
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|number| (1..=12).contains(number))
+                        .ok_or_else(|| "不支持此功能键。".to_owned())?;
+                    KeyCode::Function(number)
+                }
+                _ => return Err("不支持此键盘按键。".to_owned()),
+            };
+            if code
+                .modifier_mask()
+                .is_some_and(|own_modifier| modifiers.contains(own_modifier))
+            {
+                return Err("修饰键不能重复包含自身状态。".to_owned());
+            }
             Ok(InputEvent::Key {
-                code: match input.key.as_deref() {
-                    Some("character") => {
-                        let value = input
-                            .character
-                            .as_deref()
-                            .and_then(|value| {
-                                let mut chars = value.chars();
-                                let character = chars.next()?;
-                                chars.next().is_none().then_some(character)
-                            })
-                            .ok_or_else(|| "键盘字符无效。".to_owned())?;
-                        KeyCode::Character(value)
-                    }
-                    Some("enter") => KeyCode::Enter,
-                    Some("escape") => KeyCode::Escape,
-                    Some("backspace") => KeyCode::Backspace,
-                    Some("tab") => KeyCode::Tab,
-                    Some("arrowUp") => KeyCode::ArrowUp,
-                    Some("arrowDown") => KeyCode::ArrowDown,
-                    Some("arrowLeft") => KeyCode::ArrowLeft,
-                    Some("arrowRight") => KeyCode::ArrowRight,
-                    Some("delete") => KeyCode::Delete,
-                    Some("insert") => KeyCode::Insert,
-                    Some("home") => KeyCode::Home,
-                    Some("end") => KeyCode::End,
-                    Some("pageUp") => KeyCode::PageUp,
-                    Some("pageDown") => KeyCode::PageDown,
-                    Some("capsLock") => KeyCode::CapsLock,
-                    Some(value) if value.starts_with('f') => {
-                        let number = value[1..]
-                            .parse::<u8>()
-                            .ok()
-                            .filter(|number| (1..=12).contains(number))
-                            .ok_or_else(|| "不支持此功能键。".to_owned())?;
-                        KeyCode::Function(number)
-                    }
-                    _ => return Err("不支持此键盘按键。".to_owned()),
-                },
+                code,
                 pressed: input
                     .pressed
                     .ok_or_else(|| "缺少键盘按键状态。".to_owned())?,
@@ -1646,6 +2833,39 @@ fn required_point(x: Option<i32>, y: Option<i32>) -> Result<(i32, i32), String> 
         return Err("指针位置超出远程桌面范围。".to_owned());
     }
     Ok((x, y))
+}
+
+fn publish_file_queue(
+    signals: &Channel<ControllerSignal>,
+    queued_files: &VecDeque<OutgoingFile>,
+    paused: bool,
+) {
+    let _ = signals.send(ControllerSignal::FileQueue {
+        queued: queued_files
+            .iter()
+            .map(|file| QueuedFileSummary {
+                id: hex(&file.transfer_id),
+                name: file.name.clone(),
+                size: file.size,
+            })
+            .collect(),
+        paused,
+    });
+}
+
+fn parse_transfer_id(value: &str) -> Result<TransferId, String> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("文件队列项目无效，请刷新传输面板。".to_owned());
+    }
+    let mut transfer_id = [0_u8; 16];
+    for (index, byte) in transfer_id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "文件队列项目无效，请刷新传输面板。".to_owned())?;
+    }
+    if transfer_id.iter().all(|byte| *byte == 0) {
+        return Err("文件队列项目无效，请刷新传输面板。".to_owned());
+    }
+    Ok(transfer_id)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1668,18 +2888,36 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectFailure, ControllerCommand, ControllerInput, ControllerManager,
-        ControllerRuntimeSummary, RetryWaitOutcome, directory_transport_error_is_retryable,
-        directory_transport_error_message, parse_input, session_earned_fresh_retry_budget,
-        validate_text_input, wait_for_retry_deadline,
+        COMMAND_CAPACITY, ConnectFailure, ControllerAudioDecoder, ControllerCommand,
+        ControllerInput, ControllerManager, ControllerRuntimeSummary, MAX_BUFFERED_POINTER_MOVES,
+        RetryWaitOutcome, directory_transport_error_is_retryable,
+        directory_transport_error_message, parse_input, parse_transfer_id,
+        session_earned_fresh_retry_budget, should_drop_buffered_pointer_move, validate_text_input,
+        wait_for_retry_deadline,
     };
+    use apps_windows::audio::RemoteAudioEncoder;
     use desklink_ffi::ControllerError;
-    use desklink_protocol::{AccessDenialReason, InputEvent, KeyCode, Modifiers};
+    use desklink_protocol::{
+        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket, InputEvent,
+        KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton, PROTOCOL_VERSION,
+    };
     use desklink_transport::{JoinRejectCode, TransportError};
+
+    #[test]
+    fn queued_file_ids_require_exact_nonzero_hex() {
+        assert_eq!(
+            parse_transfer_id("0102030405060708090a0b0c0d0e0f10").unwrap(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert!(parse_transfer_id("00").is_err());
+        assert!(parse_transfer_id("00000000000000000000000000000000").is_err());
+        assert!(parse_transfer_id("zz02030405060708090a0b0c0d0e0f10").is_err());
+    }
     use tokio::sync::{mpsc, watch};
 
     fn empty_input(kind: &str) -> ControllerInput {
         ControllerInput {
+            stream_id: 1,
             kind: kind.to_owned(),
             x: None,
             y: None,
@@ -1691,6 +2929,49 @@ mod tests {
             pressed: None,
             modifiers: None,
         }
+    }
+
+    #[test]
+    fn pointer_backlog_is_bounded_without_dropping_discrete_input() {
+        let pointer = ControllerCommand::Input {
+            stream_id: 1,
+            event: InputEvent::MouseMove { x: 1, y: 1 },
+        };
+        let release = ControllerCommand::Input {
+            stream_id: 1,
+            event: InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+            },
+        };
+
+        assert!(!should_drop_buffered_pointer_move(
+            &pointer,
+            COMMAND_CAPACITY - MAX_BUFFERED_POINTER_MOVES + 1
+        ));
+        assert!(should_drop_buffered_pointer_move(
+            &pointer,
+            COMMAND_CAPACITY - MAX_BUFFERED_POINTER_MOVES
+        ));
+        assert!(!should_drop_buffered_pointer_move(&release, 0));
+    }
+
+    #[tokio::test]
+    async fn stale_or_missing_stream_ids_never_enter_the_active_command_queue() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+
+        let mut stale = empty_input("mouseMove");
+        stale.stream_id = 41;
+        stale.x = Some(1);
+        stale.y = Some(1);
+        assert!(manager.send_input(stale).await.is_ok());
+
+        let mut missing = empty_input("mouseMove");
+        missing.stream_id = 0;
+        missing.x = Some(1);
+        missing.y = Some(1);
+        assert!(manager.send_input(missing).await.is_err());
     }
 
     #[test]
@@ -1748,6 +3029,25 @@ mod tests {
                 modifiers: Modifiers::SHIFT,
             }
         );
+
+        let mut windows_key = empty_input("key");
+        windows_key.key = Some("meta".to_owned());
+        windows_key.pressed = Some(true);
+        windows_key.modifiers = Some(0);
+        assert_eq!(
+            parse_input(windows_key).unwrap(),
+            InputEvent::Key {
+                code: KeyCode::Meta,
+                pressed: true,
+                modifiers: Modifiers(0),
+            }
+        );
+
+        let mut duplicate_modifier = empty_input("key");
+        duplicate_modifier.key = Some("control".to_owned());
+        duplicate_modifier.pressed = Some(true);
+        duplicate_modifier.modifiers = Some(Modifiers::CONTROL.0);
+        assert!(parse_input(duplicate_modifier).is_err());
 
         let mut unsupported = empty_input("key");
         unsupported.key = Some("f13".to_owned());
@@ -1915,5 +3215,46 @@ mod tests {
         assert!(!session_earned_fresh_retry_budget(Duration::from_secs(1)));
         assert!(!session_earned_fresh_retry_budget(Duration::from_secs(29)));
         assert!(session_earned_fresh_retry_budget(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn controller_audio_recovers_one_gap_and_drops_duplicate_datagrams() {
+        let mut encoder = RemoteAudioEncoder::new().expect("create encoder");
+        let mut decoder = ControllerAudioDecoder::new();
+        let pcm = vec![0_u8; MAX_AUDIO_PAYLOAD_BYTES];
+        let packets = (1_u64..=3)
+            .map(|sequence| AudioPacket {
+                protocol_version: PROTOCOL_VERSION,
+                stream_id: 17,
+                sequence,
+                capture_timestamp_us: 1_000_000 + sequence * 10_000,
+                codec: AudioCodec::Opus,
+                sample_rate: AUDIO_SAMPLE_RATE,
+                channels: AUDIO_CHANNELS,
+                payload: encoder.encode_pcm_s16_le(&pcm).expect("encode frame"),
+            })
+            .collect::<Vec<_>>();
+
+        let first = decoder.decode(packets[0].clone());
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].sequence, 1);
+
+        // Packet 2 is intentionally dropped. Packet 3 carries enough Opus
+        // redundancy to reconstruct at most that one missing 10 ms frame.
+        let recovered = decoder.decode(packets[2].clone());
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|packet| packet.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(
+            recovered
+                .iter()
+                .all(|packet| packet.payload.len() == MAX_AUDIO_PAYLOAD_BYTES)
+        );
+
+        assert!(decoder.decode(packets[2].clone()).is_empty());
     }
 }

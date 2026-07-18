@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::Read,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -6,16 +8,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use blake2::{Blake2s256, Digest};
 use desklink_crypto::{
     CryptoError, DeviceIdentity, NoiseResponder, PeerIdentity, SecureLane, SecureRole,
     SecureSession,
 };
 use desklink_protocol::{
-    AccessDenialReason, Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole,
-    FrameFlags, InputEvent, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake,
-    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, VideoConfig,
-    decode_control, decode_noise_handshake, decode_session_input, encode_control,
-    encode_cursor_update, encode_noise_handshake, encode_video_config, encode_video_packet,
+    AccessDenialReason, AudioCodec, AudioPacket, Codec, ControlMessage, CursorUpdate,
+    DeviceCapabilities, DeviceRole, FrameFlags, InputEvent, MAX_INPUT_AGE_US,
+    MAX_INPUT_FUTURE_SKEW_US, MAX_TRANSFER_CHUNK_BYTES, NoiseHandshake, NoiseHandshakeStep,
+    PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId, TransferMessage,
+    TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset, decode_control,
+    decode_noise_handshake, decode_session_input, decode_transfer, encode_audio_packet,
+    encode_control, encode_cursor_update, encode_noise_handshake, encode_transfer,
+    encode_video_config, encode_video_packet,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -25,16 +31,24 @@ use desklink_transport::{
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, packetize_frame};
 use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
 use crate::{
+    audio::{
+        AUDIO_QUEUE_CAPACITY, AudioCaptureState, AudioFrameQueue, RemoteAudioEncoder,
+        run_loopback_capture,
+    },
     capture::{
         CaptureError, CapturedFrame, DesktopCapturer, DxgiDesktopCapturer, available_displays,
         display_topology,
     },
-    encoder::{EncodedFrame, EncoderError, H264Encoder, fit_h264_dimensions},
+    encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
+    transfer::{
+        IncomingFile, OutgoingFile, confirm_file_offer, notify_file_received, pick_outgoing_file,
+        prepare_outgoing_file, read_clipboard_text, write_clipboard_text,
+    },
     window::ApprovalState,
 };
 
@@ -46,6 +60,152 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const VIDEO_QUEUE_CAPACITY: usize = 2;
+const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
+const VIDEO_FEEDBACK_MIN_PACKETS: u32 = 40;
+const VIDEO_HEALTHY_LOSS_BASIS_POINTS: u64 = 50;
+const VIDEO_DEGRADED_LOSS_BASIS_POINTS: u64 = 500;
+const VIDEO_SEVERE_LOSS_BASIS_POINTS: u64 = 1_500;
+const VIDEO_DEGRADED_SAMPLES: u8 = 2;
+const VIDEO_HEALTHY_SAMPLES: u8 = 12;
+const VIDEO_SWITCH_COOLDOWN_SAMPLES: u8 = 8;
+
+fn video_quality_settings(preset: VideoQualityPreset) -> H264EncoderSettings {
+    match preset {
+        VideoQualityPreset::Smooth => H264EncoderSettings {
+            max_width: 1280,
+            max_height: 720,
+            fps: 15,
+            bitrate: 1_500_000,
+        },
+        VideoQualityPreset::Balanced => H264EncoderSettings {
+            max_width: 1920,
+            max_height: 1080,
+            fps: 20,
+            bitrate: 2_500_000,
+        },
+        VideoQualityPreset::Sharp => H264EncoderSettings::default(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdaptiveVideoQuality {
+    preference: VideoQualityPreference,
+    preset: VideoQualityPreset,
+    degraded_samples: u8,
+    healthy_samples: u8,
+    cooldown_samples: u8,
+}
+
+impl AdaptiveVideoQuality {
+    fn new() -> Self {
+        Self {
+            preference: VideoQualityPreference::Sharp,
+            preset: DEFAULT_VIDEO_QUALITY,
+            degraded_samples: 0,
+            healthy_samples: 0,
+            cooldown_samples: 0,
+        }
+    }
+
+    fn set_preference(&mut self, preference: VideoQualityPreference) -> Option<VideoQualityPreset> {
+        self.preference = preference;
+        self.reset_samples();
+        self.cooldown_samples = 0;
+        manual_video_quality(preference).filter(|preset| *preset != self.preset)
+    }
+
+    fn observe(
+        &mut self,
+        received_packets: u32,
+        dropped_packets: u32,
+    ) -> Option<VideoQualityPreset> {
+        if self.preference != VideoQualityPreference::Automatic {
+            return None;
+        }
+
+        let total_packets = received_packets.saturating_add(dropped_packets);
+        if total_packets < VIDEO_FEEDBACK_MIN_PACKETS {
+            return None;
+        }
+        if self.cooldown_samples > 0 {
+            self.cooldown_samples -= 1;
+            return None;
+        }
+
+        let loss_basis_points =
+            u64::from(dropped_packets).saturating_mul(10_000) / u64::from(total_packets);
+        if loss_basis_points >= VIDEO_SEVERE_LOSS_BASIS_POINTS {
+            return self.request_lower_preset();
+        }
+        if loss_basis_points >= VIDEO_DEGRADED_LOSS_BASIS_POINTS {
+            self.healthy_samples = 0;
+            self.degraded_samples = self.degraded_samples.saturating_add(1);
+            if self.degraded_samples >= VIDEO_DEGRADED_SAMPLES {
+                return self.request_lower_preset();
+            }
+            return None;
+        }
+        if loss_basis_points <= VIDEO_HEALTHY_LOSS_BASIS_POINTS {
+            self.degraded_samples = 0;
+            self.healthy_samples = self.healthy_samples.saturating_add(1);
+            if self.healthy_samples >= VIDEO_HEALTHY_SAMPLES {
+                return self.request_higher_preset();
+            }
+            return None;
+        }
+
+        self.reset_samples();
+        None
+    }
+
+    fn record_applied(&mut self, preset: VideoQualityPreset) {
+        self.preset = preset;
+        self.reset_samples();
+    }
+
+    fn request_lower_preset(&mut self) -> Option<VideoQualityPreset> {
+        let next = match self.preset {
+            VideoQualityPreset::Sharp => Some(VideoQualityPreset::Balanced),
+            VideoQualityPreset::Balanced => Some(VideoQualityPreset::Smooth),
+            VideoQualityPreset::Smooth => None,
+        };
+        self.finish_switch_decision(next)
+    }
+
+    fn request_higher_preset(&mut self) -> Option<VideoQualityPreset> {
+        let next = match self.preset {
+            VideoQualityPreset::Smooth => Some(VideoQualityPreset::Balanced),
+            VideoQualityPreset::Balanced => Some(VideoQualityPreset::Sharp),
+            VideoQualityPreset::Sharp => None,
+        };
+        self.finish_switch_decision(next)
+    }
+
+    fn finish_switch_decision(
+        &mut self,
+        next: Option<VideoQualityPreset>,
+    ) -> Option<VideoQualityPreset> {
+        self.reset_samples();
+        if next.is_some() {
+            self.cooldown_samples = VIDEO_SWITCH_COOLDOWN_SAMPLES;
+        }
+        next
+    }
+
+    fn reset_samples(&mut self) {
+        self.degraded_samples = 0;
+        self.healthy_samples = 0;
+    }
+}
+
+fn manual_video_quality(preference: VideoQualityPreference) -> Option<VideoQualityPreset> {
+    match preference {
+        VideoQualityPreference::Automatic => None,
+        VideoQualityPreference::Smooth => Some(VideoQualityPreset::Smooth),
+        VideoQualityPreference::Balanced => Some(VideoQualityPreset::Balanced),
+        VideoQualityPreference::Sharp => Some(VideoQualityPreset::Sharp),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedVideo {
@@ -843,6 +1003,41 @@ impl HostRuntime {
             return Err(error);
         }
         capture_worker.start()?;
+        let audio_queue = Arc::new(Mutex::new(AudioFrameQueue::new(AUDIO_QUEUE_CAPACITY)));
+        let audio_notify = Arc::new(Notify::new());
+        let audio_enabled = Arc::new(AtomicBool::new(true));
+        let (audio_state_sender, audio_state_receiver) =
+            watch::channel(AudioCaptureState::Starting);
+        let (audio_enabled_updates, audio_enabled_receiver) = watch::channel(true);
+        let audio_thread_state = audio_state_sender.clone();
+        let audio_thread = std::thread::Builder::new()
+            .name("desklink-audio".into())
+            .spawn({
+                let audio_queue = audio_queue.clone();
+                let audio_notify = audio_notify.clone();
+                let shutdown = shutdown.clone();
+                let audio_enabled = audio_enabled.clone();
+                move || {
+                    run_loopback_capture(
+                        audio_queue,
+                        audio_notify,
+                        shutdown,
+                        audio_enabled,
+                        audio_thread_state,
+                    );
+                }
+            });
+        let mut audio_worker = match audio_thread {
+            Ok(thread) => Some(AudioWorkerGuard::new(
+                thread,
+                shutdown.clone(),
+                audio_notify.clone(),
+            )),
+            Err(_) => {
+                audio_state_sender.send_replace(AudioCaptureState::Unavailable);
+                None
+            }
+        };
         let input = InputInjector::new(VirtualDesktop::new(ready.desktop, ready.coordinate_space));
         stable.store(true, Ordering::Release);
         on_connected(stream_id);
@@ -867,6 +1062,10 @@ impl HostRuntime {
                 capture_commands: capture_command_sender,
                 selected_desktop: selected_desktop.clone(),
                 displays: Arc::new(ready.displays),
+                audio_enabled: audio_enabled.clone(),
+                audio_enabled_updates,
+                audio_queue: audio_queue.clone(),
+                audio_notify: audio_notify.clone(),
             },
         ));
         let mut cursor = Box::pin(send_cursor_loop(
@@ -876,22 +1075,44 @@ impl HostRuntime {
             stream_id,
             selected_desktop,
         ));
+        let mut transfer = Box::pin(receive_transfer_loop(
+            client.clone(),
+            secure.clone(),
+            peer_generation,
+        ));
+        let mut audio = Box::pin(send_audio_loop(
+            client.clone(),
+            secure.clone(),
+            peer_generation,
+            stream_id,
+            audio_queue,
+            audio_notify,
+            audio_state_receiver,
+            audio_enabled_receiver,
+        ));
         let mut worker_receiver = Box::pin(worker_receiver);
 
         let outcome = tokio::select! {
             result = &mut video => result,
             result = &mut inbound => result,
             result = &mut cursor => result,
+            result = &mut transfer => result,
+            result = &mut audio => result,
             result = &mut worker_receiver => result.unwrap_or(Err(HostRuntimeError::CaptureWorkerStopped)),
         };
         drop(video);
         drop(inbound);
         drop(cursor);
+        drop(transfer);
+        drop(audio);
         drop(worker_receiver);
         let outcome = match capture_worker.shutdown_and_join() {
             Ok(()) => outcome,
             Err(error) => Err(error),
         };
+        if let Some(worker) = audio_worker.take() {
+            worker.shutdown_and_join();
+        }
         if let Err(error) = &outcome
             && let Some(reason) = host_runtime_denial_reason(error)
         {
@@ -962,6 +1183,47 @@ impl Drop for CaptureWorkerGuard {
     }
 }
 
+struct AudioWorkerGuard {
+    thread: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl AudioWorkerGuard {
+    fn new(
+        thread: std::thread::JoinHandle<()>,
+        shutdown: Arc<AtomicBool>,
+        notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            thread: Some(thread),
+            shutdown,
+            notify,
+        }
+    }
+
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn shutdown_and_join(mut self) {
+        self.signal_shutdown();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for AudioWorkerGuard {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CaptureWorkerReady {
     desktop: DesktopRect,
@@ -983,6 +1245,10 @@ enum CaptureWorkerCommand {
         display_id: u32,
         reply: oneshot::Sender<bool>,
     },
+    SetVideoQuality {
+        preset: VideoQualityPreset,
+        reply: oneshot::Sender<VideoQualityPreset>,
+    },
 }
 
 struct CaptureWorkerContext {
@@ -998,6 +1264,10 @@ struct HostInboundContext {
     capture_commands: std::sync::mpsc::Sender<CaptureWorkerCommand>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
     displays: Arc<Vec<RemoteDisplay>>,
+    audio_enabled: Arc<AtomicBool>,
+    audio_enabled_updates: watch::Sender<bool>,
+    audio_queue: Arc<Mutex<AudioFrameQueue>>,
+    audio_notify: Arc<Notify>,
 }
 
 type SharedSecureSession = Arc<AsyncMutex<SecureSession>>;
@@ -1205,20 +1475,18 @@ fn capture_worker_entry(
         }
     };
     let (source_width, source_height) = capture.dimensions();
-    let (width, height) = match fit_h264_dimensions(source_width, source_height) {
-        Ok(dimensions) => dimensions,
-        Err(error) => {
-            let _ = ready.send(Err(HostRuntimeError::Encoder(error)));
-            return Ok(());
-        }
-    };
-    let encoder = match H264Encoder::new(width, height, 30) {
+    let encoder = match H264Encoder::new_with_settings(
+        source_width,
+        source_height,
+        video_quality_settings(DEFAULT_VIDEO_QUALITY),
+    ) {
         Ok(encoder) => encoder,
         Err(error) => {
             let _ = ready.send(Err(HostRuntimeError::Encoder(error)));
             return Ok(());
         }
     };
+    let (width, height) = encoder.dimensions();
     let coordinate_space = match display_topology() {
         Ok(topology) => topology.virtual_desktop,
         Err(error) => {
@@ -1283,7 +1551,12 @@ async fn receive_controller_capabilities(
                 ControlMessage::Hello { .. }
                 | ControlMessage::RequestKeyframe { .. }
                 | ControlMessage::DisplayList { .. }
-                | ControlMessage::SelectDisplay { .. } => {}
+                | ControlMessage::SelectDisplay { .. }
+                | ControlMessage::SetAudioEnabled { .. }
+                | ControlMessage::AudioState { .. }
+                | ControlMessage::SetVideoQuality { .. }
+                | ControlMessage::VideoQualityState { .. }
+                | ControlMessage::VideoNetworkFeedback { .. } => {}
             }
         }
     };
@@ -1327,6 +1600,14 @@ async fn send_host_capabilities(
         )
         .await?;
     send_display_list(client, secure, peer_generation, displays, active_display_id).await?;
+    send_video_quality_state(
+        client,
+        secure,
+        peer_generation,
+        VideoQualityPreference::Sharp,
+        DEFAULT_VIDEO_QUALITY,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1405,7 +1686,7 @@ fn capture_encode_loop(
     mut capture: DxgiDesktopCapturer,
     mut encoder: H264Encoder,
     context: CaptureWorkerContext,
-    coordinate_space: DesktopRect,
+    mut coordinate_space: DesktopRect,
 ) -> Result<(), HostRuntimeError> {
     let CaptureWorkerContext {
         commands,
@@ -1416,6 +1697,8 @@ fn capture_encode_loop(
         selected_desktop,
     } = context;
     let mut encoder_recovery_attempts = 0_u8;
+    let mut video_quality = DEFAULT_VIDEO_QUALITY;
+    let mut last_encoded_timestamp_us = None;
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -1428,13 +1711,20 @@ fn capture_encode_loop(
                     let switched = (|| {
                         let next_capture = DxgiDesktopCapturer::new_display(display_id)
                             .map_err(HostRuntimeError::Capture)?;
+                        let next_coordinate_space = display_topology()
+                            .map(|topology| topology.virtual_desktop)
+                            .unwrap_or(coordinate_space);
                         let (source_width, source_height) = next_capture.dimensions();
-                        let (width, height) = fit_h264_dimensions(source_width, source_height)
-                            .map_err(HostRuntimeError::Encoder)?;
                         encoder
-                            .rebuild(width, height)
+                            .reconfigure_for_source(
+                                source_width,
+                                source_height,
+                                video_quality_settings(video_quality),
+                            )
                             .map_err(HostRuntimeError::Encoder)?;
                         capture = next_capture;
+                        coordinate_space = next_coordinate_space;
+                        last_encoded_timestamp_us = None;
                         lock_queue(&queue).drain_newest_first();
                         *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                             display_id,
@@ -1447,6 +1737,26 @@ fn capture_encode_loop(
                     .is_ok();
                     let _ = reply.send(switched);
                 }
+                CaptureWorkerCommand::SetVideoQuality { preset, reply } => {
+                    if preset != video_quality {
+                        let (source_width, source_height) = capture.dimensions();
+                        if encoder
+                            .reconfigure_for_source(
+                                source_width,
+                                source_height,
+                                video_quality_settings(preset),
+                            )
+                            .is_ok()
+                        {
+                            video_quality = preset;
+                            last_encoded_timestamp_us = None;
+                            lock_queue(&queue).drain_newest_first();
+                            force_keyframe.store(true, Ordering::Release);
+                            notify.notify_one();
+                        }
+                    }
+                    let _ = reply.send(video_quality);
+                }
             }
         }
         let frame = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT)
@@ -1455,17 +1765,49 @@ fn capture_encode_loop(
             CaptureOutcome::Frame(frame) => frame,
             CaptureOutcome::Idle => continue,
             CaptureOutcome::Recovered => {
+                coordinate_space = display_topology()
+                    .map(|topology| topology.virtual_desktop)
+                    .unwrap_or(coordinate_space);
+                let (source_width, source_height) = capture.dimensions();
+                encoder
+                    .reconfigure_for_source(
+                        source_width,
+                        source_height,
+                        video_quality_settings(video_quality),
+                    )
+                    .map_err(HostRuntimeError::Encoder)?;
+                last_encoded_timestamp_us = None;
+                lock_queue(&queue).drain_newest_first();
+                *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
+                    display_id: capture.display_id(),
+                    desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
+                };
                 force_keyframe.store(true, Ordering::Release);
+                notify.notify_one();
                 continue;
             }
         };
         let request_keyframe = force_keyframe.swap(false, Ordering::AcqRel);
+        if !request_keyframe
+            && !video_frame_is_due(
+                last_encoded_timestamp_us,
+                frame.timestamp_us,
+                video_quality_settings(video_quality).fps,
+            )
+        {
+            continue;
+        }
+        let frame_timestamp_us = frame.timestamp_us;
         let encoded = match encoder.encode(frame, request_keyframe) {
             Ok(encoded) => {
                 encoder_recovery_attempts = 0;
+                last_encoded_timestamp_us = Some(frame_timestamp_us);
                 encoded
             }
-            Err(EncoderError::NeedMoreInput) => continue,
+            Err(EncoderError::NeedMoreInput) => {
+                last_encoded_timestamp_us = Some(frame_timestamp_us);
+                continue;
+            }
             Err(error)
                 if encoder_error_is_recoverable(&error)
                     && encoder_recovery_attempts < MAX_ENCODER_RECOVERY_ATTEMPTS =>
@@ -1489,6 +1831,16 @@ fn capture_encode_loop(
         notify.notify_one();
     }
     Ok(())
+}
+
+fn video_frame_is_due(last_timestamp_us: Option<u64>, timestamp_us: u64, fps: u32) -> bool {
+    let Some(last_timestamp_us) = last_timestamp_us else {
+        return true;
+    };
+    if timestamp_us < last_timestamp_us {
+        return true;
+    }
+    timestamp_us.saturating_sub(last_timestamp_us) >= 1_000_000_u64 / u64::from(fps.max(1))
 }
 
 async fn send_video_loop(
@@ -1536,6 +1888,161 @@ async fn send_video_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn send_audio_loop(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+    stream_id: u64,
+    queue: Arc<Mutex<AudioFrameQueue>>,
+    notify: Arc<Notify>,
+    mut capture_state: watch::Receiver<AudioCaptureState>,
+    mut enabled: watch::Receiver<bool>,
+) -> Result<(), HostRuntimeError> {
+    let mut encoder = match RemoteAudioEncoder::new() {
+        Ok(encoder) => encoder,
+        Err(_) => {
+            // Audio is optional. A codec initialization failure must not tear
+            // down the video, input, clipboard, or file-transfer session.
+            let audio_enabled = *enabled.borrow();
+            let _ = send_audio_state(&client, &secure, peer_generation, false, audio_enabled).await;
+            std::future::pending::<()>().await;
+            unreachable!("pending audio codec fallback returned")
+        }
+    };
+    let mut sequence = 0_u64;
+    let mut announced = None;
+    loop {
+        let available = *capture_state.borrow() == AudioCaptureState::Available;
+        let is_enabled = *enabled.borrow();
+        let current = (available, is_enabled);
+        if announced != Some(current) {
+            send_audio_state(&client, &secure, peer_generation, available, is_enabled).await?;
+            announced = Some(current);
+        }
+
+        if !available || !is_enabled {
+            tokio::select! {
+                changed = capture_state.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                changed = enabled.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            _ = notify.notified() => {}
+            changed = capture_state.changed() => {
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                continue;
+            }
+            changed = enabled.changed() => {
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                continue;
+            }
+        }
+        if *capture_state.borrow() != AudioCaptureState::Available || !*enabled.borrow() {
+            lock_unpoisoned(&queue).clear();
+            continue;
+        }
+
+        let frames = { lock_unpoisoned(&queue).drain() };
+        for frame in frames {
+            let payload = match encoder.encode_pcm_s16_le(&frame.payload) {
+                Ok(payload) => payload,
+                // Malformed capture frames or a transient codec failure are
+                // isolated to this lossy lane. The next 10 ms frame retries.
+                Err(_) => continue,
+            };
+            sequence = sequence.wrapping_add(1).max(1);
+            let packet = AudioPacket {
+                protocol_version: PROTOCOL_VERSION,
+                stream_id,
+                sequence,
+                capture_timestamp_us: frame.capture_timestamp_us,
+                codec: AudioCodec::Opus,
+                sample_rate: desklink_protocol::AUDIO_SAMPLE_RATE,
+                channels: desklink_protocol::AUDIO_CHANNELS,
+                payload,
+            };
+            let plaintext = encode_audio_packet(&packet)?;
+            let send = client
+                .send_audio_datagram_for_generation(
+                    peer_generation,
+                    seal(&secure, SecureLane::AudioDatagram, &plaintext).await?,
+                )
+                .await;
+            match send {
+                Ok(()) => {}
+                // QUIC datagram congestion is an expected lossy boundary. Drop
+                // this sound packet instead of turning optional audio pressure
+                // into a remote-control reconnect.
+                Err(TransportError::Datagram(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+async fn send_audio_state(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    available: bool,
+    enabled: bool,
+) -> Result<(), HostRuntimeError> {
+    let plaintext = encode_control(&ControlMessage::AudioState { available, enabled })?;
+    client
+        .send_control_for_generation(
+            peer_generation,
+            seal(secure, SecureLane::Control, &plaintext).await?,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn send_video_quality_state(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    preference: VideoQualityPreference,
+    preset: VideoQualityPreset,
+) -> Result<(), HostRuntimeError> {
+    let plaintext = encode_control(&ControlMessage::VideoQualityState { preference, preset })?;
+    client
+        .send_control_for_generation(
+            peer_generation,
+            seal(secure, SecureLane::Control, &plaintext).await?,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn apply_video_quality(
+    capture_commands: &std::sync::mpsc::Sender<CaptureWorkerCommand>,
+    preset: VideoQualityPreset,
+) -> Result<Option<VideoQualityPreset>, HostRuntimeError> {
+    let (reply, applied) = oneshot::channel();
+    capture_commands
+        .send(CaptureWorkerCommand::SetVideoQuality { preset, reply })
+        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+    Ok(tokio::time::timeout(Duration::from_secs(5), applied)
+        .await
+        .ok()
+        .and_then(Result::ok))
+}
+
 async fn receive_input_and_control(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
@@ -1549,8 +2056,13 @@ async fn receive_input_and_control(
         capture_commands,
         selected_desktop,
         displays,
+        audio_enabled,
+        audio_enabled_updates,
+        audio_queue,
+        audio_notify,
     } = context;
     let mut policy = HostInboundPolicy::new(stream_id);
+    let mut video_quality = AdaptiveVideoQuality::new();
     loop {
         tokio::select! {
             result = client.next_control_for_generation(peer_generation) => {
@@ -1559,42 +2071,92 @@ async fn receive_input_and_control(
                 if policy.handle_control(&plaintext)? {
                     force_keyframe.store(true, Ordering::Release);
                 }
-                if let ControlMessage::SelectDisplay { display_id } = decode_control(&plaintext)? {
-                    let known_display = displays.iter().any(|display| display.id == display_id);
-                    if known_display {
-                        // A transient Windows input rejection while switching
-                        // monitors must not close the video and control lanes.
-                        // Retained pressed-state entries are retried by later
-                        // release events and once more when the injector drops.
-                        let _ = input.release_all();
-                        let (reply, switched) = oneshot::channel();
-                        capture_commands
-                            .send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
-                            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-                        if tokio::time::timeout(Duration::from_secs(5), switched)
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or(false)
-                        {
-                            input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
+                match decode_control(&plaintext)? {
+                    ControlMessage::SelectDisplay { display_id } => {
+                        let known_display = displays.iter().any(|display| display.id == display_id);
+                        if known_display {
+                            // A transient Windows input rejection while switching
+                            // monitors must not close the video and control lanes.
+                            // Retained pressed-state entries are retried by later
+                            // release events and once more when the injector drops.
+                            let _ = input.release_all();
+                            let (reply, switched) = oneshot::channel();
+                            capture_commands
+                                .send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
+                                .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                            if tokio::time::timeout(Duration::from_secs(5), switched)
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .unwrap_or(false)
+                            {
+                                input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
+                            }
+                        }
+                        let active_display_id = lock_unpoisoned(&selected_desktop).display_id;
+                        send_display_list(
+                            &client,
+                            &secure,
+                            peer_generation,
+                            &displays,
+                            active_display_id,
+                        )
+                        .await?;
+                    }
+                    ControlMessage::SetAudioEnabled { enabled } => {
+                        audio_enabled.store(enabled, Ordering::Release);
+                        audio_enabled_updates.send_replace(enabled);
+                        if !enabled {
+                            lock_unpoisoned(&audio_queue).clear();
+                        }
+                        audio_notify.notify_waiters();
+                    }
+                    ControlMessage::SetVideoQuality { preference } => {
+                        let requested = video_quality.set_preference(preference);
+                        let actual = match requested {
+                            Some(preset) => apply_video_quality(&capture_commands, preset).await?,
+                            None => Some(video_quality.preset),
+                        };
+                        if let Some(actual) = actual {
+                            video_quality.record_applied(actual);
+                            send_video_quality_state(
+                                &client,
+                                &secure,
+                                peer_generation,
+                                video_quality.preference,
+                                actual,
+                            )
+                            .await?;
                         }
                     }
-                    let active_display_id = lock_unpoisoned(&selected_desktop).display_id;
-                    send_display_list(
-                        &client,
-                        &secure,
-                        peer_generation,
-                        &displays,
-                        active_display_id,
-                    )
-                    .await?;
+                    ControlMessage::VideoNetworkFeedback {
+                        received_packets,
+                        dropped_packets,
+                    } => {
+                        if let Some(preset) =
+                            video_quality.observe(received_packets, dropped_packets)
+                            && let Some(actual) =
+                                apply_video_quality(&capture_commands, preset).await?
+                        {
+                            video_quality.record_applied(actual);
+                            send_video_quality_state(
+                                &client,
+                                &secure,
+                                peer_generation,
+                                video_quality.preference,
+                                actual,
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {}
                 }
             }
             result = client.next_input_for_generation(peer_generation) => {
                 let bytes = result?;
                 let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
                 if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
+                    input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
                     match input.apply(event) {
                         Ok(()) => {}
                         // An individual Windows input injection can be rejected
@@ -1613,6 +2175,436 @@ async fn receive_input_and_control(
             }
         }
     }
+}
+
+async fn receive_transfer_loop(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+) -> Result<(), HostRuntimeError> {
+    let mut incoming: Option<IncomingFile> = None;
+    let mut outgoing: Option<HostOutgoingTransfer> = None;
+    let (outgoing_events, mut pending_outgoing_events) =
+        mpsc::unbounded_channel::<HostOutgoingEvent>();
+    loop {
+        let encrypted = tokio::select! {
+            event = pending_outgoing_events.recv() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                if outgoing.as_ref().is_some_and(|transfer| {
+                    transfer.file.transfer_id == event.transfer_id
+                }) {
+                    let transfer = outgoing.take().expect("checked outgoing transfer");
+                    if let Err(result) = event.result
+                        && result != TransferResult::Cancelled
+                    {
+                        let _ = send_transfer_response(
+                            &client,
+                            &secure,
+                            peer_generation,
+                            TransferMessage::FileResult {
+                                transfer_id: transfer.file.transfer_id,
+                                result,
+                            },
+                        ).await;
+                    }
+                }
+                continue;
+            }
+            encrypted = client.next_transfer_for_generation(peer_generation) => encrypted?,
+        };
+        let plaintext = open(&secure, SecureLane::Transfer, &encrypted).await?;
+        match decode_transfer(&plaintext)? {
+            TransferMessage::ClipboardSet { request_id, text } => {
+                let result = tokio::task::spawn_blocking(move || write_clipboard_text(&text))
+                    .await
+                    .unwrap_or(Err(TransferResult::IoFailed))
+                    .map(|_| TransferResult::Completed)
+                    .unwrap_or_else(|error| error);
+                send_transfer_response(
+                    &client,
+                    &secure,
+                    peer_generation,
+                    TransferMessage::ClipboardResult { request_id, result },
+                )
+                .await?;
+            }
+            TransferMessage::ClipboardRequest { request_id } => {
+                let result = tokio::task::spawn_blocking(read_clipboard_text)
+                    .await
+                    .unwrap_or(Err(TransferResult::IoFailed));
+                let response = match result {
+                    Ok(text) => TransferMessage::ClipboardData { request_id, text },
+                    Err(result) => TransferMessage::ClipboardResult { request_id, result },
+                };
+                send_transfer_response(&client, &secure, peer_generation, response).await?;
+            }
+            TransferMessage::FileSelectionRequest { request_id } => {
+                if incoming.is_some() || outgoing.is_some() {
+                    send_transfer_response(
+                        &client,
+                        &secure,
+                        peer_generation,
+                        TransferMessage::FileSelectionResult {
+                            request_id,
+                            result: TransferResult::Busy,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                let selected = tokio::task::spawn_blocking(|| {
+                    match pick_outgoing_file("选择要发送给控制端的文件") {
+                        Ok(Some(path)) => prepare_outgoing_file(path).map(Some),
+                        Ok(None) => Ok(None),
+                        Err(result) => Err(result),
+                    }
+                })
+                .await
+                .unwrap_or(Err(TransferResult::IoFailed));
+                let file = match selected {
+                    Ok(Some(file)) => file,
+                    Ok(None) => {
+                        send_transfer_response(
+                            &client,
+                            &secure,
+                            peer_generation,
+                            TransferMessage::FileSelectionResult {
+                                request_id,
+                                result: TransferResult::Cancelled,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(result) => {
+                        send_transfer_response(
+                            &client,
+                            &secure,
+                            peer_generation,
+                            TransferMessage::FileSelectionResult { request_id, result },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                send_transfer_response(
+                    &client,
+                    &secure,
+                    peer_generation,
+                    TransferMessage::FileOffer {
+                        transfer_id: file.transfer_id,
+                        name: file.name.clone(),
+                        size: file.size,
+                    },
+                )
+                .await?;
+                outgoing = Some(HostOutgoingTransfer {
+                    request_id,
+                    file,
+                    cancellation: Arc::new(AtomicBool::new(false)),
+                    phase: HostOutgoingPhase::AwaitingDecision,
+                });
+            }
+            TransferMessage::FileSelectionCancel { request_id } => {
+                if outgoing
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.request_id == request_id)
+                {
+                    let transfer = outgoing.take().expect("checked outgoing transfer");
+                    transfer.cancellation.store(true, Ordering::Release);
+                }
+                let _ = send_transfer_response(
+                    &client,
+                    &secure,
+                    peer_generation,
+                    TransferMessage::FileSelectionResult {
+                        request_id,
+                        result: TransferResult::Cancelled,
+                    },
+                )
+                .await;
+            }
+            TransferMessage::FileOffer {
+                transfer_id,
+                name,
+                size,
+            } => {
+                let accepted = if incoming.is_some() || outgoing.is_some() {
+                    false
+                } else {
+                    let prompt_name = name.clone();
+                    tokio::task::spawn_blocking(move || confirm_file_offer(&prompt_name, size))
+                        .await
+                        .unwrap_or(false)
+                };
+                if accepted {
+                    incoming = tokio::task::spawn_blocking(move || {
+                        IncomingFile::create(transfer_id, name, size)
+                    })
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                }
+                let accepted = accepted && incoming.is_some();
+                send_transfer_response(
+                    &client,
+                    &secure,
+                    peer_generation,
+                    TransferMessage::FileDecision {
+                        transfer_id,
+                        accepted,
+                    },
+                )
+                .await?;
+            }
+            TransferMessage::FileDecision {
+                transfer_id,
+                accepted,
+            } => {
+                let matches = outgoing.as_ref().is_some_and(|transfer| {
+                    transfer.file.transfer_id == transfer_id
+                        && transfer.phase == HostOutgoingPhase::AwaitingDecision
+                });
+                if !matches {
+                    continue;
+                }
+                if !accepted {
+                    outgoing.take();
+                    continue;
+                }
+                let transfer = outgoing.as_mut().expect("checked outgoing transfer");
+                transfer.phase = HostOutgoingPhase::Sending;
+                let file = transfer.file.clone();
+                let cancellation = transfer.cancellation.clone();
+                let client = client.clone();
+                let secure = secure.clone();
+                let outgoing_events = outgoing_events.clone();
+                tokio::spawn(async move {
+                    let result = stream_host_outgoing_file(
+                        client,
+                        secure,
+                        peer_generation,
+                        file,
+                        cancellation,
+                    )
+                    .await;
+                    let _ = outgoing_events.send(HostOutgoingEvent {
+                        transfer_id,
+                        result,
+                    });
+                });
+            }
+            TransferMessage::FileChunk {
+                transfer_id,
+                offset,
+                bytes,
+            } => {
+                let result = incoming
+                    .as_mut()
+                    .filter(|file| file.transfer_id() == transfer_id)
+                    .ok_or(TransferResult::InvalidData)
+                    .and_then(|file| file.write_chunk(offset, &bytes));
+                if let Err(result) = result {
+                    incoming.take();
+                    send_transfer_response(
+                        &client,
+                        &secure,
+                        peer_generation,
+                        TransferMessage::FileResult {
+                            transfer_id,
+                            result,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            TransferMessage::FileComplete {
+                transfer_id,
+                content_hash,
+            } => {
+                let result = match incoming.take() {
+                    Some(file) if file.transfer_id() == transfer_id => {
+                        tokio::task::spawn_blocking(move || file.finish(content_hash))
+                            .await
+                            .unwrap_or(Err(TransferResult::IoFailed))
+                    }
+                    _ => Err(TransferResult::InvalidData),
+                };
+                let transfer_result = match result {
+                    Ok(path) => {
+                        tokio::task::spawn_blocking(move || notify_file_received(&path));
+                        TransferResult::Completed
+                    }
+                    Err(error) => error,
+                };
+                send_transfer_response(
+                    &client,
+                    &secure,
+                    peer_generation,
+                    TransferMessage::FileResult {
+                        transfer_id,
+                        result: transfer_result,
+                    },
+                )
+                .await?;
+            }
+            TransferMessage::Cancel { transfer_id } => {
+                if incoming
+                    .as_ref()
+                    .is_some_and(|file| file.transfer_id() == transfer_id)
+                {
+                    incoming.take();
+                }
+                if outgoing
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.file.transfer_id == transfer_id)
+                {
+                    let transfer = outgoing.take().expect("checked outgoing transfer");
+                    transfer.cancellation.store(true, Ordering::Release);
+                }
+                send_transfer_response(
+                    &client,
+                    &secure,
+                    peer_generation,
+                    TransferMessage::FileResult {
+                        transfer_id,
+                        result: TransferResult::Cancelled,
+                    },
+                )
+                .await?;
+            }
+            TransferMessage::FileResult {
+                transfer_id,
+                result: _,
+            } => {
+                if outgoing
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.file.transfer_id == transfer_id)
+                {
+                    let transfer = outgoing.take().expect("checked outgoing transfer");
+                    transfer.cancellation.store(true, Ordering::Release);
+                }
+            }
+            TransferMessage::ClipboardData { .. }
+            | TransferMessage::ClipboardResult { .. }
+            | TransferMessage::FileSelectionResult { .. } => {
+                // These are host-to-controller responses. Ignore an unexpected
+                // response without taking down input or video.
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostOutgoingPhase {
+    AwaitingDecision,
+    Sending,
+}
+
+struct HostOutgoingTransfer {
+    request_id: u64,
+    file: OutgoingFile,
+    cancellation: Arc<AtomicBool>,
+    phase: HostOutgoingPhase,
+}
+
+struct HostOutgoingEvent {
+    transfer_id: TransferId,
+    result: Result<(), TransferResult>,
+}
+
+enum HostFileReadEvent {
+    Chunk { offset: u64, bytes: Vec<u8> },
+    Complete([u8; 32]),
+    Failed,
+}
+
+async fn stream_host_outgoing_file(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+    file: OutgoingFile,
+    cancellation: Arc<AtomicBool>,
+) -> Result<(), TransferResult> {
+    let (events, mut receiver) = mpsc::channel(2);
+    let producer_cancellation = cancellation.clone();
+    let path = file.path.clone();
+    let size = file.size;
+    tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let mut file = File::open(path).map_err(|_| ())?;
+            let mut hasher = Blake2s256::new();
+            let mut offset = 0_u64;
+            loop {
+                if producer_cancellation.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let mut bytes = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
+                let read = file.read(&mut bytes).map_err(|_| ())?;
+                if read == 0 {
+                    break;
+                }
+                bytes.truncate(read);
+                hasher.update(&bytes);
+                events
+                    .blocking_send(HostFileReadEvent::Chunk { offset, bytes })
+                    .map_err(|_| ())?;
+                offset = offset.checked_add(read as u64).ok_or(())?;
+            }
+            if offset != size {
+                return Err(());
+            }
+            events
+                .blocking_send(HostFileReadEvent::Complete(hasher.finalize().into()))
+                .map_err(|_| ())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = events.blocking_send(HostFileReadEvent::Failed);
+        }
+    });
+
+    while let Some(event) = receiver.recv().await {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(TransferResult::Cancelled);
+        }
+        let message = match event {
+            HostFileReadEvent::Chunk { offset, bytes } => TransferMessage::FileChunk {
+                transfer_id: file.transfer_id,
+                offset,
+                bytes,
+            },
+            HostFileReadEvent::Complete(content_hash) => TransferMessage::FileComplete {
+                transfer_id: file.transfer_id,
+                content_hash,
+            },
+            HostFileReadEvent::Failed => return Err(TransferResult::IoFailed),
+        };
+        let complete = matches!(message, TransferMessage::FileComplete { .. });
+        send_transfer_response(&client, &secure, peer_generation, message)
+            .await
+            .map_err(|_| TransferResult::IoFailed)?;
+        if complete {
+            return Ok(());
+        }
+    }
+    Err(TransferResult::IoFailed)
+}
+
+async fn send_transfer_response(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    message: TransferMessage,
+) -> Result<(), HostRuntimeError> {
+    let plaintext = encode_transfer(&message)?;
+    let ciphertext = seal(secure, SecureLane::Transfer, &plaintext).await?;
+    client
+        .send_transfer_for_generation(peer_generation, ciphertext)
+        .await?;
+    Ok(())
 }
 
 async fn send_cursor_loop(
@@ -1717,10 +2709,12 @@ mod retry_policy_tests {
     use desklink_transport::TransportError;
 
     use super::{
-        HostRuntimeError, encoder_error_is_recoverable, host_error_is_retryable,
-        host_error_is_retryable_for_session, host_error_rearms_on_connected_relay,
-        host_runtime_denial_reason,
+        AdaptiveVideoQuality, HostRuntimeError, encoder_error_is_recoverable,
+        host_error_is_retryable, host_error_is_retryable_for_session,
+        host_error_rearms_on_connected_relay, host_runtime_denial_reason, video_frame_is_due,
+        video_quality_settings,
     };
+    use desklink_protocol::{VideoQualityPreference, VideoQualityPreset};
 
     #[test]
     fn persistent_host_recovers_after_rejecting_a_stale_pairing_request() {
@@ -1809,5 +2803,77 @@ mod retry_policy_tests {
         )));
         assert!(!encoder_error_is_recoverable(&EncoderError::InvalidFrame));
         assert!(!encoder_error_is_recoverable(&EncoderError::FrameTooLarge));
+    }
+
+    #[test]
+    fn quality_profiles_reduce_bandwidth_without_changing_the_default() {
+        let smooth = video_quality_settings(VideoQualityPreset::Smooth);
+        let balanced = video_quality_settings(VideoQualityPreset::Balanced);
+        let sharp = video_quality_settings(VideoQualityPreset::Sharp);
+        assert_eq!(
+            (smooth.max_width, smooth.max_height, smooth.fps),
+            (1280, 720, 15)
+        );
+        assert!(smooth.bitrate < balanced.bitrate);
+        assert!(balanced.bitrate < sharp.bitrate);
+        assert_eq!(sharp, crate::encoder::H264EncoderSettings::default());
+    }
+
+    #[test]
+    fn automatic_quality_requires_sustained_loss_and_steps_down_once() {
+        let mut quality = AdaptiveVideoQuality::new();
+        assert_eq!(
+            quality.set_preference(VideoQualityPreference::Automatic),
+            None
+        );
+        assert_eq!(quality.observe(90, 10), None);
+        assert_eq!(quality.observe(90, 10), Some(VideoQualityPreset::Balanced));
+        quality.record_applied(VideoQualityPreset::Balanced);
+
+        for _ in 0..8 {
+            assert_eq!(quality.observe(90, 10), None);
+        }
+        assert_eq!(quality.observe(90, 10), None);
+        assert_eq!(quality.observe(90, 10), Some(VideoQualityPreset::Smooth));
+    }
+
+    #[test]
+    fn automatic_quality_recovers_only_after_a_long_healthy_window() {
+        let mut quality = AdaptiveVideoQuality::new();
+        assert_eq!(
+            quality.set_preference(VideoQualityPreference::Smooth),
+            Some(VideoQualityPreset::Smooth)
+        );
+        quality.record_applied(VideoQualityPreset::Smooth);
+        assert_eq!(
+            quality.set_preference(VideoQualityPreference::Automatic),
+            None
+        );
+
+        for _ in 0..11 {
+            assert_eq!(quality.observe(100, 0), None);
+        }
+        assert_eq!(quality.observe(100, 0), Some(VideoQualityPreset::Balanced));
+    }
+
+    #[test]
+    fn automatic_quality_ignores_sparse_feedback_and_manual_modes() {
+        let mut quality = AdaptiveVideoQuality::new();
+        assert_eq!(quality.observe(1, 100), None);
+        assert_eq!(
+            quality.set_preference(VideoQualityPreference::Automatic),
+            None
+        );
+        assert_eq!(quality.observe(10, 10), None);
+        assert_eq!(quality.set_preference(VideoQualityPreference::Sharp), None);
+        assert_eq!(quality.observe(80, 20), None);
+    }
+
+    #[test]
+    fn frame_cadence_allows_first_and_requested_interval_frames() {
+        assert!(video_frame_is_due(None, 1_000_000, 20));
+        assert!(!video_frame_is_due(Some(1_000_000), 1_049_999, 20));
+        assert!(video_frame_is_due(Some(1_000_000), 1_050_000, 20));
+        assert!(video_frame_is_due(Some(1_000_000), 999_999, 20));
     }
 }

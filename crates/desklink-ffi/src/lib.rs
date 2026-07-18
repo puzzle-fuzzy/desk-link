@@ -13,7 +13,7 @@ use desklink_crypto::{
 use desklink_protocol::{
     ControlMessage, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES, MAX_MVP_HEIGHT,
     MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_PAYLOAD_BYTES,
-    MAX_WHEEL_DELTA, Modifiers, MouseButton, encode_control, encode_input,
+    MAX_WHEEL_DELTA, Modifiers, MouseButton, encode_control, encode_input, encode_transfer,
 };
 use desklink_session::{
     InputSequencer, PressedInputState, SessionEvent, SessionMachine, SessionState,
@@ -26,7 +26,10 @@ mod host;
 mod host_worker;
 mod worker;
 
-pub use controller::{ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime};
+pub use controller::{
+    ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime,
+    ControllerTransferSender,
+};
 pub use host::{
     HostCommand, HostError, HostEvent, HostIdentity, HostMetrics, HostRuntime, HostState,
 };
@@ -76,6 +79,8 @@ pub enum DesklinkEventKind {
     Cursor = 8,
     Metrics = 9,
     ReleaseAll = 10,
+    Transfer = 11,
+    Audio = 12,
 }
 
 #[repr(u32)]
@@ -88,6 +93,7 @@ pub enum DesklinkHostEventKind {
     KeyframeRequested = 5,
     ReleaseAll = 6,
     Metrics = 7,
+    Transfer = 8,
 }
 
 #[repr(u32)]
@@ -361,6 +367,10 @@ impl HostCallbackState {
             HostEvent::Input(input) => {
                 c_event.kind = DesklinkHostEventKind::Input;
                 c_event.input = convert_host_input(input);
+            }
+            HostEvent::Transfer(message) => {
+                data = encode_transfer(&message).ok();
+                c_event.kind = DesklinkHostEventKind::Transfer;
             }
             HostEvent::KeyframeRequested => {
                 c_event.kind = DesklinkHostEventKind::KeyframeRequested;
@@ -1694,6 +1704,7 @@ fn dispatch_host_events(runtime: Arc<HostRuntime>, callback: Arc<HostCallbackSta
                 callback.emit(event, HostState::WaitingForApproval)
             }
             Ok(event @ HostEvent::Input(_)) => callback.emit(event, HostState::Connected),
+            Ok(event @ HostEvent::Transfer(_)) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::KeyframeRequested) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::ReleaseAll) => callback.emit(event, runtime.state()),
             Ok(event @ HostEvent::Metrics(_)) => callback.emit(event, runtime.state()),
@@ -1807,6 +1818,10 @@ fn convert_key_to_ffi(code: KeyCode) -> (u32, u32) {
         KeyCode::PageDown => (14, 0),
         KeyCode::CapsLock => (15, 0),
         KeyCode::Function(number) => (15 + u32::from(number), 0),
+        KeyCode::Control => (28, 0),
+        KeyCode::Alt => (29, 0),
+        KeyCode::Shift => (30, 0),
+        KeyCode::Meta => (31, 0),
     }
 }
 
@@ -1842,8 +1857,15 @@ fn convert_input(input: &DesklinkInput) -> Result<InputEvent, DesklinkResult> {
             if !modifiers.is_valid() {
                 return Err(DesklinkResult::InvalidArgument);
             }
+            let code = convert_key(input.key_code, input.character)?;
+            if code
+                .modifier_mask()
+                .is_some_and(|own_modifier| modifiers.contains(own_modifier))
+            {
+                return Err(DesklinkResult::InvalidArgument);
+            }
             Ok(InputEvent::Key {
-                code: convert_key(input.key_code, input.character)?,
+                code,
                 pressed: input.pressed != 0,
                 modifiers,
             })
@@ -1884,6 +1906,10 @@ fn convert_key(key_code: u32, character: u32) -> Result<KeyCode, DesklinkResult>
         14 => Ok(KeyCode::PageDown),
         15 => Ok(KeyCode::CapsLock),
         16..=27 => Ok(KeyCode::Function((key_code - 15) as u8)),
+        28 => Ok(KeyCode::Control),
+        29 => Ok(KeyCode::Alt),
+        30 => Ok(KeyCode::Shift),
+        31 => Ok(KeyCode::Meta),
         _ => Err(DesklinkResult::InvalidArgument),
     }
 }
@@ -1961,6 +1987,10 @@ mod tests {
         key.key_code = 1;
         key.modifiers = 0x80;
         assert_eq!(convert_input(&key), Err(DesklinkResult::InvalidArgument));
+
+        key.key_code = 28;
+        key.modifiers = Modifiers::CONTROL.0;
+        assert_eq!(convert_input(&key), Err(DesklinkResult::InvalidArgument));
     }
 
     #[test]
@@ -1977,11 +2007,15 @@ mod tests {
             (15, KeyCode::CapsLock),
             (16, KeyCode::Function(1)),
             (27, KeyCode::Function(12)),
+            (28, KeyCode::Control),
+            (29, KeyCode::Alt),
+            (30, KeyCode::Shift),
+            (31, KeyCode::Meta),
         ];
         for (ffi_code, protocol_code) in cases {
             assert_eq!(convert_key(ffi_code, 0), Ok(protocol_code));
             assert_eq!(convert_key_to_ffi(protocol_code), (ffi_code, 0));
         }
-        assert_eq!(convert_key(28, 0), Err(DesklinkResult::InvalidArgument));
+        assert_eq!(convert_key(32, 0), Err(DesklinkResult::InvalidArgument));
     }
 }

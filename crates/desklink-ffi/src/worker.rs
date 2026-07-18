@@ -9,7 +9,9 @@ use std::{
 };
 
 use desklink_crypto::{DeviceIdentity, SessionId};
-use desklink_protocol::{InputEvent, encode_control, encode_cursor_update};
+use desklink_protocol::{
+    InputEvent, encode_audio_packet, encode_control, encode_cursor_update, encode_transfer,
+};
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError};
 use ed25519_dalek::VerifyingKey;
@@ -651,6 +653,26 @@ fn emit_controller_event(callback: CallbackTarget, event: ControllerEvent) -> bo
                     DesklinkEventKind::Cursor,
                     &data,
                     EventMeta::for_stream(cursor.stream_id),
+                    DesklinkState::Connected,
+                );
+            }
+        }
+        ControllerEvent::Audio(packet) => {
+            if let Ok(data) = encode_audio_packet(&packet) {
+                callback.emit(
+                    DesklinkEventKind::Audio,
+                    &data,
+                    EventMeta::for_stream(packet.stream_id),
+                    DesklinkState::Connected,
+                );
+            }
+        }
+        ControllerEvent::Transfer(message) => {
+            if let Ok(data) = encode_transfer(&message) {
+                callback.emit(
+                    DesklinkEventKind::Transfer,
+                    &data,
+                    EventMeta::for_stream(0),
                     DesklinkState::Connected,
                 );
             }

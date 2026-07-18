@@ -109,6 +109,7 @@ fn incomplete_frame_expires_without_blocking_new_frame() {
         assembler.push(instant(121), packet(11, 0, 1)),
         AssembleResult::Complete(frame(11))
     );
+    assert_eq!(assembler.take_dropped_chunks(), 1);
     assert_eq!(assembler.expire(instant(121)), 0);
 }
 
@@ -154,6 +155,7 @@ fn assembler_evicts_oldest_incomplete_frame_at_capacity() {
         assembler.push(instant(2), packet(3, 0, 1)),
         AssembleResult::Complete(frame(3))
     );
+    assert_eq!(assembler.take_dropped_chunks(), 1);
     assert_eq!(
         assembler.push(instant(3), packet(1, 1, 2)),
         AssembleResult::Pending

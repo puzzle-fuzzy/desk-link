@@ -1,0 +1,7 @@
+[env]
+# Newer Visual Studio previews may register a generator before their bundled
+# CMake/MSBuild pair is stable. Ninja plus an explicit MSVC compiler is the
+# reproducible path used by opus-head-sys on Windows and by GitHub runners.
+CMAKE_GENERATOR_x86_64_pc_windows_msvc = { value = "Ninja", force = false }
+# CMake 4 removed compatibility defaults required by libopus' upstream build.
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = false }

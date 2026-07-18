@@ -143,7 +143,7 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
     }
 }
 
-async fn spawn_stalled_control_relay() -> MockRelay {
+async fn spawn_stalled_reliable_relay(held_channel: u8) -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
@@ -202,7 +202,7 @@ async fn spawn_stalled_control_relay() -> MockRelay {
                     if receive.read_exact(&mut header).await.is_err() {
                         continue;
                     }
-                    if header[0] == 1 {
+                    if header[0] == held_channel {
                         held_control_streams.push(receive);
                         continue;
                     }
@@ -545,18 +545,25 @@ async fn localhost_client_keeps_reliable_channels_separate_and_forwards_datagram
         .send_cursor_datagram(vec![12, 13, 14, 251])
         .await
         .unwrap();
+    client.send_transfer(vec![15, 16, 17, 250]).await.unwrap();
+    client
+        .send_audio_datagram(vec![18, 19, 20, 249])
+        .await
+        .unwrap();
 
-    let events = next_n(&client, 5).await;
+    let events = next_n(&client, 7).await;
     assert!(events.contains(&TransportEvent::Control(vec![0, 1, 2, 255])));
     assert!(events.contains(&TransportEvent::Input(vec![3, 4, 5, 254])));
     assert!(events.contains(&TransportEvent::VideoConfig(vec![6, 7, 8, 253])));
     assert!(events.contains(&TransportEvent::VideoDatagram(vec![9, 10, 11, 252])));
     assert!(events.contains(&TransportEvent::CursorDatagram(vec![12, 13, 14, 251])));
+    assert!(events.contains(&TransportEvent::Transfer(vec![15, 16, 17, 250])));
+    assert!(events.contains(&TransportEvent::AudioDatagram(vec![18, 19, 20, 249])));
 }
 
 #[tokio::test]
 async fn stalled_control_channel_does_not_block_input_channel() {
-    let relay = spawn_stalled_control_relay().await;
+    let relay = spawn_stalled_reliable_relay(1).await;
     let client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
     client
         .join(RelayJoin::new(
@@ -589,6 +596,42 @@ async fn stalled_control_channel_does_not_block_input_channel() {
     input.unwrap();
     stalled_control.abort();
     relay.task.abort();
+}
+
+#[tokio::test]
+async fn stalled_file_transfer_does_not_block_input_channel() {
+    let relay = spawn_stalled_reliable_relay(6).await;
+    let client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
+    client
+        .join(RelayJoin::new(
+            SessionId::from_bytes([7; 16]),
+            DeviceRole::Controller,
+            [3; 32],
+        ))
+        .await
+        .unwrap();
+
+    let mut stalled_transfer = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            client
+                .send_transfer(vec![0; MAX_RELIABLE_MESSAGE_BYTES])
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut stalled_transfer)
+            .await
+            .is_err(),
+        "file send should remain blocked by the stalled peer"
+    );
+
+    tokio::time::timeout(Duration::from_millis(250), client.send_input(vec![1, 2, 3]))
+        .await
+        .expect("input was blocked by the file transfer")
+        .unwrap();
+    stalled_transfer.abort();
 }
 
 #[tokio::test]

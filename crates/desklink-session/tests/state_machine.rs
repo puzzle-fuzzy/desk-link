@@ -87,7 +87,7 @@ fn released_inputs_are_not_released_again() {
 }
 
 #[test]
-fn unicode_text_is_not_tracked_as_a_held_key() {
+fn unicode_key_is_released_if_the_session_ends_before_key_up() {
     let mut state = PressedInputState::default();
     state.press(&InputEvent::Key {
         code: KeyCode::Character('中'),
@@ -95,7 +95,14 @@ fn unicode_text_is_not_tracked_as_a_held_key() {
         modifiers: Modifiers(0),
     });
 
-    assert!(state.release_events().is_empty());
+    assert_eq!(
+        state.release_events(),
+        vec![InputEvent::Key {
+            code: KeyCode::Character('中'),
+            pressed: false,
+            modifiers: Modifiers(0),
+        }]
+    );
 }
 
 #[test]

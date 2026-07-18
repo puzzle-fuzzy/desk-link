@@ -2,6 +2,7 @@
 
 mod controller;
 mod device_directory;
+mod file_picker;
 mod host;
 mod local_relay;
 
@@ -31,7 +32,7 @@ use std::{
     env,
     fmt::Write as _,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -43,6 +44,7 @@ use apps_windows::{
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
     startup::WindowsStartupSettings,
+    transfer,
     trusted::WindowsTrustedControllerStore,
     window::WindowsLocalApprovalDialog,
 };
@@ -352,8 +354,9 @@ async fn connect_device(
     input: ControllerDeviceInput,
     signals: Channel<ControllerSignal>,
     video: Channel<Response>,
+    audio: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
-    manager.connect_device(input, signals, video).await
+    manager.connect_device(input, signals, video, audio).await
 }
 
 #[tauri::command]
@@ -362,8 +365,11 @@ async fn connect_saved_device(
     input: SavedDeviceInput,
     signals: Channel<ControllerSignal>,
     video: Channel<Response>,
+    audio: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
-    manager.connect_saved_device(input, signals, video).await
+    manager
+        .connect_saved_device(input, signals, video, audio)
+        .await
 }
 
 #[tauri::command]
@@ -371,8 +377,9 @@ async fn reconnect_controller(
     manager: State<'_, ControllerManager>,
     signals: Channel<ControllerSignal>,
     video: Channel<Response>,
+    audio: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
-    manager.connect_saved(signals, video).await
+    manager.connect_saved(signals, video, audio).await
 }
 
 #[tauri::command]
@@ -389,6 +396,105 @@ async fn send_controller_text(
     text: String,
 ) -> Result<(), String> {
     manager.send_text(text).await
+}
+
+#[tauri::command]
+async fn set_controller_audio_enabled(
+    manager: State<'_, ControllerManager>,
+    enabled: bool,
+) -> Result<(), String> {
+    manager.set_audio_enabled(enabled).await
+}
+
+#[tauri::command]
+async fn set_controller_video_quality(
+    manager: State<'_, ControllerManager>,
+    preference: desklink_protocol::VideoQualityPreference,
+) -> Result<(), String> {
+    manager.set_video_quality(preference).await
+}
+
+#[tauri::command]
+async fn send_controller_clipboard(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    let text = tauri::async_runtime::spawn_blocking(apps_windows::transfer::read_clipboard_text)
+        .await
+        .map_err(|_| "DeskLink 无法读取本机剪贴板。".to_owned())?
+        .map_err(|result| match result {
+            desklink_protocol::TransferResult::TooLarge => {
+                "剪贴板文本超过 48 KB，无法发送。".to_owned()
+            }
+            desklink_protocol::TransferResult::Unsupported => {
+                "本机剪贴板当前没有可发送的纯文本。".to_owned()
+            }
+            _ => "Windows 剪贴板正被其他程序占用，请稍后重试。".to_owned(),
+        })?;
+    manager.send_clipboard(text).await
+}
+
+#[tauri::command]
+async fn request_controller_clipboard(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    manager.request_clipboard().await
+}
+
+#[tauri::command]
+async fn choose_and_send_controller_file(
+    manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    let paths = tauri::async_runtime::spawn_blocking(file_picker::pick_files)
+        .await
+        .map_err(|_| "DeskLink 无法打开 Windows 文件选择器。".to_owned())??;
+    manager.send_files(paths).await
+}
+
+#[tauri::command]
+async fn queue_controller_files(
+    manager: State<'_, ControllerManager>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    manager
+        .send_files(paths.into_iter().map(PathBuf::from).collect())
+        .await
+}
+
+#[tauri::command]
+async fn remove_controller_queued_file(
+    manager: State<'_, ControllerManager>,
+    transfer_id: String,
+) -> Result<(), String> {
+    manager.remove_queued_file(&transfer_id).await
+}
+
+#[tauri::command]
+async fn clear_controller_file_queue(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    manager.clear_file_queue().await
+}
+
+#[tauri::command]
+async fn resume_controller_file_queue(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    manager.resume_file_queue().await
+}
+
+#[tauri::command]
+async fn request_controller_remote_file(
+    manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    manager.request_remote_file().await
+}
+
+#[tauri::command]
+async fn retry_controller_file(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    manager.retry_file().await
+}
+
+#[tauri::command]
+async fn cancel_controller_file(manager: State<'_, ControllerManager>) -> Result<(), String> {
+    manager.cancel_file().await
+}
+
+#[tauri::command]
+async fn open_controller_downloads_folder() -> Result<(), String> {
+    transfer::open_downloads_folder()
+        .map_err(|_| "DeskLink 无法打开当前 Windows 账户的下载文件夹。".to_owned())
 }
 
 #[tauri::command]
@@ -1241,6 +1347,19 @@ pub fn run() {
             reconnect_controller,
             send_controller_input,
             send_controller_text,
+            set_controller_audio_enabled,
+            set_controller_video_quality,
+            send_controller_clipboard,
+            request_controller_clipboard,
+            choose_and_send_controller_file,
+            queue_controller_files,
+            remove_controller_queued_file,
+            clear_controller_file_queue,
+            resume_controller_file_queue,
+            request_controller_remote_file,
+            retry_controller_file,
+            cancel_controller_file,
+            open_controller_downloads_folder,
             request_controller_keyframe,
             report_controller_render_metrics,
             open_github_repository,

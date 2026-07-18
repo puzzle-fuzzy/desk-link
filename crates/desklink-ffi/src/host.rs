@@ -85,6 +85,7 @@ pub enum HostCommand {
         stream_id: u64,
         bytes: Vec<u8>,
     },
+    SendTransfer(desklink_protocol::TransferMessage),
     RequestKeyframe,
     ReleaseAll,
     Stop,
@@ -97,6 +98,7 @@ impl HostCommand {
             Self::SendVideoConfig { .. }
                 | Self::SendVideoAccessUnit { .. }
                 | Self::SendCursor { .. }
+                | Self::SendTransfer(_)
                 | Self::RequestKeyframe
         )
     }
@@ -139,6 +141,7 @@ pub enum HostEvent {
         fingerprint: String,
     },
     Input(InputEvent),
+    Transfer(desklink_protocol::TransferMessage),
     KeyframeRequested,
     ReleaseAll,
     Metrics(HostMetrics),

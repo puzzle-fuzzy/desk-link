@@ -74,10 +74,6 @@ impl PressedInputState {
                 pressed: true,
             } if !self.buttons.contains(button) => self.buttons.push(*button),
             InputEvent::Key {
-                code: KeyCode::Character(_),
-                ..
-            } => {}
-            InputEvent::Key {
                 code,
                 pressed: true,
                 modifiers,
@@ -93,10 +89,6 @@ impl PressedInputState {
             } => {
                 self.buttons.retain(|held| held != button);
             }
-            InputEvent::Key {
-                code: KeyCode::Character(_),
-                ..
-            } => {}
             InputEvent::Key {
                 code,
                 pressed: false,

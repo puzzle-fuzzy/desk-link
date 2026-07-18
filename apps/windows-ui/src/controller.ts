@@ -1,4 +1,7 @@
 import {
+  cancelControllerFile,
+  clearControllerFileQueue,
+  chooseAndSendControllerFile,
   clearSavedDevices,
   connectDevice,
   connectSavedDevice,
@@ -7,13 +10,24 @@ import {
   forgetSavedDevice,
   getControllerSnapshot,
   reconnectController,
+  removeControllerQueuedFile,
   renameSavedDevice,
+  openControllerDownloadsFolder,
   reportControllerRenderMetrics,
   requestControllerKeyframe,
+  requestControllerClipboard,
+  requestControllerRemoteFile,
+  queueControllerFiles,
+  resumeControllerFileQueue,
+  retryControllerFile,
   selectControllerDisplay,
   sendControllerInput,
+  sendControllerClipboard,
+  setControllerAudioEnabled,
+  setControllerVideoQuality,
   sendControllerText,
 } from "./api";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { ControllerChannels } from "./api";
 import {
   deviceCredentialsAreValid,
@@ -22,12 +36,13 @@ import {
 } from "./device-credentials";
 import { escapeHtml } from "./html";
 import {
-  MAX_POINTER_COORDINATE,
   clampWheel,
   keyboardKey,
+  keyboardModifierMask,
   keyboardModifiers,
   mouseButton,
   normalizedPointerPosition,
+  remoteCursorContentPosition,
 } from "./remote-input";
 import type {
   ControllerInput,
@@ -37,21 +52,53 @@ import type {
   ControllerSnapshot,
   ControllerVideoConfigSignal,
   RemoteDisplaySummary,
+  VideoQualityPreference,
+  VideoQualityPreset,
 } from "./types";
 import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
 import { deviceIdsMatch, formatLastUsed } from "./saved-device";
 import { RemoteInputDispatcher } from "./remote-input-dispatcher";
+import { RemoteKeyboardState, type ControllerKeyInput } from "./remote-keyboard-state";
 import {
   CONNECTION_PROGRESS_STEPS,
   connectionProgressPresentation,
   formatConnectionElapsed,
 } from "./connection-progress";
-import { icon } from "./icons";
+import { icon, renderLucideIcons } from "./icons";
 import { isH264Keyframe, prepareH264AccessUnit } from "./h264-annex-b";
+import { RemoteAudioPlayer } from "./remote-audio";
+import {
+  loadRemoteScaleMode,
+  normalizeRemoteScaleMode,
+  saveRemoteScaleMode,
+  type RemoteScaleMode,
+} from "./remote-scale";
+import { remotePanPosition, type RemotePanOrigin } from "./remote-pan";
+import { RemoteDisplaySwitchState } from "./remote-display-switch";
+import {
+  appendTransferHistory,
+  type TransferHistoryEntry,
+} from "./file-transfer-history";
+import {
+  queuedFilesSummary,
+  sampleTransferMetrics,
+  transferMetricsLabel,
+  type TransferMetrics,
+} from "./file-transfer-metrics";
+import {
+  markTransferResultsRead,
+  recordTransferResult,
+  transferProgressPaintDelay,
+  type TransferActivityState,
+} from "./file-transfer-activity";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
 type VideoPayload = ArrayBuffer | ArrayBufferView | number[];
+type ClipboardTransferStatus = Extract<ControllerSignal, { kind: "clipboard" }>;
+type FileTransferStatus = Extract<ControllerSignal, { kind: "fileTransfer" }>;
+type FileQueueStatus = Omit<Extract<ControllerSignal, { kind: "fileQueue" }>, "kind">;
+type AudioStatus = "starting" | "enabled" | "muted" | "unavailable";
 
 const FRAME_PREFIX_BYTES = 17;
 let snapshot: ControllerSnapshot | null = null;
@@ -87,21 +134,56 @@ let pointerFrame: number | null = null;
 let remoteResizeObserver: ResizeObserver | null = null;
 let remoteCanvasBounds: DOMRectReadOnly | null = null;
 let remoteViewportBounds: DOMRectReadOnly | null = null;
+let remoteScaleFrame: number | null = null;
+let remoteScaleMode: RemoteScaleMode = loadRemoteScaleMode();
+let remotePanMode = false;
 let pointerInsideViewport = false;
+let fullscreenListenerInitialized = false;
 let requestRender: RenderRequest = () => {};
 let decodedFrames = 0;
 let textSending = false;
 let failedVideoConfig: string | null = null;
 let remoteDisplays: RemoteDisplaySummary[] = [];
 let activeRemoteDisplayId: number | null = null;
-let pendingRemoteDisplayId: number | null = null;
+const remoteDisplaySwitch = new RemoteDisplaySwitchState();
+let remoteDisplaySwitchTimer: number | null = null;
+let remoteDisplaySwitchStatus: {
+  tone: "pending" | "success" | "error";
+  message: string;
+} | null = null;
 let attemptStartedAtMs: number | null = null;
 let attemptTarget = "";
 let forgetConfirmation: string | null = null;
 let renameDeviceId: string | null = null;
 let renameDraft = "";
 let renameBusy = false;
-const inputDispatcher = new RemoteInputDispatcher(sendControllerInput);
+let transferPanelOpen = false;
+let clipboardTransfer: ClipboardTransferStatus | null = null;
+let fileTransfer: FileTransferStatus | null = null;
+let fileQueue: FileQueueStatus = { queued: [], paused: false };
+let transferHistory: TransferHistoryEntry[] = [];
+let transferHistorySequence = 0;
+let fileTransferMetrics: TransferMetrics | null = null;
+let transferActivity: TransferActivityState = { unreadResults: 0, tone: null };
+let transferPanelUpdateTimer: number | null = null;
+let lastTransferProgressPaintAtMs: number | null = null;
+let filePickerBusy = false;
+let downloadsFolderBusy = false;
+let downloadsFolderMessage = "";
+let fileDropInitialized = false;
+let fileDragActive = false;
+let audioStatus: AudioStatus = "starting";
+let audioEnabled = true;
+let audioToggleBusy = false;
+let audioMessage = "正在准备远端系统声音。";
+let videoQualityPreference: VideoQualityPreference = "sharp";
+let appliedVideoQuality: VideoQualityPreset = "sharp";
+let pendingVideoQuality: VideoQualityPreference | null = null;
+let videoQualityAckTimer: number | null = null;
+const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
+  sendControllerInput({ ...input, streamId })
+));
+const remoteAudio = new RemoteAudioPlayer();
 
 function resetVideoTelemetry(): void {
   pendingVideoKeyframe = null;
@@ -119,6 +201,11 @@ function resetVideoTelemetry(): void {
 
 export async function initializeController(renderer: RenderRequest): Promise<void> {
   requestRender = renderer;
+  void initializeNativeFileDrop();
+  if (!fullscreenListenerInitialized) {
+    document.addEventListener("fullscreenchange", syncRemoteFullscreenControl);
+    fullscreenListenerInitialized = true;
+  }
   try {
     snapshot = await getControllerSnapshot();
     const latestSavedDevice = snapshot.savedDevices.at(0);
@@ -140,12 +227,17 @@ export function prepareControllerRender(): void {
     window.cancelAnimationFrame(pointerFrame);
     pointerFrame = null;
   }
+  if (remoteScaleFrame !== null) {
+    window.cancelAnimationFrame(remoteScaleFrame);
+    remoteScaleFrame = null;
+  }
   releaseVideoDecoder();
   remoteResizeObserver?.disconnect();
   remoteResizeObserver = null;
   remoteCanvasBounds = null;
   remoteViewportBounds = null;
   pointerInsideViewport = false;
+  cancelScheduledTransferPanelUpdate();
 }
 
 export function renderControllerView(): string {
@@ -159,6 +251,9 @@ export function renderControllerView(): string {
   }
   const runtime = snapshot?.runtime;
   const connected = runtime?.state === "connected";
+  if (!connected) {
+    remotePanMode = false;
+  }
   return `
     <div class="controller-stack">
       ${feedback ? renderFeedback(feedback) : ""}
@@ -282,11 +377,56 @@ export function bindControllerInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-controller-keyframe]")?.addEventListener("click", () => {
     retryVideo();
   });
+  document.querySelector<HTMLButtonElement>("[data-controller-audio]")?.addEventListener("click", () => {
+    void toggleRemoteAudio();
+  });
   document.querySelector<HTMLButtonElement>("[data-controller-fullscreen]")?.addEventListener("click", () => {
     void toggleFullscreen();
   });
+  document.querySelector<HTMLButtonElement>("[data-controller-transfer]")?.addEventListener("click", () => {
+    transferPanelOpen = !transferPanelOpen;
+    if (transferPanelOpen) {
+      transferActivity = markTransferResultsRead(transferActivity);
+    } else {
+      cancelScheduledTransferPanelUpdate();
+    }
+    updateTransferPanel({ ledger: true });
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-clipboard-send]")?.addEventListener("click", () => {
+    void sendLocalClipboard();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-clipboard-request]")?.addEventListener("click", () => {
+    void receiveRemoteClipboard();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-file-send]")?.addEventListener("click", () => {
+    void chooseFileForTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-file-receive]")?.addEventListener("click", () => {
+    void requestRemoteFileTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-file-cancel]")?.addEventListener("click", () => {
+    void cancelFileTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-file-retry]")?.addEventListener("click", () => {
+    void retryFileTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-downloads-open]")?.addEventListener("click", () => {
+    void openDownloadsFolder();
+  });
   document.querySelector<HTMLSelectElement>("[data-controller-display]")?.addEventListener("change", (event) => {
     void changeRemoteDisplay(Number((event.currentTarget as HTMLSelectElement).value));
+  });
+  document.querySelector<HTMLSelectElement>("[data-controller-video-quality]")?.addEventListener("change", (event) => {
+    void changeVideoQuality((event.currentTarget as HTMLSelectElement).value as VideoQualityPreference);
+  });
+  document.querySelector<HTMLSelectElement>("[data-controller-scale]")?.addEventListener("change", (event) => {
+    changeRemoteScaleMode((event.currentTarget as HTMLSelectElement).value);
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-pan]")?.addEventListener("click", () => {
+    setRemotePanMode(!remotePanMode);
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-windows-key]")?.addEventListener("click", () => {
+    sendRemoteKeyTap("meta");
   });
   document.querySelector<HTMLButtonElement>("[data-controller-text]")?.addEventListener("click", () => {
     const panel = document.querySelector<HTMLElement>("[data-controller-text-panel]");
@@ -302,8 +442,11 @@ export function bindControllerInteractions(): void {
   document.querySelector<HTMLFormElement>("[data-controller-text-form]")?.addEventListener("submit", (event) => {
     void submitTextInput(event);
   });
+  bindTransferLedgerActions();
   if (snapshot?.runtime.state === "connected") {
     setupRemoteDesktop();
+    syncRemoteInteractionControls();
+    syncRemoteFullscreenControl();
   }
 }
 
@@ -527,6 +670,48 @@ function renderForgetConfirmation(deviceId: string): string {
   `;
 }
 
+function renderTransferToolbarButton(): string {
+  const activity = transferToolbarActivityView();
+  return `<button class="toolbar-button${activity.visible ? " toolbar-button--has-activity" : ""}" type="button" data-controller-transfer aria-expanded="${transferPanelOpen}" title="${activity.title}">${icon("share-2")}<span>传输</span><span class="remote-transfer-activity" data-controller-transfer-activity data-state="${activity.tone}" ${activity.visible ? "" : "hidden"} role="status" aria-live="polite" aria-label="${activity.ariaLabel}">${activity.badge}</span></button>`;
+}
+
+function transferToolbarActivityView(): {
+  visible: boolean;
+  tone: "active" | "success" | "error" | "idle";
+  badge: string;
+  title: string;
+  ariaLabel: string;
+} {
+  const active = isFileTransferActive(fileTransfer?.state);
+  const unread = transferActivity.unreadResults;
+  if (active) {
+    const resultText = unread > 0 ? `，另有 ${unread} 条未查看结果` : "";
+    return {
+      visible: true,
+      tone: "active",
+      badge: unread > 0 ? String(unread) : "",
+      title: `文件正在传输${resultText}`,
+      ariaLabel: `文件正在传输${resultText}`,
+    };
+  }
+  if (unread > 0) {
+    return {
+      visible: true,
+      tone: transferActivity.tone ?? "success",
+      badge: String(unread),
+      title: `${unread} 条文件传输结果未查看`,
+      ariaLabel: `${unread} 条文件传输结果未查看`,
+    };
+  }
+  return {
+    visible: false,
+    tone: "idle",
+    badge: "",
+    title: "发送剪贴板文本或文件",
+    ariaLabel: "",
+  };
+}
+
 function renderRemoteDesktop(): string {
   const config = videoConfig;
   const videoFailed = config ? failedVideoConfig === videoConfigKey(config) : false;
@@ -538,36 +723,174 @@ function renderRemoteDesktop(): string {
           <div><strong>实时远程桌面</strong><small data-controller-metrics>${config ? `${config.width} × ${config.height} · 已加密` : "正在等待首个视频画面"}</small></div>
         </div>
         <div class="remote-toolbar-actions">
+          <label class="remote-quality-picker" title="根据当前网络调整远程画面的清晰度和流畅度">
+            ${icon("gauge")}
+            <span class="sr-only">选择远程画质</span>
+            <select data-controller-video-quality aria-label="选择远程画质" ${pendingVideoQuality === null ? "" : "disabled"}>
+              <option value="automatic" ${videoQualityPreference === "automatic" ? "selected" : ""}>自动（${videoQualityPresetLabel(appliedVideoQuality)}）</option>
+              <option value="smooth" ${videoQualityPreference === "smooth" ? "selected" : ""}>流畅</option>
+              <option value="balanced" ${videoQualityPreference === "balanced" ? "selected" : ""}>均衡</option>
+              <option value="sharp" ${videoQualityPreference === "sharp" ? "selected" : ""}>清晰</option>
+            </select>
+          </label>
+          ${renderAudioControl()}
           ${remoteDisplays.length > 1 ? `
             <label class="remote-display-picker" title="切换目标电脑的显示器">
               ${icon("monitor")}
               <span class="sr-only">选择远程显示器</span>
-              <select data-controller-display aria-label="选择远程显示器" ${pendingRemoteDisplayId === null ? "" : "disabled"}>
-                ${remoteDisplays.map((display, index) => `<option value="${display.id}" ${display.id === (pendingRemoteDisplayId ?? activeRemoteDisplayId) ? "selected" : ""}>屏幕 ${index + 1}${display.primary ? "（主屏）" : ""} · ${display.width} × ${display.height}</option>`).join("")}
+              <select data-controller-display aria-label="选择远程显示器" ${remoteDisplaySwitch.pendingId === null ? "" : "disabled"}>
+                ${remoteDisplays.map((display, index) => `<option value="${display.id}" ${display.id === (remoteDisplaySwitch.pendingId ?? activeRemoteDisplayId) ? "selected" : ""}>屏幕 ${index + 1}${display.primary ? "（主屏）" : ""} · ${display.width} × ${display.height}</option>`).join("")}
               </select>
-            </label>` : ""}
+            </label><span class="remote-display-switch-status" data-controller-display-status data-tone="${remoteDisplaySwitchStatus?.tone ?? ""}" ${remoteDisplaySwitchStatus ? "" : "hidden"} role="status" aria-live="polite">${escapeHtml(remoteDisplaySwitchStatus?.message ?? "")}</span>` : ""}
+          <label class="remote-scale-picker" title="适应窗口会显示完整画面；1:1 会按收到的画面像素显示，超出区域可用滚动条查看">
+            ${icon("scan")}
+            <span class="sr-only">远程画面缩放</span>
+            <select data-controller-scale aria-label="远程画面缩放">
+              <option value="fit" ${remoteScaleMode === "fit" ? "selected" : ""}>适应</option>
+              <option value="actual" ${remoteScaleMode === "actual" ? "selected" : ""}>1:1</option>
+            </select>
+          </label>
+          <button class="toolbar-button${remotePanMode ? " toolbar-button--active" : ""}" type="button" data-controller-pan aria-pressed="${remotePanMode}" ${remoteScaleMode === "actual" ? "" : "disabled"} title="${remoteScaleMode === "actual" ? (remotePanMode ? "恢复向远程电脑发送鼠标和键盘输入" : "只在本地拖动或滚动画面，不会操作远程电脑") : "切换到 1:1 后可以浏览超出窗口的画面"}">${icon("hand")}${remotePanMode ? "继续控制" : "浏览画面"}</button>
+          <button class="toolbar-button" type="button" data-controller-windows-key title="在远程电脑打开或关闭开始菜单，不会打开本机开始菜单">${icon("panels-top-left")}Windows 键</button>
           <button class="toolbar-button" type="button" data-controller-text title="发送中文、符号或一段文字">${icon("keyboard")}发送文字</button>
+          ${renderTransferToolbarButton()}
           <button class="toolbar-button" type="button" data-controller-keyframe title="刷新远程画面">${icon("refresh-cw")}刷新画面</button>
-          <button class="toolbar-button" type="button" data-controller-fullscreen>${icon("maximize-2")}全屏</button>
+          <button class="toolbar-button" type="button" data-controller-fullscreen aria-label="进入全屏">${icon("maximize-2")}<span data-controller-fullscreen-label>全屏</span></button>
           <button class="toolbar-button toolbar-button--danger" type="button" data-controller-disconnect>${icon("log-out")}断开连接</button>
         </div>
       </div>
+      ${renderTransferPanel()}
       <form class="remote-text-entry" data-controller-text-form data-controller-text-panel hidden>
         <label for="remote-text-input">发送文字到远程电脑</label>
         <input id="remote-text-input" data-controller-text-input type="text" maxlength="256" autocomplete="off" placeholder="可输入或粘贴中文、符号和短文本" required>
         <button class="toolbar-button" type="submit">${icon("send-horizontal")}发送文字</button>
         <button class="toolbar-button" type="button" data-controller-text-cancel>取消</button>
       </form>
-      <div class="remote-viewport" data-remote-viewport tabindex="0" aria-label="远程 Windows 桌面，点击后可发送键盘和鼠标输入。">
+      <div class="remote-viewport" data-remote-viewport data-scale-mode="${remoteScaleMode}" data-interaction-mode="${remotePanMode ? "pan" : "control"}" tabindex="0" aria-label="远程 Windows 桌面，点击后可发送键盘和鼠标输入。">
         ${videoFailed
           ? '<div class="remote-waiting remote-waiting--error"><strong>远程画面暂时无法解码</strong><p>请更新 WebView2，或点击“刷新画面”再试一次。</p></div>'
           : config
             ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><div class="remote-video-starting" data-remote-video-starting>${icon("loader-circle", "controller-spinner")}<strong>正在启动远程画面</strong><p>正在接收并解码第一个加密视频帧。</p></div><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden>${icon("mouse-pointer-2")}</span>`
             : `<div class="remote-waiting">${icon("loader-circle", "controller-spinner")}<strong>正在准备远程画面</strong><p>DeskLink 协商视频流时，请保持此窗口打开。</p></div>`}
-        <div class="remote-focus-hint">点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作</div>
+        <div class="remote-focus-hint" data-remote-focus-hint>${remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑" : "点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作"}</div>
+        <div class="remote-file-drop-overlay" data-controller-file-drop-overlay ${fileDragActive ? "" : "hidden"} aria-hidden="true">
+          ${icon("file-up")}<strong>松开鼠标，将文件加入发送队列</strong><span>文件会按顺序发送，不会打断画面和输入。</span>
+        </div>
       </div>
     </section>
   `;
+}
+
+function renderAudioControl(): string {
+  const unavailable = audioStatus === "starting" || audioStatus === "unavailable";
+  const muted = audioStatus === "muted" || !audioEnabled;
+  const iconName = unavailable ? "volume-off" : muted ? "volume-x" : "volume-2";
+  const label = audioStatus === "starting"
+    ? "声音准备中"
+    : audioStatus === "unavailable"
+      ? "无声音"
+      : muted
+        ? "打开声音"
+        : "静音";
+  return '<button class="toolbar-button" type="button" data-controller-audio aria-pressed="'
+    + String(muted)
+    + '" title="'
+    + escapeHtml(audioMessage)
+    + '"'
+    + (unavailable || audioToggleBusy ? " disabled" : "")
+    + ">"
+    + icon(iconName)
+    + '<span data-controller-audio-label>'
+    + label
+    + "</span></button>";
+}
+
+function renderTransferPanel(): string {
+  const fileActive = isFileTransferActive(fileTransfer?.state);
+  const fileRetryable = isFileTransferRetryable(fileTransfer?.state);
+  const progress = transferPercent(fileTransfer?.transferred ?? 0, fileTransfer?.total ?? 0);
+  const details = fileTransfer ? formatTransferDetails(fileTransfer) : "";
+  const receivedFile = hasCompletedDownload();
+  return `
+    <section class="remote-transfer-panel" data-controller-transfer-panel ${transferPanelOpen ? "" : "hidden"} aria-label="剪贴板与文件传输">
+      <div class="remote-transfer-heading">
+        <div>${icon("share-2")}<span><strong>剪贴板与文件</strong><small>可双向传输；获取文件时由远端电脑选择。</small></span></div>
+        <div class="remote-transfer-actions">
+          <button class="toolbar-button" type="button" data-controller-clipboard-send>${icon("clipboard-copy")}发送本机剪贴板</button>
+          <button class="toolbar-button" type="button" data-controller-clipboard-request>${icon("clipboard-paste")}读取远端剪贴板</button>
+          <button class="toolbar-button" type="button" data-controller-file-send ${filePickerBusy ? "disabled" : ""}>${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}</button>
+          <button class="toolbar-button" type="button" data-controller-file-receive ${fileActive || fileQueue.queued.length > 0 ? "disabled" : ""}>${icon("file-down")}获取远端文件</button>
+        </div>
+      </div>
+      <div class="remote-file-drop-hint">
+        <span>${icon("file-up")}也可以把一个或多个文件拖到远程画面，最多排队 20 个。</span>
+        <span class="remote-downloads-action" ${receivedFile ? "" : "hidden"}>
+          <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-downloads-open ${downloadsFolderBusy ? "disabled" : ""}>${icon("folder-open")}${downloadsFolderBusy ? "正在打开…" : "打开下载文件夹"}</button>
+          <small data-controller-downloads-message aria-live="polite">${escapeHtml(downloadsFolderMessage)}</small>
+        </span>
+      </div>
+      <div class="remote-transfer-statuses">
+        <div class="remote-transfer-status" data-controller-clipboard-status ${clipboardTransfer ? "" : "hidden"}>
+          <strong>剪贴板</strong><span data-controller-clipboard-message>${escapeHtml(clipboardTransfer?.message ?? "")}</span>
+        </div>
+        <div class="remote-transfer-status remote-transfer-status--file" data-controller-file-status ${fileTransfer ? "" : "hidden"}>
+          <div><strong data-controller-file-name>${escapeHtml(fileTransfer?.name ?? "")}</strong><span data-controller-file-message>${escapeHtml(fileTransfer?.message ?? "")}</span><small data-controller-file-size>${escapeHtml(details)}</small></div>
+          <progress data-controller-file-progress max="100" value="${progress}" aria-label="文件传输进度"></progress>
+          <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-retry ${fileRetryable ? "" : "hidden"}>${icon("rotate-ccw")}${fileTransfer?.direction === "download" ? "重新获取" : "重新发送"}</button>
+          <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-cancel ${fileActive ? "" : "hidden"}>取消</button>
+        </div>
+      </div>
+      <div class="remote-transfer-ledger">
+        <section class="remote-transfer-list" data-controller-file-queue ${fileQueue.queued.length > 0 ? "" : "hidden"} aria-label="等待发送的文件">
+          ${renderFileQueue()}
+        </section>
+        <section class="remote-transfer-list" data-controller-file-history ${transferHistory.length > 0 ? "" : "hidden"} aria-label="最近传输记录">
+          ${renderTransferHistory()}
+        </section>
+      </div>
+    </section>
+  `;
+}
+
+function renderFileQueue(): string {
+  const visible = fileQueue.queued.slice(0, 4);
+  const summary = queuedFilesSummary(fileQueue.queued);
+  return `
+    <div class="remote-transfer-list-heading"><strong>${fileQueue.paused ? "队列已暂停" : "等待发送"} · ${summary}</strong><span>${fileQueue.paused ? `<button type="button" data-controller-file-queue-resume>继续队列</button>` : ""}<button type="button" data-controller-file-queue-clear>清空等待</button></span></div>
+    <ul>${visible.map((file) => `
+      <li><span>${icon("file-up")}<span><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></span><button type="button" data-controller-file-queue-remove="${file.id}" aria-label="从队列移除 ${escapeHtml(file.name)}" title="从队列移除">${icon("x")}</button></li>
+    `).join("")}</ul>
+    ${fileQueue.queued.length > visible.length ? `<small class="remote-transfer-more">还有 ${fileQueue.queued.length - visible.length} 个文件正在等待</small>` : ""}
+  `;
+}
+
+function renderTransferHistory(): string {
+  const visible = transferHistory.slice(0, 4);
+  return `
+    <div class="remote-transfer-list-heading"><strong>最近传输</strong><button type="button" data-controller-history-clear>清除记录</button></div>
+    <ul>${visible.map((entry) => `
+      <li data-state="${entry.state}"><span>${icon(entry.direction === "download" ? "file-down" : "file-up")}<span><strong title="${escapeHtml(entry.name)}">${escapeHtml(entry.name)}</strong><small>${transferHistoryLabel(entry)} · ${formatHistoryTime(entry.finishedAtMs)}</small></span></span></li>
+    `).join("")}</ul>
+  `;
+}
+
+function transferHistoryLabel(entry: TransferHistoryEntry): string {
+  const action = entry.direction === "download" ? "接收" : "发送";
+  switch (entry.state) {
+    case "completed": return `${action}完成${entry.size > 0 ? ` · ${formatBytes(entry.size)}` : ""}`;
+    case "rejected": return `${action}被拒绝`;
+    case "cancelled": return `${action}已取消`;
+    default: return `${action}失败`;
+  }
+}
+
+function formatHistoryTime(value: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date(value));
 }
 
 function updateDeviceSubmitState(): void {
@@ -631,6 +954,13 @@ async function beginConnection(
   attemptTarget = target;
   videoConfig = null;
   failedVideoConfig = null;
+  remoteAudio.release();
+  audioStatus = "starting";
+  audioEnabled = true;
+  audioToggleBusy = false;
+  audioMessage = "正在准备远端系统声音。";
+  remoteAudio.setEnabled(true);
+  remoteAudio.prepare();
   resetVideoTelemetry();
   prepareControllerRender();
   const generation = ++channelGeneration;
@@ -648,6 +978,16 @@ async function beginConnection(
     (error) => {
       if (generation === channelGeneration) {
         handleVideoDeliveryError(error);
+      }
+    },
+    (payload) => {
+      if (generation === channelGeneration) {
+        remoteAudio.push(payload);
+      }
+    },
+    () => {
+      if (generation === channelGeneration) {
+        remoteAudio.resetConnection();
       }
     },
   );
@@ -692,6 +1032,9 @@ async function cancelConnection(): Promise<void> {
   busy = false;
   cancelling = true;
   prepareControllerRender();
+  remoteAudio.release();
+  audioStatus = "starting";
+  audioMessage = "正在准备远端系统声音。";
   videoConfig = null;
   resetVideoTelemetry();
   activeChannels = null;
@@ -817,12 +1160,33 @@ function handleSignal(signal: ControllerSignal): void {
         };
       }
       if (signal.runtime.state !== "connected") {
+        releaseInputState();
+        inputDispatcher.discardAll();
+        if (pointerFrame !== null) {
+          window.cancelAnimationFrame(pointerFrame);
+          pointerFrame = null;
+        }
+        pointerInsideViewport = false;
+        remotePanMode = false;
+        remoteCanvasBounds = null;
+        remoteViewportBounds = null;
+        setFileDragActive(false);
         videoConfig = null;
         failedVideoConfig = null;
         resetVideoTelemetry();
         remoteDisplays = [];
         activeRemoteDisplayId = null;
-        pendingRemoteDisplayId = null;
+        clearRemoteDisplaySwitch();
+        clearVideoQualityAckTimer();
+        videoQualityPreference = "sharp";
+        appliedVideoQuality = "sharp";
+        pendingVideoQuality = null;
+        remoteAudio.resetConnection();
+        audioStatus = "starting";
+        audioMessage = "正在等待远端系统声音。";
+        fileTransferMetrics = null;
+        lastTransferProgressPaintAtMs = null;
+        cancelScheduledTransferPanelUpdate();
       }
       if (signal.runtime.state === "connected") {
         temporaryPasswordDraft = "";
@@ -851,12 +1215,37 @@ function handleSignal(signal: ControllerSignal): void {
       updateRemoteCursor(signal.xMillionths, signal.yMillionths, signal.visible);
       break;
     case "displays": {
+      const outcome = remoteDisplaySwitch.acknowledge(signal.activeDisplayId);
+      clearRemoteDisplaySwitchTimer();
       remoteDisplays = signal.displays;
       activeRemoteDisplayId = signal.activeDisplayId;
-      pendingRemoteDisplayId = null;
-      const picker = document.querySelector<HTMLSelectElement>("[data-controller-display]");
+      if (outcome === "applied") {
+        const index = remoteDisplays.findIndex((display) => display.id === activeRemoteDisplayId);
+        remoteDisplaySwitchStatus = {
+          tone: "success",
+          message: index >= 0 ? `已切换到屏幕 ${index + 1}` : "已切换远程屏幕",
+        };
+      } else if (outcome === "rejected") {
+        remoteDisplaySwitchStatus = {
+          tone: "error",
+          message: "目标屏幕暂时不可用，仍保持当前屏幕。",
+        };
+      }
+      updateRemoteDisplayControls();
+      break;
+    }
+    case "videoQuality": {
+      clearVideoQualityAckTimer();
+      videoQualityPreference = signal.preference;
+      appliedVideoQuality = signal.preset;
+      pendingVideoQuality = null;
+      const picker = document.querySelector<HTMLSelectElement>("[data-controller-video-quality]");
       if (picker) {
-        picker.value = String(activeRemoteDisplayId);
+        const automatic = picker.querySelector<HTMLOptionElement>('option[value="automatic"]');
+        if (automatic) {
+          automatic.textContent = `自动（${videoQualityPresetLabel(appliedVideoQuality)}）`;
+        }
+        picker.value = videoQualityPreference;
         picker.disabled = false;
       }
       break;
@@ -873,7 +1262,521 @@ function handleSignal(signal: ControllerSignal): void {
       reportRenderMetrics();
       break;
     }
+    case "clipboard":
+      clipboardTransfer = signal;
+      updateTransferPanel({ ledger: false });
+      break;
+    case "fileTransfer": {
+      const previous = fileTransfer;
+      fileTransfer = signal;
+      updateFileTransferMetrics(signal);
+      const historyChanged = recordTransferHistory(previous, signal);
+      transferActivity = recordTransferResult(transferActivity, previous, signal, transferPanelOpen);
+      scheduleTransferPanelUpdate(previous, signal, historyChanged);
+      break;
+    }
+    case "fileQueue":
+      fileQueue = { queued: signal.queued, paused: signal.paused };
+      updateTransferPanel({ ledger: true });
+      break;
+    case "audio":
+      audioStatus = signal.state;
+      audioEnabled = signal.enabled;
+      audioMessage = signal.message;
+      remoteAudio.setEnabled(signal.state === "enabled" && signal.enabled);
+      updateAudioControl();
+      break;
   }
+}
+
+async function toggleRemoteAudio(): Promise<void> {
+  if (
+    audioToggleBusy
+    || audioStatus === "starting"
+    || audioStatus === "unavailable"
+  ) {
+    return;
+  }
+  const previousEnabled = audioEnabled;
+  const previousStatus = audioStatus;
+  const previousMessage = audioMessage;
+  const nextEnabled = !audioEnabled;
+  audioToggleBusy = true;
+  audioEnabled = nextEnabled;
+  audioStatus = nextEnabled ? "enabled" : "muted";
+  audioMessage = nextEnabled ? "正在播放远端系统声音。" : "远端系统声音已静音。";
+  remoteAudio.setEnabled(nextEnabled);
+  updateAudioControl();
+  try {
+    await setControllerAudioEnabled(nextEnabled);
+  } catch (error) {
+    audioEnabled = previousEnabled;
+    audioStatus = previousStatus;
+    audioMessage = previousMessage;
+    remoteAudio.setEnabled(previousStatus === "enabled" && previousEnabled);
+    feedback = { tone: "error", message: normalizeError(error) };
+    requestRender();
+  } finally {
+    audioToggleBusy = false;
+    updateAudioControl();
+  }
+}
+
+function updateAudioControl(): void {
+  const button = document.querySelector<HTMLButtonElement>("[data-controller-audio]");
+  if (!button) return;
+  const unavailable = audioStatus === "starting" || audioStatus === "unavailable";
+  const muted = audioStatus === "muted" || !audioEnabled;
+  const iconName = unavailable ? "volume-off" : muted ? "volume-x" : "volume-2";
+  const label = audioStatus === "starting"
+    ? "声音准备中"
+    : audioStatus === "unavailable"
+      ? "无声音"
+      : muted
+        ? "打开声音"
+        : "静音";
+  button.disabled = unavailable || audioToggleBusy;
+  button.title = audioMessage;
+  button.setAttribute("aria-pressed", String(muted));
+  button.innerHTML = icon(iconName) + '<span data-controller-audio-label>' + label + "</span>";
+  renderLucideIcons(button);
+}
+
+function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void {
+  const panel = document.querySelector<HTMLElement>("[data-controller-transfer-panel]");
+  const toggle = document.querySelector<HTMLButtonElement>("[data-controller-transfer]");
+  if (panel) {
+    panel.hidden = !transferPanelOpen;
+  }
+  toggle?.setAttribute("aria-expanded", String(transferPanelOpen));
+  updateTransferToolbarActivity();
+  if (!transferPanelOpen) {
+    return;
+  }
+
+  const clipboardStatus = document.querySelector<HTMLElement>("[data-controller-clipboard-status]");
+  if (clipboardStatus) {
+    clipboardStatus.hidden = !clipboardTransfer;
+    clipboardStatus.dataset.state = clipboardTransfer?.state ?? "";
+  }
+  const clipboardMessage = document.querySelector<HTMLElement>("[data-controller-clipboard-message]");
+  if (clipboardMessage) {
+    clipboardMessage.textContent = clipboardTransfer?.message ?? "";
+  }
+
+  const fileStatus = document.querySelector<HTMLElement>("[data-controller-file-status]");
+  if (fileStatus) {
+    fileStatus.hidden = !fileTransfer;
+    fileStatus.dataset.state = fileTransfer?.state ?? "";
+  }
+  const fileName = document.querySelector<HTMLElement>("[data-controller-file-name]");
+  const fileMessage = document.querySelector<HTMLElement>("[data-controller-file-message]");
+  const fileSize = document.querySelector<HTMLElement>("[data-controller-file-size]");
+  if (fileName) fileName.textContent = fileTransfer?.name ?? "";
+  if (fileMessage) fileMessage.textContent = fileTransfer?.message ?? "";
+  if (fileSize) {
+    fileSize.textContent = fileTransfer
+      ? formatTransferDetails(fileTransfer)
+      : "";
+  }
+  const progress = document.querySelector<HTMLProgressElement>("[data-controller-file-progress]");
+  if (progress) progress.value = transferPercent(fileTransfer?.transferred ?? 0, fileTransfer?.total ?? 0);
+  const cancel = document.querySelector<HTMLButtonElement>("[data-controller-file-cancel]");
+  if (cancel) cancel.hidden = !isFileTransferActive(fileTransfer?.state);
+  const retry = document.querySelector<HTMLButtonElement>("[data-controller-file-retry]");
+  if (retry) {
+    retry.hidden = !isFileTransferRetryable(fileTransfer?.state);
+    retry.innerHTML = `${icon("rotate-ccw")}${fileTransfer?.direction === "download" ? "重新获取" : "重新发送"}`;
+    renderLucideIcons(retry);
+  }
+  const sendFile = document.querySelector<HTMLButtonElement>("[data-controller-file-send]");
+  if (sendFile) {
+    sendFile.disabled = filePickerBusy;
+    sendFile.innerHTML = `${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}`;
+    renderLucideIcons(sendFile);
+  }
+  const receiveFile = document.querySelector<HTMLButtonElement>("[data-controller-file-receive]");
+  if (receiveFile) {
+    receiveFile.disabled = isFileTransferActive(fileTransfer?.state) || fileQueue.queued.length > 0;
+  }
+  if (ledger) {
+    const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
+    if (queue) {
+      queue.hidden = fileQueue.queued.length === 0;
+      queue.innerHTML = renderFileQueue();
+      renderLucideIcons(queue);
+    }
+    const history = document.querySelector<HTMLElement>("[data-controller-file-history]");
+    if (history) {
+      history.hidden = transferHistory.length === 0;
+      history.innerHTML = renderTransferHistory();
+      renderLucideIcons(history);
+    }
+    bindTransferLedgerActions();
+  }
+  updateDownloadsFolderAction();
+}
+
+function openTransferPanel(): void {
+  transferPanelOpen = true;
+  transferActivity = markTransferResultsRead(transferActivity);
+}
+
+function recordTransferHistory(
+  previous: FileTransferStatus | null,
+  next: FileTransferStatus,
+): boolean {
+  const nextSequence = transferHistorySequence + 1;
+  const updated = appendTransferHistory(
+    transferHistory,
+    previous,
+    next,
+    nextSequence,
+    Date.now(),
+  );
+  if (updated !== transferHistory) {
+    transferHistorySequence = nextSequence;
+    transferHistory = updated;
+    return true;
+  }
+  return false;
+}
+
+function scheduleTransferPanelUpdate(
+  previous: FileTransferStatus | null,
+  next: FileTransferStatus,
+  ledger: boolean,
+): void {
+  updateTransferToolbarActivity();
+  if (!transferPanelOpen) {
+    cancelScheduledTransferPanelUpdate();
+    return;
+  }
+  const nowMs = performance.now();
+  const delay = transferProgressPaintDelay(
+    previous?.state ?? null,
+    next.state,
+    lastTransferProgressPaintAtMs,
+    nowMs,
+  );
+  if (delay === 0) {
+    cancelScheduledTransferPanelUpdate();
+    lastTransferProgressPaintAtMs = nowMs;
+    updateTransferPanel({ ledger });
+    return;
+  }
+  if (transferPanelUpdateTimer !== null) {
+    return;
+  }
+  transferPanelUpdateTimer = window.setTimeout(() => {
+    transferPanelUpdateTimer = null;
+    if (!transferPanelOpen) return;
+    lastTransferProgressPaintAtMs = performance.now();
+    updateTransferPanel({ ledger: false });
+  }, delay);
+}
+
+function cancelScheduledTransferPanelUpdate(): void {
+  if (transferPanelUpdateTimer === null) return;
+  window.clearTimeout(transferPanelUpdateTimer);
+  transferPanelUpdateTimer = null;
+}
+
+function updateTransferToolbarActivity(): void {
+  const button = document.querySelector<HTMLButtonElement>("[data-controller-transfer]");
+  const badge = document.querySelector<HTMLElement>("[data-controller-transfer-activity]");
+  if (!button || !badge) return;
+  const activity = transferToolbarActivityView();
+  button.classList.toggle("toolbar-button--has-activity", activity.visible);
+  button.title = activity.title;
+  badge.hidden = !activity.visible;
+  badge.dataset.state = activity.tone;
+  badge.textContent = activity.badge;
+  badge.setAttribute("aria-label", activity.ariaLabel);
+}
+
+function updateFileTransferMetrics(status: FileTransferStatus): void {
+  if ((status.state !== "sending" && status.state !== "receiving") || status.total <= 0) {
+    fileTransferMetrics = null;
+    return;
+  }
+  fileTransferMetrics = sampleTransferMetrics(fileTransferMetrics, {
+    identity: transferIdentity(status),
+    state: status.state,
+    transferred: status.transferred,
+    total: status.total,
+  }, performance.now());
+}
+
+function transferIdentity(status: FileTransferStatus): string {
+  return `${status.direction}\u0000${status.name}\u0000${status.total}`;
+}
+
+function hasCompletedDownload(): boolean {
+  return (fileTransfer?.direction === "download" && fileTransfer.state === "completed")
+    || transferHistory.some((entry) => entry.direction === "download" && entry.state === "completed");
+}
+
+function updateDownloadsFolderAction(): void {
+  const action = document.querySelector<HTMLElement>(".remote-downloads-action");
+  const button = document.querySelector<HTMLButtonElement>("[data-controller-downloads-open]");
+  const message = document.querySelector<HTMLElement>("[data-controller-downloads-message]");
+  if (action) action.hidden = !hasCompletedDownload();
+  if (button) {
+    button.disabled = downloadsFolderBusy;
+    button.innerHTML = `${icon("folder-open")}${downloadsFolderBusy ? "正在打开…" : "打开下载文件夹"}`;
+    renderLucideIcons(button);
+  }
+  if (message) message.textContent = downloadsFolderMessage;
+}
+
+async function openDownloadsFolder(): Promise<void> {
+  if (downloadsFolderBusy) return;
+  downloadsFolderBusy = true;
+  downloadsFolderMessage = "";
+  updateDownloadsFolderAction();
+  try {
+    await openControllerDownloadsFolder();
+    downloadsFolderMessage = "已打开";
+  } catch (error) {
+    downloadsFolderMessage = normalizeError(error);
+  } finally {
+    downloadsFolderBusy = false;
+    updateDownloadsFolderAction();
+  }
+}
+
+function bindTransferLedgerActions(): void {
+  document.querySelector<HTMLButtonElement>("[data-controller-file-queue-clear]")
+    ?.addEventListener("click", () => void clearQueuedFiles());
+  document.querySelector<HTMLButtonElement>("[data-controller-file-queue-resume]")
+    ?.addEventListener("click", () => void resumeQueuedFiles());
+  document.querySelectorAll<HTMLButtonElement>("[data-controller-file-queue-remove]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const transferId = button.dataset.controllerFileQueueRemove;
+      if (transferId) void removeQueuedFile(transferId);
+    });
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-history-clear]")
+    ?.addEventListener("click", () => {
+      transferHistory = [];
+      transferActivity = markTransferResultsRead(transferActivity);
+      updateTransferPanel();
+    });
+}
+
+async function sendLocalClipboard(): Promise<void> {
+  openTransferPanel();
+  clipboardTransfer = { kind: "clipboard", state: "sending", message: "正在读取并发送本机剪贴板…" };
+  updateTransferPanel();
+  try {
+    await sendControllerClipboard();
+  } catch (error) {
+    clipboardTransfer = { kind: "clipboard", state: "failed", message: normalizeError(error) };
+    updateTransferPanel();
+  }
+}
+
+async function receiveRemoteClipboard(): Promise<void> {
+  openTransferPanel();
+  clipboardTransfer = { kind: "clipboard", state: "receiving", message: "正在读取远端剪贴板…" };
+  updateTransferPanel();
+  try {
+    await requestControllerClipboard();
+  } catch (error) {
+    clipboardTransfer = { kind: "clipboard", state: "failed", message: normalizeError(error) };
+    updateTransferPanel();
+  }
+}
+
+async function chooseFileForTransfer(): Promise<void> {
+  if (filePickerBusy) return;
+  openTransferPanel();
+  filePickerBusy = true;
+  updateTransferPanel();
+  try {
+    await chooseAndSendControllerFile();
+  } catch (error) {
+    fileTransfer = {
+      kind: "fileTransfer",
+      state: "failed",
+      direction: "upload",
+      name: "文件传输",
+      transferred: 0,
+      total: 0,
+      message: normalizeError(error),
+    };
+  } finally {
+    filePickerBusy = false;
+    updateTransferPanel();
+  }
+}
+
+async function enqueueDroppedFiles(paths: string[]): Promise<void> {
+  if (paths.length === 0) return;
+  openTransferPanel();
+  updateTransferPanel();
+  try {
+    await queueControllerFiles(paths);
+  } catch (error) {
+    showFileQueueError(error);
+  }
+}
+
+async function removeQueuedFile(transferId: string): Promise<void> {
+  try {
+    await removeControllerQueuedFile(transferId);
+  } catch (error) {
+    showFileQueueError(error);
+  }
+}
+
+async function clearQueuedFiles(): Promise<void> {
+  try {
+    await clearControllerFileQueue();
+  } catch (error) {
+    showFileQueueError(error);
+  }
+}
+
+async function resumeQueuedFiles(): Promise<void> {
+  try {
+    await resumeControllerFileQueue();
+  } catch (error) {
+    showFileQueueError(error);
+  }
+}
+
+function showFileQueueError(error: unknown): void {
+  if (!isFileTransferActive(fileTransfer?.state)) {
+    fileTransfer = {
+      kind: "fileTransfer",
+      state: "failed",
+      direction: "upload",
+      name: "文件队列",
+      transferred: 0,
+      total: 0,
+      message: normalizeError(error),
+    };
+  }
+  updateTransferPanel();
+}
+
+async function initializeNativeFileDrop(): Promise<void> {
+  if (fileDropInitialized) return;
+  fileDropInitialized = true;
+  try {
+    await getCurrentWebview().onDragDropEvent((event) => {
+      const connected = snapshot?.runtime.state === "connected";
+      if (!connected) {
+        setFileDragActive(false);
+        return;
+      }
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        setFileDragActive(true);
+      } else if (event.payload.type === "leave") {
+        setFileDragActive(false);
+      } else if (event.payload.type === "drop") {
+        setFileDragActive(false);
+        void enqueueDroppedFiles(event.payload.paths);
+      }
+    });
+  } catch {
+    fileDropInitialized = false;
+  }
+}
+
+function setFileDragActive(active: boolean): void {
+  fileDragActive = active;
+  const overlay = document.querySelector<HTMLElement>("[data-controller-file-drop-overlay]");
+  if (overlay) {
+    overlay.hidden = !active;
+  }
+}
+
+async function requestRemoteFileTransfer(): Promise<void> {
+  if (isFileTransferActive(fileTransfer?.state) || fileQueue.queued.length > 0) return;
+  openTransferPanel();
+  fileTransfer = {
+    kind: "fileTransfer",
+    state: "waiting",
+    direction: "download",
+    name: "等待远端选择文件",
+    transferred: 0,
+    total: 0,
+    message: "正在请求远端电脑选择文件…",
+  };
+  updateTransferPanel();
+  try {
+    await requestControllerRemoteFile();
+  } catch (error) {
+    fileTransfer = { ...fileTransfer, state: "failed", message: normalizeError(error) };
+    updateTransferPanel();
+  }
+}
+
+async function cancelFileTransfer(): Promise<void> {
+  if (!isFileTransferActive(fileTransfer?.state)) return;
+  try {
+    await cancelControllerFile();
+  } catch (error) {
+    fileTransfer = fileTransfer
+      ? { ...fileTransfer, state: "failed", message: normalizeError(error) }
+      : null;
+    updateTransferPanel();
+  }
+}
+
+async function retryFileTransfer(): Promise<void> {
+  if (!fileTransfer || !isFileTransferRetryable(fileTransfer.state)) return;
+  const previous = fileTransfer;
+  fileTransfer = {
+    ...previous,
+    state: "waiting",
+    transferred: 0,
+    message: previous.direction === "download"
+      ? "正在重新请求远端选择文件…"
+      : "正在重新发送，等待远端确认…",
+  };
+  updateTransferPanel();
+  try {
+    await retryControllerFile();
+  } catch (error) {
+    fileTransfer = { ...previous, state: "failed", message: normalizeError(error) };
+    updateTransferPanel();
+  }
+}
+
+function isFileTransferActive(state: FileTransferStatus["state"] | undefined): boolean {
+  return state === "waiting" || state === "sending" || state === "receiving" || state === "verifying";
+}
+
+function isFileTransferRetryable(state: FileTransferStatus["state"] | undefined): boolean {
+  return state === "failed" || state === "cancelled";
+}
+
+function formatTransferBytes(transferred: number, total: number): string {
+  if (total <= 0) return "";
+  return `${formatBytes(Math.min(transferred, total))} / ${formatBytes(total)}`;
+}
+
+function formatTransferDetails(status: FileTransferStatus): string {
+  const size = formatTransferBytes(status.transferred, status.total);
+  const metrics = status.state === "sending" || status.state === "receiving"
+    ? transferMetricsLabel(fileTransferMetrics, status.transferred, status.total)
+    : "";
+  return [size, metrics].filter(Boolean).join(" · ");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function transferPercent(transferred: number, total: number): number {
+  if (total <= 0) return transferred > 0 ? 100 : 0;
+  return Math.min(100, Math.max(0, Math.round((transferred / total) * 100)));
 }
 
 function isActiveConnectionState(state: string): boolean {
@@ -942,6 +1845,7 @@ function setupRemoteDesktop(): void {
     return;
   }
   setupRemoteGeometry(viewport, canvas);
+  scheduleRemoteScaleLayout(viewport, canvas, remoteScaleMode === "actual");
   startVideoDecoder(canvas, context, configKey, "hardware");
   bindRemoteInput(viewport, canvas);
   viewport.focus({ preventScroll: true });
@@ -1232,26 +2136,86 @@ function retryVideo(): void {
 }
 
 async function changeRemoteDisplay(displayId: number): Promise<void> {
-  if (
-    pendingRemoteDisplayId !== null
-    || displayId === activeRemoteDisplayId
-    || !remoteDisplays.some((display) => display.id === displayId)
-  ) {
+  if (!remoteDisplaySwitch.begin(
+    displayId,
+    activeRemoteDisplayId,
+    remoteDisplays.map((display) => display.id),
+  )) {
     return;
   }
-  pendingRemoteDisplayId = displayId;
-  const picker = document.querySelector<HTMLSelectElement>("[data-controller-display]");
-  if (picker) {
-    picker.disabled = true;
-    picker.value = String(displayId);
+  releaseInputState();
+  inputDispatcher.discardPendingMoves();
+  if (pointerFrame !== null) {
+    window.cancelAnimationFrame(pointerFrame);
+    pointerFrame = null;
   }
+  remoteCanvasBounds = null;
+  remoteViewportBounds = null;
+  remoteDisplaySwitchStatus = { tone: "pending", message: "正在切换远程屏幕…" };
+  updateRemoteDisplayControls();
+  clearRemoteDisplaySwitchTimer();
+  remoteDisplaySwitchTimer = window.setTimeout(() => {
+    remoteDisplaySwitchTimer = null;
+    if (remoteDisplaySwitch.fail(displayId)) {
+      remoteDisplaySwitchStatus = {
+        tone: "error",
+        message: "屏幕切换超时，仍保持当前屏幕。可以重新选择。",
+      };
+      updateRemoteDisplayControls();
+    }
+  }, 8_000);
   try {
     await selectControllerDisplay(displayId);
   } catch (error) {
-    pendingRemoteDisplayId = null;
+    if (remoteDisplaySwitch.fail(displayId)) {
+      clearRemoteDisplaySwitchTimer();
+      remoteDisplaySwitchStatus = {
+        tone: "error",
+        message: `无法切换远程屏幕：${normalizeError(error)}`,
+      };
+      updateRemoteDisplayControls();
+    }
+  }
+}
+
+async function changeVideoQuality(preference: VideoQualityPreference): Promise<void> {
+  if (
+    pendingVideoQuality !== null
+    || preference === videoQualityPreference
+    || !["automatic", "smooth", "balanced", "sharp"].includes(preference)
+  ) {
+    return;
+  }
+  pendingVideoQuality = preference;
+  const picker = document.querySelector<HTMLSelectElement>("[data-controller-video-quality]");
+  if (picker) {
+    picker.disabled = true;
+    picker.value = preference;
+  }
+  clearVideoQualityAckTimer();
+  videoQualityAckTimer = window.setTimeout(() => {
+    if (pendingVideoQuality !== preference) {
+      return;
+    }
+    pendingVideoQuality = null;
+    const currentPicker = document.querySelector<HTMLSelectElement>("[data-controller-video-quality]");
+    if (currentPicker) {
+      currentPicker.disabled = false;
+      currentPicker.value = videoQualityPreference;
+      currentPicker.setCustomValidity("目标电脑未确认新的画质档位，请稍后重试。");
+      currentPicker.reportValidity();
+      currentPicker.setCustomValidity("");
+    }
+    videoQualityAckTimer = null;
+  }, 8_000);
+  try {
+    await setControllerVideoQuality(preference);
+  } catch (error) {
+    clearVideoQualityAckTimer();
+    pendingVideoQuality = null;
     if (picker?.isConnected) {
       picker.disabled = false;
-      picker.value = String(activeRemoteDisplayId ?? "");
+      picker.value = videoQualityPreference;
       picker.setCustomValidity(normalizeError(error));
       picker.reportValidity();
       picker.setCustomValidity("");
@@ -1259,11 +2223,166 @@ async function changeRemoteDisplay(displayId: number): Promise<void> {
   }
 }
 
-const pressedKeys = new Map<string, ControllerInput>();
+function videoQualityPresetLabel(preset: VideoQualityPreset): string {
+  switch (preset) {
+    case "smooth":
+      return "流畅";
+    case "balanced":
+      return "均衡";
+    case "sharp":
+      return "清晰";
+  }
+}
+
+function changeRemoteScaleMode(value: string): void {
+  if (value !== "fit" && value !== "actual") {
+    const picker = document.querySelector<HTMLSelectElement>("[data-controller-scale]");
+    if (picker) {
+      picker.value = remoteScaleMode;
+    }
+    return;
+  }
+  const mode = normalizeRemoteScaleMode(value);
+  if (mode === remoteScaleMode) {
+    return;
+  }
+  remoteScaleMode = mode;
+  saveRemoteScaleMode(mode);
+  const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
+  const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
+  if (!viewport) {
+    return;
+  }
+  viewport.dataset.scaleMode = mode;
+  remoteCanvasBounds = null;
+  remoteViewportBounds = null;
+  if (mode === "fit") {
+    setRemotePanMode(false);
+  } else {
+    syncRemoteInteractionControls();
+  }
+  if (!canvas) {
+    return;
+  }
+  if (mode === "fit") {
+    viewport.scrollLeft = 0;
+    viewport.scrollTop = 0;
+  }
+  scheduleRemoteScaleLayout(viewport, canvas, mode === "actual");
+}
+
+function setRemotePanMode(enabled: boolean): void {
+  const next = enabled && remoteScaleMode === "actual";
+  if (next !== remotePanMode) {
+    releaseInputState();
+    inputDispatcher.discardPendingMoves();
+    if (pointerFrame !== null) {
+      window.cancelAnimationFrame(pointerFrame);
+      pointerFrame = null;
+    }
+    remotePanMode = next;
+  }
+  syncRemoteInteractionControls();
+}
+
+function syncRemoteInteractionControls(): void {
+  const available = remoteScaleMode === "actual";
+  if (!available) {
+    remotePanMode = false;
+  }
+  const button = document.querySelector<HTMLButtonElement>("[data-controller-pan]");
+  const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
+  const hint = document.querySelector<HTMLElement>("[data-remote-focus-hint]");
+  if (button) {
+    button.disabled = !available;
+    button.classList.toggle("toolbar-button--active", remotePanMode);
+    button.setAttribute("aria-pressed", String(remotePanMode));
+    button.title = available
+      ? remotePanMode
+        ? "恢复向远程电脑发送鼠标和键盘输入"
+        : "只在本地拖动或滚动画面，不会操作远程电脑"
+      : "切换到 1:1 后可以浏览超出窗口的画面";
+    button.innerHTML = `${icon("hand")}${remotePanMode ? "继续控制" : "浏览画面"}`;
+    renderLucideIcons(button);
+  }
+  if (viewport) {
+    viewport.dataset.interactionMode = remotePanMode ? "pan" : "control";
+    viewport.setAttribute(
+      "aria-label",
+      remotePanMode
+        ? "远程 Windows 桌面浏览模式。拖动画面或使用滚轮查看，点击继续控制可恢复远程输入。"
+        : "远程 Windows 桌面，点击后可发送键盘和鼠标输入。",
+    );
+  }
+  if (hint) {
+    hint.textContent = remotePanMode
+      ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑"
+      : "点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作";
+  }
+}
+
+function scheduleRemoteScaleLayout(
+  viewport: HTMLElement,
+  canvas: HTMLCanvasElement,
+  center: boolean,
+): void {
+  if (remoteScaleFrame !== null) {
+    window.cancelAnimationFrame(remoteScaleFrame);
+  }
+  remoteScaleFrame = window.requestAnimationFrame(() => {
+    remoteScaleFrame = null;
+    if (!viewport.isConnected || !canvas.isConnected) {
+      return;
+    }
+    if (center) {
+      viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
+      viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
+    }
+    remoteCanvasBounds = canvas.getBoundingClientRect();
+    remoteViewportBounds = viewport.getBoundingClientRect();
+  });
+}
+
+function clearVideoQualityAckTimer(): void {
+  if (videoQualityAckTimer !== null) {
+    window.clearTimeout(videoQualityAckTimer);
+    videoQualityAckTimer = null;
+  }
+}
+
+function clearRemoteDisplaySwitchTimer(): void {
+  if (remoteDisplaySwitchTimer !== null) {
+    window.clearTimeout(remoteDisplaySwitchTimer);
+    remoteDisplaySwitchTimer = null;
+  }
+}
+
+function clearRemoteDisplaySwitch(): void {
+  clearRemoteDisplaySwitchTimer();
+  remoteDisplaySwitch.reset();
+  remoteDisplaySwitchStatus = null;
+}
+
+function updateRemoteDisplayControls(): void {
+  const picker = document.querySelector<HTMLSelectElement>("[data-controller-display]");
+  if (picker) {
+    picker.disabled = remoteDisplaySwitch.pendingId !== null;
+    picker.value = String(remoteDisplaySwitch.pendingId ?? activeRemoteDisplayId ?? "");
+  }
+  const status = document.querySelector<HTMLElement>("[data-controller-display-status]");
+  if (status) {
+    status.hidden = remoteDisplaySwitchStatus === null;
+    status.dataset.tone = remoteDisplaySwitchStatus?.tone ?? "";
+    status.textContent = remoteDisplaySwitchStatus?.message ?? "";
+  }
+}
+
+const pressedKeys = new RemoteKeyboardState();
 const pressedButtons = new Set<"left" | "right" | "middle">();
 
 function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void {
   let pendingPoint: { x: number; y: number } | null = null;
+  let panDrag: (RemotePanOrigin & { pointerId: number }) | null = null;
   const sendPendingPoint = () => {
     if (pointerFrame !== null) {
       window.cancelAnimationFrame(pointerFrame);
@@ -1274,6 +2393,20 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       pendingPoint = null;
     }
   };
+  const discardPendingPoint = () => {
+    if (pointerFrame !== null) {
+      window.cancelAnimationFrame(pointerFrame);
+      pointerFrame = null;
+    }
+    pendingPoint = null;
+  };
+  const finishPanDrag = () => {
+    if (panDrag && viewport.hasPointerCapture(panDrag.pointerId)) {
+      viewport.releasePointerCapture(panDrag.pointerId);
+    }
+    panDrag = null;
+    delete viewport.dataset.panning;
+  };
   viewport.addEventListener("pointermove", (event) => {
     if (!pointerInsideViewport) {
       pointerInsideViewport = true;
@@ -1281,6 +2414,21 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       if (cursor) {
         cursor.hidden = true;
       }
+    }
+    if (remotePanMode) {
+      discardPendingPoint();
+      if (panDrag?.pointerId === event.pointerId) {
+        event.preventDefault();
+        const position = remotePanPosition(panDrag, event.clientX, event.clientY, {
+          clientWidth: viewport.clientWidth,
+          clientHeight: viewport.clientHeight,
+          scrollWidth: viewport.scrollWidth,
+          scrollHeight: viewport.scrollHeight,
+        });
+        viewport.scrollLeft = position.left;
+        viewport.scrollTop = position.top;
+      }
+      return;
     }
     const point = pointerPosition(event, canvas);
     if (!point) {
@@ -1302,6 +2450,24 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     pointerInsideViewport = false;
   });
   viewport.addEventListener("pointerdown", (event) => {
+    if (remotePanMode) {
+      discardPendingPoint();
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      viewport.focus({ preventScroll: true });
+      panDrag = {
+        pointerId: event.pointerId,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        scrollLeft: viewport.scrollLeft,
+        scrollTop: viewport.scrollTop,
+      };
+      viewport.dataset.panning = "true";
+      viewport.setPointerCapture(event.pointerId);
+      return;
+    }
     const button = mouseButton(event.button);
     if (!button) {
       return;
@@ -1321,6 +2487,14 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     fireInput({ kind: "mouseButton", button, pressed: true });
   });
   viewport.addEventListener("pointerup", (event) => {
+    if (panDrag?.pointerId === event.pointerId) {
+      event.preventDefault();
+      finishPanDrag();
+      return;
+    }
+    if (remotePanMode) {
+      return;
+    }
     const button = mouseButton(event.button);
     if (!button) {
       return;
@@ -1335,6 +2509,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     fireInput({ kind: "mouseButton", button, pressed: false });
   });
   const releaseCapturedInput = () => {
+    finishPanDrag();
     sendPendingPoint();
     releaseInputState();
   };
@@ -1342,6 +2517,10 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
   viewport.addEventListener("lostpointercapture", releaseCapturedInput);
   viewport.addEventListener("contextmenu", (event) => event.preventDefault());
   viewport.addEventListener("wheel", (event) => {
+    if (remotePanMode) {
+      discardPendingPoint();
+      return;
+    }
     event.preventDefault();
     sendPendingPoint();
     const deltaX = clampWheel(Math.round(event.deltaX));
@@ -1350,8 +2529,22 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       fireInput({ kind: "wheel", deltaX, deltaY });
     }
   }, { passive: false });
-  viewport.addEventListener("keydown", (event) => sendKeyboardEvent(event, true));
-  viewport.addEventListener("keyup", (event) => sendKeyboardEvent(event, false));
+  viewport.addEventListener("keydown", (event) => {
+    if (remotePanMode) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finishPanDrag();
+        setRemotePanMode(false);
+      }
+      return;
+    }
+    sendKeyboardEvent(event, true);
+  });
+  viewport.addEventListener("keyup", (event) => {
+    if (!remotePanMode) {
+      sendKeyboardEvent(event, false);
+    }
+  });
   viewport.addEventListener("blur", releaseCapturedInput);
 }
 
@@ -1364,31 +2557,30 @@ function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
     return;
   }
   event.preventDefault();
+  const physicalCode = event.code || key.key;
   if (pressed) {
-    const input: ControllerInput = {
+    const ownModifier = keyboardModifierMask(key.key);
+    const input: ControllerKeyInput = {
       kind: "key",
       key: key.key,
       character: key.character,
       pressed: true,
-      modifiers: keyboardModifiers(event),
+      modifiers: keyboardModifiers(event, pressedKeys.modifierMask() | ownModifier),
     };
-    pressedKeys.set(event.code, input);
-    fireInput(input);
-  } else {
-    const prior = pressedKeys.get(event.code);
-    if (!prior) {
-      return;
+    for (const next of pressedKeys.press(physicalCode, input)) {
+      fireInput(next);
     }
-    pressedKeys.delete(event.code);
-    fireInput({ ...prior, pressed: false, modifiers: keyboardModifiers(event) });
+  } else {
+    for (const next of pressedKeys.release(physicalCode)) {
+      fireInput(next);
+    }
   }
 }
 
 function releaseInputState(): void {
-  for (const input of pressedKeys.values()) {
-    fireInput({ ...input, pressed: false, modifiers: 0 });
+  for (const input of pressedKeys.releaseAll()) {
+    fireInput(input);
   }
-  pressedKeys.clear();
   for (const button of pressedButtons) {
     fireInput({ kind: "mouseButton", button, pressed: false });
   }
@@ -1396,7 +2588,18 @@ function releaseInputState(): void {
 }
 
 function fireInput(input: ControllerInput): void {
-  inputDispatcher.enqueue(input);
+  const streamId = snapshot?.runtime.state === "connected"
+    ? snapshot.runtime.streamId
+    : null;
+  if (streamId !== null) {
+    inputDispatcher.enqueue(input, streamId);
+  }
+}
+
+function sendRemoteKeyTap(key: string): void {
+  fireInput({ kind: "key", key, pressed: true, modifiers: 0 });
+  fireInput({ kind: "key", key, pressed: false, modifiers: 0 });
+  document.querySelector<HTMLElement>("[data-remote-viewport]")?.focus({ preventScroll: true });
 }
 
 async function submitTextInput(event: SubmitEvent): Promise<void> {
@@ -1463,10 +2666,16 @@ function updateRemoteCursor(x: number, y: number, visible: boolean): void {
   }
   const canvasBounds = remoteCanvasBounds ?? canvas.getBoundingClientRect();
   const viewportBounds = remoteViewportBounds ?? viewport.getBoundingClientRect();
-  const left = canvasBounds.left - viewportBounds.left
-    + (x / MAX_POINTER_COORDINATE) * canvasBounds.width;
-  const top = canvasBounds.top - viewportBounds.top
-    + (y / MAX_POINTER_COORDINATE) * canvasBounds.height;
+  const position = remoteCursorContentPosition(
+    x,
+    y,
+    canvasBounds,
+    viewportBounds,
+    viewport.scrollLeft,
+    viewport.scrollTop,
+  );
+  const left = position.left;
+  const top = position.top;
   cursor.style.transform = `translate3d(${left - 1}px, ${top - 1}px, 0)`;
   cursor.hidden = !visible;
 }
@@ -1481,19 +2690,42 @@ function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): 
   remoteResizeObserver = new ResizeObserver(refresh);
   remoteResizeObserver.observe(viewport);
   remoteResizeObserver.observe(canvas);
+  viewport.addEventListener("scroll", refresh, { passive: true });
 }
 
 async function toggleFullscreen(): Promise<void> {
   const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
-  if (!viewport) {
+  const session = viewport?.closest<HTMLElement>(".remote-session");
+  if (!viewport || !session) {
     return;
   }
-  if (document.fullscreenElement) {
-    await document.exitFullscreen();
-  } else {
-    await viewport.requestFullscreen();
-    viewport.focus({ preventScroll: true });
+  try {
+    if (document.fullscreenElement === session) {
+      await document.exitFullscreen();
+    } else {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+      await session.requestFullscreen();
+      viewport.focus({ preventScroll: true });
+    }
+  } catch (error) {
+    showOperationError(error);
+  } finally {
+    syncRemoteFullscreenControl();
   }
+}
+
+function syncRemoteFullscreenControl(): void {
+  const button = document.querySelector<HTMLButtonElement>("[data-controller-fullscreen]");
+  if (!button) {
+    return;
+  }
+  const active = document.fullscreenElement?.classList.contains("remote-session") === true;
+  button.setAttribute("aria-label", active ? "退出全屏" : "进入全屏");
+  button.title = active ? "退出全屏" : "进入全屏";
+  button.innerHTML = `${icon(active ? "minimize-2" : "maximize-2")}<span data-controller-fullscreen-label>${active ? "退出全屏" : "全屏"}</span>`;
+  renderLucideIcons(button);
 }
 
 function toUint8Array(payload: VideoPayload): Uint8Array {

@@ -1,6 +1,6 @@
 [package]
 name = "desklink-windows"
-version = "0.1.26"
+version = "0.1.41"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,6 +28,7 @@ tokio.workspace = true
 zeroize = "1.8"
 
 [target.'cfg(windows)'.dependencies]
+opus-head-sys = { version = "0.3.1", default-features = false }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -35,12 +36,16 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Networking_WinHttp",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_Threading",

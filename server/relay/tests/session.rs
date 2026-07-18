@@ -172,6 +172,16 @@ async fn relay_matches_host_and_controller_and_forwards_opaque_bytes() {
         next_event(&controller_client).await,
         TransportEvent::VideoConfig(config_bytes)
     );
+
+    let transfer = vec![17, 0, 42, 255];
+    controller_client
+        .send_transfer(transfer.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&host_client).await,
+        TransportEvent::Transfer(transfer)
+    );
 }
 
 #[tokio::test]

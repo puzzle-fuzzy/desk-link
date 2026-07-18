@@ -191,7 +191,9 @@ mod windows {
                     }
                     ControllerEvent::Control(_)
                     | ControllerEvent::VideoConfig(_)
-                    | ControllerEvent::Cursor(_) => {}
+                    | ControllerEvent::Cursor(_)
+                    | ControllerEvent::Audio(_)
+                    | ControllerEvent::Transfer(_) => {}
                 }
             }
         })
@@ -211,7 +213,9 @@ mod windows {
                     }
                     ControllerEvent::Control(_)
                     | ControllerEvent::VideoConfig(_)
-                    | ControllerEvent::H264AccessUnit(_) => {}
+                    | ControllerEvent::H264AccessUnit(_)
+                    | ControllerEvent::Audio(_)
+                    | ControllerEvent::Transfer(_) => {}
                 }
             }
         })
