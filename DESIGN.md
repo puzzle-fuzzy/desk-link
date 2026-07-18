@@ -69,14 +69,14 @@ components:
 
 **Creative North Star: "The Quiet Control Light"**
 
-DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. Windows and macOS use the same restrained white surface, one burnt-coral action color, four-section navigation, and semantic status colors only where state needs emphasis.
+DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. Windows and macOS use the same restrained white surface, one burnt-coral action color, remote-task-first navigation, and semantic status colors only where state needs emphasis.
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
 **Key Characteristics:**
 
 - Shared Windows/macOS information architecture with native platform behavior
-- Status-first hierarchy with plain-language recovery detail
+- Remote-task-first hierarchy with plain-language recovery detail
 - Restrained color with explicit semantic states
 - Compact trusted-device management without nested navigation
 - No decorative motion
@@ -87,7 +87,17 @@ The ordinary Windows status, connection, and trusted-device views are implemente
 
 The Tauri process owns the single-instance application lifetime, native tray, and host supervisor start/stop boundary. Capture, encoding, encrypted transport, input injection, and high-consequence approval or revocation confirmations remain in Rust/Win32. The WebView receives sanitized lifecycle summaries and is a presentation layer, not a replacement for native security or media boundaries.
 
-The macOS surface is implemented with SwiftUI and mirrors the Windows top bar, four navigation sections, status-first hierarchy, flat groups, Chinese copy, and shared semantic colors. SwiftUI owns presentation only; Keychain, Rust FFI, ScreenCaptureKit, VideoToolbox, AppKit input injection, and system permission boundaries retain their platform responsibilities.
+The macOS surface is implemented with SwiftUI and mirrors the Windows task hierarchy, flat groups, Chinese copy, and shared semantic colors. SwiftUI owns presentation only; Keychain, Rust FFI, ScreenCaptureKit, VideoToolbox, AppKit input injection, and system permission boundaries retain their platform responsibilities.
+
+## Information Architecture
+
+The remote-task-first hierarchy is ordered by the user's next remote action:
+
+连接设备 -> 最近设备 -> 共享此设备 -> 已批准设备 -> 设置 / 诊断
+
+“连接设备” is the default entry and contains the recent-device reconnect path. “共享此设备” is the desktop host flow for generating an invitation and approving or revoking controllers. “已批准设备” manages trusted devices, while “设置 / 诊断” contains permissions, host availability, and technical details. Diagnostics and local runtime metrics remain secondary and must not displace the connection task.
+
+iOS is a controller only. Its default screen is “连接设备”; it may use bottom navigation or sheets to express the same task hierarchy. iOS must not render “共享此设备” as an executable controlled-device entry. The repository has no `apps/ios` implementation, so this is a future page contract rather than an iOS build artifact.
 
 ## Colors
 
