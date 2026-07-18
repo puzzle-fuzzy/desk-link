@@ -11,6 +11,7 @@ import pwd
 import shutil
 import subprocess
 import tarfile
+import time
 import urllib.request
 
 
@@ -31,6 +32,22 @@ ANCHOR = "    location ^~ /assets/ {"
 
 def run(arguments: list[str]) -> None:
     subprocess.run(arguments, check=True)
+
+
+def wait_for_health(timeout_seconds: float = 20) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:3411/health", timeout=2
+            ) as response:
+                if response.status == 200:
+                    return
+        except Exception as error:
+            last_error = error
+        time.sleep(0.5)
+    raise RuntimeError(f"diagnostics health check failed: {last_error}")
 
 
 def ensure_user() -> None:
@@ -155,16 +172,15 @@ def install(archive: Path, release_id: str) -> dict[str, str]:
     )
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "desklink-diagnostics.service"])
-    run(["systemctl", "enable", "--now", "desklink-diagnostics-analysis.timer"])
+    run(["systemctl", "stop", "desklink-diagnostics-analysis.timer"])
     run(["systemctl", "restart", "desklink-diagnostics.service"])
     run(["systemctl", "is-active", "--quiet", "desklink-diagnostics.service"])
     run(["nginx", "-s", "reload"])
-    with urllib.request.urlopen("http://127.0.0.1:3411/health", timeout=5) as response:
-        if response.status != 200:
-            raise RuntimeError("diagnostics health check failed")
+    wait_for_health()
     run(["systemctl", "start", "desklink-diagnostics-analysis.service"])
     if not (STATE / "health-report.json").is_file():
         raise RuntimeError("diagnostics health report was not generated")
+    run(["systemctl", "enable", "--now", "desklink-diagnostics-analysis.timer"])
     archive.unlink(missing_ok=True)
     return {
         "release": release_id,
