@@ -14,12 +14,12 @@ mod windows {
         window::{PairingApprovalGate, PendingController},
     };
     use desklink_crypto::{
-        DeviceIdentity, NoiseInitiator, NoiseResponder, PairingInvite, PeerIdentity, SecureRole,
-        SecureSession, SessionId,
+        DeviceIdentity, NoiseInitiator, NoiseResponder, PairingInvite, PeerIdentity, SecureLane,
+        SecureRole, SecureSession, SessionId,
     };
     use desklink_protocol::{
-        NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, decode_noise_handshake,
-        encode_noise_handshake,
+        ControlMessage, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, decode_control,
+        decode_noise_handshake, encode_noise_handshake,
     };
     use desklink_relay::{RelayConfig, RelayServer};
     use desklink_transport::{
@@ -144,8 +144,16 @@ mod windows {
         let runtime = HostRuntime::with_authorizer(host, 1, host_identity, authorizer).unwrap();
         let host_task = tokio::spawn(async move { runtime.run().await });
 
-        let _secure = controller_handshake(&controller, controller_identity, expected_host).await;
-        tokio::time::timeout(Duration::from_secs(5), host_task)
+        let mut secure =
+            controller_handshake(&controller, controller_identity, expected_host).await;
+        let denial = controller.next_control().await.unwrap();
+        let denial = secure.open(SecureLane::Control, &denial).unwrap();
+        assert!(matches!(
+            decode_control(&denial).unwrap(),
+            ControlMessage::AccessDenied { .. }
+        ));
+        drop(controller);
+        tokio::time::timeout(Duration::from_secs(7), host_task)
             .await
             .unwrap()
             .unwrap()

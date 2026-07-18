@@ -5,12 +5,45 @@ use desklink_session::{DesktopRect, NormalizedPoint, PressedInputState, map_to_d
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VirtualDesktop {
+    /// The monitor (or desktop region) currently shown to the controller.
     pub rect: DesktopRect,
+    /// The complete Windows virtual-desktop coordinate space used by `SendInput`.
+    pub coordinate_space: DesktopRect,
 }
 
 impl VirtualDesktop {
+    pub const fn new(rect: DesktopRect, coordinate_space: DesktopRect) -> Self {
+        Self {
+            rect,
+            coordinate_space,
+        }
+    }
+
+    pub const fn single(rect: DesktopRect) -> Self {
+        Self::new(rect, rect)
+    }
+
     pub fn map(&self, point: NormalizedPoint) -> (i32, i32) {
         map_to_desktop(point, self.rect)
+    }
+
+    /// Maps a point from the captured monitor into the 0..=65535 coordinate system expected by
+    /// `SendInput(MOUSEEVENTF_VIRTUALDESK)`. These coordinate systems only differ on multi-monitor
+    /// desktops, especially when a secondary monitor is left of or above the primary monitor.
+    pub fn absolute_position(&self, point: NormalizedPoint) -> (i32, i32) {
+        let (desktop_x, desktop_y) = self.map(point);
+        (
+            absolute_axis(
+                desktop_x,
+                self.coordinate_space.left,
+                self.coordinate_space.width,
+            ),
+            absolute_axis(
+                desktop_y,
+                self.coordinate_space.top,
+                self.coordinate_space.height,
+            ),
+        )
     }
 }
 
@@ -125,6 +158,10 @@ impl<B: InputBackend> InputInjector<B> {
         }
     }
 
+    pub fn set_desktop(&mut self, desktop: VirtualDesktop) {
+        self.desktop = desktop;
+    }
+
     pub fn apply(&mut self, event: InputEvent) -> Result<(), InputInjectionError> {
         match &event {
             InputEvent::MouseMove { x, y } => {
@@ -213,6 +250,7 @@ mod native {
         VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
         VK_SHIFT, VK_TAB, VK_UP, VkKeyScanW,
     };
+    use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
     pub(super) fn send(
         event: &InputEvent,
@@ -220,14 +258,14 @@ mod native {
     ) -> Result<(), InputInjectionError> {
         let (inputs, cleanup) = match event {
             InputEvent::MouseMove { x, y } => {
-                let (desktop_x, desktop_y) = desktop.map(NormalizedPoint::new(
+                let (absolute_x, absolute_y) = desktop.absolute_position(NormalizedPoint::new(
                     *x as f32 / 1_000_000.0,
                     *y as f32 / 1_000_000.0,
                 ));
                 (
                     vec![mouse_input(
-                        absolute_axis(desktop_x, desktop.rect.left, desktop.rect.width),
-                        absolute_axis(desktop_y, desktop.rect.top, desktop.rect.height),
+                        absolute_x,
+                        absolute_y,
                         0,
                         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                     )],
@@ -268,6 +306,19 @@ mod native {
         let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } as usize;
         if sent == inputs.len() {
             return Ok(());
+        }
+        if let InputEvent::MouseMove { x, y } = event {
+            // `SendInput` can be rejected briefly while Windows switches the
+            // foreground/security desktop. A direct cursor-position fallback
+            // keeps ordinary mouse movement usable without dropping the whole
+            // encrypted session.
+            let (desktop_x, desktop_y) = desktop.map(NormalizedPoint::new(
+                *x as f32 / 1_000_000.0,
+                *y as f32 / 1_000_000.0,
+            ));
+            if unsafe { SetCursorPos(desktop_x, desktop_y) }.is_ok() {
+                return Ok(());
+            }
         }
         if let Some(cleanup) = cleanup {
             let _ = unsafe { SendInput(&cleanup, size_of::<INPUT>() as i32) };
@@ -464,9 +515,7 @@ mod tests {
 
     #[test]
     fn release_all_sends_native_key_and_button_up_before_clearing() {
-        let desktop = VirtualDesktop {
-            rect: DesktopRect::new(0, 0, 1920, 1080),
-        };
+        let desktop = VirtualDesktop::single(DesktopRect::new(0, 0, 1920, 1080));
         let mut injector = InputInjector::with_backend(desktop, RecordingBackend::default());
         injector
             .apply(InputEvent::MouseButton {
@@ -505,9 +554,7 @@ mod tests {
 
     #[test]
     fn wheel_events_are_injected_without_becoming_pressed() {
-        let desktop = VirtualDesktop {
-            rect: DesktopRect::new(0, 0, 1920, 1080),
-        };
+        let desktop = VirtualDesktop::single(DesktopRect::new(0, 0, 1920, 1080));
         let mut injector = InputInjector::with_backend(desktop, RecordingBackend::default());
         let wheel = InputEvent::MouseWheel {
             delta_x: -120,
@@ -551,10 +598,42 @@ mod tests {
     }
 
     #[test]
+    fn absolute_position_uses_the_whole_virtual_desktop_for_a_primary_monitor() {
+        let desktop = VirtualDesktop::new(
+            DesktopRect::new(0, 0, 1920, 1080),
+            DesktopRect::new(-1920, 0, 3840, 1080),
+        );
+
+        assert_eq!(
+            desktop.absolute_position(NormalizedPoint::new(0.0, 0.0)),
+            (absolute_axis(0, -1920, 3840), 0)
+        );
+        assert_eq!(
+            desktop.absolute_position(NormalizedPoint::new(1.0, 1.0)),
+            (65_535, 65_535)
+        );
+        assert!(desktop.absolute_position(NormalizedPoint::new(0.0, 0.0)).0 > 32_000);
+    }
+
+    #[test]
+    fn absolute_position_supports_a_secondary_monitor_left_of_the_primary() {
+        let desktop = VirtualDesktop::new(
+            DesktopRect::new(-1920, 0, 1920, 1080),
+            DesktopRect::new(-1920, 0, 3840, 1080),
+        );
+
+        assert_eq!(
+            desktop.absolute_position(NormalizedPoint::new(0.0, 0.0)),
+            (0, 0)
+        );
+        let (right, bottom) = desktop.absolute_position(NormalizedPoint::new(1.0, 1.0));
+        assert!(right > 32_000 && right < 33_000);
+        assert_eq!(bottom, 65_535);
+    }
+
+    #[test]
     fn release_all_retains_unsent_inputs_when_native_injection_is_blocked() {
-        let desktop = VirtualDesktop {
-            rect: DesktopRect::new(0, 0, 1920, 1080),
-        };
+        let desktop = VirtualDesktop::single(DesktopRect::new(0, 0, 1920, 1080));
         let mut injector = InputInjector::with_backend(desktop, RecordingBackend::default());
         injector
             .apply(InputEvent::MouseButton {

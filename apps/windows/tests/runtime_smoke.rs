@@ -81,6 +81,7 @@ mod windows {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires access to the interactive Windows desktop"]
     async fn local_relay_windows_pairing_persists_trust_and_connection_for_reconnect() {
         let relay = spawn_test_relay().await;
         let config = || {

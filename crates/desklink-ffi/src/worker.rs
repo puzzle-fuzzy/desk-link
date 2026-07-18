@@ -534,7 +534,8 @@ fn controller_error_is_retryable(error: &ControllerError) -> bool {
         | ControllerError::InvalidHostCapabilities
         | ControllerError::InconsistentVideoConfig
         | ControllerError::NoActiveStream
-        | ControllerError::UnexpectedTransportLane => false,
+        | ControllerError::UnexpectedTransportLane
+        | ControllerError::AccessDenied(_) => false,
     }
 }
 
@@ -544,7 +545,9 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::ConnectionLimit
         | TransportError::Stream(_)
         | TransportError::Datagram(_)
-        | TransportError::Closed => true,
+        | TransportError::Closed
+        | TransportError::PeerDisconnected
+        | TransportError::PeerReplaced => true,
         TransportError::JoinRejected(code) => matches!(
             code,
             JoinRejectCode::SessionNotFound

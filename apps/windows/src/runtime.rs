@@ -11,15 +11,16 @@ use desklink_crypto::{
     SecureSession,
 };
 use desklink_protocol::{
-    Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEvent,
-    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, VideoConfig,
-    decode_control, decode_input, decode_noise_handshake, encode_control, encode_cursor_update,
-    encode_noise_handshake, encode_video_config, encode_video_packet,
+    AccessDenialReason, Codec, ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole,
+    FrameFlags, InputEvent, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake,
+    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, VideoConfig,
+    decode_control, decode_noise_handshake, decode_session_input, encode_control,
+    encode_cursor_update, encode_noise_handshake, encode_video_config, encode_video_packet,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
     JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryRegistration, RelayJoin,
-    TransportError, TransportEvent,
+    TransportError,
 };
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, packetize_frame};
 use ed25519_dalek::VerifyingKey;
@@ -28,7 +29,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use zeroize::Zeroizing;
 
 use crate::{
-    capture::{CaptureError, CapturedFrame, DesktopCapturer, DxgiDesktopCapturer},
+    capture::{
+        CaptureError, CapturedFrame, DesktopCapturer, DxgiDesktopCapturer, available_displays,
+        display_topology,
+    },
     encoder::{EncodedFrame, EncoderError, H264Encoder, fit_h264_dimensions},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
     window::ApprovalState,
@@ -40,6 +44,7 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 // The authenticated handshake includes the native local-approval dialog. Give
 // the person at the host enough time to inspect and approve the controller.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
+const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,7 +227,7 @@ impl HostSupervisor {
                 stream_id,
             });
             let stable = AtomicBool::new(false);
-            let outcome = self.run_attempt(stream_id, &stable).await;
+            let outcome = self.run_attempt(&mut stream_id, &stable).await;
             let error = match outcome {
                 Ok(()) => return Ok(()),
                 Err(error)
@@ -302,10 +307,10 @@ impl HostSupervisor {
 
     async fn run_attempt(
         &self,
-        stream_id: u64,
+        stream_id: &mut u64,
         stable: &AtomicBool,
     ) -> Result<(), HostRuntimeError> {
-        let client = QuicClient::connect(self.transport.clone()).await?;
+        let client = Arc::new(QuicClient::connect(self.transport.clone()).await?);
         let mut join = RelayJoin::host_with_participant(
             self.session_id,
             *self.relay_authentication,
@@ -315,13 +320,39 @@ impl HostSupervisor {
             join = join.with_directory_registration(registration.clone())?;
         }
         client.join(join).await?;
-        self.publish(HostLifecycleEvent::Available { stream_id });
-        let identity = DeviceIdentity::from_secret_key(self.host_device_id, &self.host_secret_key);
-        HostRuntime::with_authorizer(client, stream_id, identity, self.authorizer.clone())?
+        self.publish(HostLifecycleEvent::Available {
+            stream_id: *stream_id,
+        });
+        loop {
+            let identity =
+                DeviceIdentity::from_secret_key(self.host_device_id, &self.host_secret_key);
+            let outcome = HostRuntime::with_shared_authorizer(
+                client.clone(),
+                *stream_id,
+                identity,
+                self.authorizer.clone(),
+            )?
             .run_tracking_stability(stable, |stream_id| {
                 self.publish(HostLifecycleEvent::Connected { stream_id });
             })
-            .await
+            .await;
+            match outcome {
+                Err(error)
+                    if self.expires_at_unix_s.is_none()
+                        && host_error_rearms_on_connected_relay(&error) =>
+                {
+                    client.reset_reliable_channels().await;
+                    *stream_id = stream_id
+                        .checked_add(1)
+                        .filter(|stream_id| *stream_id != 0)
+                        .ok_or(HostRuntimeError::InvalidControllerCapabilities)?;
+                    self.publish(HostLifecycleEvent::Available {
+                        stream_id: *stream_id,
+                    });
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     fn publish(&self, event: HostLifecycleEvent) {
@@ -344,15 +375,19 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         | HostRuntimeError::Protocol(_)
         | HostRuntimeError::Crypto(_)
         | HostRuntimeError::InvalidControllerCapabilities
-        | HostRuntimeError::UnexpectedHandshakeStep => true,
-        HostRuntimeError::Capture(_)
+        | HostRuntimeError::UnexpectedHandshakeStep
+        // Capture, encoding, and input backends belong to the current interactive Windows
+        // desktop. Display changes, driver resets, lock/unlock, and RDP transitions can make one
+        // controller attempt fail without invalidating the host configuration. Rebuild the
+        // complete runtime instead of permanently stopping the host service.
+        | HostRuntimeError::Capture(_)
         | HostRuntimeError::InvalidDimensions
         | HostRuntimeError::InconsistentVideoConfig
         | HostRuntimeError::Encoder(_)
         | HostRuntimeError::Input(_)
         | HostRuntimeError::CaptureWorkerStopped
-        | HostRuntimeError::CaptureWorkerPanicked
-        | HostRuntimeError::ApprovalRequired
+        | HostRuntimeError::CaptureWorkerPanicked => true,
+        HostRuntimeError::ApprovalRequired
         | HostRuntimeError::PairingRejected
         | HostRuntimeError::PairingExpired
         | HostRuntimeError::AuthorizationBackend(_) => false,
@@ -364,7 +399,10 @@ fn host_error_is_retryable_for_session(error: &HostRuntimeError, persistent_sess
         || (persistent_session
             && matches!(
                 error,
-                HostRuntimeError::ApprovalRequired | HostRuntimeError::PairingRejected
+                HostRuntimeError::ApprovalRequired
+                    | HostRuntimeError::PairingRejected
+                    | HostRuntimeError::PairingExpired
+                    | HostRuntimeError::AuthorizationBackend(_)
             ))
 }
 
@@ -375,6 +413,8 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::Stream(_)
         | TransportError::Datagram(_)
         | TransportError::Closed
+        | TransportError::PeerDisconnected
+        | TransportError::PeerReplaced
         | TransportError::Malformed => true,
         TransportError::JoinRejected(code) => matches!(
             code,
@@ -391,6 +431,22 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::DirectoryRateLimited
         | TransportError::InvalidConfig(_) => false,
     }
+}
+
+fn host_error_rearms_on_connected_relay(error: &HostRuntimeError) -> bool {
+    !matches!(
+        error,
+        HostRuntimeError::TransportClosed(_)
+            | HostRuntimeError::Transport(
+                TransportError::Connection(_)
+                    | TransportError::ConnectionLimit
+                    | TransportError::Closed
+                    | TransportError::JoinRejected(_)
+                    | TransportError::NotJoined
+                    | TransportError::AlreadyJoined
+                    | TransportError::InvalidConfig(_)
+            )
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -519,6 +575,13 @@ impl HostVideoPipeline {
 pub struct HostInboundPolicy {
     stream_id: u64,
     last_input_sequence: u64,
+    input_clock_anchor: Option<InputClockAnchor>,
+}
+
+#[derive(Clone, Copy)]
+struct InputClockAnchor {
+    remote_us: u64,
+    local_us: u64,
 }
 
 impl HostInboundPolicy {
@@ -526,6 +589,7 @@ impl HostInboundPolicy {
         Self {
             stream_id,
             last_input_sequence: 0,
+            input_clock_anchor: None,
         }
     }
 
@@ -541,12 +605,43 @@ impl HostInboundPolicy {
         bytes: &[u8],
         now_us: u64,
     ) -> Result<Option<InputEvent>, HostRuntimeError> {
-        let envelope = decode_input(bytes, now_us)?;
+        let envelope = decode_session_input(bytes)?;
         if !sequence_is_newer(envelope.sequence, self.last_input_sequence) {
             return Ok(None);
         }
+        if !self.input_timestamp_is_fresh(envelope.timestamp_us, now_us) {
+            // A Windows time synchronization, resume from sleep, or manual clock
+            // correction must not tear down the authenticated remote session.
+            // Re-anchor on the newest sequence; sequence ordering still rejects
+            // every replay within this secure session.
+            self.input_clock_anchor = Some(InputClockAnchor {
+                remote_us: envelope.timestamp_us,
+                local_us: now_us,
+            });
+        }
         self.last_input_sequence = envelope.sequence;
         Ok(Some(envelope.event))
+    }
+
+    fn input_timestamp_is_fresh(&mut self, remote_us: u64, local_us: u64) -> bool {
+        let Some(anchor) = self.input_clock_anchor else {
+            self.input_clock_anchor = Some(InputClockAnchor {
+                remote_us,
+                local_us,
+            });
+            return true;
+        };
+        let mapped_local_us = if remote_us >= anchor.remote_us {
+            anchor
+                .local_us
+                .saturating_add(remote_us.saturating_sub(anchor.remote_us))
+        } else {
+            anchor
+                .local_us
+                .saturating_sub(anchor.remote_us.saturating_sub(remote_us))
+        };
+        mapped_local_us >= local_us.saturating_sub(MAX_INPUT_AGE_US)
+            && mapped_local_us <= local_us.saturating_add(MAX_INPUT_FUTURE_SKEW_US)
     }
 }
 
@@ -557,7 +652,7 @@ pub fn next_frame_with_recovery<C: DesktopCapturer>(
     match capture.next_frame(timeout) {
         Ok(frame) => Ok(CaptureOutcome::Frame(frame)),
         Err(CaptureError::Timeout) => Ok(CaptureOutcome::Idle),
-        Err(CaptureError::AccessLost) => {
+        Err(CaptureError::AccessLost | CaptureError::Native(_)) => {
             capture.recover()?;
             Ok(CaptureOutcome::Recovered)
         }
@@ -635,11 +730,20 @@ impl HostRuntime {
         identity: DeviceIdentity,
         authorizer: Arc<dyn ControllerAuthorizer>,
     ) -> Result<Self, HostRuntimeError> {
+        Self::with_shared_authorizer(Arc::new(client), stream_id, identity, authorizer)
+    }
+
+    pub fn with_shared_authorizer(
+        client: Arc<QuicClient>,
+        stream_id: u64,
+        identity: DeviceIdentity,
+        authorizer: Arc<dyn ControllerAuthorizer>,
+    ) -> Result<Self, HostRuntimeError> {
         if stream_id == 0 {
             return Err(HostRuntimeError::InvalidControllerCapabilities);
         }
         Ok(Self {
-            client: Arc::new(client),
+            client,
             stream_id,
             identity,
             authorizer,
@@ -662,76 +766,91 @@ impl HostRuntime {
             identity,
             authorizer,
         } = self;
-        let secure = Arc::new(AsyncMutex::new(
-            perform_noise_handshake(&client, identity, authorizer.as_ref()).await?,
-        ));
+        let (secure, peer_generation) =
+            perform_noise_handshake(&client, identity, authorizer.as_ref()).await?;
+        let secure = Arc::new(AsyncMutex::new(secure));
         let force_keyframe = Arc::new(AtomicBool::new(true));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let video_queue = Arc::new(Mutex::new(LatestFrameQueue::new(VIDEO_QUEUE_CAPACITY)));
-        let video_notify = Arc::new(Notify::new());
-        let shutdown_guard = RuntimeShutdown {
-            shutdown: shutdown.clone(),
-            video_notify: video_notify.clone(),
-        };
-        let (ready_sender, ready_receiver) = oneshot::channel();
-        let (worker_sender, worker_receiver) = oneshot::channel();
-        let (start_sender, start_receiver) = std::sync::mpsc::sync_channel(0);
-        let worker_shutdown = shutdown.clone();
-        let worker_force = force_keyframe.clone();
-        let worker_queue = video_queue.clone();
-        let worker_notify = video_notify.clone();
-        let capture_worker = std::thread::Builder::new()
-            .name("desklink-capture".into())
-            .spawn(move || {
-                let result = capture_worker_entry(
-                    ready_sender,
-                    start_receiver,
-                    worker_queue,
-                    worker_notify,
-                    worker_force,
-                    worker_shutdown,
-                );
-                let _ = worker_sender.send(result);
-            })
-            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-        let ready = match ready_receiver.await {
-            Ok(Ok(ready)) => ready,
-            Ok(Err(error)) => {
-                let _ = capture_worker.join();
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = capture_worker.join();
-                return Err(HostRuntimeError::CaptureWorkerStopped);
-            }
-        };
-        if let Err(error) = negotiate_controller(
+        // The controller sends its encrypted capabilities immediately after
+        // finishing Noise. Consume and authenticate them before creating the
+        // capture stack or sending anything back. This proves the approved
+        // controller attempt is still the active peer and prevents late
+        // approval from writing old ciphertext into a replacement connection.
+        receive_controller_capabilities(
             &client,
             &secure,
-            ready.width,
-            ready.height,
+            peer_generation,
             force_keyframe.clone(),
             stream_id,
         )
+        .await?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let video_queue = Arc::new(Mutex::new(LatestFrameQueue::new(VIDEO_QUEUE_CAPACITY)));
+        let video_notify = Arc::new(Notify::new());
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (worker_sender, worker_receiver) = oneshot::channel();
+        let (start_sender, start_receiver) = std::sync::mpsc::sync_channel(0);
+        let (capture_command_sender, capture_command_receiver) = std::sync::mpsc::channel();
+        let selected_desktop = Arc::new(Mutex::new(SelectedDesktop {
+            display_id: 0,
+            desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
+        }));
+        let capture_context = CaptureWorkerContext {
+            commands: capture_command_receiver,
+            queue: video_queue.clone(),
+            notify: video_notify.clone(),
+            force_keyframe: force_keyframe.clone(),
+            shutdown: shutdown.clone(),
+            selected_desktop: selected_desktop.clone(),
+        };
+        let capture_thread = std::thread::Builder::new()
+            .name("desklink-capture".into())
+            .spawn(move || {
+                let result = capture_worker_entry(ready_sender, start_receiver, capture_context);
+                let _ = worker_sender.send(result);
+            })
+            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+        let mut capture_worker = CaptureWorkerGuard::new(
+            start_sender,
+            capture_thread,
+            shutdown.clone(),
+            video_notify.clone(),
+        );
+        let ready = match ready_receiver.await {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                let _ = send_host_unavailable(&client, &secure, peer_generation).await;
+                let _ = capture_worker.shutdown_and_join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = send_host_unavailable(&client, &secure, peer_generation).await;
+                let _ = capture_worker.shutdown_and_join();
+                return Err(HostRuntimeError::CaptureWorkerStopped);
+            }
+        };
+        if let Err(error) = send_host_capabilities(
+            &client,
+            &secure,
+            peer_generation,
+            ready.width,
+            ready.height,
+            &ready.displays,
+            ready.active_display_id,
+        )
         .await
         {
-            drop(start_sender);
-            shutdown.store(true, Ordering::Release);
-            let _ = capture_worker.join();
+            let _ = capture_worker.shutdown_and_join();
             return Err(error);
         }
-        start_sender
-            .send(())
-            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-        let input = InputInjector::new(VirtualDesktop {
-            rect: ready.desktop,
-        });
+        capture_worker.start()?;
+        let input = InputInjector::new(VirtualDesktop::new(ready.desktop, ready.coordinate_space));
         stable.store(true, Ordering::Release);
         on_connected(stream_id);
 
         let mut video = Box::pin(send_video_loop(
             client.clone(),
             secure.clone(),
+            peer_generation,
             stream_id,
             video_queue,
             video_notify.clone(),
@@ -740,11 +859,23 @@ impl HostRuntime {
         let mut inbound = Box::pin(receive_input_and_control(
             client.clone(),
             secure.clone(),
+            peer_generation,
             stream_id,
             input,
             force_keyframe,
+            HostInboundContext {
+                capture_commands: capture_command_sender,
+                selected_desktop: selected_desktop.clone(),
+                displays: Arc::new(ready.displays),
+            },
         ));
-        let mut cursor = Box::pin(send_cursor_loop(client, secure, stream_id, ready.desktop));
+        let mut cursor = Box::pin(send_cursor_loop(
+            client.clone(),
+            secure.clone(),
+            peer_generation,
+            stream_id,
+            selected_desktop,
+        ));
         let mut worker_receiver = Box::pin(worker_receiver);
 
         let outcome = tokio::select! {
@@ -753,37 +884,120 @@ impl HostRuntime {
             result = &mut cursor => result,
             result = &mut worker_receiver => result.unwrap_or(Err(HostRuntimeError::CaptureWorkerStopped)),
         };
-        shutdown.store(true, Ordering::Release);
-        video_notify.notify_waiters();
         drop(video);
         drop(inbound);
         drop(cursor);
         drop(worker_receiver);
-        if capture_worker.join().is_err() {
-            return Err(HostRuntimeError::CaptureWorkerPanicked);
+        let outcome = match capture_worker.shutdown_and_join() {
+            Ok(()) => outcome,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &outcome
+            && let Some(reason) = host_runtime_denial_reason(error)
+        {
+            // This message uses the already authenticated end-to-end encrypted control lane.
+            // The controller can stop retrying and show an actionable local-backend failure
+            // instead of misreporting the intentional host rearm as a network disconnect.
+            let _ = send_runtime_failure(&client, &secure, peer_generation, reason).await;
         }
-        drop(shutdown_guard);
         outcome
     }
 }
 
-struct RuntimeShutdown {
+struct CaptureWorkerGuard {
+    start: Option<std::sync::mpsc::SyncSender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
     video_notify: Arc<Notify>,
 }
 
-impl Drop for RuntimeShutdown {
-    fn drop(&mut self) {
+impl CaptureWorkerGuard {
+    fn new(
+        start: std::sync::mpsc::SyncSender<()>,
+        thread: std::thread::JoinHandle<()>,
+        shutdown: Arc<AtomicBool>,
+        video_notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            start: Some(start),
+            thread: Some(thread),
+            shutdown,
+            video_notify,
+        }
+    }
+
+    fn start(&mut self) -> Result<(), HostRuntimeError> {
+        self.start
+            .take()
+            .ok_or(HostRuntimeError::CaptureWorkerStopped)?
+            .send(())
+            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)
+    }
+
+    fn signal_shutdown(&mut self) {
+        // Dropping the start sender also releases a worker that is still waiting
+        // between capture initialization and capability negotiation.
+        self.start.take();
         self.shutdown.store(true, Ordering::Release);
         self.video_notify.notify_waiters();
     }
+
+    fn shutdown_and_join(mut self) -> Result<(), HostRuntimeError> {
+        self.signal_shutdown();
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| HostRuntimeError::CaptureWorkerPanicked)
+    }
+}
+
+impl Drop for CaptureWorkerGuard {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CaptureWorkerReady {
+    desktop: DesktopRect,
+    coordinate_space: DesktopRect,
+    width: u32,
+    height: u32,
+    displays: Vec<RemoteDisplay>,
+    active_display_id: u32,
 }
 
 #[derive(Clone, Copy)]
-struct CaptureWorkerReady {
-    desktop: DesktopRect,
-    width: u32,
-    height: u32,
+struct SelectedDesktop {
+    display_id: u32,
+    desktop: VirtualDesktop,
+}
+
+enum CaptureWorkerCommand {
+    SelectDisplay {
+        display_id: u32,
+        reply: oneshot::Sender<bool>,
+    },
+}
+
+struct CaptureWorkerContext {
+    commands: std::sync::mpsc::Receiver<CaptureWorkerCommand>,
+    queue: Arc<Mutex<LatestFrameQueue<EncodedDesktopFrame>>>,
+    notify: Arc<Notify>,
+    force_keyframe: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    selected_desktop: Arc<Mutex<SelectedDesktop>>,
+}
+
+struct HostInboundContext {
+    capture_commands: std::sync::mpsc::Sender<CaptureWorkerCommand>,
+    selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    displays: Arc<Vec<RemoteDisplay>>,
 }
 
 type SharedSecureSession = Arc<AsyncMutex<SecureSession>>;
@@ -792,48 +1006,147 @@ async fn perform_noise_handshake(
     client: &QuicClient,
     identity: DeviceIdentity,
     authorizer: &dyn ControllerAuthorizer,
-) -> Result<SecureSession, HostRuntimeError> {
+) -> Result<(SecureSession, u64), HostRuntimeError> {
     // An idle host is already online at the relay. Waiting for the first controller message is
     // therefore not a failed handshake and must not churn the relay session or the UI state.
-    let first = decode_noise_handshake(&client.next_control().await?)?;
-    if first.step != NoiseHandshakeStep::InitiatorHello {
-        return Err(HostRuntimeError::UnexpectedHandshakeStep);
-    }
+    let (peer_generation, first) = next_initiator_hello(client).await?;
     let handshake = async {
         let (mut responder, response) = match authorizer.pinned_verify_key() {
             Some(expected) => NoiseResponder::accept(&first.payload, identity, expected)?,
             None => NoiseResponder::accept_pairing(&first.payload, identity)?,
         };
         client
-            .send_control(encode_noise_handshake(&NoiseHandshake {
-                protocol_version: PROTOCOL_VERSION,
-                step: NoiseHandshakeStep::ResponderHello,
-                payload: response,
-            })?)
+            .send_control_for_generation(
+                peer_generation,
+                encode_noise_handshake(&NoiseHandshake {
+                    protocol_version: PROTOCOL_VERSION,
+                    step: NoiseHandshakeStep::ResponderHello,
+                    payload: response,
+                })?,
+            )
             .await?;
 
-        let finish = decode_noise_handshake(&client.next_control().await?)?;
+        let finish =
+            decode_noise_handshake(&client.next_control_for_generation(peer_generation).await?)?;
         if finish.step != NoiseHandshakeStep::InitiatorFinish {
             return Err(HostRuntimeError::UnexpectedHandshakeStep);
         }
         responder.receive(&finish.payload)?;
-        let secure = responder
+        let mut secure = responder
             .finish()?
             .into_secure_session(SecureRole::Responder);
         match authorizer
             .authorize(secure.peer_identity())
             .map_err(HostRuntimeError::AuthorizationBackend)?
         {
-            ControllerAuthorization::Authorized => Ok(secure),
-            ControllerAuthorization::Unknown => Err(HostRuntimeError::UntrustedController),
-            ControllerAuthorization::KeyChanged => Err(HostRuntimeError::ControllerKeyChanged),
-            ControllerAuthorization::Rejected => Err(HostRuntimeError::PairingRejected),
-            ControllerAuthorization::Expired => Err(HostRuntimeError::PairingExpired),
+            ControllerAuthorization::Authorized => Ok((secure, peer_generation)),
+            ControllerAuthorization::Unknown => {
+                send_access_denied(
+                    client,
+                    peer_generation,
+                    &mut secure,
+                    AccessDenialReason::ControllerNotTrusted,
+                )
+                .await?;
+                Err(HostRuntimeError::UntrustedController)
+            }
+            ControllerAuthorization::KeyChanged => {
+                send_access_denied(
+                    client,
+                    peer_generation,
+                    &mut secure,
+                    AccessDenialReason::ControllerIdentityChanged,
+                )
+                .await?;
+                Err(HostRuntimeError::ControllerKeyChanged)
+            }
+            ControllerAuthorization::Rejected => {
+                send_access_denied(
+                    client,
+                    peer_generation,
+                    &mut secure,
+                    AccessDenialReason::ApprovalRejected,
+                )
+                .await?;
+                Err(HostRuntimeError::PairingRejected)
+            }
+            ControllerAuthorization::Expired => {
+                send_access_denied(
+                    client,
+                    peer_generation,
+                    &mut secure,
+                    AccessDenialReason::ApprovalExpired,
+                )
+                .await?;
+                Err(HostRuntimeError::PairingExpired)
+            }
         }
     };
     tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| HostRuntimeError::HandshakeTimeout)?
+}
+
+async fn next_initiator_hello(
+    client: &QuicClient,
+) -> Result<(u64, NoiseHandshake), HostRuntimeError> {
+    const MAX_STALE_MESSAGES: usize = 32;
+    let mut stale_messages = 0;
+    loop {
+        match client.next_control_with_generation().await {
+            Ok((peer_generation, payload)) => match decode_noise_handshake(&payload) {
+                Ok(handshake) if handshake.step == NoiseHandshakeStep::InitiatorHello => {
+                    return Ok((peer_generation, handshake));
+                }
+                Ok(_) | Err(_) => {
+                    // Messages queued by an already disconnected controller
+                    // are not allowed to take the durable host offline. Drain
+                    // a bounded stale generation and then rearm the peer lanes.
+                    stale_messages += 1;
+                    if stale_messages >= MAX_STALE_MESSAGES {
+                        client.reset_reliable_channels().await;
+                        return Err(HostRuntimeError::UnexpectedHandshakeStep);
+                    }
+                }
+            },
+            Err(TransportError::PeerDisconnected) => {
+                client.reset_reliable_channels().await;
+                stale_messages = 0;
+            }
+            Err(error) => return Err(HostRuntimeError::Transport(error)),
+        }
+    }
+}
+
+async fn send_access_denied(
+    client: &QuicClient,
+    peer_generation: u64,
+    secure: &mut SecureSession,
+    reason: AccessDenialReason,
+) -> Result<(), HostRuntimeError> {
+    let plaintext = encode_control(&ControlMessage::AccessDenied { reason })?;
+    let ciphertext = secure.seal(SecureLane::Control, &plaintext)?;
+    client
+        .send_control_for_generation(peer_generation, ciphertext)
+        .await?;
+    let disconnected = async {
+        loop {
+            match client.next_control_for_generation(peer_generation).await {
+                Ok(_) => {}
+                Err(TransportError::PeerDisconnected | TransportError::PeerReplaced) => {
+                    return Ok(());
+                }
+                Err(error) => return Err(HostRuntimeError::Transport(error)),
+            }
+        }
+    };
+    tokio::time::timeout(DENIAL_DISCONNECT_TIMEOUT, disconnected)
+        .await
+        .map_err(|_| {
+            HostRuntimeError::Transport(TransportError::Connection(
+                "controller did not close after access denial".to_owned(),
+            ))
+        })?
 }
 
 async fn seal(
@@ -855,11 +1168,35 @@ async fn open(
 fn capture_worker_entry(
     ready: oneshot::Sender<Result<CaptureWorkerReady, HostRuntimeError>>,
     start: std::sync::mpsc::Receiver<()>,
-    queue: Arc<Mutex<LatestFrameQueue<EncodedDesktopFrame>>>,
-    notify: Arc<Notify>,
-    force_keyframe: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
+    context: CaptureWorkerContext,
 ) -> Result<(), HostRuntimeError> {
+    let display_descriptors = match available_displays() {
+        Ok(displays) => displays,
+        Err(error) => {
+            let _ = ready.send(Err(HostRuntimeError::Capture(error)));
+            return Ok(());
+        }
+    };
+    let displays = match display_descriptors
+        .iter()
+        .map(|display| {
+            Ok(RemoteDisplay {
+                id: display.id,
+                width: u16::try_from(display.rect.width)
+                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
+                height: u16::try_from(display.rect.height)
+                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
+                primary: display.primary,
+            })
+        })
+        .collect::<Result<Vec<_>, HostRuntimeError>>()
+    {
+        Ok(displays) => displays,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return Ok(());
+        }
+    };
     let capture = match DxgiDesktopCapturer::new_primary() {
         Ok(capture) => capture,
         Err(error) => {
@@ -882,52 +1219,52 @@ fn capture_worker_entry(
             return Ok(());
         }
     };
+    let coordinate_space = match display_topology() {
+        Ok(topology) => topology.virtual_desktop,
+        Err(error) => {
+            let _ = ready.send(Err(HostRuntimeError::Capture(error)));
+            return Ok(());
+        }
+    };
+    let active_display_id = capture.display_id();
+    *lock_unpoisoned(&context.selected_desktop) = SelectedDesktop {
+        display_id: active_display_id,
+        desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
+    };
     let worker_ready = CaptureWorkerReady {
         desktop: capture.desktop_rect(),
+        coordinate_space,
         width,
         height,
+        displays,
+        active_display_id,
     };
     if ready.send(Ok(worker_ready)).is_err() || start.recv().is_err() {
         return Ok(());
     }
-    capture_encode_loop(capture, encoder, queue, notify, force_keyframe, shutdown)
+    capture_encode_loop(capture, encoder, context, coordinate_space)
 }
 
-async fn negotiate_controller(
+async fn receive_controller_capabilities(
     client: &QuicClient,
     secure: &SharedSecureSession,
-    width: u32,
-    height: u32,
+    peer_generation: u64,
     force_keyframe: Arc<AtomicBool>,
     stream_id: u64,
 ) -> Result<(), HostRuntimeError> {
-    let width = u16::try_from(width).map_err(|_| HostRuntimeError::InvalidDimensions)?;
-    let height = u16::try_from(height).map_err(|_| HostRuntimeError::InvalidDimensions)?;
-    let hello = encode_control(&ControlMessage::Hello {
-        platform: Platform::Windows,
-        role: DeviceRole::Host,
-    })?;
-    client
-        .send_control(seal(secure, SecureLane::Control, &hello).await?)
-        .await?;
-    let capabilities = encode_control(&ControlMessage::Capabilities(DeviceCapabilities {
-        platform: Platform::Windows,
-        role: DeviceRole::Host,
-        codecs: vec![Codec::H264],
-        width,
-        height,
-    }))?;
-    client
-        .send_control(seal(secure, SecureLane::Control, &capabilities).await?)
-        .await?;
-
     let negotiation = async {
+        let mut received_controller_hello = false;
         loop {
-            let encrypted = client.next_control().await?;
+            let encrypted = client.next_control_for_generation(peer_generation).await?;
             let plaintext = open(secure, SecureLane::Control, &encrypted).await?;
             match decode_control(&plaintext)? {
+                ControlMessage::Hello {
+                    role: DeviceRole::Controller,
+                    ..
+                } => received_controller_hello = true,
                 ControlMessage::Capabilities(capabilities)
-                    if capabilities.role == DeviceRole::Controller
+                    if received_controller_hello
+                        && capabilities.role == DeviceRole::Controller
                         && capabilities.codecs.contains(&Codec::H264) =>
                 {
                     return Ok(());
@@ -940,7 +1277,13 @@ async fn negotiate_controller(
                 } if requested_stream == stream_id => {
                     force_keyframe.store(true, Ordering::Release);
                 }
-                ControlMessage::Hello { .. } | ControlMessage::RequestKeyframe { .. } => {}
+                ControlMessage::AccessDenied { .. } => {
+                    return Err(HostRuntimeError::InvalidControllerCapabilities);
+                }
+                ControlMessage::Hello { .. }
+                | ControlMessage::RequestKeyframe { .. }
+                | ControlMessage::DisplayList { .. }
+                | ControlMessage::SelectDisplay { .. } => {}
             }
         }
     };
@@ -949,15 +1292,163 @@ async fn negotiate_controller(
         .map_err(|_| HostRuntimeError::NegotiationTimeout)?
 }
 
+async fn send_host_capabilities(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    width: u32,
+    height: u32,
+    displays: &[RemoteDisplay],
+    active_display_id: u32,
+) -> Result<(), HostRuntimeError> {
+    let width = u16::try_from(width).map_err(|_| HostRuntimeError::InvalidDimensions)?;
+    let height = u16::try_from(height).map_err(|_| HostRuntimeError::InvalidDimensions)?;
+    let hello = encode_control(&ControlMessage::Hello {
+        platform: Platform::Windows,
+        role: DeviceRole::Host,
+    })?;
+    client
+        .send_control_for_generation(
+            peer_generation,
+            seal(secure, SecureLane::Control, &hello).await?,
+        )
+        .await?;
+    let capabilities = encode_control(&ControlMessage::Capabilities(DeviceCapabilities {
+        platform: Platform::Windows,
+        role: DeviceRole::Host,
+        codecs: vec![Codec::H264],
+        width,
+        height,
+    }))?;
+    client
+        .send_control_for_generation(
+            peer_generation,
+            seal(secure, SecureLane::Control, &capabilities).await?,
+        )
+        .await?;
+    send_display_list(client, secure, peer_generation, displays, active_display_id).await?;
+    Ok(())
+}
+
+async fn send_display_list(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    displays: &[RemoteDisplay],
+    active_display_id: u32,
+) -> Result<(), HostRuntimeError> {
+    let message = encode_control(&ControlMessage::DisplayList {
+        displays: displays.to_vec(),
+        active_display_id,
+    })?;
+    client
+        .send_control_for_generation(
+            peer_generation,
+            seal(secure, SecureLane::Control, &message).await?,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn send_host_unavailable(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+) -> Result<(), HostRuntimeError> {
+    let mut secure = secure.lock().await;
+    send_access_denied(
+        client,
+        peer_generation,
+        &mut secure,
+        AccessDenialReason::HostUnavailable,
+    )
+    .await
+}
+
+fn host_runtime_denial_reason(error: &HostRuntimeError) -> Option<AccessDenialReason> {
+    match error {
+        HostRuntimeError::Capture(_)
+        | HostRuntimeError::CaptureWorkerStopped
+        | HostRuntimeError::CaptureWorkerPanicked => Some(AccessDenialReason::HostCaptureFailed),
+        HostRuntimeError::Encoder(_)
+        | HostRuntimeError::InvalidDimensions
+        | HostRuntimeError::InconsistentVideoConfig => Some(AccessDenialReason::HostEncoderFailed),
+        HostRuntimeError::Input(_) => Some(AccessDenialReason::HostInputFailed),
+        _ => None,
+    }
+}
+
+async fn send_runtime_failure(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    reason: AccessDenialReason,
+) -> Result<(), HostRuntimeError> {
+    let plaintext = encode_control(&ControlMessage::AccessDenied { reason })?;
+    let ciphertext = seal(secure, SecureLane::Control, &plaintext).await?;
+    client
+        .send_control_for_generation(peer_generation, ciphertext)
+        .await?;
+    Ok(())
+}
+
+const MAX_ENCODER_RECOVERY_ATTEMPTS: u8 = 2;
+
+fn encoder_error_is_recoverable(error: &EncoderError) -> bool {
+    matches!(
+        error,
+        EncoderError::BackendUnavailable | EncoderError::Native(_)
+    )
+}
+
 fn capture_encode_loop(
     mut capture: DxgiDesktopCapturer,
     mut encoder: H264Encoder,
-    queue: Arc<Mutex<LatestFrameQueue<EncodedDesktopFrame>>>,
-    notify: Arc<Notify>,
-    force_keyframe: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
+    context: CaptureWorkerContext,
+    coordinate_space: DesktopRect,
 ) -> Result<(), HostRuntimeError> {
+    let CaptureWorkerContext {
+        commands,
+        queue,
+        notify,
+        force_keyframe,
+        shutdown,
+        selected_desktop,
+    } = context;
+    let mut encoder_recovery_attempts = 0_u8;
     while !shutdown.load(Ordering::Acquire) {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                CaptureWorkerCommand::SelectDisplay { display_id, reply } => {
+                    let current_display_id = lock_unpoisoned(&selected_desktop).display_id;
+                    if display_id == current_display_id {
+                        let _ = reply.send(true);
+                        continue;
+                    }
+                    let switched = (|| {
+                        let next_capture = DxgiDesktopCapturer::new_display(display_id)
+                            .map_err(HostRuntimeError::Capture)?;
+                        let (source_width, source_height) = next_capture.dimensions();
+                        let (width, height) = fit_h264_dimensions(source_width, source_height)
+                            .map_err(HostRuntimeError::Encoder)?;
+                        encoder
+                            .rebuild(width, height)
+                            .map_err(HostRuntimeError::Encoder)?;
+                        capture = next_capture;
+                        lock_queue(&queue).drain_newest_first();
+                        *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
+                            display_id,
+                            desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
+                        };
+                        force_keyframe.store(true, Ordering::Release);
+                        notify.notify_one();
+                        Ok::<(), HostRuntimeError>(())
+                    })()
+                    .is_ok();
+                    let _ = reply.send(switched);
+                }
+            }
+        }
         let frame = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT)
             .map_err(HostRuntimeError::Capture)?
         {
@@ -970,8 +1461,23 @@ fn capture_encode_loop(
         };
         let request_keyframe = force_keyframe.swap(false, Ordering::AcqRel);
         let encoded = match encoder.encode(frame, request_keyframe) {
-            Ok(encoded) => encoded,
+            Ok(encoded) => {
+                encoder_recovery_attempts = 0;
+                encoded
+            }
             Err(EncoderError::NeedMoreInput) => continue,
+            Err(error)
+                if encoder_error_is_recoverable(&error)
+                    && encoder_recovery_attempts < MAX_ENCODER_RECOVERY_ATTEMPTS =>
+            {
+                encoder_recovery_attempts += 1;
+                let (width, height) = encoder.dimensions();
+                encoder
+                    .rebuild(width, height)
+                    .map_err(HostRuntimeError::Encoder)?;
+                force_keyframe.store(true, Ordering::Release);
+                continue;
+            }
             Err(error) => return Err(HostRuntimeError::Encoder(error)),
         };
         let (width, height) = encoder.dimensions();
@@ -988,6 +1494,7 @@ fn capture_encode_loop(
 async fn send_video_loop(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
+    peer_generation: u64,
     stream_id: u64,
     queue: Arc<Mutex<LatestFrameQueue<EncodedDesktopFrame>>>,
     notify: Arc<Notify>,
@@ -1007,12 +1514,16 @@ async fn send_video_loop(
             PrepareVideo::Ready(prepared) => {
                 if let Some(config) = prepared.video_config {
                     client
-                        .send_video_config(seal(&secure, SecureLane::VideoConfig, &config).await?)
+                        .send_video_config_for_generation(
+                            peer_generation,
+                            seal(&secure, SecureLane::VideoConfig, &config).await?,
+                        )
                         .await?;
                 }
                 for (index, datagram) in prepared.datagrams.into_iter().enumerate() {
                     client
-                        .send_video_datagram(
+                        .send_video_datagram_for_generation(
+                            peer_generation,
                             seal(&secure, SecureLane::VideoDatagram, &datagram).await?,
                         )
                         .await?;
@@ -1028,31 +1539,78 @@ async fn send_video_loop(
 async fn receive_input_and_control(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
+    peer_generation: u64,
     stream_id: u64,
     mut input: InputInjector,
     force_keyframe: Arc<AtomicBool>,
+    context: HostInboundContext,
 ) -> Result<(), HostRuntimeError> {
+    let HostInboundContext {
+        capture_commands,
+        selected_desktop,
+        displays,
+    } = context;
     let mut policy = HostInboundPolicy::new(stream_id);
     loop {
-        match client.next_event().await? {
-            TransportEvent::Control(bytes) => {
+        tokio::select! {
+            result = client.next_control_for_generation(peer_generation) => {
+                let bytes = result?;
                 let plaintext = open(&secure, SecureLane::Control, &bytes).await?;
                 if policy.handle_control(&plaintext)? {
                     force_keyframe.store(true, Ordering::Release);
                 }
-            }
-            TransportEvent::Input(bytes) => {
-                let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
-                if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
-                    input.apply(event).map_err(HostRuntimeError::Input)?;
+                if let ControlMessage::SelectDisplay { display_id } = decode_control(&plaintext)? {
+                    let known_display = displays.iter().any(|display| display.id == display_id);
+                    if known_display {
+                        // A transient Windows input rejection while switching
+                        // monitors must not close the video and control lanes.
+                        // Retained pressed-state entries are retried by later
+                        // release events and once more when the injector drops.
+                        let _ = input.release_all();
+                        let (reply, switched) = oneshot::channel();
+                        capture_commands
+                            .send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
+                            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                        if tokio::time::timeout(Duration::from_secs(5), switched)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or(false)
+                        {
+                            input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
+                        }
+                    }
+                    let active_display_id = lock_unpoisoned(&selected_desktop).display_id;
+                    send_display_list(
+                        &client,
+                        &secure,
+                        peer_generation,
+                        &displays,
+                        active_display_id,
+                    )
+                    .await?;
                 }
             }
-            TransportEvent::Closed { reason } => {
+            result = client.next_input_for_generation(peer_generation) => {
+                let bytes = result?;
+                let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
+                if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
+                    match input.apply(event) {
+                        Ok(()) => {}
+                        // An individual Windows input injection can be rejected
+                        // temporarily (secure desktop, focus transition, UIPI),
+                        // and an unsupported key belongs only to that event. Do
+                        // not convert either case into a transport-wide failure.
+                        Err(InputInjectionError::Blocked | InputInjectionError::UnsupportedKey) => {}
+                        Err(error @ InputInjectionError::InvalidInput) => {
+                            return Err(HostRuntimeError::Input(error));
+                        }
+                    }
+                }
+            }
+            reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
-            TransportEvent::VideoConfig(_)
-            | TransportEvent::VideoDatagram(_)
-            | TransportEvent::CursorDatagram(_) => {}
         }
     }
 }
@@ -1060,8 +1618,9 @@ async fn receive_input_and_control(
 async fn send_cursor_loop(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
+    peer_generation: u64,
     stream_id: u64,
-    desktop: DesktopRect,
+    selected_desktop: Arc<Mutex<SelectedDesktop>>,
 ) -> Result<(), HostRuntimeError> {
     let mut interval = tokio::time::interval(CURSOR_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1069,12 +1628,16 @@ async fn send_cursor_loop(
     loop {
         interval.tick().await;
         sequence = sequence.wrapping_add(1).max(1);
+        let desktop = lock_unpoisoned(&selected_desktop).desktop.rect;
         let Some(cursor) = sample_cursor(desktop, stream_id, sequence) else {
             continue;
         };
         let plaintext = encode_cursor_update(&cursor)?;
         client
-            .send_cursor_datagram(seal(&secure, SecureLane::CursorDatagram, &plaintext).await?)
+            .send_cursor_datagram_for_generation(
+                peer_generation,
+                seal(&secure, SecureLane::CursorDatagram, &plaintext).await?,
+            )
             .await?;
     }
 }
@@ -1119,7 +1682,11 @@ fn sample_cursor(desktop: DesktopRect, stream_id: u64, sequence: u64) -> Option<
 }
 
 fn lock_queue<T>(queue: &Mutex<LatestFrameQueue<T>>) -> MutexGuard<'_, LatestFrameQueue<T>> {
-    match queue.lock() {
+    lock_unpoisoned(queue)
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
@@ -1144,17 +1711,103 @@ fn now_unix_s() -> u64 {
 
 #[cfg(test)]
 mod retry_policy_tests {
-    use super::{HostRuntimeError, host_error_is_retryable_for_session};
+    use crate::{capture::CaptureError, encoder::EncoderError};
+
+    use desklink_protocol::AccessDenialReason;
+    use desklink_transport::TransportError;
+
+    use super::{
+        HostRuntimeError, encoder_error_is_recoverable, host_error_is_retryable,
+        host_error_is_retryable_for_session, host_error_rearms_on_connected_relay,
+        host_runtime_denial_reason,
+    };
 
     #[test]
     fn persistent_host_recovers_after_rejecting_a_stale_pairing_request() {
-        assert!(host_error_is_retryable_for_session(
-            &HostRuntimeError::PairingRejected,
-            true
+        for error in [
+            HostRuntimeError::ApprovalRequired,
+            HostRuntimeError::PairingRejected,
+            HostRuntimeError::PairingExpired,
+            HostRuntimeError::AuthorizationBackend("temporary trust-store failure".into()),
+        ] {
+            assert!(host_error_is_retryable_for_session(&error, true));
+            assert!(!host_error_is_retryable_for_session(&error, false));
+        }
+    }
+
+    #[test]
+    fn interactive_desktop_failures_rearm_the_host_service() {
+        for error in [
+            HostRuntimeError::Capture(CaptureError::AccessLost),
+            HostRuntimeError::Encoder(EncoderError::BackendUnavailable),
+            HostRuntimeError::CaptureWorkerStopped,
+            HostRuntimeError::CaptureWorkerPanicked,
+        ] {
+            assert!(
+                host_error_is_retryable(&error),
+                "runtime desktop failure must not stop persistent hosting: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_attempt_failures_never_reconnect_the_durable_host_transport() {
+        for error in [
+            HostRuntimeError::HandshakeTimeout,
+            HostRuntimeError::NegotiationTimeout,
+            HostRuntimeError::UnexpectedHandshakeStep,
+            HostRuntimeError::Capture(CaptureError::AccessLost),
+            HostRuntimeError::Encoder(EncoderError::BackendUnavailable),
+            HostRuntimeError::Transport(TransportError::PeerDisconnected),
+            HostRuntimeError::Transport(TransportError::Stream("peer stream reset".into())),
+        ] {
+            assert!(
+                host_error_rearms_on_connected_relay(&error),
+                "peer attempt must not take the host offline: {error}"
+            );
+        }
+
+        for error in [
+            HostRuntimeError::TransportClosed("relay connection closed".into()),
+            HostRuntimeError::Transport(TransportError::Closed),
+            HostRuntimeError::Transport(TransportError::Connection("relay unavailable".into())),
+        ] {
+            assert!(
+                !host_error_rearms_on_connected_relay(&error),
+                "a dead relay transport must be rebuilt: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_backend_failures_are_reported_without_masking_network_failures() {
+        assert_eq!(
+            host_runtime_denial_reason(&HostRuntimeError::Capture(CaptureError::AccessLost)),
+            Some(AccessDenialReason::HostCaptureFailed)
+        );
+        assert_eq!(
+            host_runtime_denial_reason(&HostRuntimeError::Encoder(EncoderError::Native(
+                "MFT failed".into()
+            ))),
+            Some(AccessDenialReason::HostEncoderFailed)
+        );
+        assert_eq!(
+            host_runtime_denial_reason(&HostRuntimeError::Transport(
+                TransportError::PeerDisconnected
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn only_transient_encoder_backend_errors_trigger_a_limited_rebuild() {
+        assert!(encoder_error_is_recoverable(
+            &EncoderError::BackendUnavailable
         ));
-        assert!(!host_error_is_retryable_for_session(
-            &HostRuntimeError::PairingRejected,
-            false
-        ));
+        assert!(encoder_error_is_recoverable(&EncoderError::Native(
+            "device reset".into()
+        )));
+        assert!(!encoder_error_is_recoverable(&EncoderError::InvalidFrame));
+        assert!(!encoder_error_is_recoverable(&EncoderError::FrameTooLarge));
     }
 }

@@ -1,5 +1,6 @@
 #[cfg(windows)]
 #[test]
+#[ignore = "requires access to the interactive Windows desktop"]
 fn captured_desktop_frame_encodes_to_h264() {
     use std::time::Duration;
 
@@ -28,17 +29,23 @@ fn captured_desktop_frame_encodes_to_h264() {
                 submitted += 1;
                 assert!(!encoded.access_unit.is_empty());
                 if encoded.frame_id == 1 {
+                    let sequence_header = encoded
+                        .sequence_header
+                        .as_ref()
+                        .expect("the first access unit must expose decoder configuration");
+                    println!(
+                        "H.264 sequence header prefix: {:02X?}",
+                        &sequence_header[..sequence_header.len().min(32)]
+                    );
+                    println!(
+                        "H.264 access unit prefix: {:02X?}",
+                        &encoded.access_unit[..encoded.access_unit.len().min(32)]
+                    );
                     assert!(
                         encoded.keyframe,
                         "the first access unit must be random-access"
                     );
-                    assert!(
-                        encoded
-                            .sequence_header
-                            .as_ref()
-                            .is_some_and(|header| !header.is_empty()),
-                        "the first access unit must expose decoder configuration"
-                    );
+                    assert!(!sequence_header.is_empty());
                 }
                 if encoded.frame_id == forced_keyframe_id {
                     assert!(

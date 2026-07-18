@@ -222,15 +222,15 @@ impl WindowsPairingAuthorizer {
 
 impl ControllerAuthorizer for WindowsPairingAuthorizer {
     fn authorize(&self, identity: PeerIdentity) -> Result<ControllerAuthorization, String> {
-        match self
+        let identity_changed = match self
             .store
             .status(identity)
             .map_err(|error| error.to_string())?
         {
             TrustStatus::Trusted(_) => return Ok(ControllerAuthorization::Authorized),
-            TrustStatus::KeyChanged { .. } => return Ok(ControllerAuthorization::KeyChanged),
-            TrustStatus::Unknown => {}
-        }
+            TrustStatus::KeyChanged { .. } => true,
+            TrustStatus::Unknown => false,
+        };
 
         let started_at_unix_s = now_unix_s()?;
         let mut invite = self
@@ -248,6 +248,11 @@ impl ControllerAuthorizer for WindowsPairingAuthorizer {
             }
             Err(error) => return Err(error.to_string()),
         };
+        let pending = if identity_changed {
+            pending.mark_identity_changed()
+        } else {
+            pending
+        };
         if !self.approval.approve(pending) {
             gate.reject(pending.identity())
                 .map_err(|error| error.to_string())?;
@@ -261,9 +266,15 @@ impl ControllerAuthorizer for WindowsPairingAuthorizer {
             }
             Err(error) => return Err(error.to_string()),
         };
-        self.store
-            .trust(approved)
-            .map_err(|error| error.to_string())?;
+        if identity_changed {
+            self.store
+                .replace_after_approval(approved)
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.store
+                .trust(approved)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(ControllerAuthorization::Authorized)
     }
 }
@@ -301,8 +312,7 @@ impl ControllerAuthorizer for WindowsPersistentAccessAuthorizer {
             .map_err(|error| error.to_string())?
         {
             TrustStatus::Trusted(_) => return Ok(ControllerAuthorization::Authorized),
-            TrustStatus::KeyChanged { .. } => return Ok(ControllerAuthorization::KeyChanged),
-            TrustStatus::Unknown => {}
+            TrustStatus::KeyChanged { .. } | TrustStatus::Unknown => {}
         }
 
         let mut gate = self
@@ -311,20 +321,25 @@ impl ControllerAuthorizer for WindowsPersistentAccessAuthorizer {
             .map_err(|_| "fixed-access approval lock is poisoned".to_owned())?;
         // Another request may have approved this identity while this request
         // was waiting for the serialized local prompt.
-        match self
+        let identity_changed = match self
             .store
             .status(identity)
             .map_err(|error| error.to_string())?
         {
             TrustStatus::Trusted(_) => return Ok(ControllerAuthorization::Authorized),
-            TrustStatus::KeyChanged { .. } => return Ok(ControllerAuthorization::KeyChanged),
-            TrustStatus::Unknown => {}
-        }
+            TrustStatus::KeyChanged { .. } => true,
+            TrustStatus::Unknown => false,
+        };
 
         let started_at_unix_s = now_unix_s()?;
         let pending = gate
             .begin(identity, started_at_unix_s, PERSISTENT_APPROVAL_TTL_S)
             .map_err(|error| error.to_string())?;
+        let pending = if identity_changed {
+            pending.mark_identity_changed()
+        } else {
+            pending
+        };
         if !self.approval.approve(pending) {
             gate.reject(pending.identity())
                 .map_err(|error| error.to_string())?;
@@ -335,9 +350,15 @@ impl ControllerAuthorizer for WindowsPersistentAccessAuthorizer {
             Err(PairingApprovalError::Expired) => return Ok(ControllerAuthorization::Expired),
             Err(error) => return Err(error.to_string()),
         };
-        self.store
-            .trust(approved)
-            .map_err(|error| error.to_string())?;
+        if identity_changed {
+            self.store
+                .replace_after_approval(approved)
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.store
+                .trust(approved)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(ControllerAuthorization::Authorized)
     }
 }
@@ -400,6 +421,26 @@ impl WindowsTrustedControllerStore {
         }) {
             return Err(WindowsTrustedControllerError::IdentityConflict);
         }
+        let record = TrustedController {
+            device_id: approved.device_id(),
+            verify_key: approved.verify_key(),
+            approved_at_unix_s: approved.approved_at_unix_s(),
+        };
+        let fingerprint = record.fingerprint();
+        if !records.contains_key(&fingerprint) && records.len() >= MAX_TRUSTED_CONTROLLERS {
+            return Err(WindowsTrustedControllerError::CapacityReached);
+        }
+        records.insert(fingerprint, record);
+        self.save_records(&records)?;
+        Ok(record)
+    }
+
+    pub fn replace_after_approval(
+        &self,
+        approved: ApprovedController,
+    ) -> Result<TrustedController, WindowsTrustedControllerError> {
+        let mut records = self.load_records()?;
+        records.retain(|_, record| record.device_id != approved.device_id());
         let record = TrustedController {
             device_id: approved.device_id(),
             verify_key: approved.verify_key(),

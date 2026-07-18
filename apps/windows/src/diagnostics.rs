@@ -6,7 +6,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::storage::{downloads_path, local_app_data_path};
@@ -26,9 +26,45 @@ const MAX_REPORT_CHARS: usize = 256 * 1024;
 pub enum DiagnosticOperation {
     TrustedControllersRefresh,
     ControllerRevocation,
-    ConnectionMigration,
     RelayProbe,
     DiagnosticExport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerDiagnosticStage {
+    Connecting,
+    RelayConnected,
+    RelayJoined,
+    WaitingForApproval,
+    SecureSessionReady,
+    Connected,
+    RetryScheduled,
+    Stopped,
+    Cancelled,
+}
+
+impl ControllerDiagnosticStage {
+    const fn event_name(self) -> &'static str {
+        match self {
+            Self::Connecting => "controller_connecting",
+            Self::RelayConnected => "controller_relay_connected",
+            Self::RelayJoined => "controller_relay_joined",
+            Self::WaitingForApproval => "controller_waiting_for_approval",
+            Self::SecureSessionReady => "controller_secure_session_ready",
+            Self::Connected => "controller_connected",
+            Self::RetryScheduled => "controller_retry_scheduled",
+            Self::Stopped => "controller_stopped",
+            Self::Cancelled => "controller_cancelled",
+        }
+    }
+
+    const fn level(self) -> &'static str {
+        match self {
+            Self::RetryScheduled => "warning",
+            Self::Stopped => "error",
+            _ => "info",
+        }
+    }
 }
 
 impl DiagnosticOperation {
@@ -38,8 +74,6 @@ impl DiagnosticOperation {
             (Self::TrustedControllersRefresh, false) => "trusted_controllers_refresh_failed",
             (Self::ControllerRevocation, true) => "controller_revoked",
             (Self::ControllerRevocation, false) => "controller_revocation_failed",
-            (Self::ConnectionMigration, true) => "connection_migration_succeeded",
-            (Self::ConnectionMigration, false) => "connection_migration_failed",
             (Self::RelayProbe, true) => "relay_probe_succeeded",
             (Self::RelayProbe, false) => "relay_probe_failed",
             (Self::DiagnosticExport, true) => "diagnostic_report_exported",
@@ -65,6 +99,19 @@ pub enum DiagnosticEvent {
     OperationFailed {
         operation: DiagnosticOperation,
         reason: String,
+    },
+    ControllerConnection {
+        stage: ControllerDiagnosticStage,
+        attempt: u32,
+        retry: Option<u32>,
+        delay: Option<Duration>,
+        reason: Option<String>,
+    },
+    ControllerVideoMetrics {
+        attempt: u32,
+        received_video_packets: u64,
+        dropped_video_packets: u64,
+        completed_frames: u64,
     },
 }
 
@@ -97,6 +144,16 @@ impl DiagnosticLog {
                 .join("DeskLink")
                 .join("logs")
                 .join("host.jsonl"),
+        ))
+    }
+
+    pub fn controller_for_current_user() -> Result<Self, DiagnosticLogError> {
+        let local_app_data = local_app_data_path().ok_or(DiagnosticLogError::MissingStoragePath)?;
+        Ok(Self::new(
+            local_app_data
+                .join("DeskLink")
+                .join("logs")
+                .join("controller.jsonl"),
         ))
     }
 
@@ -276,6 +333,37 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             "\"level\":\"error\",\"event\":{},\"reason\":{}",
             json_string(operation.event_name(false)),
             json_string(&bounded_redacted_text(reason))
+        ),
+        DiagnosticEvent::ControllerConnection {
+            stage,
+            attempt,
+            retry,
+            delay,
+            reason,
+        } => {
+            let retry = retry.map_or_else(String::new, |retry| format!(",\"retry\":{retry}"));
+            let delay = delay.map_or_else(String::new, |delay| {
+                format!(",\"delay_ms\":{}", delay.as_millis())
+            });
+            let reason = reason.as_ref().map_or_else(String::new, |reason| {
+                format!(
+                    ",\"reason\":{}",
+                    json_string(&bounded_redacted_text(reason))
+                )
+            });
+            format!(
+                "\"level\":\"{}\",\"event\":{},\"attempt\":{attempt}{retry}{delay}{reason}",
+                stage.level(),
+                json_string(stage.event_name())
+            )
+        }
+        DiagnosticEvent::ControllerVideoMetrics {
+            attempt,
+            received_video_packets,
+            dropped_video_packets,
+            completed_frames,
+        } => format!(
+            "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt},\"received_video_packets\":{received_video_packets},\"dropped_video_packets\":{dropped_video_packets},\"completed_frames\":{completed_frames}"
         ),
     };
     format!("{{\"schema\":1,\"timestamp_unix_ms\":{timestamp_unix_ms},{fields}}}\n")
@@ -491,6 +579,53 @@ mod tests {
         assert!(contents.contains("<redacted>"));
         assert!(!contents.contains(secret));
         assert!(!contents.contains("plain-secret"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn controller_log_keeps_failure_stage_but_redacts_connection_secrets() {
+        let path = temporary_log_path("controller-redaction");
+        let logger = DiagnosticLog::new(&path);
+        let secret = "ef".repeat(32);
+        logger
+            .record(&DiagnosticEvent::ControllerConnection {
+                stage: ControllerDiagnosticStage::RetryScheduled,
+                attempt: 3,
+                retry: Some(2),
+                delay: Some(Duration::from_millis(1_000)),
+                reason: Some(format!("peer_replaced DESKLINK_SESSION_ID={secret}")),
+            })
+            .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"event\":\"controller_retry_scheduled\""));
+        assert!(contents.contains("\"attempt\":3"));
+        assert!(contents.contains("\"retry\":2"));
+        assert!(contents.contains("\"delay_ms\":1000"));
+        assert!(contents.contains("peer_replaced"));
+        assert!(contents.contains("<redacted>"));
+        assert!(!contents.contains(&secret));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn controller_video_metrics_distinguish_transport_from_ui_rendering() {
+        let path = temporary_log_path("controller-video");
+        let logger = DiagnosticLog::new(&path);
+        logger
+            .record(&DiagnosticEvent::ControllerVideoMetrics {
+                attempt: 2,
+                received_video_packets: 1_200,
+                dropped_video_packets: 4,
+                completed_frames: 87,
+            })
+            .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"event\":\"controller_video_metrics\""));
+        assert!(contents.contains("\"received_video_packets\":1200"));
+        assert!(contents.contains("\"dropped_video_packets\":4"));
+        assert!(contents.contains("\"completed_frames\":87"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

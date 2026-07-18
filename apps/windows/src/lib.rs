@@ -17,6 +17,8 @@ pub mod input;
 #[cfg(windows)]
 pub mod recent_access;
 pub mod runtime;
+#[cfg(windows)]
+pub mod startup;
 mod storage;
 pub mod tray;
 #[cfg(windows)]
