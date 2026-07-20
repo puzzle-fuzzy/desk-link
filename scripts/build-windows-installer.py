@@ -14,6 +14,10 @@ import tomllib
 import time
 from pathlib import Path
 
+SCRIPTS_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPTS_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIRECTORY))
+
 from windows_native_build_env import (
     prepare_windows_native_build_environment,
     prepare_windows_release_environment,

@@ -17,16 +17,23 @@ use apps_windows::{
     diagnostics::{ControllerDiagnosticStage, DiagnosticEvent, DiagnosticLog},
     identity::WindowsIdentityStore,
     recent_access::{RecentAccessEntry, WindowsRecentAccessError, WindowsRecentAccessStore},
-    transfer::{IncomingFile, OutgoingFile, prepare_outgoing_file},
+    transfer::{
+        IncomingFile, OutgoingFile, chunk_after_resume, discard_incoming_resume,
+        prepare_outgoing_file, verify_resume_prefix,
+    },
+    transfer_recovery::{
+        MAX_FILE_QUEUE_RECOVERY_ITEMS, TransferQueueRecovery, TransferRecoveryAction,
+        WindowsFileQueueRecoveryStore, WindowsTransferRecoveryStore,
+    },
 };
 use blake2::{Blake2s256, Digest};
 use desklink_crypto::{PairingCode, PairingInvite};
 use desklink_ffi::{ControllerError, ControllerEvent, ControllerRuntime, ControllerTransferSender};
 use desklink_protocol::{
-    AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FrameFlags, InputEvent, KeyCode,
-    MAX_CLIPBOARD_TEXT_BYTES, MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA,
-    Modifiers, MouseButton, Platform, TransferId, TransferMessage, TransferResult,
-    VideoQualityPreference, VideoQualityPreset,
+    AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FileResumeHint, FrameFlags,
+    InputEvent, KeyCode, MAX_CLIPBOARD_TEXT_BYTES, MAX_POINTER_COORDINATE,
+    MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, ProtocolError,
+    TransferId, TransferMessage, TransferResult, VideoQualityPreference, VideoQualityPreset,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -35,7 +42,7 @@ use desklink_transport::{
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Response};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use zeroize::Zeroize;
 
 const COMMAND_CAPACITY: usize = 512;
@@ -50,7 +57,15 @@ const DIRECTORY_RECOVERY_DELAYS: [Duration; 2] =
 const DIRECTORY_TRANSPORT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(350), Duration::from_millis(900)];
 const AUDIO_FRAME_DURATION_US: u64 = 10_000;
-const MAX_FILE_QUEUE_ITEMS: usize = 20;
+const MAX_FILE_QUEUE_ITEMS: usize = MAX_FILE_QUEUE_RECOVERY_ITEMS;
+const TRANSFER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+const CLIPBOARD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const FILE_DECISION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const REMOTE_FILE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FILE_RECEIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const FILE_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+const FILE_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_QUEUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct DecodedControllerAudio {
     stream_id: u64,
@@ -280,6 +295,31 @@ pub struct ControllerSnapshot {
     pub connection_error: Option<String>,
     pub saved_devices: Vec<SavedDeviceCredentialSummary>,
     pub saved_devices_error: Option<String>,
+    pub file_recovery: Option<TransferRecoverySummary>,
+    pub file_recovery_error: Option<String>,
+    pub file_queue_recovery: Option<FileQueueRecoverySummary>,
+    pub file_queue_recovery_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferRecoverySummary {
+    pub revision: u64,
+    pub device_id: String,
+    pub direction: &'static str,
+    pub name: String,
+    pub total: u64,
+    pub message: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileQueueRecoverySummary {
+    pub revision: u64,
+    pub device_id: String,
+    pub queued: Vec<QueuedFileSummary>,
+    pub paused: bool,
+    pub message: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -391,6 +431,7 @@ pub enum ControllerSignal {
     },
     Clipboard {
         state: &'static str,
+        operation: &'static str,
         message: String,
     },
     FileTransfer {
@@ -404,6 +445,8 @@ pub enum ControllerSignal {
     FileQueue {
         queued: Vec<QueuedFileSummary>,
         paused: bool,
+        recovery_state: &'static str,
+        recovery_message: Option<String>,
     },
     Audio {
         state: &'static str,
@@ -446,22 +489,38 @@ pub struct ControllerRenderMetrics {
 }
 
 enum ControllerCommand {
-    Input { stream_id: u64, event: InputEvent },
+    Input {
+        stream_id: u64,
+        event: InputEvent,
+    },
     Text(String),
     RequestKeyframe,
     SelectDisplay(u32),
     SetAudioEnabled(bool),
     SetVideoQuality(VideoQualityPreference),
     SendClipboard(String),
+    PasteClipboard(String),
     RequestClipboard,
     SendFiles(Vec<OutgoingFile>),
     RetryFile(OutgoingFile),
-    RemoveQueuedFile(TransferId),
-    ClearFileQueue,
-    ResumeFileQueue,
-    RequestRemoteFile,
+    RemoveQueuedFile {
+        transfer_id: TransferId,
+        reply: FileQueueCommandReply,
+    },
+    ClearFileQueue {
+        reply: FileQueueCommandReply,
+    },
+    ResumeFileQueue {
+        reply: FileQueueCommandReply,
+    },
+    RetryFileQueueProtection {
+        reply: FileQueueCommandReply,
+    },
+    RequestRemoteFile(Option<FileResumeHint>),
     CancelFile,
 }
+
+type FileQueueCommandReply = oneshot::Sender<Result<(), String>>;
 
 fn should_drop_buffered_pointer_move(command: &ControllerCommand, capacity: usize) -> bool {
     matches!(
@@ -473,9 +532,56 @@ fn should_drop_buffered_pointer_move(command: &ControllerCommand, capacity: usiz
     ) && capacity <= COMMAND_CAPACITY.saturating_sub(MAX_BUFFERED_POINTER_MOVES)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardOperation {
+    Send,
+    Paste,
+    Receive,
+}
+
+impl ClipboardOperation {
+    fn signal_name(self) -> &'static str {
+        match self {
+            Self::Send => "send",
+            Self::Paste => "paste",
+            Self::Receive => "receive",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingClipboardOperation {
+    request_id: u64,
+    operation: ClipboardOperation,
+    deadline: Instant,
+}
+
+impl PendingClipboardOperation {
+    fn new(request_id: u64, operation: ClipboardOperation, now: Instant) -> Self {
+        Self {
+            request_id,
+            operation,
+            deadline: now + CLIPBOARD_RESPONSE_TIMEOUT,
+        }
+    }
+
+    fn matches(self, request_id: u64, operation: ClipboardOperation) -> bool {
+        self.request_id == request_id && self.operation == operation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutgoingTransferPhase {
+    AwaitingDecision,
+    Sending,
+    AwaitingResult,
+}
+
 struct OutgoingTransfer {
     file: OutgoingFile,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
+    phase: OutgoingTransferPhase,
+    deadline: Option<Instant>,
 }
 
 struct IncomingTransfer {
@@ -483,20 +589,183 @@ struct IncomingTransfer {
     name: String,
     size: u64,
     transferred: u64,
+    last_activity: Instant,
+}
+
+#[derive(Default)]
+struct ResumableIncomingTransfer(Option<IncomingTransfer>);
+
+impl std::ops::Deref for ResumableIncomingTransfer {
+    type Target = Option<IncomingTransfer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ResumableIncomingTransfer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ResumableIncomingTransfer {
+    fn drop(&mut self) {
+        if let Some(transfer) = self.0.take() {
+            let _ = transfer.file.preserve();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRemoteFileRequest {
+    request_id: u64,
+    deadline: Instant,
+}
+
+impl PendingRemoteFileRequest {
+    fn new(request_id: u64, now: Instant) -> Self {
+        Self {
+            request_id,
+            deadline: now + REMOTE_FILE_SELECTION_TIMEOUT,
+        }
+    }
+}
+
+fn deadline_expired(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
+fn file_offer_matches_request(
+    pending: Option<PendingRemoteFileRequest>,
+    request_id: Option<u64>,
+) -> bool {
+    pending.is_some_and(|pending| request_id == Some(pending.request_id))
 }
 
 #[derive(Clone)]
-enum LastFileAction {
-    Upload(PathBuf),
-    Download,
+enum LastFileOperation {
+    Upload(OutgoingFile),
+    Download(Option<FileResumeHint>),
 }
 
-struct OutgoingFileFailure {
-    transfer_id: TransferId,
-    message: String,
+#[derive(Clone)]
+struct LastFileAction {
+    host_device_id: [u8; 16],
+    operation: LastFileOperation,
+}
+
+impl LastFileAction {
+    fn upload(host_device_id: [u8; 16], file: OutgoingFile) -> Self {
+        Self {
+            host_device_id,
+            operation: LastFileOperation::Upload(file),
+        }
+    }
+
+    fn download(host_device_id: [u8; 16], resume: Option<FileResumeHint>) -> Self {
+        Self {
+            host_device_id,
+            operation: LastFileOperation::Download(resume),
+        }
+    }
+
+    fn from_recovery(action: TransferRecoveryAction) -> Self {
+        match action {
+            TransferRecoveryAction::Upload {
+                host_device_id,
+                transfer_id,
+                path,
+                name,
+                size,
+                modified_at_unix_ns,
+                ..
+            } => Self::upload(
+                host_device_id,
+                OutgoingFile {
+                    transfer_id,
+                    path,
+                    name,
+                    size,
+                    modified_at_unix_ns,
+                },
+            ),
+            TransferRecoveryAction::Download {
+                host_device_id,
+                resume,
+                ..
+            } => Self::download(host_device_id, resume),
+        }
+    }
+
+    fn recovery_action(&self) -> TransferRecoveryAction {
+        match &self.operation {
+            LastFileOperation::Upload(file) => {
+                TransferRecoveryAction::upload(self.host_device_id, file)
+            }
+            LastFileOperation::Download(resume) => {
+                TransferRecoveryAction::download(self.host_device_id, resume.clone())
+            }
+        }
+    }
+
+    fn summary(&self) -> TransferRecoverySummary {
+        let device_id = crate::device_directory::format_device_id(
+            crate::device_directory::public_device_id(self.host_device_id),
+        );
+        match &self.operation {
+            LastFileOperation::Upload(file) => TransferRecoverySummary {
+                revision: 0,
+                device_id,
+                direction: "upload",
+                name: file.name.clone(),
+                total: file.size,
+                message: "上次文件发送未完成；连接设备后可以从断点重试。",
+            },
+            LastFileOperation::Download(Some(resume)) => TransferRecoverySummary {
+                revision: 0,
+                device_id,
+                direction: "download",
+                name: resume.name.clone(),
+                total: resume.size,
+                message: "上次文件接收未完成；连接设备后可以从断点重新获取。",
+            },
+            LastFileOperation::Download(None) => TransferRecoverySummary {
+                revision: 0,
+                device_id,
+                direction: "download",
+                name: "远端文件".to_owned(),
+                total: 0,
+                message: "上次远端文件获取未完成；连接设备后可以重新获取。",
+            },
+        }
+    }
+
+    fn ensure_target(&self, active_host_device_id: [u8; 16]) -> Result<(), String> {
+        if self.host_device_id == active_host_device_id {
+            return Ok(());
+        }
+        Err(format!(
+            "这项文件任务属于设备 {}，请连接该设备后重试，或放弃此任务。",
+            crate::device_directory::format_device_id(crate::device_directory::public_device_id(
+                self.host_device_id
+            ))
+        ))
+    }
+}
+
+enum OutgoingFileEvent {
+    AwaitingResult {
+        transfer_id: TransferId,
+    },
+    Failed {
+        transfer_id: TransferId,
+        message: String,
+    },
 }
 
 struct ControllerWorker {
+    host_device_id: [u8; 16],
     commands: mpsc::Sender<ControllerCommand>,
     cancellation: watch::Sender<bool>,
     task: tauri::async_runtime::JoinHandle<()>,
@@ -513,6 +782,15 @@ pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
     worker: Arc<Mutex<Option<ControllerWorker>>>,
     last_file_action: Arc<Mutex<Option<LastFileAction>>>,
+    file_recovery_store: Option<WindowsTransferRecoveryStore>,
+    file_recovery_error: Arc<Mutex<Option<String>>>,
+    file_recovery_operation: Arc<Mutex<()>>,
+    file_recovery_revision: Arc<AtomicU64>,
+    file_queue_recovery: Arc<Mutex<Option<TransferQueueRecovery>>>,
+    file_queue_recovery_store: Option<WindowsFileQueueRecoveryStore>,
+    file_queue_recovery_error: Arc<Mutex<Option<String>>>,
+    file_queue_recovery_operation: Arc<Mutex<()>>,
+    file_queue_recovery_revision: Arc<AtomicU64>,
     operation_lock: Arc<AsyncMutex<()>>,
     operation_generation: Arc<AtomicU64>,
     recent_cancellation: Arc<Mutex<Option<Instant>>>,
@@ -525,6 +803,15 @@ impl Default for ControllerManager {
             status: Arc::new(Mutex::new(ControllerRuntimeSummary::idle())),
             worker: Arc::new(Mutex::new(None)),
             last_file_action: Arc::new(Mutex::new(None)),
+            file_recovery_store: None,
+            file_recovery_error: Arc::new(Mutex::new(None)),
+            file_recovery_operation: Arc::new(Mutex::new(())),
+            file_recovery_revision: Arc::new(AtomicU64::new(0)),
+            file_queue_recovery: Arc::new(Mutex::new(None)),
+            file_queue_recovery_store: None,
+            file_queue_recovery_error: Arc::new(Mutex::new(None)),
+            file_queue_recovery_operation: Arc::new(Mutex::new(())),
+            file_queue_recovery_revision: Arc::new(AtomicU64::new(0)),
             operation_lock: Arc::new(AsyncMutex::new(())),
             operation_generation: Arc::new(AtomicU64::new(0)),
             recent_cancellation: Arc::new(Mutex::new(None)),
@@ -534,6 +821,407 @@ impl Default for ControllerManager {
 }
 
 impl ControllerManager {
+    pub fn for_current_user() -> Self {
+        let mut manager = Self::default();
+        match WindowsTransferRecoveryStore::for_current_user() {
+            Ok(store) => {
+                match store.load() {
+                    Ok(action) => {
+                        let restored = action.map(LastFileAction::from_recovery);
+                        if restored.is_some() {
+                            manager.file_recovery_revision.store(1, Ordering::SeqCst);
+                        }
+                        if let Ok(mut last_action) = manager.last_file_action.lock() {
+                            *last_action = restored;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = store.clear();
+                        manager.set_file_recovery_error(Some(
+                            "旧版或损坏的文件恢复记录已安全清理；新传输仍可正常使用。",
+                        ));
+                    }
+                }
+                manager.file_recovery_store = Some(store);
+            }
+            Err(_) => manager.set_file_recovery_error(Some(
+                "当前 Windows 账户无法保存文件传输恢复记录；断线重试仍可在本次运行中使用。",
+            )),
+        }
+        match WindowsFileQueueRecoveryStore::for_current_user() {
+            Ok(store) => {
+                match store.load() {
+                    Ok(queue) => {
+                        if queue.is_some() {
+                            manager
+                                .file_queue_recovery_revision
+                                .store(1, Ordering::SeqCst);
+                        }
+                        if let Ok(mut recovery) = manager.file_queue_recovery.lock() {
+                            *recovery = queue;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = store.clear();
+                        manager.set_file_queue_recovery_error(Some(
+                            "旧版或损坏的等待队列记录已安全清理；新文件仍可正常发送。",
+                        ));
+                    }
+                }
+                manager.file_queue_recovery_store = Some(store);
+            }
+            Err(_) => manager.set_file_queue_recovery_error(Some(
+                "当前 Windows 账户无法保存等待发送队列；队列只会保留到本次运行结束。",
+            )),
+        }
+        manager
+    }
+
+    fn remember_last_file_action(&self, action: LastFileAction) -> Result<(), String> {
+        let _operation = self
+            .file_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法更新文件恢复记录。".to_owned())?;
+        *self
+            .last_file_action
+            .lock()
+            .map_err(|_| "DeskLink 无法保留最近的文件操作。".to_owned())? = Some(action.clone());
+        self.next_file_recovery_revision();
+        if let Some(store) = self.file_recovery_store.as_ref() {
+            if store.save(&action.recovery_action()).is_ok() {
+                self.set_file_recovery_error(None);
+            } else {
+                self.set_file_recovery_error(Some(
+                    "无法保存文件传输恢复记录；本次运行中的重试不受影响。",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_last_file_action(&self) {
+        if self.clear_last_file_action_result().is_err() {
+            self.set_file_recovery_error(Some(
+                "已完成传输，但无法清理旧的恢复记录；请重新启动 DeskLink 后检查。",
+            ));
+        }
+    }
+
+    fn clear_last_file_action_result(&self) -> Result<(), String> {
+        let _operation = self
+            .file_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法更新文件恢复记录。".to_owned())?;
+        self.clear_last_file_action_locked()
+    }
+
+    fn clear_last_file_action_locked(&self) -> Result<(), String> {
+        let previous = self
+            .last_file_action
+            .lock()
+            .map_err(|_| "DeskLink 无法清理最近的文件操作。".to_owned())?
+            .take();
+        if let Some(store) = self.file_recovery_store.as_ref()
+            && store.clear().is_err()
+        {
+            if let Ok(mut action) = self.last_file_action.lock() {
+                *action = previous;
+            }
+            return Err("Windows 无法删除加密的文件恢复记录，请稍后重试。".to_owned());
+        }
+        self.set_file_recovery_error(None);
+        self.file_recovery_revision.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn discard_file_recovery(&self, expected_revision: u64) -> Result<(), String> {
+        let _operation = self
+            .file_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法更新文件恢复记录。".to_owned())?;
+        if expected_revision == 0
+            || self.file_recovery_revision.load(Ordering::SeqCst) != expected_revision
+        {
+            return Err("文件任务已经变化，请刷新传输面板后重试。".to_owned());
+        }
+        let action = self
+            .last_file_action
+            .lock()
+            .map_err(|_| "DeskLink 无法读取最近的文件操作。".to_owned())?
+            .clone();
+        if let Some(LastFileAction {
+            operation: LastFileOperation::Download(Some(resume)),
+            ..
+        }) = action
+        {
+            discard_incoming_resume(resume.transfer_id)
+                .map_err(|_| "无法删除未完成的文件断点，请检查下载文件夹权限后重试。".to_owned())?;
+        }
+        self.clear_last_file_action_locked()
+    }
+
+    fn file_recovery_summary(&self) -> Option<TransferRecoverySummary> {
+        let _operation = self.file_recovery_operation.lock().ok()?;
+        let revision = self.file_recovery_revision.load(Ordering::SeqCst);
+        self.last_file_action
+            .lock()
+            .ok()
+            .and_then(|action| action.as_ref().map(LastFileAction::summary))
+            .map(|summary| TransferRecoverySummary {
+                revision,
+                ..summary
+            })
+    }
+
+    fn file_recovery_error(&self) -> Option<String> {
+        self.file_recovery_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+    }
+
+    fn set_file_recovery_error(&self, message: Option<&str>) {
+        if let Ok(mut error) = self.file_recovery_error.lock() {
+            *error = message.map(str::to_owned);
+        }
+    }
+
+    fn next_file_recovery_revision(&self) -> u64 {
+        let previous = self.file_recovery_revision.fetch_add(1, Ordering::SeqCst);
+        let revision = previous.wrapping_add(1);
+        if revision == 0 {
+            self.file_recovery_revision.store(1, Ordering::SeqCst);
+            1
+        } else {
+            revision
+        }
+    }
+
+    fn remember_file_queue(
+        &self,
+        host_device_id: [u8; 16],
+        queued_files: &VecDeque<OutgoingFile>,
+        paused: bool,
+    ) -> Result<bool, String> {
+        let _operation = self
+            .file_queue_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法更新等待队列恢复记录。".to_owned())?;
+        let existing = self
+            .file_queue_recovery
+            .lock()
+            .map_err(|_| "DeskLink 无法读取等待队列恢复记录。".to_owned())?
+            .clone();
+        let existing_target = existing.as_ref().map(TransferQueueRecovery::host_device_id);
+        if let Some(existing_target) = existing_target
+            && existing_target != host_device_id
+        {
+            return Err(format!(
+                "仍有设备 {} 的等待发送队列，请先连接该设备继续发送，或放弃旧队列。",
+                crate::device_directory::format_device_id(
+                    crate::device_directory::public_device_id(existing_target)
+                )
+            ));
+        }
+        if queued_files.is_empty() {
+            if existing.is_none() && self.file_queue_recovery_error().is_none() {
+                return Ok(false);
+            }
+            self.clear_file_queue_recovery_locked()?;
+            return Ok(true);
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|recovery| recovery.matches_queue(host_device_id, queued_files, paused))
+            && self.file_queue_recovery_error().is_none()
+        {
+            return Ok(false);
+        }
+        let recovery = TransferQueueRecovery::new(host_device_id, queued_files, paused);
+        *self
+            .file_queue_recovery
+            .lock()
+            .map_err(|_| "DeskLink 无法保留等待发送队列。".to_owned())? = Some(recovery.clone());
+        self.next_file_queue_recovery_revision();
+        if let Some(store) = self.file_queue_recovery_store.as_ref()
+            && store.save(&recovery).is_ok()
+        {
+            self.set_file_queue_recovery_error(None);
+        } else {
+            self.set_file_queue_recovery_error(Some(
+                "无法加密保存等待发送队列；队列仅保留到本次运行结束。",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn restored_file_queue_for(&self, host_device_id: [u8; 16]) -> VecDeque<OutgoingFile> {
+        let Ok(_operation) = self.file_queue_recovery_operation.lock() else {
+            return VecDeque::new();
+        };
+        self.file_queue_recovery
+            .lock()
+            .ok()
+            .and_then(|recovery| {
+                recovery
+                    .as_ref()
+                    .filter(|recovery| recovery.host_device_id() == host_device_id)
+                    .map(|recovery| {
+                        recovery
+                            .files()
+                            .iter()
+                            .map(|file| file.outgoing_file())
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    fn ensure_file_queue_target(&self, host_device_id: [u8; 16]) -> Result<(), String> {
+        let _operation = self
+            .file_queue_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法读取等待队列恢复记录。".to_owned())?;
+        let target = self
+            .file_queue_recovery
+            .lock()
+            .map_err(|_| "DeskLink 无法读取等待队列恢复记录。".to_owned())?
+            .as_ref()
+            .map(TransferQueueRecovery::host_device_id);
+        if let Some(target) = target
+            && target != host_device_id
+        {
+            return Err(format!(
+                "仍有设备 {} 的等待发送队列；为避免误发，当前设备暂不能添加文件。",
+                crate::device_directory::format_device_id(
+                    crate::device_directory::public_device_id(target)
+                )
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn discard_file_queue_recovery(&self, expected_revision: u64) -> Result<(), String> {
+        let _operation = self
+            .file_queue_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法更新等待队列恢复记录。".to_owned())?;
+        if expected_revision == 0
+            || self.file_queue_recovery_revision.load(Ordering::SeqCst) != expected_revision
+        {
+            return Err("等待队列已经变化，请刷新传输面板后重试。".to_owned());
+        }
+        let recovery_target = self
+            .file_queue_recovery
+            .lock()
+            .map_err(|_| "DeskLink 无法读取等待队列恢复记录。".to_owned())?
+            .as_ref()
+            .map(TransferQueueRecovery::host_device_id);
+        if self.snapshot().state == "connected"
+            && recovery_target.is_some()
+            && recovery_target == self.active_host_device_id()
+        {
+            return Err("等待队列已经载入当前会话，请使用“清空等待”安全移除。".to_owned());
+        }
+        self.clear_file_queue_recovery_locked()
+    }
+
+    fn clear_file_queue_recovery_locked(&self) -> Result<(), String> {
+        let previous = self
+            .file_queue_recovery
+            .lock()
+            .map_err(|_| "DeskLink 无法清理等待队列恢复记录。".to_owned())?
+            .take();
+        if let Some(store) = self.file_queue_recovery_store.as_ref()
+            && store.clear().is_err()
+        {
+            if let Ok(mut recovery) = self.file_queue_recovery.lock() {
+                *recovery = previous;
+            }
+            let message = "Windows 无法删除加密的等待队列记录，请稍后重试。";
+            self.set_file_queue_recovery_error(Some(message));
+            return Err(message.to_owned());
+        }
+        if self.file_queue_recovery_store.is_some() {
+            self.set_file_queue_recovery_error(None);
+        }
+        self.file_queue_recovery_revision.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn file_queue_recovery_summary(&self) -> Option<FileQueueRecoverySummary> {
+        let _operation = self.file_queue_recovery_operation.lock().ok()?;
+        let revision = self.file_queue_recovery_revision.load(Ordering::SeqCst);
+        self.file_queue_recovery
+            .lock()
+            .ok()
+            .and_then(|recovery| recovery.clone())
+            .map(|recovery| FileQueueRecoverySummary {
+                revision,
+                device_id: crate::device_directory::format_device_id(
+                    crate::device_directory::public_device_id(recovery.host_device_id()),
+                ),
+                queued: recovery
+                    .files()
+                    .iter()
+                    .map(|file| file.outgoing_file())
+                    .map(|file| QueuedFileSummary {
+                        id: hex(&file.transfer_id),
+                        name: file.name,
+                        size: file.size,
+                    })
+                    .collect(),
+                paused: recovery.paused(),
+                message: "上次还有文件等待发送；连接原设备后，队列会暂停载入。",
+            })
+    }
+
+    fn file_queue_recovery_error(&self) -> Option<String> {
+        self.file_queue_recovery_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+    }
+
+    fn file_queue_protection_status(
+        &self,
+        has_queued_files: bool,
+    ) -> (&'static str, Option<String>) {
+        if !has_queued_files {
+            return ("empty", None);
+        }
+        if let Some(error) = self.file_queue_recovery_error() {
+            return ("memoryOnly", Some(error));
+        }
+        if self.file_queue_recovery_store.is_some() {
+            ("protected", None)
+        } else {
+            (
+                "memoryOnly",
+                Some("等待发送队列仅保留到本次运行结束。".to_owned()),
+            )
+        }
+    }
+
+    fn set_file_queue_recovery_error(&self, message: Option<&str>) {
+        if let Ok(mut error) = self.file_queue_recovery_error.lock() {
+            *error = message.map(str::to_owned);
+        }
+    }
+
+    fn next_file_queue_recovery_revision(&self) -> u64 {
+        let previous = self
+            .file_queue_recovery_revision
+            .fetch_add(1, Ordering::SeqCst);
+        let revision = previous.wrapping_add(1);
+        if revision == 0 {
+            self.file_queue_recovery_revision.store(1, Ordering::SeqCst);
+            1
+        } else {
+            revision
+        }
+    }
+
     pub fn snapshot(&self) -> ControllerRuntimeSummary {
         self.status
             .lock()
@@ -729,7 +1417,7 @@ impl ControllerManager {
         self.ensure_current(generation)?;
         self.start(generation, settings, true, signals, video, audio)
             .await?;
-        load_snapshot(self.snapshot())
+        load_snapshot(self, self.snapshot())
     }
 
     pub async fn connect_saved(
@@ -747,7 +1435,7 @@ impl ControllerManager {
             .ok_or_else(|| "没有可供重新连接的已保存 Windows 电脑。".to_owned())?;
         self.start(generation, settings, false, signals, video, audio)
             .await?;
-        load_snapshot(self.snapshot())
+        load_snapshot(self, self.snapshot())
     }
 
     async fn start(
@@ -767,6 +1455,7 @@ impl ControllerManager {
         self.publish_if_current(generation, &signals, ControllerRuntimeSummary::connecting());
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (cancellation, cancellation_receiver) = watch::channel(false);
+        let host_device_id = settings.host_device_id();
         let manager = self.clone();
         let task = tauri::async_runtime::spawn(async move {
             run_controller(
@@ -788,6 +1477,7 @@ impl ControllerManager {
             .lock()
             .map_err(|_| "DeskLink 无法启动控制端任务。".to_owned())?;
         *worker = Some(ControllerWorker {
+            host_device_id,
             commands,
             cancellation,
             task,
@@ -841,6 +1531,13 @@ impl ControllerManager {
         self.send(ControllerCommand::SendClipboard(text)).await
     }
 
+    pub async fn paste_clipboard(&self, text: String) -> Result<(), String> {
+        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err("剪贴板文本超过 48 KB，无法粘贴。".to_owned());
+        }
+        self.send(ControllerCommand::PasteClipboard(text)).await
+    }
+
     pub async fn request_clipboard(&self) -> Result<(), String> {
         self.send(ControllerCommand::RequestClipboard).await
     }
@@ -869,12 +1566,7 @@ impl ControllerManager {
     }
 
     pub async fn request_remote_file(&self) -> Result<(), String> {
-        *self
-            .last_file_action
-            .lock()
-            .map_err(|_| "DeskLink 无法保留最近的文件操作。".to_owned())? =
-            Some(LastFileAction::Download);
-        self.send(ControllerCommand::RequestRemoteFile).await
+        self.send(ControllerCommand::RequestRemoteFile(None)).await
     }
 
     pub async fn retry_file(&self) -> Result<(), String> {
@@ -884,16 +1576,43 @@ impl ControllerManager {
             .map_err(|_| "DeskLink 无法读取最近的文件操作。".to_owned())?
             .clone()
             .ok_or_else(|| "没有可以重试的文件任务。".to_owned())?;
-        match action {
-            LastFileAction::Upload(path) => {
-                let prepared =
-                    tauri::async_runtime::spawn_blocking(move || prepare_outgoing_file(path))
-                        .await
-                        .map_err(|_| "DeskLink 无法重新读取所选文件。".to_owned())?
-                        .map_err(|result| prepare_file_error_message(result).to_owned())?;
+        if self.snapshot().state != "connected" {
+            return Err("请先连接文件任务对应的设备，再进行重试。".to_owned());
+        }
+        let active_host_device_id = self
+            .active_host_device_id()
+            .ok_or_else(|| "当前远程控制会话已经结束，请重新连接设备。".to_owned())?;
+        action.ensure_target(active_host_device_id)?;
+        match action.operation {
+            LastFileOperation::Upload(previous) => {
+                let previous_transfer_id = previous.transfer_id;
+                let previous_name = previous.name;
+                let previous_size = previous.size;
+                let previous_modified_at_unix_ns = previous.modified_at_unix_ns;
+                let mut prepared = tauri::async_runtime::spawn_blocking(move || {
+                    prepare_outgoing_file(previous.path)
+                })
+                .await
+                .map_err(|_| "DeskLink 无法重新读取所选文件。".to_owned())?
+                .map_err(|result| prepare_file_error_message(result).to_owned())?;
+                if prepared.name != previous_name
+                    || prepared.size != previous_size
+                    || (previous_modified_at_unix_ns != 0
+                        && prepared.modified_at_unix_ns != previous_modified_at_unix_ns)
+                {
+                    return Err("源文件已经变化，请重新选择文件。".to_owned());
+                }
+                prepared.transfer_id = previous_transfer_id;
                 self.send(ControllerCommand::RetryFile(prepared)).await
             }
-            LastFileAction::Download => self.send(ControllerCommand::RequestRemoteFile).await,
+            LastFileOperation::Download(resume) => {
+                self.remember_last_file_action(LastFileAction::download(
+                    active_host_device_id,
+                    resume.clone(),
+                ))?;
+                self.send(ControllerCommand::RequestRemoteFile(resume))
+                    .await
+            }
         }
     }
 
@@ -902,18 +1621,36 @@ impl ControllerManager {
     }
 
     pub async fn remove_queued_file(&self, transfer_id: &str) -> Result<(), String> {
-        self.send(ControllerCommand::RemoveQueuedFile(parse_transfer_id(
+        let transfer_id = parse_transfer_id(transfer_id)?;
+        self.send_file_queue_command(|reply| ControllerCommand::RemoveQueuedFile {
             transfer_id,
-        )?))
+            reply,
+        })
         .await
     }
 
     pub async fn clear_file_queue(&self) -> Result<(), String> {
-        self.send(ControllerCommand::ClearFileQueue).await
+        self.send_file_queue_command(|reply| ControllerCommand::ClearFileQueue { reply })
+            .await
     }
 
     pub async fn resume_file_queue(&self) -> Result<(), String> {
-        self.send(ControllerCommand::ResumeFileQueue).await
+        self.send_file_queue_command(|reply| ControllerCommand::ResumeFileQueue { reply })
+            .await
+    }
+
+    pub async fn retry_file_queue_protection(&self) -> Result<(), String> {
+        self.send_file_queue_command(|reply| ControllerCommand::RetryFileQueueProtection { reply })
+            .await
+    }
+
+    async fn send_file_queue_command(
+        &self,
+        command: impl FnOnce(FileQueueCommandReply) -> ControllerCommand,
+    ) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.send(command(reply)).await?;
+        wait_for_file_queue_command(response, FILE_QUEUE_COMMAND_TIMEOUT).await
     }
 
     async fn send(&self, command: ControllerCommand) -> Result<(), String> {
@@ -942,11 +1679,18 @@ impl ControllerManager {
         commands
             .send(command)
             .await
-            .map_err(|_| "远程控制会话已结束，无法继续发送输入。".to_owned())
+            .map_err(|_| "远程控制会话已结束，无法继续执行操作。".to_owned())
     }
 
     fn active_stream_id(&self) -> Option<u64> {
         self.status.lock().ok().and_then(|status| status.stream_id)
+    }
+
+    fn active_host_device_id(&self) -> Option<[u8; 16]> {
+        self.worker
+            .lock()
+            .ok()
+            .and_then(|worker| worker.as_ref().map(|worker| worker.host_device_id))
     }
 
     pub fn record_render_metrics(&self, metrics: ControllerRenderMetrics) -> Result<(), String> {
@@ -986,7 +1730,7 @@ impl ControllerManager {
         let _operation = self.operation_lock.lock().await;
         self.stop_current().await;
         self.set_status(ControllerRuntimeSummary::idle());
-        load_snapshot(self.snapshot())
+        load_snapshot(self, self.snapshot())
     }
 
     pub async fn forget_saved_device(
@@ -1016,7 +1760,7 @@ impl ControllerManager {
                 .map_err(|_| "DeskLink 无法移除已保存的控制端连接。".to_owned())?;
         }
         self.set_status(ControllerRuntimeSummary::idle());
-        load_snapshot(self.snapshot())
+        load_snapshot(self, self.snapshot())
     }
 
     pub async fn rename_saved_device(
@@ -1033,7 +1777,7 @@ impl ControllerManager {
                 WindowsRecentAccessError::InvalidAlias => error.to_string(),
                 _ => "DeskLink 无法保存设备名称，请检查当前账户的数据目录。".to_owned(),
             })?;
-        load_snapshot(self.snapshot())
+        load_snapshot(self, self.snapshot())
     }
 
     pub async fn clear_saved_devices(&self) -> Result<ControllerSnapshot, String> {
@@ -1041,7 +1785,7 @@ impl ControllerManager {
             .map_err(|_| "当前 Windows 账户无法使用已保存的设备密码。".to_owned())?
             .clear()
             .map_err(|_| "DeskLink 无法清除已保存的设备密码。".to_owned())?;
-        load_snapshot(self.snapshot())
+        load_snapshot(self, self.snapshot())
     }
 
     pub fn request_stop(&self) {
@@ -1160,6 +1904,17 @@ fn directory_transport_error_message(error: &TransportError) -> &'static str {
         ) => "中继服务器当前繁忙，DeskLink 已自动重试，请稍后再试。",
         TransportError::Malformed => "中继服务器返回了不兼容的设备查询响应，请更新两台电脑后重试。",
         TransportError::InvalidConfig(_) => "DeskLink 内置中继配置无效，请重新安装最新版本。",
+        TransportError::DirectoryProtocolMismatch {
+            controller: Some(controller),
+            host: Some(host),
+        } if controller < host => "当前控制端的 DeskLink 版本过旧，请先在这台电脑上安装最新版本。",
+        TransportError::DirectoryProtocolMismatch {
+            controller: Some(controller),
+            host: Some(host),
+        } if controller > host => "目标电脑的 DeskLink 版本过旧，请先在目标电脑上安装最新版本。",
+        TransportError::DirectoryProtocolMismatch { .. } => {
+            "两台电脑的 DeskLink 连接协议不兼容，请在两台电脑上安装同一个最新版本后重试。"
+        }
         TransportError::Connection(_) | TransportError::Stream(_) | TransportError::Closed => {
             "设备查询连接连续中断。请确认两台电脑均为最新版本，并保持目标电脑上的 DeskLink 在线。"
         }
@@ -1167,7 +1922,10 @@ fn directory_transport_error_message(error: &TransportError) -> &'static str {
     }
 }
 
-pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnapshot, String> {
+pub fn load_snapshot(
+    manager: &ControllerManager,
+    runtime: ControllerRuntimeSummary,
+) -> Result<ControllerSnapshot, String> {
     let store = WindowsControllerConnectionStore::for_current_user()
         .map_err(|_| "当前 Windows 账户无法使用已保存的控制端连接。".to_owned())?;
     let (saved_connection, connection_error) = match store.load() {
@@ -1210,6 +1968,10 @@ pub fn load_snapshot(runtime: ControllerRuntimeSummary) -> Result<ControllerSnap
         connection_error,
         saved_devices,
         saved_devices_error,
+        file_recovery: manager.file_recovery_summary(),
+        file_recovery_error: manager.file_recovery_error(),
+        file_queue_recovery: manager.file_queue_recovery_summary(),
+        file_queue_recovery_error: manager.file_queue_recovery_error(),
     })
 }
 
@@ -1237,12 +1999,15 @@ async fn run_controller(
     } = outputs;
     let diagnostics = DiagnosticLog::controller_for_current_user().ok();
     let _ = set_session_correlation(DiagnosticSource::Controller, settings.session_id());
+    let host_device_id = settings.host_device_id();
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
     let mut attempt = 0_u32;
     let mut audio_enabled = true;
     let mut video_quality = VideoQualityPreference::Sharp;
-    let mut queued_files = VecDeque::<OutgoingFile>::new();
-    let mut file_queue_paused = false;
+    let mut queued_files = manager.restored_file_queue_for(host_device_id);
+    // A recovered queue must never resume merely because the app or connection restarted.
+    // The user explicitly resumes it after seeing the target device and file list.
+    let mut file_queue_paused = !queued_files.is_empty();
     'connect: loop {
         attempt = attempt.saturating_add(1);
         record_controller_diagnostic(
@@ -1279,13 +2044,15 @@ async fn run_controller(
                     | Some(ControllerCommand::RequestKeyframe)
                     | Some(ControllerCommand::SelectDisplay(_))
                     | Some(ControllerCommand::SendClipboard(_))
+                    | Some(ControllerCommand::PasteClipboard(_))
                     | Some(ControllerCommand::RequestClipboard)
                     | Some(ControllerCommand::SendFiles(_))
                     | Some(ControllerCommand::RetryFile(_))
-                    | Some(ControllerCommand::RemoveQueuedFile(_))
-                    | Some(ControllerCommand::ClearFileQueue)
-                    | Some(ControllerCommand::ResumeFileQueue)
-                    | Some(ControllerCommand::RequestRemoteFile)
+                    | Some(ControllerCommand::RemoveQueuedFile { .. })
+                    | Some(ControllerCommand::ClearFileQueue { .. })
+                    | Some(ControllerCommand::ResumeFileQueue { .. })
+                    | Some(ControllerCommand::RetryFileQueueProtection { .. })
+                    | Some(ControllerCommand::RequestRemoteFile(_))
                     | Some(ControllerCommand::CancelFile) => {}
                 },
                 result = &mut connection => match result {
@@ -1361,11 +2128,20 @@ async fn run_controller(
             .unwrap_or_else(Instant::now);
         let mut next_transfer_request_id = 1_u64;
         let mut outgoing: Option<OutgoingTransfer> = None;
-        let mut incoming: Option<IncomingTransfer> = None;
-        let mut pending_remote_file_request: Option<u64> = None;
+        let mut incoming = ResumableIncomingTransfer::default();
+        let mut pending_remote_file_request: Option<PendingRemoteFileRequest> = None;
+        let mut pending_clipboard: Option<PendingClipboardOperation> = None;
         let mut audio_decoder = ControllerAudioDecoder::new();
-        let (file_failures, mut pending_file_failures) = mpsc::unbounded_channel();
-        publish_file_queue(&signals, &queued_files, file_queue_paused);
+        let (outgoing_file_events, mut pending_outgoing_file_events) = mpsc::unbounded_channel();
+        let mut transfer_watchdog = tokio::time::interval(TRANSFER_WATCHDOG_INTERVAL);
+        transfer_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        publish_file_queue(
+            &manager,
+            host_device_id,
+            &signals,
+            &queued_files,
+            file_queue_paused,
+        );
         let failure = loop {
             if outgoing.is_none()
                 && incoming.is_none()
@@ -1373,11 +2149,37 @@ async fn run_controller(
                 && !file_queue_paused
                 && let Some(file) = queued_files.pop_front()
             {
-                if let Ok(mut action) = manager.last_file_action.lock() {
-                    *action = Some(LastFileAction::Upload(file.path.clone()));
-                }
+                let failed_name = file.name.clone();
+                let failed_size = file.size;
+                let file = match revalidate_queued_file(file) {
+                    Ok(file) => file,
+                    Err(message) => {
+                        let _ = signals.send(ControllerSignal::FileTransfer {
+                            state: "failed",
+                            direction: "upload",
+                            name: failed_name,
+                            transferred: 0,
+                            total: failed_size,
+                            message,
+                        });
+                        file_queue_paused = !queued_files.is_empty();
+                        publish_file_queue(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
+                        continue;
+                    }
+                };
+                let _ = manager.remember_last_file_action(LastFileAction::upload(
+                    host_device_id,
+                    file.clone(),
+                ));
                 let offer = TransferMessage::FileOffer {
                     transfer_id: file.transfer_id,
+                    request_id: None,
                     name: file.name.clone(),
                     size: file.size,
                 };
@@ -1396,8 +2198,16 @@ async fn run_controller(
                 outgoing = Some(OutgoingTransfer {
                     file,
                     cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    phase: OutgoingTransferPhase::AwaitingDecision,
+                    deadline: Some(Instant::now() + FILE_DECISION_TIMEOUT),
                 });
-                publish_file_queue(&signals, &queued_files, file_queue_paused);
+                publish_file_queue(
+                    &manager,
+                    host_device_id,
+                    &signals,
+                    &queued_files,
+                    file_queue_paused,
+                );
             }
             tokio::select! {
                 changed = cancellation.changed() => {
@@ -1446,10 +2256,19 @@ async fn run_controller(
                         }
                     }
                     Some(ControllerCommand::SendClipboard(text)) => {
+                        if pending_clipboard.is_some() {
+                            let _ = signals.send(ControllerSignal::Clipboard {
+                                state: "failed",
+                                operation: "send",
+                                message: "上一项剪贴板操作仍在处理中，请稍后再试。".to_owned(),
+                            });
+                            continue;
+                        }
                         let request_id = next_transfer_request_id;
                         next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
                         let _ = signals.send(ControllerSignal::Clipboard {
                             state: "sending",
+                            operation: "send",
                             message: "正在发送本机剪贴板…".to_owned(),
                         });
                         if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardSet {
@@ -1458,12 +2277,54 @@ async fn run_controller(
                         }).await {
                             break ConnectFailure::from_controller(error);
                         }
+                        pending_clipboard = Some(PendingClipboardOperation::new(
+                            request_id,
+                            ClipboardOperation::Send,
+                            Instant::now(),
+                        ));
+                    }
+                    Some(ControllerCommand::PasteClipboard(text)) => {
+                        if pending_clipboard.is_some() {
+                            let _ = signals.send(ControllerSignal::Clipboard {
+                                state: "failed",
+                                operation: "paste",
+                                message: "上一次快捷粘贴仍在处理中，请稍后再试。".to_owned(),
+                            });
+                            continue;
+                        }
+                        let request_id = next_transfer_request_id;
+                        next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
+                        let _ = signals.send(ControllerSignal::Clipboard {
+                            state: "sending",
+                            operation: "paste",
+                            message: "正在将本机剪贴板写入远端并粘贴…".to_owned(),
+                        });
+                        if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardSet {
+                            request_id,
+                            text,
+                        }).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                        pending_clipboard = Some(PendingClipboardOperation::new(
+                            request_id,
+                            ClipboardOperation::Paste,
+                            Instant::now(),
+                        ));
                     }
                     Some(ControllerCommand::RequestClipboard) => {
+                        if pending_clipboard.is_some() {
+                            let _ = signals.send(ControllerSignal::Clipboard {
+                                state: "failed",
+                                operation: "receive",
+                                message: "上一项剪贴板操作仍在处理中，请稍后再试。".to_owned(),
+                            });
+                            continue;
+                        }
                         let request_id = next_transfer_request_id;
                         next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
                         let _ = signals.send(ControllerSignal::Clipboard {
                             state: "receiving",
+                            operation: "receive",
                             message: "正在读取远端剪贴板…".to_owned(),
                         });
                         if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardRequest {
@@ -1471,10 +2332,26 @@ async fn run_controller(
                         }).await {
                             break ConnectFailure::from_controller(error);
                         }
+                        pending_clipboard = Some(PendingClipboardOperation::new(
+                            request_id,
+                            ClipboardOperation::Receive,
+                            Instant::now(),
+                        ));
                     }
                     Some(ControllerCommand::SendFiles(files)) => {
                         let occupied = queued_files.len() + usize::from(outgoing.is_some());
                         if files.is_empty() {
+                            continue;
+                        }
+                        if let Err(message) = manager.ensure_file_queue_target(host_device_id) {
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: "文件队列".to_owned(),
+                                transferred: 0,
+                                total: 0,
+                                message,
+                            });
                             continue;
                         }
                         if occupied.saturating_add(files.len()) > MAX_FILE_QUEUE_ITEMS {
@@ -1489,9 +2366,26 @@ async fn run_controller(
                             continue;
                         }
                         queued_files.extend(files);
-                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                        publish_file_queue(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
                     }
                     Some(ControllerCommand::RetryFile(file)) => {
+                        if let Err(message) = manager.ensure_file_queue_target(host_device_id) {
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: file.name,
+                                transferred: 0,
+                                total: file.size,
+                                message,
+                            });
+                            continue;
+                        }
                         if queued_files.len() + usize::from(outgoing.is_some())
                             >= MAX_FILE_QUEUE_ITEMS
                         {
@@ -1507,25 +2401,81 @@ async fn run_controller(
                         }
                         queued_files.push_front(file);
                         file_queue_paused = false;
-                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                        publish_file_queue(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
                     }
-                    Some(ControllerCommand::RemoveQueuedFile(transfer_id)) => {
+                    Some(ControllerCommand::RemoveQueuedFile { transfer_id, reply }) => {
+                        if !queued_files
+                            .iter()
+                            .any(|file| file.transfer_id == transfer_id)
+                        {
+                            let _ = reply.send(Err(
+                                "这个文件已经不在等待队列中，请刷新传输面板。".to_owned(),
+                            ));
+                            continue;
+                        }
                         queued_files.retain(|file| file.transfer_id != transfer_id);
                         if queued_files.is_empty() {
                             file_queue_paused = false;
                         }
-                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                        let result = publish_file_queue_with_result(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
+                        let _ = reply.send(result);
                     }
-                    Some(ControllerCommand::ClearFileQueue) => {
+                    Some(ControllerCommand::ClearFileQueue { reply }) => {
+                        if queued_files.is_empty() {
+                            let _ = reply.send(Err("等待发送队列已经清空。".to_owned()));
+                            continue;
+                        }
                         queued_files.clear();
                         file_queue_paused = false;
-                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                        let result = publish_file_queue_with_result(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
+                        let _ = reply.send(result);
                     }
-                    Some(ControllerCommand::ResumeFileQueue) => {
+                    Some(ControllerCommand::ResumeFileQueue { reply }) => {
+                        if queued_files.is_empty() || !file_queue_paused {
+                            let _ = reply.send(Err(
+                                "等待发送队列已经开始处理，请刷新传输面板。".to_owned(),
+                            ));
+                            continue;
+                        }
                         file_queue_paused = false;
-                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                        let result = publish_file_queue_with_result(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
+                        let _ = reply.send(result);
                     }
-                    Some(ControllerCommand::RequestRemoteFile) => {
+                    Some(ControllerCommand::RetryFileQueueProtection { reply }) => {
+                        let result = publish_file_queue_with_result(
+                            &manager,
+                            host_device_id,
+                            &signals,
+                            &queued_files,
+                            file_queue_paused,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    Some(ControllerCommand::RequestRemoteFile(resume)) => {
                         if outgoing.is_some()
                             || incoming.is_some()
                             || pending_remote_file_request.is_some()
@@ -1541,14 +2491,24 @@ async fn run_controller(
                             });
                             continue;
                         }
+                        let _ = manager.remember_last_file_action(LastFileAction::download(
+                            host_device_id,
+                            resume.clone(),
+                        ));
                         let request_id = next_transfer_request_id;
                         next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
                         if let Err(error) = runtime.send_transfer(
-                            TransferMessage::FileSelectionRequest { request_id },
+                            TransferMessage::FileSelectionRequest {
+                                request_id,
+                                resume,
+                            },
                         ).await {
                             break ConnectFailure::from_controller(error);
                         }
-                        pending_remote_file_request = Some(request_id);
+                        pending_remote_file_request = Some(PendingRemoteFileRequest::new(
+                            request_id,
+                            Instant::now(),
+                        ));
                         let _ = signals.send(ControllerSignal::FileTransfer {
                             state: "waiting",
                             direction: "download",
@@ -1574,7 +2534,13 @@ async fn run_controller(
                             });
                             if !queued_files.is_empty() {
                                 file_queue_paused = true;
-                                publish_file_queue(&signals, &queued_files, file_queue_paused);
+                                publish_file_queue(
+                                    &manager,
+                                    host_device_id,
+                                    &signals,
+                                    &queued_files,
+                                    file_queue_paused,
+                                );
                             }
                         } else if let Some(transfer) = incoming.take() {
                             let _ = runtime.send_transfer(TransferMessage::Cancel {
@@ -1588,9 +2554,11 @@ async fn run_controller(
                                 total: transfer.size,
                                 message: "文件接收已取消，未完成的临时文件已删除。".to_owned(),
                             });
-                        } else if let Some(request_id) = pending_remote_file_request.take() {
+                        } else if let Some(request) = pending_remote_file_request.take() {
                             let _ = runtime.send_transfer(
-                                TransferMessage::FileSelectionCancel { request_id },
+                                TransferMessage::FileSelectionCancel {
+                                    request_id: request.request_id,
+                                },
                             ).await;
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "cancelled",
@@ -1731,7 +2699,13 @@ async fn run_controller(
                     }
                     Ok(ControllerEvent::Control(_)) => {}
                     Ok(ControllerEvent::Transfer(message)) => match message {
-                        TransferMessage::ClipboardData { text, .. } => {
+                        TransferMessage::ClipboardData { request_id, text } => {
+                            if !pending_clipboard.is_some_and(|pending| {
+                                pending.matches(request_id, ClipboardOperation::Receive)
+                            }) {
+                                continue;
+                            }
+                            pending_clipboard = None;
                             let write = tauri::async_runtime::spawn_blocking(move || {
                                 apps_windows::transfer::write_clipboard_text(&text)
                             }).await.unwrap_or(Err(TransferResult::IoFailed));
@@ -1742,30 +2716,48 @@ async fn run_controller(
                             };
                             let _ = signals.send(ControllerSignal::Clipboard {
                                 state,
+                                operation: "receive",
                                 message: message.to_owned(),
                             });
                         }
-                        TransferMessage::ClipboardResult { result, .. } => {
-                            let completed = result == TransferResult::Completed;
+                        TransferMessage::ClipboardResult { request_id, result } => {
+                            let Some(pending) = pending_clipboard.filter(|pending| {
+                                pending.request_id == request_id
+                            }) else {
+                                continue;
+                            };
+                            pending_clipboard = None;
+                            let completed = result == TransferResult::Completed
+                                && pending.operation != ClipboardOperation::Receive;
+                            if pending.operation == ClipboardOperation::Paste && completed
+                                && let Err(error) = send_remote_paste_shortcut(&runtime).await
+                            {
+                                break ConnectFailure::from_controller(error);
+                            }
                             let _ = signals.send(ControllerSignal::Clipboard {
                                 state: if completed { "completed" } else { "failed" },
-                                message: if completed {
+                                operation: pending.operation.signal_name(),
+                                message: if pending.operation == ClipboardOperation::Paste && completed {
+                                    "已将本机剪贴板粘贴到远程电脑。"
+                                } else if pending.operation == ClipboardOperation::Send && completed {
                                     "本机文本已写入远端剪贴板。"
+                                } else if pending.operation == ClipboardOperation::Receive
+                                    && result == TransferResult::Completed
+                                {
+                                    "远端没有返回剪贴板文本，请重试。"
                                 } else {
                                     transfer_result_message(result)
                                 }.to_owned(),
                             });
                         }
                         TransferMessage::FileSelectionResult { request_id, result } => {
-                            if pending_remote_file_request != Some(request_id) {
+                            if !pending_remote_file_request
+                                .is_some_and(|pending| pending.request_id == request_id)
+                            {
                                 continue;
                             }
                             pending_remote_file_request = None;
-                            let state = match result {
-                                TransferResult::Cancelled => "cancelled",
-                                TransferResult::Rejected => "rejected",
-                                _ => "failed",
-                            };
+                            let state = transfer_result_state(result);
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state,
                                 direction: "download",
@@ -1775,11 +2767,32 @@ async fn run_controller(
                                 message: transfer_result_message(result).to_owned(),
                             });
                         }
-                        TransferMessage::FileOffer { transfer_id, name, size } => {
-                            let requested = pending_remote_file_request.take().is_some();
+                        TransferMessage::FileOffer {
+                            transfer_id,
+                            request_id,
+                            name,
+                            size,
+                        } => {
+                            let requested = file_offer_matches_request(
+                                pending_remote_file_request,
+                                request_id,
+                            );
+                            if requested {
+                                pending_remote_file_request = None;
+                            }
                             if !requested || outgoing.is_some() || incoming.is_some() {
+                                let result = if requested {
+                                    TransferResult::Busy
+                                } else {
+                                    TransferResult::Rejected
+                                };
                                 if let Err(error) = runtime.send_transfer(
-                                    TransferMessage::FileDecision { transfer_id, accepted: false },
+                                    TransferMessage::FileDecision {
+                                        transfer_id,
+                                        result,
+                                        resume_offset: 0,
+                                        resume_prefix_hash: None,
+                                    },
                                 ).await {
                                     break ConnectFailure::from_controller(error);
                                 }
@@ -1789,30 +2802,65 @@ async fn run_controller(
                                 let name = name.clone();
                                 move || IncomingFile::create(transfer_id, name, size)
                             }).await.unwrap_or(Err(TransferResult::IoFailed));
-                            let accepted = incoming_file.is_ok();
+                            let (result, resume_offset, resume_prefix_hash, mut staged) =
+                                match incoming_file {
+                                Ok(file) => {
+                                    let resume_offset = file.resume_offset();
+                                    let resume_prefix_hash = file.resume_prefix_hash();
+                                    (
+                                        TransferResult::Completed,
+                                        resume_offset,
+                                        resume_prefix_hash,
+                                        ResumableIncomingTransfer(Some(IncomingTransfer {
+                                            file,
+                                            name: name.clone(),
+                                            size,
+                                            transferred: resume_offset,
+                                            last_activity: Instant::now(),
+                                        })),
+                                    )
+                                }
+                                Err(result) => {
+                                    (result, 0, None, ResumableIncomingTransfer::default())
+                                }
+                            };
                             if let Err(error) = runtime.send_transfer(
-                                TransferMessage::FileDecision { transfer_id, accepted },
+                                TransferMessage::FileDecision {
+                                    transfer_id,
+                                    result,
+                                    resume_offset,
+                                    resume_prefix_hash,
+                                },
                             ).await {
                                 break ConnectFailure::from_controller(error);
                             }
-                            match incoming_file {
-                                Ok(file) => {
+                            match staged.take() {
+                                Some(transfer) => {
+                                    let _ = manager.remember_last_file_action(
+                                        LastFileAction::download(host_device_id, Some(FileResumeHint {
+                                            transfer_id,
+                                            name: name.clone(),
+                                            size,
+                                        })),
+                                    );
                                     let _ = signals.send(ControllerSignal::FileTransfer {
                                         state: "receiving",
                                         direction: "download",
                                         name: name.clone(),
-                                        transferred: 0,
+                                        transferred: resume_offset,
                                         total: size,
-                                        message: "正在接收远端文件… 0%".to_owned(),
+                                        message: if resume_offset == 0 {
+                                            "正在接收远端文件… 0%".to_owned()
+                                        } else {
+                                            format!(
+                                                "从 {}% 继续接收远端文件…",
+                                                transfer_percent(resume_offset, size)
+                                            )
+                                        },
                                     });
-                                    incoming = Some(IncomingTransfer {
-                                        file,
-                                        name,
-                                        size,
-                                        transferred: 0,
-                                    });
+                                    *incoming = Some(transfer);
                                 }
-                                Err(result) => {
+                                None => {
                                     let _ = signals.send(ControllerSignal::FileTransfer {
                                         state: "failed",
                                         direction: "download",
@@ -1832,6 +2880,7 @@ async fn run_controller(
                                 .and_then(|transfer| {
                                     transfer.file.write_chunk(offset, &bytes)?;
                                     transfer.transferred = offset.saturating_add(bytes.len() as u64);
+                                    transfer.last_activity = Instant::now();
                                     Ok((
                                         transfer.name.clone(),
                                         transfer.transferred,
@@ -1883,7 +2932,7 @@ async fn run_controller(
                                     (name, size, result)
                                 }
                                 Some(transfer) => {
-                                    incoming = Some(transfer);
+                                    *incoming = Some(transfer);
                                     ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData))
                                 }
                                 None => ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData)),
@@ -1904,6 +2953,9 @@ async fn run_controller(
                                 break ConnectFailure::from_controller(error);
                             }
                             let completed = transfer_result == TransferResult::Completed;
+                            if completed {
+                                manager.clear_last_file_action();
+                            }
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: if completed { "completed" } else { "failed" },
                                 direction: "download",
@@ -1917,26 +2969,43 @@ async fn run_controller(
                                 }.to_owned(),
                             });
                         }
-                        TransferMessage::FileDecision { transfer_id, accepted } => {
+                        TransferMessage::FileDecision {
+                            transfer_id,
+                            result,
+                            resume_offset,
+                            resume_prefix_hash,
+                        } => {
                             let matches = outgoing.as_ref().is_some_and(|transfer| {
                                 transfer.file.transfer_id == transfer_id
+                                    && transfer.phase == OutgoingTransferPhase::AwaitingDecision
                             });
                             if !matches {
                                 continue;
                             }
-                            if !accepted {
+                            if result != TransferResult::Completed
+                                || outgoing.as_ref().is_some_and(|transfer| {
+                                    resume_offset > transfer.file.size
+                                })
+                            {
                                 let transfer = outgoing.take().expect("checked outgoing transfer");
+                                let result = if result == TransferResult::Completed {
+                                    TransferResult::InvalidData
+                                } else {
+                                    result
+                                };
                                 let _ = signals.send(ControllerSignal::FileTransfer {
-                                    state: "rejected",
+                                    state: transfer_result_state(result),
                                     direction: "upload",
                                     name: transfer.file.name,
                                     transferred: 0,
                                     total: transfer.file.size,
-                                    message: "远端已拒绝接收此文件。".to_owned(),
+                                    message: transfer_result_message(result).to_owned(),
                                 });
                                 if !queued_files.is_empty() {
                                     file_queue_paused = true;
                                     publish_file_queue(
+                                        &manager,
+                                        host_device_id,
                                         &signals,
                                         &queued_files,
                                         file_queue_paused,
@@ -1944,29 +3013,30 @@ async fn run_controller(
                                 }
                                 continue;
                             }
-                            let transfer = outgoing.as_ref().expect("checked outgoing transfer");
+                            let transfer = outgoing.as_mut().expect("checked outgoing transfer");
+                            transfer.phase = OutgoingTransferPhase::Sending;
+                            transfer.deadline = None;
                             let sender = runtime.transfer_sender();
                             let signals = signals.clone();
                             let cancellation = transfer.cancellation.clone();
-                            let path = transfer.file.path.clone();
-                            let name = transfer.file.name.clone();
-                            let size = transfer.file.size;
-                            let file_failures = file_failures.clone();
+                            let file = transfer.file.clone();
+                            let outgoing_file_events = outgoing_file_events.clone();
                             tauri::async_runtime::spawn(async move {
-                                if let Err(message) = send_outgoing_file(
+                                let event = match send_outgoing_file(
                                     sender,
-                                    transfer_id,
-                                    path,
-                                    name.clone(),
-                                    size,
+                                    file,
+                                    resume_offset,
+                                    resume_prefix_hash,
                                     cancellation,
-                                    signals.clone(),
+                                    signals,
                                 ).await {
-                                    let _ = file_failures.send(OutgoingFileFailure {
+                                    Ok(()) => OutgoingFileEvent::AwaitingResult { transfer_id },
+                                    Err(message) => OutgoingFileEvent::Failed {
                                         transfer_id,
                                         message,
-                                    });
-                                }
+                                    },
+                                };
+                                let _ = outgoing_file_events.send(event);
                             });
                         }
                         TransferMessage::FileResult { transfer_id, result } => {
@@ -1976,6 +3046,9 @@ async fn run_controller(
                                 let transfer = outgoing.take().expect("checked outgoing transfer");
                                 transfer.cancellation.store(true, Ordering::Release);
                                 let completed = result == TransferResult::Completed;
+                                if completed {
+                                    manager.clear_last_file_action();
+                                }
                                 let _ = signals.send(ControllerSignal::FileTransfer {
                                     state: if completed { "completed" } else { "failed" },
                                     direction: "upload",
@@ -1991,11 +3064,25 @@ async fn run_controller(
                                 if !completed && !queued_files.is_empty() {
                                     file_queue_paused = true;
                                     publish_file_queue(
+                                        &manager,
+                                        host_device_id,
                                         &signals,
                                         &queued_files,
                                         file_queue_paused,
                                     );
                                 }
+                            } else if incoming.as_ref().is_some_and(|transfer| {
+                                transfer.file.transfer_id() == transfer_id
+                            }) {
+                                let transfer = incoming.take().expect("checked incoming transfer");
+                                let _ = signals.send(ControllerSignal::FileTransfer {
+                                    state: "failed",
+                                    direction: "download",
+                                    name: transfer.name,
+                                    transferred: transfer.transferred,
+                                    total: transfer.size,
+                                    message: transfer_result_message(result).to_owned(),
+                                });
                             }
                         }
                         TransferMessage::Cancel { transfer_id } => {
@@ -2015,6 +3102,8 @@ async fn run_controller(
                                 if !queued_files.is_empty() {
                                     file_queue_paused = true;
                                     publish_file_queue(
+                                        &manager,
+                                        host_device_id,
                                         &signals,
                                         &queued_files,
                                         file_queue_paused,
@@ -2044,29 +3133,138 @@ async fn run_controller(
                     }
                     Err(error) => break ConnectFailure::from_controller(error),
                 },
-                Some(failed) = pending_file_failures.recv() => {
-                    let matches = outgoing.as_ref().is_some_and(|transfer| {
-                        transfer.file.transfer_id == failed.transfer_id
-                    });
-                    if !matches {
-                        continue;
+                Some(event) = pending_outgoing_file_events.recv() => {
+                    match event {
+                        OutgoingFileEvent::AwaitingResult { transfer_id } => {
+                            if let Some(transfer) = outgoing.as_mut().filter(|transfer| {
+                                transfer.file.transfer_id == transfer_id
+                                    && transfer.phase == OutgoingTransferPhase::Sending
+                            }) {
+                                transfer.phase = OutgoingTransferPhase::AwaitingResult;
+                                transfer.deadline = Some(Instant::now() + FILE_RESULT_TIMEOUT);
+                            }
+                        }
+                        OutgoingFileEvent::Failed { transfer_id, message } => {
+                            let matches = outgoing.as_ref().is_some_and(|transfer| {
+                                transfer.file.transfer_id == transfer_id
+                            });
+                            if !matches {
+                                continue;
+                            }
+                            let transfer = outgoing.take().expect("checked outgoing transfer");
+                            transfer.cancellation.store(true, Ordering::Release);
+                            let _ = runtime.send_transfer(TransferMessage::Cancel {
+                                transfer_id: transfer.file.transfer_id,
+                            }).await;
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: transfer.file.name,
+                                transferred: 0,
+                                total: transfer.file.size,
+                                message,
+                            });
+                            if !queued_files.is_empty() {
+                                file_queue_paused = true;
+                                publish_file_queue(
+                                    &manager,
+                                    host_device_id,
+                                    &signals,
+                                    &queued_files,
+                                    file_queue_paused,
+                                );
+                            }
+                        }
                     }
-                    let transfer = outgoing.take().expect("checked outgoing transfer");
-                    transfer.cancellation.store(true, Ordering::Release);
-                    let _ = runtime.send_transfer(TransferMessage::Cancel {
-                        transfer_id: transfer.file.transfer_id,
-                    }).await;
-                    let _ = signals.send(ControllerSignal::FileTransfer {
-                        state: "failed",
-                        direction: "upload",
-                        name: transfer.file.name,
-                        transferred: 0,
-                        total: transfer.file.size,
-                        message: failed.message,
-                    });
-                    if !queued_files.is_empty() {
-                        file_queue_paused = true;
-                        publish_file_queue(&signals, &queued_files, file_queue_paused);
+                }
+                _ = transfer_watchdog.tick() => {
+                    let now = Instant::now();
+                    if pending_clipboard
+                        .is_some_and(|pending| deadline_expired(pending.deadline, now))
+                    {
+                        let pending = pending_clipboard.take().expect("checked clipboard deadline");
+                        let _ = signals.send(ControllerSignal::Clipboard {
+                            state: "failed",
+                            operation: pending.operation.signal_name(),
+                            message: "15 秒内未收到远端剪贴板响应，请检查连接后重试。".to_owned(),
+                        });
+                    }
+                    if pending_remote_file_request
+                        .is_some_and(|pending| deadline_expired(pending.deadline, now))
+                    {
+                        let pending = pending_remote_file_request
+                            .take()
+                            .expect("checked remote file request deadline");
+                        let _ = runtime.send_transfer(TransferMessage::FileSelectionCancel {
+                            request_id: pending.request_id,
+                        }).await;
+                        let _ = signals.send(ControllerSignal::FileTransfer {
+                            state: "failed",
+                            direction: "download",
+                            name: "远端文件".to_owned(),
+                            transferred: 0,
+                            total: 0,
+                            message: "远端 5 分钟内未选择文件，已停止等待；可以稍后重新获取。".to_owned(),
+                        });
+                    }
+                    if incoming.as_ref().is_some_and(|transfer| {
+                        now.duration_since(transfer.last_activity) >= FILE_RECEIVE_IDLE_TIMEOUT
+                    }) {
+                        let transfer = incoming.take().expect("checked incoming file deadline");
+                        let _ = runtime.send_transfer(TransferMessage::Cancel {
+                            transfer_id: transfer.file.transfer_id(),
+                        }).await;
+                        let _ = signals.send(ControllerSignal::FileTransfer {
+                            state: "failed",
+                            direction: "download",
+                            name: transfer.name,
+                            transferred: transfer.transferred,
+                            total: transfer.size,
+                            message: "连续 60 秒未收到新的文件数据，已取消接收并删除临时文件。".to_owned(),
+                        });
+                    }
+                    if outgoing.as_ref().is_some_and(|transfer| {
+                        transfer
+                            .deadline
+                            .is_some_and(|deadline| deadline_expired(deadline, now))
+                    }) {
+                        let transfer = outgoing.take().expect("checked outgoing file deadline");
+                        transfer.cancellation.store(true, Ordering::Release);
+                        let _ = runtime.send_transfer(TransferMessage::Cancel {
+                            transfer_id: transfer.file.transfer_id,
+                        }).await;
+                        let (transferred, message) = match transfer.phase {
+                            OutgoingTransferPhase::AwaitingDecision => (
+                                0,
+                                "远端 2 分钟内未确认接收，已停止等待；请确认对方看到提示后重试。",
+                            ),
+                            OutgoingTransferPhase::AwaitingResult => (
+                                transfer.file.size,
+                                "文件已发送，但 60 秒内未收到远端保存确认；请确认远端下载文件夹后再决定是否重试。",
+                            ),
+                            OutgoingTransferPhase::Sending => (
+                                0,
+                                "文件发送长时间没有进展，已停止本次传输。",
+                            ),
+                        };
+                        let _ = signals.send(ControllerSignal::FileTransfer {
+                            state: "failed",
+                            direction: "upload",
+                            name: transfer.file.name,
+                            transferred,
+                            total: transfer.file.size,
+                            message: message.to_owned(),
+                        });
+                        if !queued_files.is_empty() {
+                            file_queue_paused = true;
+                            publish_file_queue(
+                                &manager,
+                                host_device_id,
+                                &signals,
+                                &queued_files,
+                                file_queue_paused,
+                            );
+                        }
                     }
                 }
             }
@@ -2112,6 +3310,13 @@ async fn run_controller(
                 last_metrics = Instant::now();
             }
         };
+        if let Some(pending) = pending_clipboard.take() {
+            let _ = signals.send(ControllerSignal::Clipboard {
+                state: "failed",
+                operation: pending.operation.signal_name(),
+                message: "连接中断，剪贴板操作未完成；重新连接后可以重试。".to_owned(),
+            });
+        }
         if let Some(transfer) = outgoing.take() {
             transfer.cancellation.store(true, Ordering::Release);
             let _ = signals.send(ControllerSignal::FileTransfer {
@@ -2124,17 +3329,34 @@ async fn run_controller(
             });
             if !queued_files.is_empty() {
                 file_queue_paused = true;
-                publish_file_queue(&signals, &queued_files, file_queue_paused);
+                publish_file_queue(
+                    &manager,
+                    host_device_id,
+                    &signals,
+                    &queued_files,
+                    file_queue_paused,
+                );
             }
         }
         if let Some(transfer) = incoming.take() {
+            let name = transfer.name;
+            let transferred = transfer.transferred;
+            let total = transfer.size;
+            let preserved = tauri::async_runtime::spawn_blocking(move || transfer.file.preserve())
+                .await
+                .is_ok_and(|result| result.is_ok());
             let _ = signals.send(ControllerSignal::FileTransfer {
                 state: "failed",
                 direction: "download",
-                name: transfer.name,
-                transferred: transfer.transferred,
-                total: transfer.size,
-                message: "连接中断，文件接收未完成；临时文件已删除。".to_owned(),
+                name,
+                transferred,
+                total,
+                message: if preserved {
+                    "连接中断，已保留接收进度；连接恢复后点击重试即可继续。"
+                } else {
+                    "连接中断，且无法安全保留接收进度；请重新获取文件。"
+                }
+                .to_owned(),
             });
         } else if pending_remote_file_request.take().is_some() {
             let _ = signals.send(ControllerSignal::FileTransfer {
@@ -2177,13 +3399,38 @@ enum FileReadEvent {
 
 async fn send_outgoing_file(
     sender: ControllerTransferSender,
-    transfer_id: TransferId,
-    path: PathBuf,
-    name: String,
-    size: u64,
+    file: OutgoingFile,
+    resume_offset: u64,
+    resume_prefix_hash: Option<[u8; 32]>,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
     signals: Channel<ControllerSignal>,
 ) -> Result<(), String> {
+    let transfer_id = file.transfer_id;
+    let path = file.path;
+    let name = file.name;
+    let size = file.size;
+    if resume_offset > size {
+        return Err("远端返回了无效的文件续传位置。".to_owned());
+    }
+    let proof_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        verify_resume_prefix(&proof_path, resume_offset, resume_prefix_hash)
+    })
+    .await
+    .map_err(|_| "无法验证文件断点，请重新选择文件。".to_owned())?
+    .map_err(|result| transfer_result_message(result).to_owned())?;
+    let _ = signals.send(ControllerSignal::FileTransfer {
+        state: "sending",
+        direction: "upload",
+        name: name.clone(),
+        transferred: resume_offset,
+        total: size,
+        message: if resume_offset == 0 {
+            "正在发送… 0%".to_owned()
+        } else {
+            format!("从 {}% 继续发送…", transfer_percent(resume_offset, size))
+        },
+    });
     let (events, mut receiver) = mpsc::channel(2);
     let producer_cancellation = cancellation.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -2202,10 +3449,18 @@ async fn send_outgoing_file(
                 }
                 bytes.truncate(read);
                 hasher.update(&bytes);
-                events
-                    .blocking_send(FileReadEvent::Chunk { offset, bytes })
-                    .map_err(|_| ())?;
-                offset = offset.checked_add(read as u64).ok_or(())?;
+                let end = offset.checked_add(read as u64).ok_or(())?;
+                if let Some((chunk_offset, bytes)) =
+                    chunk_after_resume(offset, bytes, resume_offset).map_err(|_| ())?
+                {
+                    events
+                        .blocking_send(FileReadEvent::Chunk {
+                            offset: chunk_offset,
+                            bytes,
+                        })
+                        .map_err(|_| ())?;
+                }
+                offset = end;
             }
             if offset != size {
                 return Err(());
@@ -2228,14 +3483,17 @@ async fn send_outgoing_file(
         match event {
             FileReadEvent::Chunk { offset, bytes } => {
                 let transferred = offset.saturating_add(bytes.len() as u64);
-                sender
-                    .send(TransferMessage::FileChunk {
+                tokio::time::timeout(
+                    FILE_CHUNK_SEND_TIMEOUT,
+                    sender.send(TransferMessage::FileChunk {
                         transfer_id,
                         offset,
                         bytes,
-                    })
-                    .await
-                    .map_err(|_| "发送文件时连接中断。".to_owned())?;
+                    }),
+                )
+                .await
+                .map_err(|_| "连续 30 秒无法发送新的文件数据，已停止本次传输。".to_owned())?
+                .map_err(|_| "发送文件时连接中断。".to_owned())?;
                 let _ = signals.send(ControllerSignal::FileTransfer {
                     state: "sending",
                     direction: "upload",
@@ -2246,13 +3504,16 @@ async fn send_outgoing_file(
                 });
             }
             FileReadEvent::Complete(content_hash) => {
-                sender
-                    .send(TransferMessage::FileComplete {
+                tokio::time::timeout(
+                    FILE_CHUNK_SEND_TIMEOUT,
+                    sender.send(TransferMessage::FileComplete {
                         transfer_id,
                         content_hash,
-                    })
-                    .await
-                    .map_err(|_| "发送完成确认时连接中断。".to_owned())?;
+                    }),
+                )
+                .await
+                .map_err(|_| "发送完成信息超时，已停止等待远端校验。".to_owned())?
+                .map_err(|_| "发送完成确认时连接中断。".to_owned())?;
                 let _ = signals.send(ControllerSignal::FileTransfer {
                     state: "verifying",
                     direction: "upload",
@@ -2289,8 +3550,19 @@ fn transfer_result_message(result: TransferResult) -> &'static str {
         TransferResult::InvalidData => "内容校验失败，未保存文件。",
         TransferResult::PermissionDenied => "Windows 拒绝访问剪贴板或下载文件夹。",
         TransferResult::IoFailed => "读写内容失败，请检查 Windows 权限和磁盘空间。",
+        TransferResult::InsufficientSpace => "接收端下载磁盘空间不足，请清理空间后重试。",
+        TransferResult::SourceChanged => "发送端文件与已保存的断点内容不一致，请重新选择文件。",
         TransferResult::Unsupported => "远端暂不支持此操作。",
         TransferResult::Busy => "另一项文件传输正在进行，请稍后重试。",
+    }
+}
+
+fn transfer_result_state(result: TransferResult) -> &'static str {
+    match result {
+        TransferResult::Completed => "completed",
+        TransferResult::Rejected => "rejected",
+        TransferResult::Cancelled => "cancelled",
+        _ => "failed",
     }
 }
 
@@ -2300,6 +3572,20 @@ fn prepare_file_error_message(result: TransferResult) -> &'static str {
         TransferResult::InvalidData => "请选择文件名有效的普通文件，而不是文件夹。",
         _ => "无法读取所选文件，请检查文件权限后重试。",
     }
+}
+
+fn revalidate_queued_file(previous: OutgoingFile) -> Result<OutgoingFile, String> {
+    let mut prepared = prepare_outgoing_file(previous.path)
+        .map_err(|result| prepare_file_error_message(result).to_owned())?;
+    if prepared.name != previous.name
+        || prepared.size != previous.size
+        || (previous.modified_at_unix_ns != 0
+            && prepared.modified_at_unix_ns != previous.modified_at_unix_ns)
+    {
+        return Err("源文件已经变化，已从等待队列移除；请重新添加该文件。".to_owned());
+    }
+    prepared.transfer_id = previous.transfer_id;
+    Ok(prepared)
 }
 
 fn session_earned_fresh_retry_budget(connected_for: Duration) -> bool {
@@ -2471,6 +3757,22 @@ impl ConnectFailure {
 
     fn from_controller(error: ControllerError) -> Self {
         let technical_reason = error.to_string();
+        if let ControllerError::Protocol(ProtocolError::UnsupportedVersion(_)) = &error {
+            return Self::with_reason(
+                false,
+                "两台电脑的 DeskLink 连接协议不兼容，请在两台电脑上安装同一个最新版本后重试。",
+                "protocol_version_mismatch",
+                technical_reason,
+            );
+        }
+        if matches!(&error, ControllerError::InvalidHostCapabilities) {
+            return Self::with_reason(
+                false,
+                "目标电脑的远程功能与当前版本不兼容，请先在目标电脑上安装最新 DeskLink。",
+                "capability_mismatch",
+                technical_reason,
+            );
+        }
         if let ControllerError::AccessDenied(reason) = error {
             return match reason {
                 AccessDenialReason::ApprovalRejected => Self::with_reason(
@@ -2716,6 +4018,28 @@ async fn send_text_input(runtime: &ControllerRuntime, text: &str) -> Result<(), 
     Ok(())
 }
 
+fn remote_paste_shortcut_events() -> [InputEvent; 2] {
+    [
+        InputEvent::Key {
+            code: KeyCode::Character('v'),
+            pressed: true,
+            modifiers: Modifiers::CONTROL,
+        },
+        InputEvent::Key {
+            code: KeyCode::Character('v'),
+            pressed: false,
+            modifiers: Modifiers::CONTROL,
+        },
+    ]
+}
+
+async fn send_remote_paste_shortcut(runtime: &ControllerRuntime) -> Result<(), ControllerError> {
+    for event in remote_paste_shortcut_events() {
+        runtime.send_input(event).await?;
+    }
+    Ok(())
+}
+
 fn validate_text_input(text: &str) -> Result<(), String> {
     let character_count = text.chars().count();
     if character_count == 0 {
@@ -2835,11 +4159,42 @@ fn required_point(x: Option<i32>, y: Option<i32>) -> Result<(i32, i32), String> 
     Ok((x, y))
 }
 
+async fn wait_for_file_queue_command(
+    response: oneshot::Receiver<Result<(), String>>,
+    deadline: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(deadline, response).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("远程控制会话已经变化，文件队列操作未能完成，请重试。".to_owned()),
+        Err(_) => Err("文件队列操作处理超时，请稍后重试。".to_owned()),
+    }
+}
+
 fn publish_file_queue(
+    manager: &ControllerManager,
+    host_device_id: [u8; 16],
     signals: &Channel<ControllerSignal>,
     queued_files: &VecDeque<OutgoingFile>,
     paused: bool,
 ) {
+    let _ = publish_file_queue_with_result(manager, host_device_id, signals, queued_files, paused);
+}
+
+fn publish_file_queue_with_result(
+    manager: &ControllerManager,
+    host_device_id: [u8; 16],
+    signals: &Channel<ControllerSignal>,
+    queued_files: &VecDeque<OutgoingFile>,
+    paused: bool,
+) -> Result<(), String> {
+    let persistence_error = manager
+        .remember_file_queue(host_device_id, queued_files, paused)
+        .err();
+    let (recovery_state, recovery_message) = if let Some(error) = persistence_error {
+        ("memoryOnly", Some(error))
+    } else {
+        manager.file_queue_protection_status(!queued_files.is_empty())
+    };
     let _ = signals.send(ControllerSignal::FileQueue {
         queued: queued_files
             .iter()
@@ -2850,7 +4205,14 @@ fn publish_file_queue(
             })
             .collect(),
         paused,
+        recovery_state,
+        recovery_message: recovery_message.clone(),
     });
+    if recovery_state == "memoryOnly" {
+        return Err(recovery_message
+            .unwrap_or_else(|| "无法加密保存等待发送队列；队列仅保留到本次运行结束。".to_owned()));
+    }
+    Ok(())
 }
 
 fn parse_transfer_id(value: &str) -> Result<TransferId, String> {
@@ -2885,21 +4247,32 @@ fn now_unix_s() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::VecDeque,
+        fs,
+        time::{Duration, Instant, SystemTime},
+    };
 
     use super::{
-        COMMAND_CAPACITY, ConnectFailure, ControllerAudioDecoder, ControllerCommand,
-        ControllerInput, ControllerManager, ControllerRuntimeSummary, MAX_BUFFERED_POINTER_MOVES,
-        RetryWaitOutcome, directory_transport_error_is_retryable,
-        directory_transport_error_message, parse_input, parse_transfer_id,
-        session_earned_fresh_retry_budget, should_drop_buffered_pointer_move, validate_text_input,
-        wait_for_retry_deadline,
+        COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
+        ControllerCommand, ControllerInput, ControllerManager, ControllerRuntimeSummary,
+        LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
+        PendingRemoteFileRequest, RetryWaitOutcome, deadline_expired,
+        directory_transport_error_is_retryable, directory_transport_error_message,
+        file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
+        revalidate_queued_file, session_earned_fresh_retry_budget,
+        should_drop_buffered_pointer_move, transfer_result_message, transfer_result_state,
+        validate_text_input, wait_for_file_queue_command, wait_for_retry_deadline,
     };
-    use apps_windows::audio::RemoteAudioEncoder;
+    use apps_windows::{
+        audio::RemoteAudioEncoder, transfer::OutgoingFile,
+        transfer_recovery::WindowsFileQueueRecoveryStore,
+    };
     use desklink_ffi::ControllerError;
     use desklink_protocol::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket, InputEvent,
-        KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton, PROTOCOL_VERSION,
+        KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton, PROTOCOL_VERSION, ProtocolError,
+        TransferResult,
     };
     use desklink_transport::{JoinRejectCode, TransportError};
 
@@ -2912,6 +4285,316 @@ mod tests {
         assert!(parse_transfer_id("00").is_err());
         assert!(parse_transfer_id("00000000000000000000000000000000").is_err());
         assert!(parse_transfer_id("zz02030405060708090a0b0c0d0e0f10").is_err());
+    }
+
+    #[test]
+    fn recovered_file_tasks_are_bound_to_the_exact_host_identity() {
+        let action = LastFileAction::download([7; 16], None);
+        assert!(action.ensure_target([7; 16]).is_ok());
+        let error = action.ensure_target([8; 16]).unwrap_err();
+        assert!(error.contains("属于设备"));
+        assert_eq!(
+            action.summary().device_id,
+            crate::device_directory::format_device_id(crate::device_directory::public_device_id(
+                [7; 16]
+            ))
+        );
+    }
+
+    #[test]
+    fn stale_discard_revision_cannot_clear_a_newer_file_task() {
+        let manager = ControllerManager::default();
+        manager
+            .remember_last_file_action(LastFileAction::download([7; 16], None))
+            .unwrap();
+        let stale_revision = manager.file_recovery_summary().unwrap().revision;
+        manager
+            .remember_last_file_action(LastFileAction::download([8; 16], None))
+            .unwrap();
+
+        assert!(manager.discard_file_recovery(stale_revision).is_err());
+        let current = manager.file_recovery_summary().unwrap();
+        assert_ne!(current.revision, stale_revision);
+        assert_eq!(
+            current.device_id,
+            crate::device_directory::format_device_id(crate::device_directory::public_device_id(
+                [8; 16]
+            ))
+        );
+        manager.discard_file_recovery(current.revision).unwrap();
+        assert!(manager.file_recovery_summary().is_none());
+    }
+
+    #[test]
+    fn recovered_file_queue_is_bound_to_one_exact_host() {
+        let manager = ControllerManager::default();
+        let file = OutgoingFile {
+            transfer_id: [1; 16],
+            path: std::env::temp_dir().join("等待发送.txt"),
+            name: "等待发送.txt".to_owned(),
+            size: 12,
+            modified_at_unix_ns: 0,
+        };
+        let queue = VecDeque::from([file]);
+        manager.remember_file_queue([7; 16], &queue, true).unwrap();
+
+        assert_eq!(manager.restored_file_queue_for([7; 16]).len(), 1);
+        assert!(manager.restored_file_queue_for([8; 16]).is_empty());
+        assert!(manager.ensure_file_queue_target([7; 16]).is_ok());
+        assert!(manager.ensure_file_queue_target([8; 16]).is_err());
+        assert!(
+            manager
+                .remember_file_queue([8; 16], &VecDeque::new(), false)
+                .is_err()
+        );
+        assert!(manager.file_queue_recovery_summary().is_some());
+    }
+
+    #[test]
+    fn stale_queue_discard_cannot_clear_a_newer_queue() {
+        let manager = ControllerManager::default();
+        let first = VecDeque::from([OutgoingFile {
+            transfer_id: [2; 16],
+            path: std::env::temp_dir().join("甲.bin"),
+            name: "甲.bin".to_owned(),
+            size: 1,
+            modified_at_unix_ns: 0,
+        }]);
+        manager.remember_file_queue([3; 16], &first, true).unwrap();
+        let stale_revision = manager.file_queue_recovery_summary().unwrap().revision;
+        let mut second = first;
+        second.push_back(OutgoingFile {
+            transfer_id: [4; 16],
+            path: std::env::temp_dir().join("乙.bin"),
+            name: "乙.bin".to_owned(),
+            size: 2,
+            modified_at_unix_ns: 0,
+        });
+        manager
+            .remember_file_queue([3; 16], &second, false)
+            .unwrap();
+
+        assert!(manager.discard_file_queue_recovery(stale_revision).is_err());
+        let current = manager.file_queue_recovery_summary().unwrap();
+        assert_eq!(current.queued.len(), 2);
+        manager
+            .discard_file_queue_recovery(current.revision)
+            .unwrap();
+        assert!(manager.file_queue_recovery_summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn file_queue_command_waits_for_backend_acknowledgement() {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            wait_for_file_queue_command(response, Duration::from_secs(1)).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        reply.send(Ok(())).unwrap();
+        assert_eq!(waiting.await.unwrap(), Ok(()));
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        reply
+            .send(Err("Windows 无法更新加密记录。".to_owned()))
+            .unwrap();
+        assert_eq!(
+            wait_for_file_queue_command(response, Duration::from_secs(1)).await,
+            Err("Windows 无法更新加密记录。".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn file_queue_command_reports_session_changes_and_timeouts() {
+        let (reply, response) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        drop(reply);
+        assert_eq!(
+            wait_for_file_queue_command(response, Duration::from_secs(1)).await,
+            Err("远程控制会话已经变化，文件队列操作未能完成，请重试。".to_owned())
+        );
+
+        let (_reply, response) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        assert_eq!(
+            wait_for_file_queue_command(response, Duration::ZERO).await,
+            Err("文件队列操作处理超时，请稍后重试。".to_owned())
+        );
+    }
+
+    #[test]
+    fn identical_queue_state_skips_redundant_protected_writes() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "desklink-queue-deduplicate-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let manager = ControllerManager {
+            file_queue_recovery_store: Some(WindowsFileQueueRecoveryStore::new(
+                directory.join("queue.bin"),
+            )),
+            ..Default::default()
+        };
+        let queue = VecDeque::from([OutgoingFile {
+            transfer_id: [6; 16],
+            path: directory.join("队列.bin"),
+            name: "队列.bin".to_owned(),
+            size: 3,
+            modified_at_unix_ns: 7,
+        }]);
+        assert!(manager.remember_file_queue([9; 16], &queue, true).unwrap());
+        let revision = manager.file_queue_recovery_summary().unwrap().revision;
+        assert!(!manager.remember_file_queue([9; 16], &queue, true).unwrap());
+        assert_eq!(
+            manager.file_queue_recovery_summary().unwrap().revision,
+            revision
+        );
+        assert_eq!(
+            manager.file_queue_protection_status(true),
+            ("protected", None)
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_queue_protection_is_visible_and_same_state_can_retry() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "desklink-queue-protection-retry-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let blocked_parent = directory.join("not-a-directory");
+        fs::write(&blocked_parent, b"blocked").unwrap();
+        let mut manager = ControllerManager {
+            file_queue_recovery_store: Some(WindowsFileQueueRecoveryStore::new(
+                blocked_parent.join("queue.bin"),
+            )),
+            ..Default::default()
+        };
+        let queue = VecDeque::from([OutgoingFile {
+            transfer_id: [8; 16],
+            path: directory.join("重试.bin"),
+            name: "重试.bin".to_owned(),
+            size: 4,
+            modified_at_unix_ns: 10,
+        }]);
+        assert!(
+            manager
+                .remember_file_queue([11; 16], &queue, false)
+                .unwrap()
+        );
+        let (state, message) = manager.file_queue_protection_status(true);
+        assert_eq!(state, "memoryOnly");
+        assert!(message.is_some_and(|message| message.contains("本次运行")));
+
+        manager.file_queue_recovery_store = Some(WindowsFileQueueRecoveryStore::new(
+            directory.join("queue.bin"),
+        ));
+        assert!(
+            manager
+                .remember_file_queue([11; 16], &queue, false)
+                .unwrap()
+        );
+        assert_eq!(
+            manager.file_queue_protection_status(true),
+            ("protected", None)
+        );
+        let queue_path = directory.join("queue.bin");
+        manager.file_queue_recovery_store = Some(WindowsFileQueueRecoveryStore::new(&directory));
+        assert!(
+            manager
+                .remember_file_queue([11; 16], &VecDeque::new(), false)
+                .is_err()
+        );
+        assert!(manager.file_queue_recovery_summary().is_some());
+        assert!(manager.file_queue_recovery_error().is_some());
+        manager.file_queue_recovery_store = Some(WindowsFileQueueRecoveryStore::new(queue_path));
+        assert!(
+            manager
+                .remember_file_queue([11; 16], &VecDeque::new(), false)
+                .unwrap()
+        );
+        assert!(manager.file_queue_recovery_summary().is_none());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn queued_source_is_revalidated_before_sending() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "desklink-queue-revalidate-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("报告.txt");
+        fs::write(&path, b"first").unwrap();
+        let mut queued = apps_windows::transfer::prepare_outgoing_file(path.clone()).unwrap();
+        queued.transfer_id = [5; 16];
+        let refreshed = revalidate_queued_file(queued.clone()).unwrap();
+        assert_eq!(refreshed.transfer_id, queued.transfer_id);
+        std::thread::sleep(Duration::from_millis(2));
+        fs::write(&path, b"other").unwrap();
+        assert!(revalidate_queued_file(queued).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn remote_paste_shortcut_holds_control_for_the_v_key() {
+        assert_eq!(
+            remote_paste_shortcut_events(),
+            [
+                InputEvent::Key {
+                    code: KeyCode::Character('v'),
+                    pressed: true,
+                    modifiers: Modifiers::CONTROL,
+                },
+                InputEvent::Key {
+                    code: KeyCode::Character('v'),
+                    pressed: false,
+                    modifiers: Modifiers::CONTROL,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn file_offer_decisions_preserve_the_remote_failure_reason() {
+        assert_eq!(transfer_result_state(TransferResult::Rejected), "rejected");
+        assert!(transfer_result_message(TransferResult::Rejected).contains("拒绝"));
+        assert_eq!(transfer_result_state(TransferResult::Busy), "failed");
+        assert!(transfer_result_message(TransferResult::Busy).contains("正在进行"));
+        assert!(transfer_result_message(TransferResult::IoFailed).contains("磁盘空间"));
+        assert!(transfer_result_message(TransferResult::InsufficientSpace).contains("空间不足"));
+        assert!(transfer_result_message(TransferResult::SourceChanged).contains("断点"));
+    }
+
+    #[test]
+    fn transfer_requests_accept_only_matching_responses_until_their_deadline() {
+        let now = Instant::now();
+        let clipboard = PendingClipboardOperation::new(7, ClipboardOperation::Receive, now);
+        assert!(clipboard.matches(7, ClipboardOperation::Receive));
+        assert!(!clipboard.matches(8, ClipboardOperation::Receive));
+        assert!(!clipboard.matches(7, ClipboardOperation::Send));
+        assert!(!deadline_expired(
+            clipboard.deadline,
+            clipboard.deadline - Duration::from_millis(1)
+        ));
+        assert!(deadline_expired(clipboard.deadline, clipboard.deadline));
+
+        let remote_file = PendingRemoteFileRequest::new(11, now);
+        assert!(file_offer_matches_request(Some(remote_file), Some(11)));
+        assert!(!file_offer_matches_request(Some(remote_file), Some(12)));
+        assert!(!file_offer_matches_request(Some(remote_file), None));
+        assert!(!file_offer_matches_request(None, Some(11)));
     }
     use tokio::sync::{mpsc, watch};
 
@@ -3113,6 +4796,29 @@ mod tests {
         let incompatible = TransportError::Malformed;
         assert!(!directory_transport_error_is_retryable(&incompatible));
         assert!(directory_transport_error_message(&incompatible).contains("不兼容"));
+
+        let older_controller = TransportError::DirectoryProtocolMismatch {
+            controller: Some(PROTOCOL_VERSION - 1),
+            host: Some(PROTOCOL_VERSION),
+        };
+        assert!(!directory_transport_error_is_retryable(&older_controller));
+        assert!(directory_transport_error_message(&older_controller).contains("当前控制端"));
+
+        let older_host = TransportError::DirectoryProtocolMismatch {
+            controller: Some(PROTOCOL_VERSION),
+            host: Some(PROTOCOL_VERSION - 1),
+        };
+        assert!(directory_transport_error_message(&older_host).contains("目标电脑"));
+    }
+
+    #[test]
+    fn protocol_decode_failure_stops_retrying_with_an_upgrade_action() {
+        let failure = ConnectFailure::from_controller(ControllerError::Protocol(
+            ProtocolError::UnsupportedVersion(PROTOCOL_VERSION - 1),
+        ));
+        assert!(!failure.retryable);
+        assert_eq!(failure.kind, "protocol_version_mismatch");
+        assert!(failure.detail.contains("同一个最新版本"));
     }
 
     #[test]

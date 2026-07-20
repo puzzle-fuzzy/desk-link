@@ -7,6 +7,7 @@ use std::{
 };
 
 use desklink_crypto::SessionId;
+use desklink_protocol::PROTOCOL_VERSION;
 use desklink_transport::{
     QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
     TransportError,
@@ -59,6 +60,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         != Err(TransportError::DirectoryNotFound)
     {
         return Err(io::Error::other("wrong directory password was not rejected safely").into());
+    }
+
+    let incompatible = QuicClient::connect(config.clone()).await?;
+    if incompatible
+        .lookup_directory(RelayDirectoryLookup::new_for_protocol(
+            device_id,
+            access_code,
+            PROTOCOL_VERSION + 1,
+        )?)
+        .await
+        != Err(TransportError::DirectoryProtocolMismatch {
+            controller: Some(PROTOCOL_VERSION + 1),
+            host: Some(PROTOCOL_VERSION),
+        })
+    {
+        return Err(io::Error::other(
+            "directory did not reject an incompatible application protocol",
+        )
+        .into());
     }
 
     let correct = QuicClient::connect(config).await?;

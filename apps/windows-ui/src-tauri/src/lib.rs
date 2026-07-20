@@ -5,6 +5,7 @@ mod device_directory;
 mod file_picker;
 mod host;
 mod local_relay;
+mod updates;
 
 #[cfg(windows)]
 mod power;
@@ -253,6 +254,13 @@ async fn upload_diagnostics_now() -> Result<DiagnosticUploadResult, String> {
 }
 
 #[tauri::command]
+async fn check_windows_release() -> Result<updates::WindowsReleaseSource, String> {
+    updates::check()
+        .await
+        .map_err(|_| "暂时无法检查 DeskLink 正式版本，请检查网络后在设置中重试。".to_owned())
+}
+
+#[tauri::command]
 async fn quit_desklink(
     app: AppHandle,
     host_manager: State<'_, HostManager>,
@@ -293,7 +301,7 @@ fn respond_host_approval(
 async fn get_controller_snapshot(
     manager: State<'_, ControllerManager>,
 ) -> Result<ControllerSnapshot, String> {
-    controller::load_snapshot(manager.snapshot())
+    controller::load_snapshot(&manager, manager.snapshot())
 }
 
 #[tauri::command]
@@ -398,6 +406,33 @@ async fn send_controller_text(
     manager.send_text(text).await
 }
 
+fn local_clipboard_error(result: desklink_protocol::TransferResult) -> String {
+    match result {
+        desklink_protocol::TransferResult::TooLarge => {
+            "剪贴板文本超过 48 KB，无法发送。".to_owned()
+        }
+        desklink_protocol::TransferResult::Unsupported => {
+            "本机剪贴板当前没有可发送的纯文本。".to_owned()
+        }
+        _ => "Windows 剪贴板正被其他程序占用，请稍后重试。".to_owned(),
+    }
+}
+
+async fn read_local_clipboard_text() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(apps_windows::transfer::read_clipboard_text)
+        .await
+        .map_err(|_| "DeskLink 无法读取本机剪贴板。".to_owned())?
+        .map_err(local_clipboard_error)
+}
+
+#[tauri::command]
+async fn paste_controller_clipboard_text(
+    manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    let text = read_local_clipboard_text().await?;
+    manager.paste_clipboard(text).await
+}
+
 #[tauri::command]
 async fn set_controller_audio_enabled(
     manager: State<'_, ControllerManager>,
@@ -416,18 +451,7 @@ async fn set_controller_video_quality(
 
 #[tauri::command]
 async fn send_controller_clipboard(manager: State<'_, ControllerManager>) -> Result<(), String> {
-    let text = tauri::async_runtime::spawn_blocking(apps_windows::transfer::read_clipboard_text)
-        .await
-        .map_err(|_| "DeskLink 无法读取本机剪贴板。".to_owned())?
-        .map_err(|result| match result {
-            desklink_protocol::TransferResult::TooLarge => {
-                "剪贴板文本超过 48 KB，无法发送。".to_owned()
-            }
-            desklink_protocol::TransferResult::Unsupported => {
-                "本机剪贴板当前没有可发送的纯文本。".to_owned()
-            }
-            _ => "Windows 剪贴板正被其他程序占用，请稍后重试。".to_owned(),
-        })?;
+    let text = read_local_clipboard_text().await?;
     manager.send_clipboard(text).await
 }
 
@@ -475,6 +499,13 @@ async fn resume_controller_file_queue(manager: State<'_, ControllerManager>) -> 
 }
 
 #[tauri::command]
+async fn retry_controller_file_queue_protection(
+    manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    manager.retry_file_queue_protection().await
+}
+
+#[tauri::command]
 async fn request_controller_remote_file(
     manager: State<'_, ControllerManager>,
 ) -> Result<(), String> {
@@ -489,6 +520,22 @@ async fn retry_controller_file(manager: State<'_, ControllerManager>) -> Result<
 #[tauri::command]
 async fn cancel_controller_file(manager: State<'_, ControllerManager>) -> Result<(), String> {
     manager.cancel_file().await
+}
+
+#[tauri::command]
+fn discard_controller_file_recovery(
+    manager: State<'_, ControllerManager>,
+    revision: u64,
+) -> Result<(), String> {
+    manager.discard_file_recovery(revision)
+}
+
+#[tauri::command]
+fn discard_controller_file_queue_recovery(
+    manager: State<'_, ControllerManager>,
+    revision: u64,
+) -> Result<(), String> {
+    manager.discard_file_queue_recovery(revision)
 }
 
 #[tauri::command]
@@ -529,6 +576,30 @@ fn open_github_repository() -> Result<(), String> {
     };
     if result.0 as isize <= 32 {
         Err("Windows 无法打开 DeskLink 的 GitHub 页面。".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn open_windows_releases() -> Result<(), String> {
+    use windows::{
+        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        core::w,
+    };
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("https://github.com/puzzle-fuzzy/desk-link/releases/latest"),
+            w!(""),
+            w!(""),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err("Windows 无法打开 DeskLink 的正式下载页面。".to_owned())
     } else {
         Ok(())
     }
@@ -1277,7 +1348,7 @@ pub fn run() {
             }
         }))
         .manage(HostManager::default())
-        .manage(ControllerManager::default());
+        .manage(ControllerManager::for_current_user());
     #[cfg(windows)]
     let builder = builder.manage(instance_guard);
     let application = builder
@@ -1327,6 +1398,7 @@ pub fn run() {
             set_launch_at_login,
             set_diagnostics_sharing,
             upload_diagnostics_now,
+            check_windows_release,
             quit_desklink,
             respond_host_approval,
             restart_host,
@@ -1347,6 +1419,7 @@ pub fn run() {
             reconnect_controller,
             send_controller_input,
             send_controller_text,
+            paste_controller_clipboard_text,
             set_controller_audio_enabled,
             set_controller_video_quality,
             send_controller_clipboard,
@@ -1356,13 +1429,17 @@ pub fn run() {
             remove_controller_queued_file,
             clear_controller_file_queue,
             resume_controller_file_queue,
+            retry_controller_file_queue_protection,
             request_controller_remote_file,
             retry_controller_file,
             cancel_controller_file,
+            discard_controller_file_recovery,
+            discard_controller_file_queue_recovery,
             open_controller_downloads_folder,
             request_controller_keyframe,
             report_controller_render_metrics,
             open_github_repository,
+            open_windows_releases,
             select_controller_display,
             disconnect_controller,
             forget_saved_device,

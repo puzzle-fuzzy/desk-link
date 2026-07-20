@@ -13,10 +13,11 @@ use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
     ChannelKind, DEAD_TIMEOUT, DIRECTORY_ACCESS_CODE_BYTES, DIRECTORY_LOOKUP_ENVELOPE_BYTES,
-    DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED, DIRECTORY_LOOKUP_NOT_FOUND,
-    DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode, KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES,
-    MAX_JOIN_ENVELOPE_BYTES, MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE,
-    RelayDirectoryLookup, RelayJoin, decode_directory_lookup, decode_relay_join,
+    DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES, DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED,
+    DIRECTORY_LOOKUP_NOT_FOUND, DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, DIRECTORY_LOOKUP_RATE_LIMITED,
+    JoinRejectCode, KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES,
+    MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup,
+    RelayDirectoryRegistration, RelayJoin, decode_directory_lookup, decode_relay_join,
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -463,6 +464,7 @@ struct DirectoryRecord {
     connection_id: u64,
     access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
     invitation: Vec<u8>,
+    protocol_version: Option<u16>,
     expires_at: Option<Instant>,
 }
 
@@ -544,14 +546,11 @@ impl RelayState {
         )?;
         if let Some(registration) = join.directory_registration() {
             self.publish_directory(
-                registration.device_id(),
+                registration,
                 join.participant_id()
                     .copied()
                     .ok_or(RelayError::MalformedJoin)?,
                 connection_id,
-                *registration.access_code(),
-                registration.invitation().to_vec(),
-                registration.ttl_s(),
             );
         }
         let mut participants = self.lock_participants();
@@ -590,26 +589,24 @@ impl RelayState {
 
     fn publish_directory(
         &self,
-        device_id: u64,
+        registration: &RelayDirectoryRegistration,
         participant_id: [u8; 16],
         connection_id: u64,
-        access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
-        invitation: Vec<u8>,
-        ttl_s: u16,
     ) {
         let mut directory = match self.directory.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         directory.insert(
-            device_id,
+            registration.device_id(),
             DirectoryRecord {
                 participant_id,
                 connection_id,
-                access_code,
-                invitation,
-                expires_at: (ttl_s != 0)
-                    .then(|| Instant::now() + Duration::from_secs(u64::from(ttl_s))),
+                access_code: *registration.access_code(),
+                invitation: registration.invitation().to_vec(),
+                protocol_version: registration.protocol_version(),
+                expires_at: (registration.ttl_s() != 0)
+                    .then(|| Instant::now() + Duration::from_secs(u64::from(registration.ttl_s()))),
             },
         );
     }
@@ -618,7 +615,7 @@ impl RelayState {
         &self,
         source: IpAddr,
         lookup: &RelayDirectoryLookup,
-    ) -> Result<Vec<u8>, u8> {
+    ) -> Result<Vec<u8>, (u8, Option<u16>)> {
         let now = Instant::now();
         let key = (source, lookup.device_id());
         {
@@ -633,11 +630,11 @@ impl RelayState {
                 .get(&key)
                 .is_some_and(|attempt| attempt.failures >= DIRECTORY_LOOKUP_FAILURE_LIMIT)
             {
-                return Err(DIRECTORY_LOOKUP_RATE_LIMITED);
+                return Err((DIRECTORY_LOOKUP_RATE_LIMITED, None));
             }
         }
 
-        let invitation = {
+        let lookup_result = {
             let mut directory = match self.directory.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -645,15 +642,20 @@ impl RelayState {
             directory
                 .retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
             directory.get(&lookup.device_id()).and_then(|record| {
-                bool::from(record.access_code.ct_eq(lookup.access_code()))
-                    .then(|| record.invitation.clone())
+                bool::from(record.access_code.ct_eq(lookup.access_code())).then(|| {
+                    if lookup.protocol_version() == record.protocol_version {
+                        Ok(record.invitation.clone())
+                    } else {
+                        Err((DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, record.protocol_version))
+                    }
+                })
             })
         };
-        if let Some(invitation) = invitation {
+        if let Some(result) = lookup_result {
             if let Ok(mut attempts) = self.lookup_attempts.lock() {
                 attempts.remove(&key);
             }
-            return Ok(invitation);
+            return result;
         }
 
         let mut attempts = match self.lookup_attempts.lock() {
@@ -669,7 +671,7 @@ impl RelayState {
             attempt.failures = 0;
         }
         attempt.failures = attempt.failures.saturating_add(1);
-        Err(DIRECTORY_LOOKUP_NOT_FOUND)
+        Err((DIRECTORY_LOOKUP_NOT_FOUND, None))
     }
 
     fn peer_with_id(
@@ -878,13 +880,19 @@ async fn handle_connection(
                         let _ = join_send.finish();
                     }
                 }
-                Err(status) => {
+                Err((status, host_protocol_version)) => {
                     log_connection_event(
                         "directory_lookup",
                         connection_id,
                         directory_status_label(status),
                     );
-                    if join_send.write_all(&[status]).await.is_ok() {
+                    let sent = join_send.write_all(&[status]).await.is_ok()
+                        && (status != DIRECTORY_LOOKUP_PROTOCOL_MISMATCH
+                            || join_send
+                                .write_all(&host_protocol_version.unwrap_or(0).to_be_bytes())
+                                .await
+                                .is_ok());
+                    if sent {
                         let _ = join_send.finish();
                     }
                 }
@@ -1314,6 +1322,7 @@ const fn directory_status_label(status: u8) -> &'static str {
         DIRECTORY_LOOKUP_NOT_FOUND => "not_found",
         DIRECTORY_LOOKUP_RATE_LIMITED => "rate_limited",
         DIRECTORY_LOOKUP_MALFORMED => "malformed",
+        DIRECTORY_LOOKUP_PROTOCOL_MISMATCH => "protocol_mismatch",
         _ => "unknown",
     }
 }
@@ -1377,8 +1386,10 @@ async fn read_request(receive: &mut quinn::RecvStream) -> Result<RelayRequest, J
         .read_exact(&mut bytes)
         .await
         .map_err(|_| JoinRejectCode::Malformed)?;
-    if length == DIRECTORY_LOOKUP_ENVELOPE_BYTES
-        && let Ok(lookup) = decode_directory_lookup(&bytes)
+    if matches!(
+        length,
+        DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES | DIRECTORY_LOOKUP_ENVELOPE_BYTES
+    ) && let Ok(lookup) = decode_directory_lookup(&bytes)
     {
         return Ok(RelayRequest::DirectoryLookup(lookup));
     }

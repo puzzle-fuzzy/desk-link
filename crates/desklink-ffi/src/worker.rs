@@ -563,6 +563,7 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::AlreadyJoined
         | TransportError::DirectoryNotFound
         | TransportError::DirectoryRateLimited
+        | TransportError::DirectoryProtocolMismatch { .. }
         | TransportError::Malformed
         | TransportError::InvalidConfig(_) => false,
     }

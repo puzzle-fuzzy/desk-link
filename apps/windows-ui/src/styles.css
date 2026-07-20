@@ -280,6 +280,19 @@ select:focus-visible {
   line-height: 1.45;
 }
 
+.settings-update {
+  border-top: 0;
+}
+
+.settings-update > div:first-child {
+  min-width: 0;
+}
+
+.settings-update .button .app-icon {
+  width: 14px;
+  height: 14px;
+}
+
 .settings-value {
   flex: 0 0 auto;
   padding: 5px 8px;
@@ -2809,7 +2822,8 @@ select:focus-visible {
 .remote-transfer-heading > div:first-child,
 .remote-transfer-actions,
 .remote-transfer-status,
-.remote-transfer-status--file > div {
+.remote-transfer-file-copy,
+.remote-transfer-file-actions {
   display: flex;
   align-items: center;
 }
@@ -2937,14 +2951,19 @@ select:focus-visible {
 
 .remote-transfer-status--file {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(100px, 240px) auto auto;
+  grid-template-columns: minmax(180px, 1fr) minmax(100px, 240px) auto;
 }
 
-.remote-transfer-status--file > div {
+.remote-transfer-file-copy {
   min-width: 0;
   flex-wrap: wrap;
   row-gap: 2px;
   gap: 8px;
+}
+
+.remote-transfer-file-actions {
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .remote-transfer-status progress {
@@ -2963,6 +2982,59 @@ select:focus-visible {
 
 .remote-transfer-status progress::-webkit-progress-value {
   background: oklch(0.68 0.14 55);
+}
+
+.remote-queue-recovery {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  margin-top: 8px;
+  padding: 8px 9px;
+  border: 1px solid oklch(0.48 0.09 55);
+  border-radius: var(--radius-sm);
+  background: oklch(0.22 0.025 55);
+}
+
+.remote-queue-recovery[hidden] {
+  display: none;
+}
+
+.remote-queue-recovery__icon {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 50%;
+  background: oklch(0.31 0.05 55);
+  color: oklch(0.8 0.12 65);
+}
+
+.remote-queue-recovery__icon .app-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.remote-queue-recovery__copy {
+  min-width: 0;
+}
+
+.remote-queue-recovery__copy strong,
+.remote-queue-recovery__copy small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.remote-queue-recovery__copy strong {
+  color: oklch(0.93 0.02 65);
+  font-size: 10.5px;
+}
+
+.remote-queue-recovery__copy small {
+  margin-top: 2px;
+  color: oklch(0.72 0.025 65);
+  font-size: 9.5px;
+  line-height: 1.45;
 }
 
 .remote-transfer-ledger {
@@ -3007,6 +3079,61 @@ select:focus-visible {
   font-size: 10.5px;
 }
 
+.remote-file-queue-protection {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 0 5px;
+  color: oklch(0.72 0.06 145);
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+
+.remote-file-queue-protection[data-state="memory-only"] {
+  color: oklch(0.78 0.11 65);
+}
+
+.remote-file-queue-protection > .app-icon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.remote-file-queue-protection > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-file-queue-protection > button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.remote-file-queue-protection > button:hover:not(:disabled) {
+  background: oklch(1 0 0 / 8%);
+}
+
+.remote-file-queue-protection > button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.remote-file-queue-protection > button .app-icon {
+  width: 11px;
+  height: 11px;
+}
+
 .remote-transfer-list-heading button,
 .remote-transfer-list li > button {
   padding: 3px 5px;
@@ -3018,10 +3145,16 @@ select:focus-visible {
   cursor: pointer;
 }
 
-.remote-transfer-list-heading button:hover,
-.remote-transfer-list li > button:hover {
+.remote-transfer-list-heading button:hover:not(:disabled),
+.remote-transfer-list li > button:hover:not(:disabled) {
   background: oklch(0.27 0.013 250);
   color: oklch(0.94 0.006 250);
+}
+
+.remote-transfer-list-heading button:disabled,
+.remote-transfer-list li > button:disabled {
+  cursor: wait;
+  opacity: 0.5;
 }
 
 .remote-transfer-list ul {
@@ -3170,23 +3303,6 @@ select:focus-visible {
   box-shadow: inset 0 0 0 2px var(--focus);
 }
 
-.remote-session:fullscreen {
-  width: 100vw;
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  border: 0;
-  border-radius: 0;
-  background: black;
-}
-
-.remote-session:fullscreen .remote-viewport {
-  width: 100%;
-  height: auto;
-  min-height: 0;
-  flex: 1 1 auto;
-}
-
 .remote-canvas {
   display: block;
   min-width: 0;
@@ -3199,6 +3315,15 @@ select:focus-visible {
   image-rendering: auto;
 }
 
+.remote-viewport[data-scale-mode="fit"] .remote-canvas {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  object-fit: contain;
+  object-position: center;
+}
+
 .remote-viewport[data-scale-mode="actual"] {
   place-items: start;
   overflow: auto;
@@ -3208,8 +3333,138 @@ select:focus-visible {
 }
 
 .remote-viewport[data-scale-mode="actual"] .remote-canvas {
+  width: auto;
   max-width: none;
+  height: auto;
   max-height: none;
+  object-fit: fill;
+}
+
+/* Native remote-session fullscreen: the Windows window fills the monitor while
+   DeskLink chrome stays out of the video layout. The toolbar remains reachable
+   as an overlay and therefore never takes pixels away from the remote canvas. */
+html[data-remote-fullscreen="true"],
+html[data-remote-fullscreen="true"] body,
+html[data-remote-fullscreen="true"] #app,
+html[data-remote-fullscreen="true"] .app-shell {
+  overflow: hidden;
+  background: black;
+}
+
+html[data-remote-fullscreen="true"] .app-shell {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+html[data-remote-fullscreen="true"] .titlebar,
+html[data-remote-fullscreen="true"] .section-nav,
+html[data-remote-fullscreen="true"] .control-workspace > :not(.control-workspace-main),
+html[data-remote-fullscreen="true"] .controller-heading,
+html[data-remote-fullscreen="true"] .controller-stack > .feedback {
+  display: none;
+}
+
+html[data-remote-fullscreen="true"] .workspace--controller,
+html[data-remote-fullscreen="true"] .control-workspace,
+html[data-remote-fullscreen="true"] .control-workspace-main,
+html[data-remote-fullscreen="true"] .controller-stack {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+html[data-remote-fullscreen="true"] .workspace--controller {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  overflow: hidden;
+  background: black;
+}
+
+html[data-remote-fullscreen="true"] .control-workspace,
+html[data-remote-fullscreen="true"] .controller-stack {
+  gap: 0;
+}
+
+html[data-remote-fullscreen="true"] .remote-session {
+  position: fixed;
+  z-index: 81;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: black;
+  box-shadow: none;
+}
+
+html[data-remote-fullscreen="true"] .remote-viewport {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: black;
+}
+
+html[data-remote-fullscreen="true"] .remote-toolbar {
+  position: absolute;
+  z-index: 12;
+  top: 10px;
+  right: 12px;
+  left: 12px;
+  width: auto;
+  min-height: 48px;
+  padding: 7px 9px 7px 13px;
+  overflow: hidden;
+  border: 1px solid oklch(0.34 0.014 250);
+  border-radius: var(--radius-md);
+  background: oklch(0.17 0.013 250);
+  box-shadow: 0 8px 24px oklch(0 0 0 / 38%);
+}
+
+html[data-remote-fullscreen="true"] .remote-toolbar-status {
+  flex: 0 1 auto;
+}
+
+html[data-remote-fullscreen="true"] .remote-toolbar-actions {
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+html[data-remote-fullscreen="true"] .remote-toolbar-actions::-webkit-scrollbar {
+  display: none;
+}
+
+html[data-remote-fullscreen="true"] .remote-transfer-panel,
+html[data-remote-fullscreen="true"] .remote-text-entry {
+  position: absolute;
+  z-index: 13;
+  top: 68px;
+  right: 12px;
+  width: min(760px, calc(100vw - 24px));
+  max-height: calc(100vh - 80px);
+  overflow: auto;
+  border: 1px solid oklch(0.34 0.014 250);
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 28px oklch(0 0 0 / 44%);
+}
+
+html[data-remote-fullscreen="true"] .remote-text-entry {
+  left: 50%;
+  width: min(680px, calc(100vw - 24px));
+  transform: translateX(-50%);
+}
+
+@media (max-width: 1120px) {
+  html[data-remote-fullscreen="true"] .remote-toolbar-status small {
+    display: none;
+  }
 }
 
 .remote-viewport[data-interaction-mode="pan"] {
@@ -3356,6 +3611,15 @@ select:focus-visible {
   .remote-transfer-status--file progress {
     grid-column: 1 / -1;
     grid-row: 2;
+  }
+
+  .remote-queue-recovery {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .remote-queue-recovery > .toolbar-button {
+    grid-column: 2;
+    justify-self: start;
   }
 
   .remote-transfer-ledger {

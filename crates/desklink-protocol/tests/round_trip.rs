@@ -87,7 +87,18 @@ fn clipboard_and_file_messages_round_trip() {
             text: "来自控制端的文本".to_owned(),
         },
         TransferMessage::ClipboardRequest { request_id: 2 },
-        TransferMessage::FileSelectionRequest { request_id: 3 },
+        TransferMessage::FileSelectionRequest {
+            request_id: 3,
+            resume: None,
+        },
+        TransferMessage::FileSelectionRequest {
+            request_id: 4,
+            resume: Some(desklink_protocol::FileResumeHint {
+                transfer_id,
+                name: "远端文档.txt".to_owned(),
+                size: 3,
+            }),
+        },
         TransferMessage::FileSelectionCancel { request_id: 3 },
         TransferMessage::FileSelectionResult {
             request_id: 3,
@@ -95,8 +106,21 @@ fn clipboard_and_file_messages_round_trip() {
         },
         TransferMessage::FileOffer {
             transfer_id,
+            request_id: None,
             name: "测试文档.txt".to_owned(),
             size: 3,
+        },
+        TransferMessage::FileOffer {
+            transfer_id,
+            request_id: Some(3),
+            name: "远端文档.txt".to_owned(),
+            size: 3,
+        },
+        TransferMessage::FileDecision {
+            transfer_id,
+            result: desklink_protocol::TransferResult::Completed,
+            resume_offset: 2,
+            resume_prefix_hash: Some([8; 32]),
         },
         TransferMessage::FileChunk {
             transfer_id,
@@ -129,7 +153,48 @@ fn transfer_rejects_unsafe_names_and_unbounded_payloads() {
         Err(ProtocolError::InvalidTransfer)
     ));
     assert!(matches!(
-        encode_transfer(&TransferMessage::FileSelectionRequest { request_id: 0 }),
+        encode_transfer(&TransferMessage::FileSelectionRequest {
+            request_id: 0,
+            resume: None,
+        }),
+        Err(ProtocolError::InvalidTransfer)
+    ));
+    assert!(matches!(
+        encode_transfer(&TransferMessage::FileSelectionRequest {
+            request_id: 3,
+            resume: Some(desklink_protocol::FileResumeHint {
+                transfer_id: [0; 16],
+                name: "remote.txt".to_owned(),
+                size: 1,
+            }),
+        }),
+        Err(ProtocolError::InvalidTransfer)
+    ));
+    assert!(matches!(
+        encode_transfer(&TransferMessage::FileDecision {
+            transfer_id: [1; 16],
+            result: desklink_protocol::TransferResult::Rejected,
+            resume_offset: 1,
+            resume_prefix_hash: Some([8; 32]),
+        }),
+        Err(ProtocolError::InvalidTransfer)
+    ));
+    assert!(matches!(
+        encode_transfer(&TransferMessage::FileDecision {
+            transfer_id: [1; 16],
+            result: desklink_protocol::TransferResult::Completed,
+            resume_offset: 1,
+            resume_prefix_hash: None,
+        }),
+        Err(ProtocolError::InvalidTransfer)
+    ));
+    assert!(matches!(
+        encode_transfer(&TransferMessage::FileOffer {
+            transfer_id: [1; 16],
+            request_id: Some(0),
+            name: "remote.txt".to_owned(),
+            size: 1,
+        }),
         Err(ProtocolError::InvalidTransfer)
     ));
     assert!(matches!(

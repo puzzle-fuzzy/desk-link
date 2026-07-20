@@ -1,6 +1,6 @@
 [package]
 name = "desklink-windows-ui"
-version = "0.1.41"
+version = "0.1.55"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,13 +26,16 @@ tauri-build = { version = "2.6.3", features = [] }
 [target.'cfg(windows)'.dependencies]
 apps-windows = { package = "desklink-windows", path = "../../windows" }
 blake2 = "0.10"
+bytes.workspace = true
 desklink-crypto.workspace = true
 desklink-ffi.workspace = true
 desklink-protocol.workspace = true
 desklink-session.workspace = true
 desklink-transport.workspace = true
 rand_core.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 serde.workspace = true
+serde_json = "1"
 tauri = { version = "2.11.5", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2.4.3"
 tokio.workspace = true

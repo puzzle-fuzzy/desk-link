@@ -20,6 +20,7 @@ import type {
   WindowsPreferencesSummary,
 } from "./types";
 import type { VideoQualityPreference } from "./types";
+import type { WindowsReleaseSource } from "./windows-update";
 
 export interface ControllerChannels {
   signals: Channel<ControllerSignal>;
@@ -45,6 +46,10 @@ export function setDiagnosticsSharing(enabled: boolean): Promise<WindowsPreferen
 
 export function uploadDiagnosticsNow(): Promise<DiagnosticUploadResult> {
   return invoke<DiagnosticUploadResult>("upload_diagnostics_now");
+}
+
+export function checkWindowsRelease(): Promise<WindowsReleaseSource> {
+  return invoke<WindowsReleaseSource>("check_windows_release");
 }
 
 export function quitDeskLink(): Promise<void> {
@@ -165,6 +170,10 @@ export function sendControllerText(text: string): Promise<void> {
   return invoke<void>("send_controller_text", { text });
 }
 
+export function pasteControllerClipboardText(): Promise<void> {
+  return invoke<void>("paste_controller_clipboard_text");
+}
+
 export function setControllerAudioEnabled(enabled: boolean): Promise<void> {
   return invoke<void>("set_controller_audio_enabled", { enabled });
 }
@@ -201,6 +210,10 @@ export function resumeControllerFileQueue(): Promise<void> {
   return invoke<void>("resume_controller_file_queue");
 }
 
+export function retryControllerFileQueueProtection(): Promise<void> {
+  return invoke<void>("retry_controller_file_queue_protection");
+}
+
 export function requestControllerRemoteFile(): Promise<void> {
   return invoke<void>("request_controller_remote_file");
 }
@@ -211,6 +224,14 @@ export function retryControllerFile(): Promise<void> {
 
 export function cancelControllerFile(): Promise<void> {
   return invoke<void>("cancel_controller_file");
+}
+
+export function discardControllerFileRecovery(revision: number): Promise<void> {
+  return invoke<void>("discard_controller_file_recovery", { revision });
+}
+
+export function discardControllerFileQueueRecovery(revision: number): Promise<void> {
+  return invoke<void>("discard_controller_file_queue_recovery", { revision });
 }
 
 export function openControllerDownloadsFolder(): Promise<void> {
@@ -227,6 +248,10 @@ export function reportControllerRenderMetrics(metrics: ControllerRenderMetrics):
 
 export function openGithubRepository(): Promise<void> {
   return invoke<void>("open_github_repository");
+}
+
+export function openWindowsReleases(): Promise<void> {
+  return invoke<void>("open_windows_releases");
 }
 
 export function selectControllerDisplay(displayId: number): Promise<void> {

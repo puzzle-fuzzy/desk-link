@@ -4,6 +4,7 @@ use std::{
 };
 
 use desklink_crypto::SessionId;
+use desklink_protocol::PROTOCOL_VERSION;
 use desklink_relay::{RelayConfig, RelayError, RelayServer, RelaySessionTable};
 use desklink_transport::{
     MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
@@ -213,6 +214,58 @@ async fn directory_resolves_an_online_host_only_with_the_temporary_password() {
             .await
             .unwrap(),
         invitation
+    );
+}
+
+#[tokio::test]
+async fn directory_rejects_incompatible_protocol_only_after_password_matches() {
+    let relay = spawn_test_relay().await;
+    let device_id = 133_456_789_012;
+    let access_code = *b"AB2DEF3G";
+    let invitation = b"versioned signed invitation".to_vec();
+    let registration =
+        RelayDirectoryRegistration::new(device_id, access_code, invitation, 60).unwrap();
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(
+            RelayJoin::host_with_participant(session(33), [4; 32], [7; 16])
+                .with_directory_registration(registration)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let wrong_password = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        wrong_password
+            .lookup_directory(
+                RelayDirectoryLookup::new_for_protocol(
+                    device_id,
+                    *b"AB2DEF4G",
+                    PROTOCOL_VERSION + 1,
+                )
+                .unwrap(),
+            )
+            .await,
+        Err(TransportError::DirectoryNotFound)
+    );
+
+    let incompatible = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        incompatible
+            .lookup_directory(
+                RelayDirectoryLookup::new_for_protocol(
+                    device_id,
+                    access_code,
+                    PROTOCOL_VERSION + 1,
+                )
+                .unwrap(),
+            )
+            .await,
+        Err(TransportError::DirectoryProtocolMismatch {
+            controller: Some(PROTOCOL_VERSION + 1),
+            host: Some(PROTOCOL_VERSION),
+        })
     );
 }
 

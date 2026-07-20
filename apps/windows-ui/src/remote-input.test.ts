@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   clampWheel,
+  containedPointerBounds,
   keyboardKey,
   keyboardModifierMask,
   keyboardModifiers,
@@ -42,6 +43,27 @@ describe("remote keyboard mapping", () => {
 });
 
 describe("remote pointer mapping", () => {
+  test("maps an upscaled contained picture instead of its fullscreen letterbox", () => {
+    expect(containedPointerBounds(
+      { left: 0, top: 0, width: 2_560, height: 1_600 },
+      1_920,
+      1_080,
+    )).toEqual({ left: 0, top: 80, width: 2_560, height: 1_440 });
+    expect(containedPointerBounds(
+      { left: 12, top: 20, width: 1_280, height: 720 },
+      1_024,
+      1_280,
+    )).toEqual({ left: 364, top: 20, width: 576, height: 720 });
+  });
+
+  test("returns an empty picture for invalid source dimensions", () => {
+    expect(containedPointerBounds(
+      { left: 12, top: 20, width: 1_280, height: 720 },
+      0,
+      720,
+    )).toEqual({ left: 12, top: 20, width: 0, height: 0 });
+  });
+
   test("accepts only the three supported mouse buttons", () => {
     expect(mouseButton(0)).toBe("left");
     expect(mouseButton(1)).toBe("middle");

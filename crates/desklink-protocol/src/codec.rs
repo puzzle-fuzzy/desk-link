@@ -96,20 +96,43 @@ fn validate_transfer(message: &TransferMessage) -> Result<(), ProtocolError> {
         }
         ClipboardRequest { request_id }
         | ClipboardResult { request_id, .. }
-        | FileSelectionRequest { request_id }
         | FileSelectionCancel { request_id }
         | FileSelectionResult { request_id, .. } => *request_id != 0,
+        FileSelectionRequest { request_id, resume } => {
+            *request_id != 0
+                && resume.as_ref().is_none_or(|resume| {
+                    valid_id(&resume.transfer_id)
+                        && resume.size <= crate::MAX_TRANSFER_FILE_BYTES
+                        && crate::is_valid_transfer_file_name(&resume.name)
+                })
+        }
         FileOffer {
             transfer_id,
+            request_id,
             name,
             size,
         } => {
             valid_id(transfer_id)
+                && request_id.is_none_or(|request_id| request_id != 0)
                 && *size <= crate::MAX_TRANSFER_FILE_BYTES
                 && crate::is_valid_transfer_file_name(name)
         }
-        FileDecision { transfer_id, .. }
-        | FileComplete { transfer_id, .. }
+        FileDecision {
+            transfer_id,
+            result,
+            resume_offset,
+            resume_prefix_hash,
+        } => {
+            valid_id(transfer_id)
+                && *resume_offset <= crate::MAX_TRANSFER_FILE_BYTES
+                && if *result == crate::TransferResult::Completed {
+                    (*resume_offset == 0 && resume_prefix_hash.is_none())
+                        || (*resume_offset > 0 && resume_prefix_hash.is_some())
+                } else {
+                    *resume_offset == 0 && resume_prefix_hash.is_none()
+                }
+        }
+        FileComplete { transfer_id, .. }
         | FileResult { transfer_id, .. }
         | Cancel { transfer_id } => valid_id(transfer_id),
         FileChunk {

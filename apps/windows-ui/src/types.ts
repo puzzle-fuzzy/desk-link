@@ -170,12 +170,37 @@ export interface SavedDeviceRenameInput {
   alias: string;
 }
 
+export interface TransferRecoverySummary {
+  revision: number;
+  deviceId: string;
+  direction: "upload" | "download";
+  name: string;
+  total: number;
+  message: string;
+}
+
+export interface FileQueueRecoverySummary {
+  revision: number;
+  deviceId: string;
+  queued: Array<{
+    id: string;
+    name: string;
+    size: number;
+  }>;
+  paused: boolean;
+  message: string;
+}
+
 export interface ControllerSnapshot {
   runtime: ControllerRuntimeSummary;
   savedConnection: SavedControllerConnectionSummary | null;
   connectionError: string | null;
   savedDevices: SavedDeviceCredentialSummary[];
   savedDevicesError: string | null;
+  fileRecovery: TransferRecoverySummary | null;
+  fileRecoveryError: string | null;
+  fileQueueRecovery: FileQueueRecoverySummary | null;
+  fileQueueRecoveryError: string | null;
 }
 
 export interface ControllerDeviceInput {
@@ -258,6 +283,7 @@ export type ControllerSignal =
   | {
       kind: "clipboard";
       state: "sending" | "receiving" | "completed" | "failed";
+      operation: "send" | "receive" | "paste";
       message: string;
     }
   | {
@@ -272,6 +298,8 @@ export type ControllerSignal =
   | {
       kind: "fileQueue";
       paused: boolean;
+      recoveryState: "empty" | "protected" | "memoryOnly";
+      recoveryMessage: string | null;
       queued: Array<{
         id: string;
         name: string;

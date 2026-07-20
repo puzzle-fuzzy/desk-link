@@ -3,6 +3,25 @@ export const MAX_WHEEL_DELTA = 1_200;
 
 export type PointerBounds = Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">;
 
+export function containedPointerBounds(
+  bounds: PointerBounds,
+  contentWidth: number,
+  contentHeight: number,
+): PointerBounds {
+  if (bounds.width <= 0 || bounds.height <= 0 || contentWidth <= 0 || contentHeight <= 0) {
+    return { left: bounds.left, top: bounds.top, width: 0, height: 0 };
+  }
+  const scale = Math.min(bounds.width / contentWidth, bounds.height / contentHeight);
+  const width = contentWidth * scale;
+  const height = contentHeight * scale;
+  return {
+    left: bounds.left + (bounds.width - width) / 2,
+    top: bounds.top + (bounds.height - height) / 2,
+    width,
+    height,
+  };
+}
+
 export function normalizedPointerPosition(
   clientX: number,
   clientY: number,

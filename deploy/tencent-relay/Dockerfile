@@ -8,11 +8,7 @@ ARG RUST_VERSION
 USER root
 WORKDIR /src
 
-RUN sed -i \
-      -e 's|http://deb.debian.org/debian-security|http://mirrors.cloud.tencent.com/debian-security|g' \
-      -e 's|http://deb.debian.org/debian|http://mirrors.cloud.tencent.com/debian|g' \
-      /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \

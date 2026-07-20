@@ -6,6 +6,7 @@
 - `turn.p2p.yxswy.com:4433/udp` 当前运行在单台腾讯云主机，外部 QUIC/TLS 探针每 30 分钟执行一次。
 - 容器必须启用健康检查、`always` 或 `unless-stopped` 重启策略、只读根文件系统、非 root 用户和连接/会话上限。
 - 中继每分钟只记录聚合容量：活动会话数、已附加参与方数、QUIC 连接数及上限；不记录设备 ID、访问密码或业务内容。
+- 目录登记和查询会携带非秘密的应用协议版本。relay 仅在访问密码匹配后比较版本，不把版本差异变成设备在线探测接口。
 
 ## 巡检
 
@@ -28,6 +29,8 @@ python scripts/verify-managed-relay.py
 ```text
 python scripts/deploy-managed-relay.py --target root@101.35.246.159 --identity-file C:\Users\18267\.ssh\p2p-tencent-ed25519
 ```
+
+加入信封或目录信封升级时，发布顺序固定为：先部署同时支持旧、新信封的 relay 并通过外部探针，再构建和分发新客户端。不得先发布依赖新信封的客户端。
 
 ## 告警与处置
 

@@ -10,7 +10,7 @@ pub use codec::{
 use serde::{Deserialize, Serialize};
 use std::ops::{BitOr, BitOrAssign};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_NOISE_HANDSHAKE_BYTES: usize = 4 * 1024;
 pub const MAX_VIDEO_CONFIG_BYTES: usize = 16 * 1024;
@@ -228,6 +228,16 @@ pub enum ControlMessage {
 
 pub type TransferId = [u8; 16];
 
+/// Identifies a partially received file that the controller can explicitly
+/// request again after reconnecting. The peer must still ask its local user to
+/// choose the file and only reuses the transfer id when the metadata matches.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileResumeHint {
+    pub transfer_id: TransferId,
+    pub name: String,
+    pub size: u64,
+}
+
 /// Explicit clipboard and file operations carried on their own reliable lane.
 /// File contents never share the latency-sensitive input or video streams.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -250,6 +260,7 @@ pub enum TransferMessage {
     /// Ask the peer to let its local user choose one file to send back.
     FileSelectionRequest {
         request_id: u64,
+        resume: Option<FileResumeHint>,
     },
     /// Cancel a pending peer-side file selection request.
     FileSelectionCancel {
@@ -262,12 +273,25 @@ pub enum TransferMessage {
     },
     FileOffer {
         transfer_id: TransferId,
+        /// Present only when this offer answers a `FileSelectionRequest`.
+        /// Direct controller-to-host uploads use `None`.
+        request_id: Option<u64>,
         name: String,
         size: u64,
     },
     FileDecision {
         transfer_id: TransferId,
-        accepted: bool,
+        /// `Completed` means the receiver is ready for chunks. Other values
+        /// explain why the offer could not be accepted.
+        result: TransferResult,
+        /// Number of verified sequential bytes already staged by the receiver.
+        /// Senders hash the complete source but only transmit bytes at and
+        /// after this offset.
+        resume_offset: u64,
+        /// BLAKE2s digest of the staged prefix. It is present exactly when
+        /// `resume_offset` is non-zero and prevents resuming from a different
+        /// same-sized source file.
+        resume_prefix_hash: Option<[u8; 32]>,
     },
     FileChunk {
         transfer_id: TransferId,
@@ -296,6 +320,8 @@ pub enum TransferResult {
     InvalidData,
     PermissionDenied,
     IoFailed,
+    InsufficientSpace,
+    SourceChanged,
     Unsupported,
     Busy,
 }

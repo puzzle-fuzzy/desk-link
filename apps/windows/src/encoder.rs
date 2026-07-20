@@ -138,31 +138,43 @@ pub fn convert_to_nv12(
         .checked_mul(target_height)
         .ok_or(EncoderError::FrameTooLarge)?;
     let mut nv12 = vec![0_u8; y_plane_len + y_plane_len / 2];
-    for target_y in 0..target_height {
-        let source_y = target_y * source_height / target_height;
-        for target_x in 0..target_width {
-            let source_x = target_x * source_width / target_width;
-            let (red, green, blue) = rgb_at(pixels, source_row_pitch, source_x, source_y, order);
-            nv12[target_y * target_width + target_x] = rgb_to_y(red, green, blue);
-        }
-    }
-
+    // Mapping once per row/column removes millions of integer divisions from the
+    // 1080p hot path. Processing a 2x2 block also reuses the same four BGRA/RGBA
+    // samples for luma and chroma instead of reading every source pixel twice.
+    let source_x_offset_by_target = (0..target_width)
+        .map(|target_x| target_x * source_width / target_width * 4)
+        .collect::<Vec<_>>();
+    let source_y_offset_by_target = (0..target_height)
+        .map(|target_y| target_y * source_height / target_height * source_row_pitch)
+        .collect::<Vec<_>>();
     for target_y in (0..target_height).step_by(2) {
+        let source_y_0 = source_y_offset_by_target[target_y];
+        let source_y_1 = source_y_offset_by_target[target_y + 1];
         for target_x in (0..target_width).step_by(2) {
-            let mut red = 0_u32;
-            let mut green = 0_u32;
-            let mut blue = 0_u32;
-            for offset_y in 0..2 {
-                for offset_x in 0..2 {
-                    let source_x = (target_x + offset_x) * source_width / target_width;
-                    let source_y = (target_y + offset_y) * source_height / target_height;
-                    let (sample_red, sample_green, sample_blue) =
-                        rgb_at(pixels, source_row_pitch, source_x, source_y, order);
-                    red += u32::from(sample_red);
-                    green += u32::from(sample_green);
-                    blue += u32::from(sample_blue);
-                }
-            }
+            let source_x_0 = source_x_offset_by_target[target_x];
+            let source_x_1 = source_x_offset_by_target[target_x + 1];
+            let samples = [
+                rgb_at_offset(pixels, source_y_0 + source_x_0, order),
+                rgb_at_offset(pixels, source_y_0 + source_x_1, order),
+                rgb_at_offset(pixels, source_y_1 + source_x_0, order),
+                rgb_at_offset(pixels, source_y_1 + source_x_1, order),
+            ];
+            let y_offset_0 = target_y * target_width + target_x;
+            let y_offset_1 = y_offset_0 + target_width;
+            nv12[y_offset_0] = rgb_to_y(samples[0].0, samples[0].1, samples[0].2);
+            nv12[y_offset_0 + 1] = rgb_to_y(samples[1].0, samples[1].1, samples[1].2);
+            nv12[y_offset_1] = rgb_to_y(samples[2].0, samples[2].1, samples[2].2);
+            nv12[y_offset_1 + 1] = rgb_to_y(samples[3].0, samples[3].1, samples[3].2);
+            let (red, green, blue) =
+                samples
+                    .into_iter()
+                    .fold((0_u32, 0_u32, 0_u32), |(red, green, blue), sample| {
+                        (
+                            red + u32::from(sample.0),
+                            green + u32::from(sample.1),
+                            blue + u32::from(sample.2),
+                        )
+                    });
             let (u, v) = rgb_to_uv((red / 4) as u8, (green / 4) as u8, (blue / 4) as u8);
             let uv_offset = y_plane_len + target_y / 2 * target_width + target_x;
             nv12[uv_offset] = u;
@@ -172,8 +184,7 @@ pub fn convert_to_nv12(
     Ok(nv12)
 }
 
-fn rgb_at(pixels: &[u8], row_pitch: usize, x: usize, y: usize, order: PixelOrder) -> (u8, u8, u8) {
-    let offset = y * row_pitch + x * 4;
+fn rgb_at_offset(pixels: &[u8], offset: usize, order: PixelOrder) -> (u8, u8, u8) {
     match order {
         PixelOrder::Bgra => (pixels[offset + 2], pixels[offset + 1], pixels[offset]),
         PixelOrder::Rgba => (pixels[offset], pixels[offset + 1], pixels[offset + 2]),

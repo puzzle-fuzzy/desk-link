@@ -7,18 +7,22 @@ import {
   connectSavedDevice,
   createControllerChannels,
   disconnectController,
+  discardControllerFileRecovery,
+  discardControllerFileQueueRecovery,
   forgetSavedDevice,
   getControllerSnapshot,
   reconnectController,
   removeControllerQueuedFile,
   renameSavedDevice,
   openControllerDownloadsFolder,
+  pasteControllerClipboardText,
   reportControllerRenderMetrics,
   requestControllerKeyframe,
   requestControllerClipboard,
   requestControllerRemoteFile,
   queueControllerFiles,
   resumeControllerFileQueue,
+  retryControllerFileQueueProtection,
   retryControllerFile,
   selectControllerDisplay,
   sendControllerInput,
@@ -28,6 +32,7 @@ import {
   sendControllerText,
 } from "./api";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ControllerChannels } from "./api";
 import {
   deviceCredentialsAreValid,
@@ -37,12 +42,14 @@ import {
 import { escapeHtml } from "./html";
 import {
   clampWheel,
+  containedPointerBounds,
   keyboardKey,
   keyboardModifierMask,
   keyboardModifiers,
   mouseButton,
   normalizedPointerPosition,
   remoteCursorContentPosition,
+  type PointerBounds,
 } from "./remote-input";
 import type {
   ControllerInput,
@@ -59,6 +66,7 @@ import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
 import { deviceIdsMatch, formatLastUsed } from "./saved-device";
 import { RemoteInputDispatcher } from "./remote-input-dispatcher";
 import { RemoteKeyboardState, type ControllerKeyInput } from "./remote-keyboard-state";
+import { isRemoteClipboardPasteShortcut } from "./remote-clipboard-shortcut";
 import {
   CONNECTION_PROGRESS_STEPS,
   connectionProgressPresentation,
@@ -91,6 +99,17 @@ import {
   transferProgressPaintDelay,
   type TransferActivityState,
 } from "./file-transfer-activity";
+import {
+  fileRecoveryAvailabilityAfterSignal,
+  preferredDeviceIdForRecovery,
+  recoveredFileTransfer,
+} from "./file-transfer-recovery";
+import { fileQueueProtectionPresentation } from "./file-queue-protection";
+import {
+  FileQueueActionGate,
+  type FileQueueActionKind,
+  type FileQueueActionToken,
+} from "./file-queue-action";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -101,6 +120,7 @@ type FileQueueStatus = Omit<Extract<ControllerSignal, { kind: "fileQueue" }>, "k
 type AudioStatus = "starting" | "enabled" | "muted" | "unavailable";
 
 const FRAME_PREFIX_BYTES = 17;
+const controllerWindow = getCurrentWindow();
 let snapshot: ControllerSnapshot | null = null;
 let loading = true;
 let busy = false;
@@ -132,13 +152,18 @@ let firstFrameMs: number | null = null;
 let lastRenderMetricsReportedAtMs = 0;
 let pointerFrame: number | null = null;
 let remoteResizeObserver: ResizeObserver | null = null;
-let remoteCanvasBounds: DOMRectReadOnly | null = null;
+let remoteCanvasBounds: PointerBounds | null = null;
 let remoteViewportBounds: DOMRectReadOnly | null = null;
 let remoteScaleFrame: number | null = null;
 let remoteScaleMode: RemoteScaleMode = loadRemoteScaleMode();
 let remotePanMode = false;
 let pointerInsideViewport = false;
 let fullscreenListenerInitialized = false;
+let remoteFullscreenActive = false;
+let remoteFullscreenBusy = false;
+let remoteFullscreenDesired = false;
+let remoteFullscreenOperation: Promise<void> | null = null;
+let remoteFullscreenResizeTimer: number | null = null;
 let requestRender: RenderRequest = () => {};
 let decodedFrames = 0;
 let textSending = false;
@@ -160,14 +185,25 @@ let renameBusy = false;
 let transferPanelOpen = false;
 let clipboardTransfer: ClipboardTransferStatus | null = null;
 let fileTransfer: FileTransferStatus | null = null;
-let fileQueue: FileQueueStatus = { queued: [], paused: false };
+let fileRecoveryAvailable = false;
+let fileQueue: FileQueueStatus = {
+  queued: [],
+  paused: false,
+  recoveryState: "empty",
+  recoveryMessage: null,
+};
 let transferHistory: TransferHistoryEntry[] = [];
 let transferHistorySequence = 0;
 let fileTransferMetrics: TransferMetrics | null = null;
 let transferActivity: TransferActivityState = { unreadResults: 0, tone: null };
 let transferPanelUpdateTimer: number | null = null;
 let lastTransferProgressPaintAtMs: number | null = null;
+let smartPasteBusy = false;
+let smartPastePending = false;
 let filePickerBusy = false;
+let discardFileRecoveryBusy = false;
+let discardFileQueueRecoveryBusy = false;
+const fileQueueActions = new FileQueueActionGate();
 let downloadsFolderBusy = false;
 let downloadsFolderMessage = "";
 let fileDropInitialized = false;
@@ -203,14 +239,35 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
   requestRender = renderer;
   void initializeNativeFileDrop();
   if (!fullscreenListenerInitialized) {
-    document.addEventListener("fullscreenchange", syncRemoteFullscreenControl);
+    window.addEventListener("resize", scheduleRemoteFullscreenSync);
+    document.addEventListener("keydown", handleRemoteFullscreenEscape, true);
     fullscreenListenerInitialized = true;
+    void synchronizeRemoteFullscreen();
   }
   try {
     snapshot = await getControllerSnapshot();
     const latestSavedDevice = snapshot.savedDevices.at(0);
-    if (!deviceIdDraft && latestSavedDevice) {
-      deviceIdDraft = latestSavedDevice.deviceId;
+    deviceIdDraft = preferredDeviceIdForRecovery(
+      deviceIdDraft,
+      snapshot.fileRecovery?.deviceId ?? snapshot.fileQueueRecovery?.deviceId ?? null,
+      latestSavedDevice?.deviceId ?? null,
+    );
+    if (!fileTransfer && snapshot.fileRecovery) {
+      fileTransfer = recoveredFileTransfer(snapshot.fileRecovery);
+      fileRecoveryAvailable = true;
+      feedback = {
+        tone: "info",
+        message: `${snapshot.fileRecovery.message} 目标设备：${snapshot.fileRecovery.deviceId}。恢复信息已由当前 Windows 账户加密保存。`,
+      };
+    } else if (snapshot.fileQueueRecovery) {
+      feedback = {
+        tone: "info",
+        message: `${snapshot.fileQueueRecovery.message} 目标设备：${snapshot.fileQueueRecovery.deviceId}；连接后需手动点击“继续队列”。`,
+      };
+    } else if (snapshot.fileRecoveryError && !feedback) {
+      feedback = { tone: "info", message: snapshot.fileRecoveryError };
+    } else if (snapshot.fileQueueRecoveryError && !feedback) {
+      feedback = { tone: "info", message: snapshot.fileQueueRecoveryError };
     }
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
@@ -409,6 +466,9 @@ export function bindControllerInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-controller-file-retry]")?.addEventListener("click", () => {
     void retryFileTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-file-discard]")?.addEventListener("click", () => {
+    void discardFileRecovery();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-downloads-open]")?.addEventListener("click", () => {
     void openDownloadsFolder();
@@ -755,7 +815,7 @@ function renderRemoteDesktop(): string {
           <button class="toolbar-button" type="button" data-controller-text title="发送中文、符号或一段文字">${icon("keyboard")}发送文字</button>
           ${renderTransferToolbarButton()}
           <button class="toolbar-button" type="button" data-controller-keyframe title="刷新远程画面">${icon("refresh-cw")}刷新画面</button>
-          <button class="toolbar-button" type="button" data-controller-fullscreen aria-label="进入全屏">${icon("maximize-2")}<span data-controller-fullscreen-label>全屏</span></button>
+          <button class="toolbar-button" type="button" data-controller-fullscreen aria-label="${remoteFullscreenActive ? "退出全屏" : "进入全屏"}" aria-pressed="${remoteFullscreenActive}" ${remoteFullscreenBusy ? 'disabled aria-busy="true"' : ""}>${icon(remoteFullscreenActive ? "minimize-2" : "maximize-2")}<span data-controller-fullscreen-label>${remoteFullscreenActive ? "退出全屏" : "全屏"}</span></button>
           <button class="toolbar-button toolbar-button--danger" type="button" data-controller-disconnect>${icon("log-out")}断开连接</button>
         </div>
       </div>
@@ -772,7 +832,7 @@ function renderRemoteDesktop(): string {
           : config
             ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><div class="remote-video-starting" data-remote-video-starting>${icon("loader-circle", "controller-spinner")}<strong>正在启动远程画面</strong><p>正在接收并解码第一个加密视频帧。</p></div><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden>${icon("mouse-pointer-2")}</span>`
             : `<div class="remote-waiting">${icon("loader-circle", "controller-spinner")}<strong>正在准备远程画面</strong><p>DeskLink 协商视频流时，请保持此窗口打开。</p></div>`}
-        <div class="remote-focus-hint" data-remote-focus-hint>${remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑" : "点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作"}</div>
+        <div class="remote-focus-hint" data-remote-focus-hint>${remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑" : "点击画面开始控制 · Ctrl+V 粘贴本机短文本 · Ctrl+Alt+Delete 必须在主机本地操作"}</div>
         <div class="remote-file-drop-overlay" data-controller-file-drop-overlay ${fileDragActive ? "" : "hidden"} aria-hidden="true">
           ${icon("file-up")}<strong>松开鼠标，将文件加入发送队列</strong><span>文件会按顺序发送，不会打断画面和输入。</span>
         </div>
@@ -807,7 +867,8 @@ function renderAudioControl(): string {
 
 function renderTransferPanel(): string {
   const fileActive = isFileTransferActive(fileTransfer?.state);
-  const fileRetryable = isFileTransferRetryable(fileTransfer?.state);
+  const clipboardActive = isClipboardTransferActive(clipboardTransfer?.state);
+  const fileRetryable = fileRecoveryAvailable && isFileTransferRetryable(fileTransfer?.state);
   const progress = transferPercent(fileTransfer?.transferred ?? 0, fileTransfer?.total ?? 0);
   const details = fileTransfer ? formatTransferDetails(fileTransfer) : "";
   const receivedFile = hasCompletedDownload();
@@ -816,10 +877,10 @@ function renderTransferPanel(): string {
       <div class="remote-transfer-heading">
         <div>${icon("share-2")}<span><strong>剪贴板与文件</strong><small>可双向传输；获取文件时由远端电脑选择。</small></span></div>
         <div class="remote-transfer-actions">
-          <button class="toolbar-button" type="button" data-controller-clipboard-send>${icon("clipboard-copy")}发送本机剪贴板</button>
-          <button class="toolbar-button" type="button" data-controller-clipboard-request>${icon("clipboard-paste")}读取远端剪贴板</button>
-          <button class="toolbar-button" type="button" data-controller-file-send ${filePickerBusy ? "disabled" : ""}>${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}</button>
-          <button class="toolbar-button" type="button" data-controller-file-receive ${fileActive || fileQueue.queued.length > 0 ? "disabled" : ""}>${icon("file-down")}获取远端文件</button>
+          <button class="toolbar-button" type="button" data-controller-clipboard-send ${clipboardActive ? "disabled" : ""}>${icon("clipboard-copy")}发送本机剪贴板</button>
+          <button class="toolbar-button" type="button" data-controller-clipboard-request ${clipboardActive ? "disabled" : ""}>${icon("clipboard-paste")}读取远端剪贴板</button>
+          <button class="toolbar-button" type="button" data-controller-file-send ${filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy ? "disabled" : ""}>${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}</button>
+          <button class="toolbar-button" type="button" data-controller-file-receive ${fileActive || fileQueue.queued.length > 0 || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy ? "disabled" : ""}>${icon("file-down")}获取远端文件</button>
         </div>
       </div>
       <div class="remote-file-drop-hint">
@@ -834,12 +895,16 @@ function renderTransferPanel(): string {
           <strong>剪贴板</strong><span data-controller-clipboard-message>${escapeHtml(clipboardTransfer?.message ?? "")}</span>
         </div>
         <div class="remote-transfer-status remote-transfer-status--file" data-controller-file-status ${fileTransfer ? "" : "hidden"}>
-          <div><strong data-controller-file-name>${escapeHtml(fileTransfer?.name ?? "")}</strong><span data-controller-file-message>${escapeHtml(fileTransfer?.message ?? "")}</span><small data-controller-file-size>${escapeHtml(details)}</small></div>
+          <div class="remote-transfer-file-copy"><strong data-controller-file-name>${escapeHtml(fileTransfer?.name ?? "")}</strong><span data-controller-file-message>${escapeHtml(fileTransfer?.message ?? "")}</span><small data-controller-file-size>${escapeHtml(details)}</small></div>
           <progress data-controller-file-progress max="100" value="${progress}" aria-label="文件传输进度"></progress>
-          <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-retry ${fileRetryable ? "" : "hidden"}>${icon("rotate-ccw")}${fileTransfer?.direction === "download" ? "重新获取" : "重新发送"}</button>
-          <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-cancel ${fileActive ? "" : "hidden"}>取消</button>
+          <div class="remote-transfer-file-actions">
+            <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-retry ${fileRetryable ? "" : "hidden"} ${discardFileRecoveryBusy ? "disabled" : ""}>${icon("rotate-ccw")}${fileTransfer?.direction === "download" ? "重新获取" : "重新发送"}</button>
+            <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-discard ${fileRetryable ? "" : "hidden"} ${discardFileRecoveryBusy ? "disabled" : ""}>${icon("trash-2")}${discardFileRecoveryBusy ? "正在清理…" : "不再重试"}</button>
+            <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-cancel ${fileActive ? "" : "hidden"}>取消</button>
+          </div>
         </div>
       </div>
+      ${renderFileQueueRecovery()}
       <div class="remote-transfer-ledger">
         <section class="remote-transfer-list" data-controller-file-queue ${fileQueue.queued.length > 0 ? "" : "hidden"} aria-label="等待发送的文件">
           ${renderFileQueue()}
@@ -852,16 +917,67 @@ function renderTransferPanel(): string {
   `;
 }
 
+function renderFileQueueRecovery(): string {
+  const recovery = snapshot?.fileQueueRecovery;
+  const protectionFailure = fileQueue.queued.length === 0
+    && fileQueue.recoveryState === "memoryOnly"
+    && fileQueue.recoveryMessage;
+  if (protectionFailure) {
+    const retrying = fileQueueActions.matches("protect");
+    return `
+      <section class="remote-queue-recovery" data-controller-file-queue-recovery aria-label="等待队列保护失败">
+        <span class="remote-queue-recovery__icon">${icon("shield-alert")}</span>
+        <span class="remote-queue-recovery__copy"><strong>等待队列状态尚未安全更新</strong><small>${escapeHtml(protectionFailure)}</small></span>
+        <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-queue-protection-retry ${fileQueueActions.busy ? "disabled" : ""}>${icon(retrying ? "loader-circle" : "rotate-ccw", retrying ? "button-spinner" : "")}${retrying ? "正在重试…" : "重试保护"}</button>
+      </section>
+    `;
+  }
+  if (!recovery || fileQueue.queued.length > 0) {
+    return '<section class="remote-queue-recovery" data-controller-file-queue-recovery hidden></section>';
+  }
+  const targetMatches = deviceIdsMatch(recovery.deviceId, attemptTarget || deviceIdDraft);
+  return `
+    <section class="remote-queue-recovery" data-controller-file-queue-recovery aria-label="等待队列恢复">
+      <span class="remote-queue-recovery__icon">${icon("rotate-ccw")}</span>
+      <span class="remote-queue-recovery__copy">
+        <strong>还有 ${recovery.queued.length} 个文件等待发送</strong>
+        <small>${targetMatches
+          ? `队列属于当前设备 ${escapeHtml(recovery.deviceId)}；载入后仍会保持暂停，请点击“继续队列”。`
+          : `队列属于设备 ${escapeHtml(recovery.deviceId)}，不会发送到当前电脑。`}</small>
+      </span>
+      <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-file-queue-recovery-discard ${discardFileQueueRecoveryBusy ? "disabled" : ""}>${icon("trash-2")}${discardFileQueueRecoveryBusy ? "正在清理…" : "放弃旧队列"}</button>
+    </section>
+  `;
+}
+
 function renderFileQueue(): string {
   const visible = fileQueue.queued.slice(0, 4);
   const summary = queuedFilesSummary(fileQueue.queued);
+  const queueActionsDisabled = fileQueueActions.busy || filePickerBusy || discardFileQueueRecoveryBusy;
+  const resuming = fileQueueActions.matches("resume");
+  const clearing = fileQueueActions.matches("clear");
   return `
-    <div class="remote-transfer-list-heading"><strong>${fileQueue.paused ? "队列已暂停" : "等待发送"} · ${summary}</strong><span>${fileQueue.paused ? `<button type="button" data-controller-file-queue-resume>继续队列</button>` : ""}<button type="button" data-controller-file-queue-clear>清空等待</button></span></div>
+    <div class="remote-transfer-list-heading"><strong>${fileQueue.paused ? "队列已暂停" : "等待发送"} · ${summary}</strong><span>${fileQueue.paused ? `<button type="button" data-controller-file-queue-resume ${queueActionsDisabled ? "disabled" : ""}>${resuming ? `${icon("loader-circle", "button-spinner")}正在继续…` : "继续队列"}</button>` : ""}<button type="button" data-controller-file-queue-clear ${queueActionsDisabled ? "disabled" : ""}>${clearing ? `${icon("loader-circle", "button-spinner")}正在清空…` : "清空等待"}</button></span></div>
+    ${renderFileQueueProtection()}
     <ul>${visible.map((file) => `
-      <li><span>${icon("file-up")}<span><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></span><button type="button" data-controller-file-queue-remove="${file.id}" aria-label="从队列移除 ${escapeHtml(file.name)}" title="从队列移除">${icon("x")}</button></li>
+      <li><span>${icon("file-up")}<span><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></span><button type="button" data-controller-file-queue-remove="${file.id}" aria-label="${fileQueueActions.matches("remove", file.id) ? "正在从队列移除" : "从队列移除"} ${escapeHtml(file.name)}" title="${fileQueueActions.matches("remove", file.id) ? "正在移除" : "从队列移除"}" ${queueActionsDisabled ? "disabled" : ""}>${fileQueueActions.matches("remove", file.id) ? icon("loader-circle", "button-spinner") : icon("x")}</button></li>
     `).join("")}</ul>
     ${fileQueue.queued.length > visible.length ? `<small class="remote-transfer-more">还有 ${fileQueue.queued.length - visible.length} 个文件正在等待</small>` : ""}
   `;
+}
+
+function renderFileQueueProtection(): string {
+  const retrying = fileQueueActions.matches("protect");
+  const protection = fileQueueProtectionPresentation(
+    fileQueue.recoveryState,
+    fileQueue.recoveryMessage,
+    retrying,
+  );
+  if (!protection) return "";
+  if (protection.tone === "protected") {
+    return `<div class="remote-file-queue-protection" data-state="protected">${icon("shield-check")}<span>${protection.message}</span></div>`;
+  }
+  return `<div class="remote-file-queue-protection" data-state="memory-only" title="${escapeHtml(protection.message)}">${icon("shield-alert")}<span>${escapeHtml(protection.message)}</span><button type="button" data-controller-file-queue-protection-retry ${fileQueueActions.busy || protection.retryDisabled ? "disabled" : ""}>${icon(retrying ? "loader-circle" : "rotate-ccw", retrying ? "button-spinner" : "")}${protection.retryLabel}</button></div>`;
 }
 
 function renderTransferHistory(): string {
@@ -1000,6 +1116,27 @@ async function beginConnection(
       return false;
     }
     snapshot = nextSnapshot;
+    if (fileRecoveryAvailable && isFileTransferRetryable(fileTransfer?.state)) {
+      const recoveryTarget = nextSnapshot.fileRecovery?.deviceId;
+      if (!recoveryTarget || deviceIdsMatch(recoveryTarget, target)) {
+        transferPanelOpen = true;
+      } else {
+        feedback = {
+          tone: "info",
+          message: `上次文件任务属于设备 ${recoveryTarget}，当前连接不会恢复或发送该任务。`,
+        };
+      }
+    }
+    const queueRecoveryTarget = nextSnapshot.fileQueueRecovery?.deviceId;
+    if (queueRecoveryTarget) {
+      transferPanelOpen = true;
+      if (!deviceIdsMatch(queueRecoveryTarget, target)) {
+        feedback = {
+          tone: "info",
+          message: `设备 ${queueRecoveryTarget} 仍有等待发送文件；它们不会发送到当前电脑，可在传输面板中放弃旧队列。`,
+        };
+      }
+    }
     started = true;
   } catch (error) {
     if (generation !== channelGeneration) {
@@ -1028,6 +1165,9 @@ async function cancelConnection(): Promise<void> {
     return;
   }
   const wasConnected = snapshot?.runtime.state === "connected";
+  if (remoteFullscreenActive || remoteFullscreenDesired) {
+    void setRemoteFullscreen(false, false);
+  }
   const generation = ++channelGeneration;
   busy = false;
   cancelling = true;
@@ -1157,9 +1297,18 @@ function handleSignal(signal: ControllerSignal): void {
           connectionError: null,
           savedDevices: [],
           savedDevicesError: null,
+          fileRecovery: null,
+          fileRecoveryError: null,
+          fileQueueRecovery: null,
+          fileQueueRecoveryError: null,
         };
       }
       if (signal.runtime.state !== "connected") {
+        if (remoteFullscreenActive || remoteFullscreenDesired) {
+          void setRemoteFullscreen(false, false);
+        }
+        smartPasteBusy = false;
+        smartPastePending = false;
         releaseInputState();
         inputDispatcher.discardAll();
         if (pointerFrame !== null) {
@@ -1264,21 +1413,53 @@ function handleSignal(signal: ControllerSignal): void {
     }
     case "clipboard":
       clipboardTransfer = signal;
+      if (
+        smartPastePending
+        && signal.operation === "paste"
+        && (signal.state === "completed" || signal.state === "failed")
+      ) {
+        smartPasteBusy = false;
+        smartPastePending = false;
+      }
       updateTransferPanel({ ledger: false });
       break;
     case "fileTransfer": {
       const previous = fileTransfer;
       fileTransfer = signal;
+      fileRecoveryAvailable = fileRecoveryAvailabilityAfterSignal(
+        fileRecoveryAvailable,
+        signal.state,
+      );
       updateFileTransferMetrics(signal);
       const historyChanged = recordTransferHistory(previous, signal);
       transferActivity = recordTransferResult(transferActivity, previous, signal, transferPanelOpen);
       scheduleTransferPanelUpdate(previous, signal, historyChanged);
       break;
     }
-    case "fileQueue":
-      fileQueue = { queued: signal.queued, paused: signal.paused };
+    case "fileQueue": {
+      const previouslyQueued = fileQueue.queued.length;
+      fileQueue = {
+        queued: signal.queued,
+        paused: signal.paused,
+        recoveryState: signal.recoveryState,
+        recoveryMessage: signal.recoveryMessage,
+      };
+      if (
+        previouslyQueued > 0
+        && signal.queued.length === 0
+        && signal.recoveryState === "empty"
+        && snapshot?.fileQueueRecovery
+        && deviceIdsMatch(snapshot.fileQueueRecovery.deviceId, attemptTarget || deviceIdDraft)
+      ) {
+        snapshot = {
+          ...snapshot,
+          fileQueueRecovery: null,
+          fileQueueRecoveryError: null,
+        };
+      }
       updateTransferPanel({ ledger: true });
       break;
+    }
     case "audio":
       audioStatus = signal.state;
       audioEnabled = signal.enabled;
@@ -1385,21 +1566,39 @@ function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void
   if (cancel) cancel.hidden = !isFileTransferActive(fileTransfer?.state);
   const retry = document.querySelector<HTMLButtonElement>("[data-controller-file-retry]");
   if (retry) {
-    retry.hidden = !isFileTransferRetryable(fileTransfer?.state);
+    retry.hidden = !(fileRecoveryAvailable && isFileTransferRetryable(fileTransfer?.state));
+    retry.disabled = discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy;
     retry.innerHTML = `${icon("rotate-ccw")}${fileTransfer?.direction === "download" ? "重新获取" : "重新发送"}`;
     renderLucideIcons(retry);
   }
+  const discard = document.querySelector<HTMLButtonElement>("[data-controller-file-discard]");
+  if (discard) {
+    discard.hidden = !(fileRecoveryAvailable && isFileTransferRetryable(fileTransfer?.state));
+    discard.disabled = discardFileRecoveryBusy;
+    discard.innerHTML = `${icon("trash-2")}${discardFileRecoveryBusy ? "正在清理…" : "不再重试"}`;
+    renderLucideIcons(discard);
+  }
   const sendFile = document.querySelector<HTMLButtonElement>("[data-controller-file-send]");
   if (sendFile) {
-    sendFile.disabled = filePickerBusy;
+    sendFile.disabled = filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy;
     sendFile.innerHTML = `${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}`;
     renderLucideIcons(sendFile);
   }
   const receiveFile = document.querySelector<HTMLButtonElement>("[data-controller-file-receive]");
   if (receiveFile) {
-    receiveFile.disabled = isFileTransferActive(fileTransfer?.state) || fileQueue.queued.length > 0;
+    receiveFile.disabled = isFileTransferActive(fileTransfer?.state)
+      || fileQueue.queued.length > 0
+      || discardFileRecoveryBusy
+      || discardFileQueueRecoveryBusy
+      || fileQueueActions.busy;
   }
   if (ledger) {
+    const recovery = document.querySelector<HTMLElement>("[data-controller-file-queue-recovery]");
+    if (recovery) {
+      recovery.outerHTML = renderFileQueueRecovery();
+      const nextRecovery = document.querySelector<HTMLElement>("[data-controller-file-queue-recovery]");
+      if (nextRecovery) renderLucideIcons(nextRecovery);
+    }
     const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
     if (queue) {
       queue.hidden = fileQueue.queued.length === 0;
@@ -1547,10 +1746,14 @@ async function openDownloadsFolder(): Promise<void> {
 }
 
 function bindTransferLedgerActions(): void {
+  document.querySelector<HTMLButtonElement>("[data-controller-file-queue-recovery-discard]")
+    ?.addEventListener("click", () => void discardFileQueueRecovery());
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-clear]")
     ?.addEventListener("click", () => void clearQueuedFiles());
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-resume]")
     ?.addEventListener("click", () => void resumeQueuedFiles());
+  document.querySelector<HTMLButtonElement>("[data-controller-file-queue-protection-retry]")
+    ?.addEventListener("click", () => void retryQueuedFilesProtection());
   document.querySelectorAll<HTMLButtonElement>("[data-controller-file-queue-remove]").forEach((button) => {
     button.addEventListener("click", () => {
       const transferId = button.dataset.controllerFileQueueRemove;
@@ -1566,31 +1769,53 @@ function bindTransferLedgerActions(): void {
 }
 
 async function sendLocalClipboard(): Promise<void> {
+  if (isClipboardTransferActive(clipboardTransfer?.state)) return;
   openTransferPanel();
-  clipboardTransfer = { kind: "clipboard", state: "sending", message: "正在读取并发送本机剪贴板…" };
+  clipboardTransfer = {
+    kind: "clipboard",
+    state: "sending",
+    operation: "send",
+    message: "正在读取并发送本机剪贴板…",
+  };
   updateTransferPanel();
   try {
     await sendControllerClipboard();
   } catch (error) {
-    clipboardTransfer = { kind: "clipboard", state: "failed", message: normalizeError(error) };
+    clipboardTransfer = {
+      kind: "clipboard",
+      state: "failed",
+      operation: "send",
+      message: normalizeError(error),
+    };
     updateTransferPanel();
   }
 }
 
 async function receiveRemoteClipboard(): Promise<void> {
+  if (isClipboardTransferActive(clipboardTransfer?.state)) return;
   openTransferPanel();
-  clipboardTransfer = { kind: "clipboard", state: "receiving", message: "正在读取远端剪贴板…" };
+  clipboardTransfer = {
+    kind: "clipboard",
+    state: "receiving",
+    operation: "receive",
+    message: "正在读取远端剪贴板…",
+  };
   updateTransferPanel();
   try {
     await requestControllerClipboard();
   } catch (error) {
-    clipboardTransfer = { kind: "clipboard", state: "failed", message: normalizeError(error) };
+    clipboardTransfer = {
+      kind: "clipboard",
+      state: "failed",
+      operation: "receive",
+      message: normalizeError(error),
+    };
     updateTransferPanel();
   }
 }
 
 async function chooseFileForTransfer(): Promise<void> {
-  if (filePickerBusy) return;
+  if (filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
   openTransferPanel();
   filePickerBusy = true;
   updateTransferPanel();
@@ -1613,7 +1838,7 @@ async function chooseFileForTransfer(): Promise<void> {
 }
 
 async function enqueueDroppedFiles(paths: string[]): Promise<void> {
-  if (paths.length === 0) return;
+  if (paths.length === 0 || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
   openTransferPanel();
   updateTransferPanel();
   try {
@@ -1624,26 +1849,66 @@ async function enqueueDroppedFiles(paths: string[]): Promise<void> {
 }
 
 async function removeQueuedFile(transferId: string): Promise<void> {
-  try {
-    await removeControllerQueuedFile(transferId);
-  } catch (error) {
-    showFileQueueError(error);
-  }
+  await runFileQueueAction("remove", () => removeControllerQueuedFile(transferId), transferId);
 }
 
 async function clearQueuedFiles(): Promise<void> {
-  try {
-    await clearControllerFileQueue();
-  } catch (error) {
-    showFileQueueError(error);
-  }
+  await runFileQueueAction("clear", clearControllerFileQueue);
 }
 
 async function resumeQueuedFiles(): Promise<void> {
+  await runFileQueueAction("resume", resumeControllerFileQueue);
+}
+
+async function retryQueuedFilesProtection(): Promise<void> {
+  if (fileQueue.recoveryState !== "memoryOnly") return;
+  await runFileQueueAction("protect", retryControllerFileQueueProtection);
+}
+
+async function runFileQueueAction(
+  kind: FileQueueActionKind,
+  operation: () => Promise<void>,
+  transferId: string | null = null,
+): Promise<void> {
+  if (filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy) return;
+  const action = fileQueueActions.begin(kind, transferId);
+  if (!action) return;
+  updateTransferPanel();
   try {
-    await resumeControllerFileQueue();
+    await operation();
   } catch (error) {
     showFileQueueError(error);
+  } finally {
+    finishFileQueueAction(action);
+  }
+}
+
+function finishFileQueueAction(action: FileQueueActionToken): void {
+  if (!fileQueueActions.finish(action)) return;
+  updateTransferPanel();
+}
+
+async function discardFileQueueRecovery(): Promise<void> {
+  if (filePickerBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
+  discardFileQueueRecoveryBusy = true;
+  updateTransferPanel();
+  try {
+    const latestSnapshot = await getControllerSnapshot();
+    const recovery = latestSnapshot.fileQueueRecovery;
+    if (recovery) {
+      await discardControllerFileQueueRecovery(recovery.revision);
+    }
+    snapshot = {
+      ...latestSnapshot,
+      fileQueueRecovery: null,
+      fileQueueRecoveryError: null,
+    };
+    feedback = { tone: "success", message: "旧的等待发送队列已清理，未删除任何本机文件。" };
+  } catch (error) {
+    showFileQueueError(error);
+  } finally {
+    discardFileQueueRecoveryBusy = false;
+    updateTransferPanel();
   }
 }
 
@@ -1695,7 +1960,11 @@ function setFileDragActive(active: boolean): void {
 }
 
 async function requestRemoteFileTransfer(): Promise<void> {
-  if (isFileTransferActive(fileTransfer?.state) || fileQueue.queued.length > 0) return;
+  if (
+    isFileTransferActive(fileTransfer?.state)
+    || fileQueue.queued.length > 0
+    || discardFileRecoveryBusy
+  ) return;
   openTransferPanel();
   fileTransfer = {
     kind: "fileTransfer",
@@ -1728,7 +1997,7 @@ async function cancelFileTransfer(): Promise<void> {
 }
 
 async function retryFileTransfer(): Promise<void> {
-  if (!fileTransfer || !isFileTransferRetryable(fileTransfer.state)) return;
+  if (!fileTransfer || !fileRecoveryAvailable || !isFileTransferRetryable(fileTransfer.state)) return;
   const previous = fileTransfer;
   fileTransfer = {
     ...previous,
@@ -1747,8 +2016,46 @@ async function retryFileTransfer(): Promise<void> {
   }
 }
 
+async function discardFileRecovery(): Promise<void> {
+  if (
+    !fileTransfer
+    || !fileRecoveryAvailable
+    || !isFileTransferRetryable(fileTransfer.state)
+    || discardFileRecoveryBusy
+  ) {
+    return;
+  }
+  const previous = fileTransfer;
+  discardFileRecoveryBusy = true;
+  updateTransferPanel();
+  try {
+    const latestSnapshot = await getControllerSnapshot();
+    const recovery = latestSnapshot.fileRecovery;
+    if (recovery) {
+      await discardControllerFileRecovery(recovery.revision);
+    }
+    fileTransfer = null;
+    fileRecoveryAvailable = false;
+    fileTransferMetrics = null;
+    snapshot = {
+      ...latestSnapshot,
+      fileRecovery: null,
+      fileRecoveryError: null,
+    };
+  } catch (error) {
+    fileTransfer = { ...previous, state: "failed", message: normalizeError(error) };
+  } finally {
+    discardFileRecoveryBusy = false;
+    updateTransferPanel();
+  }
+}
+
 function isFileTransferActive(state: FileTransferStatus["state"] | undefined): boolean {
   return state === "waiting" || state === "sending" || state === "receiving" || state === "verifying";
+}
+
+function isClipboardTransferActive(state: ClipboardTransferStatus["state"] | undefined): boolean {
+  return state === "sending" || state === "receiving";
 }
 
 function isFileTransferRetryable(state: FileTransferStatus["state"] | undefined): boolean {
@@ -2338,7 +2645,7 @@ function scheduleRemoteScaleLayout(
       viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
       viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
     }
-    remoteCanvasBounds = canvas.getBoundingClientRect();
+    remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
   });
 }
@@ -2472,7 +2779,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     if (!button) {
       return;
     }
-    remoteCanvasBounds = canvas.getBoundingClientRect();
+    remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
     const point = pointerPosition(event, canvas);
     if (!point) {
@@ -2538,6 +2845,16 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       }
       return;
     }
+    if (smartPasteBusy) {
+      event.preventDefault();
+      return;
+    }
+    if (isRemoteClipboardPasteShortcut(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      void pasteLocalClipboardText();
+      return;
+    }
     sendKeyboardEvent(event, true);
   });
   viewport.addEventListener("keyup", (event) => {
@@ -2585,6 +2902,40 @@ function releaseInputState(): void {
     fireInput({ kind: "mouseButton", button, pressed: false });
   }
   pressedButtons.clear();
+}
+
+async function pasteLocalClipboardText(): Promise<void> {
+  if (smartPasteBusy || snapshot?.runtime.state !== "connected") {
+    return;
+  }
+  smartPasteBusy = true;
+  smartPastePending = true;
+  clipboardTransfer = {
+    kind: "clipboard",
+    state: "sending",
+    operation: "paste",
+    message: "正在将本机剪贴板文字粘贴到远程电脑…",
+  };
+  updateTransferPanel({ ledger: false });
+  inputDispatcher.discardPendingMoves();
+  releaseInputState();
+  try {
+    await inputDispatcher.drain();
+    await pasteControllerClipboardText();
+  } catch (error) {
+    smartPasteBusy = false;
+    smartPastePending = false;
+    openTransferPanel();
+    clipboardTransfer = {
+      kind: "clipboard",
+      state: "failed",
+      operation: "paste",
+      message: normalizeError(error),
+    };
+  } finally {
+    updateTransferPanel({ ledger: false });
+    document.querySelector<HTMLElement>("[data-remote-viewport]")?.focus({ preventScroll: true });
+  }
 }
 
 function fireInput(input: ControllerInput): void {
@@ -2649,7 +3000,7 @@ function closeTextInput(): void {
 }
 
 function pointerPosition(event: PointerEvent, canvas: HTMLCanvasElement): { x: number; y: number } | null {
-  const bounds = remoteCanvasBounds ?? canvas.getBoundingClientRect();
+  const bounds = remoteCanvasBounds ?? readRemoteCanvasBounds(canvas);
   return normalizedPointerPosition(event.clientX, event.clientY, bounds);
 }
 
@@ -2664,7 +3015,7 @@ function updateRemoteCursor(x: number, y: number, visible: boolean): void {
     cursor.hidden = true;
     return;
   }
-  const canvasBounds = remoteCanvasBounds ?? canvas.getBoundingClientRect();
+  const canvasBounds = remoteCanvasBounds ?? readRemoteCanvasBounds(canvas);
   const viewportBounds = remoteViewportBounds ?? viewport.getBoundingClientRect();
   const position = remoteCursorContentPosition(
     x,
@@ -2682,7 +3033,7 @@ function updateRemoteCursor(x: number, y: number, visible: boolean): void {
 
 function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): void {
   const refresh = () => {
-    remoteCanvasBounds = canvas.getBoundingClientRect();
+    remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
   };
   refresh();
@@ -2693,27 +3044,108 @@ function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): 
   viewport.addEventListener("scroll", refresh, { passive: true });
 }
 
+function readRemoteCanvasBounds(canvas: HTMLCanvasElement): PointerBounds {
+  const bounds = canvas.getBoundingClientRect();
+  return remoteScaleMode === "fit"
+    ? containedPointerBounds(bounds, canvas.width, canvas.height)
+    : bounds;
+}
+
 async function toggleFullscreen(): Promise<void> {
-  const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
-  const session = viewport?.closest<HTMLElement>(".remote-session");
-  if (!viewport || !session) {
+  if (!document.querySelector("[data-remote-viewport]")) {
+    return;
+  }
+  await setRemoteFullscreen(!remoteFullscreenDesired, true);
+  if (remoteFullscreenActive) {
+    document.querySelector<HTMLElement>("[data-remote-viewport]")?.focus({ preventScroll: true });
+  }
+}
+
+function setRemoteFullscreen(active: boolean, reportErrors: boolean): Promise<void> {
+  remoteFullscreenDesired = active;
+  if (!remoteFullscreenOperation) {
+    remoteFullscreenOperation = applyRemoteFullscreenRequests(reportErrors).finally(() => {
+      remoteFullscreenOperation = null;
+      if (remoteFullscreenDesired !== remoteFullscreenActive) {
+        void setRemoteFullscreen(remoteFullscreenDesired, false);
+      }
+    });
+  }
+  return remoteFullscreenOperation;
+}
+
+async function applyRemoteFullscreenRequests(reportErrors: boolean): Promise<void> {
+  remoteFullscreenBusy = true;
+  syncRemoteFullscreenControl();
+  try {
+    while (remoteFullscreenActive !== remoteFullscreenDesired) {
+      const target = remoteFullscreenDesired;
+      releaseInputState();
+      inputDispatcher.discardPendingMoves();
+      await controllerWindow.setFullscreen(target);
+      applyRemoteFullscreenState(target, false);
+    }
+  } catch (error) {
+    remoteFullscreenDesired = remoteFullscreenActive;
+    if (reportErrors) {
+      feedback = {
+        tone: "error",
+        message: `Windows 无法${remoteFullscreenDesired ? "退出" : "进入"}全屏，请重新尝试。`,
+      };
+      requestRender();
+    }
+  } finally {
+    remoteFullscreenBusy = false;
+    syncRemoteFullscreenControl();
+  }
+}
+
+function applyRemoteFullscreenState(active: boolean, synchronizeDesired = true): void {
+  remoteFullscreenActive = active;
+  if (synchronizeDesired) {
+    remoteFullscreenDesired = active;
+  }
+  if (active) {
+    document.documentElement.dataset.remoteFullscreen = "true";
+  } else {
+    delete document.documentElement.dataset.remoteFullscreen;
+  }
+  remoteCanvasBounds = null;
+  remoteViewportBounds = null;
+  syncRemoteFullscreenControl();
+}
+
+async function synchronizeRemoteFullscreen(): Promise<void> {
+  if (remoteFullscreenBusy) {
     return;
   }
   try {
-    if (document.fullscreenElement === session) {
-      await document.exitFullscreen();
-    } else {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen();
-      }
-      await session.requestFullscreen();
-      viewport.focus({ preventScroll: true });
+    const active = await controllerWindow.isFullscreen();
+    if (!remoteFullscreenBusy) {
+      applyRemoteFullscreenState(active);
     }
-  } catch (error) {
-    showOperationError(error);
-  } finally {
-    syncRemoteFullscreenControl();
+  } catch {
+    // The UI remains usable in browser preview and on older embedded runtimes.
   }
+}
+
+function scheduleRemoteFullscreenSync(): void {
+  if (remoteFullscreenResizeTimer !== null) {
+    window.clearTimeout(remoteFullscreenResizeTimer);
+  }
+  remoteFullscreenResizeTimer = window.setTimeout(() => {
+    remoteFullscreenResizeTimer = null;
+    void synchronizeRemoteFullscreen();
+  }, 80);
+}
+
+function handleRemoteFullscreenEscape(event: KeyboardEvent): void {
+  if (!remoteFullscreenActive || event.key !== "Escape" || event.repeat) {
+    return;
+  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  void setRemoteFullscreen(false, true);
 }
 
 function syncRemoteFullscreenControl(): void {
@@ -2721,10 +3153,12 @@ function syncRemoteFullscreenControl(): void {
   if (!button) {
     return;
   }
-  const active = document.fullscreenElement?.classList.contains("remote-session") === true;
-  button.setAttribute("aria-label", active ? "退出全屏" : "进入全屏");
-  button.title = active ? "退出全屏" : "进入全屏";
-  button.innerHTML = `${icon(active ? "minimize-2" : "maximize-2")}<span data-controller-fullscreen-label>${active ? "退出全屏" : "全屏"}</span>`;
+  button.disabled = remoteFullscreenBusy;
+  button.setAttribute("aria-busy", String(remoteFullscreenBusy));
+  button.setAttribute("aria-pressed", String(remoteFullscreenActive));
+  button.setAttribute("aria-label", remoteFullscreenActive ? "退出全屏" : "进入全屏");
+  button.title = remoteFullscreenActive ? "退出全屏（Esc）" : "进入全屏";
+  button.innerHTML = `${icon(remoteFullscreenActive ? "minimize-2" : "maximize-2")}<span data-controller-fullscreen-label>${remoteFullscreenActive ? "退出全屏" : "全屏"}</span>`;
   renderLucideIcons(button);
 }
 

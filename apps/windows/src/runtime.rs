@@ -46,8 +46,9 @@ use crate::{
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
     transfer::{
-        IncomingFile, OutgoingFile, confirm_file_offer, notify_file_received, pick_outgoing_file,
-        prepare_outgoing_file, read_clipboard_text, write_clipboard_text,
+        IncomingFile, OutgoingFile, chunk_after_resume, confirm_file_offer, notify_file_received,
+        pick_outgoing_file, prepare_outgoing_file, read_clipboard_text, verify_resume_prefix,
+        write_clipboard_text,
     },
     window::ApprovalState,
 };
@@ -59,6 +60,7 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 // the person at the host enough time to inspect and approve the controller.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const FILE_TRANSFER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
 const VIDEO_FEEDBACK_MIN_PACKETS: u32 = 40;
@@ -68,6 +70,7 @@ const VIDEO_SEVERE_LOSS_BASIS_POINTS: u64 = 1_500;
 const VIDEO_DEGRADED_SAMPLES: u8 = 2;
 const VIDEO_HEALTHY_SAMPLES: u8 = 12;
 const VIDEO_SWITCH_COOLDOWN_SAMPLES: u8 = 8;
+const VIDEO_FRAME_PACING_TOLERANCE_US: u64 = 2_000;
 
 fn video_quality_settings(preset: VideoQualityPreset) -> H264EncoderSettings {
     match preset {
@@ -204,6 +207,60 @@ fn manual_video_quality(preference: VideoQualityPreference) -> Option<VideoQuali
         VideoQualityPreference::Smooth => Some(VideoQualityPreset::Smooth),
         VideoQualityPreference::Balanced => Some(VideoQualityPreset::Balanced),
         VideoQualityPreference::Sharp => Some(VideoQualityPreset::Sharp),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VideoFramePacer {
+    fps: u32,
+    next_due_us: Option<u64>,
+}
+
+impl VideoFramePacer {
+    fn new(fps: u32) -> Self {
+        Self {
+            fps: fps.max(1),
+            next_due_us: None,
+        }
+    }
+
+    fn reset(&mut self, fps: u32) {
+        self.fps = fps.max(1);
+        self.next_due_us = None;
+    }
+
+    fn should_encode(&mut self, timestamp_us: u64, force: bool) -> bool {
+        let interval_us = (1_000_000_u64 / u64::from(self.fps)).max(1);
+        let Some(next_due_us) = self.next_due_us else {
+            self.next_due_us = Some(timestamp_us.saturating_add(interval_us));
+            return true;
+        };
+        if force {
+            self.next_due_us = Some(timestamp_us.saturating_add(interval_us));
+            return true;
+        }
+        if timestamp_us < next_due_us {
+            let early_us = next_due_us - timestamp_us;
+            if early_us > interval_us {
+                self.next_due_us = Some(timestamp_us.saturating_add(interval_us));
+                return true;
+            }
+            if early_us > VIDEO_FRAME_PACING_TOLERANCE_US {
+                return false;
+            }
+        }
+
+        let intervals = if timestamp_us < next_due_us {
+            1
+        } else {
+            timestamp_us
+                .saturating_sub(next_due_us)
+                .checked_div(interval_us)
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        self.next_due_us = Some(next_due_us.saturating_add(interval_us.saturating_mul(intervals)));
+        true
     }
 }
 
@@ -589,6 +646,7 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::AlreadyJoined
         | TransportError::DirectoryNotFound
         | TransportError::DirectoryRateLimited
+        | TransportError::DirectoryProtocolMismatch { .. }
         | TransportError::InvalidConfig(_) => false,
     }
 }
@@ -1698,7 +1756,7 @@ fn capture_encode_loop(
     } = context;
     let mut encoder_recovery_attempts = 0_u8;
     let mut video_quality = DEFAULT_VIDEO_QUALITY;
-    let mut last_encoded_timestamp_us = None;
+    let mut frame_pacer = VideoFramePacer::new(video_quality_settings(video_quality).fps);
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -1724,7 +1782,7 @@ fn capture_encode_loop(
                             .map_err(HostRuntimeError::Encoder)?;
                         capture = next_capture;
                         coordinate_space = next_coordinate_space;
-                        last_encoded_timestamp_us = None;
+                        frame_pacer.reset(video_quality_settings(video_quality).fps);
                         lock_queue(&queue).drain_newest_first();
                         *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                             display_id,
@@ -1749,7 +1807,7 @@ fn capture_encode_loop(
                             .is_ok()
                         {
                             video_quality = preset;
-                            last_encoded_timestamp_us = None;
+                            frame_pacer.reset(video_quality_settings(video_quality).fps);
                             lock_queue(&queue).drain_newest_first();
                             force_keyframe.store(true, Ordering::Release);
                             notify.notify_one();
@@ -1776,7 +1834,7 @@ fn capture_encode_loop(
                         video_quality_settings(video_quality),
                     )
                     .map_err(HostRuntimeError::Encoder)?;
-                last_encoded_timestamp_us = None;
+                frame_pacer.reset(video_quality_settings(video_quality).fps);
                 lock_queue(&queue).drain_newest_first();
                 *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                     display_id: capture.display_id(),
@@ -1788,26 +1846,15 @@ fn capture_encode_loop(
             }
         };
         let request_keyframe = force_keyframe.swap(false, Ordering::AcqRel);
-        if !request_keyframe
-            && !video_frame_is_due(
-                last_encoded_timestamp_us,
-                frame.timestamp_us,
-                video_quality_settings(video_quality).fps,
-            )
-        {
+        if !frame_pacer.should_encode(frame.timestamp_us, request_keyframe) {
             continue;
         }
-        let frame_timestamp_us = frame.timestamp_us;
         let encoded = match encoder.encode(frame, request_keyframe) {
             Ok(encoded) => {
                 encoder_recovery_attempts = 0;
-                last_encoded_timestamp_us = Some(frame_timestamp_us);
                 encoded
             }
-            Err(EncoderError::NeedMoreInput) => {
-                last_encoded_timestamp_us = Some(frame_timestamp_us);
-                continue;
-            }
+            Err(EncoderError::NeedMoreInput) => continue,
             Err(error)
                 if encoder_error_is_recoverable(&error)
                     && encoder_recovery_attempts < MAX_ENCODER_RECOVERY_ATTEMPTS =>
@@ -1831,16 +1878,6 @@ fn capture_encode_loop(
         notify.notify_one();
     }
     Ok(())
-}
-
-fn video_frame_is_due(last_timestamp_us: Option<u64>, timestamp_us: u64, fps: u32) -> bool {
-    let Some(last_timestamp_us) = last_timestamp_us else {
-        return true;
-    };
-    if timestamp_us < last_timestamp_us {
-        return true;
-    }
-    timestamp_us.saturating_sub(last_timestamp_us) >= 1_000_000_u64 / u64::from(fps.max(1))
 }
 
 async fn send_video_loop(
@@ -2182,7 +2219,32 @@ async fn receive_transfer_loop(
     secure: SharedSecureSession,
     peer_generation: u64,
 ) -> Result<(), HostRuntimeError> {
-    let mut incoming: Option<IncomingFile> = None;
+    let mut incoming = ResumableHostIncoming::default();
+    let result =
+        receive_transfer_loop_inner(client, secure, peer_generation, &mut incoming.0).await;
+    if let Some(file) = incoming.0.take() {
+        let _ = tokio::task::spawn_blocking(move || file.preserve()).await;
+    }
+    result
+}
+
+#[derive(Default)]
+struct ResumableHostIncoming(Option<IncomingFile>);
+
+impl Drop for ResumableHostIncoming {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take() {
+            let _ = file.preserve();
+        }
+    }
+}
+
+async fn receive_transfer_loop_inner(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+    incoming: &mut Option<IncomingFile>,
+) -> Result<(), HostRuntimeError> {
     let mut outgoing: Option<HostOutgoingTransfer> = None;
     let (outgoing_events, mut pending_outgoing_events) =
         mpsc::unbounded_channel::<HostOutgoingEvent>();
@@ -2240,7 +2302,7 @@ async fn receive_transfer_loop(
                 };
                 send_transfer_response(&client, &secure, peer_generation, response).await?;
             }
-            TransferMessage::FileSelectionRequest { request_id } => {
+            TransferMessage::FileSelectionRequest { request_id, resume } => {
                 if incoming.is_some() || outgoing.is_some() {
                     send_transfer_response(
                         &client,
@@ -2263,7 +2325,7 @@ async fn receive_transfer_loop(
                 })
                 .await
                 .unwrap_or(Err(TransferResult::IoFailed));
-                let file = match selected {
+                let mut file = match selected {
                     Ok(Some(file)) => file,
                     Ok(None) => {
                         send_transfer_response(
@@ -2289,12 +2351,19 @@ async fn receive_transfer_loop(
                         continue;
                     }
                 };
+                if resume
+                    .as_ref()
+                    .is_some_and(|resume| resume.name == file.name && resume.size == file.size)
+                {
+                    file.transfer_id = resume.expect("checked resume metadata").transfer_id;
+                }
                 send_transfer_response(
                     &client,
                     &secure,
                     peer_generation,
                     TransferMessage::FileOffer {
                         transfer_id: file.transfer_id,
+                        request_id: Some(request_id),
                         name: file.name.clone(),
                         size: file.size,
                     },
@@ -2328,40 +2397,57 @@ async fn receive_transfer_loop(
             }
             TransferMessage::FileOffer {
                 transfer_id,
+                request_id,
                 name,
                 size,
             } => {
-                let accepted = if incoming.is_some() || outgoing.is_some() {
-                    false
+                let (result, resume_offset, resume_prefix_hash) = if request_id.is_some() {
+                    (TransferResult::Rejected, 0, None)
+                } else if incoming.is_some() || outgoing.is_some() {
+                    (TransferResult::Busy, 0, None)
                 } else {
                     let prompt_name = name.clone();
-                    tokio::task::spawn_blocking(move || confirm_file_offer(&prompt_name, size))
+                    let accepted =
+                        tokio::task::spawn_blocking(move || confirm_file_offer(&prompt_name, size))
+                            .await
+                            .unwrap_or(false);
+                    if !accepted {
+                        (TransferResult::Rejected, 0, None)
+                    } else {
+                        match tokio::task::spawn_blocking(move || {
+                            IncomingFile::create(transfer_id, name, size)
+                        })
                         .await
-                        .unwrap_or(false)
+                        {
+                            Ok(Ok(file)) => {
+                                let resume_offset = file.resume_offset();
+                                let resume_prefix_hash = file.resume_prefix_hash();
+                                *incoming = Some(file);
+                                (TransferResult::Completed, resume_offset, resume_prefix_hash)
+                            }
+                            Ok(Err(result)) => (result, 0, None),
+                            Err(_) => (TransferResult::IoFailed, 0, None),
+                        }
+                    }
                 };
-                if accepted {
-                    incoming = tokio::task::spawn_blocking(move || {
-                        IncomingFile::create(transfer_id, name, size)
-                    })
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
-                }
-                let accepted = accepted && incoming.is_some();
                 send_transfer_response(
                     &client,
                     &secure,
                     peer_generation,
                     TransferMessage::FileDecision {
                         transfer_id,
-                        accepted,
+                        result,
+                        resume_offset,
+                        resume_prefix_hash,
                     },
                 )
                 .await?;
             }
             TransferMessage::FileDecision {
                 transfer_id,
-                accepted,
+                result,
+                resume_offset,
+                resume_prefix_hash,
             } => {
                 let matches = outgoing.as_ref().is_some_and(|transfer| {
                     transfer.file.transfer_id == transfer_id
@@ -2370,7 +2456,11 @@ async fn receive_transfer_loop(
                 if !matches {
                     continue;
                 }
-                if !accepted {
+                if result != TransferResult::Completed
+                    || outgoing
+                        .as_ref()
+                        .is_some_and(|transfer| resume_offset > transfer.file.size)
+                {
                     outgoing.take();
                     continue;
                 }
@@ -2387,6 +2477,8 @@ async fn receive_transfer_loop(
                         secure,
                         peer_generation,
                         file,
+                        resume_offset,
+                        resume_prefix_hash,
                         cancellation,
                     )
                     .await;
@@ -2526,8 +2618,19 @@ async fn stream_host_outgoing_file(
     secure: SharedSecureSession,
     peer_generation: u64,
     file: OutgoingFile,
+    resume_offset: u64,
+    resume_prefix_hash: Option<[u8; 32]>,
     cancellation: Arc<AtomicBool>,
 ) -> Result<(), TransferResult> {
+    if resume_offset > file.size {
+        return Err(TransferResult::InvalidData);
+    }
+    let proof_path = file.path.clone();
+    tokio::task::spawn_blocking(move || {
+        verify_resume_prefix(&proof_path, resume_offset, resume_prefix_hash)
+    })
+    .await
+    .unwrap_or(Err(TransferResult::IoFailed))?;
     let (events, mut receiver) = mpsc::channel(2);
     let producer_cancellation = cancellation.clone();
     let path = file.path.clone();
@@ -2548,10 +2651,18 @@ async fn stream_host_outgoing_file(
                 }
                 bytes.truncate(read);
                 hasher.update(&bytes);
-                events
-                    .blocking_send(HostFileReadEvent::Chunk { offset, bytes })
-                    .map_err(|_| ())?;
-                offset = offset.checked_add(read as u64).ok_or(())?;
+                let end = offset.checked_add(read as u64).ok_or(())?;
+                if let Some((chunk_offset, bytes)) =
+                    chunk_after_resume(offset, bytes, resume_offset).map_err(|_| ())?
+                {
+                    events
+                        .blocking_send(HostFileReadEvent::Chunk {
+                            offset: chunk_offset,
+                            bytes,
+                        })
+                        .map_err(|_| ())?;
+                }
+                offset = end;
             }
             if offset != size {
                 return Err(());
@@ -2583,9 +2694,13 @@ async fn stream_host_outgoing_file(
             HostFileReadEvent::Failed => return Err(TransferResult::IoFailed),
         };
         let complete = matches!(message, TransferMessage::FileComplete { .. });
-        send_transfer_response(&client, &secure, peer_generation, message)
-            .await
-            .map_err(|_| TransferResult::IoFailed)?;
+        tokio::time::timeout(
+            FILE_TRANSFER_SEND_TIMEOUT,
+            send_transfer_response(&client, &secure, peer_generation, message),
+        )
+        .await
+        .map_err(|_| TransferResult::IoFailed)?
+        .map_err(|_| TransferResult::IoFailed)?;
         if complete {
             return Ok(());
         }
@@ -2709,10 +2824,9 @@ mod retry_policy_tests {
     use desklink_transport::TransportError;
 
     use super::{
-        AdaptiveVideoQuality, HostRuntimeError, encoder_error_is_recoverable,
+        AdaptiveVideoQuality, HostRuntimeError, VideoFramePacer, encoder_error_is_recoverable,
         host_error_is_retryable, host_error_is_retryable_for_session,
-        host_error_rearms_on_connected_relay, host_runtime_denial_reason, video_frame_is_due,
-        video_quality_settings,
+        host_error_rearms_on_connected_relay, host_runtime_denial_reason, video_quality_settings,
     };
     use desklink_protocol::{VideoQualityPreference, VideoQualityPreset};
 
@@ -2870,10 +2984,27 @@ mod retry_policy_tests {
     }
 
     #[test]
-    fn frame_cadence_allows_first_and_requested_interval_frames() {
-        assert!(video_frame_is_due(None, 1_000_000, 20));
-        assert!(!video_frame_is_due(Some(1_000_000), 1_049_999, 20));
-        assert!(video_frame_is_due(Some(1_000_000), 1_050_000, 20));
-        assert!(video_frame_is_due(Some(1_000_000), 999_999, 20));
+    fn frame_pacer_does_not_alias_a_sixty_hz_capture_source_to_twenty_fps() {
+        let mut pacer = VideoFramePacer::new(30);
+        let encoded = (0..60)
+            .filter(|index| pacer.should_encode(index * 16_666, false))
+            .count();
+        assert_eq!(encoded, 30);
+    }
+
+    #[test]
+    fn frame_pacer_handles_quality_changes_forced_frames_and_clock_rewinds() {
+        let mut pacer = VideoFramePacer::new(20);
+        assert!(pacer.should_encode(1_000_000, false));
+        assert!(!pacer.should_encode(1_020_000, false));
+        assert!(pacer.should_encode(1_030_000, true));
+        assert!(!pacer.should_encode(1_050_000, false));
+        assert!(pacer.should_encode(900_000, false));
+
+        pacer.reset(15);
+        let encoded = (0..60)
+            .filter(|index| pacer.should_encode(index * 16_666, false))
+            .count();
+        assert_eq!(encoded, 15);
     }
 }

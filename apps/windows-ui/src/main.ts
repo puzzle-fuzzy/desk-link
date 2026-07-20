@@ -6,12 +6,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   cancelPairingSession,
+  checkWindowsRelease,
   disableFixedAccessPassword,
   exportDiagnosticReport,
   getFixedAccessPassword,
   getHostSnapshot,
   getWindowsPreferences,
   openGithubRepository,
+  openWindowsReleases,
   quitDeskLink,
   regenerateFixedAccessPassword,
   respondHostApproval,
@@ -55,9 +57,18 @@ import { LatestRequest } from "./latest-request";
 import { escapeHtml } from "./html";
 import { icon, renderLucideIcons } from "./icons";
 import { hostStatusSummary } from "./host-status";
+import {
+  evaluateWindowsRelease,
+  type WindowsUpdateCheck,
+} from "./windows-update";
 
 type View = "controller" | "connection" | "devices" | "pairing" | "fixedAccess" | "settings" | "about";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
+type WindowsUpdateState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "error" }
+  | WindowsUpdateCheck;
 
 const applicationRoot = document.querySelector<HTMLElement>("#app");
 if (!applicationRoot) {
@@ -94,6 +105,7 @@ let diagnosticsSharingBusy = false;
 let diagnosticsUploadBusy = false;
 let quitConfirming = false;
 let applicationVersion = "";
+let windowsUpdate: WindowsUpdateState = { kind: "idle" };
 const snapshotRequests = new LatestRequest();
 
 function render(): void {
@@ -931,6 +943,14 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
         : ""}
     </section>
 
+    <section class="settings-group" aria-labelledby="update-settings-heading">
+      <div class="settings-group-heading">
+        <h2 id="update-settings-heading">应用更新</h2>
+        <p>只检查 DeskLink GitHub 仓库中已经完成签名验证的正式 Windows 版本。</p>
+      </div>
+      ${renderWindowsUpdate(settings.version)}
+    </section>
+
     <section class="settings-group" aria-labelledby="application-settings-heading">
       <div class="settings-group-heading">
         <h2 id="application-settings-heading">应用信息</h2>
@@ -956,6 +976,67 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
         : '<button class="button button--secondary" type="button" data-request-quit>退出 DeskLink</button>'}
     </section>
   `;
+}
+
+function renderWindowsUpdate(currentVersion: string): string {
+  let title = `当前版本 DeskLink ${escapeHtml(currentVersion)}`;
+  let detail = "尚未检查正式版本。检查不会上传设备 ID、访问密码或远程会话信息。";
+  let action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}检查更新</button>`;
+
+  if (windowsUpdate.kind === "checking") {
+    title = "正在检查正式版本";
+    detail = "正在读取 GitHub Release 和签名安装器清单，远程连接不会因此暂停。";
+    action = `<button class="button button--secondary button--compact" type="button" disabled>${icon("loader-circle")}正在检查…</button>`;
+  } else if (windowsUpdate.kind === "available") {
+    title = `发现 DeskLink ${escapeHtml(windowsUpdate.latestVersion)}`;
+    const releaseDate = windowsUpdate.publishedAt
+      ? `，发布于 ${formatUpdateDate(windowsUpdate.publishedAt)}`
+      : "";
+    detail = `此版本已包含匹配的签名 Windows 安装器清单${releaseDate}。升级会保留设备身份、已批准设备和本机设置。`;
+    action = `<button class="button button--primary button--compact" type="button" data-open-windows-release>${icon("file-down")}查看并安装</button>`;
+  } else if (windowsUpdate.kind === "current") {
+    title = "当前已是最新正式版本";
+    detail = `GitHub 最新稳定版本为 DeskLink ${escapeHtml(windowsUpdate.latestVersion)}。`;
+    action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}再次检查</button>`;
+  } else if (windowsUpdate.kind === "unavailable") {
+    if (windowsUpdate.reason === "noRelease") {
+      title = "暂时没有正式 Windows 版本";
+      detail = "GitHub 尚未发布通过签名门禁的安装包；当前开发版本可以继续使用。";
+    } else if (windowsUpdate.reason === "invalidRelease") {
+      title = "最新发布信息无法确认";
+      detail = "DeskLink 忽略了不符合稳定版本规则的 Release，不会提供下载入口。";
+    } else {
+      title = "最新版本尚未通过安装器验证";
+      detail = "Release 缺少匹配的 x64 安装器或签名清单，DeskLink 已阻止升级入口。";
+    }
+    action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}重新检查</button>`;
+  } else if (windowsUpdate.kind === "error") {
+    title = "暂时无法检查更新";
+    detail = "可能是网络不可用或 GitHub 暂时无法访问，不影响远程连接和本机共享。";
+    action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}重试</button>`;
+  }
+
+  return `
+    <div class="settings-inline-action settings-update" role="status" aria-live="polite">
+      <div>
+        <strong>${title}</strong>
+        <p>${detail}</p>
+      </div>
+      ${action}
+    </div>
+  `;
+}
+
+function formatUpdateDate(value: string): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return "日期未知";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(date);
 }
 
 function connectionToInput(connection: ConnectionSummary | null): ConnectionSettingsInput {
@@ -1094,6 +1175,33 @@ async function loadPreferences(): Promise<void> {
   }
 }
 
+async function checkForWindowsUpdate(): Promise<void> {
+  if (windowsUpdate.kind === "checking") {
+    return;
+  }
+  const version = applicationVersion || preferences?.version;
+  if (!version) {
+    windowsUpdate = { kind: "error" };
+    if (activeView === "settings") {
+      render();
+    }
+    return;
+  }
+  windowsUpdate = { kind: "checking" };
+  if (activeView === "settings") {
+    render();
+  }
+  try {
+    windowsUpdate = evaluateWindowsRelease(version, await checkWindowsRelease());
+  } catch {
+    windowsUpdate = { kind: "error" };
+  } finally {
+    if (activeView === "settings") {
+      render();
+    }
+  }
+}
+
 async function updateLaunchAtLogin(enabled: boolean): Promise<void> {
   if (launchAtLoginBusy) {
     return;
@@ -1188,6 +1296,12 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
     button.addEventListener("click", () => void openGithub());
   });
+  document.querySelector<HTMLButtonElement>("[data-check-windows-update]")?.addEventListener("click", () => {
+    void checkForWindowsUpdate();
+  });
+  document.querySelector<HTMLButtonElement>("[data-open-windows-release]")?.addEventListener("click", () => {
+    void openWindowsReleasePage();
+  });
   if (activeView === "controller") {
     bindControllerInteractions();
   }
@@ -1219,6 +1333,9 @@ function bindInteractions(): void {
         void loadFixedAccess();
       } else if (activeView === "settings" && !preferences) {
         void loadPreferences();
+      }
+      if (activeView === "settings" && windowsUpdate.kind === "idle") {
+        void checkForWindowsUpdate();
       }
     });
     button.addEventListener("keydown", (event) => {
@@ -1426,6 +1543,15 @@ function runWindowAction(action: () => Promise<void>): void {
 async function openGithub(): Promise<void> {
   try {
     await openGithubRepository();
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+    render();
+  }
+}
+
+async function openWindowsReleasePage(): Promise<void> {
+  try {
+    await openWindowsReleases();
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
     render();
@@ -1732,6 +1858,7 @@ void getVersion().then((version) => {
   if (activeView === "about") {
     render();
   }
+  void checkForWindowsUpdate();
 }).catch(() => {
   applicationVersion = "";
 });

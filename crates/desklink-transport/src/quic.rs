@@ -8,10 +8,10 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     ChannelKind, DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED, DIRECTORY_LOOKUP_NOT_FOUND,
-    DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode, MAX_DATAGRAM_BYTES,
-    MAX_DIRECTORY_INVITATION_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClientConfig,
-    RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayJoin, TransportError,
-    TransportEvent,
+    DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode,
+    MAX_DATAGRAM_BYTES, MAX_DIRECTORY_INVITATION_BYTES, MAX_RELIABLE_MESSAGE_BYTES,
+    QuicClientConfig, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayJoin,
+    TransportError, TransportEvent,
 };
 
 const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
@@ -340,6 +340,7 @@ impl QuicClient {
             .open_bi()
             .await
             .map_err(map_connection_error)?;
+        let controller_protocol_version = lookup.protocol_version();
         let envelope = lookup.encode();
         send.write_all(&(envelope.len() as u32).to_be_bytes())
             .await
@@ -374,6 +375,18 @@ impl QuicClient {
             DIRECTORY_LOOKUP_NOT_FOUND => Err(TransportError::DirectoryNotFound),
             DIRECTORY_LOOKUP_RATE_LIMITED => Err(TransportError::DirectoryRateLimited),
             DIRECTORY_LOOKUP_MALFORMED => Err(TransportError::Malformed),
+            DIRECTORY_LOOKUP_PROTOCOL_MISMATCH => {
+                let mut host_protocol_version = [0; 2];
+                receive
+                    .read_exact(&mut host_protocol_version)
+                    .await
+                    .map_err(|error| map_read_exact_error(&self.inner.connection, error))?;
+                let host_protocol_version = u16::from_be_bytes(host_protocol_version);
+                Err(TransportError::DirectoryProtocolMismatch {
+                    controller: controller_protocol_version,
+                    host: (host_protocol_version != 0).then_some(host_protocol_version),
+                })
+            }
             _ => Err(TransportError::Malformed),
         }
     }

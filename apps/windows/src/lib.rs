@@ -26,6 +26,8 @@ pub mod runtime;
 pub mod startup;
 mod storage;
 pub mod transfer;
+#[cfg(windows)]
+pub mod transfer_recovery;
 pub mod tray;
 #[cfg(windows)]
 pub mod trusted;

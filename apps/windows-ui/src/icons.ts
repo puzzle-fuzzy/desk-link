@@ -39,6 +39,7 @@ import {
   ShieldCheck,
   ShieldUser,
   Square,
+  Trash2,
   TriangleAlert,
   Volume2,
   VolumeOff,
@@ -88,6 +89,7 @@ const deskLinkIcons = {
   ShieldCheck,
   ShieldUser,
   Square,
+  Trash2,
   TriangleAlert,
   Volume2,
   VolumeOff,
@@ -136,6 +138,7 @@ export type DeskLinkIconName =
   | "shield-check"
   | "shield-user"
   | "square"
+  | "trash-2"
   | "triangle-alert"
   | "volume-2"
   | "volume-off"
