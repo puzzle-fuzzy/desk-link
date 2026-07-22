@@ -19,6 +19,7 @@ export class VideoRenderTiming {
   private previousPresentedAtMs: number | null = null;
   private maxGapMs = 0;
   private coalescedFrameDrops = 0;
+  private pendingCoalescedFrameDrops = 0;
 
   reset(): void {
     this.displayedFrames = 0;
@@ -26,10 +27,18 @@ export class VideoRenderTiming {
     this.previousPresentedAtMs = null;
     this.maxGapMs = 0;
     this.coalescedFrameDrops = 0;
+    this.pendingCoalescedFrameDrops = 0;
   }
 
   recordCoalescedFrame(): void {
     this.coalescedFrameDrops += 1;
+    this.pendingCoalescedFrameDrops += 1;
+  }
+
+  takeCoalescedFrameDrops(): number {
+    const drops = this.pendingCoalescedFrameDrops;
+    this.pendingCoalescedFrameDrops = 0;
+    return drops;
   }
 
   observe(presentedAtMs: number): void {

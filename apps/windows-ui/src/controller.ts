@@ -126,6 +126,7 @@ import type { ControllerRemoteSurfaceState } from "./controller-runtime-presenta
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
 import { VideoRenderTiming } from "./video-render-timing";
+import { presentationDropDecodeQueueHint } from "./video-render-pressure";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -2395,8 +2396,16 @@ function armVideoPlaybackPressureReporter(streamId: number): void {
       return;
     }
     const sample = videoPlaybackPressure.takeSample();
-    const report = sample.peakDecodeQueueSize > 0 || sample.freshnessRecoveries > 0
-      ? reportControllerPlaybackPressure({ streamId, ...sample }).catch(() => {
+    const coalescedFrameDrops = videoRenderTiming.takeCoalescedFrameDrops();
+    const presentationQueueHint = presentationDropDecodeQueueHint(coalescedFrameDrops);
+    const report = sample.peakDecodeQueueSize > 0
+      || sample.freshnessRecoveries > 0
+      || presentationQueueHint > 0
+      ? reportControllerPlaybackPressure({
+          streamId,
+          peakDecodeQueueSize: Math.max(sample.peakDecodeQueueSize, presentationQueueHint),
+          freshnessRecoveries: sample.freshnessRecoveries,
+        }).catch(() => {
           // Playback feedback is best-effort and must never interrupt the live session.
         })
       : Promise.resolve();
