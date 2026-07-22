@@ -1211,6 +1211,10 @@ fn build_diagnostic_report(
     let _ = writeln!(report, "\n[控制端状态]");
     let _ = writeln!(report, "运行状态: {}", controller_runtime.state);
     let _ = writeln!(report, "运行说明: {}", controller_runtime.detail);
+    let _ = writeln!(report, "\n[视频性能摘要]");
+    for finding in build_video_performance_summary(recent_events) {
+        let _ = writeln!(report, "{finding}");
+    }
     let _ = writeln!(report, "\n[最近诊断事件，最多 200 条；已区分主机与控制端]");
     if recent_events.is_empty() {
         let _ = writeln!(report, "没有可用的历史事件。");
@@ -1220,6 +1224,93 @@ fn build_diagnostic_report(
         }
     }
     apps_windows::diagnostics::redact_sensitive_text(&report)
+}
+
+fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
+    let render = latest_metric_event(recent_events, "controller_render_metrics");
+    let transport = latest_metric_event(recent_events, "controller_video_metrics");
+    let Some(render) = render else {
+        return vec!["控制端尚未捕获足够的视频渲染指标。".to_owned()];
+    };
+
+    let mut findings = Vec::new();
+    if let Some(fps_x100) = render
+        .get("displayed_fps_x100")
+        .and_then(serde_json::Value::as_u64)
+    {
+        findings.push(format!("本地显示帧率: {:.2} FPS", fps_x100 as f64 / 100.0));
+    } else {
+        findings.push("本地显示帧率: 尚未形成有效采样".to_owned());
+    }
+    if let Some(gap_ms) = render
+        .get("max_frame_gap_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        findings.push(format!("本地最大帧间隔: {gap_ms} 毫秒"));
+    }
+
+    let received = render
+        .get("received_frames")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let submitted = render
+        .get("submitted_frames")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let displayed = render
+        .get("displayed_frames")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let pull_failures = render
+        .get("video_pull_failures")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    findings.push(format!(
+        "控制端视频计数: 收到 {received}，提交解码 {submitted}，显示 {displayed}，拉取失败 {pull_failures}"
+    ));
+
+    let completed = transport
+        .as_ref()
+        .and_then(|value| value.get("completed_frames"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let delivered = transport
+        .as_ref()
+        .and_then(|value| value.get("delivered_video_frames"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let fps_x100 = render
+        .get("displayed_fps_x100")
+        .and_then(serde_json::Value::as_u64);
+    let gap_ms = render
+        .get("max_frame_gap_ms")
+        .and_then(serde_json::Value::as_u64);
+
+    let diagnosis = if submitted > 0 && displayed == 0 {
+        "判断线索: 视频已进入解码路径但尚未显示，优先检查 WebView2 解码能力。"
+    } else if completed == 0 && delivered == 0 && received == 0 {
+        "判断线索: 暂无持续视频交付证据，优先检查网络、中继会话或目标主机编码。"
+    } else if fps_x100.is_some_and(|value| value < 1_500) || gap_ms.is_some_and(|value| value > 250)
+    {
+        "判断线索: 视频已交付但本地显示有积压，优先检查解码或 WebView2 渲染。"
+    } else if completed > 0 && delivered > 0 {
+        "判断线索: 最近一段视频链路未显示明显的显示层卡顿。"
+    } else {
+        "判断线索: 指标不足以定位单一层级，请在复现卡顿后再次导出报告。"
+    };
+    findings.push(diagnosis.to_owned());
+    findings
+}
+
+fn latest_metric_event(recent_events: &[String], event_name: &str) -> Option<serde_json::Value> {
+    recent_events.iter().rev().find_map(|line| {
+        let json = line
+            .split_once("] ")
+            .map_or(line.as_str(), |(_, value)| value);
+        let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+        (value.get("event").and_then(serde_json::Value::as_str) == Some(event_name))
+            .then_some(value)
+    })
 }
 
 fn diagnostic_status_label(status: &str) -> &'static str {
@@ -1563,7 +1654,8 @@ fn show_main_window(app: &AppHandle) {
 mod tests {
     use super::{
         ConnectionSummary, HostSnapshot, TrustedControllerSummary, build_diagnostic_checks,
-        build_diagnostic_report, hex, merge_recent_diagnostic_lines, normalize_fingerprint,
+        build_diagnostic_report, build_video_performance_summary, hex,
+        merge_recent_diagnostic_lines, normalize_fingerprint,
     };
     use crate::{
         controller::ControllerRuntimeSummary, host::HostRuntimeSummary,
@@ -1675,5 +1767,26 @@ mod tests {
         assert!(!report.contains("0123456789abcdef0123456789abcdef"));
         assert!(!report.contains(&verify_key));
         assert!(!report.contains(&secret));
+    }
+
+    #[test]
+    fn diagnostic_report_adds_video_performance_findings_without_raw_secrets() {
+        let events = vec![
+            "[控制端] {\"event\":\"controller_video_metrics\",\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
+            "[控制端] {\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":1240,\"max_frame_gap_ms\":420}".to_owned(),
+        ];
+
+        let summary = build_video_performance_summary(&events).join("\n");
+
+        assert!(summary.contains("本地显示帧率: 12.40 FPS"));
+        assert!(summary.contains("本地最大帧间隔: 420 毫秒"));
+        assert!(summary.contains("优先检查解码或 WebView2 渲染"));
+        assert!(!summary.contains("session"));
+    }
+
+    #[test]
+    fn video_performance_summary_explains_missing_samples() {
+        let summary = build_video_performance_summary(&[]).join("\n");
+        assert!(summary.contains("尚未捕获足够的视频渲染指标"));
     }
 }
