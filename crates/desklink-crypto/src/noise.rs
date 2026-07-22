@@ -3,7 +3,7 @@ use std::{fmt, ops::Deref};
 use blake2::{Blake2s256, Digest};
 use chacha20poly1305::{
     ChaCha20Poly1305,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInPlace, Buffer, KeyInit, Payload},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
@@ -398,6 +398,53 @@ struct PacketCipher {
     replay_window: u128,
 }
 
+/// A packet buffer whose first bytes remain clear while the suffix is
+/// encrypted in place.  This keeps the packet sequence prefix adjacent to the
+/// ciphertext without allocating a second encrypted Vec.
+struct PrefixedBuffer {
+    bytes: Vec<u8>,
+    prefix_len: usize,
+}
+
+impl PrefixedBuffer {
+    fn new(prefix: &[u8], plaintext: &[u8], tag_capacity: usize) -> Self {
+        let mut bytes = Vec::with_capacity(prefix.len() + plaintext.len() + tag_capacity);
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(plaintext);
+        Self {
+            bytes,
+            prefix_len: prefix.len(),
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl AsRef<[u8]> for PrefixedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[self.prefix_len..]
+    }
+}
+
+impl AsMut<[u8]> for PrefixedBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.prefix_len..]
+    }
+}
+
+impl Buffer for PrefixedBuffer {
+    fn extend_from_slice(&mut self, other: &[u8]) -> chacha20poly1305::aead::Result<()> {
+        self.bytes.extend_from_slice(other);
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.bytes.truncate(self.prefix_len.saturating_add(len));
+    }
+}
+
 impl PacketCipher {
     fn new(session_key: &SessionKey, direction: u8, lane: SecureLane) -> Self {
         let mut hasher = Blake2s256::new();
@@ -429,19 +476,11 @@ impl PacketCipher {
         let aad = packet_aad(self.direction, self.lane, sequence_bytes);
         let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
             .map_err(|_| CryptoError::BackendFailure)?;
-        let encrypted = cipher
-            .encrypt(
-                (&nonce).into(),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
+        let mut packet = PrefixedBuffer::new(&sequence_bytes, plaintext, PACKET_TAG_BYTES);
+        cipher
+            .encrypt_in_place((&nonce).into(), &aad, &mut packet)
             .map_err(|_| CryptoError::BackendFailure)?;
-        let mut packet = Vec::with_capacity(PACKET_SEQUENCE_BYTES + encrypted.len());
-        packet.extend_from_slice(&sequence_bytes);
-        packet.extend_from_slice(&encrypted);
-        Ok(packet)
+        Ok(packet.into_inner())
     }
 
     fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
