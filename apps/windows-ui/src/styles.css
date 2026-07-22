@@ -3321,6 +3321,9 @@ select:focus-visible {
 }
 
 .remote-viewport[data-scale-mode="fit"] .remote-canvas {
+  /* Fit mode must fill a high-DPI/fullscreen viewport. object-fit keeps the
+     remote aspect ratio inside the box; the 1:1 mode below is the explicit
+     path for users who need native source pixels without upscaling. */
   width: 100%;
   max-width: none;
   height: 100%;
@@ -3335,6 +3338,10 @@ select:focus-visible {
   overscroll-behavior: contain;
   scrollbar-color: oklch(0.43 0.012 250) oklch(0.17 0.012 250);
   scrollbar-width: thin;
+}
+
+.remote-viewport[data-scale-mode="actual"][data-canvas-fits="true"] {
+  place-items: center;
 }
 
 .remote-viewport[data-scale-mode="actual"] .remote-canvas {
@@ -4406,5 +4413,616 @@ html[data-remote-fullscreen="true"] .remote-text-entry {
   .host-dock-light,
   .feedback-symbol {
     forced-color-adjust: none;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   DeskLink editorial system
+
+   The control surface borrows the supplied reference boards' visual grammar:
+   warm paper, ink-black type, blueprint blue actions, mono metadata, hairline
+   rules and numbered blocks. Keep the remote desktop surface dark and focused;
+   this layer styles the surrounding Windows workflow without changing markup
+   contracts or interaction selectors.
+   ------------------------------------------------------------------------- */
+:root {
+  --background: #f3f2ee;
+  --surface: #fffefa;
+  --surface-subtle: #efeee9;
+  --surface-quiet: #e4e3de;
+  --ink: #12130f;
+  --ink-secondary: #343630;
+  --ink-muted: #656760;
+  --border: #d4d3cd;
+  --border-strong: #969890;
+  --primary: #0c38b5;
+  --primary-hover: #082d98;
+  --primary-pressed: #062578;
+  --on-primary: #fffefa;
+  --focus: #0c38b5;
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --transition: 140ms ease-out;
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--background);
+}
+
+body {
+  background: var(--background);
+}
+
+.app-shell {
+  background: var(--background);
+}
+
+.titlebar {
+  min-height: 52px;
+  background: var(--background);
+  border-color: var(--border);
+}
+
+.titlebar .product-lockup {
+  gap: 9px;
+  padding-left: clamp(18px, 6vw, 80px);
+}
+
+.titlebar .product-mark {
+  width: 23px;
+  height: 23px;
+  padding: 4px;
+  border-radius: 0;
+  background: var(--primary);
+  color: var(--on-primary);
+}
+
+.titlebar .product-lockup strong {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.section-nav {
+  align-items: center;
+  min-height: 56px;
+  gap: clamp(16px, 2.5vw, 32px);
+  padding: 0 clamp(18px, 6vw, 80px);
+  background: transparent;
+  border-color: var(--border);
+}
+
+.nav-collection,
+.editorial-kicker,
+.card-index,
+.remote-toolbar-status small,
+.saved-device-kind,
+.storage-note,
+.page-actions,
+.connection-progress-kicker {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.nav-collection {
+  flex: 0 0 auto;
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.nav-item {
+  height: 56px;
+  padding: 0 1px;
+  color: var(--ink-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.nav-item:hover,
+.nav-item--active {
+  color: var(--primary);
+}
+
+.nav-item--active::after {
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 3px;
+  border-radius: 0;
+  background: var(--primary);
+}
+
+.nav-utility {
+  color: var(--ink-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.workspace {
+  padding: clamp(28px, 5vw, 64px) clamp(18px, 6vw, 80px) 72px;
+  background: var(--background);
+}
+
+.workspace--controller {
+  overflow: auto;
+}
+
+.control-workspace,
+.controller-stack {
+  width: min(100%, 1180px);
+}
+
+.controller-heading {
+  align-items: flex-end;
+  margin-bottom: 30px;
+  padding-bottom: 23px;
+  border-bottom: 1px solid var(--border);
+}
+
+.controller-heading-copy {
+  min-width: 0;
+}
+
+.editorial-kicker {
+  display: block;
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.controller-heading h1,
+.page-heading h1,
+.about-hero h1 {
+  margin: 13px 0 0;
+  color: var(--ink);
+  font-size: clamp(42px, 6vw, 66px);
+  font-weight: 300;
+  letter-spacing: -0.065em;
+  line-height: 0.98;
+}
+
+.controller-heading p,
+.page-heading p {
+  max-width: 54ch;
+  margin-top: 15px;
+  color: var(--ink-secondary);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.controller-runtime {
+  width: auto;
+  min-width: 210px;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--surface);
+}
+
+.controller-connect-layout {
+  grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+  gap: 2px;
+  padding: 1px;
+  border: 1px solid var(--border);
+  background: var(--border);
+}
+
+.controller-connect-column {
+  background: var(--surface);
+}
+
+.controller-card,
+.saved-devices-panel {
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.controller-card--manual {
+  position: relative;
+  padding: 28px 30px 30px;
+  border-top: 0;
+}
+
+.controller-card--manual::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 7px;
+  background: var(--primary);
+  content: "";
+}
+
+.controller-card-heading {
+  align-items: flex-start;
+}
+
+.card-index {
+  display: block;
+  margin-bottom: 15px;
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.controller-card-heading h2,
+.saved-devices-heading h2,
+.section-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 24px;
+  font-weight: 400;
+  letter-spacing: -0.035em;
+}
+
+.controller-card-heading p,
+.saved-devices-heading p {
+  max-width: 38ch;
+  margin-top: 9px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.controller-device-form {
+  gap: 10px;
+  margin-top: 26px;
+}
+
+.field > span,
+.field > label,
+.connection-form .field > label {
+  color: var(--ink-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.controller-form .field .device-id-input,
+.controller-form .field .temporary-password-input,
+.connection-form input,
+.connection-form select,
+.settings-group input:not([type="checkbox"]),
+.settings-group select {
+  min-height: 48px;
+  border: 1px solid var(--border-strong);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.settings-group input[type="checkbox"] {
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.controller-form .field .device-id-input:focus,
+.controller-form .field .temporary-password-input:focus,
+.connection-form input:focus,
+.connection-form select:focus {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.controller-form .field .device-id-input,
+.controller-form .field .temporary-password-input {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 0.12em;
+}
+
+.controller-form-actions {
+  align-items: center;
+  padding-top: 9px;
+}
+
+.controller-form-actions > span {
+  color: var(--ink-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.controller-privacy-note {
+  color: var(--ink-muted);
+}
+
+.button,
+.toolbar-button {
+  min-height: 40px;
+  border-radius: 0;
+  border-width: 1px;
+  box-shadow: none;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+}
+
+.button--primary {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--on-primary);
+}
+
+.button--primary:hover:not(:disabled),
+.button--primary:focus-visible:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
+}
+
+.button--secondary {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-secondary);
+}
+
+.button--secondary:hover:not(:disabled) {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.saved-devices-panel {
+  min-height: 100%;
+  padding: 28px 30px 30px;
+}
+
+.saved-devices-heading {
+  display: block;
+  padding-bottom: 21px;
+  border-bottom: 1px solid var(--border);
+}
+
+.saved-devices-heading .editorial-kicker {
+  margin-bottom: 15px;
+}
+
+.saved-device-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  padding-top: 2px;
+  background: var(--border);
+}
+
+.saved-device-row {
+  position: relative;
+  display: grid;
+  min-height: 168px;
+  grid-template-rows: auto 1fr auto;
+  gap: 16px;
+  padding: 22px;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface-subtle);
+}
+
+.saved-device-row::before {
+  color: var(--primary);
+  content: counter(saved-device, decimal-leading-zero);
+  counter-increment: saved-device;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+}
+
+.saved-device-list {
+  counter-reset: saved-device;
+}
+
+.saved-device-identity {
+  display: block;
+}
+
+.saved-device-identity strong {
+  display: block;
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+
+.saved-device-kind {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 4px 6px;
+  border-radius: 0;
+  background: var(--primary);
+  color: var(--on-primary);
+  font-size: 9px;
+}
+
+.saved-device-identity small {
+  display: block;
+  margin-top: 11px;
+  color: var(--ink-muted);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.saved-device-identity strong,
+.controller-card-heading h2,
+.controller-card-heading p,
+.saved-devices-heading h2,
+.saved-devices-heading p,
+.connection-progress-guidance,
+.settings-row-copy,
+.settings-inline-action > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.saved-device-actions {
+  align-self: end;
+  justify-content: flex-start;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.saved-device-actions .button {
+  min-height: 32px;
+  padding: 0 9px;
+  font-size: 10px;
+}
+
+.saved-device-remove {
+  color: var(--ink-muted);
+  font-size: 10px;
+}
+
+.saved-devices-empty {
+  grid-column: 1 / -1;
+  min-height: 210px;
+  background: var(--surface-subtle);
+}
+
+.connection-progress,
+.connection-guidance,
+.connection-form,
+.settings-group,
+.settings-exit,
+.settings-unavailable,
+.diagnostic-summary,
+.about-hero,
+.about-details {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.page-layout {
+  width: min(100%, 1060px);
+  margin: 0 auto;
+}
+
+.page-heading {
+  align-items: flex-end;
+  padding-bottom: 23px;
+  border-bottom: 1px solid var(--border);
+}
+
+.page-heading .editorial-kicker {
+  margin-bottom: 1px;
+}
+
+.page-heading h1 {
+  margin-top: 13px;
+}
+
+.page-actions,
+.storage-note {
+  color: var(--ink-muted);
+  font-size: 9px;
+}
+
+.connection-guidance {
+  border: 1px solid var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--surface));
+}
+
+.connection-form {
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.connection-progress-footer,
+.settings-row,
+.settings-inline-action {
+  flex-wrap: wrap;
+}
+
+.settings-row-copy {
+  flex: 1 1 260px;
+}
+
+.about-hero {
+  align-items: end;
+  padding: 28px 0 24px;
+}
+
+.about-mark {
+  border-radius: 0;
+  background: var(--primary);
+  color: var(--on-primary);
+}
+
+@media (max-width: 860px) {
+  .controller-connect-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .saved-device-list {
+    grid-template-columns: 1fr;
+  }
+
+  .saved-devices-empty {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 640px) {
+  .nav-collection {
+    display: none;
+  }
+
+  .section-nav {
+    gap: 14px;
+    padding-right: 18px;
+    padding-left: 18px;
+  }
+
+  .workspace {
+    padding-top: 30px;
+  }
+
+  .controller-heading,
+  .page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .controller-heading h1,
+  .page-heading h1,
+  .about-hero h1 {
+    font-size: clamp(38px, 13vw, 56px);
+  }
+
+  .controller-runtime {
+    width: 100%;
+  }
+
+  .controller-card--manual,
+  .saved-devices-panel {
+    padding: 24px 20px;
+  }
+}
+
+@media (forced-colors: active) {
+  .nav-collection,
+  .editorial-kicker,
+  .card-index {
+    color: LinkText;
+  }
+
+  .controller-card--manual::before {
+    background: Highlight;
   }
 }

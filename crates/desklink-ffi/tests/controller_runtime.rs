@@ -6,10 +6,10 @@ use desklink_crypto::{
 use desklink_ffi::{ControllerEvent, ControllerRuntime};
 use desklink_protocol::{
     AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioCodec, AudioPacket, Codec, ControlMessage,
-    CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEvent, NoiseHandshake,
-    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control, decode_input,
-    decode_noise_handshake, encode_audio_packet, encode_control, encode_cursor_update,
-    encode_noise_handshake, encode_video_config, encode_video_packet,
+    CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent,
+    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
+    decode_input, decode_noise_handshake, encode_audio_packet, encode_control,
+    encode_cursor_update, encode_noise_handshake, encode_video_config, encode_video_packet,
 };
 use desklink_relay::{RelayConfig, RelayServer};
 use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
@@ -275,6 +275,7 @@ async fn run_fake_host(
             platform: Platform::Windows,
             role: DeviceRole::Host,
             codecs: vec![Codec::H264],
+            h264_profiles: vec![H264Profile::Main],
             width: 1280,
             height: 720,
         }),
@@ -398,6 +399,7 @@ async fn run_reference_gap_host(
             platform: Platform::Windows,
             role: DeviceRole::Host,
             codecs: vec![Codec::H264],
+            h264_profiles: vec![H264Profile::Main],
             width: 1280,
             height: 720,
         }),

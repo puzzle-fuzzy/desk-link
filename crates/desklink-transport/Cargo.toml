@@ -9,10 +9,13 @@ license.workspace = true
 bytes.workspace = true
 desklink-crypto.workspace = true
 desklink-protocol.workspace = true
+rcgen.workspace = true
 quinn.workspace = true
+rand_core.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+rand_chacha = "0.3"
 rcgen.workspace = true

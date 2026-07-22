@@ -435,6 +435,29 @@ fn secure_session_isolates_lanes_and_accepts_datagram_reordering() {
 }
 
 #[test]
+fn secure_session_video_path_binding_is_shared_and_session_specific() {
+    let (initiator, responder) = connected_transport();
+    let initiator_binding = initiator
+        .into_secure_session(SecureRole::Initiator)
+        .video_path_binding();
+    let responder_binding = responder
+        .into_secure_session(SecureRole::Responder)
+        .video_path_binding();
+
+    assert_eq!(initiator_binding, responder_binding);
+    assert_ne!(initiator_binding, [0; 16]);
+
+    let (next_initiator, next_responder) = connected_transport();
+    let next_binding = next_initiator
+        .into_secure_session(SecureRole::Initiator)
+        .video_path_binding();
+    let _ = next_responder
+        .into_secure_session(SecureRole::Responder)
+        .video_path_binding();
+    assert_ne!(initiator_binding, next_binding);
+}
+
+#[test]
 fn secure_session_rejects_replay_tampering_and_wrong_lane() {
     let (initiator, responder) = connected_transport();
     let mut initiator = initiator.into_secure_session(SecureRole::Initiator);

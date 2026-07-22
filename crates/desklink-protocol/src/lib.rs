@@ -8,9 +8,15 @@ pub use codec::{
     encode_video_config, encode_video_header, encode_video_packet, encode_video_packet_parts,
 };
 use serde::{Deserialize, Serialize};
-use std::ops::{BitOr, BitOrAssign};
+use std::{
+    net::{IpAddr, SocketAddr},
+    ops::{BitOr, BitOrAssign},
+};
 
-pub const PROTOCOL_VERSION: u16 = 9;
+/// Protocol 12 is the active development wire. The project has not shipped to
+/// end users, so development binaries move together instead of carrying a
+/// legacy protocol compatibility layer.
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_NOISE_HANDSHAKE_BYTES: usize = 4 * 1024;
 pub const MAX_VIDEO_CONFIG_BYTES: usize = 16 * 1024;
@@ -38,8 +44,17 @@ pub const MAX_VIDEO_PACKET_BYTES: usize = 1200;
 /// Conservative H.264 chunk size that leaves room for the versioned packet header.
 pub const MAX_VIDEO_PACKET_PAYLOAD_BYTES: usize = 1024;
 pub const MAX_DATAGRAM_PAYLOAD_BYTES: u32 = MAX_VIDEO_PACKET_PAYLOAD_BYTES as u32;
-pub const MAX_MVP_WIDTH: u16 = 1920;
-pub const MAX_MVP_HEIGHT: u16 = 1080;
+pub const MAX_MVP_WIDTH: u16 = 2560;
+pub const MAX_MVP_HEIGHT: u16 = 1440;
+/// Upper bound used only by the offline 4K experiment budget calculator. The
+/// live MVP validator intentionally remains at 2560×1440 until a reliable
+/// direct/LAN transport and frame-recovery policy is available.
+pub const MAX_EXPERIMENTAL_4K_WIDTH: u16 = 3840;
+pub const MAX_EXPERIMENTAL_4K_HEIGHT: u16 = 2160;
+/// Direct-LAN candidates are intentionally short-lived. This is a policy
+/// bound for the future authenticated exchange, not permission to expose a
+/// listening socket today.
+pub const MAX_DIRECT_LAN_CANDIDATE_TTL_S: u16 = 10;
 /// Maximum H.264 datagrams in one frame; bounds per-frame assembly memory while
 /// allowing 4 MiB of encoded data at the 1024-byte MVP chunk size.
 pub const MAX_VIDEO_CHUNKS: u16 = 4096;
@@ -47,6 +62,144 @@ pub const MAX_INPUT_AGE_US: u64 = 5_000_000;
 pub const MAX_INPUT_FUTURE_SKEW_US: u64 = 1_000_000;
 pub const MAX_POINTER_COORDINATE: i32 = 1_000_000;
 pub const MAX_WHEEL_DELTA: i32 = 1_200;
+
+/// Wire and capture cost estimate for a candidate desktop video mode. This is
+/// deliberately a plain measurement type, not a negotiated protocol message.
+/// It lets release checks compare 2560×1440 and 4K without enabling 4K in the
+/// default relay path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoFrameBudget {
+    pub width: u32,
+    pub height: u32,
+    pub bitrate_bps: u32,
+    pub fps: u32,
+    pub average_frame_bytes: u64,
+    pub nv12_frame_bytes: u64,
+    pub packet_count: u16,
+    pub fits_current_datagram_budget: bool,
+}
+
+impl VideoFrameBudget {
+    pub fn estimate(width: u32, height: u32, bitrate_bps: u32, fps: u32) -> Option<Self> {
+        if width == 0 || height == 0 || bitrate_bps == 0 || fps == 0 {
+            return None;
+        }
+        let average_frame_bytes = u64::from(bitrate_bps).div_ceil(8).div_ceil(u64::from(fps));
+        let nv12_frame_bytes = u64::from(width)
+            .checked_mul(u64::from(height))?
+            .checked_mul(3)?
+            .div_ceil(2);
+        let packet_count = average_frame_bytes.div_ceil(MAX_VIDEO_PACKET_PAYLOAD_BYTES as u64);
+        Some(Self {
+            width,
+            height,
+            bitrate_bps,
+            fps,
+            average_frame_bytes,
+            nv12_frame_bytes,
+            packet_count: u16::try_from(packet_count).unwrap_or(u16::MAX),
+            fits_current_datagram_budget: packet_count <= u64::from(MAX_VIDEO_CHUNKS),
+        })
+    }
+}
+
+/// An authenticated LAN endpoint for the video-only data plane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectLanCandidate {
+    candidate_id: u64,
+    address: SocketAddr,
+    expires_at_unix_s: u64,
+    session_binding: [u8; 16],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DirectLanCandidateError {
+    #[error("direct candidate ID must be nonzero")]
+    InvalidId,
+    #[error("direct candidate address must be a private or loopback address")]
+    InvalidAddress,
+    #[error("direct candidate port must be nonzero")]
+    InvalidPort,
+    #[error("direct candidate session binding must be nonzero")]
+    InvalidSessionBinding,
+    #[error("direct candidate expiry is outside the allowed lifetime")]
+    InvalidExpiry,
+}
+
+impl DirectLanCandidate {
+    pub fn new(
+        candidate_id: u64,
+        address: SocketAddr,
+        expires_at_unix_s: u64,
+        session_binding: [u8; 16],
+        now_unix_s: u64,
+    ) -> Result<Self, DirectLanCandidateError> {
+        let candidate = Self {
+            candidate_id,
+            address,
+            expires_at_unix_s,
+            session_binding,
+        };
+        candidate.validate(now_unix_s, &session_binding)?;
+        Ok(candidate)
+    }
+
+    pub fn validate(
+        &self,
+        now_unix_s: u64,
+        expected_session_binding: &[u8; 16],
+    ) -> Result<(), DirectLanCandidateError> {
+        if self.candidate_id == 0 {
+            return Err(DirectLanCandidateError::InvalidId);
+        }
+        if self.address.port() == 0 {
+            return Err(DirectLanCandidateError::InvalidPort);
+        }
+        if !is_private_or_loopback_address(self.address.ip()) {
+            return Err(DirectLanCandidateError::InvalidAddress);
+        }
+        if self.session_binding == [0; 16] || &self.session_binding != expected_session_binding {
+            return Err(DirectLanCandidateError::InvalidSessionBinding);
+        }
+        let Some(lifetime) = self.expires_at_unix_s.checked_sub(now_unix_s) else {
+            return Err(DirectLanCandidateError::InvalidExpiry);
+        };
+        if lifetime == 0 || lifetime > u64::from(MAX_DIRECT_LAN_CANDIDATE_TTL_S) {
+            return Err(DirectLanCandidateError::InvalidExpiry);
+        }
+        Ok(())
+    }
+
+    pub const fn candidate_id(&self) -> u64 {
+        self.candidate_id
+    }
+
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub const fn expires_at_unix_s(&self) -> u64 {
+        self.expires_at_unix_s
+    }
+
+    pub const fn session_binding(&self) -> &[u8; 16] {
+        &self.session_binding
+    }
+}
+
+pub(crate) fn is_private_or_loopback_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_loopback()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Platform {
@@ -76,6 +229,17 @@ pub struct NoiseHandshake {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Codec {
     H264,
+}
+
+/// H.264 profiles supported by the remote decoder/encoder pair.
+///
+/// Main remains the interoperability baseline. High is an opt-in quality
+/// upgrade and must only be selected after both peers advertise it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum H264Profile {
+    Main,
+    High,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FrameFlags(pub u16);
@@ -216,6 +380,9 @@ pub enum ControlMessage {
     SetVideoQuality {
         preference: VideoQualityPreference,
     },
+    SetVideoProfile {
+        profile: H264Profile,
+    },
     VideoQualityState {
         preference: VideoQualityPreference,
         preset: VideoQualityPreset,
@@ -225,6 +392,14 @@ pub enum ControlMessage {
         dropped_packets: u32,
         decode_queue_peak: u16,
         freshness_recoveries: u16,
+    },
+    VideoPathCandidateOffer {
+        candidate: DirectLanCandidate,
+    },
+    VideoPathCandidateAnswer {
+        candidate_id: u64,
+        accepted: bool,
+        candidate: Option<DirectLanCandidate>,
     },
 }
 
@@ -402,6 +577,7 @@ pub struct DeviceCapabilities {
     pub platform: Platform,
     pub role: DeviceRole,
     pub codecs: Vec<Codec>,
+    pub h264_profiles: Vec<H264Profile>,
     pub width: u16,
     pub height: u16,
 }
@@ -413,10 +589,16 @@ impl DeviceCapabilities {
             || self.height > MAX_MVP_HEIGHT
             || self.codecs.is_empty()
             || !self.codecs.iter().all(|codec| matches!(codec, Codec::H264))
+            || self.h264_profiles.is_empty()
+            || !self.h264_profiles.contains(&H264Profile::Main)
         {
             return Err(codec::ProtocolError::InvalidCapabilities);
         }
         Ok(())
+    }
+
+    pub fn supports_h264_profile(&self, profile: H264Profile) -> bool {
+        self.codecs.contains(&Codec::H264) && self.h264_profiles.contains(&profile)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

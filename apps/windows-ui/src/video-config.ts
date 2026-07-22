@@ -1,4 +1,4 @@
-import type { ControllerVideoConfigSignal } from "./types";
+import type { ControllerVideoConfigSignal, H264Profile } from "./types";
 
 export function videoConfigKey(
   config: Pick<ControllerVideoConfigSignal, "streamId" | "configVersion">,
@@ -25,6 +25,10 @@ export function h264CodecFromSequenceHeader(header: Uint8Array): string {
     }
   }
   return "avc1.42E01E";
+}
+
+export function h264ProfileFromCodec(codec: string): H264Profile {
+  return codec.toLowerCase().startsWith("avc1.64") ? "high" : "main";
 }
 
 function hexByte(value: number): string {

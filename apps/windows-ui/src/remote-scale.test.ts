@@ -3,10 +3,24 @@ import { describe, expect, test } from "bun:test";
 import {
   REMOTE_SCALE_STORAGE_KEY,
   loadRemoteScaleMode,
+  nativeCanvasCssSize,
   normalizeRemoteScaleMode,
   saveRemoteScaleMode,
   type RemoteScaleStorage,
 } from "./remote-scale";
+
+describe("远程画面原始像素尺寸", () => {
+  test("按 Windows 显示缩放比例换算 CSS 尺寸", () => {
+    expect(nativeCanvasCssSize(1920, 1)).toBe(1920);
+    expect(nativeCanvasCssSize(1920, 1.25)).toBe(1536);
+  });
+
+  test("对无效显示缩放比例安全回退", () => {
+    expect(nativeCanvasCssSize(1920, 0)).toBe(1920);
+    expect(nativeCanvasCssSize(1920, Number.NaN)).toBe(1920);
+    expect(nativeCanvasCssSize(0, 1.25)).toBe(0);
+  });
+});
 
 function memoryStorage(initial: string | null = null): RemoteScaleStorage & { value: string | null } {
   return {

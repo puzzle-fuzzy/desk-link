@@ -37,6 +37,16 @@ const ALLOWED_EVENT_FIELDS = new Set([
   "decoder_recoveries",
   "video_pull_failures",
   "first_frame_ms",
+  "video_width",
+  "video_height",
+  "video_path",
+  "displayed_fps_x100",
+  "max_frame_gap_ms",
+  "coalesced_frame_drops",
+  "h264_profile",
+  "profile_probe",
+  "profile_probe_ms",
+  "profile_fallback_reason",
 ]);
 
 export interface DiagnosticEvent {

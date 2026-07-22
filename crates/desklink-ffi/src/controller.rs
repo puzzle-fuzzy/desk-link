@@ -11,18 +11,30 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioPacket, Codec, ControlMessage, CursorUpdate, DeviceCapabilities,
-    DeviceRole, InputEnvelope, InputEvent, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION,
-    Platform, ProtocolError, TransferMessage, VideoConfig, VideoQualityPreference,
-    decode_audio_packet, decode_control, decode_cursor_update, decode_noise_handshake,
-    decode_transfer, decode_video_config, decode_video_packet, encode_control, encode_input,
-    encode_noise_handshake, encode_transfer,
+    DeviceRole, DirectLanCandidate, H264Profile, InputEnvelope, InputEvent, NoiseHandshake,
+    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage, VideoConfig,
+    VideoQualityPreference, decode_audio_packet, decode_control, decode_cursor_update,
+    decode_noise_handshake, decode_transfer, decode_video_config, decode_video_packet,
+    encode_control, encode_input, encode_noise_handshake, encode_transfer,
 };
 use desklink_session::InputSequencer;
-use desklink_transport::{QuicClient, TransportError, TransportEvent};
+use desklink_transport::{
+    DirectLanConnection, DirectLanEndpoint, DirectLanProbeResult, DirectLanSession,
+    DirectVideoPathAction, DirectVideoPathEvent, DirectVideoPathMachine, DirectVideoPathState,
+    QuicClient, TransportError, TransportEvent, VideoPathKind, VideoPathQuality,
+};
 use desklink_video::{
     AssembleResult, EncodedFrame, FrameAssembler, VideoContinuity, VideoContinuityAction,
 };
 use ed25519_dalek::VerifyingKey;
+use rand_core::{OsRng, RngCore};
+
+fn supported_h264_profiles(platform: Platform) -> Vec<H264Profile> {
+    match platform {
+        Platform::Windows => vec![H264Profile::Main, H264Profile::High],
+        _ => vec![H264Profile::Main],
+    }
+}
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -104,6 +116,9 @@ pub struct ControllerRuntime {
     metrics: AtomicControllerMetrics,
     keyframe_needed_after_config: bool,
     video_continuity: VideoContinuity,
+    video_path: DirectVideoPathMachine,
+    direct_session: Option<DirectLanSession>,
+    direct_connection: Option<Arc<DirectLanConnection>>,
 }
 
 #[derive(Clone)]
@@ -153,6 +168,44 @@ impl ControllerRuntime {
         ));
         on_encrypted();
         negotiate_host(&client, &secure, platform).await?;
+        let video_path_binding = secure.lock().await.video_path_binding();
+        let mut video_path = DirectVideoPathMachine::new(video_path_binding);
+        let direct_session = if platform == Platform::Windows {
+            video_path = video_path.with_direct_probe();
+            let candidate_id = next_direct_candidate_id();
+            match DirectLanSession::bind_for_client(
+                "0.0.0.0:0".parse().expect("valid wildcard bind address"),
+                &client,
+                candidate_id,
+                video_path_binding,
+                now_unix_s(),
+            ) {
+                Ok(session) => {
+                    let actions = video_path.apply(DirectVideoPathEvent::StartOffer {
+                        candidate: session.candidate().clone(),
+                        now_unix_s: now_unix_s(),
+                    });
+                    let mut sent = false;
+                    for action in actions {
+                        if let DirectVideoPathAction::SendOffer(candidate) = action
+                            && send_control(
+                                &client,
+                                &secure,
+                                &ControlMessage::VideoPathCandidateOffer { candidate },
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            sent = true;
+                        }
+                    }
+                    sent.then_some(session)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         Ok(Self {
             client,
             secure,
@@ -163,7 +216,33 @@ impl ControllerRuntime {
             metrics: AtomicControllerMetrics::default(),
             keyframe_needed_after_config: false,
             video_continuity: VideoContinuity::default(),
+            video_path,
+            direct_session,
+            direct_connection: None,
         })
+    }
+
+    pub fn video_path_state(&self) -> DirectVideoPathState {
+        self.video_path.state().clone()
+    }
+
+    /// Reports the path currently carrying video datagrams. The authenticated
+    /// direct connection wins over the negotiation state because the responder
+    /// may establish the QUIC data path before the control answer is observed.
+    pub fn video_path_kind(&self) -> VideoPathKind {
+        if self.direct_connection.is_some()
+            || matches!(self.video_path.state(), DirectVideoPathState::Direct { .. })
+        {
+            VideoPathKind::DirectLan
+        } else {
+            VideoPathKind::Relay
+        }
+    }
+
+    pub fn direct_candidate(&self) -> Option<&DirectLanCandidate> {
+        self.direct_session
+            .as_ref()
+            .map(DirectLanSession::candidate)
     }
 
     pub fn metrics(&self) -> ControllerMetrics {
@@ -220,6 +299,13 @@ impl ControllerRuntime {
         Ok(())
     }
 
+    pub async fn set_video_profile(&self, profile: H264Profile) -> Result<(), ControllerError> {
+        let plaintext = encode_control(&ControlMessage::SetVideoProfile { profile })?;
+        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
+        self.client.send_control(ciphertext).await?;
+        Ok(())
+    }
+
     pub async fn report_video_network_feedback(
         &self,
         received_packets: u32,
@@ -251,12 +337,37 @@ impl ControllerRuntime {
 
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
         loop {
-            match self.client.next_event().await? {
+            match self.next_transport_event().await? {
                 TransportEvent::Control(ciphertext) => {
                     let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
                     let message = decode_control(&plaintext)?;
                     if let ControlMessage::AccessDenied { reason } = message {
                         return Err(ControllerError::AccessDenied(reason));
+                    }
+                    if let ControlMessage::VideoPathCandidateOffer { candidate } = message {
+                        let local_candidate = self.direct_candidate().cloned();
+                        let actions = self.video_path.apply(DirectVideoPathEvent::ReceiveOffer {
+                            candidate,
+                            local_candidate,
+                            now_unix_s: now_unix_s(),
+                        });
+                        self.apply_video_path_actions(actions).await?;
+                        continue;
+                    }
+                    if let ControlMessage::VideoPathCandidateAnswer {
+                        candidate_id,
+                        accepted,
+                        candidate,
+                    } = message
+                    {
+                        let actions = self.video_path.apply(DirectVideoPathEvent::ReceiveAnswer {
+                            candidate_id,
+                            accepted,
+                            candidate,
+                            now_unix_s: now_unix_s(),
+                        });
+                        self.apply_video_path_actions(actions).await?;
+                        continue;
                     }
                     return Ok(ControllerEvent::Control(message));
                 }
@@ -396,6 +507,169 @@ impl ControllerRuntime {
         }
     }
 
+    async fn next_transport_event(&mut self) -> Result<TransportEvent, ControllerError> {
+        loop {
+            if let Some(connection) = self.direct_connection.clone() {
+                tokio::select! {
+                    relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                        direct = connection.recv_datagram() => match direct {
+                            Ok(bytes) => return Ok(TransportEvent::VideoDatagram(bytes)),
+                            Err(_) => {
+                                self.direct_connection = None;
+                                let actions = self.video_path.apply(DirectVideoPathEvent::Stop);
+                                self.apply_video_path_actions(actions).await?;
+                            }
+                        },
+                }
+                continue;
+            }
+
+            let Some(session) = self.direct_session.as_ref() else {
+                return self
+                    .client
+                    .next_event()
+                    .await
+                    .map_err(ControllerError::from);
+            };
+            let endpoint = session.endpoint();
+            let expected_candidate_id = session.candidate().candidate_id();
+            let expected_binding = *session.session_binding();
+            tokio::select! {
+                relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        self.direct_session = None;
+                        continue;
+                    };
+                    let Ok(connection) = incoming else {
+                        continue;
+                    };
+                    let accepted = {
+                        let mut secure = self.secure.lock().await;
+                        endpoint
+                            .accept_probe_connection(
+                                connection,
+                                expected_candidate_id,
+                                &expected_binding,
+                                &mut secure,
+                                now_unix_s(),
+                            )
+                            .await
+                    };
+                    if let Ok((connection, result)) = accepted {
+                        self.direct_connection = Some(Arc::new(connection));
+                        let actions = self.video_path.apply(DirectVideoPathEvent::ProbeSucceeded {
+                            candidate_id: self.probe_candidate_id(result.candidate_id),
+                            quality: VideoPathQuality {
+                                kind: VideoPathKind::DirectLan,
+                                rtt_ms: result.rtt_ms,
+                                // The handshake measures RTT only. Until the
+                                // video datagram feedback loop supplies a real
+                                // loss sample, keep the 4K gate closed.
+                                loss_basis_points: u16::MAX,
+                            },
+                        });
+                        self.apply_video_path_actions(actions).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn apply_video_path_actions(
+        &mut self,
+        actions: Vec<DirectVideoPathAction>,
+    ) -> Result<(), ControllerError> {
+        let mut pending: Vec<_> = actions.into_iter().rev().collect();
+        while let Some(action) = pending.pop() {
+            match action {
+                DirectVideoPathAction::SendOffer(candidate) => {
+                    send_control(
+                        &self.client,
+                        &self.secure,
+                        &ControlMessage::VideoPathCandidateOffer { candidate },
+                    )
+                    .await?;
+                }
+                DirectVideoPathAction::SendAnswer {
+                    candidate_id,
+                    accepted,
+                    candidate,
+                } => {
+                    send_control(
+                        &self.client,
+                        &self.secure,
+                        &ControlMessage::VideoPathCandidateAnswer {
+                            candidate_id,
+                            accepted,
+                            candidate,
+                        },
+                    )
+                    .await?;
+                }
+                DirectVideoPathAction::StartProbe { candidate, .. } => {
+                    let Some(session) = self.direct_session.as_ref() else {
+                        pending.extend(self.video_path.apply(DirectVideoPathEvent::ProbeFailed {
+                            candidate_id: candidate.candidate_id(),
+                        }));
+                        continue;
+                    };
+                    let endpoint = session.endpoint();
+                    let own_candidate_id = session.candidate().candidate_id();
+                    let binding = *session.session_binding();
+                    let result = connect_or_accept_direct(
+                        endpoint,
+                        candidate.clone(),
+                        own_candidate_id,
+                        binding,
+                        self.secure.clone(),
+                    )
+                    .await;
+                    match result {
+                        Ok((connection, probe)) => {
+                            self.direct_connection = Some(Arc::new(connection));
+                            pending.extend(self.video_path.apply(
+                                DirectVideoPathEvent::ProbeSucceeded {
+                                    candidate_id: self.probe_candidate_id(probe.candidate_id),
+                                    quality: VideoPathQuality {
+                                        kind: VideoPathKind::DirectLan,
+                                        rtt_ms: probe.rtt_ms,
+                                        // A successful probe does not prove
+                                        // that the video path has acceptable
+                                        // packet loss for experimental 4K.
+                                        loss_basis_points: u16::MAX,
+                                    },
+                                },
+                            ));
+                        }
+                        Err(_) => {
+                            pending.extend(self.video_path.apply(
+                                DirectVideoPathEvent::ProbeFailed {
+                                    candidate_id: candidate.candidate_id(),
+                                },
+                            ));
+                        }
+                    }
+                }
+                DirectVideoPathAction::ActivateDirect { .. } => {}
+                DirectVideoPathAction::UseRelay { .. } => {
+                    if let Some(connection) = self.direct_connection.take() {
+                        connection.close(b"desklink direct video fallback");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_candidate_id(&self, fallback: u64) -> u64 {
+        match self.video_path.state() {
+            DirectVideoPathState::Offering { candidate }
+            | DirectVideoPathState::Probing { candidate, .. } => candidate.candidate_id(),
+            _ => fallback,
+        }
+    }
+
     async fn request_keyframe_for(&self, stream_id: u64) -> Result<(), ControllerError> {
         let plaintext = encode_control(&ControlMessage::RequestKeyframe { stream_id })?;
         let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
@@ -408,6 +682,53 @@ impl ControllerRuntime {
             .dropped_video_packets
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+async fn connect_or_accept_direct(
+    endpoint: Arc<DirectLanEndpoint>,
+    candidate: DirectLanCandidate,
+    own_candidate_id: u64,
+    binding: [u8; 16],
+    secure: Arc<Mutex<SecureSession>>,
+) -> Result<(DirectLanConnection, DirectLanProbeResult), ()> {
+    // Both Windows peers advertise a candidate and the host normally
+    // initiates the QUIC probe. Give an incoming probe a short grace window
+    // first; holding the shared Noise session while an outgoing QUIC connect
+    // waits would otherwise starve the responder and create a false timeout.
+    let accept_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        let remaining = accept_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let incoming = match tokio::time::timeout(remaining, endpoint.accept()).await {
+            Ok(Some(incoming)) => incoming,
+            Ok(None) | Err(_) => break,
+        };
+        let Ok(connection) = incoming else {
+            continue;
+        };
+        let mut secure = secure.lock().await;
+        match endpoint
+            .accept_probe_connection(
+                connection,
+                own_candidate_id,
+                &binding,
+                &mut secure,
+                now_unix_s(),
+            )
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(_) => continue,
+        }
+    }
+
+    let mut secure = secure.lock().await;
+    endpoint
+        .connect(&candidate, &binding, &mut secure, now_unix_s())
+        .await
+        .map_err(|_| ())
 }
 
 async fn perform_noise_handshake(
@@ -466,6 +787,7 @@ async fn negotiate_host(
             platform,
             role: DeviceRole::Controller,
             codecs: vec![Codec::H264],
+            h264_profiles: supported_h264_profiles(platform),
             width: 1920,
             height: 1080,
         }),
@@ -485,7 +807,7 @@ async fn negotiate_host(
                 ControlMessage::Capabilities(capabilities)
                     if received_host_hello
                         && capabilities.role == DeviceRole::Host
-                        && capabilities.codecs.contains(&Codec::H264) =>
+                        && capabilities.supports_h264_profile(H264Profile::Main) =>
                 {
                     return Ok(());
                 }
@@ -502,8 +824,11 @@ async fn negotiate_host(
                 | ControlMessage::SetAudioEnabled { .. }
                 | ControlMessage::AudioState { .. }
                 | ControlMessage::SetVideoQuality { .. }
+                | ControlMessage::SetVideoProfile { .. }
                 | ControlMessage::VideoQualityState { .. }
-                | ControlMessage::VideoNetworkFeedback { .. } => {}
+                | ControlMessage::VideoNetworkFeedback { .. }
+                | ControlMessage::VideoPathCandidateOffer { .. }
+                | ControlMessage::VideoPathCandidateAnswer { .. } => {}
             }
         }
     };
@@ -549,4 +874,110 @@ fn now_micros() -> u64 {
                 .saturating_mul(1_000_000)
                 .saturating_add(u64::from(duration.subsec_micros()))
         })
+}
+
+fn now_unix_s() -> u64 {
+    now_micros() / 1_000_000
+}
+
+fn next_direct_candidate_id() -> u64 {
+    let mut candidate_id = 0_u64;
+    while candidate_id == 0 {
+        candidate_id = OsRng.next_u64();
+    }
+    candidate_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
+    use desklink_protocol::DirectLanCandidate;
+    use rand_core::OsRng;
+
+    #[tokio::test]
+    async fn direct_probe_accepts_peer_initiated_connection_without_blocking() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let binding = [31; 16];
+        let now = now_unix_s();
+        let controller_endpoint =
+            Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let peer_endpoint =
+            Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let controller_candidate = DirectLanCandidate::new(
+            2,
+            controller_endpoint.local_addr().unwrap(),
+            now + 10,
+            binding,
+            now,
+        )
+        .unwrap();
+        let unused_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let peer_candidate =
+            DirectLanCandidate::new(1, unused_port, now + 10, binding, now).unwrap();
+        let (mut peer_secure, controller_secure) = connected_secure_sessions();
+        let controller_secure = Arc::new(Mutex::new(controller_secure));
+        let controller_candidate_for_peer = controller_candidate.clone();
+        let controller_candidate_id = controller_candidate.candidate_id();
+        let peer_endpoint_for_task = peer_endpoint.clone();
+        let peer_task = tokio::spawn(async move {
+            peer_endpoint_for_task
+                .connect(
+                    &controller_candidate_for_peer,
+                    &binding,
+                    &mut peer_secure,
+                    now,
+                )
+                .await
+        });
+
+        let (connection, result) = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_or_accept_direct(
+                controller_endpoint.clone(),
+                peer_candidate,
+                controller_candidate_id,
+                binding,
+                controller_secure,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (peer_connection, _) = peer_task.await.unwrap().unwrap();
+        assert_eq!(result.candidate_id, controller_candidate_id);
+        peer_connection.send_datagram(vec![4, 5, 6]).unwrap();
+        let datagram = tokio::time::timeout(Duration::from_secs(1), connection.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(datagram, vec![4, 5, 6]);
+    }
+
+    fn connected_secure_sessions() -> (SecureSession, SecureSession) {
+        let mut rng = OsRng;
+        let initiator_identity = DeviceIdentity::generate(&mut rng);
+        let responder_identity = DeviceIdentity::generate(&mut rng);
+        let initiator_verify_key = initiator_identity.verify_key();
+        let responder_verify_key = responder_identity.verify_key();
+        let (mut initiator, message_1) =
+            NoiseInitiator::start(initiator_identity, responder_verify_key).unwrap();
+        let (mut responder, message_2) =
+            NoiseResponder::accept(&message_1, responder_identity, initiator_verify_key).unwrap();
+        let message_3 = initiator.receive(&message_2).unwrap();
+        responder.receive(&message_3).unwrap();
+        (
+            initiator
+                .finish()
+                .unwrap()
+                .into_secure_session(SecureRole::Initiator),
+            responder
+                .finish()
+                .unwrap()
+                .into_secure_session(SecureRole::Responder),
+        )
+    }
 }

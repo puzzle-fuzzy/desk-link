@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "desklink-installer"
-version = "0.1.83"
+version = "0.1.91"
 dependencies = [
  "embed-resource",
  "windows",
@@ -965,6 +965,8 @@ dependencies = [
  "desklink-crypto",
  "desklink-protocol",
  "quinn",
+ "rand_chacha",
+ "rand_core 0.6.4",
  "rcgen",
  "rustls",
  "thiserror 2.0.18",
@@ -980,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "desklink-windows"
-version = "0.1.83"
+version = "0.1.91"
 dependencies = [
  "blake2 0.10.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "desklink-crypto",
@@ -1007,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "desklink-windows-ui"
-version = "0.1.83"
+version = "0.1.91"
 dependencies = [
  "blake2 0.10.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",

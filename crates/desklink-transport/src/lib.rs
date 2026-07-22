@@ -4,9 +4,25 @@ use desklink_crypto::SessionId;
 use desklink_protocol::{DeviceRole, PROTOCOL_VERSION};
 use thiserror::Error;
 
+mod direct_probe;
+mod lan_candidate;
 mod quic;
+mod video_egress;
+mod video_path;
 
+pub use direct_probe::{
+    DirectLanConnection, DirectLanEndpoint, DirectLanProbeError, DirectLanProbeResult,
+    DirectLanSession,
+};
+pub use lan_candidate::{discover_local_private_address, make_local_candidate};
 pub use quic::QuicClient;
+pub use video_egress::{
+    DirectLanVideoPath, RelayVideoPath, VideoDatagramBackend, VideoDatagramRoute,
+};
+pub use video_path::{
+    DIRECT_VIDEO_PROBE_TIMEOUT_S, DirectVideoPathAction, DirectVideoPathEvent,
+    DirectVideoPathFallbackReason, DirectVideoPathMachine, DirectVideoPathState,
+};
 
 pub const MAX_RELIABLE_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_DATAGRAM_BYTES: usize = 1200;
@@ -31,6 +47,95 @@ pub const MAX_JOIN_ENVELOPE_BYTES: usize = JOIN_ENVELOPE_V2_BYTES
     + MAX_DIRECTORY_INVITATION_BYTES;
 /// Application close code used when the relay cannot admit another QUIC connection.
 pub const RELAY_CONNECTION_LIMIT_CLOSE_CODE: u32 = 0x444c_0001;
+
+/// Video path classification used by the relay and authenticated DirectLan
+/// video data planes. Keeping the classification in the transport crate
+/// prevents UI code from guessing whether a session is local.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoPathKind {
+    Relay,
+    DirectLan,
+}
+
+impl VideoPathKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::DirectLan => "directLan",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoPathQuality {
+    pub kind: VideoPathKind,
+    pub rtt_ms: u32,
+    pub loss_basis_points: u16,
+}
+
+impl VideoPathQuality {
+    /// Conservative, provisional gates for the 4K experiment. These are not
+    /// used by the default relay path and must be revalidated with measured
+    /// LAN data before exposing a user-facing switch.
+    pub const MAX_EXPERIMENTAL_4K_RTT_MS: u32 = 50;
+    pub const MAX_EXPERIMENTAL_4K_LOSS_BASIS_POINTS: u16 = 50;
+
+    /// Converts a bounded packet sample into the loss unit used by the 4K
+    /// gate. Returning `None` for an empty sample prevents a transient start
+    /// of a session from being treated as a perfect path.
+    pub fn from_packet_sample(
+        kind: VideoPathKind,
+        rtt_ms: u32,
+        received_packets: u32,
+        dropped_packets: u32,
+    ) -> Option<Self> {
+        let total = received_packets.checked_add(dropped_packets)?;
+        if total == 0 {
+            return None;
+        }
+        let loss_basis_points = (u64::from(dropped_packets) * 10_000 / u64::from(total))
+            .min(u64::from(u16::MAX)) as u16;
+        Some(Self {
+            kind,
+            rtt_ms,
+            loss_basis_points,
+        })
+    }
+
+    pub const fn allows_experimental_4k(self) -> bool {
+        matches!(self.kind, VideoPathKind::DirectLan)
+            && self.rtt_ms <= Self::MAX_EXPERIMENTAL_4K_RTT_MS
+            && self.loss_basis_points <= Self::MAX_EXPERIMENTAL_4K_LOSS_BASIS_POINTS
+    }
+}
+
+/// Result of the path selector. A direct path is only selected after it has
+/// been authenticated by the existing control session and has passed the
+/// measured quality gate; all other cases remain on the relay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoPathDecision {
+    pub kind: VideoPathKind,
+    pub allows_experimental_4k: bool,
+}
+
+impl VideoPathDecision {
+    pub const fn relay() -> Self {
+        Self {
+            kind: VideoPathKind::Relay,
+            allows_experimental_4k: false,
+        }
+    }
+
+    pub const fn select(direct_quality: Option<VideoPathQuality>) -> Self {
+        match direct_quality {
+            Some(quality) if quality.allows_experimental_4k() => Self {
+                kind: VideoPathKind::DirectLan,
+                allows_experimental_4k: true,
+            },
+            _ => Self::relay(),
+        }
+    }
+}
 
 const JOIN_MAGIC: [u8; 4] = *b"DLJ1";
 const JOIN_VERSION_V1: u8 = 1;
@@ -773,6 +878,72 @@ mod directory_version_tests {
     }
 }
 
+#[cfg(test)]
+mod video_path_policy_tests {
+    use super::{VideoPathDecision, VideoPathKind, VideoPathQuality};
+
+    #[test]
+    fn relay_never_enters_the_4k_experiment() {
+        assert!(
+            !VideoPathQuality {
+                kind: VideoPathKind::Relay,
+                rtt_ms: 1,
+                loss_basis_points: 0,
+            }
+            .allows_experimental_4k()
+        );
+    }
+
+    #[test]
+    fn direct_lan_requires_both_latency_and_loss_budget() {
+        let good = VideoPathQuality {
+            kind: VideoPathKind::DirectLan,
+            rtt_ms: VideoPathQuality::MAX_EXPERIMENTAL_4K_RTT_MS,
+            loss_basis_points: VideoPathQuality::MAX_EXPERIMENTAL_4K_LOSS_BASIS_POINTS,
+        };
+        assert!(good.allows_experimental_4k());
+        assert!(
+            !VideoPathQuality {
+                rtt_ms: good.rtt_ms + 1,
+                ..good
+            }
+            .allows_experimental_4k()
+        );
+        assert!(
+            !VideoPathQuality {
+                loss_basis_points: good.loss_basis_points + 1,
+                ..good
+            }
+            .allows_experimental_4k()
+        );
+    }
+
+    #[test]
+    fn packet_samples_use_bounded_loss_and_reject_empty_measurements() {
+        let quality = VideoPathQuality::from_packet_sample(VideoPathKind::DirectLan, 20, 99, 1)
+            .expect("non-empty packet sample");
+        assert_eq!(quality.loss_basis_points, 100);
+        assert!(VideoPathQuality::from_packet_sample(VideoPathKind::DirectLan, 20, 0, 0).is_none());
+    }
+
+    #[test]
+    fn selector_falls_back_to_relay_until_a_direct_path_passes_the_gate() {
+        assert_eq!(VideoPathDecision::select(None), VideoPathDecision::relay());
+        let quality = VideoPathQuality {
+            kind: VideoPathKind::DirectLan,
+            rtt_ms: 20,
+            loss_basis_points: 10,
+        };
+        assert_eq!(
+            VideoPathDecision::select(Some(quality)),
+            VideoPathDecision {
+                kind: VideoPathKind::DirectLan,
+                allows_experimental_4k: true,
+            }
+        );
+    }
+}
+
 impl QuicClientConfig {
     pub fn new(
         relay_addr: SocketAddr,
@@ -856,12 +1027,12 @@ impl QuicClientConfig {
 }
 
 #[derive(Debug)]
-struct LanRelayCertificateVerifier {
+pub(crate) struct LanRelayCertificateVerifier {
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl LanRelayCertificateVerifier {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }

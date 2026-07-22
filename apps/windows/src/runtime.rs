@@ -15,7 +15,7 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, Codec, ControlMessage, CursorUpdate,
-    DeviceCapabilities, DeviceRole, FrameFlags, InputEvent, MAX_INPUT_AGE_US,
+    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, MAX_INPUT_AGE_US,
     MAX_INPUT_FUTURE_SKEW_US, MAX_TRANSFER_CHUNK_BYTES, NoiseHandshake, NoiseHandshakeStep,
     PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId, TransferMessage,
     TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset, decode_control,
@@ -25,11 +25,13 @@ use desklink_protocol::{
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryRegistration, RelayJoin,
-    TransportError,
+    DirectLanConnection, DirectLanSession, DirectLanVideoPath, JoinRejectCode, QuicClient,
+    QuicClientConfig, RelayDirectoryRegistration, RelayJoin, RelayVideoPath, TransportError,
+    VideoDatagramBackend,
 };
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
+use rand_core::{OsRng, RngCore};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use zeroize::Zeroizing;
@@ -75,6 +77,14 @@ const VIDEO_DEGRADED_DECODE_QUEUE: u16 = 5;
 const VIDEO_HEALTHY_DECODE_QUEUE: u16 = 2;
 const VIDEO_FRAME_PACING_TOLERANCE_US: u64 = 2_000;
 
+fn next_direct_candidate_id() -> u64 {
+    let mut candidate_id = 0_u64;
+    while candidate_id == 0 {
+        candidate_id = OsRng.next_u64();
+    }
+    candidate_id
+}
+
 fn video_quality_settings(preset: VideoQualityPreset) -> H264EncoderSettings {
     match preset {
         VideoQualityPreset::Smooth => H264EncoderSettings {
@@ -82,14 +92,26 @@ fn video_quality_settings(preset: VideoQualityPreset) -> H264EncoderSettings {
             max_height: 720,
             fps: 30,
             bitrate: 1_500_000,
+            ..H264EncoderSettings::default()
         },
         VideoQualityPreset::Balanced => H264EncoderSettings {
             max_width: 1920,
             max_height: 1080,
             fps: 30,
             bitrate: 2_500_000,
+            ..H264EncoderSettings::default()
         },
         VideoQualityPreset::Sharp => H264EncoderSettings::default(),
+    }
+}
+
+fn video_quality_settings_with_profile(
+    preset: VideoQualityPreset,
+    profile: H264Profile,
+) -> H264EncoderSettings {
+    H264EncoderSettings {
+        profile,
+        ..video_quality_settings(preset)
     }
 }
 
@@ -1001,7 +1023,7 @@ impl HostRuntime {
         // capture stack or sending anything back. This proves the approved
         // controller attempt is still the active peer and prevents late
         // approval from writing old ciphertext into a replacement connection.
-        receive_controller_capabilities(
+        let negotiated_profile = receive_controller_capabilities(
             &client,
             &secure,
             peer_generation,
@@ -1009,6 +1031,17 @@ impl HostRuntime {
             stream_id,
         )
         .await?;
+        let direct_session = DirectLanSession::bind_for_client(
+            "0.0.0.0:0".parse().expect("valid wildcard bind address"),
+            &client,
+            next_direct_candidate_id(),
+            secure.lock().await.video_path_binding(),
+            now_unix_s(),
+        )
+        .ok()
+        .map(Arc::new);
+        let direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>> =
+            Arc::new(AsyncMutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let video_queue = Arc::new(Mutex::new(LatestFrameQueue::new(VIDEO_QUEUE_CAPACITY)));
         let video_notify = Arc::new(Notify::new());
@@ -1027,6 +1060,7 @@ impl HostRuntime {
             force_keyframe: force_keyframe.clone(),
             shutdown: shutdown.clone(),
             selected_desktop: selected_desktop.clone(),
+            profile: negotiated_profile,
         };
         let capture_thread = std::thread::Builder::new()
             .name("desklink-capture".into())
@@ -1060,6 +1094,7 @@ impl HostRuntime {
             peer_generation,
             ready.width,
             ready.height,
+            ready.profile,
             &ready.displays,
             ready.active_display_id,
         )
@@ -1067,6 +1102,17 @@ impl HostRuntime {
         {
             let _ = capture_worker.shutdown_and_join();
             return Err(error);
+        }
+        if let Some(session) = direct_session.as_ref() {
+            let offer = encode_control(&ControlMessage::VideoPathCandidateOffer {
+                candidate: session.candidate().clone(),
+            })?;
+            client
+                .send_control_for_generation(
+                    peer_generation,
+                    seal(&secure, SecureLane::Control, &offer).await?,
+                )
+                .await?;
         }
         capture_worker.start()?;
         let audio_queue = Arc::new(Mutex::new(AudioFrameQueue::new(AUDIO_QUEUE_CAPACITY)));
@@ -1116,6 +1162,7 @@ impl HostRuntime {
             video_queue,
             video_notify.clone(),
             force_keyframe.clone(),
+            direct_connection.clone(),
         ));
         let mut inbound = Box::pin(receive_input_and_control(
             client.clone(),
@@ -1132,6 +1179,8 @@ impl HostRuntime {
                 audio_enabled_updates,
                 audio_queue: audio_queue.clone(),
                 audio_notify: audio_notify.clone(),
+                direct_session: direct_session.clone(),
+                direct_connection: direct_connection.clone(),
             },
         ));
         let mut cursor = Box::pin(send_cursor_loop(
@@ -1298,6 +1347,7 @@ struct CaptureWorkerReady {
     height: u32,
     displays: Vec<RemoteDisplay>,
     active_display_id: u32,
+    profile: H264Profile,
 }
 
 #[derive(Clone, Copy)]
@@ -1315,6 +1365,10 @@ enum CaptureWorkerCommand {
         preset: VideoQualityPreset,
         reply: oneshot::Sender<VideoQualityPreset>,
     },
+    SetVideoProfile {
+        profile: H264Profile,
+        reply: oneshot::Sender<H264Profile>,
+    },
 }
 
 struct CaptureWorkerContext {
@@ -1324,6 +1378,7 @@ struct CaptureWorkerContext {
     force_keyframe: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    profile: H264Profile,
 }
 
 struct HostInboundContext {
@@ -1334,6 +1389,8 @@ struct HostInboundContext {
     audio_enabled_updates: watch::Sender<bool>,
     audio_queue: Arc<Mutex<AudioFrameQueue>>,
     audio_notify: Arc<Notify>,
+    direct_session: Option<Arc<DirectLanSession>>,
+    direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
 }
 
 type SharedSecureSession = Arc<AsyncMutex<SecureSession>>;
@@ -1506,6 +1563,7 @@ fn capture_worker_entry(
     start: std::sync::mpsc::Receiver<()>,
     context: CaptureWorkerContext,
 ) -> Result<(), HostRuntimeError> {
+    let profile = context.profile;
     let display_descriptors = match available_displays() {
         Ok(displays) => displays,
         Err(error) => {
@@ -1544,7 +1602,7 @@ fn capture_worker_entry(
     let encoder = match H264Encoder::new_with_settings(
         source_width,
         source_height,
-        video_quality_settings(DEFAULT_VIDEO_QUALITY),
+        video_quality_settings_with_profile(DEFAULT_VIDEO_QUALITY, profile),
     ) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -1572,6 +1630,7 @@ fn capture_worker_entry(
         height,
         displays,
         active_display_id,
+        profile: encoder.profile(),
     };
     if ready.send(Ok(worker_ready)).is_err() || start.recv().is_err() {
         return Ok(());
@@ -1585,7 +1644,7 @@ async fn receive_controller_capabilities(
     peer_generation: u64,
     force_keyframe: Arc<AtomicBool>,
     stream_id: u64,
-) -> Result<(), HostRuntimeError> {
+) -> Result<H264Profile, HostRuntimeError> {
     let negotiation = async {
         let mut received_controller_hello = false;
         loop {
@@ -1599,9 +1658,13 @@ async fn receive_controller_capabilities(
                 ControlMessage::Capabilities(capabilities)
                     if received_controller_hello
                         && capabilities.role == DeviceRole::Controller
-                        && capabilities.codecs.contains(&Codec::H264) =>
+                        && capabilities.supports_h264_profile(H264Profile::Main) =>
                 {
-                    return Ok(());
+                    return Ok(if capabilities.supports_h264_profile(H264Profile::High) {
+                        H264Profile::High
+                    } else {
+                        H264Profile::Main
+                    });
                 }
                 ControlMessage::Capabilities(_) => {
                     return Err(HostRuntimeError::InvalidControllerCapabilities);
@@ -1621,8 +1684,11 @@ async fn receive_controller_capabilities(
                 | ControlMessage::SetAudioEnabled { .. }
                 | ControlMessage::AudioState { .. }
                 | ControlMessage::SetVideoQuality { .. }
+                | ControlMessage::SetVideoProfile { .. }
                 | ControlMessage::VideoQualityState { .. }
-                | ControlMessage::VideoNetworkFeedback { .. } => {}
+                | ControlMessage::VideoNetworkFeedback { .. }
+                | ControlMessage::VideoPathCandidateOffer { .. }
+                | ControlMessage::VideoPathCandidateAnswer { .. } => {}
             }
         }
     };
@@ -1631,12 +1697,14 @@ async fn receive_controller_capabilities(
         .map_err(|_| HostRuntimeError::NegotiationTimeout)?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_host_capabilities(
     client: &QuicClient,
     secure: &SharedSecureSession,
     peer_generation: u64,
     width: u32,
     height: u32,
+    profile: H264Profile,
     displays: &[RemoteDisplay],
     active_display_id: u32,
 ) -> Result<(), HostRuntimeError> {
@@ -1656,6 +1724,11 @@ async fn send_host_capabilities(
         platform: Platform::Windows,
         role: DeviceRole::Host,
         codecs: vec![Codec::H264],
+        h264_profiles: if profile == H264Profile::High {
+            vec![H264Profile::Main, H264Profile::High]
+        } else {
+            vec![H264Profile::Main]
+        },
         width,
         height,
     }))?;
@@ -1761,10 +1834,13 @@ fn capture_encode_loop(
         force_keyframe,
         shutdown,
         selected_desktop,
+        profile: _,
     } = context;
     let mut encoder_recovery_attempts = 0_u8;
     let mut video_quality = DEFAULT_VIDEO_QUALITY;
-    let mut frame_pacer = VideoFramePacer::new(video_quality_settings(video_quality).fps);
+    let mut video_profile = encoder.profile();
+    let mut frame_pacer =
+        VideoFramePacer::new(video_quality_settings_with_profile(video_quality, video_profile).fps);
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -1785,12 +1861,15 @@ fn capture_encode_loop(
                             .reconfigure_for_source(
                                 source_width,
                                 source_height,
-                                video_quality_settings(video_quality),
+                                video_quality_settings_with_profile(video_quality, video_profile),
                             )
                             .map_err(HostRuntimeError::Encoder)?;
                         capture = next_capture;
                         coordinate_space = next_coordinate_space;
-                        frame_pacer.reset(video_quality_settings(video_quality).fps);
+                        video_profile = encoder.profile();
+                        frame_pacer.reset(
+                            video_quality_settings_with_profile(video_quality, video_profile).fps,
+                        );
                         lock_queue(&queue).clear();
                         *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                             display_id,
@@ -1810,18 +1889,41 @@ fn capture_encode_loop(
                             .reconfigure_for_source(
                                 source_width,
                                 source_height,
-                                video_quality_settings(preset),
+                                video_quality_settings_with_profile(preset, video_profile),
                             )
                             .is_ok()
                         {
                             video_quality = preset;
-                            frame_pacer.reset(video_quality_settings(video_quality).fps);
+                            video_profile = encoder.profile();
+                            frame_pacer.reset(
+                                video_quality_settings_with_profile(video_quality, video_profile)
+                                    .fps,
+                            );
                             lock_queue(&queue).clear();
                             force_keyframe.store(true, Ordering::Release);
                             notify.notify_one();
                         }
                     }
                     let _ = reply.send(video_quality);
+                }
+                CaptureWorkerCommand::SetVideoProfile { profile, reply } => {
+                    if profile != video_profile {
+                        let (source_width, source_height) = capture.dimensions();
+                        if encoder
+                            .reconfigure_for_source(
+                                source_width,
+                                source_height,
+                                video_quality_settings_with_profile(video_quality, profile),
+                            )
+                            .is_ok()
+                        {
+                            video_profile = encoder.profile();
+                            lock_queue(&queue).clear();
+                            force_keyframe.store(true, Ordering::Release);
+                            notify.notify_one();
+                        }
+                    }
+                    let _ = reply.send(video_profile);
                 }
             }
         }
@@ -1839,10 +1941,12 @@ fn capture_encode_loop(
                     .reconfigure_for_source(
                         source_width,
                         source_height,
-                        video_quality_settings(video_quality),
+                        video_quality_settings_with_profile(video_quality, video_profile),
                     )
                     .map_err(HostRuntimeError::Encoder)?;
-                frame_pacer.reset(video_quality_settings(video_quality).fps);
+                video_profile = encoder.profile();
+                frame_pacer
+                    .reset(video_quality_settings_with_profile(video_quality, video_profile).fps);
                 lock_queue(&queue).clear();
                 *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                     display_id: capture.display_id(),
@@ -1872,6 +1976,7 @@ fn capture_encode_loop(
                 encoder
                     .rebuild(width, height)
                     .map_err(HostRuntimeError::Encoder)?;
+                video_profile = encoder.profile();
                 force_keyframe.store(true, Ordering::Release);
                 continue;
             }
@@ -1888,6 +1993,7 @@ fn capture_encode_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_video_loop(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
@@ -1896,8 +2002,10 @@ async fn send_video_loop(
     queue: Arc<Mutex<LatestFrameQueue<EncodedDesktopFrame>>>,
     notify: Arc<Notify>,
     force_keyframe: Arc<AtomicBool>,
+    direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
 ) -> Result<(), HostRuntimeError> {
     let mut pipeline = HostVideoPipeline::new(stream_id);
+    let relay_video_path = RelayVideoPath::new(client.clone(), peer_generation);
     loop {
         notify.notified().await;
         let next = lock_queue(&queue).take_newest();
@@ -1918,12 +2026,20 @@ async fn send_video_loop(
                         .await?;
                 }
                 for (index, datagram) in prepared.datagrams.into_iter().enumerate() {
-                    client
-                        .send_video_datagram_for_generation(
-                            peer_generation,
-                            seal(&secure, SecureLane::VideoDatagram, &datagram).await?,
-                        )
-                        .await?;
+                    let ciphertext = seal(&secure, SecureLane::VideoDatagram, &datagram).await?;
+                    let direct_path = direct_connection
+                        .lock()
+                        .await
+                        .clone()
+                        .map(DirectLanVideoPath::new);
+                    if let Some(direct_path) = direct_path {
+                        if direct_path.send(ciphertext.clone()).await.is_err() {
+                            *direct_connection.lock().await = None;
+                            relay_video_path.send(ciphertext).await?;
+                        }
+                    } else {
+                        relay_video_path.send(ciphertext).await?;
+                    }
                     if index % 16 == 15 {
                         tokio::task::yield_now().await;
                     }
@@ -2088,6 +2204,21 @@ async fn apply_video_quality(
         .and_then(Result::ok))
 }
 
+async fn apply_video_profile(
+    capture_commands: &std::sync::mpsc::Sender<CaptureWorkerCommand>,
+    profile: H264Profile,
+) -> Result<H264Profile, HostRuntimeError> {
+    let (reply, applied) = oneshot::channel();
+    capture_commands
+        .send(CaptureWorkerCommand::SetVideoProfile { profile, reply })
+        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+    Ok(tokio::time::timeout(Duration::from_secs(5), applied)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(H264Profile::Main))
+}
+
 async fn receive_input_and_control(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
@@ -2105,11 +2236,20 @@ async fn receive_input_and_control(
         audio_enabled_updates,
         audio_queue,
         audio_notify,
+        mut direct_session,
+        direct_connection,
     } = context;
     let mut policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
     loop {
         tokio::select! {
+            direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
+                if let Some(connection) = direct {
+                    *direct_connection.lock().await = Some(connection);
+                } else {
+                    direct_session = None;
+                }
+            }
             result = client.next_control_for_generation(peer_generation) => {
                 let bytes = result?;
                 let plaintext = open(&secure, SecureLane::Control, &bytes).await?;
@@ -2174,6 +2314,12 @@ async fn receive_input_and_control(
                             .await?;
                         }
                     }
+                    ControlMessage::SetVideoProfile { profile } => {
+                        let actual = apply_video_profile(&capture_commands, profile).await?;
+                        if actual != profile {
+                            force_keyframe.store(true, Ordering::Release);
+                        }
+                    }
                     ControlMessage::VideoNetworkFeedback {
                         received_packets,
                         dropped_packets,
@@ -2201,6 +2347,54 @@ async fn receive_input_and_control(
                             .await?;
                         }
                     }
+                    ControlMessage::VideoPathCandidateOffer { candidate } => {
+                        let answer = if let Some(session) = direct_session.as_ref()
+                            && candidate
+                                .validate(now_unix_s(), session.session_binding())
+                                .is_ok()
+                        {
+                            let endpoint = session.endpoint();
+                            let expected_binding = *session.session_binding();
+                            let secure_for_probe = secure.clone();
+                            let direct_connection_for_probe = direct_connection.clone();
+                            let candidate_for_probe = candidate.clone();
+                            tokio::spawn(async move {
+                                let result = {
+                                    let mut secure = secure_for_probe.lock().await;
+                                    endpoint
+                                        .connect(
+                                            &candidate_for_probe,
+                                            &expected_binding,
+                                            &mut secure,
+                                            now_unix_s(),
+                                        )
+                                        .await
+                                };
+                                if let Ok((connection, _)) = result {
+                                    *direct_connection_for_probe.lock().await =
+                                        Some(Arc::new(connection));
+                                }
+                            });
+                            ControlMessage::VideoPathCandidateAnswer {
+                                candidate_id: candidate.candidate_id(),
+                                accepted: true,
+                                candidate: Some(session.candidate().clone()),
+                            }
+                        } else {
+                            ControlMessage::VideoPathCandidateAnswer {
+                                candidate_id: candidate.candidate_id(),
+                                accepted: false,
+                                candidate: None,
+                            }
+                        };
+                        let answer = encode_control(&answer)?;
+                        client
+                            .send_control_for_generation(
+                                peer_generation,
+                                seal(&secure, SecureLane::Control, &answer).await?,
+                            )
+                            .await?;
+                    }
                     _ => {}
                 }
             }
@@ -2225,6 +2419,39 @@ async fn receive_input_and_control(
             reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
+        }
+    }
+}
+
+async fn accept_host_direct_connection(
+    session: Option<Arc<DirectLanSession>>,
+    secure: SharedSecureSession,
+) -> Option<Arc<DirectLanConnection>> {
+    let Some(session) = session else {
+        return std::future::pending::<Option<Arc<DirectLanConnection>>>().await;
+    };
+    let endpoint = session.endpoint();
+    let expected_candidate_id = session.candidate().candidate_id();
+    let expected_binding = *session.session_binding();
+    loop {
+        let incoming = endpoint.accept().await?;
+        let Ok(connection) = incoming else {
+            continue;
+        };
+        let accepted = {
+            let mut secure = secure.lock().await;
+            endpoint
+                .accept_probe_connection(
+                    connection,
+                    expected_candidate_id,
+                    &expected_binding,
+                    &mut secure,
+                    now_unix_s(),
+                )
+                .await
+        };
+        if let Ok((connection, _)) = accepted {
+            return Some(Arc::new(connection));
         }
     }
 }
@@ -2948,6 +3175,7 @@ mod retry_policy_tests {
             (1920, 1080, 30)
         );
         assert_eq!(sharp.fps, 30);
+        assert_eq!(sharp.bitrate, 18_000_000);
         assert!(smooth.bitrate < balanced.bitrate);
         assert!(balanced.bitrate < sharp.bitrate);
     }
@@ -3071,5 +3299,93 @@ mod retry_policy_tests {
             .filter(|index| pacer.should_encode(index * 16_666, false))
             .count();
         assert_eq!(encoded, 15);
+    }
+}
+
+#[cfg(test)]
+mod direct_video_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
+    use desklink_transport::{DirectLanEndpoint, DirectLanSession};
+    use rand_core::OsRng;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use super::{accept_host_direct_connection, now_unix_s};
+
+    #[tokio::test]
+    async fn host_acceptor_keeps_authenticated_direct_datagram_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let now = now_unix_s();
+        let binding = [42; 16];
+        let host_session = Arc::new(
+            DirectLanSession::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:9".parse().unwrap(),
+                7,
+                binding,
+                now,
+            )
+            .unwrap(),
+        );
+        let controller_endpoint = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (mut controller_secure, host_secure) = connected_secure_sessions();
+        let host_secure = Arc::new(AsyncMutex::new(host_secure));
+        let host_accept_task = tokio::spawn(accept_host_direct_connection(
+            Some(host_session.clone()),
+            host_secure,
+        ));
+
+        let (controller_connection, controller_probe) = controller_endpoint
+            .connect(
+                host_session.candidate(),
+                &binding,
+                &mut controller_secure,
+                now,
+            )
+            .await
+            .unwrap();
+        let host_connection = tokio::time::timeout(Duration::from_secs(3), host_accept_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("host should accept the authenticated direct probe");
+
+        assert_eq!(controller_probe.candidate_id, 7);
+        assert_eq!(host_connection.candidate_id(), 7);
+        controller_connection.send_datagram(vec![7, 8, 9]).unwrap();
+        let received =
+            tokio::time::timeout(Duration::from_secs(1), host_connection.recv_datagram())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(received, vec![7, 8, 9]);
+    }
+
+    fn connected_secure_sessions() -> (
+        desklink_crypto::SecureSession,
+        desklink_crypto::SecureSession,
+    ) {
+        let mut rng = OsRng;
+        let controller_identity = DeviceIdentity::generate(&mut rng);
+        let host_identity = DeviceIdentity::generate(&mut rng);
+        let controller_verify_key = controller_identity.verify_key();
+        let host_verify_key = host_identity.verify_key();
+        let (mut initiator, hello) =
+            NoiseInitiator::start(controller_identity, host_verify_key).unwrap();
+        let (mut responder, response) =
+            NoiseResponder::accept(&hello, host_identity, controller_verify_key).unwrap();
+        let finish = initiator.receive(&response).unwrap();
+        responder.receive(&finish).unwrap();
+        (
+            initiator
+                .finish()
+                .unwrap()
+                .into_secure_session(SecureRole::Initiator),
+            responder
+                .finish()
+                .unwrap()
+                .into_secure_session(SecureRole::Responder),
+        )
     }
 }

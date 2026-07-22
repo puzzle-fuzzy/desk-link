@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -212,6 +215,13 @@ impl InboundReceivers {
 }
 
 impl QuicClient {
+    /// Returns the relay peer address selected during the QUIC connection.
+    /// LAN candidate discovery uses this only as an operating-system route
+    /// hint; it is never advertised as a direct candidate.
+    pub fn remote_address(&self) -> SocketAddr {
+        self.inner.connection.remote_address()
+    }
+
     pub async fn connect(config: QuicClientConfig) -> Result<Self, TransportError> {
         if config.server_name.is_empty() {
             return Err(TransportError::InvalidConfig(

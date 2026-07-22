@@ -1,18 +1,21 @@
 use desklink_protocol::{
     AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket, Codec,
-    ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, InputEnvelope,
-    InputEvent, MAX_AUDIO_PACKET_BYTES, MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_CURSOR_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US,
-    MAX_INPUT_FUTURE_SKEW_US, MAX_NOISE_HANDSHAKE_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES,
-    MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_WHEEL_DELTA, Modifiers, NoiseHandshake,
-    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferMessage,
-    VideoConfig, VideoFrameHeader, VideoPacket, VideoQualityPreference, VideoQualityPreset,
+    ControlMessage, CursorUpdate, DeviceCapabilities, DeviceRole, DirectLanCandidate,
+    DirectLanCandidateError, FrameFlags, H264Profile, InputEnvelope, InputEvent,
+    MAX_AUDIO_PACKET_BYTES, MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_CURSOR_MESSAGE_BYTES, MAX_DATAGRAM_PAYLOAD_BYTES, MAX_EXPERIMENTAL_4K_HEIGHT,
+    MAX_EXPERIMENTAL_4K_WIDTH, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US,
+    MAX_NOISE_HANDSHAKE_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES, MAX_VIDEO_CHUNKS,
+    MAX_VIDEO_CONFIG_BYTES, MAX_WHEEL_DELTA, Modifiers, NoiseHandshake, NoiseHandshakeStep,
+    PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferMessage, VideoConfig,
+    VideoFrameBudget, VideoFrameHeader, VideoPacket, VideoQualityPreference, VideoQualityPreset,
     decode_audio_packet, decode_control, decode_cursor_update, decode_input,
     decode_noise_handshake, decode_transfer, decode_video_config, decode_video_header,
     decode_video_packet, encode_audio_packet, encode_control, encode_cursor_update, encode_input,
     encode_noise_handshake, encode_transfer, encode_video_config, encode_video_header,
     encode_video_packet, is_valid_transfer_file_name,
 };
+use std::net::SocketAddr;
 
 #[test]
 fn display_list_and_selection_round_trip() {
@@ -57,6 +60,9 @@ fn video_quality_commands_round_trip() {
         ControlMessage::SetVideoQuality {
             preference: VideoQualityPreference::Automatic,
         },
+        ControlMessage::SetVideoProfile {
+            profile: H264Profile::High,
+        },
         ControlMessage::VideoQualityState {
             preference: VideoQualityPreference::Automatic,
             preset: VideoQualityPreset::Balanced,
@@ -81,8 +87,8 @@ fn video_quality_commands_round_trip() {
 }
 
 #[test]
-fn playback_pressure_requires_protocol_nine() {
-    assert_eq!(PROTOCOL_VERSION, 9);
+fn playback_pressure_requires_profile_negotiation_protocol() {
+    assert_eq!(PROTOCOL_VERSION, 12);
 }
 
 #[test]
@@ -431,7 +437,7 @@ fn invalid_chunks_are_rejected() {
 #[test]
 fn oversized_dimensions_are_rejected() {
     let mut value = header();
-    value.width = 1921;
+    value.width = 2561;
     assert!(encode_video_header(&value).is_err());
 }
 #[test]
@@ -463,7 +469,8 @@ fn invalid_capabilities_are_rejected() {
         platform: Platform::IOS,
         role: DeviceRole::Host,
         codecs: vec![Codec::H264],
-        width: 1921,
+        h264_profiles: vec![H264Profile::Main],
+        width: 2561,
         height: 1080,
     };
     assert!(matches!(
@@ -633,6 +640,7 @@ fn capabilities_require_nonempty_h264_list() {
             platform: Platform::IOS,
             role: DeviceRole::Host,
             codecs,
+            h264_profiles: vec![H264Profile::Main],
             width: 1920,
             height: 1080,
         };
@@ -648,6 +656,171 @@ fn capabilities_require_nonempty_h264_list() {
             Err(ProtocolError::InvalidCapabilities)
         ));
     }
+}
+
+#[test]
+fn h264_capabilities_require_main_and_expose_high_support() {
+    let mut capabilities = DeviceCapabilities {
+        platform: Platform::Windows,
+        role: DeviceRole::Host,
+        codecs: vec![Codec::H264],
+        h264_profiles: vec![H264Profile::High],
+        width: 1920,
+        height: 1080,
+    };
+    assert!(matches!(
+        capabilities.validate(),
+        Err(ProtocolError::InvalidCapabilities)
+    ));
+    capabilities.h264_profiles.push(H264Profile::Main);
+    assert!(capabilities.validate().is_ok());
+    assert!(capabilities.supports_h264_profile(H264Profile::High));
+    assert!(capabilities.supports_h264_profile(H264Profile::Main));
+}
+
+#[test]
+fn video_budget_quantifies_4k_without_enabling_it() {
+    let mvp = VideoFrameBudget::estimate(2560, 1440, 18_000_000, 30).unwrap();
+    let four_k = VideoFrameBudget::estimate(
+        u32::from(MAX_EXPERIMENTAL_4K_WIDTH),
+        u32::from(MAX_EXPERIMENTAL_4K_HEIGHT),
+        40_500_000,
+        30,
+    )
+    .unwrap();
+    assert_eq!(mvp.average_frame_bytes, 75_000);
+    assert_eq!(mvp.packet_count, 74);
+    assert!(mvp.fits_current_datagram_budget);
+    assert_eq!(four_k.average_frame_bytes, 168_750);
+    assert_eq!(four_k.packet_count, 165);
+    assert!(four_k.fits_current_datagram_budget);
+    assert_eq!(four_k.nv12_frame_bytes, 12_441_600);
+}
+
+#[test]
+fn video_budget_rejects_zero_capture_inputs() {
+    assert!(VideoFrameBudget::estimate(0, 2160, 40_500_000, 30).is_none());
+    assert!(VideoFrameBudget::estimate(3840, 2160, 40_500_000, 0).is_none());
+}
+
+#[test]
+fn direct_lan_candidate_round_trips_and_binds_to_a_live_session() {
+    let binding = [7; 16];
+    let candidate = DirectLanCandidate::new(
+        41,
+        SocketAddr::from(([192, 168, 1, 42], 45_001)),
+        109,
+        binding,
+        100,
+    )
+    .expect("valid candidate");
+    let bytes = postcard::to_allocvec(&candidate).expect("candidate encode");
+    let decoded: DirectLanCandidate = postcard::from_bytes(&bytes).expect("candidate decode");
+    assert_eq!(decoded, candidate);
+    assert_eq!(
+        decoded.address(),
+        SocketAddr::from(([192, 168, 1, 42], 45_001))
+    );
+    assert!(decoded.validate(109 - 1, &binding).is_ok());
+}
+
+#[test]
+fn direct_lan_candidate_rejects_public_addresses_expiry_and_binding_reuse() {
+    let binding = [9; 16];
+    assert_eq!(
+        DirectLanCandidate::new(
+            1,
+            SocketAddr::from(([8, 8, 8, 8], 45_001)),
+            105,
+            binding,
+            100,
+        )
+        .unwrap_err(),
+        DirectLanCandidateError::InvalidAddress
+    );
+    assert_eq!(
+        DirectLanCandidate::new(
+            1,
+            SocketAddr::from(([10, 0, 0, 5], 45_001)),
+            111,
+            binding,
+            100,
+        )
+        .unwrap_err(),
+        DirectLanCandidateError::InvalidExpiry
+    );
+    let candidate = DirectLanCandidate::new(
+        1,
+        SocketAddr::from(([10, 0, 0, 5], 45_001)),
+        105,
+        binding,
+        100,
+    )
+    .expect("valid candidate");
+    assert_eq!(
+        candidate.validate(100, &[8; 16]).unwrap_err(),
+        DirectLanCandidateError::InvalidSessionBinding
+    );
+    assert_eq!(
+        candidate.validate(105, &binding).unwrap_err(),
+        DirectLanCandidateError::InvalidExpiry
+    );
+}
+
+#[test]
+fn direct_video_control_round_trips_inside_protocol_12() {
+    let binding = [4; 16];
+    let candidate = DirectLanCandidate::new(
+        77,
+        SocketAddr::from(([192, 168, 0, 8], 45_002)),
+        206,
+        binding,
+        200,
+    )
+    .expect("candidate");
+    let offer = ControlMessage::VideoPathCandidateOffer { candidate };
+    let bytes = encode_control(&offer).expect("offer encode");
+    assert_eq!(decode_control(&bytes).expect("offer decode"), offer);
+
+    let answer = ControlMessage::VideoPathCandidateAnswer {
+        candidate_id: 77,
+        accepted: true,
+        candidate: Some(
+            DirectLanCandidate::new(
+                88,
+                SocketAddr::from(([192, 168, 0, 9], 45_003)),
+                206,
+                binding,
+                200,
+            )
+            .expect("answer candidate"),
+        ),
+    };
+    let bytes = encode_control(&answer).expect("answer encode");
+    assert_eq!(decode_control(&bytes).expect("answer decode"), answer);
+}
+
+#[test]
+fn direct_video_control_rejects_malformed_messages() {
+    assert!(matches!(
+        encode_control(&ControlMessage::VideoPathCandidateAnswer {
+            candidate_id: 0,
+            accepted: false,
+            candidate: None,
+        }),
+        Err(ProtocolError::InvalidDirectVideoMessage)
+    ));
+    assert!(matches!(
+        decode_control(
+            &postcard::to_allocvec(&ControlMessage::VideoPathCandidateAnswer {
+                candidate_id: 0,
+                accepted: true,
+                candidate: None,
+            })
+            .expect("malformed answer encode")
+        ),
+        Err(ProtocolError::InvalidDirectVideoMessage)
+    ));
 }
 
 #[test]

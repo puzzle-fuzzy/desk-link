@@ -455,6 +455,14 @@ async fn set_controller_video_quality(
 }
 
 #[tauri::command]
+async fn set_controller_video_profile(
+    manager: State<'_, ControllerManager>,
+    profile: desklink_protocol::H264Profile,
+) -> Result<(), String> {
+    manager.set_video_profile(profile).await
+}
+
+#[tauri::command]
 async fn send_controller_clipboard(manager: State<'_, ControllerManager>) -> Result<(), String> {
     let text = read_local_clipboard_text().await?;
     manager.send_clipboard(text).await
@@ -1592,6 +1600,7 @@ pub fn run() {
             paste_controller_clipboard_text,
             set_controller_audio_enabled,
             set_controller_video_quality,
+            set_controller_video_profile,
             send_controller_clipboard,
             request_controller_clipboard,
             choose_and_send_controller_file,

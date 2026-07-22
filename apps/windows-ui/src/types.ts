@@ -231,6 +231,9 @@ export interface StreamBoundControllerInput extends ControllerInput {
 
 export interface ControllerRenderMetrics {
   streamId: number;
+  videoWidth: number;
+  videoHeight: number;
+  videoPath: "relay" | "directLan";
   receivedFrames: number;
   submittedFrames: number;
   displayedFrames: number;
@@ -241,6 +244,10 @@ export interface ControllerRenderMetrics {
   displayedFpsX100: number | null;
   maxFrameGapMs: number | null;
   coalescedFrameDrops: number;
+  h264Profile: H264Profile;
+  profileProbe: H264ProfileProbe;
+  profileProbeMs: number | null;
+  profileFallbackReason: H264ProfileFallbackReason | null;
 }
 
 export interface ControllerPlaybackPressure {
@@ -273,6 +280,11 @@ export interface RemoteDisplaySummary {
 export type VideoQualityPreset = "smooth" | "balanced" | "sharp";
 export type VideoQualityPreference = "automatic" | VideoQualityPreset;
 
+export type H264Profile = "main" | "high";
+export type H264ProfileProbe = "notChecked" | "supported" | "unsupported" | "unavailable";
+export type H264ProfileFallbackReason = "decoderUnsupported" | "decoderError" | "decoderStall";
+export type VideoPathKind = "relay" | "directLan";
+
 export type ControllerSignal =
   | { kind: "status"; runtime: ControllerRuntimeSummary }
   | ControllerVideoConfigSignal
@@ -294,6 +306,7 @@ export type ControllerSignal =
       receivedVideoPackets: number;
       droppedVideoPackets: number;
       completedFrames: number;
+      videoPath: VideoPathKind;
     }
   | {
       kind: "clipboard";

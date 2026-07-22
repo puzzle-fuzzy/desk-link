@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
+import { h264CodecFromSequenceHeader, h264ProfileFromCodec, videoConfigKey } from "./video-config";
 
 describe("H.264 decoder configuration", () => {
   test("reads the SPS profile from three-byte and four-byte Annex B headers", () => {
@@ -22,5 +22,11 @@ describe("H.264 decoder configuration", () => {
   test("distinguishes stream restarts from configuration revisions", () => {
     expect(videoConfigKey({ streamId: 8, configVersion: 2 })).toBe("8:2");
     expect(videoConfigKey({ streamId: 9, configVersion: 2 })).not.toBe("8:2");
+  });
+
+  test("classifies High SPS codecs for capability diagnostics", () => {
+    expect(h264ProfileFromCodec("avc1.640029")).toBe("high");
+    expect(h264ProfileFromCodec("avc1.42E01F")).toBe("main");
+    expect(h264ProfileFromCodec("malformed")).toBe("main");
   });
 });

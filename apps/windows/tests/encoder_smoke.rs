@@ -62,3 +62,16 @@ fn captured_desktop_frame_encodes_to_h264() {
 
     panic!("encoder produced no forced H.264 keyframe after 20 captured frames");
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "manual 4K Media Foundation capability probe"]
+fn experimental_4k_media_foundation_encoder_initializes() {
+    use apps_windows::encoder::{H264Encoder, H264EncoderSettings};
+
+    let encoder =
+        H264Encoder::new_with_settings(3840, 2160, H264EncoderSettings::experimental_4k())
+            .expect("4K Media Foundation encoder init");
+    assert_eq!(encoder.dimensions(), (3840, 2160));
+    println!("4K encoder profile: {:?}", encoder.profile());
+}

@@ -263,6 +263,7 @@ function renderNavigation(): string {
   const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
   return `
     <nav class="section-nav" aria-label="DeskLink 功能导航" role="tablist">
+      <span class="nav-collection" aria-hidden="true">DESKLINK / WINDOWS</span>
       ${DESKTOP_NAV_ITEMS
         .map(
           ({ id, label }) => `
@@ -480,6 +481,7 @@ function renderConnection(state: HostSnapshot): string {
     <div class="page-layout page-layout--form">
       <header class="page-heading">
         <div>
+          <span class="editorial-kicker">02 / SHARE THIS DEVICE</span>
           <h1>共享此设备</h1>
           <p>保存后，这台电脑才能生成临时密码并等待另一台电脑连接。</p>
         </div>

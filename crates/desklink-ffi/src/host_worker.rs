@@ -11,7 +11,7 @@ use desklink_crypto::{
     DeviceIdentity, NoiseResponder, SecureLane, SecureRole, SecureSession, SessionId,
 };
 use desklink_protocol::{
-    Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, NoiseHandshake,
+    Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, NoiseHandshake,
     NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
     decode_cursor_update, decode_input, decode_noise_handshake, decode_transfer, encode_control,
     encode_noise_handshake, encode_transfer, encode_video_config,
@@ -697,6 +697,7 @@ async fn negotiate_controller(
             platform: Platform::MacOS,
             role: DeviceRole::Host,
             codecs: vec![Codec::H264],
+            h264_profiles: vec![H264Profile::Main],
             width: 1920,
             height: 1080,
         }),
@@ -733,8 +734,11 @@ async fn negotiate_controller(
                 | ControlMessage::SetAudioEnabled { .. }
                 | ControlMessage::AudioState { .. }
                 | ControlMessage::SetVideoQuality { .. }
+                | ControlMessage::SetVideoProfile { .. }
                 | ControlMessage::VideoQualityState { .. }
-                | ControlMessage::VideoNetworkFeedback { .. } => {}
+                | ControlMessage::VideoNetworkFeedback { .. }
+                | ControlMessage::VideoPathCandidateOffer { .. }
+                | ControlMessage::VideoPathCandidateAnswer { .. } => {}
             }
         }
     };

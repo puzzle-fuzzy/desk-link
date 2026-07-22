@@ -21,7 +21,7 @@ import type {
   SavedDeviceRenameInput,
   WindowsPreferencesSummary,
 } from "./types";
-import type { VideoQualityPreference } from "./types";
+import type { H264Profile, VideoQualityPreference } from "./types";
 import type { WindowsReleaseSource } from "./windows-update";
 
 export interface ControllerChannels {
@@ -178,6 +178,10 @@ export function setControllerAudioEnabled(enabled: boolean): Promise<void> {
 
 export function setControllerVideoQuality(preference: VideoQualityPreference): Promise<void> {
   return invoke<void>("set_controller_video_quality", { preference });
+}
+
+export function setControllerVideoProfile(profile: H264Profile): Promise<void> {
+  return invoke<void>("set_controller_video_profile", { profile });
 }
 
 export function sendControllerClipboard(): Promise<void> {

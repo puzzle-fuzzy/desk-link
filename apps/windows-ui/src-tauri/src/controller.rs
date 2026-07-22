@@ -14,7 +14,10 @@ use apps_windows::{
     audio::RemoteAudioDecoder,
     cloud_diagnostics::{DiagnosticSource, set_session_correlation},
     controller_settings::{ControllerConnectionSettings, WindowsControllerConnectionStore},
-    diagnostics::{ControllerDiagnosticStage, DiagnosticEvent, DiagnosticLog},
+    diagnostics::{
+        ControllerDiagnosticStage, DiagnosticEvent, DiagnosticLog, H264ProfileFallbackReason,
+        H264ProfileProbe,
+    },
     identity::WindowsIdentityStore,
     recent_access::{RecentAccessEntry, WindowsRecentAccessError, WindowsRecentAccessStore},
     transfer::{
@@ -34,9 +37,10 @@ use desklink_ffi::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FileResumeHint, FrameFlags,
-    InputEvent, KeyCode, MAX_CLIPBOARD_TEXT_BYTES, MAX_POINTER_COORDINATE,
-    MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, ProtocolError,
-    TransferId, TransferMessage, TransferResult, VideoQualityPreference, VideoQualityPreset,
+    H264Profile, InputEvent, KeyCode, MAX_CLIPBOARD_TEXT_BYTES, MAX_EXPERIMENTAL_4K_HEIGHT,
+    MAX_EXPERIMENTAL_4K_WIDTH, MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA,
+    Modifiers, MouseButton, Platform, ProtocolError, TransferId, TransferMessage, TransferResult,
+    VideoQualityPreference, VideoQualityPreset,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -438,6 +442,7 @@ pub enum ControllerSignal {
         received_video_packets: u64,
         dropped_video_packets: u64,
         completed_frames: u64,
+        video_path: &'static str,
     },
     Displays {
         displays: Vec<ControllerDisplaySummary>,
@@ -494,6 +499,9 @@ pub struct QueuedFileSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ControllerRenderMetrics {
     stream_id: u64,
+    video_width: u16,
+    video_height: u16,
+    video_path: String,
     received_frames: u64,
     submitted_frames: u64,
     displayed_frames: u64,
@@ -504,6 +512,10 @@ pub struct ControllerRenderMetrics {
     displayed_fps_x100: Option<u32>,
     max_frame_gap_ms: Option<u64>,
     coalesced_frame_drops: u64,
+    h264_profile: H264Profile,
+    profile_probe: H264ProfileProbe,
+    profile_probe_ms: Option<u64>,
+    profile_fallback_reason: Option<H264ProfileFallbackReason>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -537,6 +549,7 @@ enum ControllerCommand {
     SelectDisplay(u32),
     SetAudioEnabled(bool),
     SetVideoQuality(VideoQualityPreference),
+    SetVideoProfile(H264Profile),
     SendClipboard(String),
     PasteClipboard(String),
     RequestClipboard,
@@ -1555,6 +1568,10 @@ impl ControllerManager {
             .await
     }
 
+    pub async fn set_video_profile(&self, profile: H264Profile) -> Result<(), String> {
+        self.send(ControllerCommand::SetVideoProfile(profile)).await
+    }
+
     pub async fn send_clipboard(&self, text: String) -> Result<(), String> {
         if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
             return Err("剪贴板文本超过 48 KB，无法发送。".to_owned());
@@ -1764,7 +1781,11 @@ impl ControllerManager {
         if active_stream != Some(metrics.stream_id) {
             return Ok(());
         }
-        if metrics.submitted_frames > metrics.received_frames
+        if metrics.video_width == 0
+            || metrics.video_height == 0
+            || metrics.video_width > MAX_EXPERIMENTAL_4K_WIDTH
+            || metrics.video_height > MAX_EXPERIMENTAL_4K_HEIGHT
+            || metrics.submitted_frames > metrics.received_frames
             || metrics.displayed_frames > metrics.submitted_frames
             || metrics.video_pull_failures > MAX_CONTROLLER_VIDEO_PULL_FAILURES
             || metrics
@@ -1777,6 +1798,7 @@ impl ControllerManager {
             || metrics
                 .first_frame_ms
                 .is_some_and(|value| value > 10 * 60 * 1_000)
+            || metrics.profile_probe_ms.is_some_and(|value| value > 60_000)
         {
             return Err("远程画面指标无效。".to_owned());
         }
@@ -1784,6 +1806,12 @@ impl ControllerManager {
             .map_err(|_| "DeskLink 无法打开控制端诊断记录。".to_owned())?
             .record(&DiagnosticEvent::ControllerRenderMetrics {
                 stream_id: metrics.stream_id,
+                video_width: metrics.video_width,
+                video_height: metrics.video_height,
+                video_path: match metrics.video_path.as_str() {
+                    "relay" | "directLan" => metrics.video_path,
+                    _ => "unknown".to_owned(),
+                },
                 received_frames: metrics.received_frames,
                 submitted_frames: metrics.submitted_frames,
                 displayed_frames: metrics.displayed_frames,
@@ -1794,6 +1822,10 @@ impl ControllerManager {
                 displayed_fps_x100: metrics.displayed_fps_x100,
                 max_frame_gap_ms: metrics.max_frame_gap_ms,
                 coalesced_frame_drops: metrics.coalesced_frame_drops,
+                h264_profile: metrics.h264_profile,
+                profile_probe: metrics.profile_probe,
+                profile_probe_ms: metrics.profile_probe_ms,
+                profile_fallback_reason: metrics.profile_fallback_reason,
             })
             .map_err(|_| "DeskLink 无法记录远程画面指标。".to_owned())
     }
@@ -2156,6 +2188,7 @@ async fn run_controller(
                     Some(ControllerCommand::SetVideoQuality(preference)) => {
                         video_quality = preference;
                     }
+                    Some(ControllerCommand::SetVideoProfile(_)) => {}
                     Some(ControllerCommand::Input { .. })
                     | Some(ControllerCommand::Text(_))
                     | Some(ControllerCommand::RequestKeyframe)
@@ -2339,6 +2372,11 @@ async fn run_controller(
                             continue;
                         }
                         if let Err(error) = runtime.send_input(event).await {
+                            break ConnectFailure::from_controller(error);
+                        }
+                    }
+                    Some(ControllerCommand::SetVideoProfile(profile)) => {
+                        if let Err(error) = runtime.set_video_profile(profile).await {
                             break ConnectFailure::from_controller(error);
                         }
                     }
@@ -3431,6 +3469,7 @@ async fn run_controller(
                     received_video_packets: metrics.received_video_packets,
                     dropped_video_packets: metrics.dropped_video_packets,
                     completed_frames: metrics.completed_frames,
+                    video_path: runtime.video_path_kind().as_str(),
                 });
                 if last_diagnostic_metrics.elapsed() >= Duration::from_secs(10) {
                     record_controller_video_metrics(
@@ -4426,7 +4465,7 @@ mod tests {
         COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
         ControllerCommand, ControllerInput, ControllerManager, ControllerPlaybackPressure,
         ControllerRenderMetrics, ControllerRuntimeSummary, ControllerVideoPullInput,
-        LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
+        H264ProfileProbe, LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
         PendingRemoteFileRequest, PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
         directory_transport_error_is_retryable, directory_transport_error_message,
         file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
@@ -4440,9 +4479,9 @@ mod tests {
     };
     use desklink_ffi::ControllerError;
     use desklink_protocol::{
-        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket, InputEvent,
-        KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton, PROTOCOL_VERSION, ProtocolError,
-        TransferResult,
+        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket,
+        H264Profile, InputEvent, KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton,
+        PROTOCOL_VERSION, ProtocolError, TransferResult,
     };
     use desklink_transport::{JoinRejectCode, TransportError};
 
@@ -4613,6 +4652,9 @@ mod tests {
             manager
                 .record_render_metrics(ControllerRenderMetrics {
                     stream_id: 9,
+                    video_width: 1920,
+                    video_height: 1080,
+                    video_path: "relay".to_owned(),
                     received_frames: 10,
                     submitted_frames: 10,
                     displayed_frames: 10,
@@ -4623,6 +4665,10 @@ mod tests {
                     displayed_fps_x100: Some(3_000),
                     max_frame_gap_ms: Some(67),
                     coalesced_frame_drops: 2,
+                    h264_profile: H264Profile::Main,
+                    profile_probe: H264ProfileProbe::NotChecked,
+                    profile_probe_ms: None,
+                    profile_fallback_reason: None,
                 })
                 .is_err()
         );

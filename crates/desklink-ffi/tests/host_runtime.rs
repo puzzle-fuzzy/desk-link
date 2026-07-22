@@ -8,7 +8,7 @@ use desklink_ffi::{
     HostRuntime, HostState,
 };
 use desklink_protocol::{
-    Codec, ControlMessage, DeviceCapabilities, DeviceRole, InputEnvelope, InputEvent,
+    Codec, ControlMessage, DeviceCapabilities, DeviceRole, H264Profile, InputEnvelope, InputEvent,
     NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, encode_control, encode_input,
     encode_noise_handshake,
 };
@@ -306,6 +306,7 @@ impl RawController {
             platform: Platform::MacOS,
             role: DeviceRole::Controller,
             codecs: vec![Codec::H264],
+            h264_profiles: vec![H264Profile::Main],
             width: 1920,
             height: 1080,
         }))

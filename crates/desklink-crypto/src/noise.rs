@@ -25,6 +25,7 @@ const RESPONDER_SIGNATURE_DOMAIN: &[u8] = b"desklink-noise-xx-responder-v1";
 const INITIATOR_SIGNATURE_DOMAIN: &[u8] = b"desklink-noise-xx-initiator-v1";
 const PACKET_KEY_DOMAIN: &[u8] = b"desklink-packet-key-v1";
 const PACKET_AAD_DOMAIN: &[u8] = b"desklink-packet-v1";
+const VIDEO_PATH_BINDING_DOMAIN: &[u8] = b"desklink-video-path-binding-v1";
 const PACKET_SEQUENCE_BYTES: usize = 8;
 const PACKET_TAG_BYTES: usize = 16;
 const PACKET_OVERHEAD_BYTES: usize = PACKET_SEQUENCE_BYTES + PACKET_TAG_BYTES;
@@ -359,6 +360,7 @@ pub struct SecureSession {
     outbound: [PacketCipher; SecureLane::COUNT],
     inbound: [PacketCipher; SecureLane::COUNT],
     peer_identity: PeerIdentity,
+    video_path_binding: [u8; 16],
 }
 
 impl SecureSession {
@@ -376,6 +378,14 @@ impl SecureSession {
 
     pub const fn peer_identity(&self) -> PeerIdentity {
         self.peer_identity
+    }
+
+    /// Returns a per-Noise-session binding for authenticated LAN video
+    /// candidates. The binding is derived from the session secret but does
+    /// not expose that secret, so a candidate from an earlier connection
+    /// cannot be reused on a later one.
+    pub const fn video_path_binding(&self) -> [u8; 16] {
+        self.video_path_binding
     }
 }
 
@@ -605,6 +615,12 @@ impl TransportCipher {
     }
 
     pub fn into_secure_session(self, role: SecureRole) -> SecureSession {
+        let mut binding_hasher = Blake2s256::new();
+        binding_hasher.update(VIDEO_PATH_BINDING_DOMAIN);
+        binding_hasher.update(self.session_key.as_bytes());
+        let binding_digest = binding_hasher.finalize();
+        let mut video_path_binding = [0; 16];
+        video_path_binding.copy_from_slice(&binding_digest[..16]);
         let (outbound_direction, inbound_direction) = match role {
             SecureRole::Initiator => (0, 1),
             SecureRole::Responder => (1, 0),
@@ -623,6 +639,7 @@ impl TransportCipher {
             outbound,
             inbound,
             peer_identity: self.peer_identity,
+            video_path_binding,
         }
     }
 }

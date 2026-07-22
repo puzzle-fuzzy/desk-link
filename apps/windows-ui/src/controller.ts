@@ -30,6 +30,7 @@ import {
   sendControllerInput,
   sendControllerClipboard,
   setControllerAudioEnabled,
+  setControllerVideoProfile,
   setControllerVideoQuality,
   sendControllerText,
 } from "./api";
@@ -61,11 +62,14 @@ import type {
   ControllerSignal,
   ControllerSnapshot,
   ControllerVideoConfigSignal,
+  H264ProfileFallbackReason,
+  H264ProfileProbe,
   RemoteDisplaySummary,
+  VideoPathKind,
   VideoQualityPreference,
   VideoQualityPreset,
 } from "./types";
-import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
+import { h264CodecFromSequenceHeader, h264ProfileFromCodec, videoConfigKey } from "./video-config";
 import { readLittleEndianTimestamp } from "./video-timestamp";
 import { deviceIdsMatch, formatLastUsed } from "./saved-device";
 import { RemoteInputDispatcher } from "./remote-input-dispatcher";
@@ -81,6 +85,7 @@ import { isH264Keyframe, prepareH264AccessUnit } from "./h264-annex-b";
 import { RemoteAudioPlayer } from "./remote-audio";
 import {
   loadRemoteScaleMode,
+  nativeCanvasCssSize,
   normalizeRemoteScaleMode,
   saveRemoteScaleMode,
   type RemoteScaleMode,
@@ -167,7 +172,8 @@ let pendingVideoFrame: VideoFrame | null = null;
 let videoPaintFrame: number | null = null;
 let receivedVideoFrames = 0;
 let submittedVideoFrames = 0;
-let relayCompletedFrames = 0;
+let transportCompletedFrames = 0;
+let activeVideoPath: VideoPathKind = "relay";
 let malformedVideoFrames = 0;
 let decoderRecoveries = 0;
 let videoPullFailures = 0;
@@ -252,6 +258,10 @@ let videoQualityPreference: VideoQualityPreference = "automatic";
 let appliedVideoQuality: VideoQualityPreset = "sharp";
 let pendingVideoQuality: VideoQualityPreference | null = null;
 let videoQualityAckTimer: number | null = null;
+let highProfileFallbackRequested = false;
+let h264ProfileProbe: H264ProfileProbe = "notChecked";
+let h264ProfileProbeMs: number | null = null;
+let h264ProfileFallbackReason: H264ProfileFallbackReason | null = null;
 let remoteSurfaceState: ControllerRemoteSurfaceState = "empty";
 const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
   sendControllerInput({ ...input, streamId })
@@ -281,7 +291,8 @@ function resetVideoTelemetry(): void {
   pendingVideoKeyframe = null;
   receivedVideoFrames = 0;
   submittedVideoFrames = 0;
-  relayCompletedFrames = 0;
+  transportCompletedFrames = 0;
+  activeVideoPath = "relay";
   malformedVideoFrames = 0;
   decodedFrames = 0;
   decoderRecoveries = 0;
@@ -290,6 +301,9 @@ function resetVideoTelemetry(): void {
   videoConfigReceivedAtMs = null;
   firstFrameMs = null;
   lastRenderMetricsReportedAtMs = 0;
+  h264ProfileProbe = "notChecked";
+  h264ProfileProbeMs = null;
+  h264ProfileFallbackReason = null;
   videoRenderTiming.reset();
 }
 
@@ -383,7 +397,8 @@ export function renderControllerView(): string {
     <div class="controller-stack">
       ${feedback ? renderFeedback(feedback) : ""}
       <div class="controller-heading">
-        <div>
+        <div class="controller-heading-copy">
+          <span class="editorial-kicker">01 / REMOTE CONTROL</span>
           <h1>连接设备</h1>
           <p>输入对方电脑显示的设备 ID 和访问密码，然后在对方电脑上确认连接。</p>
         </div>
@@ -698,7 +713,7 @@ function renderConnectionPanel(): string {
       <div class="controller-connect-column controller-connect-column--new">
         <section class="controller-card controller-card--primary controller-card--manual">
           <div class="controller-card-heading">
-            <div><h2>${hasQuickConnections ? "连接新的设备" : "连接远程设备"}</h2><p>输入另一台电脑显示的本机 ID，以及临时密码或固定密码。</p></div>
+            <div><span class="card-index">01</span><h2>${hasQuickConnections ? "连接新的设备" : "连接远程设备"}</h2><p>输入另一台电脑显示的本机 ID，以及临时密码或固定密码。</p></div>
           </div>
           <form class="controller-form controller-device-form" data-controller-device-form>
             <label class="field device-credential-field">
@@ -784,7 +799,7 @@ function renderSavedDevices(isWorking: boolean): string {
   return `
     <aside class="saved-devices-panel" aria-label="可直接连接的设备">
       <div class="saved-devices-heading">
-        <div><h2>已保存设备</h2><p>选择使用过的电脑，直接开始连接。</p></div>
+        <div><span class="editorial-kicker">02 / RECENT DEVICES</span><h2>已保存设备</h2><p>选择使用过的电脑，直接开始连接。</p></div>
         ${snapshot?.savedDevicesError ? `<button type="button" data-controller-saved-devices-clear ${isWorking ? "disabled" : ""}>清除异常记录</button>` : ""}
       </div>
       ${snapshot?.savedDevicesError ? `<p class="inline-error">${escapeHtml(snapshot.savedDevicesError)}</p>` : ""}
@@ -962,7 +977,7 @@ function renderRemoteDesktop(): string {
             <span class="sr-only">远程画面缩放</span>
             <select data-controller-scale aria-label="远程画面缩放">
               <option value="fit" ${remoteScaleMode === "fit" ? "selected" : ""}>适应</option>
-              <option value="actual" ${remoteScaleMode === "actual" ? "selected" : ""}>1:1</option>
+              <option value="actual" ${remoteScaleMode === "actual" ? "selected" : ""}>1:1 原始像素</option>
             </select>
           </label>
           <button class="toolbar-button${remotePanMode ? " toolbar-button--active" : ""}" type="button" data-controller-pan aria-pressed="${remotePanMode}" ${remoteScaleMode === "actual" ? "" : "disabled"} title="${remoteScaleMode === "actual" ? (remotePanMode ? "恢复向远程电脑发送鼠标和键盘输入" : "只在本地拖动或滚动画面，不会操作远程电脑") : "切换到 1:1 后可以浏览超出窗口的画面"}">${icon("hand")}${remotePanMode ? "继续控制" : "浏览画面"}</button>
@@ -1533,6 +1548,10 @@ function handleSignal(signal: ControllerSignal): void {
         videoSequenceHeader = Uint8Array.from(signal.sequenceHeader);
         resetVideoTelemetry();
         videoConfigReceivedAtMs = Date.now();
+        highProfileFallbackRequested = false;
+        h264ProfileProbe = "notChecked";
+        h264ProfileProbeMs = null;
+        h264ProfileFallbackReason = null;
       }
       videoConfig = signal;
       if (changed || !document.querySelector("[data-remote-canvas]")) {
@@ -1581,7 +1600,8 @@ function handleSignal(signal: ControllerSignal): void {
       break;
     }
     case "metrics": {
-      relayCompletedFrames = signal.completedFrames;
+      transportCompletedFrames = signal.completedFrames;
+      activeVideoPath = signal.videoPath;
       updateVideoStartingMessage();
       reportRenderMetrics();
       break;
@@ -2329,7 +2349,7 @@ function setupRemoteDesktop(): void {
   }
   setupRemoteGeometry(viewport, canvas);
   scheduleRemoteScaleLayout(viewport, canvas, remoteScaleMode === "actual");
-  startVideoDecoder(canvas, context, configKey, "hardware");
+  void startVideoDecoder(canvas, context, configKey, "hardware");
   videoPull.start(
     { streamId: config.streamId, configVersion: config.configVersion },
     nextControllerVideoFrame,
@@ -2411,7 +2431,7 @@ function restartVideoDecoderForFreshness(
   if (!canvas || !context) {
     return;
   }
-  startVideoDecoder(canvas, context, configKey, preference);
+  void startVideoDecoder(canvas, context, configKey, preference);
 }
 
 function armVideoPlaybackPressureReporter(streamId: number): void {
@@ -2467,7 +2487,7 @@ function updateVideoStartingMessage(): void {
   if (!waiting) {
     return;
   }
-  if (relayCompletedFrames > 0 && receivedVideoFrames === 0) {
+  if (transportCompletedFrames > 0 && receivedVideoFrames === 0) {
     waiting.textContent = "中继已收到远程画面，正在交付给本机显示组件。";
   } else if (receivedVideoFrames > 0 && submittedVideoFrames === 0) {
     waiting.textContent = "本机已收到视频，正在等待可解码的关键帧。";
@@ -2478,12 +2498,12 @@ function updateVideoStartingMessage(): void {
   }
 }
 
-function startVideoDecoder(
+async function startVideoDecoder(
   canvas: HTMLCanvasElement,
   context: CanvasRenderingContext2D,
   configKey: string,
   preference: "hardware" | "software",
-): void {
+): Promise<void> {
   releaseVideoDecoder();
   const generation = decoderGeneration;
   decoderPreference = preference;
@@ -2538,7 +2558,7 @@ function startVideoDecoder(
                 reportRenderMetrics(true);
               }
             } catch {
-              fallbackOrFailVideo(configKey, preference);
+              fallbackOrFailVideo(configKey, preference, "decoderError");
             } finally {
               nextFrame.close();
             }
@@ -2547,20 +2567,48 @@ function startVideoDecoder(
       },
       error: () => {
         if (generation === decoderGeneration && decoder === nextDecoder) {
-          fallbackOrFailVideo(configKey, preference);
+          fallbackOrFailVideo(configKey, preference, "decoderError");
         }
       },
     });
     decoder = nextDecoder;
-    nextDecoder.configure({
-      codec: h264CodecFromSequenceHeader(videoSequenceHeader),
+    const codec = h264CodecFromSequenceHeader(videoSequenceHeader);
+    const h264Profile = h264ProfileFromCodec(codec);
+    const decoderConfig = {
+      codec,
       codedWidth: videoConfig?.width ?? canvas.width,
       codedHeight: videoConfig?.height ?? canvas.height,
       hardwareAcceleration: preference === "hardware" ? "prefer-hardware" : "prefer-software",
       optimizeForLatency: true,
-    });
+    } as const;
+    if (h264Profile === "high" && typeof VideoDecoder.isConfigSupported === "function") {
+      const probeStartedAt = performance.now();
+      try {
+        const support = await VideoDecoder.isConfigSupported(decoderConfig);
+        h264ProfileProbe = support.supported ? "supported" : "unsupported";
+        h264ProfileProbeMs = Math.max(0, Math.round(performance.now() - probeStartedAt));
+        if (!support.supported) {
+          releaseVideoDecoder();
+          await requestMainProfileFallback(configKey, "decoderUnsupported");
+          return;
+        }
+      } catch {
+        h264ProfileProbe = "unavailable";
+        h264ProfileProbeMs = Math.max(0, Math.round(performance.now() - probeStartedAt));
+      }
+    } else if (h264Profile === "high") {
+      h264ProfileProbe = "unavailable";
+      h264ProfileProbeMs = null;
+    }
+    if (generation !== decoderGeneration || decoder !== nextDecoder) {
+      if (nextDecoder.state !== "closed") {
+        nextDecoder.close();
+      }
+      return;
+    }
+    nextDecoder.configure(decoderConfig);
   } catch {
-    fallbackOrFailVideo(configKey, preference);
+    fallbackOrFailVideo(configKey, preference, "decoderError");
     return;
   }
   const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting] p");
@@ -2594,12 +2642,43 @@ function armDecoderStallWatch(): void {
       && decodedFrames === decoderRenderedBaseline
       && decoderSubmittedSinceStart > 0
     ) {
-      fallbackOrFailVideo(configKey, preference);
+      fallbackOrFailVideo(configKey, preference, "decoderStall");
     }
   }, preference === "hardware" ? 1_500 : 3_000);
 }
 
-function fallbackOrFailVideo(configKey: string, preference: "hardware" | "software"): void {
+async function requestMainProfileFallback(
+  configKey: string,
+  reason: H264ProfileFallbackReason,
+): Promise<void> {
+  if (
+    highProfileFallbackRequested
+    || !videoConfig
+    || videoConfigKey(videoConfig) !== configKey
+    || h264ProfileFromCodec(h264CodecFromSequenceHeader(videoSequenceHeader)) !== "high"
+  ) {
+    return;
+  }
+  highProfileFallbackRequested = true;
+  h264ProfileFallbackReason = reason;
+  const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting] p");
+  if (waiting) {
+    waiting.textContent = "当前解码器不支持高画质视频，正在切换兼容模式。";
+  }
+  try {
+    await setControllerVideoProfile("main");
+    await requestControllerKeyframe();
+  } catch (error) {
+    highProfileFallbackRequested = false;
+    showOperationError(error);
+  }
+}
+
+function fallbackOrFailVideo(
+  configKey: string,
+  preference: "hardware" | "software",
+  reason: H264ProfileFallbackReason,
+): void {
   if (!videoConfig || videoConfigKey(videoConfig) !== configKey) {
     return;
   }
@@ -2609,12 +2688,17 @@ function fallbackOrFailVideo(configKey: string, preference: "hardware" | "softwa
   decoderRecoveries += 1;
   consecutiveDecoderStalls += 1;
   reportRenderMetrics(true);
+  if (h264ProfileFromCodec(h264CodecFromSequenceHeader(videoSequenceHeader)) === "high") {
+    void requestMainProfileFallback(configKey, reason);
+    releaseVideoDecoder();
+    return;
+  }
   if (preference === "hardware") {
     const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
       const context = canvas?.getContext("2d", { alpha: false, desynchronized: true });
     if (canvas && context) {
       decoderPreference = "software";
-      queueMicrotask(() => startVideoDecoder(canvas, context, configKey, "software"));
+      queueMicrotask(() => { void startVideoDecoder(canvas, context, configKey, "software"); });
       return;
     }
   }
@@ -2623,7 +2707,7 @@ function fallbackOrFailVideo(configKey: string, preference: "hardware" | "softwa
     const context = canvas?.getContext("2d", { alpha: false, desynchronized: true });
     if (canvas && context) {
       releaseVideoDecoder();
-      queueMicrotask(() => startVideoDecoder(canvas, context, configKey, "software"));
+      queueMicrotask(() => { void startVideoDecoder(canvas, context, configKey, "software"); });
       return;
     }
   }
@@ -2647,8 +2731,12 @@ function reportRenderMetrics(force = false): void {
   }
   lastRenderMetricsReportedAtMs = now;
   const renderTiming = videoRenderTiming.snapshot(performance.now());
+  const h264Profile = h264ProfileFromCodec(h264CodecFromSequenceHeader(videoSequenceHeader));
   void reportControllerRenderMetrics({
     streamId: videoConfig.streamId,
+    videoWidth: videoConfig.width,
+    videoHeight: videoConfig.height,
+    videoPath: activeVideoPath,
     receivedFrames: receivedVideoFrames,
     submittedFrames: submittedVideoFrames,
     displayedFrames: decodedFrames,
@@ -2659,6 +2747,10 @@ function reportRenderMetrics(force = false): void {
     displayedFpsX100: renderTiming.displayedFpsX100,
     maxFrameGapMs: renderTiming.maxFrameGapMs,
     coalescedFrameDrops: renderTiming.coalescedFrameDrops,
+    h264Profile,
+    profileProbe: h264Profile === "high" ? h264ProfileProbe : "notChecked",
+    profileProbeMs: h264Profile === "high" ? h264ProfileProbeMs : null,
+    profileFallbackReason: h264ProfileFallbackReason,
   }).catch(() => {
     // Diagnostics must never interrupt a live remote-control session.
   });
@@ -2904,6 +2996,7 @@ function scheduleRemoteScaleLayout(
     if (!viewport.isConnected || !canvas.isConnected) {
       return;
     }
+    syncRemoteCanvasPixelSize(canvas);
     if (center) {
       viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
       viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
@@ -2912,7 +3005,30 @@ function scheduleRemoteScaleLayout(
     remoteViewportBounds = viewport.getBoundingClientRect();
     remoteViewportScrollLeft = viewport.scrollLeft;
     remoteViewportScrollTop = viewport.scrollTop;
+    syncRemoteCanvasFitState(viewport, canvas);
   });
+}
+
+function syncRemoteCanvasFitState(viewport: HTMLElement, canvas: HTMLCanvasElement): void {
+  if (remoteScaleMode !== "actual") {
+    delete viewport.dataset.canvasFits;
+    return;
+  }
+  viewport.dataset.canvasFits = canvas.scrollWidth <= viewport.clientWidth
+    && canvas.scrollHeight <= viewport.clientHeight
+    ? "true"
+    : "false";
+}
+
+function syncRemoteCanvasPixelSize(canvas: HTMLCanvasElement): void {
+  if (remoteScaleMode !== "actual") {
+    canvas.style.removeProperty("width");
+    canvas.style.removeProperty("height");
+    return;
+  }
+  const ratio = typeof window.devicePixelRatio === "number" ? window.devicePixelRatio : 1;
+  canvas.style.width = `${nativeCanvasCssSize(canvas.width, ratio)}px`;
+  canvas.style.height = `${nativeCanvasCssSize(canvas.height, ratio)}px`;
 }
 
 function clearVideoQualityAckTimer(): void {
@@ -3320,10 +3436,12 @@ function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): 
   remoteCanvasElement = canvas;
   remoteCursorElement = document.querySelector<HTMLElement>("[data-remote-cursor]");
   const refresh = () => {
+    syncRemoteCanvasPixelSize(canvas);
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
     remoteViewportScrollLeft = viewport.scrollLeft;
     remoteViewportScrollTop = viewport.scrollTop;
+    syncRemoteCanvasFitState(viewport, canvas);
   };
   const handleScroll = () => {
     const nextScrollLeft = viewport.scrollLeft;

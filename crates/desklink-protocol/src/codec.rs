@@ -6,6 +6,7 @@ use crate::{
     MAX_MVP_WIDTH, MAX_NOISE_HANDSHAKE_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES, MAX_POINTER_COORDINATE,
     MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_BYTES, MAX_WHEEL_DELTA,
     NoiseHandshake, PROTOCOL_VERSION, TransferMessage, VideoConfig, VideoFrameHeader, VideoPacket,
+    is_private_or_loopback_address,
 };
 use thiserror::Error;
 
@@ -39,6 +40,8 @@ pub enum ProtocolError {
     InvalidDisplayList,
     #[error("invalid clipboard or file transfer message")]
     InvalidTransfer,
+    #[error("invalid direct video message")]
+    InvalidDirectVideoMessage,
 }
 
 pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
@@ -52,6 +55,7 @@ pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError
     {
         validate_display_list(displays, *active_display_id)?;
     }
+    validate_direct_video_control(message)?;
     let bytes = postcard::to_allocvec(message).map_err(|_| ProtocolError::Malformed)?;
     bounded(bytes, MAX_CONTROL_MESSAGE_BYTES)
 }
@@ -68,7 +72,43 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
     {
         validate_display_list(displays, *active_display_id)?;
     }
+    validate_direct_video_control(&message)?;
     Ok(message)
+}
+
+fn validate_direct_video_control(message: &ControlMessage) -> Result<(), ProtocolError> {
+    match message {
+        ControlMessage::VideoPathCandidateOffer { candidate } => {
+            if candidate.candidate_id() == 0
+                || candidate.address().port() == 0
+                || !is_private_or_loopback_address(candidate.address().ip())
+                || candidate.expires_at_unix_s() == 0
+                || candidate.session_binding() == &[0; 16]
+            {
+                return Err(ProtocolError::InvalidDirectVideoMessage);
+            }
+        }
+        ControlMessage::VideoPathCandidateAnswer {
+            candidate_id,
+            accepted,
+            candidate,
+        } => {
+            if *candidate_id == 0 || (*accepted && candidate.is_none()) {
+                return Err(ProtocolError::InvalidDirectVideoMessage);
+            }
+            if let Some(candidate) = candidate
+                && (candidate.candidate_id() == 0
+                    || candidate.address().port() == 0
+                    || !is_private_or_loopback_address(candidate.address().ip())
+                    || candidate.expires_at_unix_s() == 0
+                    || candidate.session_binding() == &[0; 16])
+            {
+                return Err(ProtocolError::InvalidDirectVideoMessage);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn encode_transfer(message: &TransferMessage) -> Result<Vec<u8>, ProtocolError> {

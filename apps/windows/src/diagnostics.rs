@@ -9,6 +9,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use desklink_protocol::H264Profile;
+use serde::Deserialize;
+
 use crate::storage::{downloads_path, local_app_data_path};
 
 use thiserror::Error;
@@ -82,6 +85,44 @@ impl DiagnosticOperation {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum H264ProfileProbe {
+    NotChecked,
+    Supported,
+    Unsupported,
+    Unavailable,
+}
+
+impl H264ProfileProbe {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotChecked => "notChecked",
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum H264ProfileFallbackReason {
+    DecoderUnsupported,
+    DecoderError,
+    DecoderStall,
+}
+
+impl H264ProfileFallbackReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DecoderUnsupported => "decoderUnsupported",
+            Self::DecoderError => "decoderError",
+            Self::DecoderStall => "decoderStall",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiagnosticEvent {
     ControlSurfaceStarted,
@@ -120,6 +161,9 @@ pub enum DiagnosticEvent {
     },
     ControllerRenderMetrics {
         stream_id: u64,
+        video_width: u16,
+        video_height: u16,
+        video_path: String,
         received_frames: u64,
         submitted_frames: u64,
         displayed_frames: u64,
@@ -130,6 +174,10 @@ pub enum DiagnosticEvent {
         displayed_fps_x100: Option<u32>,
         max_frame_gap_ms: Option<u64>,
         coalesced_frame_drops: u64,
+        h264_profile: H264Profile,
+        profile_probe: H264ProfileProbe,
+        profile_probe_ms: Option<u64>,
+        profile_fallback_reason: Option<H264ProfileFallbackReason>,
     },
 }
 
@@ -394,6 +442,9 @@ fn encode_event(event: &DiagnosticEvent) -> String {
         }
         DiagnosticEvent::ControllerRenderMetrics {
             stream_id,
+            video_width,
+            video_height,
+            video_path,
             received_frames,
             submitted_frames,
             displayed_frames,
@@ -404,6 +455,10 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             displayed_fps_x100,
             max_frame_gap_ms,
             coalesced_frame_drops,
+            h264_profile,
+            profile_probe,
+            profile_probe_ms,
+            profile_fallback_reason,
         } => {
             let first_frame_ms = first_frame_ms
                 .map_or_else(String::new, |value| format!(",\"first_frame_ms\":{value}"));
@@ -413,8 +468,27 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             let max_frame_gap_ms = max_frame_gap_ms.map_or_else(String::new, |value| {
                 format!(",\"max_frame_gap_ms\":{value}")
             });
+            let h264_profile = match h264_profile {
+                H264Profile::Main => "main",
+                H264Profile::High => "high",
+            };
+            let profile_probe =
+                format!(",\"profile_probe\":{}", json_string(profile_probe.as_str()));
+            let profile_probe_ms = profile_probe_ms.map_or_else(String::new, |value| {
+                format!(",\"profile_probe_ms\":{value}")
+            });
+            let profile_fallback_reason =
+                profile_fallback_reason
+                    .as_ref()
+                    .map_or_else(String::new, |reason| {
+                        format!(
+                            ",\"profile_fallback_reason\":{}",
+                            json_string(reason.as_str())
+                        )
+                    });
+            let video_path = json_string(&bounded_redacted_text(video_path));
             format!(
-                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures},\"coalesced_frame_drops\":{coalesced_frame_drops}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
+                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"video_width\":{video_width},\"video_height\":{video_height},\"video_path\":{video_path},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures},\"coalesced_frame_drops\":{coalesced_frame_drops},\"h264_profile\":\"{h264_profile}\"{profile_probe}{profile_probe_ms}{profile_fallback_reason}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
             )
         }
     };
@@ -698,6 +772,9 @@ mod tests {
         logger
             .record(&DiagnosticEvent::ControllerRenderMetrics {
                 stream_id: 7,
+                video_width: 2560,
+                video_height: 1440,
+                video_path: "relay".to_owned(),
                 received_frames: 90,
                 submitted_frames: 86,
                 displayed_frames: 82,
@@ -708,6 +785,10 @@ mod tests {
                 displayed_fps_x100: Some(2_970),
                 max_frame_gap_ms: Some(167),
                 coalesced_frame_drops: 4,
+                h264_profile: H264Profile::High,
+                profile_probe: H264ProfileProbe::Supported,
+                profile_probe_ms: Some(4),
+                profile_fallback_reason: None,
             })
             .unwrap();
 
@@ -715,6 +796,8 @@ mod tests {
         assert!(contents.contains("\"event\":\"controller_render_metrics\""));
         assert!(contents.contains("\"stream_id\":7"));
         assert!(contents.contains("\"displayed_frames\":82"));
+        assert!(contents.contains("\"h264_profile\":\"high\""));
+        assert!(contents.contains("\"profile_probe\":\"supported\""));
         assert!(contents.contains("\"decoder_recoveries\":2"));
         assert!(contents.contains("\"video_pull_failures\":2"));
         assert!(contents.contains("\"first_frame_ms\":740"));

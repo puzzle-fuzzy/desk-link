@@ -28,6 +28,14 @@ python scripts/deploy-diagnostics-service.py
 
 部署脚本创建不可变版本目录、原子切换 `current`、安装受限 systemd 服务、校验 Nginx 后再重载，并执行本机健康检查。
 
+如果服务本机 health 正常但公网 health 返回 404，说明 Nginx 入口可能因历史手工部署发生漂移。可以运行一次可回滚的入口修复：
+
+```powershell
+python scripts/repair-managed-diagnostics-ingress.py
+```
+
+脚本会从服务器当前 release 读取精确 location，备份站点配置，验证 `nginx -T` 已加载诊断路由，并要求公网 health 连续三次返回 `status=ok`；任何一步失败都会恢复原配置。修复完成后仍应运行 `python scripts/audit-managed-diagnostics.py`，正式版本部署继续使用上面的干净提交部署脚本。
+
 0.1.60 新增视频邮箱交付与前端拉取失败字段。诊断服务必须先从包含这些字段的干净 commit 完成部署，再向开启“共享脱敏诊断”的用户分发 0.1.60；否则服务端会按严格字段白名单拒绝新批次。诊断开关默认关闭，未部署新版服务不会影响远程控制本身。
 
 GitHub Actions 每半小时从外部生成临时 Ed25519 身份并提交一个签名探针批次，同时验证公网 HTTPS、签名校验、字段验证和服务端写入路径。
