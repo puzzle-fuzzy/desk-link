@@ -157,6 +157,10 @@ let decoderStallTimer: number | null = null;
 let decoderRenderedBaseline = 0;
 let decoderSubmittedSinceStart = 0;
 let awaitingDecoderKeyframe = true;
+// Tauri delivers the SPS/PPS sequence header as a number array. Convert it
+// once per video configuration instead of allocating a Uint8Array for every
+// decoded access unit.
+let videoSequenceHeader = new Uint8Array();
 let pendingVideoKeyframe: Uint8Array | null = null;
 let pendingVideoFrame: VideoFrame | null = null;
 let videoPaintFrame: number | null = null;
@@ -1225,6 +1229,7 @@ async function beginConnection(
   attemptTarget = target;
   remoteSurfaceState = "empty";
   videoConfig = null;
+  videoSequenceHeader = new Uint8Array();
   failedVideoConfig = null;
   remoteAudio.release();
   audioStatus = "starting";
@@ -1323,6 +1328,7 @@ async function cancelConnection(): Promise<void> {
   audioStatus = "starting";
   audioMessage = "正在准备远端系统声音。";
   videoConfig = null;
+  videoSequenceHeader = new Uint8Array();
   resetVideoTelemetry();
   activeChannels = null;
   feedback = { tone: "info", message: wasConnected ? "正在断开远程控制…" : "正在取消本次连接…" };
@@ -1479,6 +1485,7 @@ function handleSignal(signal: ControllerSignal): void {
         setFileDragActive(false);
         if (!keepRemoteSurface) {
           videoConfig = null;
+          videoSequenceHeader = new Uint8Array();
           failedVideoConfig = null;
           resetVideoTelemetry();
           remoteDisplays = [];
@@ -1521,6 +1528,7 @@ function handleSignal(signal: ControllerSignal): void {
     case "videoConfig": {
       const changed = !videoConfig || videoConfigKey(videoConfig) !== videoConfigKey(signal);
       if (changed) {
+        videoSequenceHeader = Uint8Array.from(signal.sequenceHeader);
         resetVideoTelemetry();
         videoConfigReceivedAtMs = Date.now();
       }
@@ -2370,7 +2378,7 @@ function submitVideoChunk(bytes: Uint8Array): void {
   }
   const timestamp = Number(view.getBigUint64(1, true));
   const data = prepareH264AccessUnit(
-    new Uint8Array(videoConfig.sequenceHeader),
+    videoSequenceHeader,
     accessUnit,
     keyframe,
   );
@@ -2544,7 +2552,7 @@ function startVideoDecoder(
     });
     decoder = nextDecoder;
     nextDecoder.configure({
-      codec: h264CodecFromSequenceHeader(new Uint8Array(videoConfig?.sequenceHeader ?? [])),
+      codec: h264CodecFromSequenceHeader(videoSequenceHeader),
       codedWidth: videoConfig?.width ?? canvas.width,
       codedHeight: videoConfig?.height ?? canvas.height,
       hardwareAcceleration: preference === "hardware" ? "prefer-hardware" : "prefer-software",
