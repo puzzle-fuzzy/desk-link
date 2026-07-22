@@ -49,10 +49,10 @@ import {
   keyboardModifierMask,
   keyboardModifiers,
   mouseButton,
-  normalizedPointerPosition,
   remoteCursorContentPosition,
   scrolledPointerBounds,
   type PointerBounds,
+  writeNormalizedPointerPosition,
 } from "./remote-input";
 import type {
   ControllerInput,
@@ -2952,16 +2952,17 @@ const pressedKeys = new RemoteKeyboardState();
 const pressedButtons = new Set<"left" | "right" | "middle">();
 
 function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void {
-  let pendingPoint: { x: number; y: number } | null = null;
+  const pendingPoint = { x: 0, y: 0 };
+  let hasPendingPoint = false;
   let panDrag: (RemotePanOrigin & { pointerId: number }) | null = null;
   const sendPendingPoint = () => {
     if (pointerFrame !== null) {
       window.cancelAnimationFrame(pointerFrame);
     }
     pointerFrame = null;
-    if (pendingPoint) {
-      fireInput({ kind: "mouseMove", ...pendingPoint });
-      pendingPoint = null;
+    if (hasPendingPoint) {
+      fireInput({ kind: "mouseMove", x: pendingPoint.x, y: pendingPoint.y });
+      hasPendingPoint = false;
     }
   };
   const discardPendingPoint = () => {
@@ -2969,7 +2970,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       window.cancelAnimationFrame(pointerFrame);
       pointerFrame = null;
     }
-    pendingPoint = null;
+    hasPendingPoint = false;
   };
   const finishPanDrag = () => {
     if (panDrag && viewport.hasPointerCapture(panDrag.pointerId)) {
@@ -3001,11 +3002,10 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       }
       return;
     }
-    const point = pointerPosition(event, canvas);
-    if (!point) {
+    if (!writePointerPosition(event, canvas, pendingPoint)) {
       return;
     }
-    pendingPoint = point;
+    hasPendingPoint = true;
     if (pointerFrame === null) {
       pointerFrame = window.requestAnimationFrame(sendPendingPoint);
     }
@@ -3045,14 +3045,13 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     }
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
-    const point = pointerPosition(event, canvas);
-    if (!point) {
+    if (!writePointerPosition(event, canvas, pendingPoint)) {
       return;
     }
     event.preventDefault();
     viewport.focus({ preventScroll: true });
     viewport.setPointerCapture(event.pointerId);
-    pendingPoint = point;
+    hasPendingPoint = true;
     sendPendingPoint();
     pressedButtons.add(button);
     fireInput({ kind: "mouseButton", button, pressed: true });
@@ -3071,9 +3070,8 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       return;
     }
     event.preventDefault();
-    const point = pointerPosition(event, canvas);
-    if (point) {
-      pendingPoint = point;
+    if (writePointerPosition(event, canvas, pendingPoint)) {
+      hasPendingPoint = true;
       sendPendingPoint();
     }
     pressedButtons.delete(button);
@@ -3264,9 +3262,13 @@ function closeTextInput(): void {
   viewport?.focus({ preventScroll: true });
 }
 
-function pointerPosition(event: PointerEvent, canvas: HTMLCanvasElement): { x: number; y: number } | null {
+function writePointerPosition(
+  event: PointerEvent,
+  canvas: HTMLCanvasElement,
+  target: { x: number; y: number },
+): boolean {
   const bounds = remoteCanvasBounds ?? readRemoteCanvasBounds(canvas);
-  return normalizedPointerPosition(event.clientX, event.clientY, bounds);
+  return writeNormalizedPointerPosition(event.clientX, event.clientY, bounds, target);
 }
 
 function updateRemoteCursor(x: number, y: number, visible: boolean): void {

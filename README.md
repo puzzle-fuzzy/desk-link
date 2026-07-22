@@ -127,6 +127,8 @@ python scripts/verify-managed-relay.py
 
 0.1.80 继续使用协议 9；控制端在视频配置变化时缓存 SPS/PPS 字节，并用无对象分配的整数读取替代每帧 DataView，降低 WebView2 垃圾回收压力；公网中继无需升级。
 
+0.1.81 继续使用协议 9；控制端复用高频鼠标移动的归一化坐标存储，只在动画帧发送时创建输入对象，降低高轮询率鼠标在 WebView2 主线程上的短命对象数量；公网中继无需升级。
+
 ## Windows 安装包
 
 ```powershell

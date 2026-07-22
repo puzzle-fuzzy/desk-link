@@ -10,6 +10,7 @@ import {
   normalizedPointerPosition,
   remoteCursorContentPosition,
   scrolledPointerBounds,
+  writeNormalizedPointerPosition,
 } from "./remote-input";
 
 describe("remote keyboard mapping", () => {
@@ -83,6 +84,24 @@ describe("remote pointer mapping", () => {
     expect(normalizedPointerPosition(720, 360, canvas)).toEqual({ x: 500_000, y: 500_000 });
     expect(normalizedPointerPosition(1_200, 630, canvas)).toEqual({ x: 1_000_000, y: 1_000_000 });
     expect(normalizedPointerPosition(200, 360, canvas)).toBeNull();
+  });
+
+  test("writes into caller-owned storage for high-frequency pointer moves", () => {
+    const target = { x: -1, y: -1 };
+    expect(writeNormalizedPointerPosition(720, 360, {
+      left: 240,
+      top: 90,
+      width: 960,
+      height: 540,
+    }, target)).toBe(true);
+    expect(target).toEqual({ x: 500_000, y: 500_000 });
+    expect(writeNormalizedPointerPosition(200, 360, {
+      left: 240,
+      top: 90,
+      width: 960,
+      height: 540,
+    }, target)).toBe(false);
+    expect(target).toEqual({ x: 500_000, y: 500_000 });
   });
 
   test("keeps fractional high-DPI canvas bounds accurate", () => {

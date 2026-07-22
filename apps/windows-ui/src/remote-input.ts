@@ -3,6 +3,11 @@ export const MAX_WHEEL_DELTA = 1_200;
 
 export type PointerBounds = Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">;
 
+export interface NormalizedPointerPosition {
+  x: number;
+  y: number;
+}
+
 export function scrolledPointerBounds(
   bounds: PointerBounds,
   previousScrollLeft: number,
@@ -40,7 +45,23 @@ export function normalizedPointerPosition(
   clientX: number,
   clientY: number,
   bounds: PointerBounds,
-): { x: number; y: number } | null {
+): NormalizedPointerPosition | null {
+  const position: NormalizedPointerPosition = { x: 0, y: 0 };
+  return writeNormalizedPointerPosition(clientX, clientY, bounds, position)
+    ? position
+    : null;
+}
+
+/**
+ * Writes a normalized coordinate into a caller-owned object so pointermove
+ * handlers can reuse storage instead of allocating once per hardware event.
+ */
+export function writeNormalizedPointerPosition(
+  clientX: number,
+  clientY: number,
+  bounds: PointerBounds,
+  target: NormalizedPointerPosition,
+): boolean {
   const right = bounds.left + bounds.width;
   const bottom = bounds.top + bounds.height;
   if (
@@ -51,14 +72,13 @@ export function normalizedPointerPosition(
     || clientY < bounds.top
     || clientY > bottom
   ) {
-    return null;
+    return false;
   }
   const x = Math.max(0, Math.min(1, (clientX - bounds.left) / bounds.width));
   const y = Math.max(0, Math.min(1, (clientY - bounds.top) / bounds.height));
-  return {
-    x: Math.round(x * MAX_POINTER_COORDINATE),
-    y: Math.round(y * MAX_POINTER_COORDINATE),
-  };
+  target.x = Math.round(x * MAX_POINTER_COORDINATE);
+  target.y = Math.round(y * MAX_POINTER_COORDINATE);
+  return true;
 }
 
 export function remoteCursorContentPosition(
