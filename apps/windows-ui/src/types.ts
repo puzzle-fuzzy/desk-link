@@ -240,6 +240,7 @@ export interface ControllerRenderMetrics {
   firstFrameMs: number | null;
   displayedFpsX100: number | null;
   maxFrameGapMs: number | null;
+  coalescedFrameDrops: number;
 }
 
 export interface ControllerPlaybackPressure {

@@ -129,6 +129,7 @@ pub enum DiagnosticEvent {
         first_frame_ms: Option<u64>,
         displayed_fps_x100: Option<u32>,
         max_frame_gap_ms: Option<u64>,
+        coalesced_frame_drops: u64,
     },
 }
 
@@ -402,6 +403,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             first_frame_ms,
             displayed_fps_x100,
             max_frame_gap_ms,
+            coalesced_frame_drops,
         } => {
             let first_frame_ms = first_frame_ms
                 .map_or_else(String::new, |value| format!(",\"first_frame_ms\":{value}"));
@@ -412,7 +414,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
                 format!(",\"max_frame_gap_ms\":{value}")
             });
             format!(
-                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
+                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures},\"coalesced_frame_drops\":{coalesced_frame_drops}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
             )
         }
     };
@@ -705,6 +707,7 @@ mod tests {
                 first_frame_ms: Some(740),
                 displayed_fps_x100: Some(2_970),
                 max_frame_gap_ms: Some(167),
+                coalesced_frame_drops: 4,
             })
             .unwrap();
 
@@ -717,6 +720,7 @@ mod tests {
         assert!(contents.contains("\"first_frame_ms\":740"));
         assert!(contents.contains("\"displayed_fps_x100\":2970"));
         assert!(contents.contains("\"max_frame_gap_ms\":167"));
+        assert!(contents.contains("\"coalesced_frame_drops\":4"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

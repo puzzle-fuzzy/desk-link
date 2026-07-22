@@ -2462,7 +2462,10 @@ function startVideoDecoder(
           return;
         }
         clearDecoderStallTimer();
-        pendingVideoFrame?.close();
+        if (pendingVideoFrame) {
+          pendingVideoFrame.close();
+          videoRenderTiming.recordCoalescedFrame();
+        }
         pendingVideoFrame = frame;
         if (videoPaintFrame === null) {
           videoPaintFrame = window.requestAnimationFrame(() => {
@@ -2618,6 +2621,7 @@ function reportRenderMetrics(force = false): void {
     firstFrameMs,
     displayedFpsX100: renderTiming.displayedFpsX100,
     maxFrameGapMs: renderTiming.maxFrameGapMs,
+    coalescedFrameDrops: renderTiming.coalescedFrameDrops,
   }).catch(() => {
     // Diagnostics must never interrupt a live remote-control session.
   });

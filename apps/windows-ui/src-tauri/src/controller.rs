@@ -503,6 +503,7 @@ pub struct ControllerRenderMetrics {
     first_frame_ms: Option<u64>,
     displayed_fps_x100: Option<u32>,
     max_frame_gap_ms: Option<u64>,
+    coalesced_frame_drops: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1772,6 +1773,7 @@ impl ControllerManager {
             || metrics
                 .max_frame_gap_ms
                 .is_some_and(|value| value > MAX_CONTROLLER_FRAME_GAP_MS)
+            || metrics.coalesced_frame_drops > metrics.submitted_frames
             || metrics
                 .first_frame_ms
                 .is_some_and(|value| value > 10 * 60 * 1_000)
@@ -1791,6 +1793,7 @@ impl ControllerManager {
                 first_frame_ms: metrics.first_frame_ms,
                 displayed_fps_x100: metrics.displayed_fps_x100,
                 max_frame_gap_ms: metrics.max_frame_gap_ms,
+                coalesced_frame_drops: metrics.coalesced_frame_drops,
             })
             .map_err(|_| "DeskLink 无法记录远程画面指标。".to_owned())
     }
@@ -4619,6 +4622,7 @@ mod tests {
                     first_frame_ms: Some(200),
                     displayed_fps_x100: Some(3_000),
                     max_frame_gap_ms: Some(67),
+                    coalesced_frame_drops: 2,
                 })
                 .is_err()
         );

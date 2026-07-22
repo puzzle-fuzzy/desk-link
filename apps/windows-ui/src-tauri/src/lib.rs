@@ -1296,12 +1296,19 @@ fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
     let gap_ms = render
         .get("max_frame_gap_ms")
         .and_then(serde_json::Value::as_u64);
+    let coalesced_frame_drops = render
+        .get("coalesced_frame_drops")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    findings.push(format!("本地显示合并帧: {coalesced_frame_drops}"));
 
     let diagnosis = if submitted > 0 && displayed == 0 {
         "判断线索: 视频已进入解码路径但尚未显示，优先检查 WebView2 解码能力。"
     } else if completed == 0 && delivered == 0 && received == 0 {
         "判断线索: 暂无持续视频交付证据，优先检查网络、中继会话或目标主机编码。"
-    } else if fps_x100.is_some_and(|value| value < 1_500) || gap_ms.is_some_and(|value| value > 250)
+    } else if fps_x100.is_some_and(|value| value < 1_500)
+        || gap_ms.is_some_and(|value| value > 250)
+        || (displayed > 0 && coalesced_frame_drops > displayed / 2)
     {
         "判断线索: 视频已交付但本地显示有积压，优先检查解码或 WebView2 渲染。"
     } else if completed > 0 && delivered > 0 {
@@ -1791,13 +1798,14 @@ mod tests {
     fn diagnostic_report_adds_video_performance_findings_without_raw_secrets() {
         let events = vec![
             "[控制端] {\"timestamp_unix_ms\":1000,\"event\":\"controller_video_metrics\",\"stream_id\":7,\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
-            "[控制端] {\"timestamp_unix_ms\":1100,\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":1240,\"max_frame_gap_ms\":420}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":1100,\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":1240,\"max_frame_gap_ms\":420,\"coalesced_frame_drops\":80}".to_owned(),
         ];
 
         let summary = build_video_performance_summary(&events).join("\n");
 
         assert!(summary.contains("本地显示帧率: 12.40 FPS"));
         assert!(summary.contains("本地最大帧间隔: 420 毫秒"));
+        assert!(summary.contains("本地显示合并帧: 80"));
         assert!(summary.contains("优先检查解码或 WebView2 渲染"));
         assert!(!summary.contains("session"));
     }

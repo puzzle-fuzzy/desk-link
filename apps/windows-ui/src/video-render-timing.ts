@@ -1,6 +1,7 @@
 export interface VideoRenderTimingSnapshot {
   displayedFpsX100: number | null;
   maxFrameGapMs: number | null;
+  coalescedFrameDrops: number;
 }
 
 const MAX_FRAME_GAP_MS = 60_000;
@@ -17,12 +18,18 @@ export class VideoRenderTiming {
   private firstPresentedAtMs: number | null = null;
   private previousPresentedAtMs: number | null = null;
   private maxGapMs = 0;
+  private coalescedFrameDrops = 0;
 
   reset(): void {
     this.displayedFrames = 0;
     this.firstPresentedAtMs = null;
     this.previousPresentedAtMs = null;
     this.maxGapMs = 0;
+    this.coalescedFrameDrops = 0;
+  }
+
+  recordCoalescedFrame(): void {
+    this.coalescedFrameDrops += 1;
   }
 
   observe(presentedAtMs: number): void {
@@ -53,6 +60,7 @@ export class VideoRenderTiming {
       return {
         displayedFpsX100: null,
         maxFrameGapMs: this.displayedFrames > 1 ? this.maxGapMs : null,
+        coalescedFrameDrops: this.coalescedFrameDrops,
       };
     }
     const elapsedMs = Math.max(1, nowMs - this.firstPresentedAtMs);
@@ -63,6 +71,7 @@ export class VideoRenderTiming {
     return {
       displayedFpsX100,
       maxFrameGapMs: this.maxGapMs,
+      coalescedFrameDrops: this.coalescedFrameDrops,
     };
   }
 }
