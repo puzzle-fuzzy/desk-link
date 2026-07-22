@@ -13,3 +13,13 @@ export function controllerRuntimeSurfaceChanged(
 ): boolean {
   return !previous || previous.state !== next.state || previous.streamId !== next.streamId;
 }
+
+export function canRetainRemoteSurface(
+  previous: ControllerRuntimeIdentity | null | undefined,
+  next: ControllerRuntimeIdentity,
+  hasSurface: boolean,
+): boolean {
+  return hasSurface
+    && previous?.state === "connected"
+    && ["finding", "connecting", "waitingApproval", "reconnecting"].includes(next.state);
+}

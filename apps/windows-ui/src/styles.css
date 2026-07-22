@@ -2637,6 +2637,11 @@ select:focus-visible {
   box-shadow: 0 0 0 3px color-mix(in oklch, oklch(0.68 0.17 145), transparent 78%);
 }
 
+.remote-live-dot[data-state="reconnecting"] {
+  background: oklch(0.76 0.15 80);
+  box-shadow: 0 0 0 3px color-mix(in oklch, oklch(0.76 0.15 80), transparent 78%);
+}
+
 .remote-toolbar-actions {
   display: flex;
   align-items: center;
@@ -3338,6 +3343,48 @@ select:focus-visible {
   height: auto;
   max-height: none;
   object-fit: fill;
+}
+
+.remote-reconnect-overlay {
+  position: absolute;
+  z-index: 3;
+  display: grid;
+  width: min(360px, calc(100% - 32px));
+  gap: 5px;
+  place-items: center;
+  padding: 16px 20px;
+  border: 1px solid color-mix(in oklch, oklch(0.76 0.15 80), transparent 58%);
+  border-radius: var(--radius-md);
+  background: color-mix(in oklch, oklch(0.12 0.012 250), transparent 12%);
+  box-shadow: 0 12px 30px color-mix(in oklch, black, transparent 58%);
+  color: oklch(0.92 0.008 250);
+  text-align: center;
+  pointer-events: none;
+  backdrop-filter: blur(5px);
+}
+
+.remote-reconnect-overlay[hidden] {
+  display: none;
+}
+
+.remote-reconnect-overlay__icon {
+  width: 20px;
+  height: 20px;
+  color: oklch(0.82 0.15 80);
+  animation: remote-reconnect-spin 1.2s linear infinite;
+}
+
+.remote-reconnect-overlay strong {
+  font-size: 13px;
+}
+
+.remote-reconnect-overlay small {
+  color: oklch(0.7 0.012 250);
+  font-size: 11px;
+}
+
+@keyframes remote-reconnect-spin {
+  to { transform: rotate(360deg); }
 }
 
 .remote-fullscreen-guide {

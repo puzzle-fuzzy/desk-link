@@ -118,7 +118,10 @@ import {
   remoteToolbarVisible,
   type RemoteToolbarVisibilityInput,
 } from "./remote-session-presentation";
-import { controllerRuntimeSurfaceChanged } from "./controller-runtime-presentation";
+import {
+  canRetainRemoteSurface,
+  controllerRuntimeSurfaceChanged,
+} from "./controller-runtime-presentation";
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
 
@@ -236,6 +239,7 @@ let videoQualityPreference: VideoQualityPreference = "automatic";
 let appliedVideoQuality: VideoQualityPreset = "sharp";
 let pendingVideoQuality: VideoQualityPreference | null = null;
 let videoQualityAckTimer: number | null = null;
+let retainedRemoteSurface = false;
 const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
   sendControllerInput({ ...input, streamId })
 ));
@@ -345,6 +349,7 @@ export function renderControllerView(): string {
   if (!connected) {
     remotePanMode = false;
   }
+  const remoteSurfaceVisible = connected || retainedRemoteSurface;
   return `
     <div class="controller-stack">
       ${feedback ? renderFeedback(feedback) : ""}
@@ -355,7 +360,7 @@ export function renderControllerView(): string {
         </div>
         ${renderRuntimeBadge()}
       </div>
-      ${connected ? renderRemoteDesktop() : renderConnectionPanel()}
+      ${remoteSurfaceVisible ? renderRemoteDesktop() : renderConnectionPanel()}
     </div>
   `;
 }
@@ -558,7 +563,7 @@ export function bindControllerInteractions(): void {
       revealRemoteToolbar();
     });
   });
-  if (snapshot?.runtime.state === "connected") {
+  if (snapshot?.runtime.state === "connected" || retainedRemoteSurface) {
     setupRemoteDesktop();
     syncRemoteInteractionControls();
     syncRemoteFullscreenControl();
@@ -602,6 +607,47 @@ function updateRuntimeBadge(): void {
   }
   if (detail) {
     detail.textContent = runtime.detail;
+  }
+  updateRemoteSessionStatus();
+}
+
+function updateRemoteSessionStatus(): void {
+  const session = document.querySelector<HTMLElement>(".remote-session");
+  if (!session) {
+    return;
+  }
+  const reconnecting = snapshot?.runtime.state !== "connected" && retainedRemoteSurface;
+  session.dataset.runtimeState = reconnecting ? "reconnecting" : "connected";
+  const title = session.querySelector<HTMLElement>("[data-controller-remote-status-title]");
+  const detail = session.querySelector<HTMLElement>("[data-controller-metrics]");
+  const dot = session.querySelector<HTMLElement>("[data-controller-remote-live-dot]");
+  const overlay = session.querySelector<HTMLElement>("[data-controller-reconnect-overlay]");
+  const overlayDetail = session.querySelector<HTMLElement>("[data-controller-reconnect-detail]");
+  if (title) {
+    title.textContent = reconnecting ? "画面已保留，正在恢复连接" : "实时远程桌面";
+  }
+  if (detail && reconnecting && snapshot?.runtime.detail) {
+    detail.textContent = snapshot.runtime.detail;
+  }
+  if (dot) {
+    dot.dataset.state = reconnecting ? "reconnecting" : "connected";
+  }
+  if (overlay) {
+    overlay.hidden = !reconnecting;
+  }
+  if (overlayDetail && reconnecting) {
+    overlayDetail.textContent = snapshot?.runtime.detail ?? "连接暂时中断，DeskLink 正在恢复。";
+  }
+  if (reconnecting) {
+    session
+      .querySelectorAll<HTMLButtonElement | HTMLSelectElement>(
+        ".remote-toolbar-actions button, .remote-toolbar-actions select",
+      )
+      .forEach((control) => {
+        if (!control.matches("[data-controller-disconnect]")) {
+          control.disabled = true;
+        }
+      });
   }
 }
 
@@ -848,12 +894,18 @@ function transferToolbarActivityView(): {
 function renderRemoteDesktop(): string {
   const config = videoConfig;
   const videoFailed = config ? failedVideoConfig === videoConfigKey(config) : false;
+  const reconnecting = snapshot?.runtime.state === "reconnecting" && retainedRemoteSurface;
+  const remoteStatusDetail = reconnecting
+    ? snapshot?.runtime.detail ?? "连接暂时中断，DeskLink 正在恢复。"
+    : config
+      ? remoteSessionSummary(config.width, config.height, videoQualityPreference, appliedVideoQuality)
+      : "正在等待首个视频画面";
   return `
-    <section class="remote-session" data-remote-toolbar-visible="true" aria-label="当前远程控制会话">
+    <section class="remote-session" data-runtime-state="${reconnecting ? "reconnecting" : "connected"}" data-remote-toolbar-visible="true" aria-label="当前远程控制会话">
       <div class="remote-toolbar">
         <div class="remote-toolbar-status">
-          <span class="remote-live-dot" aria-hidden="true"></span>
-          <div><strong>实时远程桌面</strong><small data-controller-metrics>${config ? remoteSessionSummary(config.width, config.height, videoQualityPreference, appliedVideoQuality) : "正在等待首个视频画面"}</small></div>
+          <span class="remote-live-dot" data-controller-remote-live-dot data-state="${reconnecting ? "reconnecting" : "connected"}" aria-hidden="true"></span>
+          <div><strong data-controller-remote-status-title>${reconnecting ? "画面已保留，正在恢复连接" : "实时远程桌面"}</strong><small data-controller-metrics>${escapeHtml(remoteStatusDetail)}</small></div>
         </div>
         <div class="remote-toolbar-actions">
           <label class="remote-quality-picker" title="根据当前网络调整远程画面的清晰度和流畅度">
@@ -906,6 +958,11 @@ function renderRemoteDesktop(): string {
           : config
             ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><div class="remote-video-starting" data-remote-video-starting>${icon("loader-circle", "controller-spinner")}<strong>正在启动远程画面</strong><p>正在接收并解码第一个加密视频帧。</p></div><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden>${icon("mouse-pointer-2")}</span>`
             : `<div class="remote-waiting">${icon("loader-circle", "controller-spinner")}<strong>正在准备远程画面</strong><p>DeskLink 协商视频流时，请保持此窗口打开。</p></div>`}
+          <div class="remote-reconnect-overlay" data-controller-reconnect-overlay ${reconnecting ? "" : "hidden"} role="status" aria-live="polite">
+            ${icon("refresh-cw", "remote-reconnect-overlay__icon")}
+            <strong>连接暂时中断，画面保持不变</strong>
+            <small data-controller-reconnect-detail>${escapeHtml(remoteStatusDetail)}</small>
+          </div>
         <div class="remote-focus-hint" data-remote-focus-hint>${remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑" : "点击画面开始控制 · Ctrl+V 粘贴本机短文本 · Ctrl+Alt+Delete 必须在主机本地操作"}</div>
         <div class="remote-file-drop-overlay" data-controller-file-drop-overlay ${fileDragActive ? "" : "hidden"} aria-hidden="true">
           ${icon("file-up")}<strong>松开鼠标，将文件加入发送队列</strong><span>文件会按顺序发送，不会打断画面和输入。</span>
@@ -1142,6 +1199,7 @@ async function beginConnection(
   clearRenameDraft();
   attemptStartedAtMs = Date.now();
   attemptTarget = target;
+  retainedRemoteSurface = false;
   videoConfig = null;
   failedVideoConfig = null;
   remoteAudio.release();
@@ -1235,6 +1293,7 @@ async function cancelConnection(): Promise<void> {
   const generation = ++channelGeneration;
   busy = false;
   cancelling = true;
+  retainedRemoteSurface = false;
   prepareControllerRender();
   remoteAudio.release();
   audioStatus = "starting";
@@ -1347,6 +1406,13 @@ function handleSignal(signal: ControllerSignal): void {
   switch (signal.kind) {
     case "status": {
       const previousRuntime = snapshot?.runtime;
+      const retainingSurface = canRetainRemoteSurface(
+        previousRuntime,
+        signal.runtime,
+        activeChannels !== null && videoConfig !== null,
+      );
+      const keepRemoteSurface = isActiveConnectionState(signal.runtime.state)
+        && (retainedRemoteSurface || retainingSurface);
       const presentationChanged = !previousRuntime
         || previousRuntime.state !== signal.runtime.state
         || previousRuntime.title !== signal.runtime.title
@@ -1367,6 +1433,7 @@ function handleSignal(signal: ControllerSignal): void {
           fileQueueRecoveryError: null,
         };
       }
+      retainedRemoteSurface = keepRemoteSurface;
       if (signal.runtime.state !== "connected") {
         if (remoteFullscreenActive || remoteFullscreenDesired) {
           void setRemoteFullscreen(false, false);
@@ -1385,22 +1452,29 @@ function handleSignal(signal: ControllerSignal): void {
         remoteCanvasBounds = null;
         remoteViewportBounds = null;
         setFileDragActive(false);
-        videoConfig = null;
-        failedVideoConfig = null;
-        resetVideoTelemetry();
-        remoteDisplays = [];
-        activeRemoteDisplayId = null;
-        clearRemoteDisplaySwitch();
-        clearVideoQualityAckTimer();
-        videoQualityPreference = "automatic";
-        appliedVideoQuality = "sharp";
-        pendingVideoQuality = null;
-        remoteAudio.resetConnection();
-        audioStatus = "starting";
-        audioMessage = "正在等待远端系统声音。";
-        fileTransferMetrics = null;
-        lastTransferProgressPaintAtMs = null;
-        cancelScheduledTransferPanelUpdate();
+        if (!keepRemoteSurface) {
+          videoConfig = null;
+          failedVideoConfig = null;
+          resetVideoTelemetry();
+          remoteDisplays = [];
+          activeRemoteDisplayId = null;
+          clearRemoteDisplaySwitch();
+          clearVideoQualityAckTimer();
+          videoQualityPreference = "automatic";
+          appliedVideoQuality = "sharp";
+          pendingVideoQuality = null;
+          remoteAudio.resetConnection();
+          audioStatus = "starting";
+          audioMessage = "正在等待远端系统声音。";
+          fileTransferMetrics = null;
+          lastTransferProgressPaintAtMs = null;
+          cancelScheduledTransferPanelUpdate();
+        } else {
+          remoteAudio.resetConnection();
+          audioStatus = "starting";
+          audioMessage = "连接正在恢复，远端声音会在恢复后继续。";
+          updateAudioControl();
+        }
       }
       if (signal.runtime.state === "connected") {
         temporaryPasswordDraft = "";
@@ -1409,7 +1483,9 @@ function handleSignal(signal: ControllerSignal): void {
         clearConnectionAttempt();
       }
       if (presentationChanged) {
-        if (controllerRuntimeSurfaceChanged(previousRuntime, signal.runtime)) {
+        if (keepRemoteSurface) {
+          updateRuntimeBadge();
+        } else if (controllerRuntimeSurfaceChanged(previousRuntime, signal.runtime)) {
           requestRender();
         } else {
           updateRuntimeBadge();
