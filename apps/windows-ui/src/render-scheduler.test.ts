@@ -81,6 +81,29 @@ describe("render scheduler", () => {
     expect(scheduler.pending).toBeFalse();
   });
 
+  test("supports reusing a mutable latest value without copying it", () => {
+    const callbacks: Array<() => void> = [];
+    const value = { x: 1, y: 2 };
+    const committed: Array<typeof value> = [];
+    const scheduler = new LatestFrameScheduler<typeof value>(
+      (callback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      },
+      (next) => { committed.push(next); },
+    );
+
+    scheduler.schedule(value);
+    value.x = 3;
+    value.y = 4;
+    scheduler.schedule(value);
+    callbacks[0]!();
+
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toBe(value);
+    expect(committed[0]).toEqual({ x: 3, y: 4 });
+  });
+
   test("cancels a pending latest value before it reaches the commit", () => {
     const callbacks: Array<() => void> = [];
     const cancelled: number[] = [];

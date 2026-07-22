@@ -269,6 +269,7 @@ const remoteCursorScheduler = new LatestFrameScheduler<{
   (value) => applyRemoteCursor(value.x, value.y, value.visible),
   (handle) => window.cancelAnimationFrame(handle),
 );
+const remoteCursorValue = { x: 0, y: 0, visible: false };
 
 function resetVideoTelemetry(): void {
   videoPull.stop();
@@ -3272,7 +3273,10 @@ function writePointerPosition(
 }
 
 function updateRemoteCursor(x: number, y: number, visible: boolean): void {
-  remoteCursorScheduler.schedule({ x, y, visible });
+  remoteCursorValue.x = x;
+  remoteCursorValue.y = y;
+  remoteCursorValue.visible = visible;
+  remoteCursorScheduler.schedule(remoteCursorValue);
 }
 
 function applyRemoteCursor(x: number, y: number, visible: boolean): void {
