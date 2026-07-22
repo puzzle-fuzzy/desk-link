@@ -509,8 +509,14 @@ impl HostManager {
             })) => {
                 tokio::select! {
                     result = (*supervisor).run() => {
-                        if result.is_ok() {
-                            self.publish(&app, HostRuntimeSummary::stopped_normally());
+                        match result {
+                            Ok(()) => self.publish(&app, HostRuntimeSummary::stopped_normally()),
+                            Err(error) => self.publish_event(
+                                &app,
+                                HostLifecycleEvent::Stopped {
+                                    reason: error.to_string(),
+                                },
+                            ),
                         }
                     }
                     _ = shutdown => {}

@@ -1680,6 +1680,14 @@ impl ControllerManager {
     }
 
     async fn send(&self, command: ControllerCommand) -> Result<(), String> {
+        let state = self
+            .status
+            .lock()
+            .map_err(|_| "DeskLink 无法读取控制端状态。".to_owned())?
+            .state;
+        if matches!(state, "idle" | "stopped") {
+            return Err("当前没有正在运行的远程控制会话。".to_owned());
+        }
         let commands = self
             .worker
             .lock()
@@ -5196,6 +5204,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome, RetryWaitOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn commands_are_rejected_after_runtime_stops() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::stopped("测试结束"));
+
+        assert_eq!(
+            manager.send(ControllerCommand::RequestKeyframe).await,
+            Err("当前没有正在运行的远程控制会话。".to_owned())
+        );
     }
 
     #[tokio::test]
