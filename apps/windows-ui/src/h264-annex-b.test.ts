@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { annexBNalTypes, isH264Keyframe, prepareH264AccessUnit } from "./h264-annex-b";
+import {
+  annexBNalTypes,
+  hasAnnexBNalType,
+  isH264Keyframe,
+  prepareH264AccessUnit,
+} from "./h264-annex-b";
 
 describe("H.264 Annex B access units", () => {
   test("reads NAL types behind three-byte and four-byte start codes", () => {
@@ -17,6 +22,15 @@ describe("H.264 Annex B access units", () => {
     expect(isH264Keyframe(new Uint8Array([0, 0, 1, 0x65, 0x88]), false)).toBe(true);
     expect(isH264Keyframe(new Uint8Array([0, 0, 1, 0x41, 0x88]), false)).toBe(false);
     expect(isH264Keyframe(new Uint8Array([0, 0, 1, 0x41, 0x88]), true)).toBe(true);
+  });
+
+  test("scans for one NAL type without materializing the complete type list", () => {
+    const bytes = new Uint8Array([
+      0, 0, 1, 0x41, 0x88,
+      0, 0, 0, 1, 0x65, 0x99,
+    ]);
+    expect(hasAnnexBNalType(bytes, 5)).toBe(true);
+    expect(hasAnnexBNalType(bytes, 7)).toBe(false);
   });
 
   test("does not duplicate parameter sets already present in a keyframe", () => {

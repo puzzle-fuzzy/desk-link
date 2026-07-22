@@ -19,8 +19,31 @@ export function annexBNalTypes(bytes: Uint8Array): number[] {
   return types;
 }
 
+export function hasAnnexBNalType(bytes: Uint8Array, nalType: number): boolean {
+  for (let index = 0; index + 2 < bytes.byteLength; index += 1) {
+    if (bytes[index] !== 0 || bytes[index + 1] !== 0) {
+      continue;
+    }
+    let startLength = 0;
+    if (bytes[index + 2] === 1) {
+      startLength = 3;
+    } else if (index + 3 < bytes.byteLength && bytes[index + 2] === 0 && bytes[index + 3] === 1) {
+      startLength = 4;
+    }
+    if (startLength === 0) {
+      continue;
+    }
+    const nalIndex = index + startLength;
+    if (nalIndex < bytes.byteLength && (bytes[nalIndex]! & 0x1f) === nalType) {
+      return true;
+    }
+    index = nalIndex;
+  }
+  return false;
+}
+
 export function isH264Keyframe(accessUnit: Uint8Array, signalledKeyframe: boolean): boolean {
-  return signalledKeyframe || annexBNalTypes(accessUnit).includes(NAL_TYPE_IDR);
+  return signalledKeyframe || hasAnnexBNalType(accessUnit, NAL_TYPE_IDR);
 }
 
 export function prepareH264AccessUnit(
