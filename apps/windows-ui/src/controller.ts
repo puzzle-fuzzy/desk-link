@@ -66,6 +66,7 @@ import type {
   VideoQualityPreset,
 } from "./types";
 import { h264CodecFromSequenceHeader, videoConfigKey } from "./video-config";
+import { readLittleEndianTimestamp } from "./video-timestamp";
 import { deviceIdsMatch, formatLastUsed } from "./saved-device";
 import { RemoteInputDispatcher } from "./remote-input-dispatcher";
 import { RemoteKeyboardState, type ControllerKeyInput } from "./remote-keyboard-state";
@@ -2366,8 +2367,7 @@ function submitVideoChunk(bytes: Uint8Array): void {
   if (!decoder || decoder.state !== "configured" || !videoConfig) {
     return;
   }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const accessUnit = bytes.subarray(FRAME_PREFIX_BYTES);
+   const accessUnit = bytes.subarray(FRAME_PREFIX_BYTES);
   const keyframe = isH264Keyframe(accessUnit, bytes[0] === 1);
   if (awaitingDecoderKeyframe && !keyframe) {
     return;
@@ -2376,7 +2376,7 @@ function submitVideoChunk(bytes: Uint8Array): void {
     restartVideoDecoderForFreshness(videoConfigKey(videoConfig), decoderPreference);
     return;
   }
-  const timestamp = Number(view.getBigUint64(1, true));
+   const timestamp = readLittleEndianTimestamp(bytes, 1);
   const data = prepareH264AccessUnit(
     videoSequenceHeader,
     accessUnit,

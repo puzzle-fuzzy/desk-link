@@ -8,6 +8,7 @@
 
 - 视频配置的流 ID 或配置版本变化时，将序列头转换为一个 `Uint8Array`。
 - `prepareH264AccessUnit` 以及 `VideoDecoder.configure` 都复用缓存，不再按帧复制 SPS/PPS。
+- 同一帧前缀中的小端时间戳改用两个 32 位整数合成，避免每帧创建 `DataView` 对象。
 - 新会话、终态断开和不保留远程画面的恢复路径会清空缓存，避免旧配置被误用。
 
 ## 边界与验证
