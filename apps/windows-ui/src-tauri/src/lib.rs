@@ -1228,10 +1228,12 @@ fn build_diagnostic_report(
 
 fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
     let render = latest_metric_event(recent_events, "controller_render_metrics");
-    let transport = latest_metric_event(recent_events, "controller_video_metrics");
-    let Some(render) = render else {
+    let Some((render_timestamp, render)) = render else {
         return vec!["控制端尚未捕获足够的视频渲染指标。".to_owned()];
     };
+    let transport = latest_metric_event(recent_events, "controller_video_metrics")
+        .filter(|(timestamp, _)| render_timestamp.abs_diff(*timestamp) <= 120_000)
+        .map(|(_, value)| value);
 
     let mut findings = Vec::new();
     if let Some(fps_x100) = render
@@ -1302,14 +1304,21 @@ fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
     findings
 }
 
-fn latest_metric_event(recent_events: &[String], event_name: &str) -> Option<serde_json::Value> {
+fn latest_metric_event(
+    recent_events: &[String],
+    event_name: &str,
+) -> Option<(u128, serde_json::Value)> {
     recent_events.iter().rev().find_map(|line| {
         let json = line
             .split_once("] ")
             .map_or(line.as_str(), |(_, value)| value);
         let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+        let timestamp = value
+            .get("timestamp_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(u128::from)?;
         (value.get("event").and_then(serde_json::Value::as_str) == Some(event_name))
-            .then_some(value)
+            .then_some((timestamp, value))
     })
 }
 
@@ -1772,8 +1781,8 @@ mod tests {
     #[test]
     fn diagnostic_report_adds_video_performance_findings_without_raw_secrets() {
         let events = vec![
-            "[控制端] {\"event\":\"controller_video_metrics\",\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
-            "[控制端] {\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":1240,\"max_frame_gap_ms\":420}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":1000,\"event\":\"controller_video_metrics\",\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":1100,\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":1240,\"max_frame_gap_ms\":420}".to_owned(),
         ];
 
         let summary = build_video_performance_summary(&events).join("\n");
@@ -1782,6 +1791,19 @@ mod tests {
         assert!(summary.contains("本地最大帧间隔: 420 毫秒"));
         assert!(summary.contains("优先检查解码或 WebView2 渲染"));
         assert!(!summary.contains("session"));
+    }
+
+    #[test]
+    fn video_performance_summary_does_not_mix_an_old_transport_session() {
+        let events = vec![
+            "[控制端] {\"timestamp_unix_ms\":100,\"event\":\"controller_video_metrics\",\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":200000,\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":3000,\"max_frame_gap_ms\":33}".to_owned(),
+        ];
+
+        let summary = build_video_performance_summary(&events).join("\n");
+
+        assert!(summary.contains("指标不足以定位单一层级"));
+        assert!(!summary.contains("未显示明显的显示层卡顿"));
     }
 
     #[test]
