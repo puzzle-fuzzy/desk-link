@@ -37,6 +37,9 @@ describe("correlated diagnostic analysis", () => {
       received_packets: 220,
       dropped_packets: 3,
       completed_frames: 110,
+      delivered_frames: 0,
+      video_ipc_overflow_drops: 0,
+      video_ipc_keyframe_replacements: 0,
       loss_percent: 1.35,
       input_backpressure_count: 0,
     });
@@ -46,6 +49,7 @@ describe("correlated diagnostic analysis", () => {
       displayed_frames: 105,
       malformed_frames: 0,
       decoder_recoveries: 1,
+      video_pull_failures: 0,
       first_frame_ms: 740,
     });
     expect(report.sessions[0]?.findings[0]?.code).toBe("healthy_video");
@@ -149,6 +153,78 @@ describe("correlated diagnostic analysis", () => {
     const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
     expect(session.outcome).toBe("warning");
     expect(session.findings.map((finding) => finding.code)).toEqual(["slow_first_frame"]);
+  });
+
+  test("detects completed frames that never cross the native video mailbox", () => {
+    const rows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 10_000, {
+        attempt: 1,
+        received_video_packets: 180,
+        dropped_video_packets: 0,
+        completed_frames: 60,
+        delivered_video_frames: 0,
+        video_ipc_overflow_drops: 0,
+        video_ipc_keyframe_replacements: 0,
+      }),
+    ];
+
+    const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
+    expect(session.outcome).toBe("error");
+    expect(session.findings.map((finding) => finding.code)).toEqual(["video_ipc_stalled"]);
+    expect(session.video.delivered_frames).toBe(0);
+  });
+
+  test("uses bounded thresholds for native mailbox pressure and frontend pull retries", () => {
+    const lowRows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 10_000, {
+        attempt: 1,
+        received_video_packets: 150,
+        dropped_video_packets: 0,
+        completed_frames: 50,
+        delivered_video_frames: 48,
+        video_ipc_overflow_drops: 2,
+        video_ipc_keyframe_replacements: 0,
+      }),
+      event("controller_render_metrics", 10_100, {
+        stream_id: 1,
+        received_frames: 48,
+        submitted_frames: 48,
+        displayed_frames: 48,
+        malformed_frames: 0,
+        decoder_recoveries: 0,
+        video_pull_failures: 2,
+      }),
+    ];
+    const low = analyzeDiagnosticRows(lowRows, 24, NOW).sessions[0]!;
+    expect(low.outcome).toBe("healthy");
+
+    const thresholdRows = lowRows.map((row) => ({ ...row }));
+    thresholdRows[1] = event("controller_video_metrics", 10_000, {
+      attempt: 1,
+      received_video_packets: 150,
+      dropped_video_packets: 0,
+      completed_frames: 50,
+      delivered_video_frames: 47,
+      video_ipc_overflow_drops: 2,
+      video_ipc_keyframe_replacements: 1,
+    });
+    thresholdRows[2] = event("controller_render_metrics", 10_100, {
+      stream_id: 1,
+      received_frames: 47,
+      submitted_frames: 47,
+      displayed_frames: 47,
+      malformed_frames: 0,
+      decoder_recoveries: 0,
+      video_pull_failures: 3,
+    });
+    const threshold = analyzeDiagnosticRows(thresholdRows, 24, NOW).sessions[0]!;
+    expect(threshold.outcome).toBe("warning");
+    expect(threshold.findings.map((finding) => finding.code)).toEqual([
+      "video_ipc_pressure",
+      "video_pull_instability",
+    ]);
   });
 
   test("keeps uncorrelated rows out of session conclusions", () => {

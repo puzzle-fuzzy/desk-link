@@ -63,6 +63,7 @@ const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FILE_TRANSFER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
+const DEFAULT_VIDEO_QUALITY_PREFERENCE: VideoQualityPreference = VideoQualityPreference::Automatic;
 const VIDEO_FEEDBACK_MIN_PACKETS: u32 = 40;
 const VIDEO_HEALTHY_LOSS_BASIS_POINTS: u64 = 50;
 const VIDEO_DEGRADED_LOSS_BASIS_POINTS: u64 = 500;
@@ -70,6 +71,8 @@ const VIDEO_SEVERE_LOSS_BASIS_POINTS: u64 = 1_500;
 const VIDEO_DEGRADED_SAMPLES: u8 = 2;
 const VIDEO_HEALTHY_SAMPLES: u8 = 12;
 const VIDEO_SWITCH_COOLDOWN_SAMPLES: u8 = 8;
+const VIDEO_DEGRADED_DECODE_QUEUE: u16 = 5;
+const VIDEO_HEALTHY_DECODE_QUEUE: u16 = 2;
 const VIDEO_FRAME_PACING_TOLERANCE_US: u64 = 2_000;
 
 fn video_quality_settings(preset: VideoQualityPreset) -> H264EncoderSettings {
@@ -77,13 +80,13 @@ fn video_quality_settings(preset: VideoQualityPreset) -> H264EncoderSettings {
         VideoQualityPreset::Smooth => H264EncoderSettings {
             max_width: 1280,
             max_height: 720,
-            fps: 15,
+            fps: 30,
             bitrate: 1_500_000,
         },
         VideoQualityPreset::Balanced => H264EncoderSettings {
             max_width: 1920,
             max_height: 1080,
-            fps: 20,
+            fps: 30,
             bitrate: 2_500_000,
         },
         VideoQualityPreset::Sharp => H264EncoderSettings::default(),
@@ -102,7 +105,7 @@ struct AdaptiveVideoQuality {
 impl AdaptiveVideoQuality {
     fn new() -> Self {
         Self {
-            preference: VideoQualityPreference::Sharp,
+            preference: DEFAULT_VIDEO_QUALITY_PREFERENCE,
             preset: DEFAULT_VIDEO_QUALITY,
             degraded_samples: 0,
             healthy_samples: 0,
@@ -121,26 +124,32 @@ impl AdaptiveVideoQuality {
         &mut self,
         received_packets: u32,
         dropped_packets: u32,
+        decode_queue_peak: u16,
+        freshness_recoveries: u16,
     ) -> Option<VideoQualityPreset> {
         if self.preference != VideoQualityPreference::Automatic {
             return None;
         }
 
-        let total_packets = received_packets.saturating_add(dropped_packets);
-        if total_packets < VIDEO_FEEDBACK_MIN_PACKETS {
-            return None;
-        }
         if self.cooldown_samples > 0 {
             self.cooldown_samples -= 1;
             return None;
         }
-
-        let loss_basis_points =
-            u64::from(dropped_packets).saturating_mul(10_000) / u64::from(total_packets);
-        if loss_basis_points >= VIDEO_SEVERE_LOSS_BASIS_POINTS {
+        if freshness_recoveries > 0 {
             return self.request_lower_preset();
         }
-        if loss_basis_points >= VIDEO_DEGRADED_LOSS_BASIS_POINTS {
+
+        let total_packets = received_packets.saturating_add(dropped_packets);
+        let has_network_sample = total_packets >= VIDEO_FEEDBACK_MIN_PACKETS;
+        let loss_basis_points = has_network_sample
+            .then(|| u64::from(dropped_packets).saturating_mul(10_000) / u64::from(total_packets));
+        if loss_basis_points.is_some_and(|loss| loss >= VIDEO_SEVERE_LOSS_BASIS_POINTS) {
+            return self.request_lower_preset();
+        }
+        let playback_degraded = decode_queue_peak >= VIDEO_DEGRADED_DECODE_QUEUE;
+        let network_degraded =
+            loss_basis_points.is_some_and(|loss| loss >= VIDEO_DEGRADED_LOSS_BASIS_POINTS);
+        if playback_degraded || network_degraded {
             self.healthy_samples = 0;
             self.degraded_samples = self.degraded_samples.saturating_add(1);
             if self.degraded_samples >= VIDEO_DEGRADED_SAMPLES {
@@ -148,7 +157,9 @@ impl AdaptiveVideoQuality {
             }
             return None;
         }
-        if loss_basis_points <= VIDEO_HEALTHY_LOSS_BASIS_POINTS {
+        if loss_basis_points.is_some_and(|loss| loss <= VIDEO_HEALTHY_LOSS_BASIS_POINTS)
+            && decode_queue_peak <= VIDEO_HEALTHY_DECODE_QUEUE
+        {
             self.degraded_samples = 0;
             self.healthy_samples = self.healthy_samples.saturating_add(1);
             if self.healthy_samples >= VIDEO_HEALTHY_SAMPLES {
@@ -1662,7 +1673,7 @@ async fn send_host_capabilities(
         client,
         secure,
         peer_generation,
-        VideoQualityPreference::Sharp,
+        DEFAULT_VIDEO_QUALITY_PREFERENCE,
         DEFAULT_VIDEO_QUALITY,
     )
     .await?;
@@ -2169,9 +2180,16 @@ async fn receive_input_and_control(
                     ControlMessage::VideoNetworkFeedback {
                         received_packets,
                         dropped_packets,
+                        decode_queue_peak,
+                        freshness_recoveries,
                     } => {
                         if let Some(preset) =
-                            video_quality.observe(received_packets, dropped_packets)
+                            video_quality.observe(
+                                received_packets,
+                                dropped_packets,
+                                decode_queue_peak,
+                                freshness_recoveries,
+                            )
                             && let Some(actual) =
                                 apply_video_quality(&capture_commands, preset).await?
                         {
@@ -2920,17 +2938,28 @@ mod retry_policy_tests {
     }
 
     #[test]
-    fn quality_profiles_reduce_bandwidth_without_changing_the_default() {
+    fn quality_profiles_preserve_thirty_fps_while_reducing_bandwidth() {
         let smooth = video_quality_settings(VideoQualityPreset::Smooth);
         let balanced = video_quality_settings(VideoQualityPreset::Balanced);
         let sharp = video_quality_settings(VideoQualityPreset::Sharp);
         assert_eq!(
             (smooth.max_width, smooth.max_height, smooth.fps),
-            (1280, 720, 15)
+            (1280, 720, 30)
         );
+        assert_eq!(
+            (balanced.max_width, balanced.max_height, balanced.fps),
+            (1920, 1080, 30)
+        );
+        assert_eq!(sharp.fps, 30);
         assert!(smooth.bitrate < balanced.bitrate);
         assert!(balanced.bitrate < sharp.bitrate);
-        assert_eq!(sharp, crate::encoder::H264EncoderSettings::default());
+    }
+
+    #[test]
+    fn automatic_quality_is_the_default_session_policy() {
+        let quality = AdaptiveVideoQuality::new();
+        assert_eq!(quality.preference, VideoQualityPreference::Automatic);
+        assert_eq!(quality.preset, VideoQualityPreset::Sharp);
     }
 
     #[test]
@@ -2940,15 +2969,21 @@ mod retry_policy_tests {
             quality.set_preference(VideoQualityPreference::Automatic),
             None
         );
-        assert_eq!(quality.observe(90, 10), None);
-        assert_eq!(quality.observe(90, 10), Some(VideoQualityPreset::Balanced));
+        assert_eq!(quality.observe(90, 10, 0, 0), None);
+        assert_eq!(
+            quality.observe(90, 10, 0, 0),
+            Some(VideoQualityPreset::Balanced)
+        );
         quality.record_applied(VideoQualityPreset::Balanced);
 
         for _ in 0..8 {
-            assert_eq!(quality.observe(90, 10), None);
+            assert_eq!(quality.observe(90, 10, 0, 0), None);
         }
-        assert_eq!(quality.observe(90, 10), None);
-        assert_eq!(quality.observe(90, 10), Some(VideoQualityPreset::Smooth));
+        assert_eq!(quality.observe(90, 10, 0, 0), None);
+        assert_eq!(
+            quality.observe(90, 10, 0, 0),
+            Some(VideoQualityPreset::Smooth)
+        );
     }
 
     #[test]
@@ -2965,22 +3000,55 @@ mod retry_policy_tests {
         );
 
         for _ in 0..11 {
-            assert_eq!(quality.observe(100, 0), None);
+            assert_eq!(quality.observe(100, 0, 2, 0), None);
         }
-        assert_eq!(quality.observe(100, 0), Some(VideoQualityPreset::Balanced));
+        assert_eq!(
+            quality.observe(100, 0, 2, 0),
+            Some(VideoQualityPreset::Balanced)
+        );
     }
 
     #[test]
     fn automatic_quality_ignores_sparse_feedback_and_manual_modes() {
         let mut quality = AdaptiveVideoQuality::new();
-        assert_eq!(quality.observe(1, 100), None);
+        assert_eq!(quality.observe(10, 10, 0, 0), None);
+        assert_eq!(quality.set_preference(VideoQualityPreference::Sharp), None);
+        assert_eq!(quality.observe(80, 20, 64, 16), None);
+    }
+
+    #[test]
+    fn automatic_quality_uses_playback_pressure_without_network_loss() {
+        let mut quality = AdaptiveVideoQuality::new();
+        assert_eq!(
+            quality.observe(0, 0, 7, 1),
+            Some(VideoQualityPreset::Balanced)
+        );
+
+        let mut quality = AdaptiveVideoQuality::new();
+        assert_eq!(quality.observe(0, 0, 5, 0), None);
+        assert_eq!(
+            quality.observe(0, 0, 5, 0),
+            Some(VideoQualityPreset::Balanced)
+        );
+    }
+
+    #[test]
+    fn automatic_quality_requires_a_low_decode_queue_before_recovering() {
+        let mut quality = AdaptiveVideoQuality::new();
+        assert_eq!(
+            quality.set_preference(VideoQualityPreference::Smooth),
+            Some(VideoQualityPreset::Smooth)
+        );
+        quality.record_applied(VideoQualityPreset::Smooth);
         assert_eq!(
             quality.set_preference(VideoQualityPreference::Automatic),
             None
         );
-        assert_eq!(quality.observe(10, 10), None);
-        assert_eq!(quality.set_preference(VideoQualityPreference::Sharp), None);
-        assert_eq!(quality.observe(80, 20), None);
+
+        for _ in 0..12 {
+            assert_eq!(quality.observe(100, 0, 3, 0), None);
+        }
+        assert_eq!(quality.preset, VideoQualityPreset::Smooth);
     }
 
     #[test]

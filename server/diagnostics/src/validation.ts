@@ -26,12 +26,16 @@ const ALLOWED_EVENT_FIELDS = new Set([
   "received_video_packets",
   "dropped_video_packets",
   "completed_frames",
+  "delivered_video_frames",
+  "video_ipc_overflow_drops",
+  "video_ipc_keyframe_replacements",
   "input_backpressure_count",
   "received_frames",
   "submitted_frames",
   "displayed_frames",
   "malformed_frames",
   "decoder_recoveries",
+  "video_pull_failures",
   "first_frame_ms",
 ]);
 

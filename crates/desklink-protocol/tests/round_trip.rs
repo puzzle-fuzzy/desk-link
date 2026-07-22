@@ -68,6 +68,8 @@ fn video_quality_commands_round_trip() {
         ControlMessage::VideoNetworkFeedback {
             received_packets: 120,
             dropped_packets: 3,
+            decode_queue_peak: 7,
+            freshness_recoveries: 1,
         },
     ] {
         let encoded = encode_control(&message).expect("encode video quality command");
@@ -76,6 +78,11 @@ fn video_quality_commands_round_trip() {
             message
         );
     }
+}
+
+#[test]
+fn playback_pressure_requires_protocol_nine() {
+    assert_eq!(PROTOCOL_VERSION, 9);
 }
 
 #[test]
@@ -395,10 +402,10 @@ fn header() -> VideoFrameHeader {
 #[test]
 fn malformed_header_version_is_rejected() {
     let mut value = header();
-    value.protocol_version = 9;
+    value.protocol_version = PROTOCOL_VERSION + 1;
     assert!(matches!(
         encode_video_header(&value),
-        Err(ProtocolError::UnsupportedVersion(9))
+        Err(ProtocolError::UnsupportedVersion(version)) if version == PROTOCOL_VERSION + 1
     ));
 }
 #[test]

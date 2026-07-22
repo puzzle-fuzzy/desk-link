@@ -19,7 +19,9 @@ use desklink_protocol::{
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{QuicClient, TransportError, TransportEvent};
-use desklink_video::{AssembleResult, EncodedFrame, FrameAssembler};
+use desklink_video::{
+    AssembleResult, EncodedFrame, FrameAssembler, VideoContinuity, VideoContinuityAction,
+};
 use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -101,8 +103,7 @@ pub struct ControllerRuntime {
     active_stream: AtomicU64,
     metrics: AtomicControllerMetrics,
     keyframe_needed_after_config: bool,
-    awaiting_keyframe: bool,
-    keyframe_request_outstanding: bool,
+    video_continuity: VideoContinuity,
 }
 
 #[derive(Clone)]
@@ -161,8 +162,7 @@ impl ControllerRuntime {
             active_stream: AtomicU64::new(0),
             metrics: AtomicControllerMetrics::default(),
             keyframe_needed_after_config: false,
-            awaiting_keyframe: false,
-            keyframe_request_outstanding: false,
+            video_continuity: VideoContinuity::default(),
         })
     }
 
@@ -224,10 +224,14 @@ impl ControllerRuntime {
         &self,
         received_packets: u32,
         dropped_packets: u32,
+        decode_queue_peak: u16,
+        freshness_recoveries: u16,
     ) -> Result<(), ControllerError> {
         let plaintext = encode_control(&ControlMessage::VideoNetworkFeedback {
             received_packets,
             dropped_packets,
+            decode_queue_peak,
+            freshness_recoveries,
         })?;
         let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
         self.client.send_control(ciphertext).await?;
@@ -286,13 +290,12 @@ impl ControllerRuntime {
                     }
                     self.video_config = Some(config.clone());
                     if config_changed {
-                        self.awaiting_keyframe = true;
-                        self.keyframe_request_outstanding = false;
+                        self.video_continuity.reset_for_config();
                     }
                     if self.keyframe_needed_after_config {
                         self.request_keyframe_for(config.stream_id).await?;
                         self.keyframe_needed_after_config = false;
-                        self.keyframe_request_outstanding = true;
+                        self.video_continuity.note_keyframe_request(Instant::now());
                     }
                     return Ok(ControllerEvent::VideoConfig(config));
                 }
@@ -322,6 +325,7 @@ impl ControllerRuntime {
                         self.metrics
                             .dropped_video_packets
                             .fetch_add(dropped_chunks, Ordering::Relaxed);
+                        self.video_continuity.note_transport_loss();
                     }
                     match assembled {
                         AssembleResult::Pending => {}
@@ -329,25 +333,26 @@ impl ControllerRuntime {
                         AssembleResult::Complete(frame) => {
                             let is_keyframe =
                                 frame.flags.0 & desklink_protocol::FrameFlags::KEYFRAME.0 != 0;
-                            if self.awaiting_keyframe && !is_keyframe {
-                                self.drop_video_packet();
-                                if !self.keyframe_request_outstanding {
+                            match self.video_continuity.observe_frame(
+                                frame.frame_id,
+                                is_keyframe,
+                                Instant::now(),
+                            ) {
+                                VideoContinuityAction::Present => {
+                                    if self.assembler.accept_for_present(frame.clone()) {
+                                        self.metrics
+                                            .completed_frames
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        return Ok(ControllerEvent::H264AccessUnit(frame));
+                                    }
+                                    self.drop_video_packet();
+                                }
+                                VideoContinuityAction::Drop => self.drop_video_packet(),
+                                VideoContinuityAction::DropAndRequestKeyframe => {
+                                    self.drop_video_packet();
                                     self.request_keyframe_for(config.stream_id).await?;
-                                    self.keyframe_request_outstanding = true;
                                 }
-                                continue;
                             }
-                            if self.assembler.accept_for_present(frame.clone()) {
-                                if is_keyframe {
-                                    self.awaiting_keyframe = false;
-                                    self.keyframe_request_outstanding = false;
-                                }
-                                self.metrics
-                                    .completed_frames
-                                    .fetch_add(1, Ordering::Relaxed);
-                                return Ok(ControllerEvent::H264AccessUnit(frame));
-                            }
-                            self.drop_video_packet();
                         }
                     }
                 }

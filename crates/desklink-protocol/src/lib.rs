@@ -10,7 +10,7 @@ pub use codec::{
 use serde::{Deserialize, Serialize};
 use std::ops::{BitOr, BitOrAssign};
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_NOISE_HANDSHAKE_BYTES: usize = 4 * 1024;
 pub const MAX_VIDEO_CONFIG_BYTES: usize = 16 * 1024;
@@ -223,6 +223,8 @@ pub enum ControlMessage {
     VideoNetworkFeedback {
         received_packets: u32,
         dropped_packets: u32,
+        decode_queue_peak: u16,
+        freshness_recoveries: u16,
     },
 }
 

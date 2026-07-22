@@ -3340,6 +3340,10 @@ select:focus-visible {
   object-fit: fill;
 }
 
+.remote-fullscreen-guide {
+  display: none;
+}
+
 /* Native remote-session fullscreen: the Windows window fills the monitor while
    DeskLink chrome stays out of the video layout. The toolbar remains reachable
    as an overlay and therefore never takes pixels away from the remote canvas. */
@@ -3424,6 +3428,42 @@ html[data-remote-fullscreen="true"] .remote-toolbar {
   border-radius: var(--radius-md);
   background: oklch(0.17 0.013 250);
   box-shadow: 0 8px 24px oklch(0 0 0 / 38%);
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity var(--transition),
+    transform var(--transition);
+}
+
+html[data-remote-fullscreen="true"] .remote-session[data-remote-toolbar-visible="false"] .remote-toolbar {
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(calc(-100% - 14px));
+}
+
+html[data-remote-fullscreen="true"] .remote-fullscreen-guide {
+  position: absolute;
+  z-index: 11;
+  top: 70px;
+  left: 50%;
+  display: block;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: oklch(0.14 0.01 250 / 88%);
+  color: oklch(0.82 0.008 250);
+  font-size: 10.5px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 1;
+  transform: translate(-50%, 0);
+  transition:
+    opacity var(--transition),
+    transform var(--transition);
+}
+
+html[data-remote-fullscreen="true"] .remote-session[data-remote-toolbar-visible="false"] .remote-fullscreen-guide {
+  opacity: 0;
+  transform: translate(-50%, -6px);
 }
 
 html[data-remote-fullscreen="true"] .remote-toolbar-status {
@@ -3464,6 +3504,13 @@ html[data-remote-fullscreen="true"] .remote-text-entry {
 @media (max-width: 1120px) {
   html[data-remote-fullscreen="true"] .remote-toolbar-status small {
     display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-remote-fullscreen="true"] .remote-toolbar,
+  html[data-remote-fullscreen="true"] .remote-fullscreen-guide {
+    transition: none;
   }
 }
 

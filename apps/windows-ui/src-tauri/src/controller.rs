@@ -28,7 +28,10 @@ use apps_windows::{
 };
 use blake2::{Blake2s256, Digest};
 use desklink_crypto::{PairingCode, PairingInvite};
-use desklink_ffi::{ControllerError, ControllerEvent, ControllerRuntime, ControllerTransferSender};
+use desklink_ffi::{
+    ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime,
+    ControllerTransferSender,
+};
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FileResumeHint, FrameFlags,
     InputEvent, KeyCode, MAX_CLIPBOARD_TEXT_BYTES, MAX_POINTER_COORDINATE,
@@ -44,6 +47,11 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Response};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use zeroize::Zeroize;
+
+use crate::video_mailbox::{
+    ControllerVideoMailbox, VideoDeliveryFrame, VideoMailboxKey, VideoMailboxMetrics,
+    VideoMailboxOffer,
+};
 
 const COMMAND_CAPACITY: usize = 512;
 const MAX_BUFFERED_POINTER_MOVES: usize = 8;
@@ -66,6 +74,10 @@ const FILE_RECEIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const FILE_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
 const FILE_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_QUEUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONTROLLER_DECODE_QUEUE_SIZE: u16 = 64;
+const MAX_CONTROLLER_FRESHNESS_RECOVERIES: u16 = 16;
+const MAX_CONTROLLER_VIDEO_PULL_FAILURES: u32 = 1_000_000;
+const VIDEO_MAILBOX_OVERFLOW_DECODE_QUEUE_SIZE: u16 = 5;
 
 struct DecodedControllerAudio {
     stream_id: u64,
@@ -485,7 +497,29 @@ pub struct ControllerRenderMetrics {
     displayed_frames: u64,
     malformed_frames: u64,
     decoder_recoveries: u32,
+    video_pull_failures: u32,
     first_frame_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerPlaybackPressure {
+    stream_id: u64,
+    peak_decode_queue_size: u16,
+    freshness_recoveries: u16,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControllerVideoPullInput {
+    stream_id: u64,
+    config_version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PlaybackPressureSample {
+    decode_queue_peak: u16,
+    freshness_recoveries: u16,
 }
 
 enum ControllerCommand {
@@ -773,7 +807,6 @@ struct ControllerWorker {
 
 struct ControllerOutputChannels {
     signals: Channel<ControllerSignal>,
-    video: Channel<Response>,
     audio: Channel<Response>,
 }
 
@@ -795,6 +828,8 @@ pub struct ControllerManager {
     operation_generation: Arc<AtomicU64>,
     recent_cancellation: Arc<Mutex<Option<Instant>>>,
     input_backpressure_count: Arc<AtomicU64>,
+    playback_pressure: Arc<Mutex<Option<ControllerPlaybackPressure>>>,
+    video_mailbox: Arc<ControllerVideoMailbox>,
 }
 
 impl Default for ControllerManager {
@@ -816,6 +851,8 @@ impl Default for ControllerManager {
             operation_generation: Arc::new(AtomicU64::new(0)),
             recent_cancellation: Arc::new(Mutex::new(None)),
             input_backpressure_count: Arc::new(AtomicU64::new(0)),
+            playback_pressure: Arc::new(Mutex::new(None)),
+            video_mailbox: Arc::new(ControllerVideoMailbox::default()),
         }
     }
 }
@@ -1235,7 +1272,6 @@ impl ControllerManager {
         &self,
         input: ControllerDeviceInput,
         signals: Channel<ControllerSignal>,
-        video: Channel<Response>,
         audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let device_id =
@@ -1249,7 +1285,6 @@ impl ControllerManager {
             password,
             DeviceCredentialSource::Entered,
             signals,
-            video,
             audio,
         )
         .await
@@ -1259,7 +1294,6 @@ impl ControllerManager {
         &self,
         input: SavedDeviceInput,
         signals: Channel<ControllerSignal>,
-        video: Channel<Response>,
         audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let device_id =
@@ -1272,15 +1306,8 @@ impl ControllerManager {
         let source = DeviceCredentialSource::Saved {
             persistent: saved.is_persistent(),
         };
-        self.connect_device_credentials(
-            device_id,
-            saved.password().clone(),
-            source,
-            signals,
-            video,
-            audio,
-        )
-        .await
+        self.connect_device_credentials(device_id, saved.password().clone(), source, signals, audio)
+            .await
     }
 
     async fn connect_device_credentials(
@@ -1289,7 +1316,6 @@ impl ControllerManager {
         password: PairingCode,
         source: DeviceCredentialSource,
         signals: Channel<ControllerSignal>,
-        video: Channel<Response>,
         audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let recover_after_cancel = self.take_recent_cancellation();
@@ -1415,7 +1441,7 @@ impl ControllerManager {
             }
         };
         self.ensure_current(generation)?;
-        self.start(generation, settings, true, signals, video, audio)
+        self.start(generation, settings, true, signals, audio)
             .await?;
         load_snapshot(self, self.snapshot())
     }
@@ -1423,7 +1449,6 @@ impl ControllerManager {
     pub async fn connect_saved(
         &self,
         signals: Channel<ControllerSignal>,
-        video: Channel<Response>,
         audio: Channel<Response>,
     ) -> Result<ControllerSnapshot, String> {
         let generation = self.begin_operation();
@@ -1433,7 +1458,7 @@ impl ControllerManager {
             .load()
             .map_err(|_| "无法打开已保存的控制端连接。".to_owned())?
             .ok_or_else(|| "没有可供重新连接的已保存 Windows 电脑。".to_owned())?;
-        self.start(generation, settings, false, signals, video, audio)
+        self.start(generation, settings, false, signals, audio)
             .await?;
         load_snapshot(self, self.snapshot())
     }
@@ -1444,19 +1469,23 @@ impl ControllerManager {
         settings: ControllerConnectionSettings,
         save_after_approval: bool,
         signals: Channel<ControllerSignal>,
-        video: Channel<Response>,
         audio: Channel<Response>,
     ) -> Result<(), String> {
         let _operation = self.operation_lock.lock().await;
         self.ensure_current(generation)?;
         self.stop_current().await;
         self.ensure_current(generation)?;
+        self.video_mailbox.close();
         self.input_backpressure_count.store(0, Ordering::Relaxed);
+        if let Ok(mut pressure) = self.playback_pressure.lock() {
+            *pressure = None;
+        }
         self.publish_if_current(generation, &signals, ControllerRuntimeSummary::connecting());
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (cancellation, cancellation_receiver) = watch::channel(false);
         let host_device_id = settings.host_device_id();
         let manager = self.clone();
+        let video_mailbox = self.video_mailbox.clone();
         let task = tauri::async_runtime::spawn(async move {
             run_controller(
                 manager,
@@ -1464,13 +1493,10 @@ impl ControllerManager {
                 save_after_approval,
                 receiver,
                 cancellation_receiver,
-                ControllerOutputChannels {
-                    signals,
-                    video,
-                    audio,
-                },
+                ControllerOutputChannels { signals, audio },
             )
             .await;
+            video_mailbox.close();
         });
         let mut worker = self
             .worker
@@ -1693,6 +1719,29 @@ impl ControllerManager {
             .and_then(|worker| worker.as_ref().map(|worker| worker.host_device_id))
     }
 
+    pub async fn next_video_frame(
+        &self,
+        input: ControllerVideoPullInput,
+    ) -> Result<Vec<u8>, String> {
+        self.video_mailbox
+            .next(VideoMailboxKey::new(input.stream_id, input.config_version))
+            .await
+            .map(|frame| frame.payload)
+    }
+
+    fn offer_video_frame(&self, frame: VideoDeliveryFrame, now: Instant) -> VideoMailboxOffer {
+        let stream_id = frame.key.stream_id;
+        let result = self.video_mailbox.offer(frame, now);
+        if result == VideoMailboxOffer::RequestKeyframe {
+            let _ = self.record_playback_pressure(ControllerPlaybackPressure {
+                stream_id,
+                peak_decode_queue_size: VIDEO_MAILBOX_OVERFLOW_DECODE_QUEUE_SIZE,
+                freshness_recoveries: 1,
+            });
+        }
+        result
+    }
+
     pub fn record_render_metrics(&self, metrics: ControllerRenderMetrics) -> Result<(), String> {
         let active_stream = self
             .status
@@ -1704,6 +1753,7 @@ impl ControllerManager {
         }
         if metrics.submitted_frames > metrics.received_frames
             || metrics.displayed_frames > metrics.submitted_frames
+            || metrics.video_pull_failures > MAX_CONTROLLER_VIDEO_PULL_FAILURES
             || metrics
                 .first_frame_ms
                 .is_some_and(|value| value > 10 * 60 * 1_000)
@@ -1719,9 +1769,54 @@ impl ControllerManager {
                 displayed_frames: metrics.displayed_frames,
                 malformed_frames: metrics.malformed_frames,
                 decoder_recoveries: metrics.decoder_recoveries,
+                video_pull_failures: metrics.video_pull_failures,
                 first_frame_ms: metrics.first_frame_ms,
             })
             .map_err(|_| "DeskLink 无法记录远程画面指标。".to_owned())
+    }
+
+    pub fn record_playback_pressure(
+        &self,
+        pressure: ControllerPlaybackPressure,
+    ) -> Result<(), String> {
+        if pressure.peak_decode_queue_size > MAX_CONTROLLER_DECODE_QUEUE_SIZE
+            || pressure.freshness_recoveries > MAX_CONTROLLER_FRESHNESS_RECOVERIES
+        {
+            return Err("远程画面播放压力指标无效。".to_owned());
+        }
+        if self.active_stream_id() != Some(pressure.stream_id) {
+            return Ok(());
+        }
+        let mut current = self
+            .playback_pressure
+            .lock()
+            .map_err(|_| "DeskLink 无法更新远程画面播放状态。".to_owned())?;
+        match current.as_mut() {
+            Some(existing) if existing.stream_id == pressure.stream_id => {
+                existing.peak_decode_queue_size = existing
+                    .peak_decode_queue_size
+                    .max(pressure.peak_decode_queue_size);
+                existing.freshness_recoveries = existing
+                    .freshness_recoveries
+                    .saturating_add(pressure.freshness_recoveries)
+                    .min(MAX_CONTROLLER_FRESHNESS_RECOVERIES);
+            }
+            _ => *current = Some(pressure),
+        }
+        Ok(())
+    }
+
+    fn take_playback_pressure(&self, stream_id: u64) -> PlaybackPressureSample {
+        self.playback_pressure
+            .lock()
+            .ok()
+            .and_then(|mut current| current.take())
+            .filter(|pressure| pressure.stream_id == stream_id)
+            .map(|pressure| PlaybackPressureSample {
+                decode_queue_peak: pressure.peak_decode_queue_size,
+                freshness_recoveries: pressure.freshness_recoveries,
+            })
+            .unwrap_or_default()
     }
 
     pub async fn disconnect(&self) -> Result<ControllerSnapshot, String> {
@@ -1798,6 +1893,7 @@ impl ControllerManager {
     }
 
     async fn stop_current(&self) {
+        self.video_mailbox.close();
         let worker = self.worker.lock().ok().and_then(|mut worker| worker.take());
         let Some(mut worker) = worker else {
             return;
@@ -1992,11 +2088,7 @@ async fn run_controller(
     mut cancellation: watch::Receiver<bool>,
     outputs: ControllerOutputChannels,
 ) {
-    let ControllerOutputChannels {
-        signals,
-        video,
-        audio,
-    } = outputs;
+    let ControllerOutputChannels { signals, audio } = outputs;
     let diagnostics = DiagnosticLog::controller_for_current_user().ok();
     let _ = set_session_correlation(DiagnosticSource::Controller, settings.session_id());
     let host_device_id = settings.host_device_id();
@@ -2009,6 +2101,8 @@ async fn run_controller(
     // The user explicitly resumes it after seeing the target device and file list.
     let mut file_queue_paused = !queued_files.is_empty();
     'connect: loop {
+        manager.video_mailbox.close();
+        manager.video_mailbox.reset_metrics();
         attempt = attempt.saturating_add(1);
         record_controller_diagnostic(
             diagnostics.as_ref(),
@@ -2604,6 +2698,10 @@ async fn run_controller(
                             }
                             save_after_approval = false;
                         }
+                        manager.video_mailbox.begin_config(VideoMailboxKey::new(
+                            config.stream_id,
+                            config.config_version,
+                        ));
                         manager.publish(&signals, ControllerRuntimeSummary::connected(config.stream_id));
                         let _ = signals.send(ControllerSignal::VideoConfig {
                             stream_id: config.stream_id,
@@ -2614,14 +2712,26 @@ async fn run_controller(
                         });
                     }
                     Ok(ControllerEvent::H264AccessUnit(frame)) => {
+                        let key = VideoMailboxKey::new(frame.stream_id, frame.config_version);
+                        let frame_id = frame.frame_id;
+                        let keyframe = frame.flags.0 & FrameFlags::KEYFRAME.0 != 0;
                         let mut payload = Vec::with_capacity(FRAME_PREFIX_BYTES + frame.data.len());
-                        payload.push(u8::from(frame.flags.0 & FrameFlags::KEYFRAME.0 != 0));
+                        payload.push(u8::from(keyframe));
                         payload.extend_from_slice(&frame.capture_timestamp_us.to_le_bytes());
-                        payload.extend_from_slice(&frame.frame_id.to_le_bytes());
+                        payload.extend_from_slice(&frame_id.to_le_bytes());
                         payload.extend_from_slice(&frame.data);
-                        if video.send(Response::new(payload)).is_err() {
-                            manager.set_status(ControllerRuntimeSummary::idle());
-                            return;
+                        if manager.offer_video_frame(
+                            VideoDeliveryFrame {
+                                key,
+                                frame_id,
+                                keyframe,
+                                payload,
+                            },
+                            Instant::now(),
+                        ) == VideoMailboxOffer::RequestKeyframe
+                            && let Err(error) = runtime.request_keyframe().await
+                        {
+                            break ConnectFailure::from_controller(error);
                         }
                     }
                     Ok(ControllerEvent::Cursor(cursor)) => {
@@ -3277,12 +3387,18 @@ async fn run_controller(
                     .dropped_video_packets
                     .saturating_sub(last_feedback_metrics.dropped_video_packets);
                 last_feedback_metrics = metrics;
+                let playback_pressure =
+                    manager.take_playback_pressure(manager.active_stream_id().unwrap_or_default());
                 if video_quality == VideoQualityPreference::Automatic
-                    && received_packets.saturating_add(dropped_packets) > 0
+                    && (received_packets.saturating_add(dropped_packets) > 0
+                        || playback_pressure.decode_queue_peak > 0
+                        || playback_pressure.freshness_recoveries > 0)
                     && let Err(error) = runtime
                         .report_video_network_feedback(
                             u32::try_from(received_packets).unwrap_or(u32::MAX),
                             u32::try_from(dropped_packets).unwrap_or(u32::MAX),
+                            playback_pressure.decode_queue_peak,
+                            playback_pressure.freshness_recoveries,
                         )
                         .await
                 {
@@ -3294,22 +3410,26 @@ async fn run_controller(
                     completed_frames: metrics.completed_frames,
                 });
                 if last_diagnostic_metrics.elapsed() >= Duration::from_secs(10) {
-                    if let Some(diagnostics) = diagnostics.as_ref() {
-                        let _ = diagnostics.record(&DiagnosticEvent::ControllerVideoMetrics {
-                            attempt,
-                            received_video_packets: metrics.received_video_packets,
-                            dropped_video_packets: metrics.dropped_video_packets,
-                            completed_frames: metrics.completed_frames,
-                            input_backpressure_count: manager
-                                .input_backpressure_count
-                                .load(Ordering::Relaxed),
-                        });
-                    }
+                    record_controller_video_metrics(
+                        diagnostics.as_ref(),
+                        attempt,
+                        metrics,
+                        manager.video_mailbox.metrics(),
+                        manager.input_backpressure_count.load(Ordering::Relaxed),
+                    );
                     last_diagnostic_metrics = Instant::now();
                 }
                 last_metrics = Instant::now();
             }
         };
+        record_controller_video_metrics(
+            diagnostics.as_ref(),
+            attempt,
+            runtime.metrics(),
+            manager.video_mailbox.metrics(),
+            manager.input_backpressure_count.load(Ordering::Relaxed),
+        );
+        manager.video_mailbox.close();
         if let Some(pending) = pending_clipboard.take() {
             let _ = signals.send(ControllerSignal::Clipboard {
                 state: "failed",
@@ -3993,6 +4113,28 @@ fn record_controller_diagnostic(
     });
 }
 
+fn record_controller_video_metrics(
+    diagnostics: Option<&DiagnosticLog>,
+    attempt: u32,
+    transport: ControllerMetrics,
+    mailbox: VideoMailboxMetrics,
+    input_backpressure_count: u64,
+) {
+    let Some(diagnostics) = diagnostics else {
+        return;
+    };
+    let _ = diagnostics.record(&DiagnosticEvent::ControllerVideoMetrics {
+        attempt,
+        received_video_packets: transport.received_video_packets,
+        dropped_video_packets: transport.dropped_video_packets,
+        completed_frames: transport.completed_frames,
+        delivered_video_frames: mailbox.delivered_frames,
+        video_ipc_overflow_drops: mailbox.overflow_drops,
+        video_ipc_keyframe_replacements: mailbox.keyframe_replacements,
+        input_backpressure_count,
+    });
+}
+
 async fn send_text_input(runtime: &ControllerRuntime, text: &str) -> Result<(), ControllerError> {
     for character in text.chars() {
         let code = match character {
@@ -4255,9 +4397,10 @@ mod tests {
 
     use super::{
         COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
-        ControllerCommand, ControllerInput, ControllerManager, ControllerRuntimeSummary,
+        ControllerCommand, ControllerInput, ControllerManager, ControllerPlaybackPressure,
+        ControllerRenderMetrics, ControllerRuntimeSummary, ControllerVideoPullInput,
         LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
-        PendingRemoteFileRequest, RetryWaitOutcome, deadline_expired,
+        PendingRemoteFileRequest, PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
         directory_transport_error_is_retryable, directory_transport_error_message,
         file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
         revalidate_queued_file, session_earned_fresh_retry_budget,
@@ -4275,6 +4418,185 @@ mod tests {
         TransferResult,
     };
     use desklink_transport::{JoinRejectCode, TransportError};
+
+    use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
+
+    #[tokio::test]
+    async fn controller_video_mailbox_returns_only_the_exact_stream_configuration() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+        let key = VideoMailboxKey::new(9, 3);
+        manager.video_mailbox.begin_config(key);
+        assert_eq!(
+            manager.offer_video_frame(
+                VideoDeliveryFrame {
+                    key,
+                    frame_id: 10,
+                    keyframe: true,
+                    payload: vec![1, 2, 3],
+                },
+                Instant::now(),
+            ),
+            VideoMailboxOffer::Queued
+        );
+
+        assert!(
+            manager
+                .next_video_frame(ControllerVideoPullInput {
+                    stream_id: 9,
+                    config_version: 4,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .next_video_frame(ControllerVideoPullInput {
+                    stream_id: 9,
+                    config_version: 3,
+                })
+                .await
+                .unwrap(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn controller_video_mailbox_overflow_records_bounded_playback_pressure() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+        let key = VideoMailboxKey::new(9, 3);
+        let now = Instant::now();
+        manager.video_mailbox.begin_config(key);
+        assert_eq!(
+            manager.offer_video_frame(
+                VideoDeliveryFrame {
+                    key,
+                    frame_id: 20,
+                    keyframe: true,
+                    payload: vec![20],
+                },
+                now,
+            ),
+            VideoMailboxOffer::Queued
+        );
+        assert_eq!(
+            manager.offer_video_frame(
+                VideoDeliveryFrame {
+                    key,
+                    frame_id: 21,
+                    keyframe: false,
+                    payload: vec![21],
+                },
+                now,
+            ),
+            VideoMailboxOffer::RequestKeyframe
+        );
+
+        assert_eq!(
+            manager.take_playback_pressure(9),
+            PlaybackPressureSample {
+                decode_queue_peak: 5,
+                freshness_recoveries: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn playback_pressure_merges_the_current_stream_and_clears_after_take() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+        manager
+            .record_playback_pressure(ControllerPlaybackPressure {
+                stream_id: 9,
+                peak_decode_queue_size: 5,
+                freshness_recoveries: 1,
+            })
+            .unwrap();
+        manager
+            .record_playback_pressure(ControllerPlaybackPressure {
+                stream_id: 9,
+                peak_decode_queue_size: 7,
+                freshness_recoveries: 15,
+            })
+            .unwrap();
+        manager
+            .record_playback_pressure(ControllerPlaybackPressure {
+                stream_id: 9,
+                peak_decode_queue_size: 6,
+                freshness_recoveries: 2,
+            })
+            .unwrap();
+
+        assert_eq!(
+            manager.take_playback_pressure(9),
+            PlaybackPressureSample {
+                decode_queue_peak: 7,
+                freshness_recoveries: 16,
+            }
+        );
+        assert_eq!(
+            manager.take_playback_pressure(9),
+            PlaybackPressureSample::default()
+        );
+    }
+
+    #[test]
+    fn playback_pressure_rejects_unbounded_values_and_ignores_stale_streams() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+
+        manager
+            .record_playback_pressure(ControllerPlaybackPressure {
+                stream_id: 8,
+                peak_decode_queue_size: 64,
+                freshness_recoveries: 16,
+            })
+            .unwrap();
+        assert_eq!(
+            manager.take_playback_pressure(9),
+            PlaybackPressureSample::default()
+        );
+        assert!(
+            manager
+                .record_playback_pressure(ControllerPlaybackPressure {
+                    stream_id: 9,
+                    peak_decode_queue_size: 65,
+                    freshness_recoveries: 0,
+                })
+                .is_err()
+        );
+        assert!(
+            manager
+                .record_playback_pressure(ControllerPlaybackPressure {
+                    stream_id: 9,
+                    peak_decode_queue_size: 0,
+                    freshness_recoveries: 17,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn render_metrics_reject_unbounded_video_pull_failures() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+
+        assert!(
+            manager
+                .record_render_metrics(ControllerRenderMetrics {
+                    stream_id: 9,
+                    received_frames: 10,
+                    submitted_frames: 10,
+                    displayed_frames: 10,
+                    malformed_frames: 0,
+                    decoder_recoveries: 0,
+                    video_pull_failures: 1_000_001,
+                    first_frame_ms: Some(200),
+                })
+                .is_err()
+        );
+    }
 
     #[test]
     fn queued_file_ids_require_exact_nonzero_hex() {

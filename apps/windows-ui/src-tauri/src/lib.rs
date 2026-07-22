@@ -6,6 +6,7 @@ mod file_picker;
 mod host;
 mod local_relay;
 mod updates;
+mod video_mailbox;
 
 #[cfg(windows)]
 mod power;
@@ -50,8 +51,9 @@ use apps_windows::{
     window::WindowsLocalApprovalDialog,
 };
 use controller::{
-    ControllerDeviceInput, ControllerInput, ControllerManager, ControllerRenderMetrics,
-    ControllerSignal, ControllerSnapshot, SavedDeviceInput, SavedDeviceRenameInput,
+    ControllerDeviceInput, ControllerInput, ControllerManager, ControllerPlaybackPressure,
+    ControllerRenderMetrics, ControllerSignal, ControllerSnapshot, ControllerVideoPullInput,
+    SavedDeviceInput, SavedDeviceRenameInput,
 };
 use host::{HostApprovalSummary, HostManager, HostRuntimeSummary, PairingSessionSummary, tray_id};
 use rand_core::{OsRng, RngCore};
@@ -361,10 +363,9 @@ async fn connect_device(
     manager: State<'_, ControllerManager>,
     input: ControllerDeviceInput,
     signals: Channel<ControllerSignal>,
-    video: Channel<Response>,
     audio: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
-    manager.connect_device(input, signals, video, audio).await
+    manager.connect_device(input, signals, audio).await
 }
 
 #[tauri::command]
@@ -372,22 +373,26 @@ async fn connect_saved_device(
     manager: State<'_, ControllerManager>,
     input: SavedDeviceInput,
     signals: Channel<ControllerSignal>,
-    video: Channel<Response>,
     audio: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
-    manager
-        .connect_saved_device(input, signals, video, audio)
-        .await
+    manager.connect_saved_device(input, signals, audio).await
 }
 
 #[tauri::command]
 async fn reconnect_controller(
     manager: State<'_, ControllerManager>,
     signals: Channel<ControllerSignal>,
-    video: Channel<Response>,
     audio: Channel<Response>,
 ) -> Result<ControllerSnapshot, String> {
-    manager.connect_saved(signals, video, audio).await
+    manager.connect_saved(signals, audio).await
+}
+
+#[tauri::command]
+async fn next_controller_video_frame(
+    manager: State<'_, ControllerManager>,
+    input: ControllerVideoPullInput,
+) -> Result<Response, String> {
+    manager.next_video_frame(input).await.map(Response::new)
 }
 
 #[tauri::command]
@@ -555,6 +560,14 @@ fn report_controller_render_metrics(
     metrics: ControllerRenderMetrics,
 ) -> Result<(), String> {
     manager.record_render_metrics(metrics)
+}
+
+#[tauri::command]
+fn report_controller_playback_pressure(
+    manager: State<'_, ControllerManager>,
+    pressure: ControllerPlaybackPressure,
+) -> Result<(), String> {
+    manager.record_playback_pressure(pressure)
 }
 
 #[tauri::command]
@@ -1417,6 +1430,7 @@ pub fn run() {
             connect_saved_device,
             clear_saved_devices,
             reconnect_controller,
+            next_controller_video_frame,
             send_controller_input,
             send_controller_text,
             paste_controller_clipboard_text,
@@ -1438,6 +1452,7 @@ pub fn run() {
             open_controller_downloads_folder,
             request_controller_keyframe,
             report_controller_render_metrics,
+            report_controller_playback_pressure,
             open_github_repository,
             open_windows_releases,
             select_controller_display,

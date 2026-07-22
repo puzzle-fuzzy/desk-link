@@ -236,7 +236,19 @@ export interface ControllerRenderMetrics {
   displayedFrames: number;
   malformedFrames: number;
   decoderRecoveries: number;
+  videoPullFailures: number;
   firstFrameMs: number | null;
+}
+
+export interface ControllerPlaybackPressure {
+  streamId: number;
+  peakDecodeQueueSize: number;
+  freshnessRecoveries: number;
+}
+
+export interface ControllerVideoPullInput {
+  streamId: number;
+  configVersion: number;
 }
 
 export interface ControllerVideoConfigSignal {

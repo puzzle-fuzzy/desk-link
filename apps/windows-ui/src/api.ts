@@ -3,6 +3,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ConnectionSettingsInput,
   ControllerDeviceInput,
+  ControllerPlaybackPressure,
+  ControllerVideoPullInput,
   StreamBoundControllerInput,
   ControllerRenderMetrics,
   ControllerSignal,
@@ -24,9 +26,10 @@ import type { WindowsReleaseSource } from "./windows-update";
 
 export interface ControllerChannels {
   signals: Channel<ControllerSignal>;
-  video: Channel<ArrayBuffer | ArrayBufferView | number[]>;
   audio: Channel<ArrayBuffer | ArrayBufferView | number[]>;
 }
+
+export type ControllerVideoPayload = ArrayBuffer | ArrayBufferView | number[];
 
 export function getHostSnapshot(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("get_host_snapshot");
@@ -114,22 +117,11 @@ export function getControllerSnapshot(): Promise<ControllerSnapshot> {
 
 export function createControllerChannels(
   onSignal: (signal: ControllerSignal) => void,
-  onVideo: (payload: ArrayBuffer | ArrayBufferView | number[]) => void,
-  onVideoError?: (error: unknown) => void,
   onAudio?: (payload: ArrayBuffer | ArrayBufferView | number[]) => void,
   onAudioError?: (error: unknown) => void,
 ): ControllerChannels {
   return {
     signals: new Channel<ControllerSignal>(onSignal),
-    video: new Channel<ArrayBuffer | ArrayBufferView | number[]>((payload) => {
-      try {
-        onVideo(payload);
-      } catch (error) {
-        // Tauri advances a channel only after its callback returns. Never let one
-        // malformed frame permanently block all following video messages.
-        onVideoError?.(error);
-      }
-    }),
     audio: new Channel<ArrayBuffer | ArrayBufferView | number[]>((payload) => {
       try {
         onAudio?.(payload);
@@ -140,6 +132,12 @@ export function createControllerChannels(
       }
     }),
   };
+}
+
+export function nextControllerVideoFrame(
+  input: ControllerVideoPullInput,
+): Promise<ControllerVideoPayload> {
+  return invoke<ControllerVideoPayload>("next_controller_video_frame", { input });
 }
 
 export function connectDevice(
@@ -244,6 +242,10 @@ export function requestControllerKeyframe(): Promise<void> {
 
 export function reportControllerRenderMetrics(metrics: ControllerRenderMetrics): Promise<void> {
   return invoke<void>("report_controller_render_metrics", { metrics });
+}
+
+export function reportControllerPlaybackPressure(pressure: ControllerPlaybackPressure): Promise<void> {
+  return invoke<void>("report_controller_playback_pressure", { pressure });
 }
 
 export function openGithubRepository(): Promise<void> {

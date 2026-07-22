@@ -130,6 +130,90 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     assert_eq!(runtime.metrics().dropped_video_packets, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_runtime_requests_a_keyframe_after_a_reference_gap() {
+    let relay = spawn_test_relay().await;
+    let config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+    let host = QuicClient::connect(config()).await.unwrap();
+    let controller = QuicClient::connect(config()).await.unwrap();
+    let session_id = SessionId::from_bytes([81; 16]);
+    let authentication = [82; 32];
+    host.join(RelayJoin::host(session_id, authentication))
+        .await
+        .unwrap();
+    controller
+        .join(RelayJoin::controller(session_id, authentication))
+        .await
+        .unwrap();
+
+    let host_identity = DeviceIdentity::from_secret_key([83; 16], &[84; 32]);
+    let controller_identity = DeviceIdentity::from_secret_key([85; 16], &[86; 32]);
+    let host_verify_key = host_identity.verify_key();
+    let controller_verify_key = controller_identity.verify_key();
+    let (release_host, keep_host_alive) = oneshot::channel();
+    let host_task = tokio::spawn(run_reference_gap_host(
+        host,
+        host_identity,
+        controller_verify_key,
+        keep_host_alive,
+    ));
+
+    let mut runtime = ControllerRuntime::connect(controller, controller_identity, host_verify_key)
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
+            .await
+            .unwrap()
+            .unwrap(),
+        ControllerEvent::VideoConfig(VideoConfig { stream_id: 9, .. })
+    ));
+    runtime.set_audio_enabled(false).await.unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        first,
+        ControllerEvent::H264AccessUnit(EncodedFrame { frame_id: 10, .. })
+    ));
+    runtime.set_audio_enabled(true).await.unwrap();
+
+    let recovered = tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        recovered,
+        ControllerEvent::H264AccessUnit(EncodedFrame { frame_id: 13, .. })
+    ));
+    let next = tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        next,
+        ControllerEvent::H264AccessUnit(EncodedFrame { frame_id: 14, .. })
+    ));
+    release_host.send(()).unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), host_task)
+            .await
+            .unwrap()
+            .unwrap(),
+        ControlMessage::RequestKeyframe { stream_id: 9 }
+    );
+    assert_eq!(runtime.metrics().completed_frames, 3);
+}
+
 async fn run_fake_host(
     host: QuicClient,
     identity: DeviceIdentity,
@@ -266,6 +350,119 @@ async fn run_fake_host(
     let input = decode_input(&input, now_micros()).unwrap().event;
     let control = open_control(&mut secure, control.unwrap());
     (input, control)
+}
+
+async fn run_reference_gap_host(
+    host: QuicClient,
+    identity: DeviceIdentity,
+    expected_controller: ed25519_dalek::VerifyingKey,
+    keep_host_alive: oneshot::Receiver<()>,
+) -> ControlMessage {
+    let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
+    let (mut responder, response) =
+        NoiseResponder::accept(&first.payload, identity, expected_controller).unwrap();
+    host.send_control(
+        encode_noise_handshake(&NoiseHandshake {
+            protocol_version: PROTOCOL_VERSION,
+            step: NoiseHandshakeStep::ResponderHello,
+            payload: response,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let finish = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
+    responder.receive(&finish.payload).unwrap();
+    let mut secure = responder
+        .finish()
+        .unwrap()
+        .into_secure_session(SecureRole::Responder);
+
+    let first = open_control(&mut secure, host.next_control().await.unwrap());
+    let second = open_control(&mut secure, host.next_control().await.unwrap());
+    assert!(matches!(first, ControlMessage::Hello { .. }));
+    assert!(matches!(second, ControlMessage::Capabilities(_)));
+    send_control(
+        &host,
+        &mut secure,
+        ControlMessage::Hello {
+            platform: Platform::Windows,
+            role: DeviceRole::Host,
+        },
+    )
+    .await;
+    send_control(
+        &host,
+        &mut secure,
+        ControlMessage::Capabilities(DeviceCapabilities {
+            platform: Platform::Windows,
+            role: DeviceRole::Host,
+            codecs: vec![Codec::H264],
+            width: 1280,
+            height: 720,
+        }),
+    )
+    .await;
+
+    let config = VideoConfig {
+        protocol_version: PROTOCOL_VERSION,
+        stream_id: 9,
+        config_version: 3,
+        codec: Codec::H264,
+        width: 1280,
+        height: 720,
+        sequence_header: vec![
+            0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
+        ],
+    };
+    let config_bytes = encode_video_config(&config).unwrap();
+    host.send_video_config(secure.seal(SecureLane::VideoConfig, &config_bytes).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        open_control(&mut secure, host.next_control().await.unwrap()),
+        ControlMessage::SetAudioEnabled { enabled: false }
+    );
+    send_test_video_frame(&host, &mut secure, 10, true).await;
+    assert_eq!(
+        open_control(&mut secure, host.next_control().await.unwrap()),
+        ControlMessage::SetAudioEnabled { enabled: true }
+    );
+    send_test_video_frame(&host, &mut secure, 12, false).await;
+
+    let request = open_control(&mut secure, host.next_control().await.unwrap());
+    send_test_video_frame(&host, &mut secure, 13, true).await;
+    send_test_video_frame(&host, &mut secure, 14, false).await;
+    let _ = keep_host_alive.await;
+    request
+}
+
+async fn send_test_video_frame(
+    host: &QuicClient,
+    secure: &mut SecureSession,
+    frame_id: u64,
+    keyframe: bool,
+) {
+    let frame = EncodedFrame {
+        stream_id: 9,
+        frame_id,
+        config_version: 3,
+        capture_timestamp_us: frame_id,
+        width: 1280,
+        height: 720,
+        flags: if keyframe {
+            FrameFlags(FrameFlags::KEYFRAME.0)
+        } else {
+            FrameFlags(0)
+        },
+        data: vec![frame_id as u8; 2_500],
+    };
+    for packet in packetize_frame(&frame).unwrap() {
+        let plaintext = encode_video_packet(&packet).unwrap();
+        host.send_video_datagram(secure.seal(SecureLane::VideoDatagram, &plaintext).unwrap())
+            .await
+            .unwrap();
+    }
 }
 
 fn open_control(secure: &mut SecureSession, ciphertext: Vec<u8>) -> ControlMessage {

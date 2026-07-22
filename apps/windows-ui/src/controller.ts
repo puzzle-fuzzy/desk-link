@@ -11,11 +11,13 @@ import {
   discardControllerFileQueueRecovery,
   forgetSavedDevice,
   getControllerSnapshot,
+  nextControllerVideoFrame,
   reconnectController,
   removeControllerQueuedFile,
   renameSavedDevice,
   openControllerDownloadsFolder,
   pasteControllerClipboardText,
+  reportControllerPlaybackPressure,
   reportControllerRenderMetrics,
   requestControllerKeyframe,
   requestControllerClipboard,
@@ -33,7 +35,7 @@ import {
 } from "./api";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { ControllerChannels } from "./api";
+import type { ControllerChannels, ControllerVideoPayload } from "./api";
 import {
   deviceCredentialsAreValid,
   formatDeviceId,
@@ -110,16 +112,24 @@ import {
   type FileQueueActionKind,
   type FileQueueActionToken,
 } from "./file-queue-action";
+import {
+  remoteSessionSummary,
+  remoteToolbarHideDelay,
+  remoteToolbarVisible,
+  type RemoteToolbarVisibilityInput,
+} from "./remote-session-presentation";
+import { VideoPlaybackPressure } from "./video-playback-pressure";
+import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
-type VideoPayload = ArrayBuffer | ArrayBufferView | number[];
 type ClipboardTransferStatus = Extract<ControllerSignal, { kind: "clipboard" }>;
 type FileTransferStatus = Extract<ControllerSignal, { kind: "fileTransfer" }>;
 type FileQueueStatus = Omit<Extract<ControllerSignal, { kind: "fileQueue" }>, "kind">;
 type AudioStatus = "starting" | "enabled" | "muted" | "unavailable";
 
 const FRAME_PREFIX_BYTES = 17;
+const VIDEO_PRESSURE_REPORT_INTERVAL_MS = 1_000;
 const controllerWindow = getCurrentWindow();
 let snapshot: ControllerSnapshot | null = null;
 let loading = true;
@@ -146,10 +156,12 @@ let submittedVideoFrames = 0;
 let relayCompletedFrames = 0;
 let malformedVideoFrames = 0;
 let decoderRecoveries = 0;
+let videoPullFailures = 0;
 let consecutiveDecoderStalls = 0;
 let videoConfigReceivedAtMs: number | null = null;
 let firstFrameMs: number | null = null;
 let lastRenderMetricsReportedAtMs = 0;
+let videoPlaybackPressureTimer: number | null = null;
 let pointerFrame: number | null = null;
 let remoteResizeObserver: ResizeObserver | null = null;
 let remoteCanvasBounds: PointerBounds | null = null;
@@ -164,6 +176,10 @@ let remoteFullscreenBusy = false;
 let remoteFullscreenDesired = false;
 let remoteFullscreenOperation: Promise<void> | null = null;
 let remoteFullscreenResizeTimer: number | null = null;
+let remoteToolbarLastRevealedAtMs = 0;
+let remoteToolbarPointerNearTop = false;
+let remoteToolbarFocused = false;
+let remoteToolbarTimer: number | null = null;
 let requestRender: RenderRequest = () => {};
 let decodedFrames = 0;
 let textSending = false;
@@ -212,7 +228,7 @@ let audioStatus: AudioStatus = "starting";
 let audioEnabled = true;
 let audioToggleBusy = false;
 let audioMessage = "正在准备远端系统声音。";
-let videoQualityPreference: VideoQualityPreference = "sharp";
+let videoQualityPreference: VideoQualityPreference = "automatic";
 let appliedVideoQuality: VideoQualityPreset = "sharp";
 let pendingVideoQuality: VideoQualityPreference | null = null;
 let videoQualityAckTimer: number | null = null;
@@ -220,8 +236,16 @@ const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
   sendControllerInput({ ...input, streamId })
 ));
 const remoteAudio = new RemoteAudioPlayer();
+const videoPlaybackPressure = new VideoPlaybackPressure();
+const videoPull = new SerialVideoPull<ControllerVideoPayload>();
 
 function resetVideoTelemetry(): void {
+  videoPull.stop();
+  if (videoPlaybackPressureTimer !== null) {
+    window.clearTimeout(videoPlaybackPressureTimer);
+    videoPlaybackPressureTimer = null;
+  }
+  videoPlaybackPressure.reset();
   pendingVideoKeyframe = null;
   receivedVideoFrames = 0;
   submittedVideoFrames = 0;
@@ -229,6 +253,7 @@ function resetVideoTelemetry(): void {
   malformedVideoFrames = 0;
   decodedFrames = 0;
   decoderRecoveries = 0;
+  videoPullFailures = 0;
   consecutiveDecoderStalls = 0;
   videoConfigReceivedAtMs = null;
   firstFrameMs = null;
@@ -241,6 +266,7 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
   if (!fullscreenListenerInitialized) {
     window.addEventListener("resize", scheduleRemoteFullscreenSync);
     document.addEventListener("keydown", handleRemoteFullscreenEscape, true);
+    document.addEventListener("pointermove", handleRemoteToolbarPointerMove, { passive: true });
     fullscreenListenerInitialized = true;
     void synchronizeRemoteFullscreen();
   }
@@ -294,6 +320,7 @@ export function prepareControllerRender(): void {
   remoteCanvasBounds = null;
   remoteViewportBounds = null;
   pointerInsideViewport = false;
+  clearRemoteToolbarTimer();
   cancelScheduledTransferPanelUpdate();
 }
 
@@ -448,6 +475,7 @@ export function bindControllerInteractions(): void {
       cancelScheduledTransferPanelUpdate();
     }
     updateTransferPanel({ ledger: true });
+    revealRemoteToolbar();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-clipboard-send]")?.addEventListener("click", () => {
     void sendLocalClipboard();
@@ -493,6 +521,7 @@ export function bindControllerInteractions(): void {
     const input = document.querySelector<HTMLInputElement>("[data-controller-text-input]");
     if (panel && input) {
       panel.hidden = false;
+      revealRemoteToolbar();
       input.focus();
     }
   });
@@ -503,10 +532,30 @@ export function bindControllerInteractions(): void {
     void submitTextInput(event);
   });
   bindTransferLedgerActions();
+  const remoteToolbar = document.querySelector<HTMLElement>(".remote-toolbar");
+  remoteToolbar?.addEventListener("pointerenter", () => {
+    remoteToolbarPointerNearTop = true;
+    revealRemoteToolbar();
+  });
+  remoteToolbar?.addEventListener("pointerleave", (event) => {
+    remoteToolbarPointerNearTop = event.clientY <= 12;
+    revealRemoteToolbar();
+  });
+  remoteToolbar?.addEventListener("focusin", () => {
+    remoteToolbarFocused = true;
+    revealRemoteToolbar();
+  });
+  remoteToolbar?.addEventListener("focusout", () => {
+    queueMicrotask(() => {
+      remoteToolbarFocused = remoteToolbar.contains(document.activeElement);
+      revealRemoteToolbar();
+    });
+  });
   if (snapshot?.runtime.state === "connected") {
     setupRemoteDesktop();
     syncRemoteInteractionControls();
     syncRemoteFullscreenControl();
+    updateRemoteToolbarVisibility();
   }
 }
 
@@ -776,11 +825,11 @@ function renderRemoteDesktop(): string {
   const config = videoConfig;
   const videoFailed = config ? failedVideoConfig === videoConfigKey(config) : false;
   return `
-    <section class="remote-session" aria-label="当前远程控制会话">
+    <section class="remote-session" data-remote-toolbar-visible="true" aria-label="当前远程控制会话">
       <div class="remote-toolbar">
         <div class="remote-toolbar-status">
           <span class="remote-live-dot" aria-hidden="true"></span>
-          <div><strong>实时远程桌面</strong><small data-controller-metrics>${config ? `${config.width} × ${config.height} · 已加密` : "正在等待首个视频画面"}</small></div>
+          <div><strong>实时远程桌面</strong><small data-controller-metrics>${config ? remoteSessionSummary(config.width, config.height, videoQualityPreference, appliedVideoQuality) : "正在等待首个视频画面"}</small></div>
         </div>
         <div class="remote-toolbar-actions">
           <label class="remote-quality-picker" title="根据当前网络调整远程画面的清晰度和流畅度">
@@ -819,6 +868,7 @@ function renderRemoteDesktop(): string {
           <button class="toolbar-button toolbar-button--danger" type="button" data-controller-disconnect>${icon("log-out")}断开连接</button>
         </div>
       </div>
+      <div class="remote-fullscreen-guide" aria-hidden="true">鼠标移到顶部显示工具栏 · Esc 退出全屏</div>
       ${renderTransferPanel()}
       <form class="remote-text-entry" data-controller-text-form data-controller-text-panel hidden>
         <label for="remote-text-input">发送文字到远程电脑</label>
@@ -1088,16 +1138,6 @@ async function beginConnection(
     },
     (payload) => {
       if (generation === channelGeneration) {
-        handleVideo(payload);
-      }
-    },
-    (error) => {
-      if (generation === channelGeneration) {
-        handleVideoDeliveryError(error);
-      }
-    },
-    (payload) => {
-      if (generation === channelGeneration) {
         remoteAudio.push(payload);
       }
     },
@@ -1307,6 +1347,7 @@ function handleSignal(signal: ControllerSignal): void {
         if (remoteFullscreenActive || remoteFullscreenDesired) {
           void setRemoteFullscreen(false, false);
         }
+        resetRemoteToolbarState();
         smartPasteBusy = false;
         smartPastePending = false;
         releaseInputState();
@@ -1327,7 +1368,7 @@ function handleSignal(signal: ControllerSignal): void {
         activeRemoteDisplayId = null;
         clearRemoteDisplaySwitch();
         clearVideoQualityAckTimer();
-        videoQualityPreference = "sharp";
+        videoQualityPreference = "automatic";
         appliedVideoQuality = "sharp";
         pendingVideoQuality = null;
         remoteAudio.resetConnection();
@@ -1397,16 +1438,11 @@ function handleSignal(signal: ControllerSignal): void {
         picker.value = videoQualityPreference;
         picker.disabled = false;
       }
+      updateRemoteSessionSummary();
       break;
     }
     case "metrics": {
       relayCompletedFrames = signal.completedFrames;
-      const element = document.querySelector<HTMLElement>("[data-controller-metrics]");
-      if (element && videoConfig) {
-        const total = signal.receivedVideoPackets + signal.droppedVideoPackets;
-        const loss = total === 0 ? 0 : (signal.droppedVideoPackets / total) * 100;
-        element.textContent = `${videoConfig.width} × ${videoConfig.height} · 中继 ${signal.completedFrames} 帧 · 前端 ${receivedVideoFrames} 帧 · 显示 ${decodedFrames} 帧 · 丢包率 ${loss.toFixed(1)}%`;
-      }
       updateVideoStartingMessage();
       reportRenderMetrics();
       break;
@@ -1619,6 +1655,7 @@ function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void
 function openTransferPanel(): void {
   transferPanelOpen = true;
   transferActivity = markTransferResultsRead(transferActivity);
+  revealRemoteToolbar();
 }
 
 function recordTransferHistory(
@@ -2154,11 +2191,21 @@ function setupRemoteDesktop(): void {
   setupRemoteGeometry(viewport, canvas);
   scheduleRemoteScaleLayout(viewport, canvas, remoteScaleMode === "actual");
   startVideoDecoder(canvas, context, configKey, "hardware");
+  videoPull.start(
+    { streamId: config.streamId, configVersion: config.configVersion },
+    nextControllerVideoFrame,
+    handleVideo,
+    handleVideoDeliveryError,
+    () => {
+      videoPullFailures = nextVideoPullFailureCount(videoPullFailures);
+    },
+  );
+  armVideoPlaybackPressureReporter(config.streamId);
   bindRemoteInput(viewport, canvas);
   viewport.focus({ preventScroll: true });
 }
 
-function handleVideo(payload: VideoPayload): void {
+function handleVideo(payload: ControllerVideoPayload): void {
   if (!activeChannels || !videoConfig) {
     return;
   }
@@ -2188,7 +2235,8 @@ function submitVideoChunk(bytes: Uint8Array): void {
   if (awaitingDecoderKeyframe && !keyframe) {
     return;
   }
-  if (!keyframe && decoder.decodeQueueSize > 4) {
+  if (videoPlaybackPressure.observe(decoder.decodeQueueSize, Date.now()) === "recover") {
+    restartVideoDecoderForFreshness(videoConfigKey(videoConfig), decoderPreference);
     return;
   }
   const timestamp = Number(view.getBigUint64(1, true));
@@ -2211,6 +2259,44 @@ function submitVideoChunk(bytes: Uint8Array): void {
     handleVideoDeliveryError(error);
     void requestControllerKeyframe().catch(showOperationError);
   }
+}
+
+function restartVideoDecoderForFreshness(
+  configKey: string,
+  preference: "hardware" | "software",
+): void {
+  if (!videoConfig || videoConfigKey(videoConfig) !== configKey || decoderPreference !== preference) {
+    return;
+  }
+  const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
+  const context = canvas?.getContext("2d", { alpha: false });
+  if (!canvas || !context) {
+    return;
+  }
+  startVideoDecoder(canvas, context, configKey, preference);
+}
+
+function armVideoPlaybackPressureReporter(streamId: number): void {
+  if (videoPlaybackPressureTimer !== null) {
+    return;
+  }
+  videoPlaybackPressureTimer = window.setTimeout(() => {
+    videoPlaybackPressureTimer = null;
+    if (!videoConfig || videoConfig.streamId !== streamId) {
+      return;
+    }
+    const sample = videoPlaybackPressure.takeSample();
+    const report = sample.peakDecodeQueueSize > 0 || sample.freshnessRecoveries > 0
+      ? reportControllerPlaybackPressure({ streamId, ...sample }).catch(() => {
+          // Playback feedback is best-effort and must never interrupt the live session.
+        })
+      : Promise.resolve();
+    void report.finally(() => {
+      if (videoConfig?.streamId === streamId) {
+        armVideoPlaybackPressureReporter(streamId);
+      }
+    });
+  }, VIDEO_PRESSURE_REPORT_INTERVAL_MS);
 }
 
 function handleVideoDeliveryError(error: unknown): void {
@@ -2408,6 +2494,7 @@ function reportRenderMetrics(force = false): void {
     displayedFrames: decodedFrames,
     malformedFrames: malformedVideoFrames,
     decoderRecoveries,
+    videoPullFailures,
     firstFrameMs,
   }).catch(() => {
     // Diagnostics must never interrupt a live remote-control session.
@@ -2539,6 +2626,19 @@ function videoQualityPresetLabel(preset: VideoQualityPreset): string {
     case "sharp":
       return "清晰";
   }
+}
+
+function updateRemoteSessionSummary(): void {
+  const element = document.querySelector<HTMLElement>("[data-controller-metrics]");
+  if (!element || !videoConfig) {
+    return;
+  }
+  element.textContent = remoteSessionSummary(
+    videoConfig.width,
+    videoConfig.height,
+    videoQualityPreference,
+    appliedVideoQuality,
+  );
 }
 
 function changeRemoteScaleMode(value: string): void {
@@ -2996,6 +3096,7 @@ function closeTextInput(): void {
   if (panel) {
     panel.hidden = true;
   }
+  revealRemoteToolbar();
   viewport?.focus({ preventScroll: true });
 }
 
@@ -3049,6 +3150,73 @@ function readRemoteCanvasBounds(canvas: HTMLCanvasElement): PointerBounds {
   return remoteScaleMode === "fit"
     ? containedPointerBounds(bounds, canvas.width, canvas.height)
     : bounds;
+}
+
+function clearRemoteToolbarTimer(): void {
+  if (remoteToolbarTimer !== null) {
+    window.clearTimeout(remoteToolbarTimer);
+    remoteToolbarTimer = null;
+  }
+}
+
+function remoteToolbarVisibilityInput(nowMs: number): RemoteToolbarVisibilityInput {
+  const textPanel = document.querySelector<HTMLElement>("[data-controller-text-panel]");
+  return {
+    connected: snapshot?.runtime.state === "connected",
+    fullscreen: remoteFullscreenActive,
+    nowMs,
+    lastRevealedAtMs: remoteToolbarLastRevealedAtMs,
+    pointerNearTop: remoteToolbarPointerNearTop,
+    toolbarFocused: remoteToolbarFocused,
+    panelOpen: transferPanelOpen || (textPanel !== null && !textPanel.hidden),
+  };
+}
+
+function updateRemoteToolbarVisibility(nowMs = Date.now()): void {
+  clearRemoteToolbarTimer();
+  const session = document.querySelector<HTMLElement>(".remote-session");
+  if (!session) {
+    return;
+  }
+  const input = remoteToolbarVisibilityInput(nowMs);
+  const visible = remoteToolbarVisible(input);
+  session.dataset.remoteToolbarVisible = String(visible);
+  const delay = remoteToolbarHideDelay(input);
+  if (visible && delay !== null && delay > 0) {
+    remoteToolbarTimer = window.setTimeout(() => {
+      remoteToolbarTimer = null;
+      updateRemoteToolbarVisibility();
+    }, delay + 16);
+  }
+}
+
+function revealRemoteToolbar(nowMs = Date.now()): void {
+  remoteToolbarLastRevealedAtMs = nowMs;
+  updateRemoteToolbarVisibility(nowMs);
+}
+
+function resetRemoteToolbarState(): void {
+  clearRemoteToolbarTimer();
+  remoteToolbarLastRevealedAtMs = 0;
+  remoteToolbarPointerNearTop = false;
+  remoteToolbarFocused = false;
+  const session = document.querySelector<HTMLElement>(".remote-session");
+  if (session) {
+    session.dataset.remoteToolbarVisible = "true";
+  }
+}
+
+function handleRemoteToolbarPointerMove(event: PointerEvent): void {
+  if (!remoteFullscreenActive) {
+    return;
+  }
+  const toolbarHovered = document.querySelector<HTMLElement>(".remote-toolbar")?.matches(":hover") === true;
+  const pointerNearTop = event.clientY <= 12 || toolbarHovered;
+  if (pointerNearTop === remoteToolbarPointerNearTop) {
+    return;
+  }
+  remoteToolbarPointerNearTop = pointerNearTop;
+  revealRemoteToolbar();
 }
 
 async function toggleFullscreen(): Promise<void> {
@@ -3107,8 +3275,10 @@ function applyRemoteFullscreenState(active: boolean, synchronizeDesired = true):
   }
   if (active) {
     document.documentElement.dataset.remoteFullscreen = "true";
+    revealRemoteToolbar();
   } else {
     delete document.documentElement.dataset.remoteFullscreen;
+    resetRemoteToolbarState();
   }
   remoteCanvasBounds = null;
   remoteViewportBounds = null;
@@ -3162,7 +3332,7 @@ function syncRemoteFullscreenControl(): void {
   renderLucideIcons(button);
 }
 
-function toUint8Array(payload: VideoPayload): Uint8Array {
+function toUint8Array(payload: ControllerVideoPayload): Uint8Array {
   if (payload instanceof Uint8Array) {
     return payload;
   }
