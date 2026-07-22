@@ -1232,7 +1232,16 @@ fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
         return vec!["控制端尚未捕获足够的视频渲染指标。".to_owned()];
     };
     let transport = latest_metric_event(recent_events, "controller_video_metrics")
-        .filter(|(timestamp, _)| render_timestamp.abs_diff(*timestamp) <= 120_000)
+        .filter(|(timestamp, value)| {
+            let render_stream_id = render.get("stream_id").and_then(serde_json::Value::as_u64);
+            let transport_stream_id = value.get("stream_id").and_then(serde_json::Value::as_u64);
+            match (render_stream_id, transport_stream_id) {
+                (Some(render_stream_id), Some(transport_stream_id)) => {
+                    render_stream_id == transport_stream_id
+                }
+                _ => render_timestamp.abs_diff(*timestamp) <= 120_000,
+            }
+        })
         .map(|(_, value)| value);
 
     let mut findings = Vec::new();
@@ -1781,7 +1790,7 @@ mod tests {
     #[test]
     fn diagnostic_report_adds_video_performance_findings_without_raw_secrets() {
         let events = vec![
-            "[控制端] {\"timestamp_unix_ms\":1000,\"event\":\"controller_video_metrics\",\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":1000,\"event\":\"controller_video_metrics\",\"stream_id\":7,\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
             "[控制端] {\"timestamp_unix_ms\":1100,\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":1240,\"max_frame_gap_ms\":420}".to_owned(),
         ];
 
@@ -1796,8 +1805,8 @@ mod tests {
     #[test]
     fn video_performance_summary_does_not_mix_an_old_transport_session() {
         let events = vec![
-            "[控制端] {\"timestamp_unix_ms\":100,\"event\":\"controller_video_metrics\",\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
-            "[控制端] {\"timestamp_unix_ms\":200000,\"event\":\"controller_render_metrics\",\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":3000,\"max_frame_gap_ms\":33}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":200000,\"event\":\"controller_video_metrics\",\"stream_id\":6,\"completed_frames\":120,\"delivered_video_frames\":118}".to_owned(),
+            "[控制端] {\"timestamp_unix_ms\":200100,\"event\":\"controller_render_metrics\",\"stream_id\":7,\"received_frames\":116,\"submitted_frames\":114,\"displayed_frames\":110,\"video_pull_failures\":1,\"displayed_fps_x100\":3000,\"max_frame_gap_ms\":33}".to_owned(),
         ];
 
         let summary = build_video_performance_summary(&events).join("\n");

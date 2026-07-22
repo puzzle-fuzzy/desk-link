@@ -3433,6 +3433,7 @@ async fn run_controller(
                     record_controller_video_metrics(
                         diagnostics.as_ref(),
                         attempt,
+                        manager.active_stream_id(),
                         metrics,
                         manager.video_mailbox.metrics(),
                         manager.input_backpressure_count.load(Ordering::Relaxed),
@@ -3445,6 +3446,7 @@ async fn run_controller(
         record_controller_video_metrics(
             diagnostics.as_ref(),
             attempt,
+            manager.active_stream_id(),
             runtime.metrics(),
             manager.video_mailbox.metrics(),
             manager.input_backpressure_count.load(Ordering::Relaxed),
@@ -4136,6 +4138,7 @@ fn record_controller_diagnostic(
 fn record_controller_video_metrics(
     diagnostics: Option<&DiagnosticLog>,
     attempt: u32,
+    stream_id: Option<u64>,
     transport: ControllerMetrics,
     mailbox: VideoMailboxMetrics,
     input_backpressure_count: u64,
@@ -4145,6 +4148,7 @@ fn record_controller_video_metrics(
     };
     let _ = diagnostics.record(&DiagnosticEvent::ControllerVideoMetrics {
         attempt,
+        stream_id,
         received_video_packets: transport.received_video_packets,
         dropped_video_packets: transport.dropped_video_packets,
         completed_frames: transport.completed_frames,
