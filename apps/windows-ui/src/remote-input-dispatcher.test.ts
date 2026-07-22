@@ -37,6 +37,53 @@ describe("remote input dispatcher", () => {
     ]);
   });
 
+  test("reuses a pending pointer move while IPC is busy", async () => {
+    const first = deferred();
+    const sent: Array<{ input: ControllerInput; streamId: number }> = [];
+    const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
+      sent.push({ input, streamId });
+      if (sent.length === 1) {
+        await first.promise;
+      }
+    });
+
+    dispatcher.enqueue({ kind: "key", key: "a", pressed: true }, 7);
+    await Promise.resolve();
+    dispatcher.enqueueMouseMove(10, 10, 7);
+    dispatcher.enqueueMouseMove(20, 20, 7);
+    first.resolve();
+    await dispatcher.drain();
+
+    expect(sent).toEqual([
+      { input: { kind: "key", key: "a", pressed: true }, streamId: 7 },
+      { input: { kind: "mouseMove", x: 20, y: 20 }, streamId: 7 },
+    ]);
+  });
+
+  test("flushes a pending pointer move before a discrete input", async () => {
+    const first = deferred();
+    const sent: Array<{ input: ControllerInput; streamId: number }> = [];
+    const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
+      sent.push({ input, streamId });
+      if (sent.length === 1) {
+        await first.promise;
+      }
+    });
+
+    dispatcher.enqueue({ kind: "key", key: "a", pressed: true }, 7);
+    await Promise.resolve();
+    dispatcher.enqueueMouseMove(30, 40, 7);
+    dispatcher.enqueue({ kind: "mouseButton", button: "left", pressed: true }, 7);
+    first.resolve();
+    await dispatcher.drain();
+
+    expect(sent).toEqual([
+      { input: { kind: "key", key: "a", pressed: true }, streamId: 7 },
+      { input: { kind: "mouseMove", x: 30, y: 40 }, streamId: 7 },
+      { input: { kind: "mouseButton", button: "left", pressed: true }, streamId: 7 },
+    ]);
+  });
+
   test("preserves button ordering around coalesced movement", async () => {
     const sent: Array<{ input: ControllerInput; streamId: number }> = [];
     const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
@@ -90,9 +137,9 @@ describe("remote input dispatcher", () => {
       if (sent.length === 1) await first.promise;
     });
 
-    dispatcher.enqueue({ kind: "mouseMove", x: 1, y: 1 }, 20);
-    dispatcher.enqueue({ kind: "mouseMove", x: 2, y: 2 }, 20);
-    dispatcher.enqueue({ kind: "mouseMove", x: 3, y: 3 }, 21);
+    dispatcher.enqueueMouseMove(1, 1, 20);
+    dispatcher.enqueueMouseMove(2, 2, 20);
+    dispatcher.enqueueMouseMove(3, 3, 21);
     first.resolve();
     await dispatcher.drain();
 

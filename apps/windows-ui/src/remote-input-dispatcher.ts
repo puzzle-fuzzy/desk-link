@@ -16,6 +16,8 @@ export class RemoteInputDispatcher {
   private readonly queue: QueuedInput[] = [];
   private queueHead = 0;
   private pumping: Promise<void> | null = null;
+  private readonly pendingMouseMove = { x: 0, y: 0, streamId: 0 };
+  private hasPendingMouseMove = false;
 
   constructor(
     private readonly sender: InputSender,
@@ -23,6 +25,7 @@ export class RemoteInputDispatcher {
   ) {}
 
   enqueue(input: ControllerInput, streamId: number): void {
+    this.flushPendingMouseMove();
     const last = this.queue.length > this.queueHead
       ? this.queue[this.queue.length - 1]
       : undefined;
@@ -39,7 +42,34 @@ export class RemoteInputDispatcher {
     this.startPump();
   }
 
+  /**
+   * Queues a pointer move without allocating a ControllerInput for every
+   * hardware event while an IPC call is still in flight. Discrete input is
+   * flushed ahead of button/key events so their original order is preserved.
+   */
+  enqueueMouseMove(x: number, y: number, streamId: number): void {
+    const last = this.queue.length > this.queueHead
+      ? this.queue[this.queue.length - 1]
+      : undefined;
+    if (last?.input.kind === "mouseMove" && last.streamId === streamId) {
+      last.input.x = x;
+      last.input.y = y;
+    } else if (last) {
+      this.queue.push({ input: { kind: "mouseMove", x, y }, streamId });
+    } else if (this.hasPendingMouseMove && this.pendingMouseMove.streamId !== streamId) {
+      this.flushPendingMouseMove();
+      this.queue.push({ input: { kind: "mouseMove", x, y }, streamId });
+    } else {
+      this.pendingMouseMove.x = x;
+      this.pendingMouseMove.y = y;
+      this.pendingMouseMove.streamId = streamId;
+      this.hasPendingMouseMove = true;
+    }
+    this.startPump();
+  }
+
   discardPendingMoves(): void {
+    this.hasPendingMouseMove = false;
     for (let index = this.queue.length - 1; index >= this.queueHead; index -= 1) {
       if (this.queue[index]?.input.kind === "mouseMove") {
         this.queue.splice(index, 1);
@@ -51,6 +81,7 @@ export class RemoteInputDispatcher {
   discardAll(): void {
     this.queue.length = 0;
     this.queueHead = 0;
+    this.hasPendingMouseMove = false;
   }
 
   async drain(): Promise<void> {
@@ -65,26 +96,53 @@ export class RemoteInputDispatcher {
     }
     this.pumping = this.pump().finally(() => {
       this.pumping = null;
-      if (this.queue.length > 0) {
+      if (this.queue.length > 0 || this.hasPendingMouseMove) {
         this.startPump();
       }
     });
   }
 
   private async pump(): Promise<void> {
-    while (this.queueHead < this.queue.length) {
-      const queued = this.queue[this.queueHead];
-      this.queueHead += 1;
-      if (!queued) {
-        continue;
+    while (true) {
+      while (this.queueHead < this.queue.length) {
+        const queued = this.queue[this.queueHead];
+        this.queueHead += 1;
+        if (!queued) {
+          continue;
+        }
+        try {
+          await this.sender(queued.input, queued.streamId);
+        } catch {
+          this.onError();
+        }
       }
+      this.compactQueue();
+      if (!this.hasPendingMouseMove) {
+        return;
+      }
+      const { x, y, streamId } = this.pendingMouseMove;
+      this.hasPendingMouseMove = false;
       try {
-        await this.sender(queued.input, queued.streamId);
+        await this.sender({ kind: "mouseMove", x, y }, streamId);
       } catch {
         this.onError();
       }
     }
-    this.compactQueue();
+  }
+
+  private flushPendingMouseMove(): void {
+    if (!this.hasPendingMouseMove) {
+      return;
+    }
+    this.queue.push({
+      input: {
+        kind: "mouseMove",
+        x: this.pendingMouseMove.x,
+        y: this.pendingMouseMove.y,
+      },
+      streamId: this.pendingMouseMove.streamId,
+    });
+    this.hasPendingMouseMove = false;
   }
 
   private compactQueue(): void {

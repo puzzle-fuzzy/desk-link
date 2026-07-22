@@ -2962,7 +2962,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     }
     pointerFrame = null;
     if (hasPendingPoint) {
-      fireInput({ kind: "mouseMove", x: pendingPoint.x, y: pendingPoint.y });
+      fireMouseMove(pendingPoint.x, pendingPoint.y);
       hasPendingPoint = false;
     }
   };
@@ -3207,6 +3207,15 @@ function fireInput(input: ControllerInput): void {
     : null;
   if (streamId !== null) {
     inputDispatcher.enqueue(input, streamId);
+  }
+}
+
+function fireMouseMove(x: number, y: number): void {
+  const streamId = snapshot?.runtime.state === "connected"
+    ? snapshot.runtime.streamId
+    : null;
+  if (streamId !== null) {
+    inputDispatcher.enqueueMouseMove(x, y, streamId);
   }
 }
 
