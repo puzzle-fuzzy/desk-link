@@ -118,6 +118,7 @@ import {
   remoteToolbarVisible,
   type RemoteToolbarVisibilityInput,
 } from "./remote-session-presentation";
+import { controllerRuntimeSurfaceChanged } from "./controller-runtime-presentation";
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
 
@@ -585,6 +586,23 @@ function renderRuntimeBadge(): string {
       <div><strong>${escapeHtml(label)}</strong><small>${escapeHtml(runtime?.detail ?? "请重新打开 DeskLink。")}</small></div>
     </div>
   `;
+}
+
+function updateRuntimeBadge(): void {
+  const runtime = snapshot?.runtime;
+  const badge = document.querySelector<HTMLElement>(".controller-runtime");
+  if (!runtime || !badge) {
+    return;
+  }
+  badge.className = `controller-runtime controller-runtime--${runtime.state}`;
+  const title = badge.querySelector<HTMLElement>("strong");
+  const detail = badge.querySelector<HTMLElement>("small");
+  if (title) {
+    title.textContent = runtime.title;
+  }
+  if (detail) {
+    detail.textContent = runtime.detail;
+  }
 }
 
 function renderConnectionPanel(): string {
@@ -1391,7 +1409,11 @@ function handleSignal(signal: ControllerSignal): void {
         clearConnectionAttempt();
       }
       if (presentationChanged) {
-        requestRender();
+        if (controllerRuntimeSurfaceChanged(previousRuntime, signal.runtime)) {
+          requestRender();
+        } else {
+          updateRuntimeBadge();
+        }
       }
       break;
     }
