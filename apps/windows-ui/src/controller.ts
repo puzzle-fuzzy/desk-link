@@ -182,6 +182,7 @@ let pointerInsideViewport = false;
 let remoteCanvasElement: HTMLCanvasElement | null = null;
 let remoteViewportElement: HTMLElement | null = null;
 let remoteCursorElement: HTMLElement | null = null;
+let remoteToolbarElement: HTMLElement | null = null;
 let remoteViewportScrollLeft = 0;
 let remoteViewportScrollTop = 0;
 let fullscreenListenerInitialized = false;
@@ -351,6 +352,7 @@ export function prepareControllerRender(): void {
   remoteCanvasElement = null;
   remoteViewportElement = null;
   remoteCursorElement = null;
+  remoteToolbarElement = null;
   pointerInsideViewport = false;
   clearRemoteToolbarTimer();
   cancelScheduledTransferPanelUpdate();
@@ -566,6 +568,7 @@ export function bindControllerInteractions(): void {
   });
   bindTransferLedgerActions();
   const remoteToolbar = document.querySelector<HTMLElement>(".remote-toolbar");
+  remoteToolbarElement = remoteToolbar;
   remoteToolbar?.addEventListener("pointerenter", () => {
     remoteToolbarPointerNearTop = true;
     revealRemoteToolbar();
@@ -3387,7 +3390,8 @@ function handleRemoteToolbarPointerMove(event: PointerEvent): void {
   if (!remoteFullscreenActive) {
     return;
   }
-  const toolbarHovered = document.querySelector<HTMLElement>(".remote-toolbar")?.matches(":hover") === true;
+  const toolbarHovered = event.target instanceof Node
+    && remoteToolbarElement?.contains(event.target) === true;
   const pointerNearTop = event.clientY <= 12 || toolbarHovered;
   if (pointerNearTop === remoteToolbarPointerNearTop) {
     return;
