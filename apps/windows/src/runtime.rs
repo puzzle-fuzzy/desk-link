@@ -1794,7 +1794,7 @@ fn capture_encode_loop(
                         capture = next_capture;
                         coordinate_space = next_coordinate_space;
                         frame_pacer.reset(video_quality_settings(video_quality).fps);
-                        lock_queue(&queue).drain_newest_first();
+                        lock_queue(&queue).clear();
                         *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                             display_id,
                             desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
@@ -1819,7 +1819,7 @@ fn capture_encode_loop(
                         {
                             video_quality = preset;
                             frame_pacer.reset(video_quality_settings(video_quality).fps);
-                            lock_queue(&queue).drain_newest_first();
+                            lock_queue(&queue).clear();
                             force_keyframe.store(true, Ordering::Release);
                             notify.notify_one();
                         }
@@ -1846,7 +1846,7 @@ fn capture_encode_loop(
                     )
                     .map_err(HostRuntimeError::Encoder)?;
                 frame_pacer.reset(video_quality_settings(video_quality).fps);
-                lock_queue(&queue).drain_newest_first();
+                lock_queue(&queue).clear();
                 *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
                     display_id: capture.display_id(),
                     desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
@@ -1903,7 +1903,7 @@ async fn send_video_loop(
     let mut pipeline = HostVideoPipeline::new(stream_id);
     loop {
         notify.notified().await;
-        let next = lock_queue(&queue).drain_newest_first().into_iter().next();
+        let next = lock_queue(&queue).take_newest();
         let Some(next) = next else {
             continue;
         };

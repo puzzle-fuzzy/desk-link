@@ -99,6 +99,30 @@ fn queue_evicts_oldest_when_full() {
 }
 
 #[test]
+fn queue_takes_newest_without_retaining_stale_frames() {
+    let mut queue = LatestFrameQueue::new(3);
+    queue.push_latest(10);
+    queue.push_latest(11);
+    queue.push_latest(12);
+
+    assert_eq!(queue.take_newest(), Some(12));
+    assert!(queue.is_empty());
+    assert_eq!(queue.take_newest(), None);
+}
+
+#[test]
+fn queue_clear_discards_frames_without_changing_capacity() {
+    let mut queue = LatestFrameQueue::new(2);
+    queue.push_latest(20);
+    queue.push_latest(21);
+    queue.clear();
+
+    assert!(queue.is_empty());
+    queue.push_latest(22);
+    assert_eq!(queue.pop_newest(), Some(22));
+}
+
+#[test]
 fn incomplete_frame_expires_without_blocking_new_frame() {
     let mut assembler = FrameAssembler::new(3, Duration::from_millis(120));
     assert_eq!(
