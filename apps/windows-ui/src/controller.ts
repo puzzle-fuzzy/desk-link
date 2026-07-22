@@ -125,6 +125,7 @@ import {
 import type { ControllerRemoteSurfaceState } from "./controller-runtime-presentation";
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
+import { LatestFrameScheduler } from "./render-scheduler";
 import { VideoRenderTiming } from "./video-render-timing";
 import { presentationDropDecodeQueueHint } from "./video-render-pressure";
 
@@ -250,6 +251,15 @@ const remoteAudio = new RemoteAudioPlayer();
 const videoPlaybackPressure = new VideoPlaybackPressure();
 const videoPull = new SerialVideoPull<ControllerVideoPayload>();
 const videoRenderTiming = new VideoRenderTiming();
+const remoteCursorScheduler = new LatestFrameScheduler<{
+  x: number;
+  y: number;
+  visible: boolean;
+}>(
+  (callback) => window.requestAnimationFrame(callback),
+  (value) => applyRemoteCursor(value.x, value.y, value.visible),
+  (handle) => window.cancelAnimationFrame(handle),
+);
 
 function resetVideoTelemetry(): void {
   videoPull.stop();
@@ -327,6 +337,7 @@ export function prepareControllerRender(): void {
     window.cancelAnimationFrame(remoteScaleFrame);
     remoteScaleFrame = null;
   }
+  remoteCursorScheduler.cancel();
   releaseVideoDecoder();
   remoteResizeObserver?.disconnect();
   remoteResizeObserver = null;
@@ -3241,6 +3252,10 @@ function pointerPosition(event: PointerEvent, canvas: HTMLCanvasElement): { x: n
 }
 
 function updateRemoteCursor(x: number, y: number, visible: boolean): void {
+  remoteCursorScheduler.schedule({ x, y, visible });
+}
+
+function applyRemoteCursor(x: number, y: number, visible: boolean): void {
   const cursor = remoteCursorElement;
   const canvas = remoteCanvasElement;
   const viewport = remoteViewportElement;

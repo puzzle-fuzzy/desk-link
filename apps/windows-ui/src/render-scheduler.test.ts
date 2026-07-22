@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { RenderScheduler } from "./render-scheduler";
+import { LatestFrameScheduler, RenderScheduler } from "./render-scheduler";
 
 describe("render scheduler", () => {
   test("coalesces a burst into one animation frame", () => {
@@ -57,6 +57,49 @@ describe("render scheduler", () => {
 
     expect(cancelled).toEqual([1]);
     expect(renders).toBe(0);
+    expect(scheduler.pending).toBeFalse();
+  });
+
+  test("commits only the latest value from a burst", () => {
+    const callbacks: Array<() => void> = [];
+    const committed: number[] = [];
+    const scheduler = new LatestFrameScheduler<number>(
+      (callback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      },
+      (value) => { committed.push(value); },
+    );
+
+    scheduler.schedule(1);
+    scheduler.schedule(2);
+    scheduler.schedule(3);
+    expect(callbacks).toHaveLength(1);
+    callbacks[0]!();
+
+    expect(committed).toEqual([3]);
+    expect(scheduler.pending).toBeFalse();
+  });
+
+  test("cancels a pending latest value before it reaches the commit", () => {
+    const callbacks: Array<() => void> = [];
+    const cancelled: number[] = [];
+    const committed: number[] = [];
+    const scheduler = new LatestFrameScheduler<number>(
+      (callback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      },
+      (value) => { committed.push(value); },
+      (handle) => { cancelled.push(handle); },
+    );
+
+    scheduler.schedule(7);
+    scheduler.cancel();
+    callbacks[0]!();
+
+    expect(cancelled).toEqual([1]);
+    expect(committed).toEqual([]);
     expect(scheduler.pending).toBeFalse();
   });
 });
