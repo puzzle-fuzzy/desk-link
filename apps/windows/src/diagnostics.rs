@@ -126,6 +126,8 @@ pub enum DiagnosticEvent {
         decoder_recoveries: u32,
         video_pull_failures: u32,
         first_frame_ms: Option<u64>,
+        displayed_fps_x100: Option<u32>,
+        max_frame_gap_ms: Option<u64>,
     },
 }
 
@@ -392,11 +394,19 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             decoder_recoveries,
             video_pull_failures,
             first_frame_ms,
+            displayed_fps_x100,
+            max_frame_gap_ms,
         } => {
             let first_frame_ms = first_frame_ms
                 .map_or_else(String::new, |value| format!(",\"first_frame_ms\":{value}"));
+            let displayed_fps_x100 = displayed_fps_x100.map_or_else(String::new, |value| {
+                format!(",\"displayed_fps_x100\":{value}")
+            });
+            let max_frame_gap_ms = max_frame_gap_ms.map_or_else(String::new, |value| {
+                format!(",\"max_frame_gap_ms\":{value}")
+            });
             format!(
-                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures}{first_frame_ms}"
+                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
             )
         }
     };
@@ -685,6 +695,8 @@ mod tests {
                 decoder_recoveries: 2,
                 video_pull_failures: 2,
                 first_frame_ms: Some(740),
+                displayed_fps_x100: Some(2_970),
+                max_frame_gap_ms: Some(167),
             })
             .unwrap();
 
@@ -695,6 +707,8 @@ mod tests {
         assert!(contents.contains("\"decoder_recoveries\":2"));
         assert!(contents.contains("\"video_pull_failures\":2"));
         assert!(contents.contains("\"first_frame_ms\":740"));
+        assert!(contents.contains("\"displayed_fps_x100\":2970"));
+        assert!(contents.contains("\"max_frame_gap_ms\":167"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

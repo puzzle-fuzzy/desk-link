@@ -77,6 +77,8 @@ const FILE_QUEUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROLLER_DECODE_QUEUE_SIZE: u16 = 64;
 const MAX_CONTROLLER_FRESHNESS_RECOVERIES: u16 = 16;
 const MAX_CONTROLLER_VIDEO_PULL_FAILURES: u32 = 1_000_000;
+const MAX_CONTROLLER_DISPLAYED_FPS_X100: u32 = 12_000;
+const MAX_CONTROLLER_FRAME_GAP_MS: u64 = 60_000;
 const VIDEO_MAILBOX_OVERFLOW_DECODE_QUEUE_SIZE: u16 = 5;
 
 struct DecodedControllerAudio {
@@ -499,6 +501,8 @@ pub struct ControllerRenderMetrics {
     decoder_recoveries: u32,
     video_pull_failures: u32,
     first_frame_ms: Option<u64>,
+    displayed_fps_x100: Option<u32>,
+    max_frame_gap_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1763,6 +1767,12 @@ impl ControllerManager {
             || metrics.displayed_frames > metrics.submitted_frames
             || metrics.video_pull_failures > MAX_CONTROLLER_VIDEO_PULL_FAILURES
             || metrics
+                .displayed_fps_x100
+                .is_some_and(|value| value > MAX_CONTROLLER_DISPLAYED_FPS_X100)
+            || metrics
+                .max_frame_gap_ms
+                .is_some_and(|value| value > MAX_CONTROLLER_FRAME_GAP_MS)
+            || metrics
                 .first_frame_ms
                 .is_some_and(|value| value > 10 * 60 * 1_000)
         {
@@ -1779,6 +1789,8 @@ impl ControllerManager {
                 decoder_recoveries: metrics.decoder_recoveries,
                 video_pull_failures: metrics.video_pull_failures,
                 first_frame_ms: metrics.first_frame_ms,
+                displayed_fps_x100: metrics.displayed_fps_x100,
+                max_frame_gap_ms: metrics.max_frame_gap_ms,
             })
             .map_err(|_| "DeskLink 无法记录远程画面指标。".to_owned())
     }
@@ -4601,6 +4613,8 @@ mod tests {
                     decoder_recoveries: 0,
                     video_pull_failures: 1_000_001,
                     first_frame_ms: Some(200),
+                    displayed_fps_x100: Some(3_000),
+                    max_frame_gap_ms: Some(67),
                 })
                 .is_err()
         );

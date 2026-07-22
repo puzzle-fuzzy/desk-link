@@ -125,6 +125,7 @@ import {
 import type { ControllerRemoteSurfaceState } from "./controller-runtime-presentation";
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
+import { VideoRenderTiming } from "./video-render-timing";
 
 type RenderRequest = () => void;
 type ControllerFeedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -247,6 +248,7 @@ const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
 const remoteAudio = new RemoteAudioPlayer();
 const videoPlaybackPressure = new VideoPlaybackPressure();
 const videoPull = new SerialVideoPull<ControllerVideoPayload>();
+const videoRenderTiming = new VideoRenderTiming();
 
 function resetVideoTelemetry(): void {
   videoPull.stop();
@@ -267,6 +269,7 @@ function resetVideoTelemetry(): void {
   videoConfigReceivedAtMs = null;
   firstFrameMs = null;
   lastRenderMetricsReportedAtMs = 0;
+  videoRenderTiming.reset();
 }
 
 export async function initializeController(renderer: RenderRequest): Promise<void> {
@@ -2490,6 +2493,7 @@ function startVideoDecoder(
                   waiting.hidden = true;
                 }
               }
+              videoRenderTiming.observe(performance.now());
               if (decodedFrames === 1) {
                 reportRenderMetrics(true);
               }
@@ -2602,6 +2606,7 @@ function reportRenderMetrics(force = false): void {
     return;
   }
   lastRenderMetricsReportedAtMs = now;
+  const renderTiming = videoRenderTiming.snapshot(performance.now());
   void reportControllerRenderMetrics({
     streamId: videoConfig.streamId,
     receivedFrames: receivedVideoFrames,
@@ -2611,6 +2616,8 @@ function reportRenderMetrics(force = false): void {
     decoderRecoveries,
     videoPullFailures,
     firstFrameMs,
+    displayedFpsX100: renderTiming.displayedFpsX100,
+    maxFrameGapMs: renderTiming.maxFrameGapMs,
   }).catch(() => {
     // Diagnostics must never interrupt a live remote-control session.
   });

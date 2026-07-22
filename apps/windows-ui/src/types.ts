@@ -238,6 +238,8 @@ export interface ControllerRenderMetrics {
   decoderRecoveries: number;
   videoPullFailures: number;
   firstFrameMs: number | null;
+  displayedFpsX100: number | null;
+  maxFrameGapMs: number | null;
 }
 
 export interface ControllerPlaybackPressure {
