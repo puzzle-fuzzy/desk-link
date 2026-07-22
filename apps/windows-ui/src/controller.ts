@@ -51,6 +51,7 @@ import {
   mouseButton,
   normalizedPointerPosition,
   remoteCursorContentPosition,
+  scrolledPointerBounds,
   type PointerBounds,
 } from "./remote-input";
 import type {
@@ -181,6 +182,8 @@ let pointerInsideViewport = false;
 let remoteCanvasElement: HTMLCanvasElement | null = null;
 let remoteViewportElement: HTMLElement | null = null;
 let remoteCursorElement: HTMLElement | null = null;
+let remoteViewportScrollLeft = 0;
+let remoteViewportScrollTop = 0;
 let fullscreenListenerInitialized = false;
 let remoteFullscreenActive = false;
 let remoteFullscreenBusy = false;
@@ -343,6 +346,8 @@ export function prepareControllerRender(): void {
   remoteResizeObserver = null;
   remoteCanvasBounds = null;
   remoteViewportBounds = null;
+  remoteViewportScrollLeft = 0;
+  remoteViewportScrollTop = 0;
   remoteCanvasElement = null;
   remoteViewportElement = null;
   remoteCursorElement = null;
@@ -2893,6 +2898,8 @@ function scheduleRemoteScaleLayout(
     }
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
+    remoteViewportScrollLeft = viewport.scrollLeft;
+    remoteViewportScrollTop = viewport.scrollTop;
   });
 }
 
@@ -3289,13 +3296,30 @@ function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): 
   const refresh = () => {
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
+    remoteViewportScrollLeft = viewport.scrollLeft;
+    remoteViewportScrollTop = viewport.scrollTop;
+  };
+  const handleScroll = () => {
+    const nextScrollLeft = viewport.scrollLeft;
+    const nextScrollTop = viewport.scrollTop;
+    if (remoteCanvasBounds) {
+      remoteCanvasBounds = scrolledPointerBounds(
+        remoteCanvasBounds,
+        remoteViewportScrollLeft,
+        remoteViewportScrollTop,
+        nextScrollLeft,
+        nextScrollTop,
+      );
+    }
+    remoteViewportScrollLeft = nextScrollLeft;
+    remoteViewportScrollTop = nextScrollTop;
   };
   refresh();
   remoteResizeObserver?.disconnect();
   remoteResizeObserver = new ResizeObserver(refresh);
   remoteResizeObserver.observe(viewport);
   remoteResizeObserver.observe(canvas);
-  viewport.addEventListener("scroll", refresh, { passive: true });
+  viewport.addEventListener("scroll", handleScroll, { passive: true });
 }
 
 function readRemoteCanvasBounds(canvas: HTMLCanvasElement): PointerBounds {

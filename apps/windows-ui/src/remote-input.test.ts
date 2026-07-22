@@ -9,6 +9,7 @@ import {
   mouseButton,
   normalizedPointerPosition,
   remoteCursorContentPosition,
+  scrolledPointerBounds,
 } from "./remote-input";
 
 describe("remote keyboard mapping", () => {
@@ -104,5 +105,15 @@ describe("remote pointer mapping", () => {
     expect(position).toEqual({ left: 980, top: 290 });
     expect(position.left - 300 + 100).toBe(-180 + 960);
     expect(position.top - 120 + 40).toBe(-60 + 270);
+  });
+
+  test("updates cached canvas bounds arithmetically after scrolling", () => {
+    expect(scrolledPointerBounds(
+      { left: 240, top: 90, width: 1_920, height: 1_080 },
+      0,
+      0,
+      300,
+      120,
+    )).toEqual({ left: -60, top: -30, width: 1_920, height: 1_080 });
   });
 });

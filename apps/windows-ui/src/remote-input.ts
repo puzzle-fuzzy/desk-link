@@ -3,6 +3,20 @@ export const MAX_WHEEL_DELTA = 1_200;
 
 export type PointerBounds = Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">;
 
+export function scrolledPointerBounds(
+  bounds: PointerBounds,
+  previousScrollLeft: number,
+  previousScrollTop: number,
+  nextScrollLeft: number,
+  nextScrollTop: number,
+): PointerBounds {
+  return {
+    ...bounds,
+    left: bounds.left + previousScrollLeft - nextScrollLeft,
+    top: bounds.top + previousScrollTop - nextScrollTop,
+  };
+}
+
 export function containedPointerBounds(
   bounds: PointerBounds,
   contentWidth: number,
