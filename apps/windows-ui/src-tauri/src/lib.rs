@@ -1069,6 +1069,11 @@ fn export_snapshot_report(
     let recent_events = diagnostics
         .recent_sanitized_lines()
         .unwrap_or_else(|_| vec!["{\"event\":\"diagnostic_history_unavailable\"}".to_owned()]);
+    let controller_events = DiagnosticLog::controller_for_current_user()
+        .ok()
+        .and_then(|log| log.recent_sanitized_lines().ok())
+        .unwrap_or_default();
+    let recent_events = merge_recent_diagnostic_lines(recent_events, controller_events);
     let report = build_diagnostic_report(
         snapshot,
         controller_runtime,
@@ -1105,6 +1110,41 @@ fn report_file_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("DeskLink-Diagnostics.txt")
         .to_owned()
+}
+
+fn merge_recent_diagnostic_lines(
+    host_events: Vec<String>,
+    controller_events: Vec<String>,
+) -> Vec<String> {
+    let mut events = host_events
+        .into_iter()
+        .map(|line| (diagnostic_timestamp(&line), "主机", line))
+        .chain(
+            controller_events
+                .into_iter()
+                .map(|line| (diagnostic_timestamp(&line), "控制端", line)),
+        )
+        .collect::<Vec<_>>();
+    events.sort_by_key(|(timestamp, source, _)| (*timestamp, *source));
+    events
+        .into_iter()
+        .rev()
+        .take(200)
+        .rev()
+        .map(|(_, source, line)| format!("[{source}] {line}"))
+        .collect()
+}
+
+fn diagnostic_timestamp(line: &str) -> u128 {
+    const MARKER: &str = "\"timestamp_unix_ms\":";
+    line.split_once(MARKER)
+        .and_then(|(_, remainder)| {
+            remainder
+                .split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u128::MAX)
 }
 
 fn build_diagnostic_report(
@@ -1171,7 +1211,7 @@ fn build_diagnostic_report(
     let _ = writeln!(report, "\n[控制端状态]");
     let _ = writeln!(report, "运行状态: {}", controller_runtime.state);
     let _ = writeln!(report, "运行说明: {}", controller_runtime.detail);
-    let _ = writeln!(report, "\n[最近诊断事件，最多 200 条]");
+    let _ = writeln!(report, "\n[最近诊断事件，最多 200 条；已区分主机与控制端]");
     if recent_events.is_empty() {
         let _ = writeln!(report, "没有可用的历史事件。");
     } else {
@@ -1523,7 +1563,7 @@ fn show_main_window(app: &AppHandle) {
 mod tests {
     use super::{
         ConnectionSummary, HostSnapshot, TrustedControllerSummary, build_diagnostic_checks,
-        build_diagnostic_report, hex, normalize_fingerprint,
+        build_diagnostic_report, hex, merge_recent_diagnostic_lines, normalize_fingerprint,
     };
     use crate::{
         controller::ControllerRuntimeSummary, host::HostRuntimeSummary,
@@ -1545,6 +1585,26 @@ mod tests {
     fn fingerprint_validation_rejects_wrong_length_and_non_hex() {
         assert!(normalize_fingerprint("ab").is_err());
         assert!(normalize_fingerprint(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn diagnostic_report_merges_host_and_controller_events_in_time_order() {
+        let merged = merge_recent_diagnostic_lines(
+            vec![
+                "{\"timestamp_unix_ms\":200,\"event\":\"host_late\"}".to_owned(),
+                "{\"timestamp_unix_ms\":100,\"event\":\"host_early\"}".to_owned(),
+            ],
+            vec!["{\"timestamp_unix_ms\":150,\"event\":\"controller_middle\"}".to_owned()],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "[主机] {\"timestamp_unix_ms\":100,\"event\":\"host_early\"}",
+                "[控制端] {\"timestamp_unix_ms\":150,\"event\":\"controller_middle\"}",
+                "[主机] {\"timestamp_unix_ms\":200,\"event\":\"host_late\"}",
+            ]
+        );
     }
 
     #[test]
