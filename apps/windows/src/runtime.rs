@@ -21,14 +21,14 @@ use desklink_protocol::{
     TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset, decode_control,
     decode_noise_handshake, decode_session_input, decode_transfer, encode_audio_packet,
     encode_control, encode_cursor_update, encode_noise_handshake, encode_transfer,
-    encode_video_config, encode_video_packet,
+    encode_video_config,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
     JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryRegistration, RelayJoin,
     TransportError,
 };
-use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, packetize_frame};
+use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
@@ -787,10 +787,7 @@ impl HostVideoPipeline {
             flags,
             data: frame.access_unit,
         };
-        let datagrams = packetize_frame(&wire_frame)?
-            .iter()
-            .map(encode_video_packet)
-            .collect::<Result<Vec<_>, _>>()?;
+        let datagrams = encode_video_frame(&wire_frame)?;
         if needs_config {
             self.sent_config = Some((frame.config_version, width, height));
         }

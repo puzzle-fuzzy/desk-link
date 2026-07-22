@@ -1,6 +1,6 @@
 use desklink_protocol::{
     FrameFlags, MAX_VIDEO_CHUNKS, MAX_VIDEO_PACKET_PAYLOAD_BYTES, PROTOCOL_VERSION, ProtocolError,
-    VideoFrameHeader, VideoPacket,
+    VideoFrameHeader, VideoPacket, encode_video_packet_parts,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -53,6 +53,45 @@ pub fn packetize_frame(frame: &EncodedFrame) -> Result<Vec<VideoPacket>, Protoco
             )
         })
         .collect()
+}
+
+/// Encodes an access unit directly into wire datagrams without materialising
+/// owned `VideoPacket` payloads for every chunk.
+pub fn encode_video_frame(frame: &EncodedFrame) -> Result<Vec<Vec<u8>>, ProtocolError> {
+    let maximum = MAX_VIDEO_PACKET_PAYLOAD_BYTES * usize::from(MAX_VIDEO_CHUNKS);
+    if frame.data.is_empty() {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    if frame.data.len() > maximum {
+        return Err(ProtocolError::MessageTooLarge {
+            actual: frame.data.len(),
+            maximum,
+        });
+    }
+
+    let chunk_count = frame.data.len().div_ceil(MAX_VIDEO_PACKET_PAYLOAD_BYTES) as u16;
+    let mut datagrams = Vec::with_capacity(usize::from(chunk_count));
+    for (chunk_index, payload) in frame
+        .data
+        .chunks(MAX_VIDEO_PACKET_PAYLOAD_BYTES)
+        .enumerate()
+    {
+        let header = VideoFrameHeader {
+            protocol_version: PROTOCOL_VERSION,
+            stream_id: frame.stream_id,
+            config_version: frame.config_version,
+            frame_id: frame.frame_id,
+            capture_timestamp_us: frame.capture_timestamp_us,
+            width: frame.width,
+            height: frame.height,
+            flags: frame.flags,
+            chunk_index: chunk_index as u16,
+            chunk_count,
+            payload_length: payload.len() as u32,
+        };
+        datagrams.push(encode_video_packet_parts(header, payload)?);
+    }
+    Ok(datagrams)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

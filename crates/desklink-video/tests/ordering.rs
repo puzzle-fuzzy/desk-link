@@ -1,9 +1,10 @@
 use desklink_protocol::{
     FrameFlags, MAX_VIDEO_PACKET_BYTES, MAX_VIDEO_PACKET_PAYLOAD_BYTES, PROTOCOL_VERSION,
-    VideoFrameHeader, VideoPacket, encode_video_packet,
+    VideoFrameHeader, VideoPacket, decode_video_packet, encode_video_packet,
 };
 use desklink_video::{
-    AssembleResult, DropReason, EncodedFrame, FrameAssembler, LatestFrameQueue, packetize_frame,
+    AssembleResult, DropReason, EncodedFrame, FrameAssembler, LatestFrameQueue, encode_video_frame,
+    packetize_frame,
 };
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -68,11 +69,18 @@ fn packetizer_keeps_serialized_video_packets_inside_quic_datagram_budget() {
     }
     assert_eq!(
         packets
-            .into_iter()
-            .flat_map(|packet| packet.payload)
+            .iter()
+            .flat_map(|packet| packet.payload.iter().copied())
             .collect::<Vec<_>>(),
         encoded.data
     );
+
+    let datagrams = encode_video_frame(&encoded).expect("encode video frame");
+    assert_eq!(datagrams.len(), 3);
+    for (packet, datagram) in packets.iter().zip(datagrams.iter()) {
+        assert_eq!(encode_video_packet(packet).unwrap(), *datagram);
+        assert_eq!(decode_video_packet(datagram).unwrap(), *packet);
+    }
 }
 
 #[test]
@@ -87,6 +95,7 @@ fn packetizer_rejects_empty_or_unbounded_access_units() {
             * (usize::from(desklink_protocol::MAX_VIDEO_CHUNKS) + 1)
     ];
     assert!(packetize_frame(&encoded).is_err());
+    assert!(encode_video_frame(&encoded).is_err());
 }
 
 #[test]

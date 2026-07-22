@@ -301,6 +301,41 @@ pub fn encode_video_packet(packet: &VideoPacket) -> Result<Vec<u8>, ProtocolErro
         MAX_VIDEO_PACKET_BYTES,
     )
 }
+
+/// Encodes a video packet while borrowing its payload.
+///
+/// The host sends encoded access units that are already split into borrowed
+/// slices.  Keeping the payload borrowed through postcard serialization avoids
+/// cloning every 1 KiB chunk into an intermediate `VideoPacket` first.
+pub fn encode_video_packet_parts(
+    header: VideoFrameHeader,
+    payload: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    if payload.len() > MAX_DATAGRAM_PAYLOAD_BYTES as usize {
+        return Err(ProtocolError::MessageTooLarge {
+            actual: payload.len(),
+            maximum: MAX_DATAGRAM_PAYLOAD_BYTES as usize,
+        });
+    }
+    validate_video_header(&header)?;
+    if header.payload_length as usize != payload.len() {
+        return Err(ProtocolError::PayloadLengthMismatch {
+            declared: header.payload_length,
+            actual: payload.len(),
+        });
+    }
+    #[derive(serde::Serialize)]
+    struct BorrowedVideoPacket<'a> {
+        header: VideoFrameHeader,
+        payload: &'a [u8],
+    }
+    bounded(
+        postcard::to_allocvec(&BorrowedVideoPacket { header, payload })
+            .map_err(|_| ProtocolError::Malformed)?,
+        MAX_VIDEO_PACKET_BYTES,
+    )
+}
+
 pub fn decode_video_packet(bytes: &[u8]) -> Result<VideoPacket, ProtocolError> {
     ensure(bytes, MAX_VIDEO_PACKET_BYTES)?;
     let packet: VideoPacket = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;

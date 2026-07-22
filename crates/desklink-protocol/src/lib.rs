@@ -5,7 +5,7 @@ pub use codec::{
     decode_noise_handshake, decode_session_input, decode_transfer, decode_video_config,
     decode_video_header, decode_video_packet, encode_audio_packet, encode_control,
     encode_cursor_update, encode_input, encode_noise_handshake, encode_transfer,
-    encode_video_config, encode_video_header, encode_video_packet,
+    encode_video_config, encode_video_header, encode_video_packet, encode_video_packet_parts,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::{BitOr, BitOrAssign};

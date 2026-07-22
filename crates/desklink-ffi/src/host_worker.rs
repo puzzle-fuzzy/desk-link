@@ -14,11 +14,11 @@ use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, NoiseHandshake,
     NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
     decode_cursor_update, decode_input, decode_noise_handshake, decode_transfer, encode_control,
-    encode_noise_handshake, encode_transfer, encode_video_config, encode_video_packet,
+    encode_noise_handshake, encode_transfer, encode_video_config,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin, TransportError, TransportEvent};
-use desklink_video::{EncodedFrame, packetize_frame};
+use desklink_video::{EncodedFrame, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroize;
@@ -893,8 +893,7 @@ async fn handle_command(
                 flags,
                 data: bytes,
             };
-            for packet in packetize_frame(&frame).map_err(protocol_error)? {
-                let plaintext = encode_video_packet(&packet).map_err(protocol_error)?;
+            for plaintext in encode_video_frame(&frame).map_err(protocol_error)? {
                 let ciphertext = secure
                     .seal(SecureLane::VideoDatagram, &plaintext)
                     .map_err(crypto_error)?;
