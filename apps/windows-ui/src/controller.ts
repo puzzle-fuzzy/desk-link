@@ -119,9 +119,10 @@ import {
   type RemoteToolbarVisibilityInput,
 } from "./remote-session-presentation";
 import {
-  canRetainRemoteSurface,
+  advanceControllerRemoteSurfaceState,
   controllerRuntimeSurfaceChanged,
 } from "./controller-runtime-presentation";
+import type { ControllerRemoteSurfaceState } from "./controller-runtime-presentation";
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
 
@@ -239,7 +240,7 @@ let videoQualityPreference: VideoQualityPreference = "automatic";
 let appliedVideoQuality: VideoQualityPreset = "sharp";
 let pendingVideoQuality: VideoQualityPreference | null = null;
 let videoQualityAckTimer: number | null = null;
-let retainedRemoteSurface = false;
+let remoteSurfaceState: ControllerRemoteSurfaceState = "empty";
 const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
   sendControllerInput({ ...input, streamId })
 ));
@@ -349,7 +350,7 @@ export function renderControllerView(): string {
   if (!connected) {
     remotePanMode = false;
   }
-  const remoteSurfaceVisible = connected || retainedRemoteSurface;
+  const remoteSurfaceVisible = connected || remoteSurfaceState === "retaining";
   return `
     <div class="controller-stack">
       ${feedback ? renderFeedback(feedback) : ""}
@@ -563,7 +564,7 @@ export function bindControllerInteractions(): void {
       revealRemoteToolbar();
     });
   });
-  if (snapshot?.runtime.state === "connected" || retainedRemoteSurface) {
+  if (snapshot?.runtime.state === "connected" || remoteSurfaceState === "retaining") {
     setupRemoteDesktop();
     syncRemoteInteractionControls();
     syncRemoteFullscreenControl();
@@ -616,7 +617,7 @@ function updateRemoteSessionStatus(): void {
   if (!session) {
     return;
   }
-  const reconnecting = snapshot?.runtime.state !== "connected" && retainedRemoteSurface;
+  const reconnecting = snapshot?.runtime.state !== "connected" && remoteSurfaceState === "retaining";
   session.dataset.runtimeState = reconnecting ? "reconnecting" : "connected";
   const title = session.querySelector<HTMLElement>("[data-controller-remote-status-title]");
   const detail = session.querySelector<HTMLElement>("[data-controller-metrics]");
@@ -894,7 +895,7 @@ function transferToolbarActivityView(): {
 function renderRemoteDesktop(): string {
   const config = videoConfig;
   const videoFailed = config ? failedVideoConfig === videoConfigKey(config) : false;
-  const reconnecting = snapshot?.runtime.state === "reconnecting" && retainedRemoteSurface;
+  const reconnecting = snapshot?.runtime.state !== "connected" && remoteSurfaceState === "retaining";
   const remoteStatusDetail = reconnecting
     ? snapshot?.runtime.detail ?? "连接暂时中断，DeskLink 正在恢复。"
     : config
@@ -1199,7 +1200,7 @@ async function beginConnection(
   clearRenameDraft();
   attemptStartedAtMs = Date.now();
   attemptTarget = target;
-  retainedRemoteSurface = false;
+  remoteSurfaceState = "empty";
   videoConfig = null;
   failedVideoConfig = null;
   remoteAudio.release();
@@ -1293,7 +1294,7 @@ async function cancelConnection(): Promise<void> {
   const generation = ++channelGeneration;
   busy = false;
   cancelling = true;
-  retainedRemoteSurface = false;
+  remoteSurfaceState = "empty";
   prepareControllerRender();
   remoteAudio.release();
   audioStatus = "starting";
@@ -1406,13 +1407,14 @@ function handleSignal(signal: ControllerSignal): void {
   switch (signal.kind) {
     case "status": {
       const previousRuntime = snapshot?.runtime;
-      const retainingSurface = canRetainRemoteSurface(
+      const previousSurfaceState = remoteSurfaceState;
+      const nextSurfaceState = advanceControllerRemoteSurfaceState(
+        previousSurfaceState,
         previousRuntime,
         signal.runtime,
         activeChannels !== null && videoConfig !== null,
       );
-      const keepRemoteSurface = isActiveConnectionState(signal.runtime.state)
-        && (retainedRemoteSurface || retainingSurface);
+      const keepRemoteSurface = nextSurfaceState === "retaining";
       const presentationChanged = !previousRuntime
         || previousRuntime.state !== signal.runtime.state
         || previousRuntime.title !== signal.runtime.title
@@ -1433,7 +1435,7 @@ function handleSignal(signal: ControllerSignal): void {
           fileQueueRecoveryError: null,
         };
       }
-      retainedRemoteSurface = keepRemoteSurface;
+      remoteSurfaceState = nextSurfaceState;
       if (signal.runtime.state !== "connected") {
         if (remoteFullscreenActive || remoteFullscreenDesired) {
           void setRemoteFullscreen(false, false);
