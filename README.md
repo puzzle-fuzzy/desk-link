@@ -92,6 +92,8 @@ python scripts/verify-managed-relay.py
 
 完整步骤、输入范围与故障处理见 [`docs/windows-two-pc-setup.md`](docs/windows-two-pc-setup.md)。
 
+0.1.61 继续使用协议 9，并针对控制端高频状态更新、鼠标输入队列、远程游标和 Canvas 绘制做了性能优化；公网中继无需升级。
+
 ## Windows 安装包
 
 ```powershell

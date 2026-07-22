@@ -54,6 +54,7 @@ import {
   type DeskLinkView,
 } from "./navigation";
 import { LatestRequest } from "./latest-request";
+import { RenderScheduler } from "./render-scheduler";
 import { escapeHtml } from "./html";
 import { icon, renderLucideIcons } from "./icons";
 import { hostStatusSummary } from "./host-status";
@@ -76,6 +77,10 @@ if (!applicationRoot) {
 }
 const app: HTMLElement = applicationRoot;
 const applicationWindow = getCurrentWindow();
+const renderScheduler = new RenderScheduler(
+  (callback) => window.requestAnimationFrame(callback),
+  (handle) => window.cancelAnimationFrame(handle),
+);
 
 let snapshot: HostSnapshot | null = null;
 let activeView: View = "controller";
@@ -132,6 +137,10 @@ function render(): void {
   renderedView = activeView;
   bindInteractions();
   focusNewApproval();
+}
+
+function scheduleRender(): void {
+  renderScheduler.schedule(render);
 }
 
 function renderHostApproval(): string {
@@ -1863,7 +1872,7 @@ void getVersion().then((version) => {
   applicationVersion = "";
 });
 void refreshSnapshot();
-void initializeController(render);
+void initializeController(scheduleRender);
 void listen("host-runtime-changed", () => void refreshSnapshot(false));
 void listen("host-approval-changed", () => void refreshSnapshot(false));
 window.setInterval(() => {

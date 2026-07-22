@@ -170,6 +170,9 @@ let remoteScaleFrame: number | null = null;
 let remoteScaleMode: RemoteScaleMode = loadRemoteScaleMode();
 let remotePanMode = false;
 let pointerInsideViewport = false;
+let remoteCanvasElement: HTMLCanvasElement | null = null;
+let remoteViewportElement: HTMLElement | null = null;
+let remoteCursorElement: HTMLElement | null = null;
 let fullscreenListenerInitialized = false;
 let remoteFullscreenActive = false;
 let remoteFullscreenBusy = false;
@@ -319,6 +322,9 @@ export function prepareControllerRender(): void {
   remoteResizeObserver = null;
   remoteCanvasBounds = null;
   remoteViewportBounds = null;
+  remoteCanvasElement = null;
+  remoteViewportElement = null;
+  remoteCursorElement = null;
   pointerInsideViewport = false;
   clearRemoteToolbarTimer();
   cancelScheduledTransferPanelUpdate();
@@ -2181,7 +2187,7 @@ function setupRemoteDesktop(): void {
     queueMicrotask(requestRender);
     return;
   }
-  const context = canvas.getContext("2d", { alpha: false });
+  const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
   if (!context) {
     failedVideoConfig = configKey;
     feedback = { tone: "error", message: "DeskLink 无法创建远程桌面绘制区域。" };
@@ -2269,7 +2275,7 @@ function restartVideoDecoderForFreshness(
     return;
   }
   const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
-  const context = canvas?.getContext("2d", { alpha: false });
+  const context = canvas?.getContext("2d", { alpha: false, desynchronized: true });
   if (!canvas || !context) {
     return;
   }
@@ -2365,15 +2371,24 @@ function startVideoDecoder(
               return;
             }
             try {
-              context.drawImage(nextFrame, 0, 0, canvas.width, canvas.height);
+              if (
+                nextFrame.displayWidth === canvas.width
+                && nextFrame.displayHeight === canvas.height
+              ) {
+                context.drawImage(nextFrame, 0, 0);
+              } else {
+                context.drawImage(nextFrame, 0, 0, canvas.width, canvas.height);
+              }
               if (decodedFrames === 0 && videoConfigReceivedAtMs !== null) {
                 firstFrameMs = Math.max(0, Date.now() - videoConfigReceivedAtMs);
               }
               decodedFrames += 1;
               consecutiveDecoderStalls = 0;
-              const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
-              if (waiting) {
-                waiting.hidden = true;
+              if (decodedFrames === 1) {
+                const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
+                if (waiting) {
+                  waiting.hidden = true;
+                }
               }
               if (decodedFrames === 1) {
                 reportRenderMetrics(true);
@@ -2452,7 +2467,7 @@ function fallbackOrFailVideo(configKey: string, preference: "hardware" | "softwa
   reportRenderMetrics(true);
   if (preference === "hardware") {
     const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
-    const context = canvas?.getContext("2d", { alpha: false });
+      const context = canvas?.getContext("2d", { alpha: false, desynchronized: true });
     if (canvas && context) {
       decoderPreference = "software";
       queueMicrotask(() => startVideoDecoder(canvas, context, configKey, "software"));
@@ -2461,7 +2476,7 @@ function fallbackOrFailVideo(configKey: string, preference: "hardware" | "softwa
   }
   if (consecutiveDecoderStalls <= 2) {
     const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
-    const context = canvas?.getContext("2d", { alpha: false });
+    const context = canvas?.getContext("2d", { alpha: false, desynchronized: true });
     if (canvas && context) {
       releaseVideoDecoder();
       queueMicrotask(() => startVideoDecoder(canvas, context, configKey, "software"));
@@ -3106,9 +3121,9 @@ function pointerPosition(event: PointerEvent, canvas: HTMLCanvasElement): { x: n
 }
 
 function updateRemoteCursor(x: number, y: number, visible: boolean): void {
-  const cursor = document.querySelector<HTMLElement>("[data-remote-cursor]");
-  const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
-  const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
+  const cursor = remoteCursorElement;
+  const canvas = remoteCanvasElement;
+  const viewport = remoteViewportElement;
   if (!cursor || !canvas || !viewport) {
     return;
   }
@@ -3133,6 +3148,9 @@ function updateRemoteCursor(x: number, y: number, visible: boolean): void {
 }
 
 function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): void {
+  remoteViewportElement = viewport;
+  remoteCanvasElement = canvas;
+  remoteCursorElement = document.querySelector<HTMLElement>("[data-remote-cursor]");
   const refresh = () => {
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();

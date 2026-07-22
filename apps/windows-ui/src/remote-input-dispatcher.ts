@@ -14,6 +14,7 @@ interface QueuedInput {
  */
 export class RemoteInputDispatcher {
   private readonly queue: QueuedInput[] = [];
+  private queueHead = 0;
   private pumping: Promise<void> | null = null;
 
   constructor(
@@ -22,7 +23,9 @@ export class RemoteInputDispatcher {
   ) {}
 
   enqueue(input: ControllerInput, streamId: number): void {
-    const last = this.queue.at(-1);
+    const last = this.queue.length > this.queueHead
+      ? this.queue[this.queue.length - 1]
+      : undefined;
     const queued = { input, streamId };
     if (
       input.kind === "mouseMove"
@@ -37,15 +40,17 @@ export class RemoteInputDispatcher {
   }
 
   discardPendingMoves(): void {
-    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+    for (let index = this.queue.length - 1; index >= this.queueHead; index -= 1) {
       if (this.queue[index]?.input.kind === "mouseMove") {
         this.queue.splice(index, 1);
       }
     }
+    this.compactQueue();
   }
 
   discardAll(): void {
     this.queue.length = 0;
+    this.queueHead = 0;
   }
 
   async drain(): Promise<void> {
@@ -67,8 +72,9 @@ export class RemoteInputDispatcher {
   }
 
   private async pump(): Promise<void> {
-    while (this.queue.length > 0) {
-      const queued = this.queue.shift();
+    while (this.queueHead < this.queue.length) {
+      const queued = this.queue[this.queueHead];
+      this.queueHead += 1;
       if (!queued) {
         continue;
       }
@@ -77,6 +83,22 @@ export class RemoteInputDispatcher {
       } catch {
         this.onError();
       }
+    }
+    this.compactQueue();
+  }
+
+  private compactQueue(): void {
+    if (this.queueHead === 0) {
+      return;
+    }
+    if (this.queueHead >= this.queue.length) {
+      this.queue.length = 0;
+      this.queueHead = 0;
+      return;
+    }
+    if (this.queueHead >= 32 && this.queueHead * 2 >= this.queue.length) {
+      this.queue.splice(0, this.queueHead);
+      this.queueHead = 0;
     }
   }
 }
