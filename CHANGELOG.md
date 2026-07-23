@@ -9,6 +9,7 @@
 - H.264 Main/High Profile 协商、视频质量自适应和渲染诊断指标已纳入 Windows 构建门禁。
 - 云端脱敏诊断入口已加载到生产 Nginx；Windows HTTPS 脱敏批次上报和服务端字段白名单已验证。
 - Windows UI、Rust workspace、在线中继探测和安装包构建门禁通过。
+- Windows UI 统一为单一 editorial 令牌：暖纸背景、蓝图蓝操作色、方角分组和 Cascadia Mono 元数据；删除重复的旧圆角/珊瑚色覆盖层。
 
 ### 当前明确限制
 

@@ -1,22 +1,24 @@
 :root {
-  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
-  color: oklch(0.22 0.02 40);
-  background: oklch(0.965 0.006 40);
+  /* Canonical DeskLink editorial tokens. Keep all component rules on this
+     single palette; the native remote surface remains dark by design. */
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  color: #12130f;
+  background: #f3f2ee;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --background: oklch(0.965 0.006 40);
-  --surface: oklch(1 0 0);
-  --surface-subtle: oklch(0.975 0.005 40);
-  --surface-quiet: oklch(0.945 0.009 40);
-  --ink: oklch(0.22 0.02 40);
-  --ink-secondary: oklch(0.38 0.018 40);
-  --ink-muted: oklch(0.46 0.02 40);
-  --border: oklch(0.86 0.01 40);
-  --border-strong: oklch(0.72 0.02 40);
-  --primary: oklch(0.5 0.151 40);
-  --primary-hover: oklch(0.45 0.145 40);
-  --primary-pressed: oklch(0.4 0.135 40);
-  --on-primary: oklch(0.985 0 0);
+  --background: #f3f2ee;
+  --surface: #fffefa;
+  --surface-subtle: #efeee9;
+  --surface-quiet: #e4e3de;
+  --ink: #12130f;
+  --ink-secondary: #343630;
+  --ink-muted: #656760;
+  --border: #d4d3cd;
+  --border-strong: #969890;
+  --primary: #0c38b5;
+  --primary-hover: #082d98;
+  --primary-pressed: #062578;
+  --on-primary: #fffefa;
   --success: oklch(0.53 0.14 145);
   --success-surface: oklch(0.955 0.035 145);
   --info: oklch(0.43 0.105 225);
@@ -25,11 +27,11 @@
   --error-surface: oklch(0.955 0.03 25);
   --warning: oklch(0.55 0.12 75);
   --warning-surface: oklch(0.965 0.035 75);
-  --focus: oklch(0.48 0.12 225);
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --transition: 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  --focus: #0c38b5;
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --transition: 140ms ease-out;
 }
 
 * {
@@ -4425,38 +4427,6 @@ html[data-remote-fullscreen="true"] .remote-text-entry {
    this layer styles the surrounding Windows workflow without changing markup
    contracts or interaction selectors.
    ------------------------------------------------------------------------- */
-:root {
-  --background: #f3f2ee;
-  --surface: #fffefa;
-  --surface-subtle: #efeee9;
-  --surface-quiet: #e4e3de;
-  --ink: #12130f;
-  --ink-secondary: #343630;
-  --ink-muted: #656760;
-  --border: #d4d3cd;
-  --border-strong: #969890;
-  --primary: #0c38b5;
-  --primary-hover: #082d98;
-  --primary-pressed: #062578;
-  --on-primary: #fffefa;
-  --focus: #0c38b5;
-  --radius-sm: 0px;
-  --radius-md: 0px;
-  --radius-lg: 0px;
-  --transition: 140ms ease-out;
-  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-  color: var(--ink);
-  background: var(--background);
-}
-
-body {
-  background: var(--background);
-}
-
-.app-shell {
-  background: var(--background);
-}
-
 .titlebar {
   min-height: 52px;
   background: var(--background);

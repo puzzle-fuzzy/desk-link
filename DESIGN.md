@@ -1,42 +1,42 @@
 ---
 name: DeskLink
-description: A calm cross-platform control surface for a private personal remote desktop.
+description: An editorial Windows control surface for a private personal remote desktop.
 colors:
-  primary: "oklch(0.500 0.151 40)"
-  background: "oklch(1.000 0.000 0)"
-  surface: "oklch(0.965 0.006 40)"
-  ink: "oklch(0.220 0.020 40)"
-  muted: "oklch(0.460 0.020 40)"
-  border: "oklch(0.860 0.010 40)"
+  primary: "#0c38b5"
+  background: "#f3f2ee"
+  surface: "#fffefa"
+  ink: "#12130f"
+  muted: "#656760"
+  border: "#d4d3cd"
   success: "oklch(0.530 0.140 145)"
   info: "oklch(0.430 0.105 225)"
   error: "oklch(0.490 0.180 25)"
-  on-primary: "oklch(0.985 0.000 0)"
+  on-primary: "#fffefa"
 typography:
   headline:
-    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
-    fontSize: "24px"
-    fontWeight: 600
-    lineHeight: 1.25
+    fontFamily: "Segoe UI Variable Text, Segoe UI, sans-serif"
+    fontSize: "clamp(42px, 6vw, 66px)"
+    fontWeight: 300
+    lineHeight: 0.98
   title:
-    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
-    fontSize: "16px"
-    fontWeight: 600
+    fontFamily: "Segoe UI Variable Text, Segoe UI, sans-serif"
+    fontSize: "24px"
+    fontWeight: 400
     lineHeight: 1.35
   body:
-    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
+    fontFamily: "Segoe UI Variable Text, Segoe UI, sans-serif"
     fontSize: "14px"
     fontWeight: 400
-    lineHeight: 1.45
+    lineHeight: 1.6
   label:
-    fontFamily: "Segoe UI Variable, Segoe UI, sans-serif"
+    fontFamily: "Cascadia Mono, Consolas, monospace"
     fontSize: "12px"
     fontWeight: 600
     lineHeight: 1.35
 rounded:
-  sm: "4px"
-  md: "8px"
-  lg: "12px"
+  sm: "0px"
+  md: "0px"
+  lg: "0px"
 spacing:
   xs: "4px"
   sm: "8px"
@@ -49,13 +49,13 @@ components:
     textColor: "{colors.on-primary}"
     typography: "{typography.body}"
     rounded: "{rounded.sm}"
-    padding: "8px 16px"
+    padding: "7px 14px"
   button-secondary:
     backgroundColor: "{colors.surface}"
     textColor: "{colors.ink}"
     typography: "{typography.body}"
     rounded: "{rounded.sm}"
-    padding: "8px 16px"
+    padding: "7px 14px"
   status-window:
     backgroundColor: "{colors.background}"
     textColor: "{colors.ink}"
@@ -69,17 +69,17 @@ components:
 
 **Creative North Star: "The Quiet Control Light"**
 
-DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. Windows and macOS use the same restrained white surface, one burnt-coral action color, remote-task-first navigation, and semantic status colors only where state needs emphasis.
+DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. The Windows surface uses warm paper, ink-black type, one blueprint-blue action color, remote-task-first navigation, and semantic status colors only where state needs emphasis.
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
 **Key Characteristics:**
 
-- Shared Windows/macOS information architecture with native platform behavior
-- Remote-task-first hierarchy with plain-language recovery detail
-- Restrained color with explicit semantic states
+- Remote-task-first information architecture with native Windows behavior
+- Editorial board grammar: mono metadata, hairline rules, and numbered blocks
+- One dominant action color with explicit semantic states
 - Compact trusted-device management without nested navigation
-- No decorative motion
+- Motion only for state transitions and never for decoration
 
 ## Implementation boundary
 
@@ -87,7 +87,7 @@ The Windows control workspace, host action dock, connection settings, and truste
 
 The Tauri process owns the single-instance application lifetime, native tray, and host supervisor start/stop boundary. Capture, encoding, encrypted transport, input injection, and high-consequence approval or revocation confirmations remain in Rust/Win32. The WebView receives sanitized lifecycle summaries and is a presentation layer, not a replacement for native security or media boundaries.
 
-The macOS surface is implemented with SwiftUI and mirrors the Windows task hierarchy, flat groups, Chinese copy, and shared semantic colors. SwiftUI owns presentation only; Keychain, Rust FFI, ScreenCaptureKit, VideoToolbox, AppKit input injection, and system permission boundaries retain their platform responsibilities.
+The current release target is Windows only. The macOS source tree is parked research code and is not part of the release gate; if cross-platform work resumes, it must first adopt this Windows information architecture and its semantic tokens instead of creating a second product surface.
 
 ## Information Architecture
 
@@ -97,19 +97,19 @@ The remote-task-first hierarchy is ordered by the user's next remote action:
 
 “连接设备” is the default entry and contains the recent-device reconnect path. “共享此设备” is the desktop host flow for generating an invitation and approving or revoking controllers. “已批准设备” manages trusted devices, while “设置 / 诊断” contains permissions, host availability, and technical details. Diagnostics and local runtime metrics remain secondary and must not displace the connection task.
 
-iOS is a controller only. Its default screen is “连接设备”; it may use bottom navigation or sheets to express the same task hierarchy. iOS must not render “共享此设备” as an executable controlled-device entry. The repository has no `apps/ios` implementation, so this is a future page contract rather than an iOS build artifact.
+There is no mobile release surface. Do not add mobile navigation or a second connection flow until the Windows release has completed real two-machine acceptance.
 
 ## Colors
 
-Pure white keeps the host surface neutral; burnt coral is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
+Warm paper keeps the control surface neutral; blueprint blue is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
 
 ### Primary
 
-- **Control Coral:** used for the tray identity, focused primary action, and the single most important enabled command.
+- **Blueprint Blue:** used for the tray identity, focused primary action, and the single most important enabled command.
 
-### Secondary
+### Semantic accents
 
-- **Recovery Blue:** used for connecting and retrying state indicators, never for decorative chrome.
+- **Recovery Blue:** used for connecting and retrying state indicators when the primary action is not already blue.
 
 ### Neutral
 
@@ -147,14 +147,14 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Buttons
 
-- **Shape:** standard, gently curved Windows control (4px radius).
-- **Primary:** Control Coral with near-white text and 8px by 16px padding.
+- **Shape:** square editorial control (0px radius) with a visible Windows focus rectangle.
+- **Primary:** Blueprint Blue with near-white text and 7px by 14px padding.
 - **Hover / Focus:** use the platform focus rectangle and a modest tonal shift; never scale or bounce.
 - **Secondary:** Quiet Surface with Warm Ink; destructive actions stay secondary until a specific device is selected.
 
 ### Cards / Containers
 
-- **Corner Style:** compact grouping only (8px radius), not a grid of floating cards.
+- **Corner Style:** square grouping with hairline dividers, not a grid of floating cards.
 - **Background:** Host White for the page and Quiet Surface for a single status or device region.
 - **Shadow Strategy:** none inside the window.
 - **Border:** Soft Divider only where grouping is not otherwise clear.
