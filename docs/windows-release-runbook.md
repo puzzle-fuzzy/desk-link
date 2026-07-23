@@ -48,6 +48,34 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
 
+## 2.1 发布预检
+
+在签名或创建 GitHub Release 前，先生成一份只读的统一预检报告：
+
+```powershell
+python scripts/check-windows-release-ready.py
+```
+
+报告默认写入 `dist/windows/windows-release-readiness.json`。它会把版本、当前提交 SHA、工作区洁净度、验证报告、安装包哈希、Windows-only 发布范围、签名、发布 tag 以及中继/诊断报告新鲜度放在一起检查；同时明确列出必须由发布负责人在两台真实 Windows 电脑上完成的验收项。当前命令默认只生成报告并返回 0，不会把未完成的手工验收伪装成通过。
+
+用于 CI 或发布脚本时可启用严格模式：
+
+```powershell
+python scripts/check-windows-release-ready.py --strict
+```
+
+严格模式在仍有任何阻塞项时返回 1。手工验收完成后，可用一个只包含已通过项目的 JSON 文件补充记录，例如：
+
+```json
+{
+  "two_windows_acceptance": true,
+  "long_soak_acceptance": true,
+  "smartscreen_acceptance": true
+}
+```
+
+然后传入 `--manual-json <path>` 重新生成报告。该文件不应包含密码、私钥、设备完整 ID 或屏幕内容。
+
 ## 3. 签名构建
 
 正式构建必须在受控 Windows runner 或受控签名机完成：
