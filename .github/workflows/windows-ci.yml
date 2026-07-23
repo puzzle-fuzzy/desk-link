@@ -51,3 +51,20 @@ jobs:
 
       - name: Verify production application and build local-test installer
         run: python scripts/build-windows-installer.py
+
+      - name: Generate Windows release readiness evidence
+        if: always()
+        run: python scripts/check-windows-release-ready.py --report dist/windows/windows-release-readiness.json
+
+      - name: Upload Windows candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskLink-Windows-candidate-${{ github.run_id }}
+          path: |
+            dist/windows/DeskLinkSetup-*-x64.exe
+            dist/windows/windows-installer-manifest.json
+            dist/windows/windows-release-verification.json
+            dist/windows/windows-release-readiness.json
+          if-no-files-found: warn
+          retention-days: 14

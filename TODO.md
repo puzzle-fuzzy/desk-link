@@ -100,6 +100,7 @@ python scripts/audit-managed-diagnostics.py
 - [x] 变更检查：`git diff --check`。
 - [x] 增加统一 Windows 发布预检：`check-windows-release-ready.py` 汇总来源 SHA、安装包完整性、签名、tag、中继/诊断证据，并把真实双机验收明确列为人工阻塞项。
 - [x] 增加候选绑定的人工验收记录模板：版本、来源 SHA、安装包 SHA-256、操作者和 UTC 时间必须与预检候选一致。
+- [x] Windows CI 与签名工作流上传统一发布预检报告，保留来源 SHA、安装包完整性和未完成阻塞项的构建证据。
 
 ## 当前已知事实
 
