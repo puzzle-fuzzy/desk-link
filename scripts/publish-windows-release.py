@@ -95,6 +95,17 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
 
     if verification.get("passed") is not True or verification.get("version") != version:
         raise ValueError("Windows release verification does not match the installer")
+    if verification.get("custom_protocol") is not True:
+        raise ValueError("Windows release verification did not use custom protocol")
+    scope = verification.get("release_scope")
+    if not isinstance(scope, dict) or scope != manifest.get("release_scope"):
+        raise ValueError("Windows release scope does not match the installer")
+    if (
+        scope.get("target") != "windows-10/11-x64"
+        or scope.get("macos_release") is not False
+        or scope.get("mobile_release") is not False
+    ):
+        raise ValueError("Windows release scope includes a non-Windows product")
     return ReleasePayload(
         version=version,
         source_commit=source_commit,

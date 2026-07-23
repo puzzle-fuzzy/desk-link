@@ -154,6 +154,9 @@ def main() -> int:
         raise SystemExit("Windows release verification has no source checkout status")
     if should_sign and source_dirty:
         raise SystemExit("Signed Windows releases require a clean source checkout")
+    release_scope = release_report.get("release_scope")
+    if not isinstance(release_scope, dict):
+        raise SystemExit("Windows release verification has no release scope")
     verified_application_sha256 = str(release_report["release"]["sha256"])
     if sha256(application) != verified_application_sha256:
         raise SystemExit("Windows UI payload changed after release verification")
@@ -216,6 +219,7 @@ def main() -> int:
         "version": str(version),
         "source_commit": source_commit,
         "source_dirty": source_dirty,
+        "release_scope": release_scope,
         "target": TARGET,
         "signed": should_sign,
         "application": {

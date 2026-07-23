@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -41,6 +43,11 @@ class WindowsReleasePublishTests(unittest.TestCase):
                     "version": "0.1.42",
                     "source_commit": "a" * 40,
                     "source_dirty": False,
+                    "release_scope": {
+                        "target": "windows-10/11-x64",
+                        "macos_release": False,
+                        "mobile_release": False,
+                    },
                     "signed": signed,
                     "passed": True,
                     "installer": {
@@ -58,6 +65,12 @@ class WindowsReleasePublishTests(unittest.TestCase):
                     "version": "0.1.42",
                     "source_commit": "a" * 40,
                     "source_dirty": False,
+                    "custom_protocol": True,
+                    "release_scope": {
+                        "target": "windows-10/11-x64",
+                        "macos_release": False,
+                        "mobile_release": False,
+                    },
                     "passed": True,
                 }
             ),
@@ -112,6 +125,37 @@ class WindowsReleasePublishTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "source commit"):
                 self.publish.validate_release_payload(root, "v0.1.42")
+
+    def test_rejects_a_release_scope_or_protocol_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_release(root)
+            verification = root / "dist" / "windows" / "windows-release-verification.json"
+            payload = json.loads(verification.read_text(encoding="utf-8"))
+            payload["custom_protocol"] = False
+            verification.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "custom protocol"):
+                self.publish.validate_release_payload(root, "v0.1.42")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_release(root)
+            manifest = root / "dist" / "windows" / "windows-installer-manifest.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["release_scope"]["macos_release"] = True
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "scope"):
+                self.publish.validate_release_payload(root, "v0.1.42")
+
+    def test_rejects_a_release_not_built_from_github_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_release(root)
+            with patch.dict(
+                os.environ, {"GITHUB_SHA": "b" * 40}, clear=False
+            ):
+                with self.assertRaisesRegex(ValueError, "GITHUB_SHA"):
+                    self.publish.validate_release_payload(root, "v0.1.42")
 
     def test_rejects_invalid_repository_names(self) -> None:
         payload = self.publish.ReleasePayload(
