@@ -151,6 +151,10 @@ pub enum DiagnosticEvent {
     ControllerVideoMetrics {
         attempt: u32,
         stream_id: Option<u64>,
+        video_path: String,
+        video_path_rtt_ms: Option<u32>,
+        video_path_loss_basis_points: Option<u16>,
+        video_path_fallback_reason: Option<String>,
         received_video_packets: u64,
         dropped_video_packets: u64,
         completed_frames: u64,
@@ -426,6 +430,10 @@ fn encode_event(event: &DiagnosticEvent) -> String {
         DiagnosticEvent::ControllerVideoMetrics {
             attempt,
             stream_id,
+            video_path,
+            video_path_rtt_ms,
+            video_path_loss_basis_points,
+            video_path_fallback_reason,
             received_video_packets,
             dropped_video_packets,
             completed_frames,
@@ -436,8 +444,25 @@ fn encode_event(event: &DiagnosticEvent) -> String {
         } => {
             let stream_id =
                 stream_id.map_or_else(String::new, |value| format!(",\"stream_id\":{value}"));
+            let video_path = json_string(&bounded_redacted_text(video_path));
+            let video_path_rtt_ms = video_path_rtt_ms.map_or_else(String::new, |value| {
+                format!(",\"video_path_rtt_ms\":{value}")
+            });
+            let video_path_loss_basis_points = video_path_loss_basis_points
+                .map_or_else(String::new, |value| {
+                    format!(",\"video_path_loss_basis_points\":{value}")
+                });
+            let video_path_fallback_reason =
+                video_path_fallback_reason
+                    .as_ref()
+                    .map_or_else(String::new, |value| {
+                        format!(
+                            ",\"video_path_fallback_reason\":{}",
+                            json_string(&bounded_redacted_text(value))
+                        )
+                    });
             format!(
-                "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt}{stream_id},\"received_video_packets\":{received_video_packets},\"dropped_video_packets\":{dropped_video_packets},\"completed_frames\":{completed_frames},\"delivered_video_frames\":{delivered_video_frames},\"video_ipc_overflow_drops\":{video_ipc_overflow_drops},\"video_ipc_keyframe_replacements\":{video_ipc_keyframe_replacements},\"input_backpressure_count\":{input_backpressure_count}"
+                "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt}{stream_id},\"video_path\":{video_path}{video_path_rtt_ms}{video_path_loss_basis_points}{video_path_fallback_reason},\"received_video_packets\":{received_video_packets},\"dropped_video_packets\":{dropped_video_packets},\"completed_frames\":{completed_frames},\"delivered_video_frames\":{delivered_video_frames},\"video_ipc_overflow_drops\":{video_ipc_overflow_drops},\"video_ipc_keyframe_replacements\":{video_ipc_keyframe_replacements},\"input_backpressure_count\":{input_backpressure_count}"
             )
         }
         DiagnosticEvent::ControllerRenderMetrics {
@@ -742,6 +767,10 @@ mod tests {
             .record(&DiagnosticEvent::ControllerVideoMetrics {
                 attempt: 2,
                 stream_id: Some(7),
+                video_path: "directLan".to_owned(),
+                video_path_rtt_ms: Some(4),
+                video_path_loss_basis_points: Some(12),
+                video_path_fallback_reason: None,
                 received_video_packets: 1_200,
                 dropped_video_packets: 4,
                 completed_frames: 87,
@@ -758,6 +787,9 @@ mod tests {
         assert!(contents.contains("\"dropped_video_packets\":4"));
         assert!(contents.contains("\"completed_frames\":87"));
         assert!(contents.contains("\"stream_id\":7"));
+        assert!(contents.contains("\"video_path\":\"directLan\""));
+        assert!(contents.contains("\"video_path_rtt_ms\":4"));
+        assert!(contents.contains("\"video_path_loss_basis_points\":12"));
         assert!(contents.contains("\"delivered_video_frames\":84"));
         assert!(contents.contains("\"video_ipc_overflow_drops\":3"));
         assert!(contents.contains("\"video_ipc_keyframe_replacements\":1"));

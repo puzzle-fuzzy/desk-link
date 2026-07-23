@@ -44,7 +44,8 @@ use desklink_protocol::{
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    JoinRejectCode, QuicClient, RelayDirectoryLookup, RelayJoin, TransportError,
+    DirectVideoPathFallbackReason, JoinRejectCode, QuicClient, RelayDirectoryLookup, RelayJoin,
+    TransportError, VideoPathKind, VideoPathQuality,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -3479,6 +3480,11 @@ async fn run_controller(
                         metrics,
                         manager.video_mailbox.metrics(),
                         manager.input_backpressure_count.load(Ordering::Relaxed),
+                        ControllerVideoPathDiagnostics {
+                            kind: runtime.video_path_kind(),
+                            quality: runtime.video_path_quality(),
+                            fallback_reason: runtime.video_path_fallback_reason(),
+                        },
                     );
                     last_diagnostic_metrics = Instant::now();
                 }
@@ -3492,6 +3498,11 @@ async fn run_controller(
             runtime.metrics(),
             manager.video_mailbox.metrics(),
             manager.input_backpressure_count.load(Ordering::Relaxed),
+            ControllerVideoPathDiagnostics {
+                kind: runtime.video_path_kind(),
+                quality: runtime.video_path_quality(),
+                fallback_reason: runtime.video_path_fallback_reason(),
+            },
         );
         manager.video_mailbox.close();
         if let Some(pending) = pending_clipboard.take() {
@@ -4177,6 +4188,13 @@ fn record_controller_diagnostic(
     });
 }
 
+#[derive(Clone, Copy)]
+struct ControllerVideoPathDiagnostics {
+    kind: VideoPathKind,
+    quality: Option<VideoPathQuality>,
+    fallback_reason: Option<DirectVideoPathFallbackReason>,
+}
+
 fn record_controller_video_metrics(
     diagnostics: Option<&DiagnosticLog>,
     attempt: u32,
@@ -4184,6 +4202,7 @@ fn record_controller_video_metrics(
     transport: ControllerMetrics,
     mailbox: VideoMailboxMetrics,
     input_backpressure_count: u64,
+    path: ControllerVideoPathDiagnostics,
 ) {
     let Some(diagnostics) = diagnostics else {
         return;
@@ -4191,6 +4210,19 @@ fn record_controller_video_metrics(
     let _ = diagnostics.record(&DiagnosticEvent::ControllerVideoMetrics {
         attempt,
         stream_id,
+        video_path: path.kind.as_str().to_owned(),
+        video_path_rtt_ms: path.quality.map(|quality| quality.rtt_ms),
+        video_path_loss_basis_points: path.quality.map(|quality| quality.loss_basis_points),
+        video_path_fallback_reason: path.fallback_reason.map(|reason| {
+            match reason {
+                DirectVideoPathFallbackReason::InvalidCandidate => "invalidCandidate",
+                DirectVideoPathFallbackReason::Rejected => "rejected",
+                DirectVideoPathFallbackReason::ProbeFailed => "probeFailed",
+                DirectVideoPathFallbackReason::TimedOut => "timedOut",
+                DirectVideoPathFallbackReason::Stopped => "stopped",
+            }
+            .to_owned()
+        }),
         received_video_packets: transport.received_video_packets,
         dropped_video_packets: transport.dropped_video_packets,
         completed_frames: transport.completed_frames,

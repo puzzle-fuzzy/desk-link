@@ -25,8 +25,9 @@
 - [x] 覆盖控制端对端先发起探测时的并发窗口，避免 Noise 会话锁导致假超时。
 - [x] 被控端增加入站 DirectLan 探测监听，与已有出站连接互为兜底；Rust Windows 包测试、Clippy 和认证 datagram 回环回归测试已通过。
 - [ ] 补充 HostRuntime ↔ ControllerRuntime 的 DirectLan 双机/回环 E2E：成功、超时、候选过期、认证失败、主动关闭。
+- [x] 视频 datagram 发送失败时立即撤销 DirectLan 句柄并重发同一包到中继；自动回落测试通过。
 - [ ] 验证直连失败后视频自动回落中继，且控制、审批、剪贴板、文件仍保持中继通道。
-- [ ] 增加直连 RTT、丢包和当前路径诊断字段，避免用户看到“已直连”但实际仍走中继。
+- [x] 增加直连 RTT、丢包和当前路径诊断字段；回落后仍保留最近探测质量和回落原因，避免用户看到“已直连”但实际仍走中继。
 
 ## 3. Windows 双机验收（P1，需人工）
 
@@ -60,6 +61,14 @@
 - [ ] UAC/安全桌面、语音输入、虚拟桌面等是否纳入下一版本范围。
 - [ ] macOS VideoToolbox 适配（仅当恢复跨平台发布目标时）。
 
+## 下一阶段执行顺序（发布冻结前）
+
+1. **收口当前直连诊断与回落改动**：重新跑 workspace 门禁，提交并推送当前 8 个文件；发布说明只描述已验证能力，不扩展 4K 承诺。
+2. **运行时 E2E 准备**：把 HostRuntime ↔ ControllerRuntime 的候选交换、超时、候选过期、认证失败和主动关闭整理成可重复的测试夹具；真实桌面采集仍单独走人工验收。
+3. **双机验收包**：使用现有 `verify-windows-resilience.py` 和安装包清单，记录同网直连、跨网中继、断线恢复、双屏/DPI、剪贴板和文件传输结果。
+4. **信任与安装**：用户提供 Authenticode 证书后执行签名构建、SmartScreen 和全新账户安装升级验收；没有证书时保持候选版，不伪装成正式发布。
+5. **发布冻结**：在干净 checkout 重跑所有门禁，生成 SHA-256/签名清单，最后创建 `v0.1.91` tag；4K、公网 P2P 和 macOS 继续留在后续版本。
+
 ## 自动门禁
 
 ```text
@@ -80,6 +89,7 @@ python scripts/audit-managed-diagnostics.py
 - [x] Windows 发布验证：`python scripts/verify-windows-release.py`（152 个前端测试通过，TypeScript/Vite/Rust release 构建通过）。
 - [x] Windows 安装包构建：`python scripts/build-windows-installer.py`（安装包清单生成，当前 `signed: false`）。
 - [x] 主机 DirectLan 接入回环：`cargo test -p desklink-windows --lib runtime::direct_video_tests::host_acceptor_keeps_authenticated_direct_datagram_connection`。
+- [x] 直连质量可观测性：记录当前路径、最近 RTT、丢包基点和回落原因；`cargo clippy --workspace --all-targets -- -D warnings` 与 Windows UI 控制器测试通过。
 - [x] 中继探测：`python scripts/verify-managed-relay.py`（双向控制探测通过，约 303 ms）。
 - [x] 云诊断审计：`python scripts/audit-managed-diagnostics.py`（公网 health、服务、定时器和报告新鲜度通过）。
 - [x] 变更检查：`git diff --check`。
@@ -87,7 +97,7 @@ python scripts/audit-managed-diagnostics.py
 ## 当前已知事实
 
 - 中继实况探测已通过：`101.35.246.159:4433`。
-- 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `dc85cf989ea4`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
+- 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
 - 当前安装包 `dist/windows/DeskLinkSetup-0.1.91-x64.exe` 未签名。
 - 候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，但尚未形成干净的唯一发布提交。
-- 当前 `main` 工作区仍有未提交修改，尚无本地 `v*` 发布 tag。
+- 当前工作区包含本轮直连诊断字段的未提交修改，尚无本地 `v*` 发布 tag。

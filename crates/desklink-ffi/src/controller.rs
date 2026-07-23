@@ -20,8 +20,9 @@ use desklink_protocol::{
 use desklink_session::InputSequencer;
 use desklink_transport::{
     DirectLanConnection, DirectLanEndpoint, DirectLanProbeResult, DirectLanSession,
-    DirectVideoPathAction, DirectVideoPathEvent, DirectVideoPathMachine, DirectVideoPathState,
-    QuicClient, TransportError, TransportEvent, VideoPathKind, VideoPathQuality,
+    DirectVideoPathAction, DirectVideoPathEvent, DirectVideoPathFallbackReason,
+    DirectVideoPathMachine, DirectVideoPathState, QuicClient, TransportError, TransportEvent,
+    VideoPathKind, VideoPathQuality,
 };
 use desklink_video::{
     AssembleResult, EncodedFrame, FrameAssembler, VideoContinuity, VideoContinuityAction,
@@ -237,6 +238,17 @@ impl ControllerRuntime {
         } else {
             VideoPathKind::Relay
         }
+    }
+
+    /// Returns the most recent authenticated DirectLan probe quality. The
+    /// value remains available after fallback so diagnostics can explain why
+    /// a session is currently relayed without reporting relay as direct.
+    pub fn video_path_quality(&self) -> Option<VideoPathQuality> {
+        self.video_path.last_quality()
+    }
+
+    pub fn video_path_fallback_reason(&self) -> Option<DirectVideoPathFallbackReason> {
+        self.video_path.last_fallback_reason()
     }
 
     pub fn direct_candidate(&self) -> Option<&DirectLanCandidate> {

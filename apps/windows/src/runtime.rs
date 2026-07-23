@@ -27,7 +27,7 @@ use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, Reconnec
 use desklink_transport::{
     DirectLanConnection, DirectLanSession, DirectLanVideoPath, JoinRejectCode, QuicClient,
     QuicClientConfig, RelayDirectoryRegistration, RelayJoin, RelayVideoPath, TransportError,
-    VideoDatagramBackend,
+    VideoDatagramBackend, VideoDatagramRoute,
 };
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
@@ -2027,18 +2027,20 @@ async fn send_video_loop(
                 }
                 for (index, datagram) in prepared.datagrams.into_iter().enumerate() {
                     let ciphertext = seal(&secure, SecureLane::VideoDatagram, &datagram).await?;
-                    let direct_path = direct_connection
+                    let mut direct_path = direct_connection
                         .lock()
                         .await
                         .clone()
                         .map(DirectLanVideoPath::new);
-                    if let Some(direct_path) = direct_path {
-                        if direct_path.send(ciphertext.clone()).await.is_err() {
-                            *direct_connection.lock().await = None;
-                            relay_video_path.send(ciphertext).await?;
-                        }
-                    } else {
-                        relay_video_path.send(ciphertext).await?;
+                    let had_direct_path = direct_path.is_some();
+                    send_video_datagram_with_fallback(
+                        &mut direct_path,
+                        &relay_video_path,
+                        ciphertext,
+                    )
+                    .await?;
+                    if had_direct_path && direct_path.is_none() {
+                        *direct_connection.lock().await = None;
                     }
                     if index % 16 == 15 {
                         tokio::task::yield_now().await;
@@ -2047,6 +2049,31 @@ async fn send_video_loop(
             }
         }
     }
+}
+
+async fn send_video_datagram_with_fallback<D, R>(
+    direct: &mut Option<D>,
+    relay: &R,
+    bytes: Vec<u8>,
+) -> Result<VideoDatagramRoute, TransportError>
+where
+    D: VideoDatagramBackend,
+    R: VideoDatagramBackend,
+{
+    let direct_failed = if let Some(path) = direct.as_ref() {
+        let route = path.route();
+        if path.send(bytes.clone()).await.is_ok() {
+            return Ok(route);
+        }
+        true
+    } else {
+        false
+    };
+    if direct_failed {
+        *direct = None;
+    }
+    relay.send(bytes).await?;
+    Ok(relay.route())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3304,14 +3331,52 @@ mod retry_policy_tests {
 
 #[cfg(test)]
 mod direct_video_tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        future::Future,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
-    use desklink_transport::{DirectLanEndpoint, DirectLanSession};
+    use desklink_transport::{
+        DirectLanEndpoint, DirectLanSession, TransportError, VideoDatagramBackend,
+        VideoDatagramRoute,
+    };
     use rand_core::OsRng;
     use tokio::sync::Mutex as AsyncMutex;
 
-    use super::{accept_host_direct_connection, now_unix_s};
+    use super::{accept_host_direct_connection, now_unix_s, send_video_datagram_with_fallback};
+
+    #[derive(Clone)]
+    struct RecordingBackend {
+        route: VideoDatagramRoute,
+        fail: bool,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl VideoDatagramBackend for RecordingBackend {
+        fn route(&self) -> VideoDatagramRoute {
+            self.route
+        }
+
+        fn send<'a>(
+            &'a self,
+            bytes: Vec<u8>,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send + 'a {
+            let sent = self.sent.clone();
+            let fail = self.fail;
+            async move {
+                sent.lock().unwrap().push(bytes);
+                if fail {
+                    Err(TransportError::Datagram(
+                        "simulated direct path failure".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn host_acceptor_keeps_authenticated_direct_datagram_connection() {
@@ -3360,6 +3425,32 @@ mod direct_video_tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(received, vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn failed_direct_video_datagram_falls_back_to_relay_only() {
+        let direct_sent = Arc::new(Mutex::new(Vec::new()));
+        let relay_sent = Arc::new(Mutex::new(Vec::new()));
+        let direct = RecordingBackend {
+            route: VideoDatagramRoute::DirectLan { candidate_id: 7 },
+            fail: true,
+            sent: direct_sent.clone(),
+        };
+        let relay = RecordingBackend {
+            route: VideoDatagramRoute::Relay,
+            fail: false,
+            sent: relay_sent.clone(),
+        };
+        let mut selected = Some(direct);
+
+        let route = send_video_datagram_with_fallback(&mut selected, &relay, vec![1, 2, 3])
+            .await
+            .unwrap();
+
+        assert_eq!(route, VideoDatagramRoute::Relay);
+        assert!(selected.is_none(), "failed direct path must be retired");
+        assert_eq!(direct_sent.lock().unwrap().as_slice(), &[vec![1, 2, 3]]);
+        assert_eq!(relay_sent.lock().unwrap().as_slice(), &[vec![1, 2, 3]]);
     }
 
     fn connected_secure_sessions() -> (

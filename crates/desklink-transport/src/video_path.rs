@@ -84,6 +84,8 @@ pub struct DirectVideoPathMachine {
     session_binding: [u8; 16],
     direct_probe_available: bool,
     state: DirectVideoPathState,
+    last_quality: Option<VideoPathQuality>,
+    last_fallback_reason: Option<DirectVideoPathFallbackReason>,
 }
 
 impl DirectVideoPathMachine {
@@ -92,6 +94,8 @@ impl DirectVideoPathMachine {
             session_binding,
             direct_probe_available: false,
             state: DirectVideoPathState::Relay,
+            last_quality: None,
+            last_fallback_reason: None,
         }
     }
 
@@ -106,6 +110,18 @@ impl DirectVideoPathMachine {
 
     pub const fn state(&self) -> &DirectVideoPathState {
         &self.state
+    }
+
+    /// Returns the most recent authenticated probe quality. Keeping this
+    /// separate from the state enum lets the controller report RTT and loss
+    /// after a path falls back to relay without claiming that relay is direct.
+    pub const fn last_quality(&self) -> Option<VideoPathQuality> {
+        self.last_quality
+    }
+
+    /// Returns the reason for the most recent direct-path fallback, if any.
+    pub const fn last_fallback_reason(&self) -> Option<DirectVideoPathFallbackReason> {
+        self.last_fallback_reason
     }
 
     pub fn apply(&mut self, event: DirectVideoPathEvent) -> Vec<DirectVideoPathAction> {
@@ -258,6 +274,8 @@ impl DirectVideoPathMachine {
                     };
                 }
                 let allows_experimental_4k = quality.allows_experimental_4k();
+                self.last_quality = Some(quality);
+                self.last_fallback_reason = None;
                 self.state = DirectVideoPathState::Direct {
                     candidate_id,
                     allows_experimental_4k,
@@ -307,6 +325,7 @@ impl DirectVideoPathMachine {
 
     fn fallback(&mut self, reason: DirectVideoPathFallbackReason) -> Vec<DirectVideoPathAction> {
         self.state = DirectVideoPathState::Relay;
+        self.last_fallback_reason = Some(reason);
         vec![DirectVideoPathAction::UseRelay { reason }]
     }
 }
@@ -385,6 +404,8 @@ mod tests {
                 allows_experimental_4k: true,
             }
         );
+        assert_eq!(machine.last_quality(), Some(good_quality()));
+        assert_eq!(machine.last_fallback_reason(), None);
     }
 
     #[test]
@@ -422,6 +443,38 @@ mod tests {
             }]
         );
         assert_eq!(machine.state(), &DirectVideoPathState::Relay);
+        assert_eq!(
+            machine.last_fallback_reason(),
+            Some(DirectVideoPathFallbackReason::TimedOut)
+        );
+    }
+
+    #[test]
+    fn active_direct_path_falls_back_and_keeps_last_quality_for_diagnostics() {
+        let binding = [11; 16];
+        let mut machine = DirectVideoPathMachine::new(binding).with_direct_probe();
+        machine.apply(DirectVideoPathEvent::ReceiveOffer {
+            candidate: candidate(binding),
+            local_candidate: Some(candidate(binding)),
+            now_unix_s: 100,
+        });
+        machine.apply(DirectVideoPathEvent::ProbeSucceeded {
+            candidate_id: 7,
+            quality: good_quality(),
+        });
+
+        assert_eq!(
+            machine.apply(DirectVideoPathEvent::Stop),
+            vec![DirectVideoPathAction::UseRelay {
+                reason: DirectVideoPathFallbackReason::Stopped,
+            }]
+        );
+        assert_eq!(machine.state(), &DirectVideoPathState::Relay);
+        assert_eq!(machine.last_quality(), Some(good_quality()));
+        assert_eq!(
+            machine.last_fallback_reason(),
+            Some(DirectVideoPathFallbackReason::Stopped)
+        );
     }
 
     #[test]

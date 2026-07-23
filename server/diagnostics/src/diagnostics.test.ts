@@ -83,6 +83,9 @@ describe("signed diagnostic ingestion", () => {
         eventFixture({
           event: "controller_video_metrics",
           level: "info",
+          video_path: "directLan",
+          video_path_rtt_ms: 4,
+          video_path_loss_basis_points: 12,
           received_video_packets: 220,
           dropped_video_packets: 2,
           completed_frames: 90,
@@ -103,6 +106,9 @@ describe("signed diagnostic ingestion", () => {
     expect(verified.batch.events[1]).toMatchObject({
       event: "controller_video_metrics",
       delivered_video_frames: 88,
+      video_path: "directLan",
+      video_path_rtt_ms: 4,
+      video_path_loss_basis_points: 12,
       video_ipc_overflow_drops: 2,
       video_ipc_keyframe_replacements: 1,
       input_backpressure_count: 0,
