@@ -26,6 +26,7 @@ from windows_native_build_env import (
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS_UI = ROOT / "apps" / "windows-ui"
 TARGET = "x86_64-pc-windows-msvc"
+README = ROOT / "README.md"
 PRODUCT_CONFIG = WINDOWS_UI / "src" / "product-config.ts"
 RUST_RELAY_CONFIG = WINDOWS_UI / "src-tauri" / "src" / "local_relay.rs"
 WINDOWS_ASSETS = ROOT / "apps" / "windows" / "assets"
@@ -100,6 +101,36 @@ def verify_managed_relay_profile() -> dict[str, str]:
     }
 
 
+def verify_release_scope(readme: Path = README) -> dict[str, object]:
+    """Keep the public release description aligned with the Windows target."""
+    text = readme.read_text(encoding="utf-8")
+    required = (
+        "Windows 10/11 x64",
+        "当前正式发布目标是 Windows 10/11 x64",
+        "跨平台研究代码",
+    )
+    for phrase in required:
+        if phrase not in text:
+            raise SystemExit(
+                f"README release scope is missing the required phrase: {phrase}"
+            )
+    forbidden = (
+        "当前仓库同时包含 Windows 10/11 x64 桌面端与 macOS Apple Silicon 桌面端",
+        "## macOS 构建与使用",
+        "两台 Apple Silicon Mac 完成",
+    )
+    for phrase in forbidden:
+        if phrase in text:
+            raise SystemExit(
+                f"README still advertises a non-Windows release path: {phrase}"
+            )
+    return {
+        "target": "windows-10/11-x64",
+        "macos_release": False,
+        "mobile_release": False,
+    }
+
+
 def verify_static_windows_assets() -> dict[str, dict[str, object]]:
     expected = {
         "desklink-icon.png": b"\x89PNG\r\n\x1a\n",
@@ -171,6 +202,7 @@ def main() -> int:
     prepare_windows_native_build_environment()
     prepare_windows_release_environment()
     version = verify_versions()
+    release_scope = verify_release_scope()
     managed_relay = verify_managed_relay_profile()
     windows_assets = verify_static_windows_assets()
     run(["bun", "install", "--frozen-lockfile"], cwd=WINDOWS_UI)
@@ -198,6 +230,7 @@ def main() -> int:
         "schema": 1,
         "version": version,
         "custom_protocol": True,
+        "release_scope": release_scope,
         "frontend_assets": assets,
         "managed_relay": managed_relay,
         "windows_assets": windows_assets,

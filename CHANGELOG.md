@@ -10,6 +10,7 @@
 - 云端脱敏诊断入口已加载到生产 Nginx；Windows HTTPS 脱敏批次上报和服务端字段白名单已验证。
 - Windows UI、Rust workspace、在线中继探测和安装包构建门禁通过。
 - Windows UI 统一为单一 editorial 令牌：暖纸背景、蓝图蓝操作色、方角分组和 Cascadia Mono 元数据；删除重复的旧圆角/珊瑚色覆盖层。
+- 发布边界收敛为 Windows 10/11 x64；macOS 源码保留为暂存研究代码，不进入本候选版本的构建、测试和发布承诺。
 
 ### 当前明确限制
 
