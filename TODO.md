@@ -101,4 +101,4 @@ python scripts/audit-managed-diagnostics.py
 - 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
 - 当前安装包 `dist/windows/DeskLinkSetup-0.1.91-x64.exe` 未签名。
 - 候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，但尚未形成干净的唯一发布提交。
-- 当前 `main` 已推送直连诊断与回落改动；本轮回环夹具待提交，尚无本地 `v*` 发布 tag。
+- 当前 `main` 已推送直连诊断、回落改动和 DirectLan 回环夹具；尚无本地 `v*` 发布 tag。
