@@ -608,6 +608,66 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(received, vec![1, 2, 3]);
+
+        initiator_connection.close(b"loopback test complete");
+        tokio::time::timeout(Duration::from_secs(1), responder_connection.closed())
+            .await
+            .expect("responder must observe an active direct-path close");
+        assert!(initiator_connection.is_closed());
+        assert!(responder_connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn expired_candidate_is_rejected_before_network_probe() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let endpoint = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let binding = [5; 16];
+        let candidate =
+            DirectLanCandidate::new(11, endpoint.local_addr().unwrap(), 105, binding, 100).unwrap();
+        let (mut initiator_secure, _) = connected_secure_sessions();
+
+        let error = endpoint
+            .connect(&candidate, &binding, &mut initiator_secure, 106)
+            .await
+            .expect_err("an expired candidate must never open a direct socket");
+        assert!(matches!(
+            error,
+            DirectLanProbeError::InvalidCandidate(message)
+                if message.contains("expiry is outside the allowed lifetime")
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_a_peer_with_a_different_session_binding() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let responder = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let initiator = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let binding = [7; 16];
+        let wrong_binding = [8; 16];
+        let candidate =
+            DirectLanCandidate::new(13, responder.local_addr().unwrap(), 110, binding, 100)
+                .unwrap();
+        let (mut initiator_secure, mut responder_secure) = connected_secure_sessions();
+        let responder_for_task = responder.clone();
+        let responder_task = tokio::spawn(async move {
+            let connection = responder_for_task.accept().await.unwrap().unwrap();
+            responder_for_task
+                .accept_probe_connection(connection, 13, &wrong_binding, &mut responder_secure, 100)
+                .await
+        });
+
+        let initiator_result = initiator
+            .connect(&candidate, &binding, &mut initiator_secure, 100)
+            .await;
+        let responder_result = responder_task.await.unwrap();
+        assert!(
+            initiator_result.is_err(),
+            "binding mismatch must fail the probe"
+        );
+        assert!(matches!(
+            responder_result,
+            Err(DirectLanProbeError::SessionBindingMismatch)
+        ));
     }
 
     #[tokio::test]
