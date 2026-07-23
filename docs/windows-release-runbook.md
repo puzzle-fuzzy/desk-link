@@ -64,17 +64,35 @@ python scripts/check-windows-release-ready.py
 python scripts/check-windows-release-ready.py --strict
 ```
 
-严格模式在仍有任何阻塞项时返回 1。手工验收完成后，可用一个只包含已通过项目的 JSON 文件补充记录，例如：
+严格模式在仍有任何阻塞项时返回 1。为了避免把验收结果误绑定到另一份安装包，先基于当前候选生成记录模板：
+
+```powershell
+python scripts/create-windows-acceptance-record.py --operator "release-team"
+```
+
+完成真实验收后，只修改模板中的 `checks` 和 `notes`，再传入 `--manual-json` 重新生成报告。记录必须保留版本、来源提交 SHA、安装包 SHA-256、操作者和 UTC 时间：
 
 ```json
 {
-  "two_windows_acceptance": true,
-  "long_soak_acceptance": true,
-  "smartscreen_acceptance": true
+  "schema": 1,
+  "version": "0.1.91",
+  "source_commit": "<40-char-source-sha>",
+  "installer": {
+    "file_name": "DeskLinkSetup-0.1.91-x64.exe",
+    "sha256": "<installer-sha256>"
+  },
+  "operator": "release-team",
+  "recorded_at_utc": "2026-07-23T10:00:00Z",
+  "checks": {
+    "two_windows_acceptance": true,
+    "long_soak_acceptance": true,
+    "smartscreen_acceptance": true
+  },
+  "notes": {}
 }
 ```
 
-然后传入 `--manual-json <path>` 重新生成报告。该文件不应包含密码、私钥、设备完整 ID 或屏幕内容。
+然后运行 `python scripts/check-windows-release-ready.py --manual-json <path>`。预检会拒绝版本、提交 SHA 或安装包哈希不一致的记录。该文件不应包含密码、私钥、设备完整 ID 或屏幕内容。
 
 ## 3. 签名构建
 

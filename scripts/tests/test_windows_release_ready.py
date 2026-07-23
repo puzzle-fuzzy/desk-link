@@ -100,6 +100,59 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             report = self.ready.evaluate_preflight(**fixture)
         self.assertIn("installer_integrity", {item["id"] for item in report["blockers"]})
 
+    def test_manual_acceptance_record_is_bound_to_candidate_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            record = {
+                "schema": 1,
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {
+                    "file_name": installer["file_name"],
+                    "sha256": installer["sha256"],
+                },
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            checks, metadata = self.ready.load_manual_acceptance(
+                path,
+                expected_version="0.1.42",
+                expected_commit="a" * 40,
+                expected_installer_sha256=installer["sha256"],
+            )
+        self.assertTrue(all(checks.values()))
+        self.assertEqual(metadata["operator"], "release-team")
+
+    def test_manual_acceptance_rejects_a_different_installer_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            record = {
+                "schema": 1,
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {"file_name": "DeskLinkSetup-0.1.42-x64.exe", "sha256": "b" * 64},
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "installer"):
+                self.ready.load_manual_acceptance(
+                    path,
+                    expected_version="0.1.42",
+                    expected_commit="a" * 40,
+                    expected_installer_sha256=manifest["installer"]["sha256"],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,58 @@ def read_json(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def load_manual_acceptance(
+    path: Path,
+    *,
+    expected_version: str | None,
+    expected_commit: str | None,
+    expected_installer_sha256: str | None,
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """Load an acceptance record and bind it to this exact candidate artifact."""
+
+    value = read_json(path)
+    if value is None or value.get("schema") != 1:
+        raise ValueError("manual acceptance record must use schema 1")
+    if value.get("version") != expected_version:
+        raise ValueError("manual acceptance record version does not match the candidate")
+    if value.get("source_commit") != expected_commit:
+        raise ValueError("manual acceptance record source commit does not match the candidate")
+    installer = value.get("installer")
+    if (
+        not isinstance(installer, dict)
+        or not isinstance(expected_installer_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", installer.get("sha256", "")) is None
+        or installer.get("sha256") != expected_installer_sha256
+        or not isinstance(installer.get("file_name"), str)
+    ):
+        raise ValueError("manual acceptance record is not bound to the candidate installer")
+    operator = value.get("operator")
+    if not isinstance(operator, str) or not operator.strip():
+        raise ValueError("manual acceptance record must name the operator")
+    recorded_at = value.get("recorded_at_utc")
+    if not isinstance(recorded_at, str):
+        raise ValueError("manual acceptance record timestamp is missing")
+    try:
+        parsed_recorded_at = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("manual acceptance record timestamp is invalid") from error
+    if parsed_recorded_at.tzinfo is None:
+        raise ValueError("manual acceptance record timestamp must include a timezone")
+    checks = value.get("checks")
+    if not isinstance(checks, dict):
+        raise ValueError("manual acceptance record checks are missing")
+    if any(check_id not in checks or not isinstance(checks[check_id], bool) for check_id in MANUAL_CHECK_IDS):
+        raise ValueError("manual acceptance record must contain boolean results for every check")
+    return (
+        {check_id: checks[check_id] for check_id in MANUAL_CHECK_IDS},
+        {
+            "operator": operator.strip(),
+            "recorded_at_utc": recorded_at,
+            "installer_sha256": installer["sha256"],
+        },
+    )
 
 
 def sha256(path: Path) -> str | None:
@@ -160,6 +213,7 @@ def evaluate_preflight(
     diagnostics_report: dict[str, Any] | None,
     now: int | None = None,
     manual_checks: dict[str, bool] | None = None,
+    manual_record: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else now
     manual_checks = manual_checks or {}
@@ -314,7 +368,7 @@ def evaluate_preflight(
             manual=True,
         )
 
-    return {
+    report = {
         "schema": 1,
         "version": version,
         "source_commit": head,
@@ -325,6 +379,9 @@ def evaluate_preflight(
         "checks": checks,
         "completed_at_unix_s": now,
     }
+    if manual_record is not None:
+        report["manual_acceptance"] = manual_record
+    return report
 
 
 def parse_args() -> argparse.Namespace:
@@ -337,7 +394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manual-json",
         type=Path,
-        help="Optional JSON object marking manual check ids as true after real acceptance",
+        help="Optional schema-1 acceptance record bound to this version, commit and installer",
     )
     parser.add_argument(
         "--strict",
@@ -353,23 +410,38 @@ def main() -> int:
     installer = ROOT / "dist" / "windows" / (
         f"DeskLinkSetup-{version}-x64.exe" if version else "DeskLinkSetup-unknown-x64.exe"
     )
+    manifest = read_json(ROOT / "dist" / "windows" / "windows-installer-manifest.json")
+    manifest_installer = manifest.get("installer") if manifest else None
+    expected_installer_sha256 = (
+        manifest_installer.get("sha256")
+        if isinstance(manifest_installer, dict)
+        else None
+    )
+    head = git_head(ROOT)
     manual_checks: dict[str, bool] = {}
+    manual_record: dict[str, str] | None = None
     if arguments.manual_json:
-        value = read_json(arguments.manual_json)
-        if value is None:
-            raise SystemExit(f"Manual acceptance JSON is missing or invalid: {arguments.manual_json}")
-        manual_checks = {key: value.get(key) is True for key in MANUAL_CHECK_IDS}
+        try:
+            manual_checks, manual_record = load_manual_acceptance(
+                arguments.manual_json,
+                expected_version=version,
+                expected_commit=head,
+                expected_installer_sha256=expected_installer_sha256,
+            )
+        except ValueError as error:
+            raise SystemExit(f"Manual acceptance record is invalid: {error}") from error
     report = evaluate_preflight(
         version=version,
-        head=git_head(ROOT),
+        head=head,
         dirty=git_dirty(ROOT),
         verification=read_json(ROOT / "dist" / "windows" / "windows-release-verification.json"),
-        manifest=read_json(ROOT / "dist" / "windows" / "windows-installer-manifest.json"),
+        manifest=manifest,
         installer_path=installer,
         tag_exists=git_tag_exists(ROOT, f"v{version}" if version else "vunknown"),
         relay_report=read_json(ROOT / "dist" / "windows" / "managed-relay-verification.json"),
         diagnostics_report=read_json(ROOT / "dist" / "linux" / "managed-diagnostics-audit.json"),
         manual_checks=manual_checks,
+        manual_record=manual_record,
     )
     arguments.report.parent.mkdir(parents=True, exist_ok=True)
     arguments.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
