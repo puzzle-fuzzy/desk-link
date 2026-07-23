@@ -12,7 +12,9 @@ use desklink_protocol::{
     encode_cursor_update, encode_noise_handshake, encode_video_config, encode_video_packet,
 };
 use desklink_relay::{RelayConfig, RelayServer};
-use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
+use desklink_transport::{
+    DirectVideoPathFallbackReason, QuicClient, QuicClientConfig, RelayJoin, VideoPathKind,
+};
 use desklink_video::{EncodedFrame, packetize_frame};
 use quinn::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -70,6 +72,7 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
         host_identity,
         controller_verify_key,
         continue_receiver,
+        false,
     ));
 
     let mut runtime = ControllerRuntime::connect(controller, controller_identity, host_verify_key)
@@ -136,6 +139,107 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     assert_eq!(keyframe, ControlMessage::RequestKeyframe { stream_id: 9 });
     assert_eq!(runtime.metrics().completed_frames, 1);
     assert_eq!(runtime.metrics().dropped_video_packets, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
+    let relay = spawn_test_relay().await;
+    let config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+    let host = QuicClient::connect(config()).await.unwrap();
+    let controller = QuicClient::connect(config()).await.unwrap();
+    let session_id = SessionId::from_bytes([77; 16]);
+    let authentication = [78; 32];
+    host.join(RelayJoin::host_with_participant(
+        session_id,
+        authentication,
+        [1; 16],
+    ))
+    .await
+    .unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            [2; 16],
+        ))
+        .await
+        .unwrap();
+
+    let host_identity = DeviceIdentity::from_secret_key([79; 16], &[80; 32]);
+    let controller_identity = DeviceIdentity::from_secret_key([81; 16], &[82; 32]);
+    let host_verify_key = host_identity.verify_key();
+    let controller_verify_key = controller_identity.verify_key();
+    let (continue_sender, continue_receiver) = oneshot::channel();
+    let host_task = tokio::spawn(run_fake_host(
+        host,
+        host_identity,
+        controller_verify_key,
+        continue_receiver,
+        true,
+    ));
+
+    let mut runtime = ControllerRuntime::connect_for_platform(
+        controller,
+        controller_identity,
+        host_verify_key,
+        Platform::Windows,
+    )
+    .await
+    .unwrap();
+    assert!(
+        runtime.direct_candidate().is_some(),
+        "Windows runtime should advertise a direct candidate"
+    );
+    let event = tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, ControllerEvent::VideoConfig(_)));
+    continue_sender.send(()).unwrap();
+    for _ in 0..8 {
+        if runtime.video_path_fallback_reason().is_some() {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_secs(3), runtime.next_event()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                panic!("controller runtime failed while draining relay events: {error}")
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(runtime.video_path_kind(), VideoPathKind::Relay);
+    assert_eq!(
+        runtime.video_path_fallback_reason(),
+        Some(DirectVideoPathFallbackReason::Rejected)
+    );
+
+    runtime
+        .send_input(InputEvent::MouseWheel {
+            delta_x: -30,
+            delta_y: 60,
+        })
+        .await
+        .unwrap();
+    runtime.request_keyframe().await.unwrap();
+    let (input, control) = tokio::time::timeout(Duration::from_secs(3), host_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        input,
+        InputEvent::MouseWheel {
+            delta_x: -30,
+            delta_y: 60,
+        }
+    );
+    assert_eq!(control, ControlMessage::RequestKeyframe { stream_id: 9 });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -235,6 +339,7 @@ async fn run_fake_host(
     identity: DeviceIdentity,
     expected_controller: ed25519_dalek::VerifyingKey,
     continue_receiver: oneshot::Receiver<()>,
+    reject_direct_offer: bool,
 ) -> (InputEvent, ControlMessage) {
     let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
     assert_eq!(first.step, NoiseHandshakeStep::InitiatorHello);
@@ -297,6 +402,24 @@ async fn run_fake_host(
         }),
     )
     .await;
+
+    if reject_direct_offer {
+        let offer = open_control(&mut secure, host.next_control().await.unwrap());
+        let candidate_id = match offer {
+            ControlMessage::VideoPathCandidateOffer { candidate } => candidate.candidate_id(),
+            message => panic!("expected direct video candidate offer, got {message:?}"),
+        };
+        send_control(
+            &host,
+            &mut secure,
+            ControlMessage::VideoPathCandidateAnswer {
+                candidate_id,
+                accepted: false,
+                candidate: None,
+            },
+        )
+        .await;
+    }
 
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,

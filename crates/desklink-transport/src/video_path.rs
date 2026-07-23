@@ -134,19 +134,13 @@ impl DirectVideoPathMachine {
                 now_unix_s,
             } => {
                 if !self.direct_probe_available {
-                    self.state = DirectVideoPathState::Relay;
-                    return vec![UseRelay {
-                        reason: DirectVideoPathFallbackReason::Rejected,
-                    }];
+                    return self.fallback(DirectVideoPathFallbackReason::Rejected);
                 }
                 if candidate
                     .validate(now_unix_s, &self.session_binding)
                     .is_err()
                 {
-                    self.state = DirectVideoPathState::Relay;
-                    return vec![UseRelay {
-                        reason: DirectVideoPathFallbackReason::InvalidCandidate,
-                    }];
+                    return self.fallback(DirectVideoPathFallbackReason::InvalidCandidate);
                 }
                 let action = SendOffer(candidate.clone());
                 self.state = DirectVideoPathState::Offering { candidate };
@@ -158,17 +152,13 @@ impl DirectVideoPathMachine {
                 now_unix_s,
             } => {
                 if !self.direct_probe_available {
-                    self.state = DirectVideoPathState::Relay;
-                    return vec![
-                        SendAnswer {
-                            candidate_id: candidate.candidate_id(),
-                            accepted: false,
-                            candidate: None,
-                        },
-                        UseRelay {
-                            reason: DirectVideoPathFallbackReason::Rejected,
-                        },
-                    ];
+                    let mut actions = vec![SendAnswer {
+                        candidate_id: candidate.candidate_id(),
+                        accepted: false,
+                        candidate: None,
+                    }];
+                    actions.extend(self.fallback(DirectVideoPathFallbackReason::Rejected));
+                    return actions;
                 }
                 if candidate
                     .validate(now_unix_s, &self.session_binding)
@@ -224,25 +214,16 @@ impl DirectVideoPathMachine {
                     return Vec::new();
                 }
                 if !accepted {
-                    self.state = DirectVideoPathState::Relay;
-                    return vec![UseRelay {
-                        reason: DirectVideoPathFallbackReason::Rejected,
-                    }];
+                    return self.fallback(DirectVideoPathFallbackReason::Rejected);
                 }
                 let Some(remote_candidate) = remote_candidate else {
-                    self.state = DirectVideoPathState::Relay;
-                    return vec![UseRelay {
-                        reason: DirectVideoPathFallbackReason::InvalidCandidate,
-                    }];
+                    return self.fallback(DirectVideoPathFallbackReason::InvalidCandidate);
                 };
                 if remote_candidate
                     .validate(now_unix_s, &self.session_binding)
                     .is_err()
                 {
-                    self.state = DirectVideoPathState::Relay;
-                    return vec![UseRelay {
-                        reason: DirectVideoPathFallbackReason::TimedOut,
-                    }];
+                    return self.fallback(DirectVideoPathFallbackReason::TimedOut);
                 }
                 let remote_candidate = remote_candidate.clone();
                 let deadline_unix_s = remote_candidate
@@ -516,6 +497,10 @@ mod tests {
             vec![DirectVideoPathAction::UseRelay {
                 reason: DirectVideoPathFallbackReason::Rejected,
             }]
+        );
+        assert_eq!(
+            machine.last_fallback_reason(),
+            Some(DirectVideoPathFallbackReason::Rejected)
         );
         assert_eq!(
             machine.apply(DirectVideoPathEvent::ReceiveOffer {
