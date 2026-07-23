@@ -155,7 +155,7 @@ mod windows_installer {
             ));
         }
         refuse_downgrade()?;
-        let upgrading = layout.application.is_file() || layout.legacy_host.is_file();
+        let upgrading = layout.application.is_file();
         if !options.quiet {
             let verb = if upgrading { "升级" } else { "安装" };
             let prompt = format!(
@@ -171,9 +171,6 @@ mod windows_installer {
         stop_running_application(layout);
         fs::create_dir_all(&layout.install_directory)?;
         atomic_write_with_retry(&layout.application, APPLICATION_PAYLOAD)?;
-        // 0.1.1 以前的安装包包含独立 host。现代 DeskLink.exe 已直接托管
-        // Windows runtime，升级时移除旧文件，避免保留第二个可执行入口。
-        remove_file_if_present(&layout.legacy_host)?;
         let installer = env::current_exe()?;
         if !same_file_path(&installer, &layout.uninstaller) {
             atomic_copy(&installer, &layout.uninstaller)?;

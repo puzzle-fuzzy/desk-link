@@ -93,11 +93,11 @@ fn connection(value: u64) -> u64 {
 }
 
 fn host(session_id: SessionId, auth: [u8; 32]) -> RelayJoin {
-    RelayJoin::host(session_id, auth)
+    RelayJoin::host_with_participant(session_id, auth, [1; 16])
 }
 
 fn controller(session_id: SessionId, auth: [u8; 32]) -> RelayJoin {
-    RelayJoin::controller(session_id, auth)
+    RelayJoin::controller_with_participant(session_id, auth, [2; 16])
 }
 
 async fn next_event(client: &QuicClient) -> TransportEvent {
@@ -341,7 +341,9 @@ async fn second_controller_is_rejected() {
 
     assert_eq!(
         second_controller
-            .join(controller(session_id, [4; 32]))
+            .join(RelayJoin::controller_with_participant(
+                session_id, [4; 32], [3; 16],
+            ))
             .await,
         Err(TransportError::JoinRejected(
             desklink_transport::JoinRejectCode::SessionOccupied

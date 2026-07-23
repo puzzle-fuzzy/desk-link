@@ -13,11 +13,11 @@ use desklink_crypto::SessionId;
 use desklink_protocol::DeviceRole;
 use desklink_transport::{
     ChannelKind, DEAD_TIMEOUT, DIRECTORY_ACCESS_CODE_BYTES, DIRECTORY_LOOKUP_ENVELOPE_BYTES,
-    DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES, DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED,
-    DIRECTORY_LOOKUP_NOT_FOUND, DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, DIRECTORY_LOOKUP_RATE_LIMITED,
-    JoinRejectCode, KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES,
-    MAX_RELIABLE_MESSAGE_BYTES, RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup,
-    RelayDirectoryRegistration, RelayJoin, decode_directory_lookup, decode_relay_join,
+    DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED, DIRECTORY_LOOKUP_NOT_FOUND,
+    DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode,
+    KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES, MAX_RELIABLE_MESSAGE_BYTES,
+    RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
+    decode_directory_lookup, decode_relay_join,
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -464,7 +464,7 @@ struct DirectoryRecord {
     connection_id: u64,
     access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
     invitation: Vec<u8>,
-    protocol_version: Option<u16>,
+    protocol_version: u16,
     expires_at: Option<Instant>,
 }
 
@@ -535,23 +535,17 @@ impl RelayState {
     ) -> Result<Option<quinn::Connection>, RelayError> {
         let _membership = self.lock_membership();
         if let Some(registration) = join.directory_registration() {
-            self.validate_directory_slot(registration.device_id(), join.participant_id().copied())?;
+            self.validate_directory_slot(registration.device_id(), Some(*join.participant_id()))?;
         }
         let replaced = self.sessions.attach_with_auth_and_participant(
             join.session_id(),
             join.role(),
             *join.authentication(),
-            join.participant_id().copied(),
+            Some(*join.participant_id()),
             connection_id,
         )?;
         if let Some(registration) = join.directory_registration() {
-            self.publish_directory(
-                registration,
-                join.participant_id()
-                    .copied()
-                    .ok_or(RelayError::MalformedJoin)?,
-                connection_id,
-            );
+            self.publish_directory(registration, *join.participant_id(), connection_id);
         }
         let mut participants = self.lock_participants();
         let replaced = replaced.and_then(|connection_id| {
@@ -646,7 +640,10 @@ impl RelayState {
                     if lookup.protocol_version() == record.protocol_version {
                         Ok(record.invitation.clone())
                     } else {
-                        Err((DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, record.protocol_version))
+                        Err((
+                            DIRECTORY_LOOKUP_PROTOCOL_MISMATCH,
+                            Some(record.protocol_version),
+                        ))
                     }
                 })
             })
@@ -1386,10 +1383,8 @@ async fn read_request(receive: &mut quinn::RecvStream) -> Result<RelayRequest, J
         .read_exact(&mut bytes)
         .await
         .map_err(|_| JoinRejectCode::Malformed)?;
-    if matches!(
-        length,
-        DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES | DIRECTORY_LOOKUP_ENVELOPE_BYTES
-    ) && let Ok(lookup) = decode_directory_lookup(&bytes)
+    if matches!(length, DIRECTORY_LOOKUP_ENVELOPE_BYTES)
+        && let Ok(lookup) = decode_directory_lookup(&bytes)
     {
         return Ok(RelayRequest::DirectoryLookup(lookup));
     }

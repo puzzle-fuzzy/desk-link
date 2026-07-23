@@ -102,11 +102,19 @@ mod windows {
         let invite = PairingInvite::new(&host_identity, now, 60).unwrap();
         let session_id = invite.session_id();
         let authentication = *invite.relay_authentication();
-        host.join(RelayJoin::host(session_id, authentication))
-            .await
-            .unwrap();
+        host.join(RelayJoin::host_with_participant(
+            session_id,
+            authentication,
+            [1; 16],
+        ))
+        .await
+        .unwrap();
         controller
-            .join(RelayJoin::controller(session_id, authentication))
+            .join(RelayJoin::controller_with_participant(
+                session_id,
+                authentication,
+                [2; 16],
+            ))
             .await
             .unwrap();
 
@@ -186,13 +194,18 @@ mod windows {
         let reconnect_session = session_id;
         let reconnect_authentication = authentication;
         reconnect_host
-            .join(RelayJoin::host(reconnect_session, reconnect_authentication))
+            .join(RelayJoin::host_with_participant(
+                reconnect_session,
+                reconnect_authentication,
+                [1; 16],
+            ))
             .await
             .unwrap();
         reconnect_controller
-            .join(RelayJoin::controller(
+            .join(RelayJoin::controller_with_participant(
                 reconnect_session,
                 reconnect_authentication,
+                [2; 16],
             ))
             .await
             .unwrap();
@@ -259,11 +272,19 @@ mod windows {
         let invite = PairingInvite::new(&host_identity, now, 600).unwrap();
         let session_id = invite.session_id();
         let authentication = *invite.relay_authentication();
-        host.join(RelayJoin::host(session_id, authentication))
-            .await
-            .unwrap();
+        host.join(RelayJoin::host_with_participant(
+            session_id,
+            authentication,
+            [1; 16],
+        ))
+        .await
+        .unwrap();
         controller
-            .join(RelayJoin::controller(session_id, authentication))
+            .join(RelayJoin::controller_with_participant(
+                session_id,
+                authentication,
+                [2; 16],
+            ))
             .await
             .unwrap();
 

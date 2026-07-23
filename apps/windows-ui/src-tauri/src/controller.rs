@@ -894,7 +894,7 @@ impl ControllerManager {
                     Err(_) => {
                         let _ = store.clear();
                         manager.set_file_recovery_error(Some(
-                            "旧版或损坏的文件恢复记录已安全清理；新传输仍可正常使用。",
+                            "文件恢复记录无效，已安全清理；新传输仍可正常使用。",
                         ));
                     }
                 }
@@ -920,7 +920,7 @@ impl ControllerManager {
                     Err(_) => {
                         let _ = store.clear();
                         manager.set_file_queue_recovery_error(Some(
-                            "旧版或损坏的等待队列记录已安全清理；新文件仍可正常发送。",
+                            "等待发送队列记录无效，已安全清理；新文件仍可正常发送。",
                         ));
                     }
                 }

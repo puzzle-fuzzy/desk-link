@@ -736,8 +736,11 @@ async fn relay_matches_host_and_controller_and_forwards_opaque_bytes() {
     let host = connect(&relay).await;
     let controller = connect(&relay).await;
     let session = SessionId::from_bytes([8; 16]);
-    host.join(RelayJoin::host(session, [4; 32])).await.unwrap();
-    controller.join(RelayJoin::controller(session, [4; 32])).await.unwrap();
+    host.join(RelayJoin::host_with_participant(session, [4; 32], [1; 16])).await.unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(session, [4; 32], [2; 16]))
+        .await
+        .unwrap();
     host.send_video_datagram(vec![0, 1, 2, 255]).await.unwrap();
     assert_eq!(
         controller.next_event().await.unwrap(),

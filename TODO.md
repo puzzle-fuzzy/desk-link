@@ -7,6 +7,7 @@
 ## 0. 发布基线与工作区（P1）
 
 - [ ] 整理当前工作区变更，确认所有 DirectLan、视频质量、UI 和诊断代码都属于本次发布范围。
+- [x] 删除未发布版本仍保留的旧 host 安装入口、旧设备记录解码器和旧 relay join/directory 信封路径；当前构建只维护单一安装入口与当前协议线。
 - [ ] 更新版本号、变更日志和发布说明，形成唯一的发布提交。
 - [ ] 在干净 checkout 上通过 Rust、Bun、安装包和发布校验。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
@@ -49,6 +50,7 @@
 ## 5. 产品文档与 UI 收口（P2）
 
 - [x] 清理 README 和历史版本说明，移除“直连尚未启用”等过时描述。
+- [x] 清理安装器、设备记录和 relay wire 的旧兼容分支；旧格式按损坏/不支持处理，不再制造双版本用户路径。
 - [x] 明确产品能力边界：当前最高 2560×1440；4K 和公网 NAT 穿透暂不承诺。
 - [ ] 统一 `DESIGN.md` 与 Windows UI 样式 token，删除多轮迭代产生的冲突规则。
 - [ ] 手动验收键盘导航、焦点可见性、高对比度、WebView2 缩放和中文文案溢出。
@@ -101,4 +103,4 @@ python scripts/audit-managed-diagnostics.py
 - 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
 - 当前安装包 `dist/windows/DeskLinkSetup-0.1.91-x64.exe` 未签名。
 - 候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，但尚未形成干净的唯一发布提交。
-- 当前 `main` 已推送直连诊断、回落改动和 DirectLan 回环夹具；尚无本地 `v*` 发布 tag。
+- 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具和当前协议线收口；尚无本地 `v*` 发布 tag。

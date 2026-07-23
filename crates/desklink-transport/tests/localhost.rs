@@ -55,7 +55,7 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
         };
         let mut length = [0; 4];
         if join_recv.read_exact(&mut length).await.is_err()
-            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_V2_BYTES
         {
             let _ = join_send
                 .write_all(&[JoinRejectCode::Malformed as u8])
@@ -63,7 +63,7 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
             let _ = join_send.finish();
             return;
         }
-        let mut join = vec![0; JOIN_ENVELOPE_BYTES];
+        let mut join = vec![0; JOIN_ENVELOPE_V2_BYTES];
         if join_recv.read_exact(&mut join).await.is_err() {
             return;
         }
@@ -180,11 +180,11 @@ async fn spawn_stalled_reliable_relay(held_channel: u8) -> MockRelay {
         };
         let mut length = [0; 4];
         if join_recv.read_exact(&mut length).await.is_err()
-            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_V2_BYTES
         {
             return;
         }
-        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_V2_BYTES];
         if join_recv.read_exact(&mut join_bytes).await.is_err()
             || decode_relay_join(&join_bytes).is_err()
         {
@@ -283,11 +283,11 @@ async fn spawn_peer_relay_with_reliable_prefix(prefix: Vec<u8>) -> MockRelay {
         };
         let mut length = [0; 4];
         if join_recv.read_exact(&mut length).await.is_err()
-            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_V2_BYTES
         {
             return;
         }
-        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_V2_BYTES];
         if join_recv.read_exact(&mut join_bytes).await.is_err()
             || decode_relay_join(&join_bytes).is_err()
         {
@@ -342,11 +342,11 @@ async fn spawn_video_flood_relay() -> MockRelay {
         };
         let mut length = [0; 4];
         if join_recv.read_exact(&mut length).await.is_err()
-            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_V2_BYTES
         {
             return;
         }
-        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_V2_BYTES];
         if join_recv.read_exact(&mut join_bytes).await.is_err()
             || decode_relay_join(&join_bytes).is_err()
         {
@@ -429,11 +429,11 @@ async fn spawn_input_flood_with_control_relay() -> MockRelay {
         };
         let mut length = [0; 4];
         if join_recv.read_exact(&mut length).await.is_err()
-            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_BYTES
+            || u32::from_be_bytes(length) as usize != JOIN_ENVELOPE_V2_BYTES
         {
             return;
         }
-        let mut join_bytes = vec![0; JOIN_ENVELOPE_BYTES];
+        let mut join_bytes = vec![0; JOIN_ENVELOPE_V2_BYTES];
         if join_recv.read_exact(&mut join_bytes).await.is_err()
             || decode_relay_join(&join_bytes).is_err()
         {
@@ -485,21 +485,20 @@ fn config(relay: &MockRelay) -> QuicClientConfig {
 }
 
 fn join(role: DeviceRole) -> RelayJoin {
-    RelayJoin::new(SessionId::from_bytes([8; 16]), role, [4; 32])
+    RelayJoin::new_with_participant(SessionId::from_bytes([8; 16]), role, [4; 32], [8; 16])
 }
 
 #[test]
-fn relay_join_v2_round_trips_participant_identity_and_keeps_v1_compatible() {
+fn relay_join_requires_the_current_participant_wire() {
     let session_id = SessionId::from_bytes([8; 16]);
-    let legacy = RelayJoin::host(session_id, [4; 32]);
-    let legacy_bytes = legacy.encode();
-    assert_eq!(legacy_bytes.len(), JOIN_ENVELOPE_BYTES);
-    assert_eq!(decode_relay_join(&legacy_bytes).unwrap(), legacy);
+    let current = RelayJoin::controller_with_participant(session_id, [4; 32], [9; 16]);
+    let current_bytes = current.encode();
+    assert_eq!(current_bytes.len(), JOIN_ENVELOPE_V2_BYTES);
+    assert_eq!(decode_relay_join(&current_bytes).unwrap(), current);
 
-    let resumable = RelayJoin::controller_with_participant(session_id, [4; 32], [9; 16]);
-    let resumable_bytes = resumable.encode();
-    assert_eq!(resumable_bytes.len(), JOIN_ENVELOPE_V2_BYTES);
-    assert_eq!(decode_relay_join(&resumable_bytes).unwrap(), resumable);
+    let mut legacy_bytes = current_bytes[..JOIN_ENVELOPE_BYTES].to_vec();
+    legacy_bytes[4] = 1;
+    assert!(decode_relay_join(&legacy_bytes).is_err());
 }
 
 #[tokio::test]
@@ -566,10 +565,10 @@ async fn stalled_control_channel_does_not_block_input_channel() {
     let relay = spawn_stalled_reliable_relay(1).await;
     let client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
     client
-        .join(RelayJoin::new(
+        .join(RelayJoin::controller_with_participant(
             SessionId::from_bytes([7; 16]),
-            DeviceRole::Controller,
             [3; 32],
+            [7; 16],
         ))
         .await
         .unwrap();
@@ -603,10 +602,10 @@ async fn stalled_file_transfer_does_not_block_input_channel() {
     let relay = spawn_stalled_reliable_relay(6).await;
     let client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
     client
-        .join(RelayJoin::new(
+        .join(RelayJoin::controller_with_participant(
             SessionId::from_bytes([7; 16]),
-            DeviceRole::Controller,
             [3; 32],
+            [7; 16],
         ))
         .await
         .unwrap();

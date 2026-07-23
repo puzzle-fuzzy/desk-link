@@ -35,8 +35,7 @@ pub const JOIN_ENVELOPE_V2_BYTES: usize = JOIN_ENVELOPE_BYTES + 16;
 pub const DIRECTORY_ACCESS_CODE_BYTES: usize = 8;
 pub const MAX_DIRECTORY_INVITATION_BYTES: usize = 1_024;
 pub const MAX_DIRECTORY_TTL_S: u16 = 600;
-pub const DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES: usize = 4 + 1 + 8 + DIRECTORY_ACCESS_CODE_BYTES;
-pub const DIRECTORY_LOOKUP_ENVELOPE_BYTES: usize = DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES + 2;
+pub const DIRECTORY_LOOKUP_ENVELOPE_BYTES: usize = 4 + 1 + 8 + DIRECTORY_ACCESS_CODE_BYTES + 2;
 pub const MAX_JOIN_ENVELOPE_BYTES: usize = JOIN_ENVELOPE_V2_BYTES
     + 1
     + 8
@@ -138,12 +137,9 @@ impl VideoPathDecision {
 }
 
 const JOIN_MAGIC: [u8; 4] = *b"DLJ1";
-const JOIN_VERSION_V1: u8 = 1;
 const JOIN_VERSION_V2: u8 = 2;
-const JOIN_VERSION_V3: u8 = 3;
 const JOIN_VERSION_V4: u8 = 4;
 const DIRECTORY_LOOKUP_MAGIC: [u8; 4] = *b"DLL1";
-const DIRECTORY_LOOKUP_VERSION_V1: u8 = 1;
 const DIRECTORY_LOOKUP_VERSION_V2: u8 = 2;
 
 pub const DIRECTORY_LOOKUP_FOUND: u8 = 0;
@@ -236,7 +232,7 @@ pub struct RelayJoin {
     session_id: SessionId,
     role: DeviceRole,
     authentication: [u8; 32],
-    participant_id: Option<[u8; 16]>,
+    participant_id: [u8; 16],
     directory: Option<RelayDirectoryRegistration>,
 }
 
@@ -246,7 +242,7 @@ pub struct RelayDirectoryRegistration {
     access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
     invitation: Vec<u8>,
     ttl_s: u16,
-    protocol_version: Option<u16>,
+    protocol_version: u16,
 }
 
 impl RelayDirectoryRegistration {
@@ -266,13 +262,7 @@ impl RelayDirectoryRegistration {
         ttl_s: u16,
         protocol_version: u16,
     ) -> Result<Self, TransportError> {
-        Self::from_wire(
-            device_id,
-            access_code,
-            invitation,
-            ttl_s,
-            Some(protocol_version),
-        )
+        Self::from_wire(device_id, access_code, invitation, ttl_s, protocol_version)
     }
 
     fn from_wire(
@@ -280,7 +270,7 @@ impl RelayDirectoryRegistration {
         access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
         invitation: Vec<u8>,
         ttl_s: u16,
-        protocol_version: Option<u16>,
+        protocol_version: u16,
     ) -> Result<Self, TransportError> {
         if device_id == 0 {
             return Err(TransportError::InvalidConfig(
@@ -304,7 +294,7 @@ impl RelayDirectoryRegistration {
                 "device directory TTL is invalid".to_owned(),
             ));
         }
-        if protocol_version == Some(0) {
+        if protocol_version == 0 {
             return Err(TransportError::InvalidConfig(
                 "device protocol version must be nonzero".to_owned(),
             ));
@@ -334,7 +324,7 @@ impl RelayDirectoryRegistration {
         self.ttl_s
     }
 
-    pub const fn protocol_version(&self) -> Option<u16> {
+    pub const fn protocol_version(&self) -> u16 {
         self.protocol_version
     }
 }
@@ -363,7 +353,7 @@ impl Drop for RelayDirectoryRegistration {
 pub struct RelayDirectoryLookup {
     device_id: u64,
     access_code: [u8; DIRECTORY_ACCESS_CODE_BYTES],
-    protocol_version: Option<u16>,
+    protocol_version: u16,
 }
 
 impl RelayDirectoryLookup {
@@ -392,7 +382,7 @@ impl RelayDirectoryLookup {
         Ok(Self {
             device_id,
             access_code,
-            protocol_version: Some(protocol_version),
+            protocol_version,
         })
     }
 
@@ -404,30 +394,17 @@ impl RelayDirectoryLookup {
         &self.access_code
     }
 
-    pub const fn protocol_version(&self) -> Option<u16> {
+    pub const fn protocol_version(&self) -> u16 {
         self.protocol_version
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = vec![
-            0;
-            if self.protocol_version.is_some() {
-                DIRECTORY_LOOKUP_ENVELOPE_BYTES
-            } else {
-                DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES
-            }
-        ];
+        let mut bytes = vec![0; DIRECTORY_LOOKUP_ENVELOPE_BYTES];
         bytes[..4].copy_from_slice(&DIRECTORY_LOOKUP_MAGIC);
-        bytes[4] = if self.protocol_version.is_some() {
-            DIRECTORY_LOOKUP_VERSION_V2
-        } else {
-            DIRECTORY_LOOKUP_VERSION_V1
-        };
+        bytes[4] = DIRECTORY_LOOKUP_VERSION_V2;
         bytes[5..13].copy_from_slice(&self.device_id.to_be_bytes());
         bytes[13..21].copy_from_slice(&self.access_code);
-        if let Some(protocol_version) = self.protocol_version {
-            bytes[21..23].copy_from_slice(&protocol_version.to_be_bytes());
-        }
+        bytes[21..23].copy_from_slice(&self.protocol_version.to_be_bytes());
         bytes
     }
 }
@@ -450,16 +427,6 @@ impl Drop for RelayDirectoryLookup {
 }
 
 impl RelayJoin {
-    pub fn new(session_id: SessionId, role: DeviceRole, authentication: [u8; 32]) -> Self {
-        Self {
-            session_id,
-            role,
-            authentication,
-            participant_id: None,
-            directory: None,
-        }
-    }
-
     pub fn new_with_participant(
         session_id: SessionId,
         role: DeviceRole,
@@ -470,13 +437,9 @@ impl RelayJoin {
             session_id,
             role,
             authentication,
-            participant_id: Some(participant_id),
+            participant_id,
             directory: None,
         }
-    }
-
-    pub fn host(session_id: SessionId, authentication: [u8; 32]) -> Self {
-        Self::new(session_id, DeviceRole::Host, authentication)
     }
 
     pub fn host_with_participant(
@@ -485,10 +448,6 @@ impl RelayJoin {
         participant_id: [u8; 16],
     ) -> Self {
         Self::new_with_participant(session_id, DeviceRole::Host, authentication, participant_id)
-    }
-
-    pub fn controller(session_id: SessionId, authentication: [u8; 32]) -> Self {
-        Self::new(session_id, DeviceRole::Controller, authentication)
     }
 
     pub fn controller_with_participant(
@@ -516,8 +475,8 @@ impl RelayJoin {
         &self.authentication
     }
 
-    pub fn participant_id(&self) -> Option<&[u8; 16]> {
-        self.participant_id.as_ref()
+    pub const fn participant_id(&self) -> &[u8; 16] {
+        &self.participant_id
     }
 
     pub fn directory_registration(&self) -> Option<&RelayDirectoryRegistration> {
@@ -528,7 +487,7 @@ impl RelayJoin {
         mut self,
         registration: RelayDirectoryRegistration,
     ) -> Result<Self, TransportError> {
-        if self.role != DeviceRole::Host || self.participant_id.is_none() {
+        if self.role != DeviceRole::Host {
             return Err(TransportError::InvalidConfig(
                 "only an identified host can publish a directory entry".to_owned(),
             ));
@@ -543,29 +502,19 @@ impl RelayJoin {
                 + 1
                 + 8
                 + DIRECTORY_ACCESS_CODE_BYTES
-                + usize::from(directory.protocol_version.is_some()) * 2
+                + 2
                 + 2
                 + 2
                 + directory.invitation.len()
-        } else if self.participant_id.is_some() {
-            JOIN_ENVELOPE_V2_BYTES
         } else {
-            JOIN_ENVELOPE_BYTES
+            JOIN_ENVELOPE_V2_BYTES
         };
         let mut bytes = vec![0; length];
         bytes[..JOIN_MAGIC.len()].copy_from_slice(&JOIN_MAGIC);
-        bytes[4] = if self
-            .directory
-            .as_ref()
-            .is_some_and(|directory| directory.protocol_version.is_some())
-        {
+        bytes[4] = if self.directory.is_some() {
             JOIN_VERSION_V4
-        } else if self.directory.is_some() {
-            JOIN_VERSION_V3
-        } else if self.participant_id.is_some() {
-            JOIN_VERSION_V2
         } else {
-            JOIN_VERSION_V1
+            JOIN_VERSION_V2
         };
         bytes[5] = match self.role {
             DeviceRole::Host => 1,
@@ -573,18 +522,14 @@ impl RelayJoin {
         };
         bytes[6..22].copy_from_slice(self.session_id.as_bytes());
         bytes[22..54].copy_from_slice(&self.authentication);
-        if let Some(participant_id) = self.participant_id {
-            bytes[54..70].copy_from_slice(&participant_id);
-        }
+        bytes[54..70].copy_from_slice(&self.participant_id);
         if let Some(directory) = &self.directory {
             bytes[70] = 1;
             bytes[71..79].copy_from_slice(&directory.device_id.to_be_bytes());
             bytes[79..87].copy_from_slice(&directory.access_code);
             let mut offset = 87;
-            if let Some(protocol_version) = directory.protocol_version {
-                bytes[offset..offset + 2].copy_from_slice(&protocol_version.to_be_bytes());
-                offset += 2;
-            }
+            bytes[offset..offset + 2].copy_from_slice(&directory.protocol_version.to_be_bytes());
+            offset += 2;
             bytes[offset..offset + 2].copy_from_slice(&directory.ttl_s.to_be_bytes());
             offset += 2;
             bytes[offset..offset + 2]
@@ -634,9 +579,6 @@ pub fn decode_directory_lookup(
         || !matches!(
             (bytes.get(4), bytes.len()),
             (
-                Some(&DIRECTORY_LOOKUP_VERSION_V1),
-                DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES
-            ) | (
                 Some(&DIRECTORY_LOOKUP_VERSION_V2),
                 DIRECTORY_LOOKUP_ENVELOPE_BYTES
             )
@@ -655,14 +597,12 @@ pub fn decode_directory_lookup(
     if device_id == 0 || !valid_directory_access_code(&access_code) {
         return Err(DirectoryLookupDecodeError::Malformed);
     }
-    let protocol_version = (bytes[4] == DIRECTORY_LOOKUP_VERSION_V2).then(|| {
-        u16::from_be_bytes(
-            bytes[21..23]
-                .try_into()
-                .expect("versioned directory lookup has a fixed protocol field"),
-        )
-    });
-    if protocol_version == Some(0) {
+    let protocol_version = u16::from_be_bytes(
+        bytes[21..23]
+            .try_into()
+            .expect("versioned directory lookup has a fixed protocol field"),
+    );
+    if protocol_version == 0 {
         return Err(DirectoryLookupDecodeError::Malformed);
     }
     Ok(RelayDirectoryLookup {
@@ -682,10 +622,9 @@ pub fn decode_relay_join(bytes: &[u8]) -> Result<RelayJoin, JoinDecodeError> {
     let version = bytes[4];
     if !matches!(
         (version, bytes.len()),
-        (JOIN_VERSION_V1, JOIN_ENVELOPE_BYTES)
-            | (JOIN_VERSION_V2, JOIN_ENVELOPE_V2_BYTES)
+        (JOIN_VERSION_V2, JOIN_ENVELOPE_V2_BYTES)
             | (
-                JOIN_VERSION_V3 | JOIN_VERSION_V4,
+                JOIN_VERSION_V4,
                 JOIN_ENVELOPE_V2_BYTES..=MAX_JOIN_ENVELOPE_BYTES
             )
     ) {
@@ -701,63 +640,55 @@ pub fn decode_relay_join(bytes: &[u8]) -> Result<RelayJoin, JoinDecodeError> {
     let mut authentication = [0; 32];
     authentication.copy_from_slice(&bytes[22..54]);
     let session_id = SessionId::from_bytes(session_bytes);
-    if matches!(version, JOIN_VERSION_V2 | JOIN_VERSION_V3 | JOIN_VERSION_V4) {
-        let mut participant_id = [0; 16];
-        participant_id.copy_from_slice(&bytes[54..70]);
-        let mut join =
-            RelayJoin::new_with_participant(session_id, role, authentication, participant_id);
-        if matches!(version, JOIN_VERSION_V3 | JOIN_VERSION_V4) {
-            let minimum_length = if version == JOIN_VERSION_V4 { 93 } else { 91 };
-            if role != DeviceRole::Host || bytes.len() < minimum_length || bytes[70] != 1 {
-                return Err(JoinDecodeError::InvalidLength);
-            }
-            let device_id = u64::from_be_bytes(
-                bytes[71..79]
-                    .try_into()
-                    .map_err(|_| JoinDecodeError::InvalidLength)?,
-            );
-            let access_code = bytes[79..87]
-                .try_into()
-                .map_err(|_| JoinDecodeError::InvalidLength)?;
-            let mut offset = 87;
-            let protocol_version = (version == JOIN_VERSION_V4).then(|| {
-                let value = u16::from_be_bytes(
-                    bytes[offset..offset + 2]
-                        .try_into()
-                        .expect("versioned directory join has a fixed protocol field"),
-                );
-                offset += 2;
-                value
-            });
-            let ttl_s = u16::from_be_bytes(
-                bytes[offset..offset + 2]
-                    .try_into()
-                    .map_err(|_| JoinDecodeError::InvalidLength)?,
-            );
-            offset += 2;
-            let invitation_length = u16::from_be_bytes(
-                bytes[offset..offset + 2]
-                    .try_into()
-                    .map_err(|_| JoinDecodeError::InvalidLength)?,
-            ) as usize;
-            offset += 2;
-            if bytes.len() != offset + invitation_length {
-                return Err(JoinDecodeError::InvalidLength);
-            }
-            let registration = RelayDirectoryRegistration::from_wire(
-                device_id,
-                access_code,
-                bytes[offset..].to_vec(),
-                ttl_s,
-                protocol_version,
-            )
-            .map_err(|_| JoinDecodeError::InvalidLength)?;
-            join.directory = Some(registration);
+    let mut participant_id = [0; 16];
+    participant_id.copy_from_slice(&bytes[54..70]);
+    let mut join =
+        RelayJoin::new_with_participant(session_id, role, authentication, participant_id);
+    if version == JOIN_VERSION_V4 {
+        if role != DeviceRole::Host || bytes.len() < 93 || bytes[70] != 1 {
+            return Err(JoinDecodeError::InvalidLength);
         }
-        Ok(join)
-    } else {
-        Ok(RelayJoin::new(session_id, role, authentication))
+        let device_id = u64::from_be_bytes(
+            bytes[71..79]
+                .try_into()
+                .map_err(|_| JoinDecodeError::InvalidLength)?,
+        );
+        let access_code = bytes[79..87]
+            .try_into()
+            .map_err(|_| JoinDecodeError::InvalidLength)?;
+        let mut offset = 87;
+        let protocol_version = u16::from_be_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .expect("versioned directory join has a fixed protocol field"),
+        );
+        offset += 2;
+        let ttl_s = u16::from_be_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .map_err(|_| JoinDecodeError::InvalidLength)?,
+        );
+        offset += 2;
+        let invitation_length = u16::from_be_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .map_err(|_| JoinDecodeError::InvalidLength)?,
+        ) as usize;
+        offset += 2;
+        if bytes.len() != offset + invitation_length {
+            return Err(JoinDecodeError::InvalidLength);
+        }
+        let registration = RelayDirectoryRegistration::from_wire(
+            device_id,
+            access_code,
+            bytes[offset..].to_vec(),
+            ttl_s,
+            protocol_version,
+        )
+        .map_err(|_| JoinDecodeError::InvalidLength)?;
+        join.directory = Some(registration);
     }
+    Ok(join)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -823,24 +754,21 @@ fn valid_directory_access_code(code: &[u8; DIRECTORY_ACCESS_CODE_BYTES]) -> bool
 #[cfg(test)]
 mod directory_version_tests {
     use super::{
-        DIRECTORY_LOOKUP_ENVELOPE_BYTES, DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES, JOIN_VERSION_V3,
-        PROTOCOL_VERSION, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
-        decode_directory_lookup, decode_relay_join,
+        DIRECTORY_LOOKUP_ENVELOPE_BYTES, PROTOCOL_VERSION, RelayDirectoryLookup,
+        RelayDirectoryRegistration, RelayJoin, decode_directory_lookup, decode_relay_join,
     };
     use desklink_crypto::SessionId;
 
     #[test]
-    fn versioned_directory_lookup_round_trips_and_legacy_lookup_remains_decodable() {
+    fn directory_lookup_requires_the_current_versioned_wire() {
         let lookup = RelayDirectoryLookup::new(123_456_789_012, *b"AB2DEF3G").unwrap();
         let encoded = lookup.encode();
         assert_eq!(encoded.len(), DIRECTORY_LOOKUP_ENVELOPE_BYTES);
         assert_eq!(decode_directory_lookup(&encoded).unwrap(), lookup);
 
-        let mut legacy = encoded[..DIRECTORY_LOOKUP_ENVELOPE_V1_BYTES].to_vec();
+        let mut legacy = encoded[..21].to_vec();
         legacy[4] = 1;
-        let decoded = decode_directory_lookup(&legacy).unwrap();
-        assert_eq!(decoded.protocol_version(), None);
-        assert_eq!(decoded.device_id(), 123_456_789_012);
+        assert!(decode_directory_lookup(&legacy).is_err());
 
         let mut zero_version = encoded;
         zero_version[21..23].copy_from_slice(&0_u16.to_be_bytes());
@@ -848,7 +776,7 @@ mod directory_version_tests {
     }
 
     #[test]
-    fn versioned_directory_registration_round_trips_and_keeps_v3_readable() {
+    fn directory_registration_requires_the_current_versioned_wire() {
         let registration = RelayDirectoryRegistration::new(
             123_456_789_012,
             *b"AB2DEF3G",
@@ -864,17 +792,13 @@ mod directory_version_tests {
         assert_eq!(decode_relay_join(&encoded).unwrap(), join);
         assert_eq!(
             join.directory_registration().unwrap().protocol_version(),
-            Some(PROTOCOL_VERSION)
+            PROTOCOL_VERSION
         );
 
-        let mut legacy = encoded;
-        legacy[4] = JOIN_VERSION_V3;
+        let mut legacy = encoded.clone();
+        legacy[4] = 3;
         legacy.drain(87..89);
-        let decoded = decode_relay_join(&legacy).unwrap();
-        assert_eq!(
-            decoded.directory_registration().unwrap().protocol_version(),
-            None
-        );
+        assert!(decode_relay_join(&legacy).is_err());
     }
 }
 

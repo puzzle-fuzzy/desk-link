@@ -102,11 +102,19 @@ impl Harness {
         let controller = QuicClient::connect(config()).await.unwrap();
         let session_id = SessionId::from_bytes([7; 16]);
         let authentication = [11; 32];
-        host.join(RelayJoin::host(session_id, authentication))
-            .await
-            .unwrap();
+        host.join(RelayJoin::host_with_participant(
+            session_id,
+            authentication,
+            [1; 16],
+        ))
+        .await
+        .unwrap();
         controller
-            .join(RelayJoin::controller(session_id, authentication))
+            .join(RelayJoin::controller_with_participant(
+                session_id,
+                authentication,
+                [2; 16],
+            ))
             .await
             .unwrap();
 

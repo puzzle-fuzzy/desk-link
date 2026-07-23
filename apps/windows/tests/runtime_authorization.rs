@@ -133,11 +133,19 @@ mod windows {
         let relay = spawn_test_relay().await;
         let host = QuicClient::connect(config(&relay)).await.unwrap();
         let controller = QuicClient::connect(config(&relay)).await.unwrap();
-        host.join(RelayJoin::host(session_id, authentication))
-            .await
-            .unwrap();
+        host.join(RelayJoin::host_with_participant(
+            session_id,
+            authentication,
+            [1; 16],
+        ))
+        .await
+        .unwrap();
         controller
-            .join(RelayJoin::controller(session_id, authentication))
+            .join(RelayJoin::controller_with_participant(
+                session_id,
+                authentication,
+                [2; 16],
+            ))
             .await
             .unwrap();
         let expected_host = host_identity.verify_key();
@@ -299,14 +307,22 @@ mod windows {
         let first = QuicClient::connect(config(&relay)).await.unwrap();
         let second = QuicClient::connect(config(&relay)).await.unwrap();
         let session = SessionId::from_bytes([30; 16]);
-        host.join(RelayJoin::host(session, [31; 32])).await.unwrap();
+        host.join(RelayJoin::host_with_participant(session, [31; 32], [1; 16]))
+            .await
+            .unwrap();
         first
-            .join(RelayJoin::controller(session, [31; 32]))
+            .join(RelayJoin::controller_with_participant(
+                session, [31; 32], [2; 16],
+            ))
             .await
             .unwrap();
 
         assert_eq!(
-            second.join(RelayJoin::controller(session, [31; 32])).await,
+            second
+                .join(RelayJoin::controller_with_participant(
+                    session, [31; 32], [3; 16],
+                ))
+                .await,
             Err(TransportError::JoinRejected(
                 JoinRejectCode::SessionOccupied
             ))

@@ -110,7 +110,11 @@ impl HostTestFixture {
                 self.relay.client_config.clone(),
             )
         };
-        let join = RelayJoin::controller(self.session_id, self.relay_authentication);
+        let join = RelayJoin::controller_with_participant(
+            self.session_id,
+            self.relay_authentication,
+            [2; 16],
+        );
         let controller_client = QuicClient::connect(config()).await.unwrap();
         let mut joined = false;
         for _ in 0..20 {

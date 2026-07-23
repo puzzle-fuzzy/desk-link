@@ -170,7 +170,11 @@ mod windows {
                 .await
                 .unwrap();
             match client
-                .join(RelayJoin::controller(session_id, authentication))
+                .join(RelayJoin::controller_with_participant(
+                    session_id,
+                    authentication,
+                    [2; 16],
+                ))
                 .await
             {
                 Ok(()) => {
@@ -621,7 +625,11 @@ mod windows {
                 .await
                 .unwrap();
             match client
-                .join(RelayJoin::controller(session_id, authentication))
+                .join(RelayJoin::controller_with_participant(
+                    session_id,
+                    authentication,
+                    [2; 16],
+                ))
                 .await
             {
                 Ok(()) => break client,
@@ -682,7 +690,9 @@ mod windows {
             .await
             .unwrap();
         existing
-            .join(RelayJoin::host(session_id, [122; 32]))
+            .join(RelayJoin::host_with_participant(
+                session_id, [122; 32], [1; 16],
+            ))
             .await
             .unwrap();
         let host = DeviceIdentity::from_secret_key([123; 16], &[124; 32]);
@@ -725,7 +735,11 @@ mod windows {
             .await
             .unwrap();
         existing
-            .join(RelayJoin::host(session_id, authentication))
+            .join(RelayJoin::host_with_participant(
+                session_id,
+                authentication,
+                [1; 16],
+            ))
             .await
             .unwrap();
         let host = DeviceIdentity::from_secret_key([133; 16], &[134; 32]);

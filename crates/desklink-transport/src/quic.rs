@@ -393,7 +393,7 @@ impl QuicClient {
                     .map_err(|error| map_read_exact_error(&self.inner.connection, error))?;
                 let host_protocol_version = u16::from_be_bytes(host_protocol_version);
                 Err(TransportError::DirectoryProtocolMismatch {
-                    controller: controller_protocol_version,
+                    controller: Some(controller_protocol_version),
                     host: (host_protocol_version != 0).then_some(host_protocol_version),
                 })
             }

@@ -44,11 +44,19 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     let controller = QuicClient::connect(config()).await.unwrap();
     let session_id = SessionId::from_bytes([71; 16]);
     let authentication = [72; 32];
-    host.join(RelayJoin::host(session_id, authentication))
-        .await
-        .unwrap();
+    host.join(RelayJoin::host_with_participant(
+        session_id,
+        authentication,
+        [1; 16],
+    ))
+    .await
+    .unwrap();
     controller
-        .join(RelayJoin::controller(session_id, authentication))
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            [2; 16],
+        ))
         .await
         .unwrap();
 
@@ -144,11 +152,19 @@ async fn controller_runtime_requests_a_keyframe_after_a_reference_gap() {
     let controller = QuicClient::connect(config()).await.unwrap();
     let session_id = SessionId::from_bytes([81; 16]);
     let authentication = [82; 32];
-    host.join(RelayJoin::host(session_id, authentication))
-        .await
-        .unwrap();
+    host.join(RelayJoin::host_with_participant(
+        session_id,
+        authentication,
+        [1; 16],
+    ))
+    .await
+    .unwrap();
     controller
-        .join(RelayJoin::controller(session_id, authentication))
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            [2; 16],
+        ))
         .await
         .unwrap();
 
