@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -143,6 +144,16 @@ def main() -> int:
             encoding="utf-8"
         )
     )
+    source_commit = release_report.get("source_commit")
+    source_dirty = release_report.get("source_dirty")
+    if not isinstance(source_commit, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", source_commit
+    ):
+        raise SystemExit("Windows release verification has no valid source commit")
+    if not isinstance(source_dirty, bool):
+        raise SystemExit("Windows release verification has no source checkout status")
+    if should_sign and source_dirty:
+        raise SystemExit("Signed Windows releases require a clean source checkout")
     verified_application_sha256 = str(release_report["release"]["sha256"])
     if sha256(application) != verified_application_sha256:
         raise SystemExit("Windows UI payload changed after release verification")
@@ -203,6 +214,8 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "version": str(version),
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
         "target": TARGET,
         "signed": should_sign,
         "application": {

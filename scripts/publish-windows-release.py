@@ -15,11 +15,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_PATTERN = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
 class ReleasePayload:
     version: str
+    source_commit: str
     installer: Path
     manifest: Path
     verification: Path
@@ -62,6 +64,17 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
         raise ValueError("Windows installer manifest did not pass release validation")
     if manifest.get("signed") is not True:
         raise ValueError("Unsigned Windows installers cannot become a GitHub Release")
+    source_commit = manifest.get("source_commit")
+    if not isinstance(source_commit, str) or not COMMIT_PATTERN.fullmatch(source_commit):
+        raise ValueError("Windows installer manifest contains an invalid source commit")
+    if manifest.get("source_dirty") is not False:
+        raise ValueError("Signed Windows releases require a clean source checkout")
+    verification_source_commit = verification.get("source_commit")
+    if verification_source_commit != source_commit or verification.get("source_dirty") is not False:
+        raise ValueError("Windows release verification does not match the clean source commit")
+    github_sha = os.environ.get("GITHUB_SHA", "").strip().lower()
+    if github_sha and github_sha != source_commit:
+        raise ValueError("Release source commit does not match GITHUB_SHA")
 
     installer_value = manifest.get("installer")
     if not isinstance(installer_value, dict):
@@ -84,6 +97,7 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
         raise ValueError("Windows release verification does not match the installer")
     return ReleasePayload(
         version=version,
+        source_commit=source_commit,
         installer=installer_path,
         manifest=manifest_path,
         verification=verification_path,
@@ -97,6 +111,7 @@ def release_notes(payload: ReleasePayload) -> str:
         "- 安装器和内置应用均已通过 Authenticode 签名验证。\n"
         "- 安装范围仅限当前 Windows 用户，不需要管理员权限。\n"
         "- 覆盖升级会保留设备身份、已批准设备和本机设置。\n\n"
+        f"源码提交：`{payload.source_commit}`\n"
         f"安装器 SHA-256：`{payload.sha256}`\n"
     )
 

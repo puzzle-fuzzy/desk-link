@@ -39,6 +39,8 @@ class WindowsReleasePublishTests(unittest.TestCase):
                 {
                     "schema": 1,
                     "version": "0.1.42",
+                    "source_commit": "a" * 40,
+                    "source_dirty": False,
                     "signed": signed,
                     "passed": True,
                     "installer": {
@@ -51,7 +53,14 @@ class WindowsReleasePublishTests(unittest.TestCase):
             encoding="utf-8",
         )
         (release / "windows-release-verification.json").write_text(
-            json.dumps({"version": "0.1.42", "passed": True}),
+            json.dumps(
+                {
+                    "version": "0.1.42",
+                    "source_commit": "a" * 40,
+                    "source_dirty": False,
+                    "passed": True,
+                }
+            ),
             encoding="utf-8",
         )
         return installer
@@ -85,9 +94,29 @@ class WindowsReleasePublishTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size differs"):
                 self.publish.validate_release_payload(root, "v0.1.42")
 
+    def test_rejects_a_source_commit_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_release(root)
+            verification = root / "dist" / "windows" / "windows-release-verification.json"
+            verification.write_text(
+                json.dumps(
+                    {
+                        "version": "0.1.42",
+                        "source_commit": "b" * 40,
+                        "source_dirty": False,
+                        "passed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "source commit"):
+                self.publish.validate_release_payload(root, "v0.1.42")
+
     def test_rejects_invalid_repository_names(self) -> None:
         payload = self.publish.ReleasePayload(
             version="0.1.42",
+            source_commit="a" * 40,
             installer=Path("installer.exe"),
             manifest=Path("manifest.json"),
             verification=Path("verification.json"),

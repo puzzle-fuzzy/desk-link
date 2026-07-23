@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WINDOWS_UI = ROOT / "apps" / "windows-ui"
 TARGET = "x86_64-pc-windows-msvc"
 README = ROOT / "README.md"
+COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 PRODUCT_CONFIG = WINDOWS_UI / "src" / "product-config.ts"
 RUST_RELAY_CONFIG = WINDOWS_UI / "src-tauri" / "src" / "local_relay.rs"
 WINDOWS_ASSETS = ROOT / "apps" / "windows" / "assets"
@@ -40,6 +41,36 @@ def run(command: list[str], *, cwd: Path = ROOT) -> None:
 def cargo_version(path: str) -> str:
     manifest = tomllib.loads((ROOT / path).read_text(encoding="utf-8"))
     return str(manifest["package"]["version"])
+
+
+def source_metadata() -> tuple[str, bool]:
+    """Return the source commit and whether the checkout has local changes."""
+    commit = os.environ.get("GITHUB_SHA", "").strip()
+    if commit and not COMMIT_SHA.fullmatch(commit):
+        raise SystemExit("GITHUB_SHA must contain a 40-character commit SHA")
+    if not commit:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        commit = result.stdout.strip()
+        if result.returncode != 0 or not COMMIT_SHA.fullmatch(commit):
+            raise SystemExit("Could not determine the current source commit SHA")
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if status.returncode != 0:
+        raise SystemExit("Could not inspect the source checkout status")
+    return commit.lower(), bool(status.stdout.strip())
 
 
 def verify_versions() -> str:
@@ -202,6 +233,7 @@ def main() -> int:
     prepare_windows_native_build_environment()
     prepare_windows_release_environment()
     version = verify_versions()
+    source_commit, source_dirty = source_metadata()
     release_scope = verify_release_scope()
     managed_relay = verify_managed_relay_profile()
     windows_assets = verify_static_windows_assets()
@@ -229,6 +261,8 @@ def main() -> int:
     report = {
         "schema": 1,
         "version": version,
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
         "custom_protocol": True,
         "release_scope": release_scope,
         "frontend_assets": assets,

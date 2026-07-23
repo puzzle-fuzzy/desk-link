@@ -9,6 +9,7 @@
 - [ ] 整理当前工作区变更，确认所有 DirectLan、视频质量、UI 和诊断代码都属于本次发布范围。
 - [x] 删除未发布版本仍保留的旧 host 安装入口、旧设备记录解码器和旧 relay join/directory 信封路径；当前构建只维护单一安装入口与当前协议线。
 - [x] 将 Windows-only 发布边界接入 `verify-windows-release.py`，防止 README 重新宣传未纳入本版本的 macOS/mobile 产品面。
+- [x] 让发布验证、安装包清单和 GitHub Release 绑定同一份源码提交 SHA，并拒绝脏工作区进入签名发布。
 - [ ] 更新版本号、变更日志和发布说明，形成唯一的发布提交。
 - [ ] 在干净 checkout 上通过 Rust、Bun、安装包和发布校验。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
