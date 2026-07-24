@@ -1,42 +1,42 @@
 ---
 name: DeskLink
-description: An editorial Windows control surface for a private personal remote desktop.
+description: A productized Windows control surface for a private personal remote desktop.
 colors:
-  primary: "#0c38b5"
-  background: "#f3f2ee"
-  surface: "#fffefa"
-  ink: "#12130f"
-  muted: "#656760"
-  border: "#d4d3cd"
-  success: "oklch(0.530 0.140 145)"
-  info: "oklch(0.430 0.105 225)"
-  error: "oklch(0.490 0.180 25)"
-  on-primary: "#fffefa"
+  primary: "#1677ff"
+  background: "#f7f9fc"
+  surface: "#ffffff"
+  ink: "#172033"
+  muted: "#718096"
+  border: "#e3e8f0"
+  success: "#1a9b5f"
+  info: "#1677ff"
+  error: "#d64545"
+  on-primary: "#ffffff"
 typography:
   headline:
-    fontFamily: "Segoe UI Variable Text, Segoe UI, sans-serif"
-    fontSize: "clamp(42px, 6vw, 66px)"
-    fontWeight: 300
-    lineHeight: 0.98
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "clamp(30px, 2.2vw, 42px)"
+    fontWeight: 700
+    lineHeight: 1.2
   title:
-    fontFamily: "Segoe UI Variable Text, Segoe UI, sans-serif"
-    fontSize: "24px"
-    fontWeight: 400
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "20px"
+    fontWeight: 700
     lineHeight: 1.35
   body:
-    fontFamily: "Segoe UI Variable Text, Segoe UI, sans-serif"
-    fontSize: "14px"
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "15px"
     fontWeight: 400
-    lineHeight: 1.6
+    lineHeight: 1.55
   label:
-    fontFamily: "Cascadia Mono, Consolas, monospace"
-    fontSize: "12px"
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "14px"
     fontWeight: 600
     lineHeight: 1.35
 rounded:
-  sm: "0px"
-  md: "0px"
-  lg: "0px"
+  sm: "8px"
+  md: "12px"
+  lg: "16px"
 spacing:
   xs: "4px"
   sm: "8px"
@@ -67,18 +67,18 @@ components:
 
 ## Overview
 
-**Creative North Star: "The Quiet Control Light"**
+**Product North Star: "连接动作一眼可见"**
 
-DeskLink should resemble one clear indicator on a well-made physical device: easy to find, unambiguous when it changes, and otherwise silent. The Windows surface uses warm paper, ink-black type, one blueprint-blue action color, remote-task-first navigation, and semantic status colors only where state needs emphasis.
+DeskLink should make the next connection obvious within one glance. The Windows surface uses a white product workspace, readable system typography, one blue primary action, rounded controls and remote-task-first navigation. Shared-device management, approved devices, settings and diagnostics remain complete but secondary behind one More menu.
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
 **Key Characteristics:**
 
 - Remote-task-first information architecture with native Windows behavior
-- Editorial board grammar: mono metadata, hairline rules, and numbered blocks
+- Clear primary / secondary / tertiary action hierarchy
 - One dominant action color with explicit semantic states
-- Compact trusted-device management without nested navigation
+- Compact trusted-device management behind a single More menu
 - Motion only for state transitions and never for decoration
 
 ## Implementation boundary
@@ -101,7 +101,7 @@ There is no mobile release surface. Do not add mobile navigation or a second con
 
 ## Colors
 
-Warm paper keeps the control surface neutral; blueprint blue is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
+White keeps the control surface neutral; product blue is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
 
 ### Primary
 
@@ -123,7 +123,7 @@ Warm paper keeps the control surface neutral; blueprint blue is reserved for the
 
 ## Typography
 
-**Windows Font:** Segoe UI Variable (with Segoe UI fallback)
+**Windows Font:** `v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` (with emoji fallbacks)
 **macOS Font:** SF Pro through SwiftUI system typography
 
 **Character:** familiar, compact, and highly legible at desktop scale. Weight and spacing create hierarchy without introducing a second typeface on either platform.
@@ -147,18 +147,18 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Buttons
 
-- **Shape:** square editorial control (0px radius) with a visible Windows focus rectangle.
-- **Primary:** Blueprint Blue with near-white text and 7px by 14px padding.
+- **Shape:** rounded product control (8–10px radius) with a visible Windows focus rectangle.
+- **Primary:** Product Blue with white text and 9px by 17px padding.
 - **Hover / Focus:** use the platform focus rectangle and a modest tonal shift; never scale or bounce.
 - **Secondary:** Quiet Surface with Warm Ink; destructive actions stay secondary until a specific device is selected.
 
 ### Cards / Containers
 
-- **Corner Style:** square grouping with hairline dividers, not a grid of floating cards.
-- **Background:** Host White for the page and Quiet Surface for a single status or device region.
-- **Shadow Strategy:** none inside the window.
+- **Corner Style:** 12–16px rounded grouping with a single light border.
+- **Background:** Host White for the page and Quiet Surface for secondary device regions.
+- **Shadow Strategy:** one subtle shadow to separate the workspace from the window background.
 - **Border:** Soft Divider only where grouping is not otherwise clear.
-- **Internal Padding:** 16px for compact groups, 24px for the primary status region.
+- **Internal Padding:** 16px for compact groups, 24–36px for the primary connection region.
 
 ### Inputs / Fields
 
@@ -168,7 +168,7 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Navigation
 
-The tray menu contains “Open DeskLink” and “Exit DeskLink.” The main window has three primary destinations: “控制其他电脑”, “访问管理”, and “设置”. Controlling another computer is the default. Host availability, device ID, password actions, and connection settings live in a compact dock above that workspace instead of a “本机状态” tab. Pairing, fixed password, and connection settings remain complete secondary pages opened from the dock. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
+The tray menu contains “Open DeskLink” and “Exit DeskLink.” The main window has one primary destination: “连接设备”. Controlling another computer is the default. Shared-device management, approved devices, settings / diagnostics and about are complete secondary pages opened from one compact “更多” menu. Closing the window returns it to the tray; only “Exit DeskLink” stops the host.
 
 ### Pairing and Revocation
 

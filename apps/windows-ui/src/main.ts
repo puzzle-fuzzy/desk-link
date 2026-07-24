@@ -1,4 +1,5 @@
 import "./styles.css";
+import "./product-ui.css";
 
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -48,7 +49,6 @@ import {
   isManagedRelay,
 } from "./product-config";
 import {
-  DESKTOP_NAV_ITEMS,
   navigationViewFor,
   nextTabIndex,
   type DeskLinkView,
@@ -111,6 +111,7 @@ let diagnosticsUploadBusy = false;
 let quitConfirming = false;
 let applicationVersion = "";
 let windowsUpdate: WindowsUpdateState = { kind: "idle" };
+let utilityMenuOpen = false;
 const snapshotRequests = new LatestRequest();
 
 function render(): void {
@@ -261,33 +262,48 @@ function renderHostStatusChip(state: HostSnapshot): string {
 
 function renderNavigation(): string {
   const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
+  const menuOpen = utilityMenuOpen || activeView !== "controller";
+  const utilityItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
+    { id: "connection", label: "共享此设备", icon: "monitor-up" },
+    { id: "devices", label: "已批准设备", icon: "shield-check" },
+    { id: "settings", label: "设置 / 诊断", icon: "settings-2" },
+  ];
   return `
-    <nav class="section-nav" aria-label="DeskLink 功能导航" role="tablist">
-      <span class="nav-collection" aria-hidden="true">DESKLINK / WINDOWS</span>
-      ${DESKTOP_NAV_ITEMS
-        .map(
-          ({ id, label }) => `
-            <button
-              class="nav-item ${activeNavigationView === id ? "nav-item--active" : ""}"
-              type="button"
-              role="tab"
-              data-view="${id}"
-              aria-selected="${activeNavigationView === id}"
-              ${activeNavigationView === id ? 'tabindex="0"' : 'tabindex="-1"'}
-            >${label}</button>
-          `,
-        )
-        .join("")}
-      <span class="nav-spacer" aria-hidden="true"></span>
-      <button
-        class="nav-utility ${activeView === "about" ? "nav-utility--active" : ""}"
-        type="button"
-        role="tab"
-        data-view="about"
-        aria-selected="${activeView === "about"}"
-        ${activeView === "about" ? 'tabindex="0"' : 'tabindex="-1"'}
-      >${icon("circle-help")}关于</button>
-      <button class="nav-utility" type="button" data-open-github title="在浏览器中打开 DeskLink GitHub 仓库">${icon("git-fork")}GitHub</button>
+    <nav class="section-nav" aria-label="DeskLink 功能导航">
+      <div class="nav-primary">
+        <button
+          class="nav-item nav-item--primary ${activeNavigationView === "controller" ? "nav-item--active" : ""}"
+          type="button"
+          data-view="controller"
+          aria-current="${activeNavigationView === "controller" ? "page" : "false"}"
+        >${icon("monitor-up")}<span>连接设备</span></button>
+      </div>
+      <div class="nav-utility-group">
+        <button
+          class="nav-menu-toggle ${menuOpen ? "nav-menu-toggle--active" : ""}"
+          type="button"
+          data-toggle-utility-menu
+          aria-label="打开更多功能"
+          aria-expanded="${menuOpen}"
+          title="更多功能"
+        >${icon("ellipsis")}<span>更多</span></button>
+        ${menuOpen
+          ? `<div class="utility-menu" role="menu" aria-label="更多功能">
+              ${utilityItems
+                .map(
+                  ({ id, label, icon: iconName }) => `
+                    <button class="utility-menu-item ${activeNavigationView === id ? "utility-menu-item--active" : ""}" type="button" role="menuitem" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
+                      ${icon(iconName)}<span>${label}</span>
+                    </button>
+                  `,
+                )
+                .join("")}
+              <div class="utility-menu-divider" role="separator"></div>
+              <button class="utility-menu-item" type="button" role="menuitem" data-view="about">${icon("circle-help")}<span>关于 DeskLink</span></button>
+              <button class="utility-menu-item" type="button" role="menuitem" data-open-github>${icon("git-fork")}<span>项目主页</span></button>
+            </div>`
+          : ""}
+      </div>
     </nav>
   `;
 }
@@ -1313,6 +1329,10 @@ function bindInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-open-windows-release]")?.addEventListener("click", () => {
     void openWindowsReleasePage();
   });
+  document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.addEventListener("click", () => {
+    utilityMenuOpen = !utilityMenuOpen;
+    render();
+  });
   if (activeView === "controller") {
     bindControllerInteractions();
   }
@@ -1333,6 +1353,7 @@ function bindInteractions(): void {
       }
       fixedAccessConfirmation = null;
       activeView = button.dataset.view as View;
+      utilityMenuOpen = activeView !== "controller";
       quitConfirming = false;
       if (activeView === "connection") {
         connectionDraft = null;
@@ -1401,6 +1422,7 @@ function bindInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-open-controller]")?.addEventListener("click", () => {
     clearFixedAccessSecrets();
     activeView = "controller";
+    utilityMenuOpen = false;
     feedback = null;
     render();
   });

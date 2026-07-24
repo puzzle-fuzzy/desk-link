@@ -1,36 +1,36 @@
 # DeskLink Windows UI 样式模板
 
-这套模板从参考图提取了可复用的视觉规则，服务于“连接设备”和“共享此设备”两个核心任务。它不是新的组件库，而是围绕现有 HTML 类名的稳定设计约束。
+这套模板从产品化远程桌面工具提取了可复用的视觉规则，服务于“连接设备”这个唯一首要任务。它不是新的组件库，而是围绕现有 HTML 类名的稳定设计约束；低频的共享、批准设备、设置 / 诊断和关于入口统一放入“更多”菜单。
 
 ## 视觉方向
 
-- **基调**：编辑部 / 纸张工作板。米白底、黑色正文、深蓝动作色。
-- **信息层级**：页面编号 → 大标题 → 一句任务说明 → 分区内容。
-- **版式**：细线分隔、两列网格、2px 网格间距、宽阔外边距。
-- **形状**：默认不使用圆角和阴影；状态、按钮和卡片靠颜色与边界区分。
-- **字体**：中文使用 Segoe UI Variable；编号、状态、设备 ID 使用 Cascadia Mono。
-- **交互**：蓝色只代表主动作、当前页或选中项；悬停只改变边界和颜色，不移动布局。
+- **基调**：白色工作区、低对比中性灰、清晰的蓝色主动作，接近成熟的 Windows 产品工具。
+- **信息层级**：产品标题 → 连接设备 → 设备 ID / 访问密码 → 主按钮 → 已保存连接。
+- **版式**：内容居中，主连接卡片与已保存连接并列；宽屏保持舒适最大宽度，小屏自动单列。
+- **形状**：按钮、输入框、卡片统一使用 8–16px 圆角；阴影只用于建立轻微层次，不作为装饰。
+- **字体**：`v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"`；设备 ID / 密码保留等宽字体以便核对。
+- **交互**：蓝色只代表主动作、当前页或选中项；悬停只改变边界和背景，不移动布局。
 
 ## 设计令牌
 
 ```css
 :root {
-  --background: #f3f2ee;
-  --surface: #fffefa;
-  --surface-subtle: #efeee9;
-  --surface-quiet: #e4e3de;
-  --ink: #12130f;
-  --ink-secondary: #343630;
-  --ink-muted: #73756e;
-  --border: #d4d3cd;
-  --border-strong: #969890;
-  --primary: #0c38b5;
-  --primary-hover: #082d98;
-  --primary-pressed: #062578;
-  --on-primary: #fffefa;
-  --radius-sm: 0;
-  --radius-md: 0;
-  --radius-lg: 0;
+  --background: #f7f9fc;
+  --surface: #ffffff;
+  --surface-subtle: #f4f7fb;
+  --surface-quiet: #edf2f7;
+  --ink: #172033;
+  --ink-secondary: #45536a;
+  --ink-muted: #718096;
+  --border: #e3e8f0;
+  --border-strong: #c8d1df;
+  --primary: #1677ff;
+  --primary-hover: #0d68e8;
+  --primary-pressed: #095acb;
+  --on-primary: #ffffff;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
 }
 ```
 
@@ -38,17 +38,16 @@
 
 ```html
 <main class="workspace">
-  <section class="page-layout">
-    <header class="page-heading">
+  <section class="controller-stack">
+    <header class="controller-heading">
       <div>
-        <span class="editorial-kicker">01 / REMOTE CONTROL</span>
         <h1>连接设备</h1>
         <p>一句话说明用户下一步要做什么。</p>
       </div>
     </header>
-    <div class="two-column-board">
-      <section class="board-cell board-cell--primary">核心动作</section>
-      <aside class="board-cell">最近设备 / 辅助信息</aside>
+    <div class="controller-connect-layout">
+      <section class="controller-card controller-card--primary">输入设备 ID 和访问密码</section>
+      <aside class="saved-devices-panel">已保存连接</aside>
     </div>
   </section>
 </main>
@@ -58,11 +57,11 @@
 
 | 组件 | 规则 |
 | --- | --- |
-| 主按钮 | `--primary` 填充、黑色或白色文字、0 圆角、40–48px 高 |
-| 次按钮 | 白色底、`--border-strong` 边框，悬停变蓝 |
-| 编号 | `Cascadia Mono`、10–11px、蓝色、字距 0.14–0.18em |
-| 输入框 | 1px 边框、0 圆角、ID/密码使用等宽字体 |
-| 网格卡片 | `gap: 2px`，背景使用 `--border`，格子使用 `--surface-subtle` |
+| 主按钮 | `--primary` 填充、白色文字、10px 圆角、44–48px 高 |
+| 次按钮 | 白色底、`--border-strong` 边框，悬停变浅灰 / 蓝色 |
+| 连接标题 | 30–42px、700 字重，宽屏不使用过大的展示字 |
+| 输入框 | 1px 边框、10px 圆角、ID/密码使用等宽字体、56px 高 |
+| 卡片 | 1px 边框、12–16px 圆角、轻量阴影，避免网格装饰 |
 | 错误提示 | 保留原有语义色与可访问性，不用动画推动布局 |
 
 ## 交互与无障碍约束
