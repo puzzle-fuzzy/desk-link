@@ -112,6 +112,7 @@ let quitConfirming = false;
 let applicationVersion = "";
 let windowsUpdate: WindowsUpdateState = { kind: "idle" };
 let utilityMenuOpen = false;
+let utilityMenuDismissBound = false;
 const snapshotRequests = new LatestRequest();
 
 function render(): void {
@@ -122,7 +123,6 @@ function render(): void {
   app.innerHTML = `
     <div class="app-shell">
       ${renderHeader()}
-      ${renderNavigation()}
       <section class="workspace ${activeView === "controller" ? "workspace--controller" : ""}" aria-busy="${loading}" data-surface-transition="${animateSurface}">
         ${feedback ? renderFeedback(feedback) : ""}
         ${loading ? renderLoading() : renderCurrentView()}
@@ -137,11 +137,30 @@ function render(): void {
   }
   renderedView = activeView;
   bindInteractions();
+  bindUtilityMenuDismiss();
   focusNewApproval();
 }
 
 function scheduleRender(): void {
   renderScheduler.schedule(render);
+}
+
+function bindUtilityMenuDismiss(): void {
+  if (utilityMenuDismissBound) {
+    return;
+  }
+  document.addEventListener("pointerdown", (event) => {
+    if (!utilityMenuOpen) {
+      return;
+    }
+    const target = event.target;
+    if (target instanceof Element && (target.closest("[data-toggle-utility-menu]") || target.closest(".utility-menu"))) {
+      return;
+    }
+    utilityMenuOpen = false;
+    render();
+  });
+  utilityMenuDismissBound = true;
 }
 
 function renderHostApproval(): string {
@@ -237,13 +256,14 @@ function handleApprovalKeyboard(event: KeyboardEvent): void {
 
 function renderHeader(): string {
   return `
-    <header class="titlebar" data-tauri-drag-region>
+    <header class="titlebar">
       <div class="product-lockup" aria-label="DeskLink Windows 远程桌面" data-tauri-drag-region>
         ${icon("monitor-check", "product-mark")}
         <strong data-tauri-drag-region>DeskLink</strong>
       </div>
       ${snapshot ? renderHostStatusChip(snapshot) : ""}
       <div class="titlebar-drag-space" data-tauri-drag-region></div>
+      ${renderNavigation()}
       <div class="titlebar-end">
         <div class="window-controls" aria-label="窗口控制">
           <button type="button" data-window-minimize aria-label="最小化 DeskLink" title="最小化">${icon("minus")}</button>
@@ -262,7 +282,8 @@ function renderHostStatusChip(state: HostSnapshot): string {
 
 function renderNavigation(): string {
   const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
-  const menuOpen = utilityMenuOpen || activeView !== "controller";
+  const menuOpen = utilityMenuOpen;
+  const menuActive = menuOpen || activeView !== "controller";
   const utilityItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
     { id: "connection", label: "共享此设备", icon: "monitor-up" },
     { id: "devices", label: "已批准设备", icon: "shield-check" },
@@ -280,10 +301,10 @@ function renderNavigation(): string {
       </div>
       <div class="nav-utility-group">
         <button
-          class="nav-menu-toggle ${menuOpen ? "nav-menu-toggle--active" : ""}"
+          class="nav-menu-toggle ${menuActive ? "nav-menu-toggle--active" : ""}"
           type="button"
           data-toggle-utility-menu
-          aria-label="打开更多功能"
+          aria-label="打开或关闭更多功能"
           aria-expanded="${menuOpen}"
           title="更多功能"
         >${icon("ellipsis")}<span>更多</span></button>
@@ -1353,7 +1374,7 @@ function bindInteractions(): void {
       }
       fixedAccessConfirmation = null;
       activeView = button.dataset.view as View;
-      utilityMenuOpen = activeView !== "controller";
+      utilityMenuOpen = false;
       quitConfirming = false;
       if (activeView === "connection") {
         connectionDraft = null;
@@ -1394,6 +1415,7 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-open-connection]")?.addEventListener("click", () => {
     activeView = "connection";
+    utilityMenuOpen = false;
     connectionDraft = null;
     connectionAdvancedOpen = false;
     feedback = null;
@@ -1401,6 +1423,7 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-open-overview]")?.addEventListener("click", () => {
     activeView = "settings";
+    utilityMenuOpen = false;
     feedback = null;
     if (!preferences) {
       void loadPreferences();
@@ -1409,11 +1432,13 @@ function bindInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-open-devices]")?.addEventListener("click", () => {
     activeView = "devices";
+    utilityMenuOpen = false;
     feedback = null;
     render();
   });
   document.querySelector<HTMLButtonElement>("[data-open-fixed-access]")?.addEventListener("click", () => {
     activeView = "fixedAccess";
+    utilityMenuOpen = false;
     feedback = null;
     clearFixedAccessSecrets();
     render();
@@ -1432,6 +1457,7 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-open-pairing]").forEach((button) => {
     button.addEventListener("click", () => {
       activeView = "pairing";
+      utilityMenuOpen = false;
       feedback = null;
       render();
     });

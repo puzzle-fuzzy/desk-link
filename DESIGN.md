@@ -156,7 +156,7 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 - **Corner Style:** 12–16px rounded grouping with a single light border.
 - **Background:** Host White for the page and Quiet Surface for secondary device regions.
-- **Shadow Strategy:** one subtle shadow to separate the workspace from the window background.
+- **Shadow Strategy:** none; use the border and a small surface-color change to communicate grouping.
 - **Border:** Soft Divider only where grouping is not otherwise clear.
 - **Internal Padding:** 16px for compact groups, 24–36px for the primary connection region.
 

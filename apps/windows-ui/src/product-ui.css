@@ -693,3 +693,186 @@ body {
     font-size: 16px;
   }
 }
+
+/* Screenshot refinement: merge the task navigation into the title bar and
+   keep hierarchy visible through borders and tonal surfaces, never shadows. */
+.app-shell {
+  grid-template-rows: 64px minmax(0, 1fr);
+}
+
+.titlebar {
+  position: relative;
+  z-index: 1;
+  min-height: 64px;
+  gap: 12px;
+  overflow: visible;
+  padding: 0 clamp(20px, 3vw, 40px);
+}
+
+.titlebar .product-lockup {
+  flex: 0 0 auto;
+}
+
+.titlebar .host-status-chip {
+  flex: 0 0 auto;
+  margin-left: 0;
+}
+
+.titlebar .section-nav {
+  position: relative;
+  z-index: auto;
+  display: flex;
+  min-height: 40px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  overflow: visible;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.titlebar .nav-primary,
+.titlebar .nav-utility-group {
+  flex: 0 0 auto;
+}
+
+.titlebar .nav-item,
+.titlebar .nav-menu-toggle {
+  min-height: 40px;
+}
+
+.titlebar .nav-item--active {
+  border: 1px solid #cfe2ff;
+  background: var(--info-surface);
+}
+
+.titlebar .nav-menu-toggle--active {
+  border-color: #9fc7ff;
+  background: #f1f7ff;
+}
+
+.host-status-chip--ready {
+  border-color: #bde7cf;
+  background: var(--success-surface);
+  color: #147247;
+}
+
+.host-status-chip--working {
+  border-color: #b9d8ff;
+  background: var(--info-surface);
+  color: #1768c7;
+}
+
+.host-status-chip--attention {
+  border-color: #f1d59f;
+  background: var(--warning-surface);
+  color: #8a5c12;
+}
+
+.host-status-chip--quiet {
+  border-color: var(--border);
+  background: var(--surface-subtle);
+  color: var(--ink-muted);
+}
+
+.utility-menu {
+  z-index: 4;
+  box-shadow: none;
+}
+
+.workspace {
+  padding-top: clamp(28px, 3vw, 44px);
+}
+
+.controller-heading {
+  margin-bottom: 20px;
+}
+
+.controller-connect-layout {
+  align-items: start;
+}
+
+.controller-card,
+.saved-devices-panel,
+.page-layout {
+  box-shadow: none;
+}
+
+.controller-card,
+.saved-devices-panel {
+  border-color: #d9e1ec;
+}
+
+.controller-form .field .device-id-input:focus,
+.controller-form .field .temporary-password-input:focus {
+  border-color: var(--primary);
+  box-shadow: none;
+  outline: 2px solid #b9d7ff;
+  outline-offset: 1px;
+}
+
+.saved-devices-panel {
+  min-height: 0;
+  align-self: start;
+}
+
+.saved-device-list {
+  display: grid;
+  min-height: 0;
+  max-height: none;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  overflow: visible;
+  background: transparent;
+}
+
+.saved-device-row {
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: none;
+  align-items: start;
+  overflow: visible;
+  background: #f8fafd;
+}
+
+.saved-device-actions {
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.saved-device-rename {
+  min-width: 0;
+}
+
+@media (max-width: 760px) {
+  .titlebar {
+    gap: 8px;
+    padding-right: 12px;
+    padding-left: 16px;
+  }
+
+  .titlebar .product-lockup strong {
+    font-size: 16px;
+  }
+
+  .titlebar .host-status-chip {
+    max-width: 108px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .titlebar .nav-item span,
+  .titlebar .nav-menu-toggle span {
+    display: none;
+  }
+
+  .titlebar .nav-item,
+  .titlebar .nav-menu-toggle {
+    width: 40px;
+    justify-content: center;
+    padding: 0;
+  }
+}
