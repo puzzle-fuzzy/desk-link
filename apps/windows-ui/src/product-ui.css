@@ -702,7 +702,7 @@ body {
 
 .titlebar {
   position: relative;
-  z-index: 1;
+  z-index: auto;
   min-height: 64px;
   gap: 12px;
   overflow: visible;
@@ -781,6 +781,48 @@ body {
   box-shadow: none;
 }
 
+.titlebar-end,
+.titlebar .window-controls {
+  align-self: center;
+  height: 40px;
+}
+
+.titlebar .window-controls {
+  gap: 2px;
+}
+
+.titlebar .window-controls button,
+.titlebar .window-controls .window-control-close {
+  width: 36px;
+  height: 36px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-muted);
+  cursor: pointer;
+}
+
+.titlebar .window-controls button:hover {
+  border-color: var(--border);
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+
+.titlebar .window-controls .window-control-close:hover {
+  border-color: #f2b7b7;
+  background: var(--error-surface);
+  color: var(--error);
+}
+
+.titlebar .window-controls button:active {
+  background: var(--surface-quiet);
+}
+
+.titlebar .window-controls .window-control-close:active {
+  background: #ffe0e0;
+  color: #b52d2d;
+}
+
 .workspace {
   padding-top: clamp(28px, 3vw, 44px);
 }
@@ -836,10 +878,29 @@ body {
   background: #f8fafd;
 }
 
+.saved-device-identity {
+  display: block;
+  min-width: 0;
+}
+
+.saved-device-identity small {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .saved-device-actions {
   min-width: 0;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.saved-device-actions .saved-device-remove {
+  flex-basis: 100%;
+  justify-self: start;
+  margin-top: -2px;
+  text-align: left;
 }
 
 .saved-device-rename {
