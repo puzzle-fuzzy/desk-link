@@ -7,35 +7,45 @@
  * changing any interaction selectors or remote-session rendering rules.
  */
 :root {
-  font-family: v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
-  color: #172033;
-  background: #ffffff;
-  font-size: 15px;
-  --background: #f7f9fc;
+  font-family: Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+  color: #111c2d;
+  background: #f9f9ff;
+  font-size: 14px;
+  --background: #f9f9ff;
   --surface: #ffffff;
-  --surface-subtle: #f4f7fb;
-  --surface-quiet: #edf2f7;
-  --ink: #172033;
-  --ink-secondary: #45536a;
-  --ink-muted: #718096;
-  --border: #e3e8f0;
-  --border-strong: #c8d1df;
-  --primary: #1677ff;
-  --primary-hover: #0d68e8;
-  --primary-pressed: #095acb;
+  --surface-subtle: #f8fafc;
+  --surface-quiet: #f0f3ff;
+  --surface-container-lowest: #ffffff;
+  --surface-container-low: #f0f3ff;
+  --surface-container: #e7eeff;
+  --surface-container-high: #dee8ff;
+  --surface-container-highest: #d8e3fb;
+  --ink: #111c2d;
+  --ink-secondary: #434655;
+  --ink-muted: #64748b;
+  --border: #e2e8f0;
+  --border-strong: #c3c6d7;
+  --primary: #2563eb;
+  --primary-container: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-pressed: #1e40af;
   --on-primary: #ffffff;
-  --success: #1a9b5f;
-  --success-surface: #eaf8f0;
-  --info: #1677ff;
-  --info-surface: #eef6ff;
-  --error: #d64545;
-  --error-surface: #fff1f1;
-  --warning: #b7791f;
-  --warning-surface: #fff8e8;
-  --focus: #1677ff;
-  --radius-sm: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
+  --on-primary-container: #eeefff;
+  --on-primary-fixed-variant: #003ea8;
+  --success: #15803d;
+  --success-surface: #dcfce7;
+  --info: #004ac6;
+  --info-surface: #e7eeff;
+  --error: #ba1a1a;
+  --error-surface: #ffdad6;
+  --warning: #943700;
+  --warning-surface: #ffede6;
+  --tertiary-container: #bc4800;
+  --on-tertiary-fixed-variant: #7d2d00;
+  --focus: #2563eb;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 8px;
   --transition: 150ms ease;
 }
 
@@ -935,5 +945,394 @@ body {
     width: 40px;
     justify-content: center;
     padding: 0;
+  }
+}
+
+/* RemoteFlow system layer --------------------------------------------------
+   4px rhythm, white primary canvas, low-contrast outlines and a single blue
+   action signal. Cards remain flat; only the More menu may use overlay depth.
+*/
+.titlebar {
+  min-height: 60px;
+  padding: 0 32px;
+  border-bottom-color: var(--border);
+  background: var(--surface);
+}
+
+.titlebar .product-lockup {
+  gap: 8px;
+}
+
+.titlebar .product-mark {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--primary-container, #2563eb);
+}
+
+.titlebar .product-lockup strong {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.host-status-chip {
+  min-height: 28px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.host-status-chip--ready {
+  border-color: #a7d9b7;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.host-status-chip--working {
+  border-color: #aec5f7;
+  background: var(--surface-container, #e7eeff);
+  color: var(--on-primary-fixed-variant, #003ea8);
+}
+
+.host-status-chip--attention {
+  border-color: #f0b7a6;
+  background: var(--tertiary-container, #ffede6);
+  color: var(--on-tertiary-fixed-variant, #7d2d00);
+}
+
+.host-status-chip--quiet {
+  border-color: var(--border);
+  background: var(--surface-subtle);
+  color: var(--ink-muted);
+}
+
+.titlebar .section-nav {
+  gap: 8px;
+}
+
+.titlebar .nav-item,
+.titlebar .nav-menu-toggle {
+  min-height: 40px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.titlebar .nav-item {
+  padding: 0 16px;
+}
+
+.titlebar .nav-item--active {
+  border-color: #b9d1ff;
+  background: var(--surface-container, #e7eeff);
+  color: var(--on-primary-fixed-variant, #003ea8);
+}
+
+.titlebar .nav-menu-toggle {
+  padding: 0 12px;
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-secondary);
+}
+
+.titlebar .nav-menu-toggle:hover,
+.titlebar .nav-menu-toggle--active {
+  border-color: #9bb9f5;
+  background: var(--surface-container-low, #f0f3ff);
+  color: var(--on-primary-fixed-variant, #003ea8);
+}
+
+.utility-menu {
+  width: 248px;
+  padding: 8px;
+  border-color: var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 5%), 0 2px 4px -2px rgb(0 0 0 / 5%);
+}
+
+.utility-menu-item {
+  min-height: 40px;
+  border-radius: 4px;
+  color: var(--ink-secondary);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.utility-menu-item:hover,
+.utility-menu-item--active {
+  background: var(--surface-subtle);
+  color: var(--on-primary-fixed-variant, #003ea8);
+}
+
+.workspace {
+  padding: 32px;
+  background: var(--background);
+}
+
+.control-workspace,
+.controller-stack,
+.page-layout,
+.loading-layout {
+  width: min(100%, 1180px);
+}
+
+.controller-heading {
+  margin-bottom: 24px;
+}
+
+.controller-heading h1,
+.page-heading h1,
+.about-hero h1 {
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 38px;
+}
+
+.controller-heading p,
+.page-heading p {
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.controller-runtime {
+  min-width: 300px;
+  padding: 12px 16px;
+  border-color: var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.controller-runtime strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.controller-runtime small {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.controller-connect-layout {
+  grid-template-columns: minmax(0, 7fr) minmax(300px, 5fr);
+  gap: 16px;
+}
+
+.controller-card,
+.saved-devices-panel,
+.page-layout {
+  border-color: #e2e8f0;
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.controller-card--manual {
+  padding: 24px;
+}
+
+.controller-card-heading h2,
+.saved-devices-heading h2,
+.section-heading h2 {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 28px;
+  letter-spacing: 0;
+}
+
+.controller-card-heading p,
+.saved-devices-heading p {
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.controller-device-form {
+  gap: 16px;
+  margin-top: 24px;
+}
+
+.field > span,
+.field > label,
+.connection-form .field > label {
+  margin-bottom: 4px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+}
+
+.controller-form .field .device-id-input,
+.controller-form .field .temporary-password-input {
+  min-height: 48px;
+  height: 48px;
+  border-color: var(--border-strong);
+  border-radius: 8px;
+  font-size: 18px;
+  line-height: 24px;
+}
+
+.controller-form .field .device-id-input:focus,
+.controller-form .field .temporary-password-input:focus {
+  border: 2px solid var(--primary);
+  outline: 0;
+}
+
+.controller-device-hint,
+.controller-form-actions > span,
+.controller-privacy-note {
+  color: #64748b;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.controller-form-actions {
+  gap: 16px;
+  padding-top: 0;
+}
+
+.controller-form-actions .button {
+  min-width: 192px;
+}
+
+.controller-privacy-note {
+  margin-top: 0;
+  padding-top: 16px;
+  border-top-color: #f1f5f9;
+}
+
+.saved-devices-panel {
+  padding: 24px;
+}
+
+.saved-devices-heading {
+  padding-bottom: 16px;
+  border-bottom-color: #f1f5f9;
+}
+
+.saved-device-list {
+  gap: 8px;
+  padding-top: 16px;
+}
+
+.saved-device-row {
+  gap: 12px;
+  padding: 12px;
+  border-color: #e2e8f0;
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.saved-device-identity strong {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.saved-device-kind {
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+}
+
+.saved-device-identity small {
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.saved-device-actions {
+  gap: 8px;
+}
+
+.saved-device-actions .button {
+  min-height: 36px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.saved-device-remove {
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.button,
+.toolbar-button,
+.icon-button {
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.button {
+  min-height: 44px;
+  padding: 10px 16px;
+}
+
+.button--primary {
+  border-color: var(--primary-container, #2563eb);
+  background: var(--primary-container, #2563eb);
+  color: var(--on-primary, #ffffff);
+}
+
+.button--primary:hover:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
+}
+
+.button--secondary {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-secondary);
+}
+
+.button--secondary:hover:not(:disabled) {
+  border-color: #9bb9f5;
+  background: var(--surface-subtle);
+  color: var(--on-primary-fixed-variant, #003ea8);
+}
+
+.page-layout {
+  padding: 24px;
+}
+
+@media (max-width: 900px) {
+  .workspace {
+    padding: 24px;
+  }
+
+  .controller-connect-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .titlebar {
+    min-height: 56px;
+    padding: 0 16px;
+  }
+
+  .workspace {
+    padding: 16px;
+  }
+
+  .controller-heading h1,
+  .page-heading h1,
+  .about-hero h1 {
+    font-size: 24px;
+    line-height: 32px;
   }
 }

@@ -1,42 +1,42 @@
 ---
 name: DeskLink
-description: A productized Windows control surface for a private personal remote desktop.
+description: A RemoteFlow-inspired Windows control surface for a private personal remote desktop.
 colors:
-  primary: "#1677ff"
-  background: "#f7f9fc"
+  primary: "#2563eb"
+  background: "#f9f9ff"
   surface: "#ffffff"
-  ink: "#172033"
-  muted: "#718096"
-  border: "#e3e8f0"
-  success: "#1a9b5f"
-  info: "#1677ff"
-  error: "#d64545"
+  ink: "#111c2d"
+  muted: "#64748b"
+  border: "#e2e8f0"
+  success: "#15803d"
+  info: "#004ac6"
+  error: "#ba1a1a"
   on-primary: "#ffffff"
 typography:
   headline:
-    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-    fontSize: "clamp(30px, 2.2vw, 42px)"
-    fontWeight: 700
-    lineHeight: 1.2
-  title:
-    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-    fontSize: "20px"
-    fontWeight: 700
-    lineHeight: 1.35
-  body:
-    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-    fontSize: "15px"
-    fontWeight: 400
-    lineHeight: 1.55
-  label:
-    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-    fontSize: "14px"
+    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "30px"
     fontWeight: 600
-    lineHeight: 1.35
+    lineHeight: 38px
+  title:
+    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "20px"
+    fontWeight: 600
+    lineHeight: 28px
+  body:
+    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "14px"
+    fontWeight: 400
+    lineHeight: 20px
+  label:
+    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontSize: "14px"
+    fontWeight: 500
+    lineHeight: 20px
 rounded:
-  sm: "8px"
-  md: "12px"
-  lg: "16px"
+  sm: "4px"
+  md: "8px"
+  lg: "8px"
 spacing:
   xs: "4px"
   sm: "8px"
@@ -67,9 +67,9 @@ components:
 
 ## Overview
 
-**Product North Star: "连接动作一眼可见"**
+**Product North Star: "RemoteFlow：让远程内容成为主角"**
 
-DeskLink should make the next connection obvious within one glance. The Windows surface uses a white product workspace, readable system typography, one blue primary action, rounded controls and remote-task-first navigation. Shared-device management, approved devices, settings and diagnostics remain complete but secondary behind one More menu.
+DeskLink should make the next connection obvious within one glance. The Windows surface follows RemoteFlow's systematic minimalism: a near-white canvas, Inter with the existing Chinese system fallback, one blue primary action, 8px component geometry, low-contrast outlines and a remote-task-first information architecture. Shared-device management, approved devices, settings and diagnostics remain complete but secondary behind one More menu.
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
@@ -78,6 +78,8 @@ This is a compact personal tool, not an enterprise console or a neon streaming o
 - Remote-task-first information architecture with native Windows behavior
 - Clear primary / secondary / tertiary action hierarchy
 - One dominant action color with explicit semantic states
+- 4px spacing rhythm with 16px functional gutters and 32px desktop margins
+- Flat cards with low-contrast outlines; only active menus may use restrained elevation
 - Compact trusted-device management behind a single More menu
 - Motion only for state transitions and never for decoration
 
@@ -101,11 +103,11 @@ There is no mobile release surface. Do not add mobile navigation or a second con
 
 ## Colors
 
-White keeps the control surface neutral; product blue is reserved for the primary action and product identity. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
+Near-white keeps the control surface neutral; #2563eb is reserved for primary actions, active states and focus indicators. Green, blue, and red communicate healthy, transitional, and stopped states alongside text and icons.
 
 ### Primary
 
-- **Blueprint Blue:** used for the tray identity, focused primary action, and the single most important enabled command.
+- **RemoteFlow Blue:** used for the tray identity, focused primary action, and the single most important enabled command.
 
 ### Semantic accents
 
@@ -115,25 +117,25 @@ White keeps the control surface neutral; product blue is reserved for the primar
 
 - **Host White:** the main window background.
 - **Quiet Surface:** toolbar, list, and read-only status grouping.
-- **Warm Ink:** primary text with high contrast.
-- **Muted Ink:** secondary timestamps and explanatory text.
+- **Slate Ink:** primary text with high contrast.
+- **Muted Slate:** secondary timestamps and explanatory text.
 - **Soft Divider:** structural separation only.
 
 **The One Signal Rule.** At most one saturated status or action color dominates a view. Status is always paired with a written label.
 
 ## Typography
 
-**Windows Font:** `v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` (with emoji fallbacks)
+**Windows Font:** `Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` (with emoji fallbacks)
 **macOS Font:** SF Pro through SwiftUI system typography
 
 **Character:** familiar, compact, and highly legible at desktop scale. Weight and spacing create hierarchy without introducing a second typeface on either platform.
 
 ### Hierarchy
 
-- **Headline** (600, 24px, 1.25): window title and current connection state.
-- **Title** (600, 16px, 1.35): trusted-controller group and high-consequence confirmation title.
-- **Body** (400, 14px, 1.45): status detail, device identity, and consequences; prose stays below 70 characters per line where possible.
-- **Label** (600, 12px, 1.35): field labels and compact metadata, in sentence case.
+- **Headline** (600, 30px, 38px): window title and current connection state.
+- **Title** (600, 20px, 28px): trusted-controller group and high-consequence confirmation title.
+- **Body** (400, 14px, 20px): status detail, device identity, and consequences; prose stays below 70 characters per line where possible.
+- **Label** (500, 14px, 20px): field labels and compact metadata, in sentence case.
 
 **The Plain Label Rule.** Buttons name the action and object, such as “Revoke controller” and “Exit DeskLink.” Never use an unexplained “OK” for a security action.
 
@@ -147,14 +149,14 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Buttons
 
-- **Shape:** rounded product control (8–10px radius) with a visible Windows focus rectangle.
-- **Primary:** Product Blue with white text and 9px by 17px padding.
+- **Shape:** disciplined 8px product control with a visible Windows focus rectangle.
+- **Primary:** RemoteFlow Blue with white text and 10px by 16px padding.
 - **Hover / Focus:** use the platform focus rectangle and a modest tonal shift; never scale or bounce.
 - **Secondary:** Quiet Surface with Warm Ink; destructive actions stay secondary until a specific device is selected.
 
 ### Cards / Containers
 
-- **Corner Style:** 12–16px rounded grouping with a single light border.
+- **Corner Style:** 8px rounded grouping with a single light border.
 - **Background:** Host White for the page and Quiet Surface for secondary device regions.
 - **Shadow Strategy:** none; use the border and a small surface-color change to communicate grouping.
 - **Border:** Soft Divider only where grouping is not otherwise clear.
