@@ -3817,7 +3817,8 @@ html[data-remote-fullscreen="true"] .remote-text-entry {
   }
 }
 
-/* Windows frameless shell and compact two-column controller workspace. */
+/* Windows content shell and compact two-column controller workspace. The
+   actual window frame and controls are provided by the native Tauri window. */
 .app-shell {
   grid-template-rows: 42px 44px minmax(0, 1fr);
 }

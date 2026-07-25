@@ -3,7 +3,6 @@ import "./product-ui.css";
 
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   cancelPairingSession,
@@ -76,7 +75,6 @@ if (!applicationRoot) {
   throw new Error("未找到 DeskLink 应用界面根节点");
 }
 const app: HTMLElement = applicationRoot;
-const applicationWindow = getCurrentWindow();
 const renderScheduler = new RenderScheduler(
   (callback) => window.requestAnimationFrame(callback),
   (handle) => window.cancelAnimationFrame(handle),
@@ -122,11 +120,14 @@ function render(): void {
   prepareControllerRender();
   app.innerHTML = `
     <div class="app-shell">
-      ${renderHeader()}
-      <section class="workspace ${activeView === "controller" ? "workspace--controller" : ""}" aria-busy="${loading}" data-surface-transition="${animateSurface}">
-        ${feedback ? renderFeedback(feedback) : ""}
-        ${loading ? renderLoading() : renderCurrentView()}
-      </section>
+      ${renderSidebar()}
+      <div class="app-main">
+        ${renderWorkspaceTopbar()}
+        <section class="workspace ${activeView === "controller" ? "workspace--controller" : ""}" aria-busy="${loading}" data-surface-transition="${animateSurface}">
+          ${feedback ? renderFeedback(feedback) : ""}
+          ${loading ? renderLoading() : renderCurrentView()}
+        </section>
+      </div>
     </div>
     ${renderHostApproval()}
   `;
@@ -254,79 +255,101 @@ function handleApprovalKeyboard(event: KeyboardEvent): void {
   }
 }
 
-function renderHeader(): string {
+function renderSidebar(): string {
+  const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
+  const sidebarItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
+    { id: "controller", label: "连接设备", icon: "monitor-up" },
+    { id: "devices", label: "已批准设备", icon: "shield-check" },
+    { id: "connection", label: "共享此设备", icon: "monitor-up" },
+  ];
+  const status = snapshot ? hostStatusSummary(snapshot) : null;
   return `
-    <header class="titlebar">
-      <div class="product-lockup" aria-label="DeskLink Windows 远程桌面" data-tauri-drag-region>
-        ${icon("monitor-check", "product-mark")}
-        <strong data-tauri-drag-region>DeskLink</strong>
+    <aside class="app-sidebar" aria-label="DeskLink 主导航">
+      <div class="sidebar-brand">
+        ${icon("monitor-check", "sidebar-brand-mark")}
+        <div><strong>DeskLink</strong><span>Windows 远程桌面</span></div>
       </div>
-      ${snapshot ? renderHostStatusChip(snapshot) : ""}
-      <div class="titlebar-drag-space" data-tauri-drag-region></div>
-      ${renderNavigation()}
-      <div class="titlebar-end">
-        <div class="window-controls" aria-label="窗口控制">
-          <button type="button" data-window-minimize aria-label="最小化 DeskLink" title="最小化">${icon("minus")}</button>
-          <button type="button" data-window-maximize aria-label="最大化或还原 DeskLink" title="最大化或还原">${icon("square")}</button>
-          <button class="window-control-close" type="button" data-window-close aria-label="关闭到系统托盘" title="关闭到系统托盘">${icon("x")}</button>
-        </div>
+      <nav class="sidebar-nav" aria-label="主要功能">
+        <span class="sidebar-label">工作区</span>
+        ${sidebarItems.map(({ id, label, icon: iconName }) => `
+          <button class="sidebar-nav-item ${activeNavigationView === id ? "sidebar-nav-item--active" : ""}" type="button" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
+            ${icon(iconName)}<span>${label}</span>
+          </button>
+        `).join("")}
+      </nav>
+      <div class="sidebar-bottom">
+        ${status ? `
+          <button class="sidebar-status sidebar-status--${status.tone}" type="button" data-open-overview>
+            <span class="sidebar-status-dot" aria-hidden="true"></span>
+            <span><strong>${escapeHtml(status.title)}</strong><small>${escapeHtml(status.detail)}</small></span>
+          </button>
+        ` : ""}
+        <button class="sidebar-nav-item sidebar-nav-item--secondary ${activeNavigationView === "settings" ? "sidebar-nav-item--active" : ""}" type="button" data-view="settings" aria-current="${activeNavigationView === "settings" ? "page" : "false"}">
+          ${icon("settings-2")}<span>设置与诊断</span>
+        </button>
+        <div class="sidebar-footer-note"><span class="sidebar-footer-dot"></span><span>端到端加密连接</span></div>
+      </div>
+    </aside>
+  `;
+}
+
+function renderWorkspaceTopbar(): string {
+  return `
+    <header class="workspace-topbar">
+      <div class="workspace-context">
+        <span class="workspace-context-label">DeskLink 控制台</span>
+        <span class="workspace-context-divider" aria-hidden="true"></span>
+        <strong>${activeView === "controller" ? "连接设备" : escapeHtml(viewTitle(activeView))}</strong>
+      </div>
+      <div class="workspace-topbar-actions">
+        ${snapshot ? renderHostStatusChip(snapshot) : ""}
+        <button class="topbar-icon-button" type="button" data-view="about" aria-label="关于 DeskLink" title="关于 DeskLink">${icon("circle-help")}</button>
+        <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-expanded="${utilityMenuOpen}" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
+        ${renderUtilityMenu()}
       </div>
     </header>
+  `;
+}
+
+function viewTitle(view: View): string {
+  switch (view) {
+    case "connection": return "共享此设备";
+    case "devices": return "已批准设备";
+    case "pairing": return "共享此设备";
+    case "fixedAccess": return "固定访问密码";
+    case "settings": return "设置与诊断";
+    case "about": return "关于 DeskLink";
+    default: return "连接设备";
+  }
+}
+
+function renderUtilityMenu(): string {
+  const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
+  const utilityItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
+    { id: "connection", label: "共享此设备", icon: "monitor-up" },
+    { id: "devices", label: "已批准设备", icon: "shield-check" },
+    { id: "settings", label: "设置与诊断", icon: "settings-2" },
+  ];
+  if (!utilityMenuOpen) {
+    return "";
+  }
+  return `
+    <div class="utility-menu" role="menu" aria-label="更多功能">
+      ${utilityItems.map(({ id, label, icon: iconName }) => `
+        <button class="utility-menu-item ${activeNavigationView === id ? "utility-menu-item--active" : ""}" type="button" role="menuitem" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
+          ${icon(iconName)}<span>${label}</span>
+        </button>
+      `).join("")}
+      <div class="utility-menu-divider" role="separator"></div>
+      <button class="utility-menu-item" type="button" role="menuitem" data-view="about">${icon("circle-help")}<span>关于 DeskLink</span></button>
+      <button class="utility-menu-item" type="button" role="menuitem" data-open-github>${icon("git-fork")}<span>项目主页</span></button>
+    </div>
   `;
 }
 
 function renderHostStatusChip(state: HostSnapshot): string {
   const status = hostStatusSummary(state);
   return `<button class="host-status-chip host-status-chip--${status.tone}" type="button" data-open-overview aria-label="${escapeHtml(status.title)}，${escapeHtml(status.detail)}，打开设置 / 诊断">${escapeHtml(status.title)}</button>`;
-}
-
-function renderNavigation(): string {
-  const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
-  const menuOpen = utilityMenuOpen;
-  const menuActive = menuOpen || activeView !== "controller";
-  const utilityItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
-    { id: "connection", label: "共享此设备", icon: "monitor-up" },
-    { id: "devices", label: "已批准设备", icon: "shield-check" },
-    { id: "settings", label: "设置 / 诊断", icon: "settings-2" },
-  ];
-  return `
-    <nav class="section-nav" aria-label="DeskLink 功能导航">
-      <div class="nav-primary">
-        <button
-          class="nav-item nav-item--primary ${activeNavigationView === "controller" ? "nav-item--active" : ""}"
-          type="button"
-          data-view="controller"
-          aria-current="${activeNavigationView === "controller" ? "page" : "false"}"
-        >${icon("monitor-up")}<span>连接设备</span></button>
-      </div>
-      <div class="nav-utility-group">
-        <button
-          class="nav-menu-toggle ${menuActive ? "nav-menu-toggle--active" : ""}"
-          type="button"
-          data-toggle-utility-menu
-          aria-label="打开或关闭更多功能"
-          aria-expanded="${menuOpen}"
-          title="更多功能"
-        >${icon("ellipsis")}<span>更多</span></button>
-        ${menuOpen
-          ? `<div class="utility-menu" role="menu" aria-label="更多功能">
-              ${utilityItems
-                .map(
-                  ({ id, label, icon: iconName }) => `
-                    <button class="utility-menu-item ${activeNavigationView === id ? "utility-menu-item--active" : ""}" type="button" role="menuitem" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
-                      ${icon(iconName)}<span>${label}</span>
-                    </button>
-                  `,
-                )
-                .join("")}
-              <div class="utility-menu-divider" role="separator"></div>
-              <button class="utility-menu-item" type="button" role="menuitem" data-view="about">${icon("circle-help")}<span>关于 DeskLink</span></button>
-              <button class="utility-menu-item" type="button" role="menuitem" data-open-github>${icon("git-fork")}<span>项目主页</span></button>
-            </div>`
-          : ""}
-      </div>
-    </nav>
-  `;
 }
 
 function renderFeedback(item: NonNullable<Feedback>): string {
@@ -1332,15 +1355,6 @@ async function exitDeskLink(): Promise<void> {
 }
 
 function bindInteractions(): void {
-  document.querySelector<HTMLButtonElement>("[data-window-minimize]")?.addEventListener("click", () => {
-    runWindowAction(() => applicationWindow.minimize());
-  });
-  document.querySelector<HTMLButtonElement>("[data-window-maximize]")?.addEventListener("click", () => {
-    runWindowAction(() => applicationWindow.toggleMaximize());
-  });
-  document.querySelector<HTMLButtonElement>("[data-window-close]")?.addEventListener("click", () => {
-    runWindowAction(() => applicationWindow.close());
-  });
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
     button.addEventListener("click", () => void openGithub());
   });
@@ -1590,13 +1604,6 @@ function bindInteractions(): void {
   document
     .querySelector<HTMLFormElement>("[data-connection-form]")
     ?.addEventListener("submit", (event) => void submitConnection(event));
-}
-
-function runWindowAction(action: () => Promise<void>): void {
-  void action().catch((error) => {
-    feedback = { tone: "error", message: normalizeError(error) };
-    render();
-  });
 }
 
 async function openGithub(): Promise<void> {

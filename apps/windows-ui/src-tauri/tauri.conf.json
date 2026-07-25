@@ -21,10 +21,10 @@
         "center": true,
         "visible": false,
         "resizable": true,
-        "decorations": false,
+        "decorations": true,
         "shadow": true,
         "fullscreen": false,
-        "backgroundColor": "#f6f4f3"
+        "backgroundColor": "#f9f9ff"
       }
     ],
     "security": {

@@ -688,6 +688,464 @@ body {
   }
 }
 
+/* Stitch Remote Desktop Controller layout ---------------------------------
+   Native Windows chrome owns the window controls. The application surface
+   follows the reference: a quiet navigation rail, a compact context bar and
+   a two-column connection workspace. Existing data attributes stay intact so
+   connection, approval, transfer and diagnostics behaviour is unchanged.
+*/
+html,
+body,
+#app {
+  min-width: 0;
+  min-height: 0;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  background: var(--background);
+}
+
+.app-sidebar {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  padding: 24px 12px 16px;
+  border-right: 1px solid var(--border);
+  background: var(--surface-container-lowest);
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 12px 30px;
+}
+
+.sidebar-brand-mark {
+  width: 30px;
+  height: 30px;
+  padding: 6px;
+  border-radius: 8px;
+  background: var(--primary-container);
+  color: var(--on-primary);
+}
+
+.sidebar-brand div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.sidebar-brand strong {
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.sidebar-brand span {
+  overflow: hidden;
+  color: var(--ink-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-nav {
+  display: grid;
+  gap: 4px;
+}
+
+.sidebar-label {
+  padding: 0 12px 8px;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sidebar-nav-item {
+  display: flex;
+  width: 100%;
+  min-height: 42px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  border: 0;
+  border-left: 3px solid transparent;
+  border-radius: 0 8px 8px 0;
+  background: transparent;
+  color: var(--ink-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  transition: background-color var(--transition), color var(--transition), border-color var(--transition);
+}
+
+.sidebar-nav-item .app-icon {
+  width: 18px;
+  height: 18px;
+  color: var(--ink-muted);
+}
+
+.sidebar-nav-item:hover {
+  background: var(--surface-container-low);
+  color: var(--primary);
+}
+
+.sidebar-nav-item--active {
+  border-left-color: var(--primary);
+  background: color-mix(in srgb, var(--secondary-container, #d0e1fb) 34%, transparent);
+  color: var(--on-primary-fixed-variant);
+  font-weight: 650;
+}
+
+.sidebar-nav-item--active .app-icon,
+.sidebar-nav-item:hover .app-icon {
+  color: var(--primary);
+}
+
+.sidebar-bottom {
+  display: grid;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 24px;
+}
+
+.sidebar-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-container-low);
+  color: var(--ink-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+
+.sidebar-status:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-container);
+}
+
+.sidebar-status-dot,
+.sidebar-footer-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ink-muted);
+}
+
+.sidebar-status--ready .sidebar-status-dot,
+.sidebar-footer-dot {
+  background: var(--success);
+}
+
+.sidebar-status--working .sidebar-status-dot {
+  background: var(--info);
+}
+
+.sidebar-status--attention .sidebar-status-dot {
+  background: var(--warning);
+}
+
+.sidebar-status span:last-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.sidebar-status strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-status small {
+  overflow: hidden;
+  color: var(--ink-muted);
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-nav-item--secondary {
+  min-height: 38px;
+  font-size: 12px;
+}
+
+.sidebar-footer-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 0;
+  color: var(--ink-muted);
+  font-size: 10px;
+}
+
+.app-main {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: 64px minmax(0, 1fr);
+}
+
+.workspace-topbar {
+  position: relative;
+  z-index: 30;
+  display: flex;
+  min-width: 0;
+  min-height: 64px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-container-lowest);
+}
+
+.workspace-context,
+.workspace-topbar-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.workspace-context {
+  gap: 12px;
+}
+
+.workspace-context-label {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.workspace-context-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--border-strong);
+}
+
+.workspace-context strong {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.workspace-topbar-actions {
+  position: relative;
+  gap: 12px;
+}
+
+.workspace-topbar-actions .host-status-chip {
+  margin: 0;
+}
+
+.topbar-icon-button,
+.topbar-menu-toggle {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.topbar-icon-button {
+  width: 36px;
+  padding: 0;
+}
+
+.topbar-icon-button:hover,
+.topbar-menu-toggle:hover,
+.topbar-menu-toggle--active {
+  border-color: var(--border);
+  background: var(--surface-container-low);
+  color: var(--primary);
+}
+
+.topbar-icon-button .app-icon,
+.topbar-menu-toggle .app-icon {
+  width: 17px;
+  height: 17px;
+}
+
+.workspace-topbar .utility-menu {
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 60;
+}
+
+.workspace {
+  min-width: 0;
+  min-height: 0;
+  padding: 32px;
+  background: var(--background);
+}
+
+.controller-heading h1,
+.page-heading h1 {
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 38px;
+}
+
+.controller-heading p,
+.page-heading p {
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.controller-card,
+.saved-devices-panel,
+.page-layout {
+  border-color: var(--outline-variant);
+  border-radius: 8px;
+  background: var(--surface-container-lowest);
+  box-shadow: none;
+}
+
+.controller-card:hover,
+.saved-device-row:hover {
+  border-color: var(--primary);
+  box-shadow: 0 4px 20px -4px rgb(0 74 198 / 10%);
+}
+
+.controller-card--manual,
+.saved-devices-panel {
+  padding: 24px;
+}
+
+.controller-form .field .device-id-input,
+.controller-form .field .temporary-password-input {
+  min-height: 48px;
+  height: 48px;
+  border-color: var(--outline-variant);
+  border-radius: 8px;
+  background: var(--surface-container-lowest);
+}
+
+.button,
+.saved-device-actions .button {
+  border-radius: 8px;
+}
+
+html[data-remote-fullscreen="true"] .app-shell {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+html[data-remote-fullscreen="true"] .app-sidebar,
+html[data-remote-fullscreen="true"] .workspace-topbar {
+  display: none;
+}
+
+@media (max-width: 980px) {
+  .app-shell {
+    grid-template-columns: 208px minmax(0, 1fr);
+  }
+
+  .workspace-topbar,
+  .workspace {
+    padding-right: 24px;
+    padding-left: 24px;
+  }
+
+  .sidebar-brand {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+
+  .app-sidebar {
+    padding: 16px 8px;
+  }
+
+  .sidebar-brand {
+    justify-content: center;
+    padding: 0 0 24px;
+  }
+
+  .sidebar-brand div,
+  .sidebar-label,
+  .sidebar-nav-item span,
+  .sidebar-status span:last-child,
+  .sidebar-footer-note span:last-child {
+    display: none;
+  }
+
+  .sidebar-nav-item {
+    justify-content: center;
+    padding: 0;
+    border-left: 0;
+    border-radius: 8px;
+  }
+
+  .sidebar-nav-item--active {
+    border-left: 0;
+    box-shadow: inset 3px 0 0 var(--primary);
+  }
+
+  .sidebar-status {
+    justify-content: center;
+    padding: 10px 0;
+  }
+
+  .sidebar-footer-note {
+    justify-content: center;
+    padding: 4px 0 0;
+  }
+
+  .workspace-topbar {
+    min-height: 56px;
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .app-main {
+    grid-template-rows: 56px minmax(0, 1fr);
+  }
+
+  .workspace-context-label,
+  .workspace-context-divider {
+    display: none;
+  }
+
+  .workspace {
+    padding: 20px 16px;
+  }
+}
+
 @media (min-width: 1600px) {
   :root {
     font-size: 16px;
@@ -1334,5 +1792,69 @@ body {
   .about-hero h1 {
     font-size: 24px;
     line-height: 32px;
+  }
+}
+
+/* Final native-chrome ordering: these declarations intentionally sit after
+   the legacy frameless rules above so the new DOM cannot inherit their grid
+   rows or spacing. */
+.app-shell {
+  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.app-main {
+  grid-column: 2;
+  grid-row: 1;
+  grid-template-rows: 64px minmax(0, 1fr);
+}
+
+.app-sidebar {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.workspace {
+  grid-column: 1;
+  grid-row: 2;
+  padding: 32px;
+}
+
+.titlebar,
+.section-nav,
+.window-controls,
+.titlebar-drag-space,
+.titlebar-end {
+  display: none;
+}
+
+html[data-remote-fullscreen="true"] .app-shell {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+html[data-remote-fullscreen="true"] .app-main {
+  grid-column: 1;
+  grid-row: 1;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+@media (max-width: 980px) {
+  .app-shell {
+    grid-template-columns: 208px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+
+  .app-main {
+    grid-template-rows: 56px minmax(0, 1fr);
+  }
+
+  .workspace {
+    padding: 20px 16px;
   }
 }
