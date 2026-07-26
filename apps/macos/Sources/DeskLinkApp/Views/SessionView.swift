@@ -67,18 +67,20 @@ struct SessionView: View {
                     .buttonStyle(.bordered)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button("退出登录") {
-                    Task { @MainActor in
-                        bridge.clearRemoteLinksForLogout()
-                        await host.shutdownAndWait()
-                        await account.logout()
-                    }
-                }
-                .buttonStyle(.bordered)
-            }
-            ToolbarItem(placement: .primaryAction) {
                 Button("断开连接") { bridge.disconnect() }
                     .buttonStyle(.borderedProminent)
+            }
+            if case .signedIn = account.state {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("退出登录") {
+                        Task { @MainActor in
+                            bridge.clearRemoteLinksForLogout()
+                            await host.shutdownAndWait()
+                            await account.logout()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
         }
     }

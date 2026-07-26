@@ -49,6 +49,8 @@ struct IOSAuthenticatedRootView: View {
                 ProgressView("正在准备 DeskLink…")
             case .signedOut:
                 AccountLoginView(account: account)
+            case .skipped:
+                AccountLoginView(account: account)
             case .signedIn:
                 IOSRootView(account: account, controller: controller)
             }

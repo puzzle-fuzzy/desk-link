@@ -74,13 +74,15 @@ struct DeskLinkShell: View {
                 Menu {
                     if case let .signedIn(user) = account.state {
                         Text(user.email)
-                    }
-                    Button("退出登录", systemImage: "rectangle.portrait.and.arrow.right") {
-                        Task { @MainActor in
-                            controller.clearRemoteLinksForLogout()
-                            await host.shutdownAndWait()
-                            await account.logout()
+                        Button("退出登录", systemImage: "rectangle.portrait.and.arrow.right") {
+                            Task { @MainActor in
+                                controller.clearRemoteLinksForLogout()
+                                await host.shutdownAndWait()
+                                await account.logout()
+                            }
                         }
+                    } else if case .skipped = account.state {
+                        Text("未登录 · 本机模式")
                     }
                     Divider()
                     Button("已批准设备", systemImage: "person.2") {

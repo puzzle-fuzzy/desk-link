@@ -22,6 +22,9 @@ public struct AccountUser: Codable, Equatable, Sendable {
 public enum AccountState: Equatable, Sendable {
     case loading
     case signedOut
+    /// Local-only mode. It deliberately does not create or restore an account
+    /// session and is used by clients that allow using the app without login.
+    case skipped
     case signedIn(AccountUser)
 }
 
@@ -228,6 +231,15 @@ public final class AccountClient: ObservableObject {
         clearLocalSession()
     }
 
+    /// Enters the local-only workspace without creating an account session.
+    /// Remote-device pairing and host approval remain independent of account
+    /// login, so skipping login must not alter saved remote connections.
+    public func skipLogin() {
+        guard !isBusy else { return }
+        lastError = nil
+        state = .skipped
+    }
+
     public func clearError() {
         lastError = nil
     }
@@ -310,7 +322,8 @@ public final class AccountClient: ObservableObject {
         } catch let error as AccountClientError {
             throw error
         } catch {
-            throw AccountClientError.network("无法连接账号服务，请检查网络后重试。")
+            let endpoint = request.url?.host.map { "（\($0)）" } ?? ""
+            throw AccountClientError.network("账号服务暂时无法连接\(endpoint)，请检查网络后重试。")
         }
     }
 
@@ -369,8 +382,11 @@ public struct AccountLoginView: View {
         case forgot = "找回密码"
     }
 
-    public init(account: AccountClient) {
+    private let allowsSkipLogin: Bool
+
+    public init(account: AccountClient, allowsSkipLogin: Bool = false) {
         self.account = account
+        self.allowsSkipLogin = allowsSkipLogin
     }
 
     public var body: some View {
@@ -378,7 +394,9 @@ public struct AccountLoginView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("DeskLink")
                     .font(.system(size: 28, weight: .bold))
-                Text(mode == .login ? "登录后开始使用远程控制" : mode == .register ? "创建 DeskLink 账号" : "通过邮箱重置密码")
+                Text(mode == .login
+                    ? (allowsSkipLogin ? "登录或跳过后开始使用远程控制" : "登录后开始使用远程控制")
+                    : mode == .register ? "创建 DeskLink 账号" : "通过邮箱重置密码")
                     .foregroundStyle(.secondary)
             }
 
@@ -443,6 +461,22 @@ public struct AccountLoginView: View {
                 Button("忘记密码") { switchMode(.forgot) }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
+            }
+
+            if allowsSkipLogin {
+                Divider()
+                    .padding(.vertical, 2)
+                Button("跳过登录，直接使用") {
+                    account.skipLogin()
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                Text("登录仅用于账号管理，不影响远程设备连接。")
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity)
+                    .multilineTextAlignment(.center)
             }
         }
         .padding(28)

@@ -68,13 +68,11 @@ struct DeskLinkApp: App {
                 case .loading:
                     ProgressView("正在准备 DeskLink…")
                 case .signedOut:
-                    AccountLoginView(account: account)
+                    AccountLoginView(account: account, allowsSkipLogin: true)
                 case .signedIn:
-                    if isControllerSessionState(controller.state) {
-                        SessionView(bridge: controller, host: host, account: account)
-                    } else {
-                        DeskLinkShell(host: host, controller: controller, account: account)
-                    }
+                    workspaceContent
+                case .skipped:
+                    workspaceContent
                 }
             }
             .sheet(item: pendingApproval) { approval in
@@ -93,6 +91,15 @@ struct DeskLinkApp: App {
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
+    }
+
+    @ViewBuilder
+    private var workspaceContent: some View {
+        if isControllerSessionState(controller.state) {
+            SessionView(bridge: controller, host: host, account: account)
+        } else {
+            DeskLinkShell(host: host, controller: controller, account: account)
+        }
     }
 
     private var pendingApproval: Binding<HostApproval?> {
