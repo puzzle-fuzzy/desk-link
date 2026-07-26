@@ -124,17 +124,7 @@ struct IOSConnectionHomeView: View {
     }
 
     private var statusText: String {
-        switch controller.state {
-        case .idle: "准备连接"
-        case .pairing: "等待远端确认"
-        case .connecting: "正在连接中"
-        case .connected: "已连接"
-        case .reconnecting: "正在重新连接"
-        case .recovering: "正在恢复画面"
-        case .frozen: "画面暂时冻结"
-        case .closed: "已断开"
-        case .failed: "连接失败"
-        }
+        IOSSessionPresentation.statusText(controller.state)
     }
 
     private var statusSymbol: String {
@@ -223,6 +213,8 @@ struct IOSMoreView: View {
 
     private var connectionSummary: String {
         switch controller.state {
+        case .pairing, .connecting, .reconnecting, .recovering, .frozen:
+            IOSSessionPresentation.statusText(controller.state)
         case .connected: "已连接"
         case .failed: "连接失败"
         case .closed: "已断开"

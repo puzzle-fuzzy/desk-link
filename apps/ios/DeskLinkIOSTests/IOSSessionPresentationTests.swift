@@ -11,6 +11,11 @@ final class IOSSessionPresentationTests: XCTestCase {
         XCTAssertFalse(IOSSessionPresentation.isActive(.idle))
     }
 
+    func testStatusTextDistinguishesApprovalFromConnectionSetup() {
+        XCTAssertEqual(IOSSessionPresentation.statusText(.pairing), "等待用户审批")
+        XCTAssertEqual(IOSSessionPresentation.statusText(.connecting), "正在建立安全连接")
+    }
+
     func testAspectFitGeometryKeepsLetterboxOutsideVideo() {
         let rect = VideoGeometry.aspectFit(
             source: CGSize(width: 1920, height: 1080),
