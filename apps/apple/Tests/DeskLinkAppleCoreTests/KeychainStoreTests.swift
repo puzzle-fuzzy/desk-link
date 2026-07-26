@@ -74,4 +74,36 @@ final class KeychainStoreTests: XCTestCase {
 
         XCTAssertTrue(try store.loadAll().isEmpty)
     }
+
+    func testSavingSameRemoteHostDeduplicatesAndMovesItToTheFront() throws {
+        let keychain = InMemoryKeychainStore()
+        let store = SavedHostStore(keychain: keychain, service: "hosts", account: "saved")
+        let first = SavedHost(
+            id: UUID(),
+            serverName: "relay.example.com",
+            sessionID: [UInt8](repeating: 1, count: 16),
+            relayAuthentication: [UInt8](repeating: 2, count: 32),
+            hostVerifyKey: [UInt8](repeating: 3, count: 32)
+        )
+        let second = SavedHost(
+            id: UUID(),
+            serverName: "relay-2.example.com",
+            sessionID: [UInt8](repeating: 4, count: 16),
+            relayAuthentication: [UInt8](repeating: 5, count: 32),
+            hostVerifyKey: [UInt8](repeating: 6, count: 32)
+        )
+        let refreshedFirst = SavedHost(
+            id: UUID(),
+            serverName: first.serverName,
+            sessionID: [UInt8](repeating: 8, count: 16),
+            relayAuthentication: [UInt8](repeating: 7, count: 32),
+            hostVerifyKey: first.hostVerifyKey
+        )
+
+        try store.save(first)
+        try store.save(second)
+        try store.save(refreshedFirst)
+
+        XCTAssertEqual(try store.loadAll(), [refreshedFirst, second])
+    }
 }

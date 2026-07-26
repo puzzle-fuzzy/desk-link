@@ -11,6 +11,7 @@ export class HttpMailer implements Mailer {
   async send(message: MailMessage): Promise<void> {
     const response = await this.fetcher(this.url, {
       method: "POST",
+      signal: AbortSignal.timeout(10_000),
       headers: {
         authorization: `Bearer ${this.token}`,
         "content-type": "application/json",

@@ -29,6 +29,7 @@ use crate::host::{
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 // Nonterminal events may be dropped when this reserve would be consumed. That keeps the
 // bounded event path nonblocking while guaranteeing room for ReleaseAll, Error, and Closed.
 const TERMINAL_EVENT_RESERVE: usize = 3;
@@ -652,6 +653,40 @@ async fn wait_for_approval(
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
 ) -> Result<bool, HostError> {
+    wait_for_approval_with_timeout(
+        APPROVAL_TIMEOUT,
+        device_id,
+        verify_key,
+        commands,
+        cancellation,
+        events,
+    )
+    .await
+}
+
+async fn wait_for_approval_with_timeout(
+    timeout: Duration,
+    device_id: [u8; 16],
+    verify_key: VerifyingKey,
+    commands: &mut mpsc::Receiver<HostCommand>,
+    cancellation: &mut watch::Receiver<bool>,
+    events: &mpsc::Sender<HostEvent>,
+) -> Result<bool, HostError> {
+    tokio::time::timeout(
+        timeout,
+        wait_for_approval_command(device_id, verify_key, commands, cancellation, events),
+    )
+    .await
+    .map_err(|_| HostError::ApprovalTimeout)?
+}
+
+async fn wait_for_approval_command(
+    device_id: [u8; 16],
+    verify_key: VerifyingKey,
+    commands: &mut mpsc::Receiver<HostCommand>,
+    cancellation: &mut watch::Receiver<bool>,
+    events: &mpsc::Sender<HostEvent>,
+) -> Result<bool, HostError> {
     loop {
         tokio::select! {
             biased;
@@ -1020,7 +1055,10 @@ mod tests {
     use super::{
         HostCommand, HostError, WorkerPhase, command_is_admissible, contains_idr,
         is_retryable_host_error, record_terminal_admission, try_advance_worker_phase,
+        wait_for_approval_with_timeout,
     };
+    use ed25519_dalek::SigningKey;
+    use tokio::sync::{mpsc, watch};
 
     #[test]
     fn terminal_admission_blocks_late_worker_completion_transitions() {
@@ -1097,5 +1135,27 @@ mod tests {
         assert!(!is_retryable_host_error(&HostError::Crypto(
             "tampered".into()
         )));
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_is_terminal_and_does_not_enter_reconnect() {
+        let (commands_sender, mut commands) = mpsc::channel(1);
+        let _commands_sender = commands_sender;
+        let (_cancellation_sender, mut cancellation) = watch::channel(false);
+        let (events, _events_receiver) = mpsc::channel(4);
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+
+        let error = wait_for_approval_with_timeout(
+            std::time::Duration::from_millis(1),
+            [1; 16],
+            signing_key.verifying_key(),
+            &mut commands,
+            &mut cancellation,
+            &events,
+        )
+        .await
+        .expect_err("approval should time out");
+        assert_eq!(error, HostError::ApprovalTimeout);
+        assert!(!is_retryable_host_error(&error));
     }
 }

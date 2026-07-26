@@ -1,18 +1,25 @@
 import XCTest
 
 final class IOSConnectionFlowUITests: XCTestCase {
-    func testLoginIsRequiredBeforeOpeningTheRemoteWorkspace() {
+    func testLoginCanBeSkippedBeforeOpeningTheRemoteWorkspace() {
         let app = XCUIApplication()
         app.launch()
 
-        XCTAssertTrue(app.staticTexts["登录 DeskLink"].waitForExistence(timeout: 5))
-        XCTAssertFalse(app.tabBars.buttons["连接设备"].exists)
+        let skipButton = app.buttons["跳过登录，直接使用"]
+        XCTAssertTrue(skipButton.waitForExistence(timeout: 5))
+        skipButton.tap()
+        XCTAssertTrue(app.tabBars.buttons["连接设备"].waitForExistence(timeout: 5))
     }
 
     func testScanButtonOpensScannerInsteadOfPasting() {
         let app = XCUIApplication()
-        app.launchArguments += ["-DeskLinkUITestSignedIn"]
         app.launch()
+
+        let skipButton = app.buttons["跳过登录，直接使用"]
+        if skipButton.waitForExistence(timeout: 5) {
+            skipButton.tap()
+            XCTAssertTrue(app.tabBars.buttons["连接设备"].waitForExistence(timeout: 5))
+        }
 
         let scanButton = app.buttons["scan-invite"]
         XCTAssertTrue(scanButton.waitForExistence(timeout: 5))

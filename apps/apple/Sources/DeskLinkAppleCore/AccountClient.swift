@@ -301,6 +301,7 @@ public final class AccountClient: ObservableObject {
             throw AccountClientError.invalidConfiguration
         }
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.timeoutInterval = 15
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "accept")
         if let body {

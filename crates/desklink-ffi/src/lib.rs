@@ -334,11 +334,11 @@ struct DesklinkHostConfigOwned {
     _log_level: u32,
 }
 
-struct SavedHostMaterialOwned {
-    session_id: [u8; 16],
-    relay_authentication: Zeroizing<[u8; 32]>,
-    host_verify_key: [u8; 32],
-    server_name: String,
+pub(crate) struct SavedHostMaterialOwned {
+    pub(crate) session_id: [u8; 16],
+    pub(crate) relay_authentication: Zeroizing<[u8; 32]>,
+    pub(crate) host_verify_key: [u8; 32],
+    pub(crate) server_name: String,
 }
 
 struct HostCallbackState {
@@ -1042,6 +1042,13 @@ fn start_secure_worker(
     let material_invalidator: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         clear_saved_material(&saved_material);
     });
+    let published_material = runtime.saved_host_material.clone();
+    let material_publisher: Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync> =
+        Arc::new(move |material| {
+            if let Ok(mut stored) = published_material.lock() {
+                *stored = Some(material);
+            }
+        });
     let worker = match ControllerWorker::start(
         runtime.relay_url.clone(),
         runtime.platform,
@@ -1049,6 +1056,7 @@ fn start_secure_worker(
         runtime.callback,
         runtime.callback_context,
         Some(material_invalidator),
+        Some(material_publisher),
     ) {
         Ok(worker) => worker,
         Err(error) => {
@@ -1866,7 +1874,8 @@ fn map_host_error(error: HostError) -> DesklinkResult {
     match error {
         HostError::InvalidState
         | HostError::ControllerIdentityMismatch
-        | HostError::InvalidControllerCapabilities => DesklinkResult::InvalidState,
+        | HostError::InvalidControllerCapabilities
+        | HostError::ApprovalTimeout => DesklinkResult::InvalidState,
         HostError::CommandQueueFull
         | HostError::WorkerStopped
         | HostError::Transport(_)

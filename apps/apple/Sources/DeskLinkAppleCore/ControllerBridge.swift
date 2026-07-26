@@ -184,7 +184,10 @@ public final class ControllerBridge: ObservableObject {
                 publishResultError("无法使用设备 ID 和访问密码连接。", result: result)
                 return
             }
-            awaitingApprovedHostMaterial = false
+            // The directory lookup resolves the same signed host material as
+            // a QR invite, but it is only available inside the Rust worker.
+            // Stage it after the authenticated stream reaches Connected.
+            awaitingApprovedHostMaterial = true
             state = .connecting
         } catch {
             publishError(error)

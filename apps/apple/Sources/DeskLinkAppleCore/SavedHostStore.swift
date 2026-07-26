@@ -54,11 +54,14 @@ public struct SavedHostStore: Sendable {
     public func save(_ host: SavedHost) throws {
         guard host.isValid else { throw SavedHostStoreError.invalidRecord }
         var hosts = try loadAll()
-        if let index = hosts.firstIndex(where: { $0.id == host.id }) {
-            hosts[index] = host
-        } else {
-            hosts.append(host)
+        // The UUID identifies a local record, not the remote host. Directory
+        // lookup and fresh pairing can produce a new local UUID for the same
+        // host, so de-duplicate by authenticated host identity and move the
+        // successful connection to the front.
+        hosts.removeAll { existing in
+            existing.id == host.id || Self.sameRemoteHost(existing, host)
         }
+        hosts.insert(host, at: 0)
         try write(try Self.encode(hosts))
     }
 
@@ -111,5 +114,10 @@ public struct SavedHostStore: Sendable {
         } catch let error as KeychainStoreError {
             throw SavedHostStoreError.keychain(error.status)
         }
+    }
+
+    private static func sameRemoteHost(_ lhs: SavedHost, _ rhs: SavedHost) -> Bool {
+        lhs.serverName == rhs.serverName
+            && lhs.hostVerifyKey == rhs.hostVerifyKey
     }
 }

@@ -11,6 +11,52 @@ private final class SendablePixelBuffer: @unchecked Sendable {
     }
 }
 
+/// VideoToolbox may call its output callback faster than the main actor can
+/// publish frames to SwiftUI. Keep only the newest decoded frame so a slow UI
+/// never accumulates an unbounded task backlog or displays stale video.
+private final class LatestFrameDelivery: @unchecked Sendable {
+    private struct PendingFrame: @unchecked Sendable {
+        let pixelBuffer: SendablePixelBuffer
+        let frameID: UInt64
+    }
+
+    private let lock = NSLock()
+    private var pending: PendingFrame?
+    private var scheduled = false
+
+    func submit(
+        pixelBuffer: SendablePixelBuffer,
+        frameID: UInt64,
+        deliver: @escaping @MainActor @Sendable (SendablePixelBuffer, UInt64) -> Void
+    ) {
+        lock.lock()
+        pending = PendingFrame(pixelBuffer: pixelBuffer, frameID: frameID)
+        let shouldSchedule = !scheduled
+        scheduled = true
+        lock.unlock()
+
+        guard shouldSchedule else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            while let next = self.takeLatest() {
+                deliver(next.pixelBuffer, next.frameID)
+                await Task.yield()
+            }
+        }
+    }
+
+    private func takeLatest() -> PendingFrame? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let pending else {
+            scheduled = false
+            return nil
+        }
+        self.pending = nil
+        return pending
+    }
+}
+
 @MainActor
 public final class H264Decoder {
     public static let decodeFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
@@ -18,6 +64,7 @@ public final class H264Decoder {
     public var onFrame: ((CVPixelBuffer) -> Void)?
 
     nonisolated(unsafe) private var decompressionSession: VTDecompressionSession?
+    private let frameDelivery = LatestFrameDelivery()
     private var formatDescription: CMVideoFormatDescription?
     public private(set) var latestPixelBuffer: CVPixelBuffer?
     public private(set) var lastFrameID: UInt64 = 0
@@ -61,19 +108,25 @@ public final class H264Decoder {
 
         var description: CMVideoFormatDescription?
         let status = parameterSets.sps.withUnsafeBytes { spsBytes in
-            parameterSets.pps.withUnsafeBytes { ppsBytes in
-                var pointers: [UnsafePointer<UInt8>] = [
-                    spsBytes.bindMemory(to: UInt8.self).baseAddress!,
-                    ppsBytes.bindMemory(to: UInt8.self).baseAddress!,
-                ]
+            guard let spsPointer = spsBytes.bindMemory(to: UInt8.self).baseAddress else {
+                return kCMFormatDescriptionError_InvalidParameter
+            }
+            return parameterSets.pps.withUnsafeBytes { ppsBytes in
+                guard let ppsPointer = ppsBytes.bindMemory(to: UInt8.self).baseAddress else {
+                    return kCMFormatDescriptionError_InvalidParameter
+                }
+                var pointers: [UnsafePointer<UInt8>] = [spsPointer, ppsPointer]
                 let sizes = [parameterSets.sps.count, parameterSets.pps.count]
                 return pointers.withUnsafeMutableBufferPointer { pointerBuffer in
                     sizes.withUnsafeBufferPointer { sizeBuffer in
-                        CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        guard let pointerBase = pointerBuffer.baseAddress,
+                              let sizeBase = sizeBuffer.baseAddress
+                        else { return kCMFormatDescriptionError_InvalidParameter }
+                        return CMVideoFormatDescriptionCreateFromH264ParameterSets(
                             allocator: kCFAllocatorDefault,
                             parameterSetCount: 2,
-                            parameterSetPointers: pointerBuffer.baseAddress!,
-                            parameterSetSizes: sizeBuffer.baseAddress!,
+                            parameterSetPointers: pointerBase,
+                            parameterSetSizes: sizeBase,
                             nalUnitHeaderLength: 4,
                             formatDescriptionOut: &description
                         )
@@ -128,7 +181,8 @@ public final class H264Decoder {
         guard version == configVersion,
               let session = decompressionSession,
               let formatDescription,
-              let avcc = try? H264AnnexB.avccAccessUnit(from: accessUnit)
+              let avcc = try? H264AnnexB.avccAccessUnit(from: accessUnit),
+              !avcc.isEmpty
         else {
             registerFailure()
             return false
@@ -157,9 +211,10 @@ public final class H264Decoder {
             return false
         }
 
-        let copyStatus = avcc.withUnsafeBytes { bytes in
-            CMBlockBufferReplaceDataBytes(
-                with: bytes.baseAddress!,
+        let copyStatus: OSStatus? = avcc.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return nil }
+            return CMBlockBufferReplaceDataBytes(
+                with: baseAddress,
                 blockBuffer: blockBuffer,
                 offsetIntoDestination: 0,
                 dataLength: avcc.count
@@ -250,8 +305,8 @@ public final class H264Decoder {
 
     nonisolated fileprivate func enqueue(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
         let sendableBuffer = SendablePixelBuffer(pixelBuffer)
-        Task { @MainActor [weak self, sendableBuffer] in
-            self?.accept(pixelBuffer: sendableBuffer.value, frameID: frameID)
+        frameDelivery.submit(pixelBuffer: sendableBuffer, frameID: frameID) { [weak self] buffer, frameID in
+            self?.accept(pixelBuffer: buffer.value, frameID: frameID)
         }
     }
 }

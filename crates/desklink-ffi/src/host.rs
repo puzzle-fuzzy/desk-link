@@ -122,6 +122,8 @@ pub enum HostError {
     ControllerIdentityMismatch,
     #[error("controller capabilities are invalid or incompatible")]
     InvalidControllerCapabilities,
+    #[error("controller approval timed out")]
+    ApprovalTimeout,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

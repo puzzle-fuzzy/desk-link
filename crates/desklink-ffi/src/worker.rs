@@ -1,7 +1,7 @@
 use std::{
     net::{SocketAddr, ToSocketAddrs},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
     thread,
@@ -19,11 +19,11 @@ use desklink_transport::{
 };
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     ControllerError, ControllerEvent, ControllerRuntime, DesklinkEvent, DesklinkEventCallback,
-    DesklinkEventKind, DesklinkState, EventMeta,
+    DesklinkEventKind, DesklinkState, EventMeta, SavedHostMaterialOwned,
 };
 
 const COMMAND_CAPACITY: usize = 1_024;
@@ -31,6 +31,8 @@ const RELEASE_RESERVE: usize = 1;
 const PHASE_CONNECTING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
+
+type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
 
 pub(crate) struct SecureConnectionConfigOwned {
     pub server_name: String,
@@ -65,7 +67,7 @@ impl Drop for DirectoryConnectionConfigOwned {
 #[derive(Debug)]
 pub(crate) enum ControllerCommand {
     SendInput(InputEvent),
-    ReleaseAll(Vec<InputEvent>),
+    ReleaseAll,
     RequestKeyframe,
     Shutdown,
 }
@@ -125,6 +127,8 @@ impl CallbackTarget {
 pub(crate) struct ControllerWorker {
     commands: mpsc::Sender<ControllerCommand>,
     cancellation: watch::Sender<bool>,
+    release_events: Arc<Mutex<Vec<InputEvent>>>,
+    release_pending: Arc<AtomicU8>,
     phase: Arc<AtomicU8>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -137,16 +141,22 @@ impl ControllerWorker {
         callback: Option<DesklinkEventCallback>,
         callback_context: *mut std::ffi::c_void,
         material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
+        material_publisher: Option<MaterialPublisher>,
     ) -> Result<Self, std::io::Error> {
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY + RELEASE_RESERVE);
         let (cancellation, cancellation_receiver) = watch::channel(false);
+        let release_events = Arc::new(Mutex::new(Vec::new()));
+        let release_pending = Arc::new(AtomicU8::new(0));
         let phase = Arc::new(AtomicU8::new(PHASE_CONNECTING));
         let worker_phase = phase.clone();
+        let worker_release_pending = release_pending.clone();
+        let worker_release_events = release_events.clone();
         let callback = CallbackTarget {
             callback,
             context: callback_context as usize,
         };
         let worker_material_invalidator = material_invalidator.clone();
+        let worker_material_publisher = material_publisher.clone();
         let thread = thread::Builder::new()
             .name("desklink-controller".into())
             .spawn(move || {
@@ -164,6 +174,9 @@ impl ControllerWorker {
                         worker_phase.clone(),
                         callback,
                         worker_material_invalidator,
+                        worker_material_publisher,
+                        worker_release_events,
+                        worker_release_pending,
                     )),
                     Err(error) => callback.emit_error(&error.to_string(), 0),
                 }
@@ -172,6 +185,8 @@ impl ControllerWorker {
         Ok(Self {
             commands,
             cancellation,
+            release_events,
+            release_pending,
             phase,
             thread: Some(thread),
         })
@@ -185,9 +200,12 @@ impl ControllerWorker {
     }
 
     pub(crate) fn release_all(&self, events: Vec<InputEvent>) -> Result<(), ()> {
-        self.commands
-            .try_send(ControllerCommand::ReleaseAll(events))
-            .map_err(|_| ())
+        enqueue_release_all(
+            &self.commands,
+            &self.release_events,
+            &self.release_pending,
+            events,
+        )
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -225,6 +243,9 @@ async fn run_worker(
     phase: Arc<AtomicU8>,
     callback: CallbackTarget,
     material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
+    material_publisher: Option<MaterialPublisher>,
+    release_events: Arc<Mutex<Vec<InputEvent>>>,
+    release_pending: Arc<AtomicU8>,
 ) {
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
@@ -242,10 +263,21 @@ async fn run_worker(
             },
             0,
         );
-        let connection = connect_controller(&relay_url, platform, &config, callback);
+        let connection = connect_controller(
+            &relay_url,
+            platform,
+            &config,
+            callback,
+            material_publisher.clone(),
+        );
         let controller = tokio::select! {
             result = connection => match result {
-                Ok(controller) => controller,
+                Ok(connection) => {
+                    if let Some(expires_at_unix_s) = connection.expires_at_unix_s {
+                        schedule.set_expiry(Some(expires_at_unix_s));
+                    }
+                    connection.controller
+                },
                 Err(failure) => {
                     if schedule_retry(
                         failure,
@@ -255,6 +287,8 @@ async fn run_worker(
                         &mut pending_release,
                         &mut cancellation,
                         callback,
+                        &release_events,
+                        &release_pending,
                     ).await {
                         first_attempt = false;
                         continue;
@@ -275,6 +309,8 @@ async fn run_worker(
             &mut pending_release,
             &mut cancellation,
             callback,
+            &release_events,
+            &release_pending,
         )
         .await
         {
@@ -295,6 +331,8 @@ async fn run_worker(
                     &mut pending_release,
                     &mut cancellation,
                     callback,
+                    &release_events,
+                    &release_pending,
                 )
                 .await
                 {
@@ -368,6 +406,8 @@ async fn run_connected(
     pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
+    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_pending: &Arc<AtomicU8>,
 ) -> ConnectedOutcome {
     let mut stable = false;
     if let Some(events) = pending_release.take() {
@@ -385,7 +425,9 @@ async fn run_connected(
         tokio::select! {
             biased;
             command = commands.recv() => match command {
-                Some(ControllerCommand::ReleaseAll(events)) => {
+                Some(ControllerCommand::ReleaseAll) => {
+                    release_pending.store(0, Ordering::Release);
+                    let events = take_release_events(release_events);
                     for event in events {
                         if let Err(error) = controller.send_input(event).await {
                             return ConnectedOutcome::Failed {
@@ -468,6 +510,8 @@ async fn schedule_retry(
     pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
+    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_pending: &Arc<AtomicU8>,
 ) -> bool {
     if !failure.retryable {
         callback.emit_error(&failure.message, 0);
@@ -489,7 +533,15 @@ async fn schedule_retry(
                 0,
                 DesklinkState::Reconnecting,
             );
-            wait_for_retry(delay, commands, pending_release, cancellation).await
+            wait_for_retry(
+                delay,
+                commands,
+                pending_release,
+                cancellation,
+                release_events,
+                release_pending,
+            )
+            .await
         }
         ReconnectDecision::Exhausted => {
             callback.emit_error(
@@ -514,6 +566,8 @@ async fn wait_for_retry(
     commands: &mut mpsc::Receiver<ControllerCommand>,
     pending_release: &mut Option<Vec<InputEvent>>,
     cancellation: &mut watch::Receiver<bool>,
+    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_pending: &Arc<AtomicU8>,
 ) -> bool {
     if *cancellation.borrow() {
         return false;
@@ -524,7 +578,9 @@ async fn wait_for_retry(
         tokio::select! {
             biased;
             command = commands.recv() => match command {
-                Some(ControllerCommand::ReleaseAll(events)) => {
+                Some(ControllerCommand::ReleaseAll) => {
+                    release_pending.store(0, Ordering::Release);
+                    let events = take_release_events(release_events);
                     if let Some(pending) = pending_release {
                         pending.extend(events);
                     } else {
@@ -598,44 +654,58 @@ async fn connect_controller(
     platform: Platform,
     config: &SecureConnectionConfigOwned,
     callback: CallbackTarget,
-) -> Result<ControllerRuntime, ConnectFailure> {
+    material_publisher: Option<MaterialPublisher>,
+) -> Result<ResolvedControllerConnection, ConnectFailure> {
     let relay_addr = resolve_relay(relay_url).map_err(ConnectFailure::permanent)?;
     let transport_config = QuicClientConfig::new(relay_addr, config.server_name.clone())
         .map_err(ConnectFailure::from_transport)?;
-    let (session_id, relay_authentication, host_verify_key) = if let Some(directory) =
-        &config.directory
-    {
-        let lookup_client = QuicClient::connect(transport_config.clone())
-            .await
-            .map_err(ConnectFailure::from_transport)?;
-        let lookup = RelayDirectoryLookup::new(directory.device_id, directory.access_code)
-            .map_err(ConnectFailure::from_transport)?;
-        let mut invitation = lookup_client
-            .lookup_directory(lookup)
-            .await
-            .map_err(ConnectFailure::from_transport)?;
-        let result = PairingInvite::decode(&invitation, now_unix_s())
-            .map(|invite| {
-                (
-                    *invite.session_id().as_bytes(),
-                    *invite.relay_authentication(),
-                    *invite.host_verify_key().as_bytes(),
-                )
-            })
-            .map_err(|_| {
-                ConnectFailure::permanent(
-                    "the device returned an invalid or expired connection invitation".to_owned(),
-                )
-            });
-        invitation.zeroize();
-        result?
-    } else {
-        (
-            config.session_id,
-            config.relay_authentication,
-            config.host_verify_key,
-        )
-    };
+    let (session_id, relay_authentication, host_verify_key, expires_at_unix_s) =
+        if let Some(directory) = &config.directory {
+            let lookup_client = QuicClient::connect(transport_config.clone())
+                .await
+                .map_err(ConnectFailure::from_transport)?;
+            let lookup = RelayDirectoryLookup::new(directory.device_id, directory.access_code)
+                .map_err(ConnectFailure::from_transport)?;
+            let mut invitation = lookup_client
+                .lookup_directory(lookup)
+                .await
+                .map_err(ConnectFailure::from_transport)?;
+            let result = PairingInvite::decode(&invitation, now_unix_s())
+                .map(|invite| {
+                    let session_id = *invite.session_id().as_bytes();
+                    let relay_authentication = *invite.relay_authentication();
+                    let host_verify_key = *invite.host_verify_key().as_bytes();
+                    if let Some(publish) = &material_publisher {
+                        publish(SavedHostMaterialOwned {
+                            session_id,
+                            relay_authentication: Zeroizing::new(relay_authentication),
+                            host_verify_key,
+                            server_name: config.server_name.clone(),
+                        });
+                    }
+                    (
+                        session_id,
+                        relay_authentication,
+                        host_verify_key,
+                        Some(invite.expires_at_unix_s()).filter(|expires| *expires != 0),
+                    )
+                })
+                .map_err(|_| {
+                    ConnectFailure::permanent(
+                        "the device returned an invalid or expired connection invitation"
+                            .to_owned(),
+                    )
+                });
+            invitation.zeroize();
+            result?
+        } else {
+            (
+                config.session_id,
+                config.relay_authentication,
+                config.host_verify_key,
+                config.expires_at_unix_s,
+            )
+        };
     let client = QuicClient::connect(transport_config)
         .await
         .map_err(ConnectFailure::from_transport)?;
@@ -656,7 +726,49 @@ async fn connect_controller(
     callback.emit_state(DesklinkState::NegotiatingCapabilities, 0);
     ControllerRuntime::connect_for_platform(client, identity, expected_host, platform)
         .await
+        .map(|controller| ResolvedControllerConnection {
+            controller,
+            expires_at_unix_s,
+        })
         .map_err(ConnectFailure::from_controller)
+}
+
+struct ResolvedControllerConnection {
+    controller: ControllerRuntime,
+    expires_at_unix_s: Option<u64>,
+}
+
+fn enqueue_release_all(
+    commands: &mpsc::Sender<ControllerCommand>,
+    release_events: &Mutex<Vec<InputEvent>>,
+    release_pending: &AtomicU8,
+    events: Vec<InputEvent>,
+) -> Result<(), ()> {
+    if !events.is_empty() {
+        let mut pending = release_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.extend(events);
+    }
+    if release_pending.swap(1, Ordering::AcqRel) == 1 {
+        return Ok(());
+    }
+    if commands.try_send(ControllerCommand::ReleaseAll).is_err() {
+        release_pending.store(0, Ordering::Release);
+        release_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        return Err(());
+    }
+    Ok(())
+}
+
+fn take_release_events(release_events: &Mutex<Vec<InputEvent>>) -> Vec<InputEvent> {
+    let mut pending = release_events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *pending)
 }
 
 fn emit_controller_event(callback: CallbackTarget, event: ControllerEvent) -> bool {
@@ -780,6 +892,8 @@ mod tests {
     async fn retry_wait_discards_stale_commands_and_honors_cancellation() {
         let (sender, mut commands) = mpsc::channel(4);
         let (cancellation_sender, mut cancellation) = watch::channel(false);
+        let release_events = Arc::new(Mutex::new(Vec::new()));
+        let release_pending = Arc::new(AtomicU8::new(0));
         let mut pending_release = None;
         sender
             .send(ControllerCommand::RequestKeyframe)
@@ -791,6 +905,8 @@ mod tests {
                 &mut commands,
                 &mut pending_release,
                 &mut cancellation,
+                &release_events,
+                &release_pending,
             )
             .await
         );
@@ -803,8 +919,47 @@ mod tests {
                 &mut commands,
                 &mut pending_release,
                 &mut cancellation,
+                &release_events,
+                &release_pending,
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_release_all_is_coalesced_without_consuming_queue_capacity() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let release_events = Mutex::new(Vec::new());
+        let release_pending = AtomicU8::new(0);
+        let first_event = InputEvent::MouseMove { x: 1, y: 2 };
+        let second_event = InputEvent::MouseMove { x: 3, y: 4 };
+
+        assert!(
+            enqueue_release_all(
+                &sender,
+                &release_events,
+                &release_pending,
+                vec![first_event.clone()]
+            )
+            .is_ok()
+        );
+        assert!(
+            enqueue_release_all(
+                &sender,
+                &release_events,
+                &release_pending,
+                vec![second_event.clone()]
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ControllerCommand::ReleaseAll)
+        ));
+        assert_eq!(
+            take_release_events(&release_events),
+            vec![first_event, second_event]
+        );
+        assert_eq!(release_pending.load(Ordering::Acquire), 1);
     }
 }

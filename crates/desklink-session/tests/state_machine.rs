@@ -274,6 +274,23 @@ fn reconnect_schedule_honors_expiry_and_resets_after_stable_connection() {
 }
 
 #[test]
+fn reconnect_schedule_can_receive_expiry_after_directory_resolution() {
+    let policy = ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(1), 2).unwrap();
+    let mut schedule = ReconnectSchedule::new(policy, None);
+
+    schedule.set_expiry(Some(2_005));
+
+    assert_eq!(
+        schedule.next(2_004),
+        ReconnectDecision::RetryAfter {
+            retry: 1,
+            delay: Duration::from_secs(1)
+        }
+    );
+    assert_eq!(schedule.next(2_005), ReconnectDecision::SessionExpired);
+}
+
+#[test]
 fn reconnect_policy_rejects_unsafe_configuration() {
     assert_eq!(
         ReconnectPolicy::new(Duration::ZERO, Duration::from_secs(1), 1),

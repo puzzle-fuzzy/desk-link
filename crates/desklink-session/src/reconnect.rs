@@ -116,6 +116,13 @@ impl ReconnectSchedule {
         self.policy.max_retries
     }
 
+    /// Updates the lifetime of a session after a directory lookup resolves an
+    /// invitation. Pairing-code connections know their expiry before the
+    /// worker starts; directory connections only learn it asynchronously.
+    pub const fn set_expiry(&mut self, expires_at_unix_s: Option<u64>) {
+        self.expires_at_unix_s = expires_at_unix_s;
+    }
+
     pub fn reset(&mut self) {
         self.retries_used = 0;
     }
