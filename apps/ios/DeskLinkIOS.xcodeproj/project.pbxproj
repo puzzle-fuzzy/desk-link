@@ -25,6 +25,7 @@
 		100000000000000000000072 /* IOSSpecialKeyBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000073 /* IOSSpecialKeyBar.swift */; };
 		100000000000000000000074 /* IOSSessionLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000075 /* IOSSessionLifecycle.swift */; };
 		100000000000000000000076 /* IOSLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000077 /* IOSLifecycleTests.swift */; };
+		100000000000000000000079 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000078 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -69,6 +70,7 @@
 		100000000000000000000073 /* IOSSpecialKeyBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Input/IOSSpecialKeyBar.swift; sourceTree = "<group>"; };
 		100000000000000000000075 /* IOSSessionLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Lifecycle/IOSSessionLifecycle.swift; sourceTree = "<group>"; };
 		100000000000000000000077 /* IOSLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSLifecycleTests.swift; sourceTree = "<group>"; };
+		100000000000000000000078 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -122,6 +124,7 @@
 				100000000000000000000075 /* IOSSessionLifecycle.swift */,
 				10000000000000000000006E /* IOSMetalVideoView.swift */,
 				10000000000000000000006F /* IOSSessionView.swift */,
+				100000000000000000000078 /* Assets.xcassets */,
 				100000000000000000000022 /* Info.plist */,
 			);
 			path = DeskLinkIOS;
@@ -276,7 +279,7 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		100000000000000000000041 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000041 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000079 /* Assets.xcassets in Resources */); runOnlyForDeploymentPostprocessing = 0; };
 		100000000000000000000044 /* Test Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		100000000000000000000047 /* UI Test Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */

@@ -1,4 +1,5 @@
 import AppKit
+import DeskLinkAppleCore
 import SwiftUI
 
 enum HostHomePage {
@@ -109,26 +110,8 @@ struct HostHomeView: View {
 
             DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
                 if let invite = bridge.pairingInvite {
-                    HStack(alignment: .center, spacing: 22) {
-                        PairingQRCodeView(encodedInvite: invite.encoded)
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("手机扫描此二维码")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(DeskLinkPalette.ink)
-                            Text("在 iPhone 的 DeskLink 中选择“扫描二维码”。二维码与复制的连接码使用同一份一次性邀请。")
-                                .font(.system(size: 12))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text("有效期至 \(invite.expiresAt.formatted(date: .omitted, time: .shortened))。只发送给你正在操作的设备。")
-                                .font(.system(size: 12))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
-                            HStack(spacing: 10) {
-                                Button("复制连接码") { bridge.copyInviteToPasteboard() }
-                                    .buttonStyle(DeskLinkPrimaryButtonStyle())
-                                Button("停止共享") { bridge.stop() }
-                                    .buttonStyle(DeskLinkSecondaryButtonStyle())
-                            }
-                        }
+                    TimelineView(.periodic(from: Date(), by: 1)) { context in
+                        pairingInvitePanel(invite, now: context.date)
                     }
                 } else {
                     HStack(alignment: .center, spacing: 20) {
@@ -152,6 +135,56 @@ struct HostHomeView: View {
 
             if let error = bridge.lastError {
                 DeskLinkErrorView(message: error)
+            }
+        }
+    }
+
+    private func pairingInvitePanel(_ invite: HostPairingInvite, now: Date) -> some View {
+        let isExpired = now >= invite.expiresAt
+
+        return HStack(alignment: .center, spacing: 22) {
+            ZStack {
+                PairingQRCodeView(encodedInvite: invite.encoded)
+                    .saturation(isExpired ? 0 : 1)
+                    .opacity(isExpired ? 0.35 : 1)
+                if isExpired {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.72))
+                    VStack(spacing: 6) {
+                        Image(systemName: "clock.badge.exclamationmark")
+                            .font(.system(size: 24, weight: .semibold))
+                        Text("二维码已过期")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .foregroundStyle(DeskLinkPalette.secondaryInk)
+                }
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text("手机扫描此二维码")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(DeskLinkPalette.ink)
+                    if isExpired {
+                        Button("重新生成") { bridge.createInvite() }
+                            .buttonStyle(DeskLinkPrimaryButtonStyle())
+                    }
+                }
+                Text(isExpired
+                    ? "二维码已失效，请重新生成后再用 iPhone 扫描。"
+                    : "在 iPhone 的 DeskLink 中选择“扫描二维码”。二维码与复制的连接码使用同一份一次性邀请。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskLinkPalette.secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("有效期至 \(invite.expiresAt.formatted(date: .omitted, time: .shortened))。只发送给你正在操作的设备。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(isExpired ? DeskLinkPalette.warning : DeskLinkPalette.secondaryInk)
+                HStack(spacing: 10) {
+                    Button("复制连接码") { bridge.copyInviteToPasteboard() }
+                        .buttonStyle(DeskLinkPrimaryButtonStyle())
+                        .disabled(isExpired)
+                    Button("停止共享") { bridge.stop() }
+                        .buttonStyle(DeskLinkSecondaryButtonStyle())
+                }
             }
         }
     }

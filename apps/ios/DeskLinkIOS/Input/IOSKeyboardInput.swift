@@ -58,6 +58,7 @@ enum IOSSpecialKey: String, CaseIterable, Hashable, Identifiable {
 @MainActor
 final class IOSKeyboardInput: ObservableObject {
     @Published private(set) var activeModifiers: Modifiers = []
+    @Published private(set) var isKeyboardVisible = false
 
     private let bridge: ControllerBridge
     private var responder: IOSKeyboardResponder?
@@ -75,13 +76,18 @@ final class IOSKeyboardInput: ObservableObject {
     }
 
     func becomeFirstResponder() {
-        makeResponderView().becomeFirstResponder()
+        isKeyboardVisible = makeResponderView().becomeFirstResponder()
     }
 
     func resign() {
-        responder?.resignFirstResponder()
+        _ = responder?.resignFirstResponder()
         bridge.releaseAll()
         activeModifiers = []
+        isKeyboardVisible = false
+    }
+
+    fileprivate func responderDidResign() {
+        isKeyboardVisible = false
     }
 
     func sendSpecialKey(_ key: IOSSpecialKey, pressed: Bool) {
@@ -114,6 +120,45 @@ final class IOSKeyboardResponder: UITextView {
     weak var owner: IOSKeyboardInput?
 
     override var canBecomeFirstResponder: Bool { true }
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        inputAccessoryView = Self.makeInputAccessoryView(target: self)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        inputAccessoryView = Self.makeInputAccessoryView(target: self)
+    }
+
+    private static func makeInputAccessoryView(target: IOSKeyboardResponder) -> UIToolbar {
+        let toolbar = UIToolbar()
+        toolbar.sizeToFit()
+        toolbar.items = [
+            UIBarButtonItem(
+                barButtonSystemItem: .flexibleSpace,
+                target: nil,
+                action: nil
+            ),
+            UIBarButtonItem(
+                title: "收起键盘",
+                style: .done,
+                target: self,
+                action: #selector(dismissKeyboard)
+            ),
+        ]
+        return toolbar
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let didResign = super.resignFirstResponder()
+        if didResign { owner?.responderDidResign() }
+        return didResign
+    }
+
+    @objc private func dismissKeyboard() {
+        owner?.resign()
+    }
 
     override func insertText(_ text: String) {
         owner?.sendCommittedText(text)

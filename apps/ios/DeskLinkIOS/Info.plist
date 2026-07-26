@@ -20,6 +20,12 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>DeskLink uses the camera only to scan a pairing QR code when you ask it to.</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 </dict>

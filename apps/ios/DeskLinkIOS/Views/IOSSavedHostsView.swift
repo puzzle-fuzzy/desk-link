@@ -36,7 +36,12 @@ struct IOSSavedHostsView: View {
                                     destination = .connect
                                     controller.connect(savedHost: host)
                                 }
-                                    .buttonStyle(.borderless)
+                                .buttonStyle(.borderless)
+                                Button(role: .destructive) { remove(host) } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("删除 \(host.serverName)")
                             }
                             Text("认证材料保存在 Keychain")
                                 .font(.caption)
@@ -50,14 +55,6 @@ struct IOSSavedHostsView: View {
                 }
                 if let loadError {
                     Text(loadError).foregroundStyle(.red)
-                }
-                if let lastError = controller.lastError {
-                    Section("连接状态") {
-                        Text(lastError).foregroundStyle(.red)
-                        Text("记录仍然保留，你可以重试或删除它。")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
                 }
             }
             .navigationTitle("已保存设备")

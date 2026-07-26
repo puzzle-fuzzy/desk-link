@@ -20,7 +20,7 @@ struct IOSRootView: View {
             IOSSavedHostsView(controller: controller, destination: $destination)
                 .tabItem { Label(IOSRootDestination.savedHosts.rawValue, systemImage: "externaldrive.connected.to.line.below") }
                 .tag(IOSRootDestination.savedHosts)
-            IOSMoreView(controller: controller)
+            IOSMoreView()
                 .tabItem { Label(IOSRootDestination.more.rawValue, systemImage: "ellipsis.circle") }
                 .tag(IOSRootDestination.more)
         }
@@ -46,16 +46,28 @@ struct IOSConnectionHomeView: View {
                 if !savedHosts.isEmpty {
                     Section("最近设备") {
                         ForEach(savedHosts.prefix(3)) { host in
-                            Button {
-                                controller.connect(savedHost: host)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(host.serverName)
-                                        .foregroundStyle(.primary)
-                                    Text("已保存的安全连接")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                            HStack(spacing: 12) {
+                                Button {
+                                    controller.connect(savedHost: host)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(host.serverName)
+                                            .foregroundStyle(.primary)
+                                        Text("已保存的安全连接")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
+                                .buttonStyle(.borderless)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                Button(role: .destructive) {
+                                    removeSavedHost(host)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("删除 \(host.serverName)")
                             }
                         }
                     }
@@ -110,13 +122,19 @@ struct IOSConnectionHomeView: View {
                     } onInvalidPayload: {
                         inputError = "二维码不是有效的 DeskLink 连接码。"
                     }
+                    .background(Color.black.ignoresSafeArea())
+                    .ignoresSafeArea(.container, edges: [.bottom, .horizontal])
                     .navigationTitle("扫描二维码")
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
                             Button("取消") { isShowingScanner = false }
                         }
                     }
+                    .toolbarBackground(.black, for: .navigationBar)
+                    .toolbarColorScheme(.dark, for: .navigationBar)
                 }
+                .background(Color.black.ignoresSafeArea())
+                .preferredColorScheme(.dark)
             }
             .task { reloadSavedHosts() }
             .onChange(of: controller.state) { _ in reloadSavedHosts() }
@@ -181,11 +199,18 @@ struct IOSConnectionHomeView: View {
     private func reloadSavedHosts() {
         savedHosts = (try? savedHostStore.loadAll()) ?? []
     }
+
+    private func removeSavedHost(_ host: SavedHost) {
+        do {
+            try savedHostStore.remove(id: host.id)
+            reloadSavedHosts()
+        } catch {
+            inputError = "无法删除设备记录。"
+        }
+    }
 }
 
 struct IOSMoreView: View {
-    @ObservedObject var controller: ControllerBridge
-
     var body: some View {
         NavigationStack {
             Form {
@@ -195,31 +220,8 @@ struct IOSMoreView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Section("当前连接") {
-                    Text(connectionSummary)
-                    Button("断开连接", role: .destructive) { controller.disconnect() }
-                        .disabled(!isActive)
-                }
             }
             .navigationTitle("更多")
-        }
-    }
-
-    private var isActive: Bool {
-        switch controller.state {
-        case .pairing, .connecting, .connected, .reconnecting, .recovering, .frozen: true
-        default: false
-        }
-    }
-
-    private var connectionSummary: String {
-        switch controller.state {
-        case .pairing, .connecting, .reconnecting, .recovering, .frozen:
-            IOSSessionPresentation.statusText(controller.state)
-        case .connected: "已连接"
-        case .failed: "连接失败"
-        case .closed: "已断开"
-        default: "未连接"
         }
     }
 }

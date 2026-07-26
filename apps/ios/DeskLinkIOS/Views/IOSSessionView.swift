@@ -1,5 +1,6 @@
 import DeskLinkAppleCore
 import SwiftUI
+import UIKit
 
 enum IOSSessionPresentation {
     static func isActive(_ state: ConnectionState) -> Bool {
@@ -131,22 +132,38 @@ struct IOSSessionView: View {
         VStack(spacing: 10) {
             IOSSpecialKeyBar(keyboard: keyboardInput)
 
-            Picker("输入模式", selection: $touchMode) {
-                ForEach(IOSTouchMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+            HStack(spacing: 8) {
+                Picker("输入模式", selection: $touchMode) {
+                    ForEach(IOSTouchMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: .infinity)
+
+                Button {
+                    IOSOrientationController.toggle()
+                } label: {
+                    Label("旋转", systemImage: "rotate.right")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("切换横屏和竖屏")
+                .fixedSize()
             }
-            .pickerStyle(.segmented)
             .padding(.horizontal, 12)
 
             HStack(spacing: 8) {
                 sessionAction(
-                    title: "键盘",
-                    accessibilityLabel: "打开键盘输入",
+                    title: keyboardInput.isKeyboardVisible ? "收起" : "键盘",
+                    accessibilityLabel: keyboardInput.isKeyboardVisible ? "收起键盘" : "打开键盘输入",
                     systemImage: "keyboard",
                     enabled: isInputEnabled
                 ) {
-                    keyboardInput.becomeFirstResponder()
+                    if keyboardInput.isKeyboardVisible {
+                        keyboardInput.resign()
+                    } else {
+                        keyboardInput.becomeFirstResponder()
+                    }
                 }
                 sessionAction(
                     title: "诊断",
@@ -240,5 +257,21 @@ struct IOSSessionView: View {
     private var videoSizeText: String {
         guard let videoSize = controller.videoSize else { return "等待视频配置" }
         return "\(Int(videoSize.width)) × \(Int(videoSize.height))"
+    }
+}
+
+enum IOSOrientationController {
+    static func toggle() {
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first
+        else { return }
+
+        let orientations: UIInterfaceOrientationMask = windowScene.interfaceOrientation.isPortrait
+            ? [.landscapeLeft, .landscapeRight]
+            : .portrait
+        windowScene.requestGeometryUpdate(
+            UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: orientations)
+        )
     }
 }
