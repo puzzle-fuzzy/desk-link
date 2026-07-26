@@ -8,8 +8,8 @@ let package = Package(
         .iOS(.v16),
     ],
     products: [
-        .library(name: "DeskLinkAppleCore", targets: ["DeskLinkAppleCore"]),
-        .library(name: "DeskLinkC", targets: ["DeskLinkC"]),
+        .library(name: "DeskLinkAppleCore", type: .static, targets: ["DeskLinkAppleCore"]),
+        .library(name: "DeskLinkC", type: .static, targets: ["DeskLinkC"]),
     ],
     targets: [
         .target(
@@ -26,17 +26,19 @@ let package = Package(
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("Security"),
                 .linkedFramework("VideoToolbox"),
+            ]
+        ),
+        .testTarget(
+            name: "DeskLinkAppleCoreTests",
+            dependencies: ["DeskLinkAppleCore"],
+            path: "Tests/DeskLinkAppleCoreTests",
+            linkerSettings: [
                 .unsafeFlags([
                     "-L", "../../target/aarch64-apple-darwin/release",
                     "-L", "../../target/debug",
                     "-ldesklink_ffi",
                 ]),
             ]
-        ),
-        .testTarget(
-            name: "DeskLinkAppleCoreTests",
-            dependencies: ["DeskLinkAppleCore"],
-            path: "Tests/DeskLinkAppleCoreTests"
         ),
     ],
     swiftLanguageModes: [.v6]

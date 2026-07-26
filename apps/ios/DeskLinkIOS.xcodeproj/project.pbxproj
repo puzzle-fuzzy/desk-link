@@ -1,0 +1,285 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000030 /* DeskLinkIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000020 /* DeskLinkIOSApp.swift */; };
+		100000000000000000000033 /* IOSRuntimeConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000021 /* IOSRuntimeConfiguration.swift */; };
+		100000000000000000000031 /* DeskLinkFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 100000000000000000000025 /* DeskLinkFFI.xcframework */; };
+		100000000000000000000032 /* IOSBuildConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000023 /* IOSBuildConfigurationTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		100000000000000000000063 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 100000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 100000000000000000000002;
+			remoteInfo = DeskLinkIOS;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		100000000000000000000004 /* DeskLinkIOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DeskLinkIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000005 /* DeskLinkIOSTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DeskLinkIOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000020 /* DeskLinkIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeskLinkIOSApp.swift; sourceTree = "<group>"; };
+		100000000000000000000021 /* IOSRuntimeConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Configuration/IOSRuntimeConfiguration.swift; sourceTree = "<group>"; };
+		100000000000000000000022 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000023 /* IOSBuildConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSBuildConfigurationTests.swift; sourceTree = "<group>"; };
+		100000000000000000000024 /* Tests Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000025 /* DeskLinkFFI.xcframework */ = {isa = PBXFileReference; explicitFileType = wrapper.xcframework; includeInIndex = 0; path = ../../dist/apple/DeskLinkFFI.xcframework; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		100000000000000000000042 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000031 /* DeskLinkFFI.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		100000000000000000000045 /* Test Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		100000000000000000000010 = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000011 /* DeskLinkIOS */,
+				100000000000000000000012 /* DeskLinkIOSTests */,
+				100000000000000000000013 /* Frameworks */,
+				100000000000000000000014 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		100000000000000000000011 /* DeskLinkIOS */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000020 /* DeskLinkIOSApp.swift */,
+				100000000000000000000021 /* IOSRuntimeConfiguration.swift */,
+				100000000000000000000022 /* Info.plist */,
+			);
+			path = DeskLinkIOS;
+			sourceTree = "<group>";
+		};
+		100000000000000000000012 /* DeskLinkIOSTests */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000023 /* IOSBuildConfigurationTests.swift */,
+				100000000000000000000024 /* Tests Info.plist */,
+			);
+			path = DeskLinkIOSTests;
+			sourceTree = "<group>";
+		};
+		100000000000000000000013 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000025 /* DeskLinkFFI.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		100000000000000000000014 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000004 /* DeskLinkIOS.app */,
+				100000000000000000000005 /* DeskLinkIOSTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		100000000000000000000002 /* DeskLinkIOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000053 /* Build configuration list for PBXNativeTarget "DeskLinkIOS" */;
+			buildPhases = (
+				100000000000000000000040 /* Sources */,
+				100000000000000000000041 /* Resources */,
+				100000000000000000000042 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DeskLinkIOS;
+			packageProductDependencies = (
+				100000000000000000000061 /* DeskLinkAppleCore */,
+			);
+			productName = DeskLinkIOS;
+			productReference = 100000000000000000000004 /* DeskLinkIOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		100000000000000000000003 /* DeskLinkIOSTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000056 /* Build configuration list for PBXNativeTarget "DeskLinkIOSTests" */;
+			buildPhases = (
+				100000000000000000000043 /* Sources */, 
+				100000000000000000000044 /* Resources */,
+				100000000000000000000045 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				100000000000000000000062 /* PBXTargetDependency */,
+			);
+			name = DeskLinkIOSTests;
+			productName = DeskLinkIOSTests;
+			productReference = 100000000000000000000005 /* DeskLinkIOSTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXTargetDependency section */
+		100000000000000000000062 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 100000000000000000000002 /* DeskLinkIOS */;
+			targetProxy = 100000000000000000000063 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXProject section */
+		100000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 2660;
+				TargetAttributes = {
+					100000000000000000000002 = {CreatedOnToolsVersion = 26.6; };
+					100000000000000000000003 = {CreatedOnToolsVersion = 26.6; TestTargetID = 100000000000000000000002; };
+				};
+			};
+			buildConfigurationList = 100000000000000000000050 /* Build configuration list for PBXProject "DeskLinkIOS" */;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 100000000000000000000010;
+			packageReferences = (
+				100000000000000000000060 /* XCLocalSwiftPackageReference "apple" */,
+			);
+			productRefGroup = 100000000000000000000014 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				100000000000000000000002 /* DeskLinkIOS */,
+				100000000000000000000003 /* DeskLinkIOSTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		100000000000000000000041 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000044 /* Test Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		100000000000000000000040 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000030 /* DeskLinkIOSApp.swift in Sources */, 100000000000000000000033 /* IOSRuntimeConfiguration.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000043 /* Test Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000032 /* IOSBuildConfigurationTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		100000000000000000000051 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 6.0; }; name = Debug; };
+		100000000000000000000052 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 6.0; }; name = Release; };
+		100000000000000000000054 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {
+					ARCHS = arm64;
+					ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+					CODE_SIGN_STYLE = Automatic;
+					CURRENT_PROJECT_VERSION = 1;
+					DEVELOPMENT_TEAM = "";
+					ENABLE_TESTABILITY = YES;
+					GENERATE_INFOPLIST_FILE = NO;
+					INFOPLIST_FILE = DeskLinkIOS/Info.plist;
+					IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+					LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+					PRODUCT_BUNDLE_IDENTIFIER = com.desklink.ios;
+					PRODUCT_NAME = DeskLinkIOS;
+					SDKROOT = iphoneos;
+					SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+					SWIFT_EMIT_LOC_STRINGS = YES;
+					SWIFT_VERSION = 6.0;
+					TARGETED_DEVICE_FAMILY = 1;
+				}; name = Debug; };
+		100000000000000000000055 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {
+					ARCHS = arm64;
+					ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+					CODE_SIGN_STYLE = Automatic;
+					CURRENT_PROJECT_VERSION = 1;
+					DEVELOPMENT_TEAM = "";
+					GENERATE_INFOPLIST_FILE = NO;
+					INFOPLIST_FILE = DeskLinkIOS/Info.plist;
+					IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+					LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+					PRODUCT_BUNDLE_IDENTIFIER = com.desklink.ios;
+					PRODUCT_NAME = DeskLinkIOS;
+					SDKROOT = iphoneos;
+					SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+					SWIFT_EMIT_LOC_STRINGS = YES;
+					SWIFT_VERSION = 6.0;
+					TARGETED_DEVICE_FAMILY = 1;
+				}; name = Release; };
+		100000000000000000000057 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {
+					ARCHS = arm64;
+					BUNDLE_LOADER = "$(TEST_HOST)";
+					CODE_SIGN_STYLE = Automatic;
+					GENERATE_INFOPLIST_FILE = NO;
+					INFOPLIST_FILE = DeskLinkIOSTests/Info.plist;
+					IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+					PRODUCT_BUNDLE_IDENTIFIER = com.desklink.ios.tests;
+					PRODUCT_NAME = DeskLinkIOSTests;
+					SDKROOT = iphoneos;
+					SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+					SWIFT_VERSION = 6.0;
+					TARGETED_DEVICE_FAMILY = 1;
+					TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DeskLinkIOS.app/DeskLinkIOS";
+				}; name = Debug; };
+		100000000000000000000058 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {
+					ARCHS = arm64;
+					BUNDLE_LOADER = "$(TEST_HOST)";
+					CODE_SIGN_STYLE = Automatic;
+					GENERATE_INFOPLIST_FILE = NO;
+					INFOPLIST_FILE = DeskLinkIOSTests/Info.plist;
+					IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+					PRODUCT_BUNDLE_IDENTIFIER = com.desklink.ios.tests;
+					PRODUCT_NAME = DeskLinkIOSTests;
+					SDKROOT = iphoneos;
+					SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+					SWIFT_VERSION = 6.0;
+					TARGETED_DEVICE_FAMILY = 1;
+					TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DeskLinkIOS.app/DeskLinkIOS";
+				}; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		100000000000000000000050 /* Build configuration list for PBXProject "DeskLinkIOS" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000051 /* Debug */, 100000000000000000000052 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		100000000000000000000053 /* Build configuration list for PBXNativeTarget "DeskLinkIOS" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000054 /* Debug */, 100000000000000000000055 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		100000000000000000000056 /* Build configuration list for PBXNativeTarget "DeskLinkIOSTests" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000057 /* Debug */, 100000000000000000000058 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		100000000000000000000060 /* XCLocalSwiftPackageReference "apple" */ = {isa = XCLocalSwiftPackageReference; relativePath = ../apple; };
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		100000000000000000000061 /* DeskLinkAppleCore */ = {isa = XCSwiftPackageProductDependency; package = 100000000000000000000060 /* XCLocalSwiftPackageReference "apple" */; productName = DeskLinkAppleCore; };
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 100000000000000000000001 /* Project object */;
+}
