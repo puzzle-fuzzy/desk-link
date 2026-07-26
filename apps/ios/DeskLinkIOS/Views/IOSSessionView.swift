@@ -31,7 +31,6 @@ struct IOSSessionView: View {
     @ObservedObject var controller: ControllerBridge
     @State private var visibleVideoRect: CGRect = .zero
     @State private var viewport = IOSVideoViewport()
-    @State private var isMoreExpanded = false
     @StateObject private var keyboard: IOSKeyboardInput
 
     init(controller: ControllerBridge) {
@@ -49,6 +48,16 @@ struct IOSSessionView: View {
                 .padding(.trailing, 18)
                 .padding(.bottom, 30)
 
+            VStack {
+                HStack {
+                    Spacer()
+                    disconnectControl
+                }
+                Spacer()
+            }
+            .padding(.top, 12)
+            .padding(.trailing, 18)
+
             IOSKeyboardInputView(input: keyboard)
                 .frame(width: 1, height: 1)
                 .opacity(0.01)
@@ -62,28 +71,16 @@ struct IOSSessionView: View {
         }
         .onChange(of: controller.state) { state in
             guard !IOSSessionPresentation.isActive(state) else { return }
-            isMoreExpanded = false
             viewport.reset()
             keyboard.resign()
         }
     }
 
     private var controlDock: some View {
-        VStack(alignment: .trailing, spacing: 10) {
-            if isMoreExpanded {
-                morePanel
-                    .transition(.scale(scale: 0.92, anchor: .bottomTrailing).combined(with: .opacity))
-            }
-
-            HStack(spacing: 10) {
-                if isMoreExpanded {
-                    keyboardControl
-                }
-                moreControl
-                orientationControl
-            }
+        HStack(spacing: 10) {
+            keyboardControl
+            orientationControl
         }
-        .animation(.easeInOut(duration: 0.18), value: isMoreExpanded)
     }
 
     private var orientationControl: some View {
@@ -110,13 +107,14 @@ struct IOSSessionView: View {
         }
     }
 
-    private var moreControl: some View {
+    private var disconnectControl: some View {
         sessionControlButton(
-            systemName: isMoreExpanded ? "xmark" : "ellipsis",
-            accessibilityLabel: isMoreExpanded ? "收起更多控制" : "更多控制",
-            accessibilityHint: "显示键盘、快捷键和连接操作"
+            systemName: "rectangle.portrait.and.arrow.right",
+            accessibilityLabel: "断开连接",
+            accessibilityHint: "结束当前远程会话",
+            background: Color.red.opacity(0.86)
         ) {
-            isMoreExpanded.toggle()
+            controller.disconnect()
         }
     }
 
@@ -124,6 +122,7 @@ struct IOSSessionView: View {
         systemName: String,
         accessibilityLabel: String,
         accessibilityHint: String,
+        background: Color = Color.black.opacity(0.72),
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -131,7 +130,7 @@ struct IOSSessionView: View {
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 48, height: 48)
-                .background(Color.black.opacity(0.72), in: Circle())
+                .background(background, in: Circle())
                 .overlay {
                     Circle()
                         .stroke(Color.white.opacity(0.24), lineWidth: 1)
@@ -148,47 +147,8 @@ struct IOSSessionView: View {
         switch label {
         case "切换横屏和竖屏": "session-orientation"
         case "显示键盘", "收起键盘": "session-keyboard"
-        case "更多控制", "收起更多控制": "session-more"
+        case "断开连接": "session-disconnect"
         default: "session-control"
-        }
-    }
-
-    private var morePanel: some View {
-        VStack(alignment: .trailing, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "keyboard.badge.ellipsis")
-                Text("快捷控制")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .foregroundStyle(.white)
-
-            IOSSpecialKeyBar(keyboard: keyboard)
-                .frame(maxWidth: 360)
-                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-
-            HStack(spacing: 8) {
-                Button {
-                    controller.requestKeyframe()
-                } label: {
-                    Label("刷新画面", systemImage: "arrow.clockwise")
-                        .font(.caption.weight(.medium))
-                }
-                .buttonStyle(.bordered)
-                .tint(.white)
-
-                Button("断开连接", role: .destructive) {
-                    controller.disconnect()
-                }
-                .font(.caption.weight(.medium))
-                .buttonStyle(.bordered)
-                .tint(.red)
-            }
-        }
-        .padding(12)
-        .background(Color.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 16))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.white.opacity(0.2), lineWidth: 1)
         }
     }
 
