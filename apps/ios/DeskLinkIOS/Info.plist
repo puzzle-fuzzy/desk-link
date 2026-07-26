@@ -13,9 +13,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>DeskLinkRelayURL</key>
-	<string></string>
+	<string>quic://turn.p2p.yxswy.com:4433</string>
 	<key>DeskLinkRelayServerName</key>
-	<string></string>
+	<string>turn.p2p.yxswy.com</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>

@@ -26,6 +26,21 @@ final class DeskLinkNavigationTests: XCTestCase {
         XCTAssertEqual(Data(base64Encoded: payload), invite)
     }
 
+    func testMacOSDefaultsUseTheManagedRelayOutsideLoopbackTests() {
+        guard ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] == nil,
+              ProcessInfo.processInfo.environment["DESKLINK_RELAY_SERVER_NAME"] == nil
+        else { return }
+        XCTAssertEqual(DeskLinkRuntimeConfiguration.macOSDefaults.relayURL, "quic://turn.p2p.yxswy.com:4433")
+        XCTAssertEqual(DeskLinkRuntimeConfiguration.macOSDefaults.relayServerName, "turn.p2p.yxswy.com")
+    }
+
+    func testRelayFailureDoesNotLookLikeASecurityValidationFailure() {
+        XCTAssertEqual(
+            deskLinkChineseError("The relay could not start the host invitation. (code 4)."),
+            "中继服务暂时不可用，请检查网络或中继配置后重试。"
+        )
+    }
+
     func testPrimaryNavigationUsesRemoteTasks() {
         XCTAssertEqual(
             DeskLinkSection.allCases.map(\.rawValue),

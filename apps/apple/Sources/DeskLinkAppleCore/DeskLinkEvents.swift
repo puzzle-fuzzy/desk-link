@@ -33,8 +33,8 @@ public struct DeskLinkRuntimeConfiguration: Equatable, Sendable {
 
     public static var macOSDefaults: Self {
         Self(
-            relayURL: ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] ?? "quic://127.0.0.1:4433",
-            relayServerName: ProcessInfo.processInfo.environment["DESKLINK_RELAY_SERVER_NAME"] ?? "localhost",
+            relayURL: ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] ?? "quic://turn.p2p.yxswy.com:4433",
+            relayServerName: ProcessInfo.processInfo.environment["DESKLINK_RELAY_SERVER_NAME"] ?? "turn.p2p.yxswy.com",
             platform: .macos
         )
     }

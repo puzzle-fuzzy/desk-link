@@ -31,11 +31,23 @@ private final class HostHandleOwner: @unchecked Sendable {
     deinit { destroy() }
 }
 
+private struct PairingStartResult: Sendable {
+    let resultCode: UInt32
+    let length: Int
+    let expiry: UInt64
+    let bytes: Data
+}
+
+private struct HostHandleReference: @unchecked Sendable {
+    let pointer: OpaquePointer
+}
+
 @MainActor
 final class HostBridge: ObservableObject {
     @Published private(set) var state: HostState = .idle
     @Published private(set) var permissions: MacPermissionSnapshot
     @Published private(set) var pairingInvite: HostPairingInvite?
+    @Published private(set) var isCreatingInvite = false
     @Published private(set) var pendingApproval: HostApproval?
     @Published private(set) var metrics = HostMetrics()
     @Published private(set) var trustedControllers: [TrustedController] = []
@@ -66,13 +78,14 @@ final class HostBridge: ObservableObject {
     private var captureRunning = false
     private var nextStreamID: UInt64 = 0
     private var stopTask: Task<Void, Never>?
+    private var pairingTask: Task<PairingStartResult, Never>?
     private var permissionRefreshTask: Task<Void, Never>?
     private var callbackGeneration: UInt64 = 0
     private var activeControllerDeviceID: [UInt8]?
 
     init(
-        relayURL: String = ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] ?? "quic://127.0.0.1:4433",
-        serverName: String = ProcessInfo.processInfo.environment["DESKLINK_RELAY_SERVER_NAME"] ?? "localhost",
+        relayURL: String = DeskLinkRuntimeConfiguration.macOSDefaults.relayURL,
+        serverName: String = DeskLinkRuntimeConfiguration.macOSDefaults.relayServerName,
         permissions: MacPermissions = MacPermissions(),
         identityStore: HostIdentityStore = HostIdentityStore(),
         trustedControllerStore: TrustedControllerStore = TrustedControllerStore()
@@ -150,29 +163,61 @@ final class HostBridge: ObservableObject {
     }
 
     func createInvite() {
-        guard permissions.canCaptureAndControl else {
-            publishError("Grant Screen Recording and Accessibility before creating an invitation.")
+        guard permissions.canCaptureAndControl, !isCreatingInvite else {
+            if !permissions.canCaptureAndControl {
+                publishError("Grant Screen Recording and Accessibility before creating an invitation.")
+            }
             return
         }
         start()
         guard let handle = handleOwner.pointer else { return }
-        var bytes = [UInt8](repeating: 0, count: Int(DESKLINK_PAIRING_INVITE_BYTES))
-        let capacity = bytes.count
-        var length = 0
-        var expiry: UInt64 = 0
-        let result = bytes.withUnsafeMutableBytes {
-            desklink_host_start_pairing(handle, $0.bindMemory(to: UInt8.self).baseAddress, capacity, &length, &expiry)
-        }
-        guard result == DESKLINK_OK, length == capacity else {
-            publishResultError("A secure invitation could not be created.", result: result)
-            return
-        }
-        pairingInvite = HostPairingInvite(
-            expiresAt: Date(timeIntervalSince1970: TimeInterval(expiry)),
-            encoded: Data(bytes)
-        )
+        let capacity = Int(DESKLINK_PAIRING_INVITE_BYTES)
+        let handleReference = HostHandleReference(pointer: handle)
+        let generation = callbackGeneration
+        isCreatingInvite = true
+        pairingInvite = nil
         state = .connecting
         lastError = nil
+        pairingTask = Task.detached(priority: .userInitiated) {
+            var bytes = [UInt8](repeating: 0, count: capacity)
+            var length = 0
+            var expiry: UInt64 = 0
+            let result = bytes.withUnsafeMutableBytes {
+                desklink_host_start_pairing(
+                    handleReference.pointer,
+                    $0.bindMemory(to: UInt8.self).baseAddress,
+                    capacity,
+                    &length,
+                    &expiry
+                )
+            }
+            return PairingStartResult(
+                resultCode: result.rawValue,
+                length: length,
+                expiry: expiry,
+                bytes: Data(bytes)
+            )
+        }
+        Task { @MainActor [weak self] in
+            guard let self, let pairingTask = self.pairingTask else { return }
+            let outcome = await pairingTask.value
+            self.pairingTask = nil
+            self.isCreatingInvite = false
+            guard self.callbackGeneration == generation, self.handleOwner.pointer == handle else { return }
+            guard outcome.resultCode == DESKLINK_OK.rawValue, outcome.length == capacity else {
+                self.publishResultError(
+                    "The relay could not start the host invitation.",
+                    result: DesklinkResult(rawValue: outcome.resultCode)
+                )
+                return
+            }
+            self.pairingInvite = HostPairingInvite(
+                expiresAt: Date(timeIntervalSince1970: TimeInterval(outcome.expiry)),
+                encoded: outcome.bytes
+            )
+            self.state = .connecting
+            self.lastError = nil
+        }
     }
 
     func copyInviteToPasteboard() {
@@ -266,6 +311,11 @@ final class HostBridge: ObservableObject {
     }
 
     private func performStop() async {
+        if let pairingTask {
+            _ = await pairingTask.value
+            self.pairingTask = nil
+        }
+        isCreatingInvite = false
         await captureSource.stop()
         captureStarting = false
         captureRunning = false

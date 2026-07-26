@@ -244,6 +244,9 @@ func deskLinkChineseError(_ message: String) -> String {
         return message
     }
     let value = message.lowercased()
+    if value.contains("relay") {
+        return "中继服务暂时不可用，请检查网络或中继配置后重试。"
+    }
     if value.contains("occupied") || value.contains("already in use") {
         return "上一条连接正在释放，DeskLink 会自动恢复。"
     }

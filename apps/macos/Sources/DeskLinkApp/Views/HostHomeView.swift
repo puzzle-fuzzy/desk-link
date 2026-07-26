@@ -136,14 +136,16 @@ struct HostHomeView: View {
                             Text("创建安全连接码")
                                 .font(.system(size: 16, weight: .semibold))
                                 .foregroundStyle(DeskLinkPalette.ink)
-                            Text("连接码包含一次性加入凭据，不会在此页面明文显示。")
+                            Text(bridge.isCreatingInvite
+                                ? "正在连接托管中继，连接码准备好后会显示二维码。"
+                                : "连接码包含一次性加入凭据，不会在此页面明文显示。")
                                 .font(.system(size: 12))
                                 .foregroundStyle(DeskLinkPalette.secondaryInk)
                         }
                         Spacer()
-                        Button("创建连接码") { bridge.createInvite() }
+                        Button(bridge.isCreatingInvite ? "正在连接中继…" : "创建连接码") { bridge.createInvite() }
                             .buttonStyle(DeskLinkPrimaryButtonStyle())
-                            .disabled(!bridge.permissions.canCaptureAndControl)
+                            .disabled(!bridge.permissions.canCaptureAndControl || bridge.isCreatingInvite)
                     }
                 }
             }
