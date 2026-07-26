@@ -70,6 +70,30 @@ public enum RemoteInputCommand: Equatable, Sendable {
     case unicode(String, modifiers: Modifiers)
 }
 
+public enum DeskLinkKeyCode {
+    public static let enter: UInt32 = 1
+    public static let escape: UInt32 = 2
+    public static let backspace: UInt32 = 3
+    public static let tab: UInt32 = 4
+    public static let arrowUp: UInt32 = 5
+    public static let arrowDown: UInt32 = 6
+    public static let arrowLeft: UInt32 = 7
+    public static let arrowRight: UInt32 = 8
+    public static let delete: UInt32 = 9
+    public static let insert: UInt32 = 10
+    public static let home: UInt32 = 11
+    public static let end: UInt32 = 12
+    public static let pageUp: UInt32 = 13
+    public static let pageDown: UInt32 = 14
+    public static let capsLock: UInt32 = 15
+    public static let function1: UInt32 = 16
+    public static let function12: UInt32 = 27
+    public static let control: UInt32 = 28
+    public static let alt: UInt32 = 29
+    public static let shift: UInt32 = 30
+    public static let meta: UInt32 = 31
+}
+
 public enum ConnectionState: Equatable, Sendable {
     case idle
     case pairing

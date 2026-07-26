@@ -37,7 +37,10 @@ struct IOSConnectionHomeView: View {
     private let savedHostStore = SavedHostStore()
 
     var body: some View {
-        NavigationStack {
+        if IOSSessionPresentation.isActive(controller.state) {
+            IOSSessionView(controller: controller)
+        } else {
+            NavigationStack {
             Form {
                 Section("连接设备") {
                     TextField("粘贴或输入连接码", text: $inviteText, axis: .vertical)
@@ -102,6 +105,7 @@ struct IOSConnectionHomeView: View {
             }
             .task { reloadSavedHosts() }
             .onChange(of: controller.state) { _ in reloadSavedHosts() }
+            }
         }
     }
 

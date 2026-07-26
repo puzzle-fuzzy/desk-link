@@ -98,6 +98,10 @@ typedef enum DesklinkKeyCode {
     DESKLINK_KEY_F10 = 25,
     DESKLINK_KEY_F11 = 26,
     DESKLINK_KEY_F12 = 27,
+    DESKLINK_KEY_CONTROL = 28,
+    DESKLINK_KEY_ALT = 29,
+    DESKLINK_KEY_SHIFT = 30,
+    DESKLINK_KEY_META = 31,
 } DesklinkKeyCode;
 
 typedef struct DesklinkConfig {

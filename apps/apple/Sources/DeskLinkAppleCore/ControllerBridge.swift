@@ -38,6 +38,7 @@ public final class ControllerBridge: ObservableObject {
     @Published public private(set) var lastError: String?
     @Published public private(set) var latestAccessUnit: Data?
     @Published public private(set) var latestPixelBuffer: CVPixelBuffer?
+    @Published public private(set) var videoSize: CGSize?
     @Published public private(set) var controllerVerifyKeyHex: String?
     @Published public private(set) var cursorOverlay: CursorOverlay?
 
@@ -203,6 +204,7 @@ public final class ControllerBridge: ObservableObject {
         awaitingApprovedHostMaterial = false
         latestAccessUnit = nil
         latestPixelBuffer = nil
+        videoSize = nil
         cursorOverlay = nil
         state = .closed
     }
@@ -278,6 +280,7 @@ public final class ControllerBridge: ObservableObject {
                 decoder.reset()
                 activeStreamID = streamID
                 metrics.lastFrameID = nil
+                videoSize = nil
             }
             highestStreamID = max(highestStreamID, streamID)
             state = .connected(streamID: streamID)
@@ -287,6 +290,7 @@ public final class ControllerBridge: ObservableObject {
             decoder.reset()
             activeStreamID = 0
             latestPixelBuffer = nil
+            videoSize = nil
             cursorOverlay = nil
             state = .closed
         case Int(DESKLINK_WAITING_FOR_APPROVAL.rawValue): state = .pairing
@@ -313,6 +317,7 @@ public final class ControllerBridge: ObservableObject {
         guard streamID == activeStreamID, version >= decoder.configVersion,
               decoder.configure(sequenceHeader: data, width: width, height: height, version: version)
         else { dropFrame(); return }
+        videoSize = CGSize(width: Int(width), height: Int(height))
     }
 
     private func consumeFrame(data: Data, streamID: UInt64, frameID: UInt64, version: UInt32) {
