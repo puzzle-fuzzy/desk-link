@@ -30,9 +30,12 @@ enum IOSSessionPresentation {
 struct IOSSessionView: View {
     @ObservedObject var controller: ControllerBridge
     @State private var visibleVideoRect: CGRect = .zero
+    @State private var isMoreExpanded = false
+    @StateObject private var keyboard: IOSKeyboardInput
 
     init(controller: ControllerBridge) {
         self.controller = controller
+        _keyboard = StateObject(wrappedValue: IOSKeyboardInput(bridge: controller))
     }
 
     var body: some View {
@@ -41,22 +44,88 @@ struct IOSSessionView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
 
-            orientationControl
+            controlDock
                 .padding(.trailing, 18)
                 .padding(.bottom, 30)
+
+            IOSKeyboardInputView(input: keyboard)
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+                .allowsHitTesting(false)
         }
         .background(Color.black)
         .toolbar(.hidden, for: .tabBar)
         .onDisappear {
+            keyboard.resign()
             controller.releaseAll()
+        }
+        .onChange(of: controller.state) { state in
+            guard !IOSSessionPresentation.isActive(state) else { return }
+            isMoreExpanded = false
+            keyboard.resign()
         }
     }
 
+    private var controlDock: some View {
+        VStack(alignment: .trailing, spacing: 10) {
+            if isMoreExpanded {
+                morePanel
+                    .transition(.scale(scale: 0.92, anchor: .bottomTrailing).combined(with: .opacity))
+            }
+
+            HStack(spacing: 10) {
+                if isMoreExpanded {
+                    keyboardControl
+                }
+                moreControl
+                orientationControl
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: isMoreExpanded)
+    }
+
     private var orientationControl: some View {
-        Button {
+        sessionControlButton(
+            systemName: "rotate.right",
+            accessibilityLabel: "切换横屏和竖屏",
+            accessibilityHint: "固定在屏幕右下角"
+        ) {
             IOSOrientationController.toggle()
-        } label: {
-            Image(systemName: "rotate.right")
+        }
+    }
+
+    private var keyboardControl: some View {
+        sessionControlButton(
+            systemName: keyboard.isKeyboardVisible ? "keyboard.fill" : "keyboard",
+            accessibilityLabel: keyboard.isKeyboardVisible ? "收起键盘" : "显示键盘",
+            accessibilityHint: "显示或收起 iPhone 键盘"
+        ) {
+            if keyboard.isKeyboardVisible {
+                keyboard.resign()
+            } else {
+                keyboard.becomeFirstResponder()
+            }
+        }
+    }
+
+    private var moreControl: some View {
+        sessionControlButton(
+            systemName: isMoreExpanded ? "xmark" : "ellipsis",
+            accessibilityLabel: isMoreExpanded ? "收起更多控制" : "更多控制",
+            accessibilityHint: "显示键盘、快捷键和连接操作"
+        ) {
+            isMoreExpanded.toggle()
+        }
+    }
+
+    private func sessionControlButton(
+        systemName: String,
+        accessibilityLabel: String,
+        accessibilityHint: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 48, height: 48)
@@ -68,8 +137,57 @@ struct IOSSessionView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Circle())
-        .accessibilityLabel("切换横屏和竖屏")
-        .accessibilityHint("固定在屏幕右下角")
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityHint(accessibilityHint)
+        .accessibilityIdentifier(accessibilityIdentifier(for: accessibilityLabel))
+    }
+
+    private func accessibilityIdentifier(for label: String) -> String {
+        switch label {
+        case "切换横屏和竖屏": "session-orientation"
+        case "显示键盘", "收起键盘": "session-keyboard"
+        case "更多控制", "收起更多控制": "session-more"
+        default: "session-control"
+        }
+    }
+
+    private var morePanel: some View {
+        VStack(alignment: .trailing, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "keyboard.badge.ellipsis")
+                Text("快捷控制")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(.white)
+
+            IOSSpecialKeyBar(keyboard: keyboard)
+                .frame(maxWidth: 360)
+                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+
+            HStack(spacing: 8) {
+                Button {
+                    controller.requestKeyframe()
+                } label: {
+                    Label("刷新画面", systemImage: "arrow.clockwise")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+
+                Button("断开连接", role: .destructive) {
+                    controller.disconnect()
+                }
+                .font(.caption.weight(.medium))
+                .buttonStyle(.bordered)
+                .tint(.red)
+            }
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 16))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.white.opacity(0.2), lineWidth: 1)
+        }
     }
 
     private var remoteCanvas: some View {
