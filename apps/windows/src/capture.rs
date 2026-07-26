@@ -448,6 +448,15 @@ pub fn display_topology() -> Result<DisplayTopology, CaptureError> {
     })
 }
 
+#[cfg(not(windows))]
+pub fn display_topology() -> Result<DisplayTopology, CaptureError> {
+    Ok(DisplayTopology {
+        monitor_count: 1,
+        primary: DesktopRect::new(0, 0, 1920, 1080),
+        virtual_desktop: DesktopRect::new(0, 0, 1920, 1080),
+    })
+}
+
 impl DesktopCapturer for DxgiDesktopCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<CapturedFrame, CaptureError> {
         #[cfg(windows)]
