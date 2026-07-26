@@ -52,6 +52,16 @@
                ReferencedContainer = "container:DeskLinkIOS.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "100000000000000000000007"
+               BuildableName = "DeskLinkIOSUITests.xctest"
+               BlueprintName = "DeskLinkIOSUITests"
+               ReferencedContainer = "container:DeskLinkIOS.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

@@ -47,4 +47,19 @@ final class ControllerBridgeTests: XCTestCase {
         XCTAssertFalse(bridge.activeRuntimeForTesting)
         XCTAssertEqual(bridge.state, .failed("The DeskLink runtime configuration is invalid."))
     }
+
+    func testInvalidInviteDoesNotStartRustRuntime() {
+        let bridge = ControllerBridge.testing(
+            configuration: DeskLinkRuntimeConfiguration(
+                relayURL: "quic://127.0.0.1:4433",
+                relayServerName: "localhost",
+                platform: .ios
+            )
+        )
+
+        bridge.connect(invite: Data("not-a-desklink-invite".utf8))
+
+        XCTAssertEqual(bridge.state, .failed("The pairing invitation is invalid."))
+        XCTAssertFalse(bridge.activeRuntimeForTesting)
+    }
 }
