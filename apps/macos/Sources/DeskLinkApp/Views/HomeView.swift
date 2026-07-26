@@ -1,4 +1,5 @@
 import SwiftUI
+import DeskLinkAppleCore
 
 struct HomeView: View {
     @ObservedObject var bridge: ControllerBridge

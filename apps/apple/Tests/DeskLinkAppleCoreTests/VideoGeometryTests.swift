@@ -1,6 +1,6 @@
 import CoreGraphics
 import XCTest
-@testable import DeskLinkApp
+@testable import DeskLinkAppleCore
 
 final class VideoGeometryTests: XCTestCase {
     func testAspectFitLetterboxesWideVideoInsideSquareSurface() {

@@ -1,4 +1,5 @@
 import SwiftUI
+import DeskLinkAppleCore
 
 struct DiagnosticsView: View {
     @ObservedObject var bridge: ControllerBridge

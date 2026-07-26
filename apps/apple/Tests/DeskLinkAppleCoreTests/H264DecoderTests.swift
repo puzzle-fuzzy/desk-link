@@ -1,5 +1,5 @@
 import XCTest
-@testable import DeskLinkApp
+@testable import DeskLinkAppleCore
 
 @MainActor
 final class H264DecoderTests: XCTestCase {

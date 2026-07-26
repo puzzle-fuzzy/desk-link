@@ -1,4 +1,5 @@
 import XCTest
+import DeskLinkAppleCore
 @testable import DeskLinkApp
 
 final class DeskLinkNavigationTests: XCTestCase {

@@ -1,18 +1,18 @@
 import Foundation
 
-enum H264AnnexBError: Error, Equatable {
+public enum H264AnnexBError: Error, Equatable {
     case noNALUnits
     case missingParameterSets
     case oversizedNALUnit
 }
 
-struct H264ParameterSets: Equatable {
-    let sps: Data
-    let pps: Data
+public struct H264ParameterSets: Equatable {
+    public let sps: Data
+    public let pps: Data
 }
 
-enum H264AnnexB {
-    static func parameterSets(in sequenceHeader: Data) throws -> H264ParameterSets {
+public enum H264AnnexB {
+    public static func parameterSets(in sequenceHeader: Data) throws -> H264ParameterSets {
         let units = nalUnits(in: sequenceHeader)
         guard !units.isEmpty else { throw H264AnnexBError.noNALUnits }
         guard let sps = units.first(where: { nalType($0) == 7 }),
@@ -23,7 +23,7 @@ enum H264AnnexB {
         return H264ParameterSets(sps: sps, pps: pps)
     }
 
-    static func avccAccessUnit(from annexB: Data) throws -> Data {
+    public static func avccAccessUnit(from annexB: Data) throws -> Data {
         let units = nalUnits(in: annexB)
         guard !units.isEmpty else { throw H264AnnexBError.noNALUnits }
         var output = Data()
@@ -41,7 +41,7 @@ enum H264AnnexB {
         return output
     }
 
-    static func nalUnits(in annexB: Data) -> [Data] {
+    public static func nalUnits(in annexB: Data) -> [Data] {
         let bytes = [UInt8](annexB)
         guard !bytes.isEmpty else { return [] }
         var markers: [(offset: Int, length: Int)] = []

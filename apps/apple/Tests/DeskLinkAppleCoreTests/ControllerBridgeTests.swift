@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import DeskLinkApp
+@testable import DeskLinkAppleCore
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
@@ -30,5 +30,21 @@ final class ControllerBridgeTests: XCTestCase {
 
         XCTAssertEqual(bridge.state, .closed)
         XCTAssertNil(bridge.latestPixelBuffer)
+        XCTAssertEqual(bridge.releaseAllCallCountForTesting, 1)
+    }
+
+    func testInvalidRuntimeConfigurationDoesNotAllocateRustHandle() {
+        let bridge = ControllerBridge.testing(
+            configuration: DeskLinkRuntimeConfiguration(
+                relayURL: "",
+                relayServerName: "localhost",
+                platform: .ios
+            )
+        )
+
+        bridge.connect(invite: Data(repeating: 0, count: 181))
+
+        XCTAssertFalse(bridge.activeRuntimeForTesting)
+        XCTAssertEqual(bridge.state, .failed("The DeskLink runtime configuration is invalid."))
     }
 }

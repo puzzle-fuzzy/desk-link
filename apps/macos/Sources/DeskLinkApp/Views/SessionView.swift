@@ -1,4 +1,5 @@
 import CoreVideo
+import DeskLinkAppleCore
 import SwiftUI
 
 let deskLinkSessionSafetyCopy = "退出窗口前，DeskLink 会释放所有按键与鼠标状态。"

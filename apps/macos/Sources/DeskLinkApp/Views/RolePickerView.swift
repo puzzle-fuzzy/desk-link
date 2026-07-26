@@ -1,4 +1,5 @@
 import SwiftUI
+import DeskLinkAppleCore
 
 struct RolePickerView: View {
     let selectRole: (AppRole) -> Void

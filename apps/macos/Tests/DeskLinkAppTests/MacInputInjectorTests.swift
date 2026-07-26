@@ -1,4 +1,5 @@
 import CoreGraphics
+import DeskLinkAppleCore
 import XCTest
 @testable import DeskLinkApp
 

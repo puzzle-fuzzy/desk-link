@@ -1,4 +1,5 @@
 import SwiftUI
+import DeskLinkAppleCore
 
 enum DeskLinkHostStatusTone: Equatable {
     case ready

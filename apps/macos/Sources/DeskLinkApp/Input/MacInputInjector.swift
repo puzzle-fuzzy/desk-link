@@ -1,31 +1,6 @@
 import CoreGraphics
+import DeskLinkAppleCore
 import Foundation
-
-struct Modifiers: OptionSet, Equatable, Sendable {
-    let rawValue: UInt32
-
-    static let shift = Modifiers(rawValue: 1 << 0)
-    static let control = Modifiers(rawValue: 1 << 1)
-    static let option = Modifiers(rawValue: 1 << 2)
-    static let meta = Modifiers(rawValue: 1 << 3)
-    static let capsLock = Modifiers(rawValue: 1 << 4)
-}
-
-enum MouseButton: UInt32, CaseIterable, Comparable, Sendable {
-    case left = 0
-    case right = 1
-    case center = 2
-
-    static func < (lhs: MouseButton, rhs: MouseButton) -> Bool { lhs.rawValue < rhs.rawValue }
-}
-
-enum MacInputCommand: Equatable, Sendable {
-    case move(normalizedX: Float, normalizedY: Float)
-    case mouseButton(_ button: MouseButton, pressed: Bool)
-    case wheel(deltaX: Int32, deltaY: Int32)
-    case key(code: UInt32, pressed: Bool, modifiers: Modifiers)
-    case unicode(String, modifiers: Modifiers)
-}
 
 enum MacInputInjectorError: Error, Equatable {
     case invalidCoordinate
@@ -136,7 +111,7 @@ final class MacInputInjector {
         pointer = CGPoint(x: displayFrame.midX, y: displayFrame.midY)
     }
 
-    func inject(_ command: MacInputCommand) throws {
+    func inject(_ command: RemoteInputCommand) throws {
         lock.lock()
         defer { lock.unlock() }
         switch command {

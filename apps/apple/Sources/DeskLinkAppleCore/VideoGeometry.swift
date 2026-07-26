@@ -1,7 +1,7 @@
 import CoreGraphics
 
-enum VideoGeometry {
-    static func aspectFit(source: CGSize, in bounds: CGRect) -> CGRect {
+public enum VideoGeometry {
+    public static func aspectFit(source: CGSize, in bounds: CGRect) -> CGRect {
         guard source.width > 0,
               source.height > 0,
               bounds.width > 0,

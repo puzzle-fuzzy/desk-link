@@ -1,4 +1,5 @@
 import CoreMedia
+import DeskLinkAppleCore
 import CoreVideo
 import Foundation
 import VideoToolbox

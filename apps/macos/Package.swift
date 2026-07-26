@@ -13,15 +13,16 @@ let package = Package(
     products: [
         .executable(name: "DeskLinkApp", targets: ["DeskLinkApp"]),
     ],
+    dependencies: [
+        .package(path: "../apple"),
+    ],
     targets: [
-        .target(
-            name: "DeskLinkC",
-            path: "Sources/DeskLinkC",
-            publicHeadersPath: "include"
-        ),
         .executableTarget(
             name: "DeskLinkApp",
-            dependencies: ["DeskLinkC"],
+            dependencies: [
+                .product(name: "DeskLinkAppleCore", package: "apple"),
+                .product(name: "DeskLinkC", package: "apple"),
+            ],
             path: "Sources/DeskLinkApp",
             linkerSettings: [
                 .linkedFramework("AppKit"),
@@ -43,7 +44,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DeskLinkAppTests",
-            dependencies: ["DeskLinkApp"],
+            dependencies: [
+                "DeskLinkApp",
+                .product(name: "DeskLinkAppleCore", package: "apple"),
+            ],
             path: "Tests/DeskLinkAppTests"
         ),
     ],

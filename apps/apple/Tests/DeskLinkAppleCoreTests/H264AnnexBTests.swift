@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import DeskLinkApp
+@testable import DeskLinkAppleCore
 
 final class H264AnnexBTests: XCTestCase {
     func testExtractsParameterSetsAcrossThreeAndFourByteStartCodes() throws {

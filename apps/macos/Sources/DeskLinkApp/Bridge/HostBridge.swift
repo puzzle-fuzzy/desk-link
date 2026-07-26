@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import DeskLinkAppleCore
 import DeskLinkC
 import Foundation
 
@@ -486,7 +487,7 @@ private struct HostCallbackEvent {
     let fingerprint: String?
     let controllerDeviceID: [UInt8]
     let controllerVerifyKey: [UInt8]
-    let input: MacInputCommand?
+    let input: RemoteInputCommand?
     let metrics: HostMetrics?
 }
 
@@ -536,7 +537,7 @@ private func hostCallbackKind(_ kind: DesklinkHostEventKind) -> HostCallbackKind
     }
 }
 
-private func hostInputCommand(_ input: DesklinkHostInput) -> MacInputCommand? {
+private func hostInputCommand(_ input: DesklinkHostInput) -> RemoteInputCommand? {
     switch input.kind {
     case DESKLINK_INPUT_MOUSE_MOVE:
         return .move(normalizedX: input.x, normalizedY: input.y)

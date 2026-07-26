@@ -30,25 +30,20 @@ private final class DeskLinkHandleOwner: @unchecked Sendable {
     deinit { destroy() }
 }
 
-struct CursorOverlay: Equatable {
-    let streamID: UInt64
-    let encodedUpdate: Data
-}
-
 @MainActor
-final class ControllerBridge: ObservableObject {
-    @Published private(set) var state: ConnectionState = .idle
-    @Published private(set) var pairing: PairingInfo?
-    @Published private(set) var metrics = Metrics()
-    @Published private(set) var lastError: String?
-    @Published private(set) var latestAccessUnit: Data?
-    @Published private(set) var latestPixelBuffer: CVPixelBuffer?
-    @Published private(set) var controllerVerifyKeyHex: String?
-    @Published private(set) var cursorOverlay: CursorOverlay?
+public final class ControllerBridge: ObservableObject {
+    @Published public private(set) var state: ConnectionState = .idle
+    @Published public private(set) var pairing: PairingInfo?
+    @Published public private(set) var metrics = Metrics()
+    @Published public private(set) var lastError: String?
+    @Published public private(set) var latestAccessUnit: Data?
+    @Published public private(set) var latestPixelBuffer: CVPixelBuffer?
+    @Published public private(set) var controllerVerifyKeyHex: String?
+    @Published public private(set) var cursorOverlay: CursorOverlay?
 
-    var userFacingError: String { lastError ?? "" }
+    public var userFacingError: String { lastError ?? "" }
 
-    private let relayURL: String
+    private let configuration: DeskLinkRuntimeConfiguration
     private let handleOwner = DeskLinkHandleOwner()
     private let decoder = H264Decoder()
     private let identityStore: ControllerIdentityStore
@@ -58,13 +53,17 @@ final class ControllerBridge: ObservableObject {
     private var highestStreamID: UInt64 = 0
     private var callbackGeneration: UInt64 = 0
     private var awaitingApprovedHostMaterial = false
+#if DEBUG
+    private(set) var releaseAllCallCountForTesting = 0
+    var activeRuntimeForTesting: Bool { handleOwner.pointer != nil }
+#endif
 
-    init(
-        relayURL: String = ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] ?? "quic://127.0.0.1:4433",
+    public init(
+        configuration: DeskLinkRuntimeConfiguration,
         identityStore: ControllerIdentityStore = ControllerIdentityStore(),
         savedHostStore: SavedHostStore = SavedHostStore()
     ) {
-        self.relayURL = relayURL
+        self.configuration = configuration
         self.identityStore = identityStore
         self.savedHostStore = savedHostStore
         decoder.onFrame = { [weak self] pixelBuffer in
@@ -78,16 +77,22 @@ final class ControllerBridge: ObservableObject {
     }
 
     static func testing(
+        configuration: DeskLinkRuntimeConfiguration = .macOSDefaults,
         error: String? = nil,
         state: ConnectionState = .idle
     ) -> ControllerBridge {
-        let bridge = ControllerBridge()
+        let keychain = InMemoryKeychainStore()
+        let bridge = ControllerBridge(
+            configuration: configuration,
+            identityStore: ControllerIdentityStore(keychain: keychain),
+            savedHostStore: SavedHostStore(keychain: keychain)
+        )
         bridge.state = state
         if let error { bridge.publishErrorMessage(error) }
         return bridge
     }
 
-    func connect(invite: Data) {
+    public func connect(invite: Data) {
         guard invite.count == Int(DESKLINK_PAIRING_INVITE_BYTES) else {
             publishErrorMessage("The pairing invitation is invalid.")
             return
@@ -119,9 +124,9 @@ final class ControllerBridge: ObservableObject {
         }
     }
 
-    func connect(invite: [UInt8]) { connect(invite: Data(invite)) }
+    public func connect(invite: [UInt8]) { connect(invite: Data(invite)) }
 
-    func connect(savedHost: SavedHost) {
+    public func connect(savedHost: SavedHost) {
         guard savedHost.isValid else {
             publishErrorMessage("The saved host record is invalid.")
             return
@@ -152,13 +157,13 @@ final class ControllerBridge: ObservableObject {
         }
     }
 
-    func requestKeyframe() {
+    public func requestKeyframe() {
         guard let handle = handleOwner.pointer else { return }
         let result = desklink_request_keyframe(handle)
         if result != DESKLINK_OK { publishResultError("The video stream needs to recover.", result: result) }
     }
 
-    func send(input command: MacInputCommand) {
+    public func send(input command: RemoteInputCommand) {
         var input: DesklinkInput
         switch command {
         case let .move(x, y):
@@ -179,12 +184,15 @@ final class ControllerBridge: ObservableObject {
         sendInput(&input)
     }
 
-    func releaseAll() {
+    public func releaseAll() {
+#if DEBUG
+        releaseAllCallCountForTesting += 1
+#endif
         guard let handle = handleOwner.pointer else { return }
         _ = desklink_release_all(handle)
     }
 
-    func disconnect() {
+    public func disconnect() {
         callbackGeneration &+= 1
         releaseAll()
         if let handle = handleOwner.pointer { _ = desklink_reject(handle) }
@@ -227,7 +235,7 @@ final class ControllerBridge: ObservableObject {
     }
 
     private var relayServerName: String {
-        ProcessInfo.processInfo.environment["DESKLINK_RELAY_SERVER_NAME"] ?? "localhost"
+        configuration.relayServerName
     }
 
     private func createIfNeeded() {
@@ -236,9 +244,20 @@ final class ControllerBridge: ObservableObject {
         let callbackContext = ControllerCallbackContext(bridge: self, generation: callbackGeneration)
         let callbackPointer = Unmanaged.passRetained(callbackContext).toOpaque()
         var createdHandle: OpaquePointer?
-        let result = relayURL.withCString { relayPointer in
+        guard configuration.isValid else {
+            Unmanaged<ControllerCallbackContext>.fromOpaque(callbackPointer).release()
+            publishErrorMessage("The DeskLink runtime configuration is invalid.")
+            return
+        }
+        let result = configuration.relayURL.withCString { relayPointer in
             var config = DesklinkConfig(relay_url: relayPointer, log_level: 1)
-            return desklink_create(&config, desklinkEventCallback, callbackPointer, &createdHandle)
+            return desklink_create_for_platform(
+                &config,
+                configuration.platform.cValue,
+                desklinkEventCallback,
+                callbackPointer,
+                &createdHandle
+            )
         }
         guard result == DESKLINK_OK, let createdHandle else {
             Unmanaged<ControllerCallbackContext>.fromOpaque(callbackPointer).release()

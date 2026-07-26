@@ -1,4 +1,5 @@
 import AppKit
+import DeskLinkAppleCore
 import SwiftUI
 
 struct SessionInputView: NSViewRepresentable {

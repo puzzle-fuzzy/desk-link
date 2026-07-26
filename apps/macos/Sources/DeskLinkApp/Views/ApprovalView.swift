@@ -1,4 +1,5 @@
 import SwiftUI
+import DeskLinkAppleCore
 
 struct ApprovalView: View {
     @ObservedObject var bridge: HostBridge

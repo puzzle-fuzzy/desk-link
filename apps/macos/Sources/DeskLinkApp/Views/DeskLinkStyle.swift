@@ -1,4 +1,5 @@
 import SwiftUI
+import DeskLinkAppleCore
 
 enum DeskLinkSection: String, CaseIterable, Identifiable {
     case connect = "连接设备"

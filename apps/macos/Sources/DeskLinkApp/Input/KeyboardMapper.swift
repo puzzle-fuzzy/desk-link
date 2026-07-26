@@ -1,4 +1,5 @@
 import AppKit
+import DeskLinkAppleCore
 
 enum KeyboardMapper {
     static func map(
@@ -6,7 +7,7 @@ enum KeyboardMapper {
         characters: String?,
         modifiers: NSEvent.ModifierFlags,
         isDown: Bool
-    ) -> [MacInputCommand] {
+    ) -> [RemoteInputCommand] {
         let mappedModifiers = Modifiers(appKit: modifiers)
         if let logicalKeyCode = MacKeyCodeMapper.protocolCode(forAppKitKeyCode: keyCode) {
             return [.key(code: logicalKeyCode, pressed: isDown, modifiers: mappedModifiers)]

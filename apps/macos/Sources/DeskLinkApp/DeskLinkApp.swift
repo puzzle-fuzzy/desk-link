@@ -1,4 +1,5 @@
 import AppKit
+import DeskLinkAppleCore
 import SwiftUI
 
 func deskLinkApprovalForWindowPresentation(
@@ -40,7 +41,7 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
 @main
 struct DeskLinkApp: App {
     @NSApplicationDelegateAdaptor(DeskLinkLifecycleDelegate.self) private var lifecycle
-    @StateObject private var controller = ControllerBridge()
+    @StateObject private var controller = ControllerBridge(configuration: .macOSDefaults)
     @StateObject private var host = HostBridge()
     @State private var section: DeskLinkSection = .connect
 

@@ -12,20 +12,22 @@ private final class SendablePixelBuffer: @unchecked Sendable {
 }
 
 @MainActor
-final class H264Decoder {
-    static let decodeFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
+public final class H264Decoder {
+    public static let decodeFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
 
-    var onFrame: ((CVPixelBuffer) -> Void)?
+    public var onFrame: ((CVPixelBuffer) -> Void)?
 
     nonisolated(unsafe) private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
-    private(set) var latestPixelBuffer: CVPixelBuffer?
-    private(set) var lastFrameID: UInt64 = 0
-    private(set) var configVersion: UInt32 = 0
-    private(set) var configuredWidth: UInt16 = 0
-    private(set) var configuredHeight: UInt16 = 0
+    public private(set) var latestPixelBuffer: CVPixelBuffer?
+    public private(set) var lastFrameID: UInt64 = 0
+    public private(set) var configVersion: UInt32 = 0
+    public private(set) var configuredWidth: UInt16 = 0
+    public private(set) var configuredHeight: UInt16 = 0
     private var consecutiveFailures = 0
     private var keyframeRequestIssued = false
+
+    public init() {}
 
     deinit {
         if let decompressionSession {
@@ -35,7 +37,7 @@ final class H264Decoder {
     }
 
     @discardableResult
-    func configure(
+    public func configure(
         sequenceHeader: Data,
         width: UInt16,
         height: UInt16,
@@ -118,7 +120,7 @@ final class H264Decoder {
     }
 
     @discardableResult
-    func receive(accessUnit: Data, frameID: UInt64, version: UInt32) -> Bool {
+    public func receive(accessUnit: Data, frameID: UInt64, version: UInt32) -> Bool {
         guard frameID > lastFrameID,
               frameID <= UInt64(Int64.max),
               !accessUnit.isEmpty
@@ -208,13 +210,13 @@ final class H264Decoder {
         return true
     }
 
-    func takeKeyframeRequest() -> Bool {
+    public func takeKeyframeRequest() -> Bool {
         guard consecutiveFailures >= 3, !keyframeRequestIssued else { return false }
         keyframeRequestIssued = true
         return true
     }
 
-    func reset() {
+    public func reset() {
         invalidateSession()
         latestPixelBuffer = nil
         lastFrameID = 0
