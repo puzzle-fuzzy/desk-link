@@ -1,6 +1,6 @@
 # DeskLink
 
-DeskLink 是面向个人设备的端到端加密 Windows 远程桌面工具。当前正式发布目标是 Windows 10/11 x64；仓库中的 macOS 源码属于暂存的跨平台研究代码，不进入本次 Windows 构建、测试或发布门禁。中继只负责匹配会话与转发业务密文。
+DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正式发布目标仍是 Windows 10/11 x64；Apple 端已进入独立开发与验收阶段：macOS 支持 Apple Silicon controller/host，iOS 16+ 只支持 controller。中继只负责匹配会话与转发业务密文。
 
 ## 当前状态
 
@@ -25,16 +25,24 @@ DeskLink 是面向个人设备的端到端加密 Windows 远程桌面工具。�
 
 当前明确不支持：麦克风/语音对讲、整块虚拟桌面合成、后台静默下载与自动安装更新，以及 Windows UAC 安全桌面和 `Ctrl+Alt+Delete` 注入。多显示器通过会话内切换当前屏幕实现；剪贴板采用用户主动触发的纯文本传输，不在后台自动监听。正式版本检查失败或发布清单不完整时只在设置页降级提示，不会影响远程控制。
 
+### Apple 开发面（2026-07-26）
+
+- `apps/macos`：Apple Silicon macOS 13+ controller/host，使用 ScreenCaptureKit、VideoToolbox、CGEvent 和 Keychain；自动门禁见 [`docs/apple/macos-apple-silicon-acceptance.md`](docs/apple/macos-apple-silicon-acceptance.md)。
+- `apps/ios`：iOS 16+ controller-only 客户端，支持安全配对、保存设备、H.264/Metal 画面、直接触控、轨迹板、键盘输入和前后台恢复；不会伪装成 iOS host，也不会控制其他 iOS App。
+- Apple 端当前已完成 Rust/Swift/模拟器构建门禁；物理 iPhone、系统权限、签名/公证和跨设备链路仍须人工验收，未完成项记录在 [`docs/apple/2026-07-26-apple-platform-acceptance.md`](docs/apple/2026-07-26-apple-platform-acceptance.md)。
+
 ## 架构
 
 - `crates/desklink-protocol`：有界协议 DTO、序列化与输入/视频校验；
 - `crates/desklink-crypto`：设备身份、配对邀请、Noise 会话与业务 AEAD；
 - `crates/desklink-transport`：QUIC/TLS 客户端和 relay 加入协议；
 - `crates/desklink-session`、`crates/desklink-video`：会话恢复与视频分片/重组；
-- `crates/desklink-ffi`：为暂存跨平台研究代码保留的稳定 controller/host C ABI 与可取消后台 worker，不属于当前 Windows 发布门禁；
+- `crates/desklink-ffi`：共享 Windows/Apple controller/host 的稳定 C ABI 与可取消后台 worker，不属于当前 Windows 发布门禁；
 - `apps/windows-ui`：Windows 唯一发布入口，WebView2 负责界面、视频解码与受限输入采集；
 - `apps/windows`：DXGI、Media Foundation、`SendInput`、DPAPI、原生批准、诊断和 host runtime；
-- `apps/macos`：暂存的跨平台研究代码，不属于当前 Windows 产品面；
+- `apps/apple`：跨 macOS/iOS 的 Keychain、ControllerBridge、H.264 解码和输入纯模型共享核心；
+- `apps/macos`：Apple Silicon macOS controller/host 开发面；
+- `apps/ios`：controller-only iOS 开发面；
 - `server/relay`：会话匹配、限流和密文转发，不解码桌面或输入；
 - `tools/windows-installer`：只封装已验证的 `DeskLink.exe`；程序与用户数据分离保存。
 
@@ -149,9 +157,9 @@ python scripts/build-windows-installer.py --require-signing
 
 远程的 `Windows Signed Release` 工作流只接受 GitHub Secrets 中的可信 PFX，缺少证书、证书用途不正确、证书过期、签名失败或没有 RFC 3161 时间戳都会中止，不会上传未签名安装器。
 
-## 跨平台研究代码
+## Apple 开发代码
 
-`apps/macos` 和 `crates/desklink-ffi` 目前只保留在仓库中供未来评估使用，不生成当前 Windows 发布产物，也不纳入 Windows CI 门禁。恢复跨平台发布目标前，需要单独完成 Apple Silicon 构建、系统权限、签名、公证和真实设备验收；这些工作不会阻塞首个 Windows 正式版。
+Apple 端代码不生成当前 Windows 发布产物，也不纳入 Windows CI 发布门禁。macOS 当前以 Apple Silicon 为目标，iOS 当前只作为 controller；两者仍需单独完成系统权限、签名、公证和真实设备验收。Apple 开发不改变 Windows 正式版本的发布边界。
 
 ## 安全与本地数据
 

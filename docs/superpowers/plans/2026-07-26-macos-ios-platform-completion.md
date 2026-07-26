@@ -697,13 +697,14 @@ git commit -m "fix(ios): recover controller sessions across app lifecycle"
 - `scripts/verify-ios.sh` is the iOS gate and reports simulator success separately from device/signing success.
 - Documentation must use “自动验证通过”“同机双实例通过”“跨设备人工通过”“未验收”四种明确状态，不把 historical records or simulator results into live-device evidence.
 
-- [ ] **Step 1: Run the complete automated Apple gate**
+- [x] **Step 1: Run the complete automated Apple gate**
 
 Run:
 
 ```sh
 git diff --check
 cargo fmt --all -- --check
+cargo test --workspace
 cargo test -p desklink-ffi
 cargo test --manifest-path tests/end-to-end/Cargo.toml
 ./scripts/verify-macos-runtime.sh
@@ -754,7 +755,7 @@ xcodebuild -project apps/ios/DeskLinkIOS.xcodeproj -scheme DeskLinkIOS \
 
 Record whether the iOS device build was signed with an Apple Development identity and installed on a real device; do not call an unsigned simulator build a release artifact.
 
-- [ ] **Step 5: Update product and architecture documentation**
+- [x] **Step 5: Update product and architecture documentation**
 
 Change the current “Windows only / macOS research code” wording only to the extent supported by the acceptance record. State explicitly:
 
@@ -763,7 +764,7 @@ Change the current “Windows only / macOS research code” wording only to the 
 - iOS system-level host control is not supported;
 - real-device, signing and notarization status remains visible and separate from code/test status.
 
-- [ ] **Step 6: Commit the acceptance record and docs**
+- [x] **Step 6: Commit the acceptance record and docs**
 
 ```sh
 git add README.md DESIGN.md TODO.md docs/apple scripts/verify-macos-runtime.sh scripts/verify-ios.sh
@@ -790,3 +791,10 @@ git commit -m "docs: record Apple platform acceptance boundaries"
 - Placeholder scan: the plan contains no `TBD`, `TODO`, “implement later” or unspecified acceptance step; unavailable physical-device checks are explicitly recorded as unexecuted rather than left vague.
 - Type consistency: `DesklinkPlatform`/`desklink_create_for_platform`, `DeskLinkRuntimeConfiguration`, `KeychainStore`, `RemoteInputCommand`, `suspendForBackground` and `resumeFromBackground` are used consistently across the task interfaces.
 - Scope check: macOS and iOS are separate platform deliverables sharing a narrow Apple core; iOS host control, audio, transfer, clipboard and Windows implementation changes are explicitly excluded.
+
+## Execution record
+
+- [x] Tasks 1–7 implemented and committed on the execution branch.
+- [x] Apple runtime gates, shared Swift tests, iOS unsigned device build, iOS simulator tests and the full Rust workspace test passed on 2026-07-26.
+- [x] Product/architecture documentation and the separate Apple acceptance record were updated.
+- [ ] Physical iPhone, macOS permission/loopback, cross-device, signing and notarization gates remain intentionally open until those environments are available.

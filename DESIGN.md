@@ -90,7 +90,7 @@ The Windows control workspace, host action dock, connection settings, and truste
 
 The Tauri process owns the single-instance application lifetime, native tray, and host supervisor start/stop boundary. Capture, encoding, encrypted transport, input injection, and high-consequence approval or revocation confirmations remain in Rust/Win32. The WebView receives sanitized lifecycle summaries and is a presentation layer, not a replacement for native security or media boundaries.
 
-The current release target is Windows only. The macOS source tree is parked research code and is not part of the release gate; if cross-platform work resumes, it must first adopt this Windows information architecture and its semantic tokens instead of creating a second product surface.
+The current production release target remains Windows. The Apple development surface is now active but has its own native shell: macOS is an Apple Silicon controller/host, while iOS is a controller-only client. Apple targets share security and media models through `DeskLinkAppleCore`, but their permission prompts, navigation, touch input and lifecycle behavior remain platform-native. Apple builds have separate gates and do not widen the Windows release promise.
 
 ## Information Architecture
 
@@ -100,7 +100,15 @@ The remote-task-first hierarchy is ordered by the user's next remote action:
 
 “连接设备” is the default entry and contains the recent-device reconnect path. “共享此设备” is the desktop host flow for generating an invitation and approving or revoking controllers. “已批准设备” manages trusted devices, while “设置 / 诊断” contains permissions, host availability, and technical details. Diagnostics and local runtime metrics remain secondary and must not displace the connection task.
 
-There is no mobile release surface. Do not add mobile navigation or a second connection flow until the Windows release has completed real two-machine acceptance.
+The iOS surface is intentionally controller-only. Its primary navigation is connection, saved devices and secondary diagnostics; it must not expose “共享此设备”, host approval, screen capture or any implication that iOS can control another iOS app. A remote session uses the native iOS video/input surface, with background recovery treated as a security and resource lifecycle rather than a second navigation flow.
+
+### Apple surface boundary
+
+- **Shared core:** Keychain identity and saved-host records, Rust FFI bridge, H.264 decode, stream freshness and pure input commands.
+- **macOS host/controller:** ScreenCaptureKit capture, VideoToolbox encode, CGEvent injection, native permission guidance and host approval.
+- **iOS controller:** Metal display, direct-touch/trackpad mapping, committed Unicode and special-key input, QR pairing and scene-phase suspend/resume.
+
+The shared core never creates a QUIC socket in Swift and never moves private keys or relay authentication into UI state, logs or `UserDefaults`.
 
 ## Colors
 

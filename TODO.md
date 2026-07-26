@@ -58,7 +58,21 @@
 - [ ] 手动验收键盘导航、焦点可见性、高对比度、WebView2 缩放和中文文案溢出。
 - [x] 将发布前检查、服务器回滚和日志脱敏流程写入 [Windows 发布运行手册](docs/windows-release-runbook.md)。
 
-## 6. 后续增强（不阻塞首个 Windows 正式版）
+## 6. Apple 端开发与验收（2026-07-26）
+
+- [x] Rust FFI 增加显式 macOS/iOS controller platform，保留 macOS 默认 ABI 入口。
+- [x] 抽取跨 macOS/iOS 的 `DeskLinkAppleCore`，统一 Keychain、controller bridge、H.264 解码和视频几何。
+- [x] 完成 macOS Apple Silicon controller/host bundle、权限声明、验收脚本和未签名检查。
+- [x] 完成 iOS 16+ controller-only 工程、device/simulator Rust xcframework、配对和保存设备。
+- [x] 完成 iOS Metal 视频、直接触控/轨迹板、键盘、快捷键栏和 scene lifecycle 恢复。
+- [x] 通过 Rust/Swift package/iOS device build/simulator unit+UI 自动门禁。
+- [ ] 在真实 iPhone 上安装签名包，验收 Keychain、二维码、视频、触控、键盘、断线和前后台恢复。
+- [ ] 完成 macOS Screen Recording/Accessibility 权限与同机双实例 controller/host 验收。
+- [ ] 完成 Windows↔macOS、Windows↔iOS、macOS↔iOS 跨设备验收，以及 macOS 签名/公证。
+
+详细记录见 [Apple 平台验收汇总](docs/apple/2026-07-26-apple-platform-acceptance.md) 和 [iOS controller 开发说明](docs/apple/ios-controller-development.md)。
+
+## 7. 后续增强（不阻塞首个 Windows 正式版）
 
 - [ ] 4K 原生编码能力评估、硬件矩阵和自适应码率策略。
 - [ ] 公网 STUN/ICE/TURN 路径评估，决定是否增加真正的跨网 P2P 视频通道。
