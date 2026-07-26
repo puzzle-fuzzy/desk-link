@@ -98,19 +98,16 @@ def parse_capacity(logs: str) -> dict[str, int] | None:
     if not matches:
         return None
     values = [int(value) for value in matches[-1].groups()]
-    return dict(
-        zip(
-            (
-                "active_sessions",
-                "attached_participants",
-                "accepted_connections",
-                "max_sessions",
-                "max_connections",
-            ),
-            values,
-            strict=True,
-        )
+    names = (
+        "active_sessions",
+        "attached_participants",
+        "accepted_connections",
+        "max_sessions",
+        "max_connections",
     )
+    if len(values) != len(names):
+        raise ValueError("relay capacity sample has an unexpected field count")
+    return dict(zip(names, values))
 
 
 def main() -> int:
