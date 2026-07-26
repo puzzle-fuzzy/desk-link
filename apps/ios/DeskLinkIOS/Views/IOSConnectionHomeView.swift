@@ -49,12 +49,15 @@ struct IOSConnectionHomeView: View {
                         .autocorrectionDisabled()
                         .focused($isInviteFieldFocused)
                         .font(.footnote.monospaced())
-                    HStack {
+                    HStack(spacing: 18) {
                         Button("从剪贴板粘贴") { pasteInvite() }
+                            .buttonStyle(.borderless)
+                            .accessibilityIdentifier("paste-invite")
                         Button("扫描二维码") {
-                            isInviteFieldFocused = false
-                            isShowingScanner = true
+                            beginScanning()
                         }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("scan-invite")
                     }
                     Button("开始连接") { connectInviteText() }
                         .disabled(inviteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -162,6 +165,17 @@ struct IOSConnectionHomeView: View {
         inputError = nil
         inviteText = UIPasteboard.general.string ?? ""
         if inviteText.isEmpty { inputError = "剪贴板中没有连接码。" }
+    }
+
+    private func beginScanning() {
+        isInviteFieldFocused = false
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+        isShowingScanner = true
     }
 
     private func connectInviteText() {
