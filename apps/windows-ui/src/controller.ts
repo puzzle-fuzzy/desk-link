@@ -398,9 +398,8 @@ export function renderControllerView(): string {
       ${feedback ? renderFeedback(feedback) : ""}
       <div class="controller-heading">
         <div class="controller-heading-copy">
-          <span class="editorial-kicker">01 / REMOTE CONTROL</span>
           <h1>连接设备</h1>
-          <p>输入对方电脑显示的设备 ID 和访问密码，然后在对方电脑上确认连接。</p>
+          <p>连接未知设备，或从最近使用过的设备继续。</p>
         </div>
         ${renderRuntimeBadge()}
       </div>
@@ -713,7 +712,7 @@ function renderConnectionPanel(): string {
       <div class="controller-connect-column controller-connect-column--new">
         <section class="controller-card controller-card--primary controller-card--manual">
           <div class="controller-card-heading">
-            <div><span class="card-index">01</span><h2>${hasQuickConnections ? "连接新的设备" : "连接远程设备"}</h2><p>输入另一台电脑显示的本机 ID，以及临时密码或固定密码。</p></div>
+            <div><h2>${hasQuickConnections ? "连接新的设备" : "连接远程设备"}</h2><p>输入对方设备显示的 ID 和访问密码，开始安全连接。</p></div>
           </div>
           <form class="controller-form controller-device-form" data-controller-device-form>
             <label class="field device-credential-field">
@@ -724,7 +723,7 @@ function renderConnectionPanel(): string {
               <span>访问密码</span>
               <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="8" placeholder="8 位访问密码" aria-describedby="controller-device-hint" required autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" ${isWorking ? "disabled" : ""}>
             </label>
-            <p class="controller-device-hint" id="controller-device-hint">验证成功后，设备 ID 和密码会由当前 Windows 账户加密保存。</p>
+            <p class="controller-device-hint" id="controller-device-hint">验证成功后，凭据会由当前 Windows 账户加密保存。连接请求仍需对方在本机批准。</p>
             <div class="controller-form-actions">
               <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
                 ${connectionActive ? `${icon("loader-circle", "button-spinner")} ${escapeHtml(connectionActionLabel(connectionState))}` : connectionState === "stopped" || retryAvailable ? "重新尝试" : "查找并连接设备"}
@@ -735,6 +734,9 @@ function renderConnectionPanel(): string {
           <div class="controller-privacy-note" title="远程画面和输入经过端到端加密，新控制端必须在主机上获得本地批准。">
             ${icon("shield-check")}<span>首次连接需主机确认，画面与输入端到端加密</span>
           </div>
+          <button class="controller-share-link" type="button" data-view="connection">
+            ${icon("scan")}<span><strong>需要让 iPhone 连接？</strong><small>在“共享此设备”中生成二维码</small></span>${icon("arrow-left", "controller-share-link-arrow")}
+          </button>
         </section>
       </div>
       ${renderSavedDevices(isWorking)}
@@ -790,16 +792,16 @@ function renderConnectionProgress(state: string): string {
 }
 
 function renderSavedDevices(isWorking: boolean): string {
-  const savedDevices = snapshot?.savedDevices ?? [];
+  const savedDevices = [...(snapshot?.savedDevices ?? [])].sort((left, right) => right.lastUsedUnixS - left.lastUsedUnixS);
   const approvedConnection = snapshot?.savedConnection ?? null;
   const approvedListed = approvedConnection
     ? savedDevices.some((saved) => deviceIdsMatch(saved.deviceId, approvedConnection.deviceId))
     : false;
   const hasSavedDevice = savedDevices.length > 0 || Boolean(approvedConnection);
   return `
-    <aside class="saved-devices-panel" aria-label="可直接连接的设备">
+    <aside class="saved-devices-panel" aria-label="最近连接过的设备">
       <div class="saved-devices-heading">
-        <div><span class="editorial-kicker">02 / RECENT DEVICES</span><h2>已保存设备</h2><p>选择使用过的电脑，直接开始连接。</p></div>
+        <div><h2>最近连接</h2><p>选择使用过的设备，直接开始连接。</p></div>
         ${snapshot?.savedDevicesError ? `<button type="button" data-controller-saved-devices-clear ${isWorking ? "disabled" : ""}>清除异常记录</button>` : ""}
       </div>
       ${snapshot?.savedDevicesError ? `<p class="inline-error">${escapeHtml(snapshot.savedDevicesError)}</p>` : ""}

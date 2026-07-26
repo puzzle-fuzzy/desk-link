@@ -126,6 +126,7 @@ let accountMode: "login" | "register" | "forgot" = "login";
 let accountBusy = false;
 let accountNotice: string | null = null;
 let accountCanResendVerification = false;
+let snapshotRecoveryTimer: number | null = null;
 
 function render(): void {
   if (accountLoading) {
@@ -297,6 +298,10 @@ async function logoutAccount(): Promise<void> {
   try {
     await accountLogout();
     account = { signedIn: false, user: null, deviceId: null };
+    if (snapshotRecoveryTimer !== null) {
+      window.clearTimeout(snapshotRecoveryTimer);
+      snapshotRecoveryTimer = null;
+    }
     snapshot = null;
     activeView = "controller";
     renderedView = null;
@@ -468,7 +473,6 @@ function renderWorkspaceTopbar(): string {
       <div class="workspace-topbar-actions">
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
         ${snapshot ? renderHostStatusChip(snapshot) : ""}
-        <button class="topbar-icon-button" type="button" data-view="about" aria-label="关于 DeskLink" title="关于 DeskLink">${icon("circle-help")}</button>
         <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-expanded="${utilityMenuOpen}" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
         ${renderUtilityMenu()}
       </div>
@@ -589,8 +593,7 @@ function renderFatalState(): string {
     <div class="empty-state empty-state--error">
       ${icon("circle-alert", "empty-symbol")}
       <h1>无法读取 DeskLink 状态</h1>
-      <p>当前界面无法读取此 Windows 账户的本地状态，主机设置没有被修改。</p>
-      <button class="button button--primary" type="button" data-refresh>重新读取</button>
+      <p>当前界面无法读取此 Windows 账户的本地状态，主机设置没有被修改。DeskLink 会自动恢复状态，请稍候。</p>
     </div>
   `;
 }
@@ -844,7 +847,6 @@ function renderDevices(state: HostSnapshot): string {
         </div>
         <div class="page-actions">
           ${renderPairingAction(state, "primary")}
-          <button class="button button--secondary" type="button" data-refresh>刷新设备</button>
         </div>
       </header>
 
@@ -954,7 +956,7 @@ function renderPairing(state: HostSnapshot): string {
         <div>
           <button class="back-button" type="button" data-open-connection aria-label="返回共享此设备">${icon("arrow-left")}共享此设备</button>
           <h1>允许另一台电脑连接</h1>
-          <p>在另一台电脑输入下面的设备 ID 和临时密码。</p>
+          <p>让 iPhone 扫描二维码，或在另一台电脑使用设备 ID 和临时密码。</p>
         </div>
         <span class="pairing-state ${active ? "pairing-state--active" : ""}">
           <span aria-hidden="true"></span>${active ? "临时密码有效" : "临时密码已失效"}
@@ -968,9 +970,19 @@ function renderPairing(state: HostSnapshot): string {
               <div class="pairing-card-heading">
                 <div>
                   <span class="eyebrow">本次连接凭据</span>
-                  <h2 id="pairing-credentials-heading">输入到另一台电脑</h2>
+                  <h2 id="pairing-credentials-heading">选择一种连接方式</h2>
                 </div>
                 <strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>
+              </div>
+              <div class="pairing-qr-layout">
+                <div class="pairing-qr" aria-label="DeskLink 连接二维码">
+                  ${session.qrSvg}
+                </div>
+                <div class="pairing-qr-copy">
+                  <strong>用 iPhone 扫描</strong>
+                  <p>打开 iPhone 的 DeskLink，选择“扫描二维码”，对准此处即可带入安全连接信息。</p>
+                  <span>${formatPairingRemaining(session.expiresAtUnixS)} 后失效</span>
+                </div>
               </div>
               <div class="pairing-credentials">
                 <div class="pairing-credential">
@@ -985,8 +997,8 @@ function renderPairing(state: HostSnapshot): string {
                 </div>
               </div>
               <ol class="pairing-steps" aria-label="连接步骤">
-                <li><span>1</span><p>在另一台电脑打开“连接设备”</p></li>
-                <li><span>2</span><p>输入设备 ID 和临时密码</p></li>
+                <li><span>1</span><p>扫描二维码，或打开“连接设备”</p></li>
+                <li><span>2</span><p>使用设备 ID 和临时密码连接</p></li>
                 <li><span>3</span><p>回到本机确认连接请求</p></li>
               </ol>
               <div class="pairing-card-actions">
@@ -1114,8 +1126,7 @@ function renderSettings(): string {
           : `<section class="settings-unavailable">
               ${icon("circle-alert", "empty-symbol")}
               <h2>无法读取 Windows 设置</h2>
-              <p>远程连接不会因此停止，可以重新读取设置。</p>
-              <button class="button button--primary" type="button" data-load-preferences>重新读取设置</button>
+              <p>远程连接不会因此停止。返回其他页面后，DeskLink 会在下次打开设置时再次尝试。</p>
             </section>`}
 
       ${snapshot ? renderDiagnosticSummary(snapshot) : ""}
@@ -1584,9 +1595,6 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-setup-managed]").forEach((button) => {
     button.addEventListener("click", () => void enableManagedConnection());
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-refresh]").forEach((button) => {
-    button.addEventListener("click", () => void refreshSnapshot());
-  });
   document.querySelector<HTMLButtonElement>("[data-restart-host]")?.addEventListener("click", () => {
     void restartStoppedHost();
   });
@@ -1836,6 +1844,10 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
       return;
     }
     snapshot = nextSnapshot;
+    if (snapshotRecoveryTimer !== null) {
+      window.clearTimeout(snapshotRecoveryTimer);
+      snapshotRecoveryTimer = null;
+    }
     if (pairingSession && snapshot.runtime.state === "connected") {
       clearPairingSecrets();
       pairingSession = null;
@@ -1859,12 +1871,13 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
     }
     if (showLoading || !snapshot) {
       snapshot = null;
+      scheduleSnapshotRecovery();
     }
     feedback = {
       tone: "error",
       message: showLoading
         ? normalizeError(error)
-        : `无法刷新最新状态，界面暂时保留上次结果。${normalizeError(error)}`,
+        : `无法读取最新状态，界面暂时保留上次结果。${normalizeError(error)}`,
     };
   } finally {
     if (!snapshotRequests.isCurrent(request)) {
@@ -1875,6 +1888,16 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
       render();
     }
   }
+}
+
+function scheduleSnapshotRecovery(): void {
+  if (snapshotRecoveryTimer !== null || !account.signedIn) {
+    return;
+  }
+  snapshotRecoveryTimer = window.setTimeout(() => {
+    snapshotRecoveryTimer = null;
+    void refreshSnapshot();
+  }, 1800);
 }
 
 async function restartStoppedHost(): Promise<void> {

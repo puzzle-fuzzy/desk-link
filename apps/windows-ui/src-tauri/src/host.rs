@@ -19,6 +19,8 @@ use apps_windows::{
 };
 use desklink_crypto::{MAX_PAIRING_TTL_S, PairingCode, PairingInvite};
 use desklink_transport::RelayDirectoryRegistration;
+use qrcode::QrCode;
+use qrcode::render::svg;
 use rand_core::OsRng;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, UserAttentionType};
@@ -288,11 +290,13 @@ pub struct PairingSessionSummary {
     pub device_id: String,
     pub temporary_password: String,
     pub expires_at_unix_s: u64,
+    pub qr_svg: String,
 }
 
 impl Drop for PairingSessionSummary {
     fn drop(&mut self) {
         self.temporary_password.zeroize();
+        self.qr_svg.zeroize();
     }
 }
 
@@ -739,6 +743,13 @@ fn prepare_pairing(
     let encoded = invite
         .encode()
         .map_err(|_| HostPreparationFailure::Pairing)?;
+    let qr_svg = QrCode::new(encoded.as_bytes())
+        .map_err(|_| HostPreparationFailure::Pairing)?
+        .render::<svg::Color>()
+        .min_dimensions(280, 280)
+        .dark_color(svg::Color("#111827"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
     let device_id = crate::device_directory::public_device_id(identity.device_id);
     let access_code = PairingCode::generate(&mut OsRng);
     let directory_registration = RelayDirectoryRegistration::new(
@@ -754,6 +765,7 @@ fn prepare_pairing(
         device_id: crate::device_directory::format_device_id(device_id),
         temporary_password: access_code.to_string(),
         expires_at_unix_s: invite.expires_at_unix_s(),
+        qr_svg,
     };
     let session_id = invite.session_id();
     let authentication = *invite.relay_authentication();

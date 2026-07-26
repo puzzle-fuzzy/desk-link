@@ -82,6 +82,7 @@ export interface PairingSessionSummary {
   deviceId: string;
   temporaryPassword: string;
   expiresAtUnixS: number;
+  qrSvg: string;
 }
 
 export interface FixedAccessSummary {

@@ -2442,3 +2442,675 @@ html[data-remote-fullscreen="true"] .app-main {
 .account-session-email { max-width: 220px; overflow: hidden; color: #7a838e; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-account-button { border: 1px solid #d8dde3; border-radius: 8px; padding: 7px 10px; color: #53606c; background: #fff; cursor: pointer; font: inherit; font-size: 12px; }
 .topbar-account-button:hover { border-color: #b7c1cc; color: #1e2630; }
+
+/* Apple-style connection workspace. The connection task is deliberately
+   calm and direct: one primary action on the left, recent devices on the
+   right, and system appearance applied to the complete surface. */
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --background: #f5f5f7;
+  --surface: #ffffff;
+  --surface-subtle: #f2f2f7;
+  --surface-quiet: #e5e5ea;
+  --surface-container-lowest: #ffffff;
+  --surface-container-low: #f2f2f7;
+  --surface-container: #e5e5ea;
+  --surface-container-high: #d1d1d6;
+  --surface-container-highest: #c7c7cc;
+  --ink: #1d1d1f;
+  --ink-secondary: #48484a;
+  --ink-muted: #6e6e73;
+  --border: rgba(60, 60, 67, 0.18);
+  --border-strong: rgba(60, 60, 67, 0.32);
+  --primary: #007aff;
+  --primary-container: #007aff;
+  --primary-hover: #006ee6;
+  --primary-pressed: #005ec4;
+  --on-primary: #ffffff;
+  --success: #34c759;
+  --success-surface: rgba(52, 199, 89, 0.14);
+  --info: #007aff;
+  --info-surface: rgba(0, 122, 255, 0.1);
+  --error: #ff3b30;
+  --error-surface: rgba(255, 59, 48, 0.12);
+  --warning: #ff9500;
+  --warning-surface: rgba(255, 149, 0, 0.14);
+  --focus: #007aff;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --transition: 180ms ease-out;
+}
+
+body,
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
+body,
+#app,
+.app-shell,
+.app-main {
+  background: var(--background);
+  color: var(--ink);
+}
+
+.app-sidebar,
+.workspace-topbar {
+  background: var(--surface);
+}
+
+.app-sidebar {
+  padding: 24px 14px 16px;
+  border-right-color: var(--border);
+}
+
+.sidebar-brand {
+  padding: 0 10px 28px;
+}
+
+.sidebar-brand-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--surface);
+}
+
+.sidebar-label {
+  padding-left: 10px;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sidebar-nav-item {
+  min-height: 42px;
+  border-left: 0;
+  border-radius: 10px;
+  color: var(--ink-secondary);
+}
+
+.sidebar-nav-item--active {
+  border-left-color: transparent;
+  background: var(--surface-subtle);
+  color: var(--primary);
+}
+
+.sidebar-nav-item:hover {
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+
+.sidebar-nav-item--active .app-icon,
+.sidebar-nav-item:hover .app-icon {
+  color: var(--primary);
+}
+
+.sidebar-status {
+  border-color: var(--border);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+}
+
+.workspace-topbar {
+  min-height: 64px;
+  padding: 0 32px;
+  border-bottom-color: var(--border);
+}
+
+.workspace-context-label {
+  color: var(--ink-muted);
+}
+
+.workspace-context-divider {
+  background: var(--border-strong);
+}
+
+.topbar-menu-toggle,
+.topbar-account-button {
+  border-color: var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink-secondary);
+}
+
+.topbar-menu-toggle:hover,
+.topbar-menu-toggle--active,
+.topbar-account-button:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+
+.workspace {
+  padding: 36px clamp(24px, 4vw, 56px);
+  background: var(--background);
+}
+
+.controller-stack,
+.control-workspace,
+.page-layout,
+.loading-layout {
+  width: min(100%, 1240px);
+}
+
+.controller-heading {
+  margin-bottom: 28px;
+}
+
+.controller-heading h1,
+.page-heading h1,
+.about-hero h1 {
+  color: var(--ink);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 38px;
+}
+
+.controller-heading p,
+.page-heading p {
+  color: var(--ink-muted);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.controller-runtime {
+  min-width: 260px;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.controller-connect-layout {
+  grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
+  gap: 20px;
+}
+
+.controller-card,
+.saved-devices-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.controller-card--manual {
+  padding: 28px;
+}
+
+.controller-card--manual::before {
+  display: none;
+}
+
+.controller-card-heading h2,
+.saved-devices-heading h2,
+.section-heading h2 {
+  color: var(--ink);
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 28px;
+}
+
+.controller-card-heading p,
+.saved-devices-heading p {
+  color: var(--ink-muted);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.controller-device-form {
+  gap: 14px;
+  margin-top: 24px;
+}
+
+.field > span,
+.field > label,
+.connection-form .field > label {
+  color: var(--ink-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.controller-form .field .device-id-input,
+.controller-form .field .temporary-password-input {
+  min-height: 50px;
+  height: 50px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-subtle);
+  color: var(--ink);
+  font-size: 18px;
+}
+
+.controller-form .field .device-id-input:hover,
+.controller-form .field .temporary-password-input:hover,
+.controller-form .field .device-id-input:focus,
+.controller-form .field .temporary-password-input:focus {
+  border-color: var(--primary);
+  background: var(--surface);
+}
+
+.controller-device-hint,
+.controller-form-actions > span,
+.controller-privacy-note {
+  color: var(--ink-muted);
+  font-size: 13px;
+  line-height: 19px;
+}
+
+.controller-form-actions {
+  gap: 14px;
+  align-items: center;
+}
+
+.controller-form-actions .button {
+  min-width: 190px;
+}
+
+.controller-privacy-note {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.controller-privacy-note .app-icon {
+  color: var(--success);
+}
+
+.controller-share-link {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 13px 0 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.controller-share-link > span {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+}
+
+.controller-share-link strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.controller-share-link small {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.controller-share-link:hover small {
+  color: var(--ink-secondary);
+}
+
+.controller-share-link-arrow {
+  transform: rotate(180deg);
+}
+
+.saved-devices-panel {
+  padding: 28px;
+}
+
+.saved-devices-heading {
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.saved-device-list {
+  gap: 10px;
+  padding-top: 18px;
+}
+
+.saved-device-row {
+  gap: 14px;
+  padding: 14px;
+  border-color: var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.saved-device-row:hover {
+  border-color: var(--border-strong);
+  background: var(--surface);
+}
+
+.saved-device-identity strong {
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.saved-device-kind {
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.saved-device-identity small {
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.saved-device-actions {
+  gap: 7px;
+}
+
+.saved-device-actions .button {
+  min-height: 34px;
+  padding: 7px 11px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.saved-device-remove {
+  border-radius: 8px;
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.saved-device-remove:hover {
+  color: var(--error);
+}
+
+.button,
+.toolbar-button,
+.icon-button {
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  transition: background-color var(--transition), border-color var(--transition), color var(--transition), transform var(--transition);
+}
+
+.button {
+  min-height: 44px;
+  padding: 10px 16px;
+}
+
+.button:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.button--primary {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+
+.button--primary:hover:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
+}
+
+.button--secondary {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-secondary);
+}
+
+.button--secondary:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+
+.pairing-card {
+  border-color: var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.pairing-qr-layout {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin: 4px 0 18px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.pairing-qr {
+  display: grid;
+  width: 184px;
+  height: 184px;
+  flex: 0 0 184px;
+  place-items: center;
+  padding: 10px;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.pairing-qr svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.pairing-qr-copy {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.pairing-qr-copy strong {
+  color: var(--ink);
+  font-size: 16px;
+}
+
+.pairing-qr-copy p,
+.pairing-qr-copy span {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 13px;
+  line-height: 19px;
+}
+
+.pairing-credentials {
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .workspace {
+    padding: 28px 24px;
+  }
+
+  .controller-connect-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .saved-devices-panel {
+    min-height: 360px;
+  }
+}
+
+@media (max-width: 640px) {
+  .workspace-topbar {
+    padding: 0 18px;
+  }
+
+  .workspace-context-label,
+  .workspace-context-divider {
+    display: none;
+  }
+
+  .workspace {
+    padding: 22px 16px;
+  }
+
+  .controller-heading,
+  .page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .controller-runtime {
+    width: 100%;
+  }
+
+  .controller-card--manual,
+  .saved-devices-panel {
+    padding: 22px 18px;
+  }
+
+  .controller-form-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .controller-form-actions .button {
+    width: 100%;
+  }
+
+  .pairing-qr-layout {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .pairing-qr {
+    width: min(100%, 220px);
+    height: auto;
+    aspect-ratio: 1;
+    flex-basis: auto;
+    align-self: center;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #000000;
+    --surface: #1c1c1e;
+    --surface-subtle: #2c2c2e;
+    --surface-quiet: #3a3a3c;
+    --surface-container-lowest: #1c1c1e;
+    --surface-container-low: #2c2c2e;
+    --surface-container: #3a3a3c;
+    --surface-container-high: #48484a;
+    --surface-container-highest: #636366;
+    --ink: #f5f5f7;
+    --ink-secondary: #d1d1d6;
+    --ink-muted: #98989d;
+    --border: rgba(235, 235, 245, 0.16);
+    --border-strong: rgba(235, 235, 245, 0.28);
+    --primary: #0a84ff;
+    --primary-container: #0a84ff;
+    --primary-hover: #409cff;
+    --primary-pressed: #0066cc;
+    --success: #30d158;
+    --success-surface: rgba(48, 209, 88, 0.18);
+    --info: #0a84ff;
+    --info-surface: rgba(10, 132, 255, 0.18);
+    --error: #ff453a;
+    --error-surface: rgba(255, 69, 58, 0.18);
+    --warning: #ff9f0a;
+    --warning-surface: rgba(255, 159, 10, 0.18);
+  }
+
+  .account-gate {
+    background: var(--background);
+  }
+
+  .account-card,
+  .account-mode-switch button.is-active {
+    border-color: var(--border);
+    background: var(--surface);
+    color: var(--ink);
+  }
+
+  .account-card-brand strong,
+  .account-card h1,
+  .account-field,
+  .account-mark,
+  .account-mode-switch button.is-active {
+    color: var(--ink);
+  }
+
+  .account-card-brand span,
+  .account-subtitle,
+  .account-footnote,
+  .account-session-email {
+    color: var(--ink-muted);
+  }
+
+  .account-mark {
+    border-color: var(--ink);
+    background: transparent;
+  }
+
+  .account-mode-switch {
+    background: var(--surface-subtle);
+  }
+
+  .account-mode-switch button {
+    color: var(--ink-muted);
+  }
+
+  .account-field input {
+    border-color: var(--border-strong);
+    background: var(--surface-subtle);
+    color: var(--ink);
+  }
+
+  .account-error {
+    color: #ff9f9a;
+    background: var(--error-surface);
+  }
+
+  .account-notice {
+    color: #9de7ac;
+    background: var(--success-surface);
+  }
+
+  .topbar-account-button {
+    color: var(--ink-secondary);
+  }
+
+  .controller-card,
+  .saved-devices-panel,
+  .controller-runtime,
+  .pairing-card,
+  .workspace-topbar,
+  .app-sidebar,
+  .sidebar-status {
+    box-shadow: none;
+  }
+
+  .pairing-qr {
+    background: #ffffff;
+  }
+
+  .pairing-qr-copy span {
+    color: var(--ink-muted);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button,
+  .toolbar-button,
+  .icon-button,
+  .sidebar-nav-item,
+  .controller-share-link {
+    transition: none;
+  }
+}
