@@ -16,4 +16,25 @@ public enum VideoGeometry {
             height: size.height
         )
     }
+
+    /// Converts a point from a top-left-origin video rect to the normalized
+    /// coordinates used by the remote input protocol.
+    ///
+    /// Both UIKit and the remote display protocol use this convention. Other
+    /// platform-specific coordinate systems must be converted at their input
+    /// boundary before calling this helper.
+    public static func normalizedTopLeftPoint(for point: CGPoint, in rect: CGRect) -> CGPoint? {
+        guard rect.width > 0,
+              rect.height > 0,
+              point.x >= rect.minX,
+              point.x <= rect.maxX,
+              point.y >= rect.minY,
+              point.y <= rect.maxY
+        else { return nil }
+
+        return CGPoint(
+            x: (point.x - rect.minX) / rect.width,
+            y: (point.y - rect.minY) / rect.height
+        )
+    }
 }

@@ -40,6 +40,12 @@ enum MacH264EncoderError: Error, Equatable, Sendable {
     case missingFormatDescription
 }
 
+func h264TargetBitrate(width: Int, height: Int) -> Int {
+    let pixels = Int64(max(0, width)) * Int64(max(0, height))
+    let target = pixels * 5
+    return Int(max(Int64(2_000_000), min(Int64(20_000_000), target)))
+}
+
 enum H264EncoderOutputAssembler {
     static func events(
         avccAccessUnit: Data,
@@ -347,7 +353,7 @@ final class MacH264Encoder: @unchecked Sendable {
     }
 
     private func configure(session: VTCompressionSession, width: Int, height: Int) throws {
-        let bitrate = max(1_000_000, min(12_000_000, width * height * 4))
+        let bitrate = h264TargetBitrate(width: width, height: height)
         try setProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         try setProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         try setProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)

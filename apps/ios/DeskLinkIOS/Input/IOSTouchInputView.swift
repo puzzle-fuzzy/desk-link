@@ -51,16 +51,16 @@ struct IOSTouchMapper {
 
     func command(for point: CGPoint, phase: IOSTouchPhase) -> RemoteInputCommand? {
         guard mode == .direct,
-              visibleVideoRect.width > 0,
-              visibleVideoRect.height > 0,
-              visibleVideoRect.contains(point)
+              let normalized = VideoGeometry.normalizedTopLeftPoint(
+                  for: point,
+                  in: visibleVideoRect
+              )
         else { return nil }
 
-        let x = Float((point.x - visibleVideoRect.minX) / visibleVideoRect.width)
-        // The rendered video uses Metal's bottom-left coordinate space for
-        // its vertical axis, while UIKit touch locations are top-left based.
-        let y = Float((visibleVideoRect.maxY - point.y) / visibleVideoRect.height)
-        return .move(normalizedX: x.clamped(to: 0...1), normalizedY: y.clamped(to: 0...1))
+        return .move(
+            normalizedX: Float(normalized.x).clamped(to: 0...1),
+            normalizedY: Float(normalized.y).clamped(to: 0...1)
+        )
     }
 
     mutating func relativeCommand(delta: CGSize) -> RemoteInputCommand? {
@@ -101,10 +101,6 @@ struct IOSVideoViewport: Equatable {
     private(set) var zoomScale: CGFloat = 1
     private(set) var panOffset: CGSize = .zero
 
-    static func metalAnchor(for touchAnchor: CGPoint, bounds: CGSize) -> CGPoint {
-        CGPoint(x: touchAnchor.x, y: bounds.height - touchAnchor.y)
-    }
-
     mutating func pinch(
         factor: CGFloat,
         anchor: CGPoint,
@@ -128,10 +124,9 @@ struct IOSVideoViewport: Equatable {
         let oldRect = renderRect(baseRect: baseRect)
         let nextScale = (zoomScale * factor).clamped(to: 1...4)
         let appliedFactor = nextScale / zoomScale
-        let metalAnchor = Self.metalAnchor(for: anchor, bounds: bounds)
         let nextOrigin = CGPoint(
-            x: metalAnchor.x - (metalAnchor.x - oldRect.minX) * appliedFactor,
-            y: metalAnchor.y - (metalAnchor.y - oldRect.minY) * appliedFactor
+            x: anchor.x - (anchor.x - oldRect.minX) * appliedFactor,
+            y: anchor.y - (anchor.y - oldRect.minY) * appliedFactor
         )
         let nextSize = CGSize(
             width: baseRect.width * nextScale,

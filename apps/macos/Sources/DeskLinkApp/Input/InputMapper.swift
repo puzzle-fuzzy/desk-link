@@ -1,4 +1,5 @@
 import CoreGraphics
+import DeskLinkAppleCore
 
 enum ModifierMode: Equatable {
     case automatic
@@ -31,21 +32,14 @@ struct InputMapper {
     }
 
     func normalizedPoint(for point: CGPoint) -> CGPoint? {
-        guard videoRect.width > 0,
-              videoRect.height > 0,
-              point.x >= videoRect.minX,
-              point.x <= videoRect.maxX,
-              point.y >= videoRect.minY,
-              point.y <= videoRect.maxY
-        else {
-            return nil
-        }
-        return CGPoint(
-            x: (point.x - videoRect.minX) / videoRect.width,
-            // AppKit's default NSView coordinate system is bottom-origin, while the
-            // protocol and Quartz display coordinates use a top-origin convention.
-            y: 1 - (point.y - videoRect.minY) / videoRect.height
+        // AppKit's default NSView coordinate system is bottom-origin. Convert
+        // it once at the platform boundary, then use the shared top-left
+        // protocol convention everywhere else.
+        let topLeftPoint = CGPoint(
+            x: point.x,
+            y: videoRect.maxY - (point.y - videoRect.minY)
         )
+        return VideoGeometry.normalizedTopLeftPoint(for: topLeftPoint, in: videoRect)
     }
 
     func remoteModifier(for modifier: LocalModifier) -> RemoteModifier {

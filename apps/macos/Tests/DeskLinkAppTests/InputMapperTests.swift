@@ -25,12 +25,19 @@ final class InputMapperTests: XCTestCase {
     func testCaptureVideoDimensionsFitProtocolBounds() {
         XCTAssertEqual(
             captureVideoDimensions(displayWidth: 3840, displayHeight: 2160),
-            CaptureVideoDimensions(width: 1920, height: 1080)
+            CaptureVideoDimensions(width: 2560, height: 1440)
         )
         XCTAssertEqual(
             captureVideoDimensions(displayWidth: 2560, displayHeight: 1600),
-            CaptureVideoDimensions(width: 1728, height: 1080)
+            CaptureVideoDimensions(width: 2304, height: 1440)
         )
+    }
+
+    func testH264TargetBitrateScalesWithVideoArea() {
+        XCTAssertEqual(h264TargetBitrate(width: 1920, height: 1080), 10_368_000)
+        XCTAssertEqual(h264TargetBitrate(width: 2560, height: 1440), 18_432_000)
+        XCTAssertEqual(h264TargetBitrate(width: 64, height: 64), 2_000_000)
+        XCTAssertEqual(h264TargetBitrate(width: 8_000, height: 8_000), 20_000_000)
     }
 
     func testCommandMapsToRemoteControlWhenAutomaticMappingIsEnabled() {

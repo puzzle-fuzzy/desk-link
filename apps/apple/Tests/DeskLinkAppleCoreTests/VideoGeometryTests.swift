@@ -23,4 +23,24 @@ final class VideoGeometryTests: XCTestCase {
             .zero
         )
     }
+
+    func testNormalizedTopLeftPointPreservesVerticalDirection() {
+        let rect = CGRect(x: 20, y: 40, width: 800, height: 450)
+
+        XCTAssertEqual(
+            VideoGeometry.normalizedTopLeftPoint(
+                for: CGPoint(x: 420, y: 40),
+                in: rect
+            ),
+            CGPoint(x: 0.5, y: 0)
+        )
+        XCTAssertEqual(
+            VideoGeometry.normalizedTopLeftPoint(
+                for: CGPoint(x: 420, y: 490),
+                in: rect
+            ),
+            CGPoint(x: 0.5, y: 1)
+        )
+        XCTAssertNil(VideoGeometry.normalizedTopLeftPoint(for: CGPoint(x: 10, y: 100), in: rect))
+    }
 }

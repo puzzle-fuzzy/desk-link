@@ -17,7 +17,7 @@ final class IOSInputMapperTests: XCTestCase {
         )
     }
 
-    func testDirectTouchUsesMetalVerticalCoordinate() {
+    func testDirectTouchKeepsUIKitTopLeftVerticalCoordinate() {
         let videoRect = CGRect(x: 0, y: 312, width: 390, height: 220)
         let mapper = IOSTouchMapper(
             videoSize: CGSize(width: 1920, height: 1080),
@@ -38,9 +38,9 @@ final class IOSInputMapperTests: XCTestCase {
         }
 
         XCTAssertEqual(topX, 0.5, accuracy: 0.000_001)
-        XCTAssertEqual(topY, Float(210.0 / 220.0), accuracy: 0.000_001)
+        XCTAssertEqual(topY, Float(10.0 / 220.0), accuracy: 0.000_001)
         XCTAssertEqual(bottomX, 0.5, accuracy: 0.000_001)
-        XCTAssertEqual(bottomY, Float(10.0 / 220.0), accuracy: 0.000_001)
+        XCTAssertEqual(bottomY, Float(210.0 / 220.0), accuracy: 0.000_001)
     }
 
     func testTrackpadTwoFingerPanBecomesBoundedWheelInput() {
@@ -120,14 +120,9 @@ final class IOSInputMapperTests: XCTestCase {
         XCTAssertEqual(viewport.panOffset, .zero)
     }
 
-    func testVideoViewportFlipsPinchAnchorForMetalCoordinates() {
+    func testVideoViewportKeepsUIKitPinchAnchorInPlace() {
         let bounds = CGSize(width: 390, height: 844)
         let touchAnchor = CGPoint(x: 195, y: 360)
-
-        XCTAssertEqual(
-            IOSVideoViewport.metalAnchor(for: touchAnchor, bounds: bounds),
-            CGPoint(x: 195, y: 484)
-        )
 
         var viewport = IOSVideoViewport()
         viewport.pinch(
@@ -137,9 +132,14 @@ final class IOSInputMapperTests: XCTestCase {
             bounds: bounds
         )
 
-        // The upper UIKit touch point must stay attached to the upper visual
-        // content, which is a negative pan in the Metal coordinate space.
-        XCTAssertLessThan(viewport.panOffset.height, 0)
+        // The UIKit touch point must stay attached to the same visual content
+        // after zooming, without a second vertical coordinate conversion.
+        let baseRect = VideoGeometry.aspectFit(
+            source: CGSize(width: 1920, height: 1080),
+            in: CGRect(origin: .zero, size: bounds)
+        )
+        XCTAssertTrue(viewport.renderRect(baseRect: baseRect).contains(touchAnchor))
+        XCTAssertGreaterThan(viewport.panOffset.height, 0)
     }
 
     func testViewportMovesToKeepTrackpadPointerInsideSafeEdge() {
