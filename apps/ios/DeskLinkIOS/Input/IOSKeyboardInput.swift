@@ -80,14 +80,24 @@ final class IOSKeyboardInput: ObservableObject {
     }
 
     func resign() {
-        _ = responder?.resignFirstResponder()
-        bridge.releaseAll()
-        activeModifiers = []
-        isKeyboardVisible = false
+        guard let responder, responder.isFirstResponder else {
+            finishResigning()
+            return
+        }
+        _ = responder.resignFirstResponder()
     }
 
     fileprivate func responderDidResign() {
-        isKeyboardVisible = false
+        finishResigning()
+    }
+
+    private func finishResigning() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isKeyboardVisible = false
+            self.activeModifiers = []
+            self.bridge.releaseAll()
+        }
     }
 
     func sendSpecialKey(_ key: IOSSpecialKey, pressed: Bool) {
@@ -157,7 +167,7 @@ final class IOSKeyboardResponder: UITextView {
     }
 
     @objc private func dismissKeyboard() {
-        owner?.resign()
+        _ = resignFirstResponder()
     }
 
     override func insertText(_ text: String) {
