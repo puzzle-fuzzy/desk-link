@@ -27,7 +27,7 @@ struct PairingQRCodeView: View {
                         .font(.system(size: 42))
                     Text("二维码暂时无法生成")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("请使用复制连接码")
+                    Text("请重新生成二维码")
                         .font(.system(size: 11))
                 }
                 .foregroundStyle(DeskLinkPalette.secondaryInk)

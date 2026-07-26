@@ -173,7 +173,7 @@ struct HostHomeView: View {
                 }
                 Text(isExpired
                     ? "二维码已失效，请重新生成后再用 iPhone 扫描。"
-                    : "在 iPhone 的 DeskLink 中选择“扫描二维码”。二维码与复制的连接码使用同一份一次性邀请。")
+                    : "在 iPhone 的 DeskLink 中选择“扫描二维码”，完成后即可发起连接。")
                     .font(.system(size: 12))
                     .foregroundStyle(DeskLinkPalette.secondaryInk)
                     .fixedSize(horizontal: false, vertical: true)
@@ -181,9 +181,6 @@ struct HostHomeView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(isExpired ? DeskLinkPalette.warning : DeskLinkPalette.secondaryInk)
                 HStack(spacing: 10) {
-                    Button("复制连接码") { bridge.copyInviteToPasteboard() }
-                        .buttonStyle(DeskLinkPrimaryButtonStyle())
-                        .disabled(isExpired)
                     Button("停止共享") { bridge.stop() }
                         .buttonStyle(DeskLinkSecondaryButtonStyle())
                 }

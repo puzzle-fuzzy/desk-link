@@ -89,6 +89,7 @@ struct DeskLinkApp: App {
             }
             .task { await account.restore() }
         }
+        .defaultSize(width: 1080, height: 700)
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
     }

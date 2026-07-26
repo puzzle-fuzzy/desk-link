@@ -1,4 +1,4 @@
-import AppKit
+import Foundation
 import DeskLinkAppleCore
 import DeskLinkC
 import SwiftUI
@@ -9,7 +9,7 @@ struct DeskLinkConnectionStatus: Equatable {
 }
 
 private enum DeskLinkConnectionMethod: String {
-    case invite
+    case qr
     case credentials
 }
 
@@ -34,69 +34,57 @@ func deskLinkConnectionStatus(for state: ConnectionState) -> DeskLinkConnectionS
 
 struct ConnectView: View {
     @ObservedObject var bridge: ControllerBridge
-    @State private var inviteDraft = ""
     @State private var deviceID = ""
     @State private var accessPassword = ""
-    @State private var connectionMethod: DeskLinkConnectionMethod = .invite
-    @State private var manualEntryVisible = false
-    @FocusState private var isManualEntryFocused: Bool
+    @State private var connectionMethod: DeskLinkConnectionMethod = .qr
+    @State private var isShowingScanner = false
+    @State private var scanError: String?
 
     var body: some View {
         DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
-            VStack(alignment: .leading, spacing: 12) {
-                Label(connectionStatus.title, systemImage: connectionStatus.systemImage)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(DeskLinkPalette.ink)
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 8) {
+                    Image(systemName: connectionStatus.systemImage)
+                    Text(connectionStatus.title)
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(DeskLinkPalette.ink)
 
                 Picker("连接方式", selection: $connectionMethod) {
-                    Text("连接码").tag(DeskLinkConnectionMethod.invite)
+                    Text("扫描二维码").tag(DeskLinkConnectionMethod.qr)
                     Text("设备 ID + 密码").tag(DeskLinkConnectionMethod.credentials)
                 }
                 .pickerStyle(.segmented)
-                .labelsHidden()
 
-                if connectionMethod == .invite {
-                    HStack(spacing: 8) {
-                        Button("粘贴连接码") { connectFromPasteboard() }
-                            .buttonStyle(DeskLinkPrimaryButtonStyle())
-                            .help("从剪贴板读取完整连接码并开始连接")
-
-                        Button("手动输入连接码") {
-                            manualEntryVisible.toggle()
-                            if manualEntryVisible {
-                                DispatchQueue.main.async { isManualEntryFocused = true }
-                            } else {
-                                isManualEntryFocused = false
-                            }
-                        }
-                        .buttonStyle(DeskLinkSecondaryButtonStyle())
-                    }
-
-                    if manualEntryVisible {
-                        Text("连接码")
-                            .font(.system(size: 12, weight: .semibold))
+                if connectionMethod == .qr {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("用相机扫描连接二维码", systemImage: "qrcode.viewfinder")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(DeskLinkPalette.ink)
+                        Text("二维码由另一台设备生成，识别后会自动开始连接。连接码内容不会显示在此页面。")
+                            .font(.system(size: 12))
                             .foregroundStyle(DeskLinkPalette.secondaryInk)
+                            .fixedSize(horizontal: false, vertical: true)
 
-                        TextEditor(text: $inviteDraft)
-                            .font(.system(size: 12, design: .monospaced))
-                            .frame(minHeight: 84)
-                            .focused($isManualEntryFocused)
-                            .accessibilityLabel("连接码")
-                            .accessibilityHint("输入或粘贴另一台设备生成的完整连接码")
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(DeskLinkPalette.border, lineWidth: 1)
-                            }
-
-                        Button("开始连接") {
-                            connect(inviteCode: inviteDraft)
+                        Button {
+                            scanError = nil
+                            isShowingScanner = true
+                        } label: {
+                            Label("扫描二维码", systemImage: "camera.viewfinder")
+                                .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(DeskLinkPrimaryButtonStyle())
-                        .disabled(trimmedInviteDraft.isEmpty)
+                        .disabled(isBusy)
+
+                        if let scanError {
+                            Text(scanError)
+                                .font(.system(size: 12))
+                                .foregroundStyle(DeskLinkPalette.error)
+                        }
                     }
                 } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("连接 Windows 或其他支持设备密码的主机")
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("适用于支持设备 ID 和密码连接的主机。")
                             .font(.system(size: 12))
                             .foregroundStyle(DeskLinkPalette.secondaryInk)
 
@@ -110,23 +98,35 @@ struct ConnectView: View {
                             .font(.system(size: 13, design: .monospaced))
                             .accessibilityLabel("访问密码")
 
-                        Button("开始连接") {
+                        Button {
                             bridge.connect(deviceID: deviceID, temporaryPassword: accessPassword)
+                        } label: {
+                            Text("连接设备")
+                                .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(DeskLinkPrimaryButtonStyle())
-                        .disabled(!directoryCredentialsAreComplete)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(isBusy || !directoryCredentialsAreComplete)
                     }
                 }
             }
         }
-    }
-
-    private var trimmedInviteDraft: String {
-        inviteDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        .sheet(isPresented: $isShowingScanner) {
+            QRCodeScannerSheet { payload in
+                connectFromQRCode(payload)
+            }
+        }
     }
 
     private var connectionStatus: DeskLinkConnectionStatus {
         deskLinkConnectionStatus(for: bridge.state)
+    }
+
+    private var isBusy: Bool {
+        switch bridge.state {
+        case .pairing, .connecting, .reconnecting, .recovering: true
+        default: false
+        }
     }
 
     private var directoryCredentialsAreComplete: Bool {
@@ -136,20 +136,13 @@ struct ConnectView: View {
             }.count == Int(DESKLINK_DIRECTORY_ACCESS_CODE_BYTES)
     }
 
-    private func connectFromPasteboard() {
-        let pasted = NSPasteboard.general.string(forType: .string)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        inviteDraft = pasted
-        if !pasted.isEmpty {
-            connect(inviteCode: pasted)
-        }
-    }
-
-    private func connect(inviteCode: String) {
-        guard let invite = Data(base64Encoded: inviteCode.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            bridge.connect(invite: Data())
+    private func connectFromQRCode(_ payload: String) {
+        let normalized = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let invite = Data(base64Encoded: normalized, options: .ignoreUnknownCharacters) else {
+            scanError = "二维码内容无效，请让另一台设备重新生成二维码。"
             return
         }
+        scanError = nil
         bridge.connect(invite: invite)
     }
 }

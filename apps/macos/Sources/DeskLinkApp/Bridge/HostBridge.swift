@@ -220,13 +220,6 @@ final class HostBridge: ObservableObject {
         }
     }
 
-    func copyInviteToPasteboard() {
-        guard let pairingInvite else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(pairingInvite.encoded.base64EncodedString(), forType: .string)
-    }
-
     func approve() {
         guard var approval = pendingApproval, canApprove, let handle = handleOwner.pointer else { return }
         approval.isApproved = true

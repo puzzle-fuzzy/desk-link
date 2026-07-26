@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import DeskLinkAppleCore
 
@@ -8,24 +9,26 @@ enum DeskLinkSection: String, CaseIterable, Identifiable {
 }
 
 enum DeskLinkPalette {
-    static let background = Color(red: 0.956, green: 0.951, blue: 0.946)
-    static let surface = Color.white
-    static let subtle = Color(red: 0.976, green: 0.972, blue: 0.968)
-    static let quiet = Color(red: 0.941, green: 0.933, blue: 0.926)
-    static let ink = Color(red: 0.170, green: 0.145, blue: 0.135)
-    static let secondaryInk = Color(red: 0.350, green: 0.315, blue: 0.300)
-    static let mutedInk = Color(red: 0.455, green: 0.415, blue: 0.395)
-    static let border = Color(red: 0.835, green: 0.815, blue: 0.800)
-    static let primary = Color(red: 0.720, green: 0.255, blue: 0.125)
-    static let primaryPressed = Color(red: 0.590, green: 0.190, blue: 0.090)
-    static let success = Color(red: 0.160, green: 0.535, blue: 0.295)
-    static let successSurface = Color(red: 0.925, green: 0.975, blue: 0.940)
-    static let info = Color(red: 0.160, green: 0.440, blue: 0.610)
-    static let infoSurface = Color(red: 0.925, green: 0.965, blue: 0.985)
-    static let warning = Color(red: 0.690, green: 0.425, blue: 0.080)
-    static let warningSurface = Color(red: 0.985, green: 0.960, blue: 0.900)
-    static let error = Color(red: 0.690, green: 0.145, blue: 0.120)
-    static let errorSurface = Color(red: 0.990, green: 0.935, blue: 0.925)
+    // Use AppKit semantic colors so the content follows the user's macOS
+    // appearance and accent color instead of shipping a second fixed theme.
+    static var background: Color { Color(nsColor: .windowBackgroundColor) }
+    static var surface: Color { Color(nsColor: .controlBackgroundColor) }
+    static var subtle: Color { Color(nsColor: .underPageBackgroundColor) }
+    static var quiet: Color { Color(nsColor: .controlBackgroundColor).opacity(0.72) }
+    static var ink: Color { Color(nsColor: .labelColor) }
+    static var secondaryInk: Color { Color(nsColor: .secondaryLabelColor) }
+    static var mutedInk: Color { Color(nsColor: .tertiaryLabelColor) }
+    static var border: Color { Color(nsColor: .separatorColor) }
+    static var primary: Color { Color(nsColor: .controlAccentColor) }
+    static var primaryPressed: Color { Color(nsColor: .controlAccentColor).opacity(0.78) }
+    static var success: Color { Color(nsColor: .systemGreen) }
+    static var successSurface: Color { Color(nsColor: .systemGreen).opacity(0.13) }
+    static var info: Color { Color(nsColor: .systemBlue) }
+    static var infoSurface: Color { Color(nsColor: .systemBlue).opacity(0.11) }
+    static var warning: Color { Color(nsColor: .systemOrange) }
+    static var warningSurface: Color { Color(nsColor: .systemOrange).opacity(0.13) }
+    static var error: Color { Color(nsColor: .systemRed) }
+    static var errorSurface: Color { Color(nsColor: .systemRed).opacity(0.12) }
 }
 
 struct DeskLinkShell: View {
@@ -40,8 +43,9 @@ struct DeskLinkShell: View {
         ControllerHomeView(bridge: controller)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(DeskLinkPalette.surface)
-        .frame(minWidth: 760, minHeight: 560)
+        .frame(minWidth: 980, minHeight: 620)
         .background(DeskLinkPalette.surface)
+        .tint(DeskLinkPalette.primary)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -96,12 +100,6 @@ struct DeskLinkShell: View {
                 }
                 .help("更多管理功能")
 
-                Button {
-                    host.refreshPermissions()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("刷新本机状态")
             }
         }
         .popover(item: $presentedHostPage) { page in
@@ -174,7 +172,7 @@ struct DeskLinkPrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(Color.white)
+            .foregroundStyle(Color(nsColor: .alternateSelectedControlTextColor))
             .padding(.horizontal, 16)
             .frame(minHeight: 32)
             .background(
