@@ -24,6 +24,46 @@ import type {
 import type { H264Profile, VideoQualityPreference } from "./types";
 import type { WindowsReleaseSource } from "./windows-update";
 
+export interface AccountUser {
+  id: string;
+  email: string;
+  emailVerified: boolean;
+}
+
+export interface AccountSnapshot {
+  signedIn: boolean;
+  user: AccountUser | null;
+  deviceId: string | null;
+}
+
+export function accountRestore(): Promise<AccountSnapshot> {
+  return invoke<AccountSnapshot>("account_restore");
+}
+
+export function accountRegister(email: string, password: string): Promise<void> {
+  return invoke<void>("account_register", { email, password });
+}
+
+export function accountVerifyEmail(token: string): Promise<void> {
+  return invoke<void>("account_verify_email", { token });
+}
+
+export function accountResendVerification(email: string): Promise<void> {
+  return invoke<void>("account_resend_verification", { email });
+}
+
+export function accountLogin(email: string, password: string): Promise<AccountSnapshot> {
+  return invoke<AccountSnapshot>("account_login", { email, password });
+}
+
+export function accountForgotPassword(email: string): Promise<void> {
+  return invoke<void>("account_forgot_password", { email });
+}
+
+export function accountLogout(): Promise<void> {
+  return invoke<void>("account_logout");
+}
+
 export interface ControllerChannels {
   signals: Channel<ControllerSignal>;
   audio: Channel<ArrayBuffer | ArrayBufferView | number[]>;

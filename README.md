@@ -30,6 +30,7 @@ DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正�
 - `apps/macos`：Apple Silicon macOS 13+ controller/host，使用 ScreenCaptureKit、VideoToolbox、CGEvent 和 Keychain；自动门禁见 [`docs/apple/macos-apple-silicon-acceptance.md`](docs/apple/macos-apple-silicon-acceptance.md)。
 - `apps/ios`：iOS 16+ controller-only 客户端，支持安全配对、保存设备、H.264/Metal 画面、直接触控、轨迹板、键盘输入和前后台恢复；不会伪装成 iOS host，也不会控制其他 iOS App。
 - Apple 端当前已完成 Rust/Swift/模拟器构建门禁；物理 iPhone、系统权限、签名/公证和跨设备链路仍须人工验收，未完成项记录在 [`docs/apple/2026-07-26-apple-platform-acceptance.md`](docs/apple/2026-07-26-apple-platform-acceptance.md)。
+- `server/account`：独立的邮箱账号服务；登录只作为应用使用门禁，不参与远程配对、主机审批或 relay。多设备语义、退出清理和生产发布限制见 [`docs/account-login.md`](docs/account-login.md) 与 [`docs/account-release-runbook.md`](docs/account-release-runbook.md)。
 
 ## 架构
 
@@ -43,6 +44,7 @@ DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正�
 - `apps/apple`：跨 macOS/iOS 的 Keychain、ControllerBridge、H.264 解码和输入纯模型共享核心；
 - `apps/macos`：Apple Silicon macOS controller/host 开发面；
 - `apps/ios`：controller-only iOS 开发面；
+- `server/account`：邮箱注册、验证、登录、会话刷新、退出和密码重置控制面；
 - `server/relay`：会话匹配、限流和密文转发，不解码桌面或输入；
 - `tools/windows-installer`：只封装已验证的 `DeskLink.exe`；程序与用户数据分离保存。
 

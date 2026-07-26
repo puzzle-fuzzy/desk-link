@@ -31,6 +31,7 @@ enum DeskLinkPalette {
 struct DeskLinkShell: View {
     @ObservedObject var host: HostBridge
     @ObservedObject var controller: ControllerBridge
+    @ObservedObject var account: AccountClient
 
     @State private var isShowingHostStatus = false
     @State private var presentedHostPage: HostHomePage?
@@ -71,6 +72,17 @@ struct DeskLinkShell: View {
                 .help("共享此设备")
 
                 Menu {
+                    if case let .signedIn(user) = account.state {
+                        Text(user.email)
+                    }
+                    Button("退出登录", systemImage: "rectangle.portrait.and.arrow.right") {
+                        Task { @MainActor in
+                            controller.clearRemoteLinksForLogout()
+                            await host.shutdownAndWait()
+                            await account.logout()
+                        }
+                    }
+                    Divider()
                     Button("已批准设备", systemImage: "person.2") {
                         presentedHostPage = .devices
                     }

@@ -12,6 +12,10 @@ DeskLink serves one person connecting their own Windows and Mac devices. The pri
 
 DeskLink provides a dependable, private remote-desktop path between personal devices. Success means the owner can understand whether the host is available or controlled, recover from ordinary network disruption, and stop or revoke access immediately without learning networking or cryptographic terminology.
 
+## Application Account
+
+DeskLink requires an email account login before the app workspace is usable. Account login is an application-level gate only: it does not grant remote-device access, replace host approval, or synchronize saved connections between devices. A single account may be used on multiple Windows, macOS, and iPhone installations, while each installation must pair with hosts independently. Logging out releases the current remote session and removes that installation's saved connection material.
+
 ## Brand Personality
 
 Calm, precise, trustworthy. Windows and macOS share one information architecture, status vocabulary, color system, and Chinese interface while preserving native platform behavior. Security information is explicit and legible, while routine background operation stays unobtrusive.

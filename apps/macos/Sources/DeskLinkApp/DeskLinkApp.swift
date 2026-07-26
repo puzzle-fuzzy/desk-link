@@ -2,6 +2,14 @@ import AppKit
 import DeskLinkAppleCore
 import SwiftUI
 
+private enum MacAccountConfiguration {
+    static var accountURL: URL {
+        let value = (Bundle.main.object(forInfoDictionaryKey: "DeskLinkAccountURL") as? String)
+            ?? "https://account.p2p.yxswy.com"
+        return URL(string: value) ?? URL(string: "https://account.p2p.yxswy.com")!
+    }
+}
+
 func deskLinkApprovalForWindowPresentation(
     _ approval: HostApproval?,
     controllerState _: ConnectionState
@@ -43,14 +51,30 @@ struct DeskLinkApp: App {
     @NSApplicationDelegateAdaptor(DeskLinkLifecycleDelegate.self) private var lifecycle
     @StateObject private var controller = ControllerBridge(configuration: .macOSDefaults)
     @StateObject private var host = HostBridge()
+    @StateObject private var account: AccountClient
+
+    init() {
+        _account = StateObject(wrappedValue: AccountClient(
+            baseURL: MacAccountConfiguration.accountURL,
+            platform: .macos,
+            deviceName: Host.current().localizedName ?? "Mac"
+        ))
+    }
 
     var body: some Scene {
         WindowGroup {
             Group {
-                if isControllerSessionState(controller.state) {
-                    SessionView(bridge: controller)
-                } else {
-                    DeskLinkShell(host: host, controller: controller)
+                switch account.state {
+                case .loading:
+                    ProgressView("正在准备 DeskLink…")
+                case .signedOut:
+                    AccountLoginView(account: account)
+                case .signedIn:
+                    if isControllerSessionState(controller.state) {
+                        SessionView(bridge: controller, host: host, account: account)
+                    } else {
+                        DeskLinkShell(host: host, controller: controller, account: account)
+                    }
                 }
             }
             .sheet(item: pendingApproval) { approval in
@@ -65,6 +89,7 @@ struct DeskLinkApp: App {
                 controller.releaseAll()
                 controller.disconnect()
             }
+            .task { await account.restore() }
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)

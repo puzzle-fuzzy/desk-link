@@ -9,6 +9,7 @@ enum IOSRootDestination: String, CaseIterable, Hashable {
 }
 
 struct IOSRootView: View {
+    @ObservedObject var account: AccountClient
     @ObservedObject var controller: ControllerBridge
     @State private var destination: IOSRootDestination = .connect
 
@@ -20,7 +21,7 @@ struct IOSRootView: View {
             IOSSavedHostsView(controller: controller, destination: $destination)
                 .tabItem { Label(IOSRootDestination.savedHosts.rawValue, systemImage: "externaldrive.connected.to.line.below") }
                 .tag(IOSRootDestination.savedHosts)
-            IOSMoreView()
+            IOSMoreView(account: account, controller: controller)
                 .tabItem { Label(IOSRootDestination.more.rawValue, systemImage: "ellipsis.circle") }
                 .tag(IOSRootDestination.more)
         }
@@ -211,6 +212,10 @@ struct IOSConnectionHomeView: View {
 }
 
 struct IOSMoreView: View {
+    @ObservedObject var account: AccountClient
+    @ObservedObject var controller: ControllerBridge
+    @State private var isLoggingOut = false
+
     var body: some View {
         NavigationStack {
             Form {
@@ -219,6 +224,20 @@ struct IOSMoreView: View {
                     Text("连接码只用于一次配对；认证后的设备材料保存在系统 Keychain 中。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                }
+                Section("账号") {
+                    if case let .signedIn(user) = account.state {
+                        Label(user.email, systemImage: "person.crop.circle")
+                    }
+                    Button("退出登录", role: .destructive) {
+                        isLoggingOut = true
+                        Task { @MainActor in
+                            controller.clearRemoteLinksForLogout()
+                            await account.logout()
+                            isLoggingOut = false
+                        }
+                    }
+                    .disabled(isLoggingOut)
                 }
             }
             .navigationTitle("更多")

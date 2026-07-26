@@ -13,6 +13,14 @@ enum IOSRuntimeConfiguration {
         )
     }
 
+    static var accountURL: URL {
+        let value = configuredValue(
+            "DeskLinkAccountURL",
+            fallback: "https://account.p2p.yxswy.com"
+        )
+        return URL(string: value) ?? URL(string: "https://account.p2p.yxswy.com")!
+    }
+
     static var test: DeskLinkRuntimeConfiguration {
         DeskLinkRuntimeConfiguration(
             relayURL: "quic://127.0.0.1:4433",

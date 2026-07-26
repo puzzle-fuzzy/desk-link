@@ -85,6 +85,14 @@ public struct SavedHostStore: Sendable {
         }
     }
 
+    public func removeAll() throws {
+        do {
+            try keychain.delete(service: service, account: account)
+        } catch let error as KeychainStoreError {
+            throw SavedHostStoreError.keychain(error.status)
+        }
+    }
+
     public static func encode(_ hosts: [SavedHost]) throws -> Data {
         guard hosts.allSatisfy(\.isValid) else { throw SavedHostStoreError.invalidRecord }
         return try JSONEncoder().encode(hosts)

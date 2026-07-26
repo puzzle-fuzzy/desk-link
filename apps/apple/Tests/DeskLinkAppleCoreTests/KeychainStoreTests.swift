@@ -49,4 +49,29 @@ final class KeychainStoreTests: XCTestCase {
         try store.remove(id: host.id)
         XCTAssertTrue(try store.loadAll().isEmpty)
     }
+
+    func testSavedHostStoreCanClearEveryHostForAccountLogout() throws {
+        let keychain = InMemoryKeychainStore()
+        let store = SavedHostStore(keychain: keychain, service: "hosts", account: "saved")
+        let firstHost = SavedHost(
+            id: UUID(),
+            serverName: "relay-0.example.com",
+            sessionID: [UInt8](repeating: 1, count: 16),
+            relayAuthentication: [UInt8](repeating: 2, count: 32),
+            hostVerifyKey: [UInt8](repeating: 3, count: 32)
+        )
+        let secondHost = SavedHost(
+            id: UUID(),
+            serverName: "relay-1.example.com",
+            sessionID: [UInt8](repeating: 2, count: 16),
+            relayAuthentication: [UInt8](repeating: 3, count: 32),
+            hostVerifyKey: [UInt8](repeating: 4, count: 32)
+        )
+        let hosts = [firstHost, secondHost]
+        for host in hosts { try store.save(host) }
+
+        try store.removeAll()
+
+        XCTAssertTrue(try store.loadAll().isEmpty)
+    }
 }

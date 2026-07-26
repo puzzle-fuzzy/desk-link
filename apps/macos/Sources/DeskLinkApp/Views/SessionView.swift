@@ -10,6 +10,8 @@ func deskLinkSessionStatusText(for state: ConnectionState) -> String {
 
 struct SessionView: View {
     @ObservedObject var bridge: ControllerBridge
+    @ObservedObject var host: HostBridge
+    @ObservedObject var account: AccountClient
 
     var body: some View {
         VStack(spacing: 0) {
@@ -63,6 +65,16 @@ struct SessionView: View {
             ToolbarItem(placement: .primaryAction) {
                 Button("请求关键帧") { bridge.requestKeyframe() }
                     .buttonStyle(.bordered)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("退出登录") {
+                    Task { @MainActor in
+                        bridge.clearRemoteLinksForLogout()
+                        await host.shutdownAndWait()
+                        await account.logout()
+                    }
+                }
+                .buttonStyle(.bordered)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button("断开连接") { bridge.disconnect() }

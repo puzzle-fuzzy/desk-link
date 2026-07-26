@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+mod account;
 mod controller;
 mod device_directory;
 mod file_picker;
@@ -38,6 +39,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use account::{AccountManager, AccountSnapshot};
 use apps_windows::{
     cloud_diagnostics::{DiagnosticUploadSummary, start_background_uploader, upload_all_once},
     configuration::{HostConnectionSettings, WindowsConnectionSettingsStore},
@@ -153,6 +155,83 @@ struct WindowsPreferencesSummary {
 struct DiagnosticUploadResult {
     uploaded_sources: u32,
     uploaded_events: u32,
+}
+
+#[tauri::command]
+async fn account_restore(
+    app: AppHandle,
+    manager: State<'_, AccountManager>,
+    host_manager: State<'_, HostManager>,
+) -> Result<AccountSnapshot, String> {
+    let snapshot = manager.restore().await?;
+    if snapshot.signed_in {
+        host_manager.restart(app).await;
+    } else {
+        host_manager.stop().await;
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn account_register(
+    manager: State<'_, AccountManager>,
+    email: String,
+    password: String,
+) -> Result<(), String> {
+    manager.register(email, password).await
+}
+
+#[tauri::command]
+async fn account_verify_email(
+    manager: State<'_, AccountManager>,
+    token: String,
+) -> Result<(), String> {
+    manager.verify_email(token).await
+}
+
+#[tauri::command]
+async fn account_resend_verification(
+    manager: State<'_, AccountManager>,
+    email: String,
+) -> Result<(), String> {
+    manager.resend_verification(email).await
+}
+
+#[tauri::command]
+async fn account_login(
+    app: AppHandle,
+    manager: State<'_, AccountManager>,
+    host_manager: State<'_, HostManager>,
+    email: String,
+    password: String,
+) -> Result<AccountSnapshot, String> {
+    let snapshot = manager.login(email, password).await?;
+    host_manager.restart(app).await;
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn account_forgot_password(
+    manager: State<'_, AccountManager>,
+    email: String,
+) -> Result<(), String> {
+    manager.forgot_password(email).await
+}
+
+#[tauri::command]
+async fn account_logout(
+    account_manager: State<'_, AccountManager>,
+    controller_manager: State<'_, ControllerManager>,
+    host_manager: State<'_, HostManager>,
+) -> Result<(), String> {
+    let disconnect_error = controller_manager.disconnect().await.err();
+    let clear_saved_error = controller_manager.clear_saved_devices().await.err();
+    host_manager.stop().await;
+    account_manager.logout().await?;
+    if let Some(error) = disconnect_error.or(clear_saved_error) {
+        eprintln!("DeskLink logout cleanup warning: {error}");
+    }
+    Ok(())
 }
 
 impl From<DiagnosticUploadSummary> for DiagnosticUploadResult {
@@ -1525,7 +1604,10 @@ pub fn run() {
             }
         }))
         .manage(HostManager::default())
-        .manage(ControllerManager::for_current_user());
+        .manage(ControllerManager::for_current_user())
+        .manage(
+            AccountManager::for_current_user().expect("DeskLink account storage is unavailable"),
+        );
     #[cfg(windows)]
     let builder = builder.manage(instance_guard);
     let application = builder
@@ -1554,10 +1636,6 @@ pub fn run() {
                     }
                 }
             }
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                manager.restart(app_handle).await;
-            });
             if !env::args_os().any(|argument| argument == "--startup") {
                 show_main_window(app.handle());
             }
@@ -1570,6 +1648,13 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            account_restore,
+            account_register,
+            account_verify_email,
+            account_resend_verification,
+            account_login,
+            account_forgot_password,
+            account_logout,
             get_host_snapshot,
             get_windows_preferences,
             set_launch_at_login,

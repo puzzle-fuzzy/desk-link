@@ -2,6 +2,8 @@
 // only by the real Windows backends are intentionally inactive on those targets.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
+pub mod account;
 pub mod audio;
 pub mod capture;
 #[cfg(windows)]

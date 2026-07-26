@@ -5,6 +5,12 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 
 import {
+  accountForgotPassword,
+  accountLogin,
+  accountLogout,
+  accountRegister,
+  accountResendVerification,
+  accountRestore,
   cancelPairingSession,
   checkWindowsRelease,
   disableFixedAccessPassword,
@@ -26,6 +32,7 @@ import {
   startPairingSession,
   uploadDiagnosticsNow,
 } from "./api";
+import type { AccountSnapshot } from "./api";
 import type {
   ConnectionSettingsInput,
   ConnectionSummary,
@@ -112,8 +119,24 @@ let windowsUpdate: WindowsUpdateState = { kind: "idle" };
 let utilityMenuOpen = false;
 let utilityMenuDismissBound = false;
 const snapshotRequests = new LatestRequest();
+let account: AccountSnapshot = { signedIn: false, user: null, deviceId: null };
+let accountLoading = true;
+let accountError: string | null = null;
+let accountMode: "login" | "register" | "forgot" = "login";
+let accountBusy = false;
+let accountNotice: string | null = null;
+let accountCanResendVerification = false;
 
 function render(): void {
+  if (accountLoading) {
+    app.innerHTML = renderAccountLoading();
+    return;
+  }
+  if (!account.signedIn) {
+    app.innerHTML = renderAccountGate();
+    bindAccountInteractions();
+    return;
+  }
   const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
   const preservedScrollTop = renderedView === activeView ? (previousWorkspace?.scrollTop ?? 0) : 0;
   const animateSurface = renderedView !== activeView;
@@ -144,6 +167,147 @@ function render(): void {
 
 function scheduleRender(): void {
   renderScheduler.schedule(render);
+}
+
+function renderAccountLoading(): string {
+  return `<main class="account-gate"><section class="account-card account-card--loading"><div class="account-mark">D</div><strong>正在准备 DeskLink</strong><span>正在读取本机登录状态…</span></section></main>`;
+}
+
+function renderAccountGate(): string {
+  const title = accountMode === "login" ? "登录 DeskLink" : accountMode === "register" ? "创建 DeskLink 账号" : "找回密码";
+  const action = accountMode === "login" ? "登录" : accountMode === "register" ? "注册并发送验证邮件" : "发送重置邮件";
+  return `
+    <main class="account-gate">
+      <section class="account-card" aria-labelledby="account-title">
+        <div class="account-card-brand"><div class="account-mark">D</div><div><strong>DeskLink</strong><span>端到端加密远程控制</span></div></div>
+        <h1 id="account-title">${title}</h1>
+        <p class="account-subtitle">登录后才能使用 DeskLink。账号只负责应用登录，不会代替远程设备配对和主机审批。</p>
+        <div class="account-mode-switch" role="tablist" aria-label="账号操作">
+          <button type="button" data-account-mode="login" class="${accountMode === "login" ? "is-active" : ""}">登录</button>
+          <button type="button" data-account-mode="register" class="${accountMode === "register" ? "is-active" : ""}">注册</button>
+          <button type="button" data-account-mode="forgot" class="${accountMode === "forgot" ? "is-active" : ""}">找回密码</button>
+        </div>
+        <form data-account-form>
+          <label class="account-field"><span>邮箱</span><input name="email" type="email" autocomplete="email" placeholder="name@example.com" required></label>
+          ${accountMode === "forgot" ? "" : `<label class="account-field"><span>密码</span><input name="password" type="password" autocomplete="${accountMode === "login" ? "current-password" : "new-password"}" minlength="12" maxlength="128" placeholder="至少 12 个字符" required></label>`}
+          ${accountMode === "register" ? `<label class="account-field"><span>确认密码</span><input name="confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="128" placeholder="再次输入密码" required></label>` : ""}
+          ${accountError ? `<p class="account-error" role="alert">${escapeHtml(accountError)}</p>` : ""}
+          ${accountNotice ? `<p class="account-notice" role="status">${escapeHtml(accountNotice)}</p>${accountCanResendVerification ? `<button class="text-button account-resend" type="button" data-resend-verification ${accountBusy ? "disabled" : ""}>重新发送验证邮件</button>` : ""}` : ""}
+          <button class="button button--primary account-submit" type="submit" ${accountBusy ? "disabled aria-busy=\"true\"" : ""}>${accountBusy ? "正在处理…" : action}</button>
+        </form>
+        <p class="account-footnote">使用邮箱验证，不需要手机验证码。退出账号时，本机保存的远程连接会一并清除。</p>
+      </section>
+    </main>
+  `;
+}
+
+function bindAccountInteractions(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-account-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const mode = button.dataset.accountMode;
+      if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
+      accountMode = mode;
+      accountError = null;
+      accountNotice = null;
+      accountCanResendVerification = false;
+      render();
+    });
+  });
+  document.querySelector<HTMLFormElement>("[data-account-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitAccount(event.currentTarget as HTMLFormElement);
+  });
+  document.querySelector<HTMLButtonElement>("[data-resend-verification]")?.addEventListener("click", () => {
+    void resendVerification();
+  });
+}
+
+async function resendVerification(): Promise<void> {
+  if (accountBusy) return;
+  const email = document.querySelector<HTMLInputElement>('[data-account-form] input[name="email"]')?.value.trim() ?? "";
+  if (!email) {
+    accountError = "请先填写注册邮箱。";
+    render();
+    return;
+  }
+  accountBusy = true;
+  accountError = null;
+  render();
+  try {
+    await accountResendVerification(email);
+    accountNotice = "验证邮件已重新发送，请检查收件箱。";
+  } catch (error) {
+    accountError = normalizeError(error);
+  } finally {
+    accountBusy = false;
+    render();
+  }
+}
+
+async function submitAccount(form: HTMLFormElement): Promise<void> {
+  if (accountBusy) return;
+  const data = new FormData(form);
+  const email = String(data.get("email") ?? "").trim();
+  const password = String(data.get("password") ?? "");
+  const confirmation = String(data.get("confirmation") ?? "");
+  if (!email || (accountMode !== "forgot" && password.length < 12)) {
+    accountError = "请填写有效邮箱和至少 12 个字符的密码。";
+    render();
+    return;
+  }
+  if (accountMode === "register" && password !== confirmation) {
+    accountError = "两次输入的密码不一致。";
+    render();
+    return;
+  }
+  accountBusy = true;
+  accountError = null;
+  accountNotice = null;
+  render();
+  try {
+    if (accountMode === "login") {
+      account = await accountLogin(email, password);
+      if (account.signedIn) {
+        await initializeController(scheduleRender);
+        await refreshSnapshot();
+      }
+    } else if (accountMode === "register") {
+      await accountRegister(email, password);
+      accountMode = "login";
+      accountNotice = "验证邮件已发送，请完成邮箱验证后再登录。";
+      accountCanResendVerification = true;
+    } else {
+      await accountForgotPassword(email);
+      accountMode = "login";
+      accountNotice = "如果邮箱已注册，重置密码邮件会很快送达。";
+      accountCanResendVerification = false;
+    }
+  } catch (error) {
+    accountError = normalizeError(error);
+  } finally {
+    accountBusy = false;
+    render();
+  }
+}
+
+async function logoutAccount(): Promise<void> {
+  if (accountBusy) return;
+  accountBusy = true;
+  render();
+  try {
+    await accountLogout();
+    account = { signedIn: false, user: null, deviceId: null };
+    snapshot = null;
+    activeView = "controller";
+    renderedView = null;
+    accountMode = "login";
+    accountNotice = "已退出登录，本机远程连接记录已清除。";
+  } catch (error) {
+    accountError = normalizeError(error);
+  } finally {
+    accountBusy = false;
+    render();
+  }
 }
 
 function bindUtilityMenuDismiss(): void {
@@ -302,6 +466,7 @@ function renderWorkspaceTopbar(): string {
         <strong>${activeView === "controller" ? "连接设备" : escapeHtml(viewTitle(activeView))}</strong>
       </div>
       <div class="workspace-topbar-actions">
+        ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
         ${snapshot ? renderHostStatusChip(snapshot) : ""}
         <button class="topbar-icon-button" type="button" data-view="about" aria-label="关于 DeskLink" title="关于 DeskLink">${icon("circle-help")}</button>
         <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-expanded="${utilityMenuOpen}" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
@@ -1355,6 +1520,7 @@ async function exitDeskLink(): Promise<void> {
 }
 
 function bindInteractions(): void {
+  document.querySelector<HTMLButtonElement>("[data-account-logout]")?.addEventListener("click", () => void logoutAccount());
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
     button.addEventListener("click", () => void openGithub());
   });
@@ -1918,20 +2084,28 @@ function randomHex(byteLength: number): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-render();
-void getVersion().then((version) => {
-  applicationVersion = version;
-  if (activeView === "about") {
+async function bootstrap(): Promise<void> {
+  try {
+    account = await accountRestore();
+  } catch (error) {
+    accountError = normalizeError(error);
+  } finally {
+    accountLoading = false;
     render();
   }
-  void checkForWindowsUpdate();
-}).catch(() => {
-  applicationVersion = "";
-});
-void refreshSnapshot();
-void initializeController(scheduleRender);
-void listen("host-runtime-changed", () => void refreshSnapshot(false));
-void listen("host-approval-changed", () => void refreshSnapshot(false));
+  if (!account.signedIn) return;
+  void getVersion().then((version) => {
+    applicationVersion = version;
+    if (activeView === "about") render();
+    void checkForWindowsUpdate();
+  }).catch(() => { applicationVersion = ""; });
+  await initializeController(scheduleRender);
+  await refreshSnapshot();
+  void listen("host-runtime-changed", () => void refreshSnapshot(false));
+  void listen("host-approval-changed", () => void refreshSnapshot(false));
+}
+
+void bootstrap();
 window.setInterval(() => {
   const nowUnixS = Math.floor(Date.now() / 1000);
   const approval = snapshot?.pendingApproval;

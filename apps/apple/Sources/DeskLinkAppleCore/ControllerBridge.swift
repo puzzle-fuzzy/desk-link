@@ -305,6 +305,21 @@ public final class ControllerBridge: ObservableObject {
         state = .closed
     }
 
+    /// Clears all controller-side connection material during account logout.
+    /// The device identity remains local so a future login can pair as the
+    /// same physical installation, but saved host credentials never cross
+    /// account boundaries.
+    public func clearRemoteLinksForLogout() {
+        disconnect()
+        savedHostForResume = nil
+        awaitingApprovedHostMaterial = false
+        do {
+            try savedHostStore.removeAll()
+        } catch {
+            publishErrorMessage("无法清除本机已保存的远程设备，请稍后重试。")
+        }
+    }
+
     fileprivate func consume(
         eventKind: Int,
         data: Data,
