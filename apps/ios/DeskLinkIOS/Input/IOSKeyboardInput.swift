@@ -19,6 +19,14 @@ enum IOSSpecialKey: String, CaseIterable, Hashable, Identifiable {
 
     var id: Self { self }
 
+    var displayTitle: String {
+        switch self {
+        case .option: "Alt"
+        case .command: "⌘ Win"
+        default: rawValue
+        }
+    }
+
     var code: UInt32 {
         switch self {
         case .escape: DeskLinkKeyCode.escape

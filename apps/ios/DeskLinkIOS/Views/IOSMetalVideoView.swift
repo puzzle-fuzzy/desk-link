@@ -71,13 +71,45 @@ final class IOSMetalVideoSurface: MTKView {
               let ciContext
         else { return }
 
-        let drawableRect = CGRect(origin: .zero, size: drawableSize)
-        ciContext.draw(CIImage(color: .black), in: drawableRect, from: drawableRect)
+        let targetRect = CGRect(origin: .zero, size: drawableSize)
+        let output: CIImage
         if let pixelBuffer {
             let image = CIImage(cvPixelBuffer: pixelBuffer)
-            let targetRect = VideoGeometry.aspectFit(source: image.extent.size, in: drawableRect)
-            ciContext.draw(image, in: targetRect, from: image.extent)
+            let fittedRect = VideoGeometry.aspectFit(source: image.extent.size, in: targetRect)
+            guard !fittedRect.isEmpty, !image.extent.isEmpty else { return }
+
+            let normalized = image.transformed(
+                by: CGAffineTransform(
+                    translationX: -image.extent.minX,
+                    y: -image.extent.minY
+                )
+            )
+            let scaled = normalized.transformed(
+                by: CGAffineTransform(
+                    scaleX: fittedRect.width / image.extent.width,
+                    y: fittedRect.height / image.extent.height
+                )
+            )
+            let positioned = scaled.transformed(
+                by: CGAffineTransform(
+                    translationX: fittedRect.minX,
+                    y: fittedRect.minY
+                )
+            )
+            output = positioned.composited(
+                over: CIImage(color: .black).cropped(to: targetRect)
+            )
+        } else {
+            output = CIImage(color: .black).cropped(to: targetRect)
         }
+
+        ciContext.render(
+            output,
+            to: drawable.texture,
+            commandBuffer: commandBuffer,
+            bounds: targetRect,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }

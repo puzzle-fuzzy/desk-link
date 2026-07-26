@@ -40,85 +40,13 @@ struct IOSSessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ZStack {
-                Color.black
-                IOSMetalVideoView(
-                    pixelBuffer: controller.latestPixelBuffer,
-                    videoSize: controller.videoSize,
-                    visibleVideoRect: $visibleVideoRect
-                )
-                IOSTouchInputView(
-                    bridge: controller,
-                    videoSize: controller.videoSize,
-                    visibleVideoRect: visibleVideoRect,
-                    mode: touchMode
-                )
-                .allowsHitTesting(isInputEnabled)
+            remoteCanvas
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                VStack {
-                    HStack {
-                        Text(IOSSessionPresentation.statusText(controller.state))
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(.ultraThinMaterial, in: Capsule())
-                        Spacer()
-                    }
-                    .padding(12)
-                    Spacer()
-                }
-            }
-            .clipped()
-            .overlay(alignment: .bottom) {
-                IOSSpecialKeyBar(keyboard: keyboardInput)
-                    .background(.ultraThinMaterial)
-            }
-            .overlay {
-                IOSKeyboardInputView(input: keyboardInput)
-                    .frame(width: 1, height: 1)
-                    .opacity(0.01)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            VStack(spacing: 10) {
-                Picker("输入模式", selection: $touchMode) {
-                    ForEach(IOSTouchMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                HStack {
-                    Button {
-                        keyboardInput.becomeFirstResponder()
-                    } label: {
-                        Label("键盘", systemImage: "keyboard")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button {
-                        showingDiagnostics = true
-                    } label: {
-                        Label("诊断", systemImage: "gauge")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Spacer()
-
-                    Button("请求关键帧") { controller.requestKeyframe() }
-                        .buttonStyle(.bordered)
-                    Button("断开连接", role: .destructive) {
-                        keyboardInput.resign()
-                        controller.disconnect()
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-            }
-            .padding(12)
-            .background(.bar)
+            sessionControls
         }
-        .navigationTitle("远程会话")
-        .navigationBarTitleDisplayMode(.inline)
+        .background(Color(uiColor: .systemGroupedBackground))
+        .toolbar(.hidden, for: .tabBar)
         .sheet(isPresented: $showingDiagnostics) {
             NavigationStack {
                 Form {
@@ -142,9 +70,171 @@ struct IOSSessionView: View {
         }
     }
 
+    private var remoteCanvas: some View {
+        ZStack {
+            Color.black
+            IOSMetalVideoView(
+                pixelBuffer: controller.latestPixelBuffer,
+                videoSize: controller.videoSize,
+                visibleVideoRect: $visibleVideoRect
+            )
+            IOSTouchInputView(
+                bridge: controller,
+                videoSize: controller.videoSize,
+                visibleVideoRect: visibleVideoRect,
+                mode: touchMode
+            )
+            .allowsHitTesting(isInputEnabled)
+
+            if !hasVideoFrame {
+                VStack(spacing: 10) {
+                    Image(systemName: "rectangle.inset.filled")
+                        .font(.system(size: 28, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.82))
+                    Text(videoPlaceholder)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                    Text("输入仍可使用，画面恢复后会自动显示")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.68))
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 24)
+                .allowsHitTesting(false)
+            }
+
+            VStack {
+                HStack {
+                    Label(statusText, systemImage: statusSymbol)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
+                        .background(Color.black.opacity(0.68), in: Capsule())
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 14)
+                Spacer()
+            }
+            .allowsHitTesting(false)
+        }
+        .clipped()
+        .overlay {
+            IOSKeyboardInputView(input: keyboardInput)
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+        }
+    }
+
+    private var sessionControls: some View {
+        VStack(spacing: 10) {
+            IOSSpecialKeyBar(keyboard: keyboardInput)
+
+            Picker("输入模式", selection: $touchMode) {
+                ForEach(IOSTouchMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 12)
+
+            HStack(spacing: 8) {
+                sessionAction(
+                    title: "键盘",
+                    accessibilityLabel: "打开键盘输入",
+                    systemImage: "keyboard",
+                    enabled: isInputEnabled
+                ) {
+                    keyboardInput.becomeFirstResponder()
+                }
+                sessionAction(
+                    title: "诊断",
+                    accessibilityLabel: "打开连接诊断",
+                    systemImage: "gauge"
+                ) {
+                    showingDiagnostics = true
+                }
+                sessionAction(
+                    title: "关键帧",
+                    accessibilityLabel: "请求关键帧",
+                    systemImage: "arrow.clockwise",
+                    enabled: isInputEnabled
+                ) {
+                    controller.requestKeyframe()
+                }
+                sessionAction(
+                    title: "断开",
+                    accessibilityLabel: "断开连接",
+                    systemImage: "xmark.circle",
+                    tint: .red
+                ) {
+                    keyboardInput.resign()
+                    controller.disconnect()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
+        }
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private func sessionAction(
+        title: String,
+        accessibilityLabel: String,
+        systemImage: String,
+        tint: Color? = nil,
+        enabled: Bool = true,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.body.weight(.semibold))
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity, minHeight: 48)
+        }
+        .buttonStyle(.bordered)
+        .tint(tint)
+        .disabled(!enabled)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
     private var isInputEnabled: Bool {
         if case .connected = controller.state { return true }
         return false
+    }
+
+    private var hasVideoFrame: Bool {
+        controller.latestPixelBuffer != nil
+    }
+
+    private var statusText: String {
+        IOSSessionPresentation.statusText(controller.state)
+    }
+
+    private var statusSymbol: String {
+        switch controller.state {
+        case .connected: "checkmark.circle.fill"
+        case .reconnecting, .recovering: "arrow.triangle.2.circlepath"
+        case .frozen: "pause.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        default: "circle"
+        }
+    }
+
+    private var videoPlaceholder: String {
+        switch controller.state {
+        case .reconnecting: "网络暂时中断，正在重新连接"
+        case .recovering: "正在等待新的关键帧"
+        case .frozen: "远程画面暂时没有更新"
+        default: "正在接收远程画面"
+        }
     }
 
     private var videoSizeText: String {

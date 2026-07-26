@@ -15,14 +15,15 @@ struct IOSSpecialKeyBar: View {
                             keyboard.sendSpecialKey(key, pressed: false)
                         }
                     } label: {
-                        Text(key.rawValue)
+                        Text(key.displayTitle)
                             .font(.caption.weight(.medium))
                             .lineLimit(1)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
+                            .minimumScaleFactor(0.75)
+                            .frame(minWidth: key == .command ? 72 : 50, minHeight: 36)
                     }
                     .buttonStyle(.bordered)
                     .tint(key.modifier.map { keyboard.activeModifiers.contains($0) } == true ? .accentColor : nil)
+                    .accessibilityLabel(key.rawValue)
                 }
             }
             .padding(.horizontal, 12)
