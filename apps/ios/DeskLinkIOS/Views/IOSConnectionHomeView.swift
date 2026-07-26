@@ -43,6 +43,24 @@ struct IOSConnectionHomeView: View {
         } else {
             NavigationStack {
             Form {
+                if !savedHosts.isEmpty {
+                    Section("最近设备") {
+                        ForEach(savedHosts.prefix(3)) { host in
+                            Button {
+                                controller.connect(savedHost: host)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(host.serverName)
+                                        .foregroundStyle(.primary)
+                                    Text("已保存的安全连接")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Section("连接设备") {
                     TextField("粘贴或输入连接码", text: $inviteText, axis: .vertical)
                         .textInputAutocapitalization(.never)
@@ -81,23 +99,6 @@ struct IOSConnectionHomeView: View {
                     }
                 }
 
-                if !savedHosts.isEmpty {
-                    Section("最近设备") {
-                        ForEach(savedHosts.prefix(3)) { host in
-                            Button {
-                                controller.connect(savedHost: host)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(host.serverName)
-                                        .foregroundStyle(.primary)
-                                    Text("已保存的安全连接")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
             }
             .navigationTitle("DeskLink")
             .sheet(isPresented: $isShowingScanner) {
