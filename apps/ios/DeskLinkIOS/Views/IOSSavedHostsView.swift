@@ -3,6 +3,7 @@ import SwiftUI
 
 struct IOSSavedHostsView: View {
     @ObservedObject var controller: ControllerBridge
+    @Binding var destination: IOSRootDestination
     @State private var hosts: [SavedHost] = []
     @State private var loadError: String?
 
@@ -31,7 +32,10 @@ struct IOSSavedHostsView: View {
                             HStack {
                                 Text(host.serverName).font(.headline)
                                 Spacer()
-                                Button("重新连接") { controller.connect(savedHost: host) }
+                                Button("重新连接") {
+                                    destination = .connect
+                                    controller.connect(savedHost: host)
+                                }
                                     .buttonStyle(.borderless)
                             }
                             Text("认证材料保存在 Keychain")

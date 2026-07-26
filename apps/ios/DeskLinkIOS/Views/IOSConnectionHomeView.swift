@@ -17,7 +17,7 @@ struct IOSRootView: View {
             IOSConnectionHomeView(controller: controller)
                 .tabItem { Label(IOSRootDestination.connect.rawValue, systemImage: "rectangle.portrait.and.arrow.right") }
                 .tag(IOSRootDestination.connect)
-            IOSSavedHostsView(controller: controller)
+            IOSSavedHostsView(controller: controller, destination: $destination)
                 .tabItem { Label(IOSRootDestination.savedHosts.rawValue, systemImage: "externaldrive.connected.to.line.below") }
                 .tag(IOSRootDestination.savedHosts)
             IOSMoreView(controller: controller)
