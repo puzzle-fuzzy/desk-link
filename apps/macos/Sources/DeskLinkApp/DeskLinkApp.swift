@@ -43,7 +43,6 @@ struct DeskLinkApp: App {
     @NSApplicationDelegateAdaptor(DeskLinkLifecycleDelegate.self) private var lifecycle
     @StateObject private var controller = ControllerBridge(configuration: .macOSDefaults)
     @StateObject private var host = HostBridge()
-    @State private var section: DeskLinkSection = .connect
 
     var body: some Scene {
         WindowGroup {
@@ -51,24 +50,7 @@ struct DeskLinkApp: App {
                 if isControllerSessionState(controller.state) {
                     SessionView(bridge: controller)
                 } else {
-                    DeskLinkShell(
-                        selection: $section,
-                        host: host,
-                        controller: controller
-                    ) {
-                        switch section {
-                        case .connect:
-                            ControllerHomeView(bridge: controller, openSharing: {
-                                section = .share
-                            })
-                        case .share:
-                            HostHomeView(bridge: host, page: .connection)
-                        case .devices:
-                            HostHomeView(bridge: host, page: .devices)
-                        case .settings:
-                            HostHomeView(bridge: host, page: .overview)
-                        }
-                    }
+                    DeskLinkShell(host: host, controller: controller)
                 }
             }
             .sheet(item: pendingApproval) { approval in
@@ -84,6 +66,8 @@ struct DeskLinkApp: App {
                 controller.disconnect()
             }
         }
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified)
     }
 
     private var pendingApproval: Binding<HostApproval?> {

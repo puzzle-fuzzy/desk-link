@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define DESKLINK_PAIRING_INVITE_BYTES 181
+#define DESKLINK_DIRECTORY_ACCESS_CODE_BYTES 8
 
 #ifdef __cplusplus
 extern "C" {
@@ -125,6 +126,14 @@ typedef struct DesklinkPairingInviteConnectionConfig {
     uint8_t controller_device_id[16];
     uint8_t controller_secret_key[32];
 } DesklinkPairingInviteConnectionConfig;
+
+typedef struct DesklinkDirectoryConnectionConfig {
+    const char *server_name;
+    uint64_t device_id;
+    uint8_t access_code[DESKLINK_DIRECTORY_ACCESS_CODE_BYTES];
+    uint8_t controller_device_id[16];
+    uint8_t controller_secret_key[32];
+} DesklinkDirectoryConnectionConfig;
 
 typedef struct DesklinkPairingInfo {
     uint8_t session_id[16];
@@ -260,6 +269,10 @@ DesklinkResult desklink_connect_secure(
 DesklinkResult desklink_connect_pairing_invite(
     DesklinkHandle *handle,
     const DesklinkPairingInviteConnectionConfig *config
+);
+DesklinkResult desklink_connect_directory(
+    DesklinkHandle *handle,
+    const DesklinkDirectoryConnectionConfig *config
 );
 DesklinkResult desklink_accept(DesklinkHandle *handle);
 DesklinkResult desklink_reject(DesklinkHandle *handle);

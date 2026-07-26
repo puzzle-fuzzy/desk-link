@@ -13,7 +13,6 @@ final class DeskLinkNavigationTests: XCTestCase {
 
     func testConnectionWorkspaceCopyNamesTheRemoteTask() {
         XCTAssertEqual("连接设备", DeskLinkSection.connect.rawValue)
-        XCTAssertEqual("共享此设备", DeskLinkSection.share.rawValue)
         XCTAssertNotEqual(DeskLinkSection.connect.rawValue, "本机状态")
     }
 
@@ -44,7 +43,7 @@ final class DeskLinkNavigationTests: XCTestCase {
     func testPrimaryNavigationUsesRemoteTasks() {
         XCTAssertEqual(
             DeskLinkSection.allCases.map(\.rawValue),
-            ["连接设备", "共享此设备", "已批准设备", "设置 / 诊断"]
+            ["连接设备"]
         )
         XCTAssertEqual(DeskLinkSection.connect.rawValue, "连接设备")
     }

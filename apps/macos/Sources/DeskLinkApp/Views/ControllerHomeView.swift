@@ -3,14 +3,12 @@ import DeskLinkAppleCore
 
 struct ControllerHomeView: View {
     @ObservedObject var bridge: ControllerBridge
-    let openSharing: () -> Void
     @State private var savedHosts: [SavedHost] = []
     @State private var storeError: String?
     private let savedHostStore = SavedHostStore()
 
-    init(bridge: ControllerBridge, openSharing: @escaping () -> Void = {}) {
+    init(bridge: ControllerBridge) {
         self.bridge = bridge
-        self.openSharing = openSharing
     }
 
     var body: some View {
@@ -76,25 +74,6 @@ struct ControllerHomeView: View {
                                 }
                             }
                         }
-                    }
-                }
-
-                DeskLinkPanel {
-                    HStack(alignment: .center, spacing: 16) {
-                        Image(systemName: "macbook.and.iphone")
-                            .font(.system(size: 20))
-                            .foregroundStyle(DeskLinkPalette.secondaryInk)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("允许别人连接此设备")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(DeskLinkPalette.ink)
-                            Text("需要共享这台 Mac 时，先检查权限并生成连接码。")
-                                .font(.system(size: 12))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
-                        }
-                        Spacer()
-                        Button("共享此设备", action: openSharing)
-                            .buttonStyle(DeskLinkSecondaryButtonStyle())
                     }
                 }
 

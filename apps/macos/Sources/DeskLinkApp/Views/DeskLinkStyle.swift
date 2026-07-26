@@ -3,9 +3,6 @@ import DeskLinkAppleCore
 
 enum DeskLinkSection: String, CaseIterable, Identifiable {
     case connect = "连接设备"
-    case share = "共享此设备"
-    case devices = "已批准设备"
-    case settings = "设置 / 诊断"
 
     var id: Self { self }
 }
@@ -31,103 +28,89 @@ enum DeskLinkPalette {
     static let errorSurface = Color(red: 0.990, green: 0.935, blue: 0.925)
 }
 
-struct DeskLinkShell<Content: View>: View {
-    @Binding var selection: DeskLinkSection
+struct DeskLinkShell: View {
     @ObservedObject var host: HostBridge
     @ObservedObject var controller: ControllerBridge
-    let content: () -> Content
 
     @State private var isShowingHostStatus = false
-
-    init(
-        selection: Binding<DeskLinkSection>,
-        host: HostBridge,
-        controller: ControllerBridge,
-        @ViewBuilder content: @escaping () -> Content
-    ) {
-        _selection = selection
-        self.host = host
-        self.controller = controller
-        self.content = content
-    }
+    @State private var presentedHostPage: HostHomePage?
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 26) {
-                ForEach(DeskLinkSection.allCases) { section in
-                    Button {
-                        selection = section
-                    } label: {
-                        Text(section.rawValue)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(
-                                selection == section ? DeskLinkPalette.ink : DeskLinkPalette.mutedInk
-                            )
-                            .padding(.horizontal, 2)
-                            .frame(height: 47)
-                            .overlay(alignment: .bottom) {
-                                Rectangle()
-                                    .fill(selection == section ? DeskLinkPalette.primary : Color.clear)
-                                    .frame(height: 2)
-                            }
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(selection == section ? .isSelected : [])
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 28)
-            .background(DeskLinkPalette.subtle)
-
-            Rectangle().fill(DeskLinkPalette.border).frame(height: 1)
-
-            content()
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(DeskLinkPalette.surface)
-        }
+        ControllerHomeView(bridge: controller)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(DeskLinkPalette.surface)
         .frame(minWidth: 760, minHeight: 560)
         .background(DeskLinkPalette.surface)
         .toolbar {
-            ToolbarItem(placement: .automatic) {
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     isShowingHostStatus = true
                 } label: {
-                    let status = deskLinkHostStatus(
-                        for: host.state,
-                        permissions: host.permissions,
-                        hasPendingApproval: host.pendingApproval != nil,
-                        lastError: host.lastError
-                    )
-                    Label(status.title, systemImage: status.systemImage)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(color(for: status.tone))
+                    Image(systemName: hostStatusIcon)
                 }
-                .buttonStyle(.plain)
+                .help("查看本机共享状态")
                 .popover(isPresented: $isShowingHostStatus) {
                     DeskLinkHostStatusPopover(
                         host: host,
                         openSettings: {
                             isShowingHostStatus = false
-                            selection = .settings
+                            presentedHostPage = .overview
                         },
                         openSharing: {
                             isShowingHostStatus = false
-                            selection = .share
+                            presentedHostPage = .connection
                         }
                     )
                 }
+
+                Button {
+                    presentedHostPage = .connection
+                } label: {
+                    Image(systemName: "macbook.and.iphone")
+                }
+                .help("共享此设备")
+
+                Menu {
+                    Button("已批准设备", systemImage: "person.2") {
+                        presentedHostPage = .devices
+                    }
+                    Button("设置 / 诊断", systemImage: "gearshape") {
+                        presentedHostPage = .overview
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .help("更多管理功能")
+
+                Button {
+                    host.refreshPermissions()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("刷新本机状态")
             }
+        }
+        .popover(item: $presentedHostPage) { page in
+            HostHomeView(bridge: host, page: page)
+                .frame(width: 680, height: 620)
         }
     }
 
-    private func color(for tone: DeskLinkHostStatusTone) -> Color {
-        switch tone {
-        case .ready: DeskLinkPalette.success
-        case .attention: DeskLinkPalette.warning
-        case .idle: DeskLinkPalette.mutedInk
-        case .working: DeskLinkPalette.info
+    private var hostStatusIcon: String {
+        let status = deskLinkHostStatus(
+            for: host.state,
+            permissions: host.permissions,
+            hasPendingApproval: host.pendingApproval != nil,
+            lastError: host.lastError
+        )
+        switch status.tone {
+        case .ready: return "checkmark.circle"
+        case .attention: return "exclamationmark.circle"
+        case .idle: return "circle"
+        case .working: return "arrow.triangle.2.circlepath"
         }
     }
+
 }
 
 struct DeskLinkMark: View {

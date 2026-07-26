@@ -34,7 +34,10 @@ pub use controller::{
 pub use host::{
     HostCommand, HostError, HostEvent, HostIdentity, HostMetrics, HostRuntime, HostState,
 };
-use worker::{ControllerCommand, ControllerWorker, SecureConnectionConfigOwned};
+use worker::{
+    ControllerCommand, ControllerWorker, DirectoryConnectionConfigOwned,
+    SecureConnectionConfigOwned,
+};
 
 pub const PACKAGE_NAME: &str = "desklink-ffi";
 const PAIRING_CODE_BYTES: usize = 8;
@@ -180,6 +183,16 @@ pub struct DesklinkPairingInviteConnectionConfig {
     pub server_name: *const c_char,
     pub invite: *const u8,
     pub invite_len: usize,
+    pub controller_device_id: [u8; 16],
+    pub controller_secret_key: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DesklinkDirectoryConnectionConfig {
+    pub server_name: *const c_char,
+    pub device_id: u64,
+    pub access_code: [u8; 8],
     pub controller_device_id: [u8; 16],
     pub controller_secret_key: [u8; 32],
 }
@@ -873,6 +886,7 @@ pub unsafe extern "C" fn desklink_connect_secure(
             controller_secret_key: config.controller_secret_key,
             host_verify_key: config.host_verify_key,
             expires_at_unix_s: None,
+            directory: None,
         },
     );
     if result != DesklinkResult::Ok {
@@ -952,11 +966,71 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
             controller_secret_key: config.controller_secret_key,
             host_verify_key,
             expires_at_unix_s: Some(invite.expires_at_unix_s()),
+            directory: None,
         },
     );
     if result != DesklinkResult::Ok {
         clear_saved_material(&runtime.saved_host_material);
     }
+    result
+}
+
+/// Looks up a host's temporary or fixed access credentials through the relay
+/// directory and starts the same authenticated controller runtime used by
+/// pairing invitations.
+///
+/// # Safety
+/// `handle` must be a live handle returned by `desklink_create`. `config` must
+/// point to readable storage and `server_name` must be a valid NUL-terminated
+/// UTF-8 string for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_connect_directory(
+    handle: *mut DesklinkHandle,
+    config: *const DesklinkDirectoryConnectionConfig,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    clear_saved_material(&runtime.saved_host_material);
+    if config.is_null() {
+        return DesklinkResult::InvalidArgument;
+    }
+    if runtime.ensure_active().is_err() {
+        return DesklinkResult::InvalidState;
+    }
+    if runtime
+        .worker
+        .as_ref()
+        .is_some_and(|worker| !worker.is_finished())
+    {
+        return DesklinkResult::InvalidState;
+    }
+    runtime.stop_worker();
+    let config = unsafe { &*config };
+    if config.server_name.is_null() || config.device_id == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let server_name = match unsafe { CStr::from_ptr(config.server_name) }.to_str() {
+        Ok(server_name) if !server_name.is_empty() => server_name.to_owned(),
+        Ok(_) => return DesklinkResult::InvalidArgument,
+        Err(_) => return DesklinkResult::InvalidUtf8,
+    };
+    let result = start_secure_worker(
+        runtime,
+        SecureConnectionConfigOwned {
+            server_name,
+            session_id: [0; 16],
+            relay_authentication: [0; 32],
+            controller_device_id: config.controller_device_id,
+            controller_secret_key: config.controller_secret_key,
+            host_verify_key: [0; 32],
+            expires_at_unix_s: None,
+            directory: Some(DirectoryConnectionConfigOwned {
+                device_id: config.device_id,
+                access_code: config.access_code,
+            }),
+        },
+    );
     result
 }
 

@@ -8,13 +8,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use desklink_crypto::{DeviceIdentity, SessionId};
+use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
 use desklink_protocol::{
     InputEvent, Platform, encode_audio_packet, encode_control, encode_cursor_update,
     encode_transfer,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
-use desklink_transport::{JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError};
+use desklink_transport::{
+    JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayJoin, TransportError,
+};
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroize;
@@ -38,6 +40,7 @@ pub(crate) struct SecureConnectionConfigOwned {
     pub controller_secret_key: [u8; 32],
     pub host_verify_key: [u8; 32],
     pub expires_at_unix_s: Option<u64>,
+    pub directory: Option<DirectoryConnectionConfigOwned>,
 }
 
 impl Drop for SecureConnectionConfigOwned {
@@ -45,6 +48,17 @@ impl Drop for SecureConnectionConfigOwned {
         self.relay_authentication.zeroize();
         self.controller_secret_key.zeroize();
         self.host_verify_key.zeroize();
+    }
+}
+
+pub(crate) struct DirectoryConnectionConfigOwned {
+    pub device_id: u64,
+    pub access_code: [u8; 8],
+}
+
+impl Drop for DirectoryConnectionConfigOwned {
+    fn drop(&mut self) {
+        self.access_code.zeroize();
     }
 }
 
@@ -588,13 +602,47 @@ async fn connect_controller(
     let relay_addr = resolve_relay(relay_url).map_err(ConnectFailure::permanent)?;
     let transport_config = QuicClientConfig::new(relay_addr, config.server_name.clone())
         .map_err(ConnectFailure::from_transport)?;
+    let (session_id, relay_authentication, host_verify_key) = if let Some(directory) =
+        &config.directory
+    {
+        let lookup_client = QuicClient::connect(transport_config.clone())
+            .await
+            .map_err(ConnectFailure::from_transport)?;
+        let lookup = RelayDirectoryLookup::new(directory.device_id, directory.access_code)
+            .map_err(ConnectFailure::from_transport)?;
+        let mut invitation = lookup_client
+            .lookup_directory(lookup)
+            .await
+            .map_err(ConnectFailure::from_transport)?;
+        let result = PairingInvite::decode(&invitation, now_unix_s())
+            .map(|invite| {
+                (
+                    *invite.session_id().as_bytes(),
+                    *invite.relay_authentication(),
+                    *invite.host_verify_key().as_bytes(),
+                )
+            })
+            .map_err(|_| {
+                ConnectFailure::permanent(
+                    "the device returned an invalid or expired connection invitation".to_owned(),
+                )
+            });
+        invitation.zeroize();
+        result?
+    } else {
+        (
+            config.session_id,
+            config.relay_authentication,
+            config.host_verify_key,
+        )
+    };
     let client = QuicClient::connect(transport_config)
         .await
         .map_err(ConnectFailure::from_transport)?;
     client
         .join(RelayJoin::controller_with_participant(
-            SessionId::from_bytes(config.session_id),
-            config.relay_authentication,
+            SessionId::from_bytes(session_id),
+            relay_authentication,
             config.controller_device_id,
         ))
         .await
@@ -602,7 +650,7 @@ async fn connect_controller(
     callback.emit_state(DesklinkState::SecureHandshake, 0);
     let identity =
         DeviceIdentity::from_secret_key(config.controller_device_id, &config.controller_secret_key);
-    let expected_host = VerifyingKey::from_bytes(&config.host_verify_key).map_err(|error| {
+    let expected_host = VerifyingKey::from_bytes(&host_verify_key).map_err(|error| {
         ConnectFailure::permanent(format!("invalid host verification key: {error}"))
     })?;
     callback.emit_state(DesklinkState::NegotiatingCapabilities, 0);

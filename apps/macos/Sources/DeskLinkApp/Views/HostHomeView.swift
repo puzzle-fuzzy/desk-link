@@ -2,10 +2,12 @@ import AppKit
 import DeskLinkAppleCore
 import SwiftUI
 
-enum HostHomePage {
+enum HostHomePage: String, Identifiable {
     case overview
     case connection
     case devices
+
+    var id: Self { self }
 }
 
 struct HostHomeView: View {

@@ -135,6 +135,62 @@ public final class ControllerBridge: ObservableObject {
 
     public func connect(invite: [UInt8]) { connect(invite: Data(invite)) }
 
+    /// Connects through the relay directory using the same device ID and
+    /// temporary/fixed password that the Windows controller accepts.
+    public func connect(deviceID: String, temporaryPassword: String) {
+        let normalizedDeviceID = deviceID.filter(\.isNumber)
+        let normalizedPassword = temporaryPassword
+            .uppercased()
+            .filter { "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains($0) }
+
+        guard normalizedDeviceID.count == 12,
+              let publicDeviceID = UInt64(normalizedDeviceID),
+              normalizedPassword.count == Int(DESKLINK_DIRECTORY_ACCESS_CODE_BYTES)
+        else {
+            publishErrorMessage("设备 ID 或访问密码格式无效。")
+            return
+        }
+
+        state = .connecting
+        lastError = nil
+        savedHostForResume = nil
+        suspendedForBackground = false
+        requestKeyframeAfterNextVideoConfig = false
+        createIfNeeded()
+        guard let handle = handleOwner.pointer else { return }
+        do {
+            let identity = try loadIdentityIfNeeded()
+            var config = DesklinkDirectoryConnectionConfig(
+                server_name: nil,
+                device_id: publicDeviceID,
+                access_code: (0, 0, 0, 0, 0, 0, 0, 0),
+                controller_device_id: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                controller_secret_key: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            )
+            withUnsafeMutableBytes(of: &config.access_code) {
+                $0.copyBytes(from: normalizedPassword.utf8)
+            }
+            withUnsafeMutableBytes(of: &config.controller_device_id) {
+                $0.copyBytes(from: identity.deviceID)
+            }
+            withUnsafeMutableBytes(of: &config.controller_secret_key) {
+                $0.copyBytes(from: identity.secretKey)
+            }
+            let result = relayServerName.withCString { serverName in
+                config.server_name = serverName
+                return desklink_connect_directory(handle, &config)
+            }
+            guard result == DESKLINK_OK else {
+                publishResultError("无法使用设备 ID 和访问密码连接。", result: result)
+                return
+            }
+            awaitingApprovedHostMaterial = false
+            state = .connecting
+        } catch {
+            publishError(error)
+        }
+    }
+
     public func connect(savedHost: SavedHost) {
         state = .connecting
         lastError = nil
@@ -462,6 +518,13 @@ public final class ControllerBridge: ObservableObject {
         }
         if lowercase.contains("pairing invitation could not be used") {
             return "连接码无法使用，请重新生成连接码后重试。"
+        }
+        if lowercase.contains("device is offline")
+            || lowercase.contains("temporary password")
+            || lowercase.contains("access code")
+            || lowercase.contains("device returned an invalid")
+        {
+            return "找不到在线设备或访问密码不正确，请确认设备在线并检查密码后重试。"
         }
         if lowercase.contains("could not start its connection runtime") {
             return "连接运行时启动失败，请稍后重试。"
