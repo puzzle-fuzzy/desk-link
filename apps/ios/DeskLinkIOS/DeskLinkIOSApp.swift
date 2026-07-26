@@ -14,6 +14,7 @@ struct DeskLinkIOSApp: App {
     var body: some Scene {
         WindowGroup {
             IOSRootView(controller: controller)
+                .deskLinkSessionLifecycle(controller: controller)
         }
     }
 }

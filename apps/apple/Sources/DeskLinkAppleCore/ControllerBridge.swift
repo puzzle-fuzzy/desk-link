@@ -50,13 +50,17 @@ public final class ControllerBridge: ObservableObject {
     private let identityStore: ControllerIdentityStore
     private let savedHostStore: SavedHostStore
     private var controllerIdentity: ControllerIdentity?
+    private var savedHostForResume: SavedHost?
     private var activeStreamID: UInt64 = 0
     private var highestStreamID: UInt64 = 0
     private var callbackGeneration: UInt64 = 0
     private var awaitingApprovedHostMaterial = false
+    private var suspendedForBackground = false
+    private var requestKeyframeAfterNextVideoConfig = false
 #if DEBUG
-    private(set) var releaseAllCallCountForTesting = 0
-    var activeRuntimeForTesting: Bool { handleOwner.pointer != nil }
+    public private(set) var releaseAllCallCountForTesting = 0
+    public var activeRuntimeForTesting: Bool { handleOwner.pointer != nil }
+    public var activeStreamIDForTesting: UInt64 { activeStreamID }
 #endif
 
     public init(
@@ -77,7 +81,7 @@ public final class ControllerBridge: ObservableObject {
         }
     }
 
-    static func testing(
+    public static func testing(
         configuration: DeskLinkRuntimeConfiguration = .macOSDefaults,
         error: String? = nil,
         state: ConnectionState = .idle
@@ -98,6 +102,9 @@ public final class ControllerBridge: ObservableObject {
             publishErrorMessage("The pairing invitation is invalid.")
             return
         }
+        savedHostForResume = nil
+        suspendedForBackground = false
+        requestKeyframeAfterNextVideoConfig = false
         createIfNeeded()
         guard let handle = handleOwner.pointer else { return }
         do {
@@ -132,6 +139,8 @@ public final class ControllerBridge: ObservableObject {
             publishErrorMessage("The saved host record is invalid.")
             return
         }
+        savedHostForResume = savedHost
+        suspendedForBackground = false
         createIfNeeded()
         guard let handle = handleOwner.pointer else { return }
         do {
@@ -193,19 +202,48 @@ public final class ControllerBridge: ObservableObject {
         _ = desklink_release_all(handle)
     }
 
-    public func disconnect() {
+    /// Stops the active native runtime while retaining the approved host
+    /// material for a foreground reconnect. Callback generation is advanced
+    /// before teardown so queued events from the retired runtime cannot update
+    /// the new session's decoder or UI.
+    public func suspendForBackground() {
+        guard !suspendedForBackground else { return }
+        suspendedForBackground = true
         callbackGeneration &+= 1
         releaseAll()
         if let handle = handleOwner.pointer { _ = desklink_reject(handle) }
         handleOwner.destroy()
-        decoder.reset()
-        activeStreamID = 0
-        highestStreamID = 0
+        resetDisplayedSessionState()
+        requestKeyframeAfterNextVideoConfig = false
+        if savedHostForResume != nil, state != .idle {
+            state = .reconnecting
+        }
+    }
+
+    /// Reconnects once after a background suspension. A saved host is kept in
+    /// Keychain independently of this in-memory reference; the reference is
+    /// only the session that should resume automatically.
+    public func resumeFromBackground() {
+        guard suspendedForBackground else { return }
+        suspendedForBackground = false
+        guard let savedHost = savedHostForResume else {
+            if state == .reconnecting { state = .closed }
+            return
+        }
+        requestKeyframeAfterNextVideoConfig = true
+        connect(savedHost: savedHost)
+        if case .connecting = state { state = .recovering }
+    }
+
+    public func disconnect() {
+        suspendedForBackground = false
+        requestKeyframeAfterNextVideoConfig = false
+        callbackGeneration &+= 1
+        releaseAll()
+        if let handle = handleOwner.pointer { _ = desklink_reject(handle) }
+        handleOwner.destroy()
+        resetDisplayedSessionState()
         awaitingApprovedHostMaterial = false
-        latestAccessUnit = nil
-        latestPixelBuffer = nil
-        videoSize = nil
-        cursorOverlay = nil
         state = .closed
     }
 
@@ -318,6 +356,10 @@ public final class ControllerBridge: ObservableObject {
               decoder.configure(sequenceHeader: data, width: width, height: height, version: version)
         else { dropFrame(); return }
         videoSize = CGSize(width: Int(width), height: Int(height))
+        if requestKeyframeAfterNextVideoConfig {
+            requestKeyframeAfterNextVideoConfig = false
+            requestKeyframe()
+        }
     }
 
     private func consumeFrame(data: Data, streamID: UInt64, frameID: UInt64, version: UInt32) {
@@ -354,6 +396,7 @@ public final class ControllerBridge: ObservableObject {
         )
         do {
             try savedHostStore.save(host)
+            savedHostForResume = host
             awaitingApprovedHostMaterial = false
         } catch {
             publishErrorMessage("The approved host could not be saved securely.")
@@ -383,6 +426,17 @@ public final class ControllerBridge: ObservableObject {
 
     private func publishError(_ error: Error) { publishErrorMessage(error.localizedDescription) }
 
+    private func resetDisplayedSessionState() {
+        decoder.reset()
+        activeStreamID = 0
+        highestStreamID = 0
+        metrics.lastFrameID = nil
+        latestAccessUnit = nil
+        latestPixelBuffer = nil
+        videoSize = nil
+        cursorOverlay = nil
+    }
+
     private func publishErrorMessage(_ message: String) {
         let safe = Self.redact(message)
         if handleOwner.pointer != nil {
@@ -399,6 +453,12 @@ public final class ControllerBridge: ObservableObject {
         }
         return message
     }
+
+#if DEBUG
+    public func acceptStateForTesting(streamID: UInt64) {
+        consumeState(streamID: streamID, stateValue: Int(DESKLINK_CONNECTED.rawValue))
+    }
+#endif
 }
 
 private func desklinkEventCallback(_ context: UnsafeMutableRawPointer?, _ event: UnsafePointer<DesklinkEvent>?) {

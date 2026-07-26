@@ -334,6 +334,125 @@ async fn controller_runtime_requests_a_keyframe_after_a_reference_gap() {
     assert_eq!(runtime.metrics().completed_frames, 3);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_runtime_reconnects_with_a_fresh_ios_stream_boundary() {
+    let relay = spawn_test_relay().await;
+    let config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+    let host = QuicClient::connect(config()).await.unwrap();
+    let session_id = SessionId::from_bytes([101; 16]);
+    let authentication = [102; 32];
+    host.join(RelayJoin::host_with_participant(
+        session_id,
+        authentication,
+        [1; 16],
+    ))
+    .await
+    .unwrap();
+
+    let controller_secret = [104; 32];
+    let controller_identity = DeviceIdentity::from_secret_key([105; 16], &controller_secret);
+    let host_verify_key = DeviceIdentity::from_secret_key([103; 16], &[106; 32]).verify_key();
+    let controller_verify_key = controller_identity.verify_key();
+    let (first_ready_sender, first_ready_receiver) = oneshot::channel();
+    let first_host_task = tokio::spawn(run_config_only_host(
+        host,
+        [106; 32],
+        controller_verify_key,
+        first_ready_receiver,
+        9,
+    ));
+
+    let first_controller = QuicClient::connect(config()).await.unwrap();
+    first_controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            [105; 16],
+        ))
+        .await
+        .unwrap();
+    let mut first_runtime = ControllerRuntime::connect_for_platform(
+        first_controller,
+        controller_identity,
+        host_verify_key,
+        Platform::IOS,
+    )
+    .await
+    .unwrap();
+    assert!(first_runtime.direct_candidate().is_none());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), first_runtime.next_event())
+            .await
+            .unwrap()
+            .unwrap(),
+        ControllerEvent::VideoConfig(VideoConfig { stream_id: 9, .. })
+    ));
+    first_ready_sender.send(()).unwrap();
+    drop(first_runtime);
+    tokio::time::timeout(Duration::from_secs(3), first_host_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let second_session_id = SessionId::from_bytes([108; 16]);
+    let second_host = QuicClient::connect(config()).await.unwrap();
+    second_host
+        .join(RelayJoin::host_with_participant(
+            second_session_id,
+            authentication,
+            [9; 16],
+        ))
+        .await
+        .unwrap();
+    let (second_ready_sender, second_ready_receiver) = oneshot::channel();
+    let second_host_task = tokio::spawn(run_config_only_host(
+        second_host,
+        [106; 32],
+        controller_verify_key,
+        second_ready_receiver,
+        10,
+    ));
+    let second_controller = QuicClient::connect(config()).await.unwrap();
+    second_controller
+        .join(RelayJoin::controller_with_participant(
+            second_session_id,
+            authentication,
+            [107; 16],
+        ))
+        .await
+        .unwrap();
+    let second_identity = DeviceIdentity::from_secret_key([107; 16], &controller_secret);
+    let mut second_runtime = ControllerRuntime::connect_for_platform(
+        second_controller,
+        second_identity,
+        host_verify_key,
+        Platform::IOS,
+    )
+    .await
+    .unwrap();
+    assert!(second_runtime.direct_candidate().is_none());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), second_runtime.next_event())
+            .await
+            .unwrap()
+            .unwrap(),
+        ControllerEvent::VideoConfig(VideoConfig { stream_id: 10, .. })
+    ));
+    second_ready_sender.send(()).unwrap();
+    drop(second_runtime);
+
+    tokio::time::timeout(Duration::from_secs(3), second_host_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 async fn run_fake_host(
     host: QuicClient,
     identity: DeviceIdentity,
@@ -576,6 +695,96 @@ async fn run_reference_gap_host(
     send_test_video_frame(&host, &mut secure, 14, false).await;
     let _ = keep_host_alive.await;
     request
+}
+
+async fn run_config_only_host(
+    host: QuicClient,
+    host_secret: [u8; 32],
+    expected_controller: ed25519_dalek::VerifyingKey,
+    ready: oneshot::Receiver<()>,
+    stream_id: u64,
+) {
+    let mut secure = accept_reconnect_controller(&host, host_secret, expected_controller).await;
+    send_reconnect_config(&host, &mut secure, stream_id).await;
+    ready.await.unwrap();
+}
+
+async fn accept_reconnect_controller(
+    host: &QuicClient,
+    host_secret: [u8; 32],
+    expected_controller: ed25519_dalek::VerifyingKey,
+) -> SecureSession {
+    let identity = DeviceIdentity::from_secret_key([103; 16], &host_secret);
+    let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
+    let (mut responder, response) =
+        NoiseResponder::accept(&first.payload, identity, expected_controller).unwrap();
+    host.send_control(
+        encode_noise_handshake(&NoiseHandshake {
+            protocol_version: PROTOCOL_VERSION,
+            step: NoiseHandshakeStep::ResponderHello,
+            payload: response,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let finish = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
+    assert_eq!(finish.step, NoiseHandshakeStep::InitiatorFinish);
+    responder.receive(&finish.payload).unwrap();
+    let mut secure = responder
+        .finish()
+        .unwrap()
+        .into_secure_session(SecureRole::Responder);
+
+    assert!(matches!(
+        open_control(&mut secure, host.next_control().await.unwrap()),
+        ControlMessage::Hello { .. }
+    ));
+    assert!(matches!(
+        open_control(&mut secure, host.next_control().await.unwrap()),
+        ControlMessage::Capabilities(_)
+    ));
+    send_control(
+        host,
+        &mut secure,
+        ControlMessage::Hello {
+            platform: Platform::MacOS,
+            role: DeviceRole::Host,
+        },
+    )
+    .await;
+    send_control(
+        host,
+        &mut secure,
+        ControlMessage::Capabilities(DeviceCapabilities {
+            platform: Platform::MacOS,
+            role: DeviceRole::Host,
+            codecs: vec![Codec::H264],
+            h264_profiles: vec![H264Profile::Main],
+            width: 1280,
+            height: 720,
+        }),
+    )
+    .await;
+    secure
+}
+
+async fn send_reconnect_config(host: &QuicClient, secure: &mut SecureSession, stream_id: u64) {
+    let config = VideoConfig {
+        protocol_version: PROTOCOL_VERSION,
+        stream_id,
+        config_version: 1,
+        codec: Codec::H264,
+        width: 1280,
+        height: 720,
+        sequence_header: vec![
+            0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
+        ],
+    };
+    let config_bytes = encode_video_config(&config).unwrap();
+    host.send_video_config(secure.seal(SecureLane::VideoConfig, &config_bytes).unwrap())
+        .await
+        .unwrap();
 }
 
 async fn send_test_video_frame(

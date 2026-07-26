@@ -23,6 +23,8 @@
 		10000000000000000000006A /* IOSInputMapperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000070 /* IOSInputMapperTests.swift */; };
 		10000000000000000000006B /* IOSSessionPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000071 /* IOSSessionPresentationTests.swift */; };
 		100000000000000000000072 /* IOSSpecialKeyBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000073 /* IOSSpecialKeyBar.swift */; };
+		100000000000000000000074 /* IOSSessionLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000075 /* IOSSessionLifecycle.swift */; };
+		100000000000000000000076 /* IOSLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000077 /* IOSLifecycleTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +67,8 @@
 		100000000000000000000070 /* IOSInputMapperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSInputMapperTests.swift; sourceTree = "<group>"; };
 		100000000000000000000071 /* IOSSessionPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSSessionPresentationTests.swift; sourceTree = "<group>"; };
 		100000000000000000000073 /* IOSSpecialKeyBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Input/IOSSpecialKeyBar.swift; sourceTree = "<group>"; };
+		100000000000000000000075 /* IOSSessionLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Lifecycle/IOSSessionLifecycle.swift; sourceTree = "<group>"; };
+		100000000000000000000077 /* IOSLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSLifecycleTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -115,6 +119,7 @@
 				10000000000000000000006C /* IOSTouchInputView.swift */,
 				10000000000000000000006D /* IOSKeyboardInput.swift */,
 				100000000000000000000073 /* IOSSpecialKeyBar.swift */,
+				100000000000000000000075 /* IOSSessionLifecycle.swift */,
 				10000000000000000000006E /* IOSMetalVideoView.swift */,
 				10000000000000000000006F /* IOSSessionView.swift */,
 				100000000000000000000022 /* Info.plist */,
@@ -129,6 +134,7 @@
 				100000000000000000000029 /* IOSPairingTests.swift */,
 				100000000000000000000070 /* IOSInputMapperTests.swift */,
 				100000000000000000000071 /* IOSSessionPresentationTests.swift */,
+				100000000000000000000077 /* IOSLifecycleTests.swift */,
 				100000000000000000000024 /* Tests Info.plist */,
 			);
 			path = DeskLinkIOSTests;
@@ -279,8 +285,8 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		100000000000000000000040 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000030 /* DeskLinkIOSApp.swift in Sources */, 100000000000000000000033 /* IOSRuntimeConfiguration.swift in Sources */, 100000000000000000000034 /* IOSConnectionHomeView.swift in Sources */, 100000000000000000000035 /* IOSSavedHostsView.swift in Sources */, 100000000000000000000036 /* IOSQRCodeScanner.swift in Sources */, 100000000000000000000066 /* IOSTouchInputView.swift in Sources */, 100000000000000000000067 /* IOSKeyboardInput.swift in Sources */, 100000000000000000000072 /* IOSSpecialKeyBar.swift in Sources */, 100000000000000000000068 /* IOSMetalVideoView.swift in Sources */, 100000000000000000000069 /* IOSSessionView.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
-		100000000000000000000043 /* Test Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000032 /* IOSBuildConfigurationTests.swift in Sources */, 100000000000000000000037 /* IOSPairingTests.swift in Sources */, 10000000000000000000006A /* IOSInputMapperTests.swift in Sources */, 10000000000000000000006B /* IOSSessionPresentationTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000040 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000030 /* DeskLinkIOSApp.swift in Sources */, 100000000000000000000033 /* IOSRuntimeConfiguration.swift in Sources */, 100000000000000000000034 /* IOSConnectionHomeView.swift in Sources */, 100000000000000000000035 /* IOSSavedHostsView.swift in Sources */, 100000000000000000000036 /* IOSQRCodeScanner.swift in Sources */, 100000000000000000000066 /* IOSTouchInputView.swift in Sources */, 100000000000000000000067 /* IOSKeyboardInput.swift in Sources */, 100000000000000000000072 /* IOSSpecialKeyBar.swift in Sources */, 100000000000000000000074 /* IOSSessionLifecycle.swift in Sources */, 100000000000000000000068 /* IOSMetalVideoView.swift in Sources */, 100000000000000000000069 /* IOSSessionView.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000043 /* Test Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000032 /* IOSBuildConfigurationTests.swift in Sources */, 100000000000000000000037 /* IOSPairingTests.swift in Sources */, 10000000000000000000006A /* IOSInputMapperTests.swift in Sources */, 10000000000000000000006B /* IOSSessionPresentationTests.swift in Sources */, 100000000000000000000076 /* IOSLifecycleTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
 		100000000000000000000046 /* UI Test Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000038 /* IOSConnectionFlowUITests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
