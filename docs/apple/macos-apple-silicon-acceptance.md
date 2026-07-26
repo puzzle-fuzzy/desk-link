@@ -19,6 +19,8 @@ This record separates automated evidence from permissioned, interactive acceptan
 - [x] `./scripts/build-macos-arm64.sh --check`
 - [ ] Signed bundle verification with `APPLE_SIGNING_IDENTITY` (run when signing the release artifact)
 
+For local Screen Recording and Accessibility development, set `APPLE_SIGNING_IDENTITY` to a stable Apple Development or Developer ID identity when building. An ad-hoc bundle is structurally valid, but its designated requirement is tied to the executable cdhash, so macOS may require permissions again after rebuilding.
+
 ## Same-Mac loopback
 
 Run `./scripts/launch-macos-loopback.sh` after starting the local relay. Record each result here rather than inferring it from compilation:

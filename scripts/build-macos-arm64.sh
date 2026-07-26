@@ -32,15 +32,15 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$EXECUTABLE" "$APP/Contents/MacOS/DeskLinkApp"
 cp "$ROOT/apps/macos/Info.plist" "$APP/Contents/Info.plist"
 
-if [ "$SIGN" -eq 1 ]; then
+if [ "$SIGN" -eq 1 ] || [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
     test -n "${APPLE_SIGNING_IDENTITY:-}"
     codesign --force --options runtime --timestamp \
         --entitlements "$ROOT/apps/macos/DeskLink.entitlements" \
         --sign "$APPLE_SIGNING_IDENTITY" "$APP"
 else
-    # A valid ad-hoc bundle signature gives macOS a stable bundle identity for
-    # Accessibility/TCC during local development. The executable produced by
-    # SwiftPM may be linker-signed, but the surrounding app bundle is not.
+    # An ad-hoc signature makes a valid local bundle, but its designated
+    # requirement is the executable cdhash. Use APPLE_SIGNING_IDENTITY for
+    # permissions that must survive rebuilding the development app.
     codesign --force --sign - \
         --entitlements "$ROOT/apps/macos/DeskLink.entitlements" "$APP"
 fi
