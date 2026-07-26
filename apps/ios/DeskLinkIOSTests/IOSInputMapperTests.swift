@@ -17,6 +17,32 @@ final class IOSInputMapperTests: XCTestCase {
         )
     }
 
+    func testDirectTouchUsesMetalVerticalCoordinate() {
+        let videoRect = CGRect(x: 0, y: 312, width: 390, height: 220)
+        let mapper = IOSTouchMapper(
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: CGRect(x: 0, y: 0, width: 390, height: 844),
+            mode: .direct,
+            visibleVideoRect: videoRect
+        )
+
+        guard case let .move(topX, topY) = mapper.command(
+            for: CGPoint(x: 195, y: videoRect.minY + 10),
+            phase: .began
+        ),
+        case let .move(bottomX, bottomY) = mapper.command(
+            for: CGPoint(x: 195, y: videoRect.maxY - 10),
+            phase: .began
+        ) else {
+            return XCTFail("视频区域内的直接触控应该生成鼠标位置")
+        }
+
+        XCTAssertEqual(topX, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(topY, Float(210.0 / 220.0), accuracy: 0.000_001)
+        XCTAssertEqual(bottomX, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(bottomY, Float(10.0 / 220.0), accuracy: 0.000_001)
+    }
+
     func testTrackpadTwoFingerPanBecomesBoundedWheelInput() {
         XCTAssertEqual(
             IOSTouchMapper.wheel(deltaX: 0, deltaY: -1_201),

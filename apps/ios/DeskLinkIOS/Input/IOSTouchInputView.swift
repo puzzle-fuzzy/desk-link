@@ -57,7 +57,9 @@ struct IOSTouchMapper {
         else { return nil }
 
         let x = Float((point.x - visibleVideoRect.minX) / visibleVideoRect.width)
-        let y = Float((point.y - visibleVideoRect.minY) / visibleVideoRect.height)
+        // The rendered video uses Metal's bottom-left coordinate space for
+        // its vertical axis, while UIKit touch locations are top-left based.
+        let y = Float((visibleVideoRect.maxY - point.y) / visibleVideoRect.height)
         return .move(normalizedX: x.clamped(to: 0...1), normalizedY: y.clamped(to: 0...1))
     }
 
@@ -420,6 +422,9 @@ struct IOSTouchInputView: UIViewRepresentable {
             moved = false
             longPressTriggered = false
             activeButton = nil
+            if mode == .direct, let command = touchMapper.command(for: startPoint, phase: .began) {
+                bridge?.send(input: command)
+            }
             scheduleLongPress()
         }
 
