@@ -6,6 +6,8 @@
 	<string>DeskLink</string>
 	<key>CFBundleExecutable</key>
 	<string>DeskLinkApp</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.desklink.desktop</string>
 	<key>CFBundleName</key>

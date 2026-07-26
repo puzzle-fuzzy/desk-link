@@ -28,9 +28,10 @@ EXECUTABLE="$ROOT/apps/macos/.build/arm64-apple-macosx/release/DeskLinkApp"
 RUST_LIBRARY="$ROOT/target/aarch64-apple-darwin/release/libdesklink_ffi.a"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$EXECUTABLE" "$APP/Contents/MacOS/DeskLinkApp"
 cp "$ROOT/apps/macos/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/apps/macos/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 if [ "$SIGN" -eq 1 ] || [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
     test -n "${APPLE_SIGNING_IDENTITY:-}"
@@ -51,6 +52,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     test -f "$RUST_LIBRARY"
     test "$(lipo -archs "$RUST_LIBRARY")" = 'arm64'
     test -x "$APP/Contents/MacOS/DeskLinkApp"
+    test -f "$APP/Contents/Resources/AppIcon.icns"
     test "$(lipo -archs "$APP/Contents/MacOS/DeskLinkApp")" = 'arm64'
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" | grep -qx 'com.desklink.desktop'
     /usr/libexec/PlistBuddy -c 'Print :NSScreenCaptureUsageDescription' "$APP/Contents/Info.plist" >/dev/null

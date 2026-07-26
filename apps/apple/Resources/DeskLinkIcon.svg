@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#FFFFFF"/>
+
+  <!-- A single geometric D: the diagonal cut is the link between devices. -->
+  <path
+    fill="#20262B"
+    d="M224 176h268c202 0 356 144 356 336S694 848 492 848H224V176Zm208 208v256h56c88 0 152-52 152-128s-64-128-152-128h-56Z"
+    fill-rule="evenodd"
+  />
+
+  <path fill="#FFFFFF" d="m128 418 606 336-52 94L76 512Z"/>
+  <path fill="#168CF5" d="m392 565 138 76-34 61-138-76Z"/>
+</svg>
