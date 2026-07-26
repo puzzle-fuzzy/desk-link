@@ -30,6 +30,7 @@ enum IOSSessionPresentation {
 struct IOSSessionView: View {
     @ObservedObject var controller: ControllerBridge
     @State private var visibleVideoRect: CGRect = .zero
+    @State private var viewport = IOSVideoViewport()
     @State private var isMoreExpanded = false
     @StateObject private var keyboard: IOSKeyboardInput
 
@@ -62,6 +63,7 @@ struct IOSSessionView: View {
         .onChange(of: controller.state) { state in
             guard !IOSSessionPresentation.isActive(state) else { return }
             isMoreExpanded = false
+            viewport.reset()
             keyboard.resign()
         }
     }
@@ -191,55 +193,75 @@ struct IOSSessionView: View {
     }
 
     private var remoteCanvas: some View {
-        ZStack {
-            Color.black
-            IOSMetalVideoView(
-                pixelBuffer: controller.latestPixelBuffer,
-                videoSize: controller.videoSize,
-                visibleVideoRect: $visibleVideoRect
-            )
-            IOSTouchInputView(
-                bridge: controller,
-                videoSize: controller.videoSize,
-                visibleVideoRect: visibleVideoRect,
-                mode: .direct
-            )
-            .allowsHitTesting(isInputEnabled)
+        GeometryReader { proxy in
+            ZStack {
+                Color.black
+                IOSMetalVideoView(
+                    pixelBuffer: controller.latestPixelBuffer,
+                    videoSize: controller.videoSize,
+                    zoomScale: viewport.zoomScale,
+                    panOffset: viewport.panOffset,
+                    visibleVideoRect: $visibleVideoRect
+                )
+                IOSTouchInputView(
+                    bridge: controller,
+                    videoSize: controller.videoSize,
+                    visibleVideoRect: visibleVideoRect,
+                    mode: .direct,
+                    onPinchChanged: { factor, anchor in
+                        viewport.pinch(
+                            factor: factor,
+                            anchor: anchor,
+                            videoSize: controller.videoSize,
+                            bounds: proxy.size
+                        )
+                    },
+                    onFourFingerPan: { delta in
+                        viewport.pan(
+                            delta: delta,
+                            videoSize: controller.videoSize,
+                            bounds: proxy.size
+                        )
+                    }
+                )
+                .allowsHitTesting(isInputEnabled)
 
-            if !hasVideoFrame {
-                VStack(spacing: 10) {
-                    Image(systemName: "rectangle.inset.filled")
-                        .font(.system(size: 28, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.82))
-                    Text(videoPlaceholder)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
-                    Text("输入仍可使用，画面恢复后会自动显示")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.68))
-                        .multilineTextAlignment(.center)
-                }
-                .padding(.horizontal, 24)
-                .allowsHitTesting(false)
-            }
-
-            if shouldShowStatusBadge {
-                VStack {
-                    HStack {
-                        Label(statusText, systemImage: statusSymbol)
-                            .font(.caption.weight(.semibold))
+                if !hasVideoFrame {
+                    VStack(spacing: 10) {
+                        Image(systemName: "rectangle.inset.filled")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.82))
+                        Text(videoPlaceholder)
+                            .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.white)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 7)
-                            .background(Color.black.opacity(0.68), in: Capsule())
+                        Text("输入仍可使用，画面恢复后会自动显示")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.68))
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.horizontal, 24)
+                    .allowsHitTesting(false)
+                }
+
+                if shouldShowStatusBadge {
+                    VStack {
+                        HStack {
+                            Label(statusText, systemImage: statusSymbol)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 7)
+                                .background(Color.black.opacity(0.68), in: Capsule())
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.top, 54)
                         Spacer()
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.top, 54)
-                    Spacer()
+                    .allowsHitTesting(false)
                 }
-                .allowsHitTesting(false)
             }
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .clipped()
     }

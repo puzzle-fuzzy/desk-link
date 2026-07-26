@@ -23,6 +23,35 @@ final class IOSInputMapperTests: XCTestCase {
             .wheel(deltaX: 0, deltaY: -1_200)
         )
     }
+
+    func testVideoViewportZoomsAroundPinchAnchorAndClampsBackToFit() {
+        var viewport = IOSVideoViewport()
+        let bounds = CGSize(width: 390, height: 844)
+        let anchor = CGPoint(x: 195, y: 422)
+
+        viewport.pinch(
+            factor: 2,
+            anchor: anchor,
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: bounds
+        )
+
+        let baseRect = VideoGeometry.aspectFit(
+            source: CGSize(width: 1920, height: 1080),
+            in: CGRect(origin: .zero, size: bounds)
+        )
+        XCTAssertEqual(viewport.zoomScale, 2)
+        XCTAssertTrue(viewport.renderRect(baseRect: baseRect).contains(anchor))
+
+        viewport.pinch(
+            factor: 0.1,
+            anchor: anchor,
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: bounds
+        )
+        XCTAssertEqual(viewport.zoomScale, 1)
+        XCTAssertEqual(viewport.panOffset, .zero)
+    }
 }
 
 @MainActor
@@ -33,5 +62,12 @@ final class IOSKeyboardInputTests: XCTestCase {
         input.resign()
 
         XCTAssertEqual(input.releaseAllCallCount, 1)
+    }
+
+    func testReturnTextIsHandledAsEnterInsteadOfUnicodeNewline() {
+        XCTAssertTrue(IOSKeyboardInput.isReturnText("\n"))
+        XCTAssertTrue(IOSKeyboardInput.isReturnText("\r"))
+        XCTAssertTrue(IOSKeyboardInput.isReturnText("\r\n"))
+        XCTAssertFalse(IOSKeyboardInput.isReturnText("a"))
     }
 }

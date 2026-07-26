@@ -116,7 +116,16 @@ final class IOSKeyboardInput: ObservableObject {
 
     fileprivate func sendCommittedText(_ text: String) {
         guard !text.isEmpty else { return }
+        if Self.isReturnText(text) {
+            sendSpecialKey(.enter, pressed: true)
+            sendSpecialKey(.enter, pressed: false)
+            return
+        }
         bridge.send(input: .unicode(text, modifiers: activeModifiers))
+    }
+
+    static func isReturnText(_ text: String) -> Bool {
+        text == "\n" || text == "\r" || text == "\r\n"
     }
 
     fileprivate func sendBackspace() {

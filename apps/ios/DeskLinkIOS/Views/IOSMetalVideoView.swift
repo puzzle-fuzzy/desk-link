@@ -7,6 +7,8 @@ import SwiftUI
 struct IOSMetalVideoView: UIViewRepresentable {
     let pixelBuffer: CVPixelBuffer?
     let videoSize: CGSize?
+    let zoomScale: CGFloat
+    let panOffset: CGSize
     @Binding var visibleVideoRect: CGRect
 
     func makeUIView(context: Context) -> IOSMetalVideoSurface {
@@ -14,7 +16,12 @@ struct IOSMetalVideoView: UIViewRepresentable {
         view.onVisibleVideoRectChanged = { rect in
             visibleVideoRect = rect
         }
-        view.update(pixelBuffer: pixelBuffer, videoSize: videoSize)
+        view.update(
+            pixelBuffer: pixelBuffer,
+            videoSize: videoSize,
+            zoomScale: zoomScale,
+            panOffset: panOffset
+        )
         return view
     }
 
@@ -22,7 +29,12 @@ struct IOSMetalVideoView: UIViewRepresentable {
         view.onVisibleVideoRectChanged = { rect in
             visibleVideoRect = rect
         }
-        view.update(pixelBuffer: pixelBuffer, videoSize: videoSize)
+        view.update(
+            pixelBuffer: pixelBuffer,
+            videoSize: videoSize,
+            zoomScale: zoomScale,
+            panOffset: panOffset
+        )
     }
 }
 
@@ -34,6 +46,8 @@ final class IOSMetalVideoSurface: MTKView {
     private let ciContext: CIContext?
     private var pixelBuffer: CVPixelBuffer?
     private var videoSize: CGSize?
+    private var zoomScale: CGFloat = 1
+    private var panOffset: CGSize = .zero
     private var lastPublishedRect: CGRect = .null
 
     override init(frame frameRect: CGRect, device: MTLDevice?) {
@@ -52,9 +66,17 @@ final class IOSMetalVideoSurface: MTKView {
 
     required init(coder: NSCoder) { fatalError("IOSMetalVideoSurface does not support NSCoder initialization") }
 
-    func update(pixelBuffer: CVPixelBuffer?, videoSize: CGSize?) {
+    func update(
+        pixelBuffer: CVPixelBuffer?,
+        videoSize: CGSize?,
+        zoomScale: CGFloat,
+        panOffset: CGSize
+    ) {
         self.pixelBuffer = pixelBuffer
         self.videoSize = videoSize
+        self.zoomScale = zoomScale
+        self.panOffset = panOffset
+        lastPublishedRect = .null
         publishVisibleVideoRect()
         setNeedsDisplay()
     }
@@ -75,8 +97,18 @@ final class IOSMetalVideoSurface: MTKView {
         let output: CIImage
         if let pixelBuffer {
             let image = CIImage(cvPixelBuffer: pixelBuffer)
-            let fittedRect = VideoGeometry.aspectFit(source: image.extent.size, in: targetRect)
-            guard !fittedRect.isEmpty, !image.extent.isEmpty else { return }
+            let baseRect = VideoGeometry.aspectFit(source: image.extent.size, in: targetRect)
+            guard !baseRect.isEmpty, !image.extent.isEmpty else { return }
+            let scaleX = bounds.width > 0 ? targetRect.width / bounds.width : 1
+            let scaleY = bounds.height > 0 ? targetRect.height / bounds.height : 1
+            let renderedRect = iosRenderedVideoRect(
+                baseRect: baseRect,
+                zoomScale: zoomScale,
+                panOffset: CGSize(
+                    width: panOffset.width * scaleX,
+                    height: panOffset.height * scaleY
+                )
+            )
 
             let normalized = image.transformed(
                 by: CGAffineTransform(
@@ -86,14 +118,14 @@ final class IOSMetalVideoSurface: MTKView {
             )
             let scaled = normalized.transformed(
                 by: CGAffineTransform(
-                    scaleX: fittedRect.width / image.extent.width,
-                    y: fittedRect.height / image.extent.height
+                    scaleX: renderedRect.width / image.extent.width,
+                    y: renderedRect.height / image.extent.height
                 )
             )
             let positioned = scaled.transformed(
                 by: CGAffineTransform(
-                    translationX: fittedRect.minX,
-                    y: fittedRect.minY
+                    translationX: renderedRect.minX,
+                    y: renderedRect.minY
                 )
             )
             output = positioned.composited(
@@ -118,7 +150,12 @@ final class IOSMetalVideoSurface: MTKView {
         let source = videoSize ?? pixelBuffer.map {
             CGSize(width: CVPixelBufferGetWidth($0), height: CVPixelBufferGetHeight($0))
         } ?? .zero
-        let rect = VideoGeometry.aspectFit(source: source, in: bounds)
+        let baseRect = VideoGeometry.aspectFit(source: source, in: bounds)
+        let rect = iosRenderedVideoRect(
+            baseRect: baseRect,
+            zoomScale: zoomScale,
+            panOffset: panOffset
+        )
         guard rect != lastPublishedRect else { return }
         lastPublishedRect = rect
         onVisibleVideoRectChanged?(rect)
