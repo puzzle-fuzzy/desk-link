@@ -2,11 +2,18 @@ import DeskLinkAppleCore
 import SwiftUI
 import UIKit
 
-enum IOSTouchMode: String, CaseIterable, Identifiable {
+enum IOSTouchMode: String, CaseIterable, Hashable, Identifiable {
     case direct = "直接触控"
     case trackpad = "轨迹板"
 
     var id: Self { self }
+
+    var systemImage: String {
+        switch self {
+        case .direct: "hand.tap"
+        case .trackpad: "cursorarrow"
+        }
+    }
 }
 
 enum IOSTouchPhase {
@@ -23,13 +30,23 @@ struct IOSTouchMapper {
     let bounds: CGRect
     let mode: IOSTouchMode
     let visibleVideoRect: CGRect
-    private(set) var trackpadPosition = CGPoint(x: 0.5, y: 0.5)
+    private(set) var trackpadPosition: CGPoint
 
-    init(videoSize: CGSize, bounds: CGRect, mode: IOSTouchMode, visibleVideoRect: CGRect? = nil) {
+    init(
+        videoSize: CGSize,
+        bounds: CGRect,
+        mode: IOSTouchMode,
+        visibleVideoRect: CGRect? = nil,
+        trackpadPosition: CGPoint = CGPoint(x: 0.5, y: 0.5)
+    ) {
         self.videoSize = videoSize
         self.bounds = bounds
         self.mode = mode
         self.visibleVideoRect = visibleVideoRect ?? VideoGeometry.aspectFit(source: videoSize, in: bounds)
+        self.trackpadPosition = CGPoint(
+            x: trackpadPosition.x.clamped(to: 0...1),
+            y: trackpadPosition.y.clamped(to: 0...1)
+        )
     }
 
     func command(for point: CGPoint, phase: IOSTouchPhase) -> RemoteInputCommand? {
@@ -48,6 +65,11 @@ struct IOSTouchMapper {
         guard mode == .trackpad, bounds.width > 0, bounds.height > 0 else { return nil }
         trackpadPosition.x = (trackpadPosition.x + delta.width / bounds.width).clamped(to: 0...1)
         trackpadPosition.y = (trackpadPosition.y + delta.height / bounds.height).clamped(to: 0...1)
+        return currentPointerCommand
+    }
+
+    var currentPointerCommand: RemoteInputCommand? {
+        guard mode == .trackpad else { return nil }
         return .move(
             normalizedX: Float(trackpadPosition.x),
             normalizedY: Float(trackpadPosition.y)
@@ -59,6 +81,10 @@ struct IOSTouchMapper {
             deltaX: deltaX.clamped(to: -maxWheelDelta...maxWheelDelta),
             deltaY: deltaY.clamped(to: -maxWheelDelta...maxWheelDelta)
         )
+    }
+
+    static func fourFingerPanDelta(_ delta: CGSize) -> CGSize {
+        CGSize(width: delta.width, height: -delta.height)
     }
 }
 
@@ -141,6 +167,53 @@ struct IOSVideoViewport: Equatable {
         panOffset = .zero
     }
 
+    mutating func keepPointerVisible(
+        normalizedPosition: CGPoint,
+        videoSize: CGSize?,
+        bounds: CGSize,
+        edgeInset: CGFloat = 64
+    ) {
+        guard let videoSize,
+              videoSize.width > 0,
+              videoSize.height > 0,
+              bounds.width > 0,
+              bounds.height > 0
+        else { return }
+
+        let baseRect = VideoGeometry.aspectFit(
+            source: videoSize,
+            in: CGRect(origin: .zero, size: bounds)
+        )
+        guard !baseRect.isEmpty else { return }
+
+        let normalized = CGPoint(
+            x: normalizedPosition.x.clamped(to: 0...1),
+            y: normalizedPosition.y.clamped(to: 0...1)
+        )
+        let renderedRect = renderRect(baseRect: baseRect)
+        let pointer = CGPoint(
+            x: renderedRect.minX + renderedRect.width * normalized.x,
+            y: renderedRect.minY + renderedRect.height * normalized.y
+        )
+        let inset = min(max(edgeInset, 0), min(bounds.width, bounds.height) / 2)
+        let safeRect = CGRect(origin: .zero, size: bounds).insetBy(dx: inset, dy: inset)
+        var correction = CGSize.zero
+        if pointer.x < safeRect.minX {
+            correction.width = safeRect.minX - pointer.x
+        } else if pointer.x > safeRect.maxX {
+            correction.width = safeRect.maxX - pointer.x
+        }
+        if pointer.y < safeRect.minY {
+            correction.height = safeRect.minY - pointer.y
+        } else if pointer.y > safeRect.maxY {
+            correction.height = safeRect.maxY - pointer.y
+        }
+
+        panOffset.width += correction.width
+        panOffset.height += correction.height
+        clampPan(baseRect: baseRect)
+    }
+
     private mutating func clampPan(baseRect: CGRect) {
         guard zoomScale > 1 else {
             panOffset = .zero
@@ -183,6 +256,7 @@ struct IOSTouchInputView: UIViewRepresentable {
     let mode: IOSTouchMode
     let onPinchChanged: (CGFloat, CGPoint) -> Void
     let onFourFingerPan: (CGSize) -> Void
+    let onTrackpadPositionChanged: (CGPoint) -> Void
 
     init(
         bridge: ControllerBridge,
@@ -190,7 +264,8 @@ struct IOSTouchInputView: UIViewRepresentable {
         visibleVideoRect: CGRect,
         mode: IOSTouchMode,
         onPinchChanged: @escaping (CGFloat, CGPoint) -> Void = { _, _ in },
-        onFourFingerPan: @escaping (CGSize) -> Void = { _ in }
+        onFourFingerPan: @escaping (CGSize) -> Void = { _ in },
+        onTrackpadPositionChanged: @escaping (CGPoint) -> Void = { _ in }
     ) {
         self.bridge = bridge
         self.videoSize = videoSize
@@ -198,6 +273,7 @@ struct IOSTouchInputView: UIViewRepresentable {
         self.mode = mode
         self.onPinchChanged = onPinchChanged
         self.onFourFingerPan = onFourFingerPan
+        self.onTrackpadPositionChanged = onTrackpadPositionChanged
     }
 
     func makeUIView(context: Context) -> TouchSurface {
@@ -207,7 +283,8 @@ struct IOSTouchInputView: UIViewRepresentable {
             visibleVideoRect: visibleVideoRect,
             mode: mode,
             onPinchChanged: onPinchChanged,
-            onFourFingerPan: onFourFingerPan
+            onFourFingerPan: onFourFingerPan,
+            onTrackpadPositionChanged: onTrackpadPositionChanged
         )
     }
 
@@ -217,7 +294,8 @@ struct IOSTouchInputView: UIViewRepresentable {
             visibleVideoRect: visibleVideoRect,
             mode: mode,
             onPinchChanged: onPinchChanged,
-            onFourFingerPan: onFourFingerPan
+            onFourFingerPan: onFourFingerPan,
+            onTrackpadPositionChanged: onTrackpadPositionChanged
         )
     }
 
@@ -244,6 +322,7 @@ struct IOSTouchInputView: UIViewRepresentable {
         private var longPressWorkItem: DispatchWorkItem?
         private var onPinchChanged: (CGFloat, CGPoint) -> Void
         private var onFourFingerPan: (CGSize) -> Void
+        private var onTrackpadPositionChanged: (CGPoint) -> Void
 
         private enum MultiTouchGesture: Equatable {
             case none
@@ -258,7 +337,8 @@ struct IOSTouchInputView: UIViewRepresentable {
             visibleVideoRect: CGRect,
             mode: IOSTouchMode,
             onPinchChanged: @escaping (CGFloat, CGPoint) -> Void,
-            onFourFingerPan: @escaping (CGSize) -> Void
+            onFourFingerPan: @escaping (CGSize) -> Void,
+            onTrackpadPositionChanged: @escaping (CGPoint) -> Void
         ) {
             self.bridge = bridge
             self.videoSize = videoSize
@@ -266,6 +346,7 @@ struct IOSTouchInputView: UIViewRepresentable {
             self.mode = mode
             self.onPinchChanged = onPinchChanged
             self.onFourFingerPan = onFourFingerPan
+            self.onTrackpadPositionChanged = onTrackpadPositionChanged
             self.touchMapper = IOSTouchMapper(
                 videoSize: videoSize ?? .zero,
                 bounds: .zero,
@@ -284,9 +365,11 @@ struct IOSTouchInputView: UIViewRepresentable {
             visibleVideoRect: CGRect,
             mode: IOSTouchMode,
             onPinchChanged: @escaping (CGFloat, CGPoint) -> Void,
-            onFourFingerPan: @escaping (CGSize) -> Void
+            onFourFingerPan: @escaping (CGSize) -> Void,
+            onTrackpadPositionChanged: @escaping (CGPoint) -> Void
         ) {
-            if self.mode != mode {
+            let modeChanged = self.mode != mode
+            if modeChanged {
                 releaseAll()
             }
             self.videoSize = videoSize
@@ -294,12 +377,15 @@ struct IOSTouchInputView: UIViewRepresentable {
             self.mode = mode
             self.onPinchChanged = onPinchChanged
             self.onFourFingerPan = onFourFingerPan
-            touchMapper = makeMapper()
+            self.onTrackpadPositionChanged = onTrackpadPositionChanged
+            touchMapper = makeMapper(
+                trackpadPosition: modeChanged ? CGPoint(x: 0.5, y: 0.5) : touchMapper.trackpadPosition
+            )
         }
 
         override func layoutSubviews() {
             super.layoutSubviews()
-            touchMapper = makeMapper()
+            touchMapper = makeMapper(trackpadPosition: touchMapper.trackpadPosition)
         }
 
         override func didMoveToWindow() {
@@ -351,7 +437,7 @@ struct IOSTouchInputView: UIViewRepresentable {
                         ))
                     }
                 case .fourFingerPan:
-                    onFourFingerPan(delta)
+                    onFourFingerPan(IOSTouchMapper.fourFingerPanDelta(delta))
                 case .threeFingerTap, .none:
                     break
                 }
@@ -379,8 +465,9 @@ struct IOSTouchInputView: UIViewRepresentable {
                 } else if activeButton != nil {
                     bridge?.send(input: command)
                 }
-            } else if let command = touchMapper.relativeCommand(delta: delta), moved {
+            } else if moved, let command = touchMapper.relativeCommand(delta: delta) {
                 bridge?.send(input: command)
+                onTrackpadPositionChanged(touchMapper.trackpadPosition)
             }
         }
 
@@ -393,7 +480,7 @@ struct IOSTouchInputView: UIViewRepresentable {
 
             if multiTouchGesture != .none {
                 if multiTouchGesture == .threeFingerTap, !moved,
-                   let command = touchMapper.command(for: endingCenter, phase: .ended)
+                   let command = pointerCommand(at: endingCenter)
                 {
                     bridge?.send(input: command)
                     bridge?.send(input: .mouseButton(.right, pressed: true))
@@ -433,13 +520,21 @@ struct IOSTouchInputView: UIViewRepresentable {
             resetGestureState()
         }
 
-        private func makeMapper() -> IOSTouchMapper {
+        private func makeMapper(trackpadPosition: CGPoint? = nil) -> IOSTouchMapper {
             IOSTouchMapper(
                 videoSize: videoSize ?? .zero,
                 bounds: bounds,
                 mode: mode,
-                visibleVideoRect: visibleVideoRect.isEmpty ? nil : visibleVideoRect
+                visibleVideoRect: visibleVideoRect.isEmpty ? nil : visibleVideoRect,
+                trackpadPosition: trackpadPosition ?? self.touchMapper.trackpadPosition
             )
+        }
+
+        private func pointerCommand(at point: CGPoint) -> RemoteInputCommand? {
+            if mode == .direct {
+                return touchMapper.command(for: point, phase: .ended)
+            }
+            return touchMapper.currentPointerCommand
         }
 
         private func scheduleLongPress() {
@@ -453,7 +548,7 @@ struct IOSTouchInputView: UIViewRepresentable {
             longPressTriggered = true
             if let primaryTouchID,
                let primary = trackedTouches[primaryTouchID],
-               touchMapper.command(for: primary.location(in: self), phase: .began) != nil
+               pointerCommand(at: primary.location(in: self)) != nil
             {
                 bridge?.send(input: .mouseButton(.right, pressed: true))
             }

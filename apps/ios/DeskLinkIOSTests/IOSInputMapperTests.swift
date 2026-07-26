@@ -24,6 +24,41 @@ final class IOSInputMapperTests: XCTestCase {
         )
     }
 
+    func testFourFingerPanInvertsVerticalViewportDirection() {
+        XCTAssertEqual(
+            IOSTouchMapper.fourFingerPanDelta(CGSize(width: 12, height: 34)),
+            CGSize(width: 12, height: -34)
+        )
+    }
+
+    func testTrackpadMovementDoesNotUseTouchDownPosition() {
+        var mapper = IOSTouchMapper(
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: CGRect(x: 0, y: 0, width: 390, height: 844),
+            mode: .trackpad
+        )
+
+        XCTAssertEqual(
+            mapper.relativeCommand(delta: CGSize(width: 39, height: 0)),
+            .move(normalizedX: 0.6, normalizedY: 0.5)
+        )
+    }
+
+    func testTrackpadPointerCommandUsesPersistentPosition() {
+        var mapper = IOSTouchMapper(
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: CGRect(x: 0, y: 0, width: 390, height: 844),
+            mode: .trackpad
+        )
+
+        _ = mapper.relativeCommand(delta: CGSize(width: 39, height: 0))
+
+        XCTAssertEqual(
+            mapper.currentPointerCommand,
+            .move(normalizedX: 0.6, normalizedY: 0.5)
+        )
+    }
+
     func testVideoViewportZoomsAroundPinchAnchorAndClampsBackToFit() {
         var viewport = IOSVideoViewport()
         let bounds = CGSize(width: 390, height: 844)
@@ -51,6 +86,34 @@ final class IOSInputMapperTests: XCTestCase {
         )
         XCTAssertEqual(viewport.zoomScale, 1)
         XCTAssertEqual(viewport.panOffset, .zero)
+    }
+
+    func testViewportMovesToKeepTrackpadPointerInsideSafeEdge() {
+        var viewport = IOSVideoViewport()
+        let bounds = CGSize(width: 390, height: 844)
+        viewport.pinch(
+            factor: 2,
+            anchor: CGPoint(x: 195, y: 422),
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: bounds
+        )
+
+        viewport.keepPointerVisible(
+            normalizedPosition: CGPoint(x: 1, y: 0.5),
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: bounds,
+            edgeInset: 48
+        )
+
+        let baseRect = VideoGeometry.aspectFit(
+            source: CGSize(width: 1920, height: 1080),
+            in: CGRect(origin: .zero, size: bounds)
+        )
+        XCTAssertLessThan(viewport.panOffset.width, 0)
+        XCTAssertTrue(
+            viewport.renderRect(baseRect: baseRect)
+                .intersects(CGRect(origin: .zero, size: bounds))
+        )
     }
 }
 

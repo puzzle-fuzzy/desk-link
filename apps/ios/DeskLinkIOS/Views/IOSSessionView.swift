@@ -31,6 +31,7 @@ struct IOSSessionView: View {
     @ObservedObject var controller: ControllerBridge
     @State private var visibleVideoRect: CGRect = .zero
     @State private var viewport = IOSVideoViewport()
+    @State private var touchMode: IOSTouchMode = .direct
     @StateObject private var keyboard: IOSKeyboardInput
 
     init(controller: ControllerBridge) {
@@ -78,9 +79,29 @@ struct IOSSessionView: View {
 
     private var controlDock: some View {
         HStack(spacing: 10) {
+            mouseModeControl
             keyboardControl
             orientationControl
         }
+    }
+
+    private var mouseModeControl: some View {
+        Menu {
+            Picker("鼠标模式", selection: $touchMode) {
+                ForEach(IOSTouchMode.allCases) { mode in
+                    Label(mode.rawValue, systemImage: mode.systemImage)
+                        .tag(mode)
+                }
+            }
+        } label: {
+            sessionControlLabel(systemName: touchMode.systemImage)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Circle())
+        .accessibilityLabel("鼠标模式")
+        .accessibilityValue(touchMode.rawValue)
+        .accessibilityHint("切换直接触控或轨迹板")
+        .accessibilityIdentifier("session-mouse-mode")
     }
 
     private var orientationControl: some View {
@@ -126,21 +147,28 @@ struct IOSSessionView: View {
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 48, height: 48)
-                .background(background, in: Circle())
-                .overlay {
-                    Circle()
-                        .stroke(Color.white.opacity(0.24), lineWidth: 1)
-                }
+            sessionControlLabel(systemName: systemName, background: background)
         }
         .buttonStyle(.plain)
         .contentShape(Circle())
         .accessibilityLabel(accessibilityLabel)
         .accessibilityHint(accessibilityHint)
         .accessibilityIdentifier(accessibilityIdentifier(for: accessibilityLabel))
+    }
+
+    private func sessionControlLabel(
+        systemName: String,
+        background: Color = Color.black.opacity(0.72)
+    ) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 48, height: 48)
+            .background(background, in: Circle())
+            .overlay {
+                Circle()
+                    .stroke(Color.white.opacity(0.24), lineWidth: 1)
+            }
     }
 
     private func accessibilityIdentifier(for label: String) -> String {
@@ -167,7 +195,7 @@ struct IOSSessionView: View {
                     bridge: controller,
                     videoSize: controller.videoSize,
                     visibleVideoRect: visibleVideoRect,
-                    mode: .direct,
+                    mode: touchMode,
                     onPinchChanged: { factor, anchor in
                         viewport.pinch(
                             factor: factor,
@@ -179,6 +207,13 @@ struct IOSSessionView: View {
                     onFourFingerPan: { delta in
                         viewport.pan(
                             delta: delta,
+                            videoSize: controller.videoSize,
+                            bounds: proxy.size
+                        )
+                    },
+                    onTrackpadPositionChanged: { position in
+                        viewport.keepPointerVisible(
+                            normalizedPosition: position,
                             videoSize: controller.videoSize,
                             bounds: proxy.size
                         )
