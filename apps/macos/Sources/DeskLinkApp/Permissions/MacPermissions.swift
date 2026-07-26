@@ -42,7 +42,9 @@ struct StaticMacPermissionProvider: MacPermissionProvider {
 
 struct SystemMacPermissionProvider: MacPermissionProvider {
     var screenRecordingGranted: Bool { CGPreflightScreenCaptureAccess() }
-    var accessibilityGranted: Bool { AXIsProcessTrusted() }
+    var accessibilityGranted: Bool {
+        AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": false] as CFDictionary)
+    }
 
     func requestScreenRecording() -> Bool { CGRequestScreenCaptureAccess() }
 

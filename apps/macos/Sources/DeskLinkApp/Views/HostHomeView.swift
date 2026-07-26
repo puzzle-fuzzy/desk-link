@@ -33,6 +33,9 @@ struct HostHomeView: View {
         .onChange(of: scenePhase) { phase in
             if phase == .active { bridge.refreshPermissions() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            bridge.refreshPermissions()
+        }
     }
 
     private var overview: some View {
@@ -42,25 +45,7 @@ struct HostHomeView: View {
                 detail: "检查本机共享权限、已批准设备和运行信息。"
             )
 
-            DeskLinkPanel {
-                VStack(spacing: 0) {
-                    permissionRow(
-                        title: "屏幕录制",
-                        detail: "允许 DeskLink 读取此 Mac 的画面。",
-                        granted: bridge.permissions.screenRecording == .granted,
-                        request: bridge.requestScreenRecording,
-                        settingsURL: bridge.permissions.screenRecordingSettingsURL
-                    )
-                    Divider().padding(.vertical, 14)
-                    permissionRow(
-                        title: "辅助功能",
-                        detail: "允许已批准设备发送键盘与鼠标输入。",
-                        granted: bridge.permissions.accessibility == .granted,
-                        request: bridge.requestAccessibility,
-                        settingsURL: bridge.permissions.accessibilitySettingsURL
-                    )
-                }
-            }
+            permissionPanel
 
             DeskLinkPanel {
                 VStack(alignment: .leading, spacing: 14) {
@@ -120,58 +105,95 @@ struct HostHomeView: View {
                 detail: "需要让别人控制这台 Mac 时，先完成权限检查并生成连接码。"
             )
 
-            DeskLinkPanel {
-                VStack(spacing: 0) {
-                    permissionRow(
-                        title: "屏幕录制",
-                        detail: "允许 DeskLink 读取此 Mac 的画面。",
-                        granted: bridge.permissions.screenRecording == .granted,
-                        request: bridge.requestScreenRecording,
-                        settingsURL: bridge.permissions.screenRecordingSettingsURL
-                    )
-                    Divider().padding(.vertical, 14)
-                    permissionRow(
-                        title: "辅助功能",
-                        detail: "允许已批准设备发送键盘与鼠标输入。",
-                        granted: bridge.permissions.accessibility == .granted,
-                        request: bridge.requestAccessibility,
-                        settingsURL: bridge.permissions.accessibilitySettingsURL
-                    )
-                }
-            }
+            permissionPanel
 
             DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
-                HStack(alignment: .center, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(bridge.pairingInvite == nil ? "创建安全连接码" : "连接码可以使用")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(DeskLinkPalette.ink)
-                        if let invite = bridge.pairingInvite {
-                            Text("有效期至 \(invite.expiresAt.formatted(date: .omitted, time: .shortened))。连接码只应发送给你正在操作的另一台设备。")
+                if let invite = bridge.pairingInvite {
+                    HStack(alignment: .center, spacing: 22) {
+                        PairingQRCodeView(encodedInvite: invite.encoded)
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("手机扫描此二维码")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(DeskLinkPalette.ink)
+                            Text("在 iPhone 的 DeskLink 中选择“扫描二维码”。二维码与复制的连接码使用同一份一次性邀请。")
                                 .font(.system(size: 12))
                                 .foregroundStyle(DeskLinkPalette.secondaryInk)
-                        } else {
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("有效期至 \(invite.expiresAt.formatted(date: .omitted, time: .shortened))。只发送给你正在操作的设备。")
+                                .font(.system(size: 12))
+                                .foregroundStyle(DeskLinkPalette.secondaryInk)
+                            HStack(spacing: 10) {
+                                Button("复制连接码") { bridge.copyInviteToPasteboard() }
+                                    .buttonStyle(DeskLinkPrimaryButtonStyle())
+                                Button("停止共享") { bridge.stop() }
+                                    .buttonStyle(DeskLinkSecondaryButtonStyle())
+                            }
+                        }
+                    }
+                } else {
+                    HStack(alignment: .center, spacing: 20) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("创建安全连接码")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(DeskLinkPalette.ink)
                             Text("连接码包含一次性加入凭据，不会在此页面明文显示。")
                                 .font(.system(size: 12))
                                 .foregroundStyle(DeskLinkPalette.secondaryInk)
                         }
-                    }
-                    Spacer()
-                    if bridge.pairingInvite == nil {
+                        Spacer()
                         Button("创建连接码") { bridge.createInvite() }
                             .buttonStyle(DeskLinkPrimaryButtonStyle())
                             .disabled(!bridge.permissions.canCaptureAndControl)
-                    } else {
-                        Button("复制连接码") { bridge.copyInviteToPasteboard() }
-                            .buttonStyle(DeskLinkPrimaryButtonStyle())
-                        Button("停止共享") { bridge.stop() }
-                            .buttonStyle(DeskLinkSecondaryButtonStyle())
                     }
                 }
             }
 
             if let error = bridge.lastError {
                 DeskLinkErrorView(message: error)
+            }
+        }
+    }
+
+    private var permissionPanel: some View {
+        DeskLinkPanel {
+            VStack(spacing: 0) {
+                permissionRow(
+                    title: "屏幕录制",
+                    detail: "允许 DeskLink 读取此 Mac 的画面。",
+                    granted: bridge.permissions.screenRecording == .granted,
+                    request: bridge.requestScreenRecording,
+                    settingsURL: bridge.permissions.screenRecordingSettingsURL
+                )
+                Divider().padding(.vertical, 14)
+                permissionRow(
+                    title: "辅助功能",
+                    detail: "允许已批准设备发送键盘与鼠标输入。",
+                    granted: bridge.permissions.accessibility == .granted,
+                    request: bridge.requestAccessibility,
+                    settingsURL: bridge.permissions.accessibilitySettingsURL
+                )
+                if !bridge.permissions.canCaptureAndControl {
+                    Divider().padding(.vertical, 14)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("如果系统设置中已经勾选，但这里仍显示未允许，请确认勾选的是当前运行的应用。")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(DeskLinkPalette.ink)
+                        Text(Bundle.main.bundlePath)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(DeskLinkPalette.mutedInk)
+                            .textSelection(.enabled)
+                        HStack(spacing: 10) {
+                            Button("重新检查") { bridge.refreshPermissions() }
+                                .buttonStyle(DeskLinkSecondaryButtonStyle())
+                            Button("复制当前应用路径") {
+                                let pasteboard = NSPasteboard.general
+                                pasteboard.clearContents()
+                                pasteboard.setString(Bundle.main.bundlePath, forType: .string)
+                            }
+                            .buttonStyle(DeskLinkSecondaryButtonStyle())
+                        }
+                    }
+                }
             }
         }
     }

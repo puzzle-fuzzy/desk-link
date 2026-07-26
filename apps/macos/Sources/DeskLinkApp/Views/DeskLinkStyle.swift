@@ -53,51 +53,6 @@ struct DeskLinkShell<Content: View>: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                DeskLinkMark()
-                HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text("DeskLink")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(DeskLinkPalette.ink)
-                    Text("macOS 远程桌面")
-                        .font(.system(size: 12))
-                        .foregroundStyle(DeskLinkPalette.mutedInk)
-                }
-                Spacer()
-                Button {
-                    isShowingHostStatus = true
-                } label: {
-                    let status = deskLinkHostStatus(
-                        for: host.state,
-                        permissions: host.permissions,
-                        hasPendingApproval: host.pendingApproval != nil,
-                        lastError: host.lastError
-                    )
-                    Label(status.title, systemImage: status.systemImage)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(color(for: status.tone))
-                }
-                .buttonStyle(.plain)
-                .popover(isPresented: $isShowingHostStatus) {
-                    DeskLinkHostStatusPopover(
-                        host: host,
-                        openSettings: {
-                            isShowingHostStatus = false
-                            selection = .settings
-                        },
-                        openSharing: {
-                            isShowingHostStatus = false
-                            selection = .share
-                        }
-                    )
-                }
-            }
-            .padding(.horizontal, 28)
-            .frame(height: 65)
-            .background(DeskLinkPalette.surface)
-
-            Rectangle().fill(DeskLinkPalette.border).frame(height: 1)
-
             HStack(spacing: 26) {
                 ForEach(DeskLinkSection.allCases) { section in
                     Button {
@@ -132,6 +87,37 @@ struct DeskLinkShell<Content: View>: View {
         }
         .frame(minWidth: 760, minHeight: 560)
         .background(DeskLinkPalette.surface)
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    isShowingHostStatus = true
+                } label: {
+                    let status = deskLinkHostStatus(
+                        for: host.state,
+                        permissions: host.permissions,
+                        hasPendingApproval: host.pendingApproval != nil,
+                        lastError: host.lastError
+                    )
+                    Label(status.title, systemImage: status.systemImage)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(color(for: status.tone))
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $isShowingHostStatus) {
+                    DeskLinkHostStatusPopover(
+                        host: host,
+                        openSettings: {
+                            isShowingHostStatus = false
+                            selection = .settings
+                        },
+                        openSharing: {
+                            isShowingHostStatus = false
+                            selection = .share
+                        }
+                    )
+                }
+            }
+        }
     }
 
     private func color(for tone: DeskLinkHostStatusTone) -> Color {

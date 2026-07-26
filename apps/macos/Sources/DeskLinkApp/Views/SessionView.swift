@@ -13,34 +13,6 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                DeskLinkMark()
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("DeskLink")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(DeskLinkPalette.ink)
-                    Text("正在控制另一台设备")
-                        .font(.system(size: 11))
-                        .foregroundStyle(DeskLinkPalette.mutedInk)
-                }
-                Spacer()
-                HStack(spacing: 8) {
-                    DeskLinkStatusLight(color: sessionStatusColor)
-                    Text(statusText)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(DeskLinkPalette.secondaryInk)
-                }
-                Button("请求关键帧") { bridge.requestKeyframe() }
-                    .buttonStyle(DeskLinkSecondaryButtonStyle())
-                Button("断开连接") { bridge.disconnect() }
-                    .buttonStyle(DeskLinkPrimaryButtonStyle())
-            }
-            .padding(.horizontal, 20)
-            .frame(height: 60)
-            .background(DeskLinkPalette.surface)
-
-            Rectangle().fill(DeskLinkPalette.border).frame(height: 1)
-
             ZStack {
                 MetalVideoView(pixelBuffer: bridge.latestPixelBuffer)
                     .background(Color.black)
@@ -79,6 +51,24 @@ struct SessionView: View {
         }
         .frame(minWidth: 760, minHeight: 520)
         .onDisappear { bridge.releaseAll() }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                HStack(spacing: 8) {
+                    DeskLinkStatusLight(color: sessionStatusColor)
+                    Text(statusText)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("请求关键帧") { bridge.requestKeyframe() }
+                    .buttonStyle(.bordered)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("断开连接") { bridge.disconnect() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
     }
 
     private var videoSize: CGSize? {

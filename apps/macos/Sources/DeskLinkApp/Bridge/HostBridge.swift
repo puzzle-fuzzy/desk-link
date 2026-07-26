@@ -66,6 +66,7 @@ final class HostBridge: ObservableObject {
     private var captureRunning = false
     private var nextStreamID: UInt64 = 0
     private var stopTask: Task<Void, Never>?
+    private var permissionRefreshTask: Task<Void, Never>?
     private var callbackGeneration: UInt64 = 0
     private var activeControllerDeviceID: [UInt8]?
 
@@ -140,10 +141,12 @@ final class HostBridge: ObservableObject {
 
     func requestScreenRecording() {
         applyPermissions(permissionProvider.requestScreenRecording())
+        schedulePermissionRefresh()
     }
 
     func requestAccessibility() {
         applyPermissions(permissionProvider.requestAccessibility())
+        schedulePermissionRefresh()
     }
 
     func createInvite() {
@@ -421,6 +424,15 @@ final class HostBridge: ObservableObject {
             if state == .connected { stop() }
         }
         startCaptureIfPermitted()
+    }
+
+    private func schedulePermissionRefresh() {
+        permissionRefreshTask?.cancel()
+        permissionRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+            self?.refreshPermissions()
+        }
     }
 
     private func sendVideo(_ event: EncodedVideoEvent) {

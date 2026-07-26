@@ -37,8 +37,15 @@ if [ "$SIGN" -eq 1 ]; then
     codesign --force --options runtime --timestamp \
         --entitlements "$ROOT/apps/macos/DeskLink.entitlements" \
         --sign "$APPLE_SIGNING_IDENTITY" "$APP"
-    codesign --verify --deep --strict "$APP"
+else
+    # A valid ad-hoc bundle signature gives macOS a stable bundle identity for
+    # Accessibility/TCC during local development. The executable produced by
+    # SwiftPM may be linker-signed, but the surrounding app bundle is not.
+    codesign --force --sign - \
+        --entitlements "$ROOT/apps/macos/DeskLink.entitlements" "$APP"
 fi
+
+codesign --verify --deep --strict "$APP"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     test -f "$RUST_LIBRARY"

@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 import DeskLinkAppleCore
 @testable import DeskLinkApp
@@ -14,6 +15,15 @@ final class DeskLinkNavigationTests: XCTestCase {
         XCTAssertEqual("连接设备", DeskLinkSection.connect.rawValue)
         XCTAssertEqual("共享此设备", DeskLinkSection.share.rawValue)
         XCTAssertNotEqual(DeskLinkSection.connect.rawValue, "本机状态")
+    }
+
+    func testQRCodePayloadRemainsTheInviteBase64ExpectedByIOS() {
+        let invite = Data([0x00, 0x01, 0x7f, 0xff])
+
+        let payload = DeskLinkQRCode.payload(for: invite)
+
+        XCTAssertEqual(payload, invite.base64EncodedString())
+        XCTAssertEqual(Data(base64Encoded: payload), invite)
     }
 
     func testPrimaryNavigationUsesRemoteTasks() {
