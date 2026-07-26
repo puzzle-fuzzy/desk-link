@@ -62,9 +62,16 @@ struct IOSTouchMapper {
     }
 
     mutating func relativeCommand(delta: CGSize) -> RemoteInputCommand? {
-        guard mode == .trackpad, bounds.width > 0, bounds.height > 0 else { return nil }
-        trackpadPosition.x = (trackpadPosition.x + delta.width / bounds.width).clamped(to: 0...1)
-        trackpadPosition.y = (trackpadPosition.y + delta.height / bounds.height).clamped(to: 0...1)
+        guard mode == .trackpad,
+              videoSize.width > 0,
+              videoSize.height > 0
+        else { return nil }
+
+        // Trackpad mode is a relative, 1:1 input. The command carries a
+        // normalized position, so use the remote video pixels as its scale
+        // instead of the iPhone view size (which would amplify the motion).
+        trackpadPosition.x = (trackpadPosition.x + delta.width / videoSize.width).clamped(to: 0...1)
+        trackpadPosition.y = (trackpadPosition.y + delta.height / videoSize.height).clamped(to: 0...1)
         return currentPointerCommand
     }
 
@@ -92,6 +99,10 @@ struct IOSVideoViewport: Equatable {
     private(set) var zoomScale: CGFloat = 1
     private(set) var panOffset: CGSize = .zero
 
+    static func metalAnchor(for touchAnchor: CGPoint, bounds: CGSize) -> CGPoint {
+        CGPoint(x: touchAnchor.x, y: bounds.height - touchAnchor.y)
+    }
+
     mutating func pinch(
         factor: CGFloat,
         anchor: CGPoint,
@@ -115,9 +126,10 @@ struct IOSVideoViewport: Equatable {
         let oldRect = renderRect(baseRect: baseRect)
         let nextScale = (zoomScale * factor).clamped(to: 1...4)
         let appliedFactor = nextScale / zoomScale
+        let metalAnchor = Self.metalAnchor(for: anchor, bounds: bounds)
         let nextOrigin = CGPoint(
-            x: anchor.x - (anchor.x - oldRect.minX) * appliedFactor,
-            y: anchor.y - (anchor.y - oldRect.minY) * appliedFactor
+            x: metalAnchor.x - (metalAnchor.x - oldRect.minX) * appliedFactor,
+            y: metalAnchor.y - (metalAnchor.y - oldRect.minY) * appliedFactor
         )
         let nextSize = CGSize(
             width: baseRect.width * nextScale,

@@ -38,10 +38,14 @@ final class IOSInputMapperTests: XCTestCase {
             mode: .trackpad
         )
 
-        XCTAssertEqual(
-            mapper.relativeCommand(delta: CGSize(width: 39, height: 0)),
-            .move(normalizedX: 0.6, normalizedY: 0.5)
-        )
+        guard case let .move(normalizedX, normalizedY) = mapper.relativeCommand(
+            delta: CGSize(width: 39, height: 26)
+        ) else {
+            return XCTFail("轨迹板移动应该生成相对鼠标位置")
+        }
+
+        XCTAssertEqual(normalizedX, Float(0.5 + 39 / 1920), accuracy: 0.000_001)
+        XCTAssertEqual(normalizedY, Float(0.5 + 26 / 1080), accuracy: 0.000_001)
     }
 
     func testTrackpadPointerCommandUsesPersistentPosition() {
@@ -53,10 +57,12 @@ final class IOSInputMapperTests: XCTestCase {
 
         _ = mapper.relativeCommand(delta: CGSize(width: 39, height: 0))
 
-        XCTAssertEqual(
-            mapper.currentPointerCommand,
-            .move(normalizedX: 0.6, normalizedY: 0.5)
-        )
+        guard case let .move(normalizedX, normalizedY) = mapper.currentPointerCommand else {
+            return XCTFail("轨迹板应该保留当前鼠标位置")
+        }
+
+        XCTAssertEqual(normalizedX, Float(0.5 + 39 / 1920), accuracy: 0.000_001)
+        XCTAssertEqual(normalizedY, 0.5, accuracy: 0.000_001)
     }
 
     func testVideoViewportZoomsAroundPinchAnchorAndClampsBackToFit() {
@@ -86,6 +92,28 @@ final class IOSInputMapperTests: XCTestCase {
         )
         XCTAssertEqual(viewport.zoomScale, 1)
         XCTAssertEqual(viewport.panOffset, .zero)
+    }
+
+    func testVideoViewportFlipsPinchAnchorForMetalCoordinates() {
+        let bounds = CGSize(width: 390, height: 844)
+        let touchAnchor = CGPoint(x: 195, y: 360)
+
+        XCTAssertEqual(
+            IOSVideoViewport.metalAnchor(for: touchAnchor, bounds: bounds),
+            CGPoint(x: 195, y: 484)
+        )
+
+        var viewport = IOSVideoViewport()
+        viewport.pinch(
+            factor: 2,
+            anchor: touchAnchor,
+            videoSize: CGSize(width: 1920, height: 1080),
+            bounds: bounds
+        )
+
+        // The upper UIKit touch point must stay attached to the upper visual
+        // content, which is a negative pan in the Metal coordinate space.
+        XCTAssertLessThan(viewport.panOffset.height, 0)
     }
 
     func testViewportMovesToKeepTrackpadPointerInsideSafeEdge() {
