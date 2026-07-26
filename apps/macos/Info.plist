@@ -27,8 +27,6 @@
 	<true/>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>DeskLink uses Accessibility permission only to apply remote keyboard, pointer, click, and scroll input after you approve a controller.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>DeskLink uses the camera only when a future camera-sharing feature is enabled.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>DeskLink needs Screen Recording permission to share this Mac’s display with a controller you explicitly approve.</string>
 	<key>NSMicrophoneUsageDescription</key>
