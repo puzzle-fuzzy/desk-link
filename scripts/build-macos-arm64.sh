@@ -3,14 +3,17 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CHECK_ONLY=0
-case "${1:-}" in
-    "") ;;
-    --check) CHECK_ONLY=1 ;;
-    *)
-        echo "usage: $0 [--check]" >&2
-        exit 64
-        ;;
-esac
+SIGN=0
+for argument in "$@"; do
+    case "$argument" in
+        --check) CHECK_ONLY=1 ;;
+        --sign) SIGN=1 ;;
+        *)
+            echo "usage: $0 [--check] [--sign]" >&2
+            exit 64
+            ;;
+    esac
+done
 
 MACOSX_DEPLOYMENT_TARGET=13.0 \
     cargo build --manifest-path "$ROOT/Cargo.toml" --release -p desklink-ffi --target aarch64-apple-darwin
@@ -29,6 +32,14 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$EXECUTABLE" "$APP/Contents/MacOS/DeskLinkApp"
 cp "$ROOT/apps/macos/Info.plist" "$APP/Contents/Info.plist"
 
+if [ "$SIGN" -eq 1 ]; then
+    test -n "${APPLE_SIGNING_IDENTITY:-}"
+    codesign --force --options runtime --timestamp \
+        --entitlements "$ROOT/apps/macos/DeskLink.entitlements" \
+        --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+    codesign --verify --deep --strict "$APP"
+fi
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
     test -f "$RUST_LIBRARY"
     test "$(lipo -archs "$RUST_LIBRARY")" = 'arm64'
@@ -36,5 +47,6 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     test "$(lipo -archs "$APP/Contents/MacOS/DeskLinkApp")" = 'arm64'
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" | grep -qx 'com.desklink.desktop'
     /usr/libexec/PlistBuddy -c 'Print :NSScreenCaptureUsageDescription' "$APP/Contents/Info.plist" >/dev/null
+    /usr/libexec/PlistBuddy -c 'Print :NSAccessibilityUsageDescription' "$APP/Contents/Info.plist" >/dev/null
     /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist" | grep -qx '13.0'
 fi

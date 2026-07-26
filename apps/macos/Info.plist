@@ -21,6 +21,8 @@
 	</dict>
 	<key>LSRequiresNativeExecution</key>
 	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>DeskLink uses Accessibility permission only to apply remote keyboard, pointer, click, and scroll input after you approve a controller.</string>
 	<key>NSCameraUsageDescription</key>

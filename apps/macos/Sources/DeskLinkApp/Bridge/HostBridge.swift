@@ -260,7 +260,6 @@ final class HostBridge: ObservableObject {
         callbackGeneration &+= 1
         activeControllerDeviceID = nil
         state = .stopping
-        releaseAllLocalInput()
     }
 
     private func performStop() async {
@@ -273,6 +272,7 @@ final class HostBridge: ObservableObject {
             _ = desklink_host_stop(handle)
         }
         handleOwner.destroy()
+        releaseAllLocalInput()
         pairingInvite = nil
         pendingApproval = nil
         state = .closed
@@ -324,7 +324,6 @@ final class HostBridge: ObservableObject {
             startCaptureIfPermitted()
         case Int(DESKLINK_HOST_STOPPING.rawValue): state = .stopping
         case Int(DESKLINK_HOST_CLOSED.rawValue):
-            releaseAllLocalInput()
             state = .closed
             if stopTask == nil { stop() }
         default: state = .idle
@@ -384,10 +383,11 @@ final class HostBridge: ObservableObject {
         guard captureStarting || captureRunning else { return }
         captureStarting = false
         captureRunning = false
-        encoder.stop()
-        releaseAllLocalInput()
         Task { @MainActor [weak self] in
-            await self?.captureSource.stop()
+            guard let self else { return }
+            await captureSource.stop()
+            encoder.stop()
+            releaseAllLocalInput()
         }
     }
 
@@ -396,6 +396,7 @@ final class HostBridge: ObservableObject {
         captureRunning = false
         captureStarting = false
         encoder.stop()
+        releaseAllLocalInput()
         if state == .connected { publishError("Screen capture stopped unexpectedly.") }
     }
 
