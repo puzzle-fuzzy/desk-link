@@ -10,7 +10,8 @@ use std::{
 
 use desklink_crypto::{DeviceIdentity, SessionId};
 use desklink_protocol::{
-    InputEvent, encode_audio_packet, encode_control, encode_cursor_update, encode_transfer,
+    InputEvent, Platform, encode_audio_packet, encode_control, encode_cursor_update,
+    encode_transfer,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError};
@@ -117,6 +118,7 @@ pub(crate) struct ControllerWorker {
 impl ControllerWorker {
     pub(crate) fn start(
         relay_url: String,
+        platform: Platform,
         config: SecureConnectionConfigOwned,
         callback: Option<DesklinkEventCallback>,
         callback_context: *mut std::ffi::c_void,
@@ -141,6 +143,7 @@ impl ControllerWorker {
                 match runtime {
                     Ok(runtime) => runtime.block_on(run_worker(
                         relay_url,
+                        platform,
                         config,
                         receiver,
                         cancellation_receiver,
@@ -201,6 +204,7 @@ impl Drop for ControllerWorker {
 
 async fn run_worker(
     relay_url: String,
+    platform: Platform,
     config: SecureConnectionConfigOwned,
     mut commands: mpsc::Receiver<ControllerCommand>,
     mut cancellation: watch::Receiver<bool>,
@@ -224,7 +228,7 @@ async fn run_worker(
             },
             0,
         );
-        let connection = connect_controller(&relay_url, &config, callback);
+        let connection = connect_controller(&relay_url, platform, &config, callback);
         let controller = tokio::select! {
             result = connection => match result {
                 Ok(controller) => controller,
@@ -577,6 +581,7 @@ fn now_unix_s() -> u64 {
 
 async fn connect_controller(
     relay_url: &str,
+    platform: Platform,
     config: &SecureConnectionConfigOwned,
     callback: CallbackTarget,
 ) -> Result<ControllerRuntime, ConnectFailure> {
@@ -601,7 +606,7 @@ async fn connect_controller(
         ConnectFailure::permanent(format!("invalid host verification key: {error}"))
     })?;
     callback.emit_state(DesklinkState::NegotiatingCapabilities, 0);
-    ControllerRuntime::connect(client, identity, expected_host)
+    ControllerRuntime::connect_for_platform(client, identity, expected_host, platform)
         .await
         .map_err(ConnectFailure::from_controller)
 }

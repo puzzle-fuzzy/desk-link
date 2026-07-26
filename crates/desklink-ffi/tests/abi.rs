@@ -10,9 +10,9 @@ use desklink_ffi::{
     DesklinkConfig, DesklinkEvent, DesklinkEventCallback, DesklinkEventKind, DesklinkHandle,
     DesklinkInput, DesklinkInputKind, DesklinkPairingInviteConnectionConfig, DesklinkResult,
     DesklinkSecureConnectionConfig, desklink_connect_pairing_invite, desklink_connect_secure,
-    desklink_connect_with_code, desklink_create, desklink_destroy, desklink_identity_verify_key,
-    desklink_reject, desklink_release_all, desklink_request_keyframe, desklink_send_input,
-    desklink_start_pairing,
+    desklink_connect_with_code, desklink_create, desklink_create_for_platform, desklink_destroy,
+    desklink_identity_verify_key, desklink_reject, desklink_release_all, desklink_request_keyframe,
+    desklink_send_input, desklink_start_pairing,
 };
 
 static CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -63,6 +63,17 @@ fn ffi_rejects_null_arguments_without_allocating_a_handle() {
         unsafe { desklink_create(&config(&url), None, null_mut(), null_mut()) },
         DesklinkResult::InvalidArgument
     );
+}
+
+#[test]
+fn ffi_rejects_unknown_controller_platform_without_allocating_a_handle() {
+    let url = CString::new("quic://127.0.0.1:4433").unwrap();
+    let mut handle = null_mut();
+    assert_eq!(
+        unsafe { desklink_create_for_platform(&config(&url), 99, None, null_mut(), &mut handle) },
+        DesklinkResult::InvalidArgument
+    );
+    assert!(handle.is_null());
 }
 
 #[test]

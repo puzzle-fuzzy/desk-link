@@ -13,6 +13,11 @@ extern "C" {
 typedef struct DesklinkHandle DesklinkHandle;
 typedef struct DesklinkHostHandle DesklinkHostHandle;
 
+typedef enum DesklinkPlatform {
+    DESKLINK_PLATFORM_MACOS = 1,
+    DESKLINK_PLATFORM_IOS = 2,
+} DesklinkPlatform;
+
 typedef enum DesklinkResult {
     DESKLINK_OK = 0,
     DESKLINK_INVALID_ARGUMENT = 1,
@@ -151,6 +156,7 @@ typedef struct DesklinkEvent {
 typedef void (*DesklinkEventCallback)(void *context, const DesklinkEvent *event);
 
 DesklinkResult desklink_create(const DesklinkConfig *, DesklinkEventCallback, void *, DesklinkHandle **);
+DesklinkResult desklink_create_for_platform(const DesklinkConfig *, DesklinkPlatform, DesklinkEventCallback, void *, DesklinkHandle **);
 DesklinkResult desklink_identity_verify_key(const uint8_t secret_key[32], uint8_t out_verify_key[32]);
 DesklinkResult desklink_start_pairing(DesklinkHandle *, DesklinkPairingInfo *);
 DesklinkResult desklink_connect_with_code(DesklinkHandle *, const char *code);

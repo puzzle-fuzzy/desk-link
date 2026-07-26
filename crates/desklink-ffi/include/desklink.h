@@ -13,6 +13,11 @@ extern "C" {
 typedef struct DesklinkHandle DesklinkHandle;
 typedef struct DesklinkHostHandle DesklinkHostHandle;
 
+typedef enum DesklinkPlatform {
+    DESKLINK_PLATFORM_MACOS = 1,
+    DESKLINK_PLATFORM_IOS = 2,
+} DesklinkPlatform;
+
 typedef enum DesklinkResult {
     DESKLINK_OK = 0,
     DESKLINK_INVALID_ARGUMENT = 1,
@@ -221,6 +226,13 @@ typedef struct DesklinkSavedHostMaterial {
 
 DesklinkResult desklink_create(
     const DesklinkConfig *config,
+    DesklinkEventCallback callback,
+    void *context,
+    DesklinkHandle **out_handle
+);
+DesklinkResult desklink_create_for_platform(
+    const DesklinkConfig *config,
+    DesklinkPlatform platform,
     DesklinkEventCallback callback,
     void *context,
     DesklinkHandle **out_handle

@@ -13,7 +13,8 @@ use desklink_crypto::{
 use desklink_protocol::{
     ControlMessage, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES, MAX_MVP_HEIGHT,
     MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_PAYLOAD_BYTES,
-    MAX_WHEEL_DELTA, Modifiers, MouseButton, encode_control, encode_input, encode_transfer,
+    MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, encode_control, encode_input,
+    encode_transfer,
 };
 use desklink_session::{
     InputSequencer, PressedInputState, SessionEvent, SessionMachine, SessionState,
@@ -46,6 +47,35 @@ pub enum DesklinkResult {
     InvalidUtf8 = 2,
     InvalidState = 3,
     InternalError = 4,
+}
+
+/// Apple controller platforms exposed through the stable C ABI.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesklinkPlatform {
+    MacOS = 1,
+    IOS = 2,
+}
+
+impl TryFrom<u32> for DesklinkPlatform {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::MacOS),
+            2 => Ok(Self::IOS),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<DesklinkPlatform> for Platform {
+    fn from(platform: DesklinkPlatform) -> Self {
+        match platform {
+            DesklinkPlatform::MacOS => Self::MacOS,
+            DesklinkPlatform::IOS => Self::IOS,
+        }
+    }
 }
 
 #[repr(u32)]
@@ -424,6 +454,7 @@ impl EventMeta {
 struct DesklinkRuntime {
     relay_url: String,
     _log_level: u32,
+    platform: Platform,
     callback: Option<DesklinkEventCallback>,
     callback_context: *mut c_void,
     session: SessionMachine,
@@ -592,6 +623,35 @@ pub unsafe extern "C" fn desklink_create(
     callback_context: *mut c_void,
     out_handle: *mut *mut DesklinkHandle,
 ) -> DesklinkResult {
+    unsafe {
+        desklink_create_for_platform(
+            config,
+            DesklinkPlatform::MacOS as u32,
+            callback,
+            callback_context,
+            out_handle,
+        )
+    }
+}
+
+/// Creates an opaque DeskLink controller runtime for an explicit platform.
+///
+/// The platform is represented as a `u32` in Rust even though the public C
+/// header names the values with an enum. This keeps unknown values defined at
+/// the FFI boundary so they can be rejected instead of becoming an invalid
+/// Rust enum discriminant.
+///
+/// # Safety
+/// `config` and `out_handle` must be valid writable pointers when non-null,
+/// and the callback must remain callable for the lifetime of the handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_create_for_platform(
+    config: *const DesklinkConfig,
+    platform: u32,
+    callback: Option<DesklinkEventCallback>,
+    callback_context: *mut c_void,
+    out_handle: *mut *mut DesklinkHandle,
+) -> DesklinkResult {
     if out_handle.is_null() {
         return DesklinkResult::InvalidArgument;
     }
@@ -599,6 +659,10 @@ pub unsafe extern "C" fn desklink_create(
     if config.is_null() {
         return DesklinkResult::InvalidArgument;
     }
+    let platform = match DesklinkPlatform::try_from(platform) {
+        Ok(platform) => Platform::from(platform),
+        Err(()) => return DesklinkResult::InvalidArgument,
+    };
     let config = unsafe { &*config };
     if config.relay_url.is_null() {
         return DesklinkResult::InvalidArgument;
@@ -611,6 +675,7 @@ pub unsafe extern "C" fn desklink_create(
     let runtime = DesklinkRuntime {
         relay_url,
         _log_level: config.log_level,
+        platform,
         callback,
         callback_context,
         session: SessionMachine::new(desklink_protocol::DeviceRole::Controller),
@@ -905,6 +970,7 @@ fn start_secure_worker(
     });
     let worker = match ControllerWorker::start(
         runtime.relay_url.clone(),
+        runtime.platform,
         config,
         runtime.callback,
         runtime.callback_context,
