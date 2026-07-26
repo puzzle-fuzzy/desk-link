@@ -9,6 +9,15 @@ final class ControllerBridgeTests: XCTestCase {
 
         XCTAssertFalse(bridge.userFacingError.contains("AUTH_KEY"))
         XCTAssertFalse(bridge.userFacingError.contains("relay secret"))
+        XCTAssertTrue(bridge.userFacingError.contains("安全连接校验失败"))
+    }
+
+    func testControllerErrorsAreLocalizedForCommonPairingFailures() {
+        let configuration = ControllerBridge.testing(error: "The DeskLink runtime configuration is invalid.")
+        let invite = ControllerBridge.testing(error: "The pairing invitation is invalid.")
+
+        XCTAssertEqual(configuration.userFacingError, "DeskLink 连接配置无效，请检查中继地址和服务器名称。")
+        XCTAssertEqual(invite.userFacingError, "连接码无效，请重新扫描二维码或粘贴完整连接码。")
     }
 
     func testSavedHostEncodingRoundTripsApprovedMaterial() throws {
@@ -45,7 +54,7 @@ final class ControllerBridgeTests: XCTestCase {
         bridge.connect(invite: Data(repeating: 0, count: 181))
 
         XCTAssertFalse(bridge.activeRuntimeForTesting)
-        XCTAssertEqual(bridge.state, .failed("The DeskLink runtime configuration is invalid."))
+        XCTAssertEqual(bridge.state, .failed("DeskLink 连接配置无效，请检查中继地址和服务器名称。"))
     }
 
     func testInvalidInviteDoesNotStartRustRuntime() {
@@ -59,7 +68,7 @@ final class ControllerBridgeTests: XCTestCase {
 
         bridge.connect(invite: Data("not-a-desklink-invite".utf8))
 
-        XCTAssertEqual(bridge.state, .failed("The pairing invitation is invalid."))
+        XCTAssertEqual(bridge.state, .failed("连接码无效，请重新扫描二维码或粘贴完整连接码。"))
         XCTAssertFalse(bridge.activeRuntimeForTesting)
     }
 }

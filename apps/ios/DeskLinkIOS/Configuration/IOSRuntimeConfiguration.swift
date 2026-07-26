@@ -2,10 +2,13 @@ import DeskLinkAppleCore
 import Foundation
 
 enum IOSRuntimeConfiguration {
+    private static let managedRelayURL = "quic://turn.p2p.yxswy.com:4433"
+    private static let managedRelayServerName = "turn.p2p.yxswy.com"
+
     static var production: DeskLinkRuntimeConfiguration {
         DeskLinkRuntimeConfiguration(
-            relayURL: configuredValue("DeskLinkRelayURL"),
-            relayServerName: configuredValue("DeskLinkRelayServerName"),
+            relayURL: configuredValue("DeskLinkRelayURL", fallback: managedRelayURL),
+            relayServerName: configuredValue("DeskLinkRelayServerName", fallback: managedRelayServerName),
             platform: .ios
         )
     }
@@ -18,10 +21,17 @@ enum IOSRuntimeConfiguration {
         )
     }
 
-    private static func configuredValue(_ key: String) -> String {
-        if let value = Bundle.main.object(forInfoDictionaryKey: key) as? String {
+    private static func configuredValue(_ key: String, fallback: String) -> String {
+        if let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             return value
         }
-        return UserDefaults.standard.string(forKey: key) ?? ""
+        if let value = UserDefaults.standard.string(forKey: key),
+           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return value
+        }
+        return fallback
     }
 }

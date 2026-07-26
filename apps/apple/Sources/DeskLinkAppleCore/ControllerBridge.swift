@@ -98,6 +98,8 @@ public final class ControllerBridge: ObservableObject {
     }
 
     public func connect(invite: Data) {
+        state = .connecting
+        lastError = nil
         guard invite.count == Int(DESKLINK_PAIRING_INVITE_BYTES) else {
             publishErrorMessage("The pairing invitation is invalid.")
             return
@@ -125,7 +127,6 @@ public final class ControllerBridge: ObservableObject {
                 return
             }
             awaitingApprovedHostMaterial = true
-            lastError = nil
             state = .connecting
         } catch {
             publishError(error)
@@ -135,6 +136,8 @@ public final class ControllerBridge: ObservableObject {
     public func connect(invite: [UInt8]) { connect(invite: Data(invite)) }
 
     public func connect(savedHost: SavedHost) {
+        state = .connecting
+        lastError = nil
         guard savedHost.isValid else {
             publishErrorMessage("The saved host record is invalid.")
             return
@@ -160,7 +163,6 @@ public final class ControllerBridge: ObservableObject {
                 return
             }
             awaitingApprovedHostMaterial = false
-            lastError = nil
             state = .connecting
         } catch {
             publishError(error)
@@ -261,7 +263,8 @@ public final class ControllerBridge: ObservableObject {
         case 1:
             consumeState(streamID: streamID, stateValue: stateValue)
         case 2:
-            publishErrorMessage("The connection reported an error.")
+            let message = String(decoding: data, as: UTF8.self)
+            publishErrorMessage(message.isEmpty ? "The connection reported an error." : message)
         case 6:
             consumeVideoConfig(data: data, streamID: streamID, version: configVersion, width: width, height: height)
         case 7:
@@ -438,7 +441,7 @@ public final class ControllerBridge: ObservableObject {
     }
 
     private func publishErrorMessage(_ message: String) {
-        let safe = Self.redact(message)
+        let safe = Self.userFacingMessage(message)
         if handleOwner.pointer != nil {
             disconnect()
         }
@@ -446,12 +449,33 @@ public final class ControllerBridge: ObservableObject {
         state = .failed(safe)
     }
 
-    private static func redact(_ message: String) -> String {
+    private static func userFacingMessage(_ message: String) -> String {
         let lowercase = message.lowercased()
-        if lowercase.contains("auth") || lowercase.contains("secret") || lowercase.contains("key") || lowercase.contains("token") {
-            return "A secure connection error occurred."
+        if message.range(of: "[\\u{4e00}-\\u{9fff}]", options: .regularExpression) != nil {
+            return message
         }
-        return message
+        if lowercase.contains("runtime configuration is invalid") {
+            return "DeskLink 连接配置无效，请检查中继地址和服务器名称。"
+        }
+        if lowercase.contains("pairing invitation is invalid") {
+            return "连接码无效，请重新扫描二维码或粘贴完整连接码。"
+        }
+        if lowercase.contains("pairing invitation could not be used") {
+            return "连接码无法使用，请重新生成连接码后重试。"
+        }
+        if lowercase.contains("could not start its connection runtime") {
+            return "连接运行时启动失败，请稍后重试。"
+        }
+        if lowercase.contains("auth") || lowercase.contains("secret") || lowercase.contains("key") || lowercase.contains("token") {
+            return "安全连接校验失败，请重新生成连接码后重试。"
+        }
+        if lowercase.contains("relay") || lowercase.contains("transport") || lowercase.contains("timed out") {
+            return "中继服务暂时不可用，请检查网络或中继配置后重试。"
+        }
+        if lowercase.contains("connection reported an error") {
+            return "连接运行时报告错误，请稍后重试。"
+        }
+        return "连接失败，请检查网络和中继配置后重试。"
     }
 
 #if DEBUG

@@ -33,6 +33,7 @@ struct IOSConnectionHomeView: View {
     @State private var savedHosts: [SavedHost] = []
     @State private var isShowingScanner = false
     @State private var inputError: String?
+    @FocusState private var isInviteFieldFocused: Bool
 
     private let savedHostStore = SavedHostStore()
 
@@ -46,15 +47,25 @@ struct IOSConnectionHomeView: View {
                     TextField("粘贴或输入连接码", text: $inviteText, axis: .vertical)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($isInviteFieldFocused)
                         .font(.footnote.monospaced())
                     HStack {
                         Button("从剪贴板粘贴") { pasteInvite() }
-                        Button("扫描二维码") { isShowingScanner = true }
+                        Button("扫描二维码") {
+                            isInviteFieldFocused = false
+                            isShowingScanner = true
+                        }
                     }
                     Button("开始连接") { connectInviteText() }
                         .disabled(inviteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     if isBusy {
-                        ProgressView()
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text(statusText)
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(statusText)
                     }
                     Button("断开连接", role: .destructive) { controller.disconnect() }
                         .disabled(!isConnectedOrConnecting)
@@ -113,7 +124,7 @@ struct IOSConnectionHomeView: View {
         switch controller.state {
         case .idle: "准备连接"
         case .pairing: "等待远端确认"
-        case .connecting: "连接中"
+        case .connecting: "正在连接中"
         case .connected: "已连接"
         case .reconnecting: "正在重新连接"
         case .recovering: "正在恢复画面"
@@ -128,7 +139,7 @@ struct IOSConnectionHomeView: View {
         case .connected: "checkmark.circle.fill"
         case .failed: "exclamationmark.triangle.fill"
         case .pairing: "person.crop.circle.badge.questionmark"
-        case .reconnecting, .recovering: "arrow.triangle.2.circlepath"
+        case .connecting, .reconnecting, .recovering: "arrow.triangle.2.circlepath"
         default: "circle"
         }
     }
