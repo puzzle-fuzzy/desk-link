@@ -73,7 +73,7 @@ DeskLink should make the next connection obvious within one glance. The Windows 
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
-The application account gate follows the same quiet hierarchy: signed-out users see only the email login, registration, and password-recovery actions. Account status is secondary once inside the workspace, and it never replaces the more meaningful remote pairing and host-approval states.
+The optional application account follows the same quiet hierarchy: signed-out users see email login, registration, password recovery and a clear local-mode entry. Account status is secondary once inside the workspace, and it never replaces the more meaningful remote pairing and host-approval states.
 
 **Key Characteristics:**
 

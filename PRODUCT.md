@@ -14,7 +14,7 @@ DeskLink provides a dependable, private remote-desktop path between personal dev
 
 ## Application Account
 
-DeskLink requires an email account login before the app workspace is usable. Account login is an application-level gate only: it does not grant remote-device access, replace host approval, or synchronize saved connections between devices. A single account may be used on multiple Windows, macOS, and iPhone installations, while each installation must pair with hosts independently. Logging out releases the current remote session and removes that installation's saved connection material.
+DeskLink can be used immediately in local mode without an email account. An optional application account adds email verification, session management and account-device visibility; it does not grant remote-device access, replace host approval, or synchronize saved connections between devices. A single account may be used on multiple Windows, macOS, and iPhone installations, while each installation must pair with hosts independently. Logging out releases the current remote session, clears the installation's saved remote connection records, and removes its account session; users can re-enter local mode without an account.
 
 ## Brand Personality
 

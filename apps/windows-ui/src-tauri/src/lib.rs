@@ -163,12 +163,16 @@ async fn account_restore(
     manager: State<'_, AccountManager>,
     host_manager: State<'_, HostManager>,
 ) -> Result<AccountSnapshot, String> {
-    let snapshot = manager.restore().await?;
-    if snapshot.signed_in {
-        host_manager.restart(app).await;
-    } else {
-        host_manager.stop().await;
-    }
+    let snapshot = match manager.restore().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            host_manager.restart(app).await;
+            return Err(error);
+        }
+    };
+    // Account login is optional. The host must be available for local-mode
+    // users and for inbound control before the account screen is completed.
+    host_manager.restart(app).await;
     Ok(snapshot)
 }
 

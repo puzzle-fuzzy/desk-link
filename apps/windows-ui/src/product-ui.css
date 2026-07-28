@@ -2435,11 +2435,13 @@ html[data-remote-fullscreen="true"] .app-main {
 .account-field input { width: 100%; box-sizing: border-box; padding: 12px 13px; border: 1px solid #d7dce2; border-radius: 10px; background: #fbfcfd; color: #1e2630; font: inherit; font-weight: 400; outline: none; }
 .account-field input:focus { border-color: #3b80c7; box-shadow: 0 0 0 3px rgba(59, 128, 199, .15); }
 .account-submit { width: 100%; margin-top: 22px; min-height: 44px; }
+.account-local-mode { width: 100%; margin-top: 10px; min-height: 42px; }
 .account-error, .account-notice { margin: 14px 0 0; padding: 10px 12px; border-radius: 9px; font-size: 12px; line-height: 1.6; }
 .account-error { color: #a33d3d; background: #fff2f1; }
 .account-notice { color: #316b51; background: #eef9f1; }
 .account-footnote { margin: 22px 0 0; color: #929aa4; font-size: 11px; line-height: 1.65; }
 .account-session-email { max-width: 220px; overflow: hidden; color: #7a838e; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.topbar-account-local { display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border: 1px solid #cfe4d7; border-radius: 999px; color: #2f7a4c; background: #f0faf3; font-size: 12px; white-space: nowrap; }
 .topbar-account-button { border: 1px solid #d8dde3; border-radius: 8px; padding: 7px 10px; color: #53606c; background: #fff; cursor: pointer; font: inherit; font-size: 12px; }
 .topbar-account-button:hover { border-color: #b7c1cc; color: #1e2630; }
 

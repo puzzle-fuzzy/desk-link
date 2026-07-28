@@ -61,6 +61,10 @@ import {
 } from "./navigation";
 import { LatestRequest } from "./latest-request";
 import { RenderScheduler } from "./render-scheduler";
+import {
+  accountLocalModeEnabled,
+  setAccountLocalModeEnabled,
+} from "./account-mode";
 import { escapeHtml } from "./html";
 import { icon, renderLucideIcons } from "./icons";
 import { hostStatusSummary } from "./host-status";
@@ -120,6 +124,7 @@ let utilityMenuOpen = false;
 let utilityMenuDismissBound = false;
 const snapshotRequests = new LatestRequest();
 let account: AccountSnapshot = { signedIn: false, user: null, deviceId: null };
+let accountLocalMode = false;
 let accountLoading = true;
 let accountError: string | null = null;
 let accountMode: "login" | "register" | "forgot" = "login";
@@ -127,13 +132,14 @@ let accountBusy = false;
 let accountNotice: string | null = null;
 let accountCanResendVerification = false;
 let snapshotRecoveryTimer: number | null = null;
+let workspaceListenersBound = false;
 
 function render(): void {
   if (accountLoading) {
     app.innerHTML = renderAccountLoading();
     return;
   }
-  if (!account.signedIn) {
+  if (!account.signedIn && !accountLocalMode) {
     app.innerHTML = renderAccountGate();
     bindAccountInteractions();
     return;
@@ -182,7 +188,7 @@ function renderAccountGate(): string {
       <section class="account-card" aria-labelledby="account-title">
         <div class="account-card-brand"><div class="account-mark">D</div><div><strong>DeskLink</strong><span>端到端加密远程控制</span></div></div>
         <h1 id="account-title">${title}</h1>
-        <p class="account-subtitle">登录后才能使用 DeskLink。账号只负责应用登录，不会代替远程设备配对和主机审批。</p>
+        <p class="account-subtitle">登录可以同步账号状态；不登录也能直接使用本机远程控制。账号不会代替远程设备配对和主机审批。</p>
         <div class="account-mode-switch" role="tablist" aria-label="账号操作">
           <button type="button" data-account-mode="login" class="${accountMode === "login" ? "is-active" : ""}">登录</button>
           <button type="button" data-account-mode="register" class="${accountMode === "register" ? "is-active" : ""}">注册</button>
@@ -196,7 +202,8 @@ function renderAccountGate(): string {
           ${accountNotice ? `<p class="account-notice" role="status">${escapeHtml(accountNotice)}</p>${accountCanResendVerification ? `<button class="text-button account-resend" type="button" data-resend-verification ${accountBusy ? "disabled" : ""}>重新发送验证邮件</button>` : ""}` : ""}
           <button class="button button--primary account-submit" type="submit" ${accountBusy ? "disabled aria-busy=\"true\"" : ""}>${accountBusy ? "正在处理…" : action}</button>
         </form>
-        <p class="account-footnote">使用邮箱验证，不需要手机验证码。退出账号时，本机保存的远程连接会一并清除。</p>
+        <button class="button button--secondary account-local-mode" type="button" data-account-local-mode>跳过登录，直接使用</button>
+        <p class="account-footnote">本机模式只保存当前 Windows 账户的连接设置，不上传账号资料；之后可在“更多”中登录账号。</p>
       </section>
     </main>
   `;
@@ -221,6 +228,24 @@ function bindAccountInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-resend-verification]")?.addEventListener("click", () => {
     void resendVerification();
   });
+  document.querySelector<HTMLButtonElement>("[data-account-local-mode]")?.addEventListener("click", () => {
+    void enterAccountLocalMode();
+  });
+}
+
+async function enterAccountLocalMode(): Promise<void> {
+  accountLocalMode = true;
+  accountError = null;
+  accountNotice = null;
+  setAccountLocalModeEnabled(true);
+  render();
+  try {
+    await restartHost();
+    await startWorkspace();
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+    render();
+  }
 }
 
 async function resendVerification(): Promise<void> {
@@ -269,8 +294,9 @@ async function submitAccount(form: HTMLFormElement): Promise<void> {
     if (accountMode === "login") {
       account = await accountLogin(email, password);
       if (account.signedIn) {
-        await initializeController(scheduleRender);
-        await refreshSnapshot();
+        accountLocalMode = false;
+        setAccountLocalModeEnabled(false);
+        await startWorkspace();
       }
     } else if (accountMode === "register") {
       await accountRegister(email, password);
@@ -298,6 +324,8 @@ async function logoutAccount(): Promise<void> {
   try {
     await accountLogout();
     account = { signedIn: false, user: null, deviceId: null };
+    accountLocalMode = false;
+    setAccountLocalModeEnabled(false);
     if (snapshotRecoveryTimer !== null) {
       window.clearTimeout(snapshotRecoveryTimer);
       snapshotRecoveryTimer = null;
@@ -472,6 +500,7 @@ function renderWorkspaceTopbar(): string {
       </div>
       <div class="workspace-topbar-actions">
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
+        ${accountLocalMode && !account.user ? `<span class="topbar-account-local" title="当前未登录账号，仅使用本机连接能力">本机模式</span>` : ""}
         ${snapshot ? renderHostStatusChip(snapshot) : ""}
         <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-expanded="${utilityMenuOpen}" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
         ${renderUtilityMenu()}
@@ -512,6 +541,7 @@ function renderUtilityMenu(): string {
       <div class="utility-menu-divider" role="separator"></div>
       <button class="utility-menu-item" type="button" role="menuitem" data-view="about">${icon("circle-help")}<span>关于 DeskLink</span></button>
       <button class="utility-menu-item" type="button" role="menuitem" data-open-github>${icon("git-fork")}<span>项目主页</span></button>
+      ${accountLocalMode && !account.user ? `<div class="utility-menu-divider" role="separator"></div><button class="utility-menu-item" type="button" role="menuitem" data-account-login>${icon("key-round")}<span>登录账号</span></button>` : ""}
     </div>
   `;
 }
@@ -1532,6 +1562,7 @@ async function exitDeskLink(): Promise<void> {
 
 function bindInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-account-logout]")?.addEventListener("click", () => void logoutAccount());
+  document.querySelector<HTMLButtonElement>("[data-account-login]")?.addEventListener("click", () => enterAccountLogin());
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
     button.addEventListener("click", () => void openGithub());
   });
@@ -1778,6 +1809,16 @@ function bindInteractions(): void {
   document
     .querySelector<HTMLFormElement>("[data-connection-form]")
     ?.addEventListener("submit", (event) => void submitConnection(event));
+}
+
+function enterAccountLogin(): void {
+  accountLocalMode = false;
+  setAccountLocalModeEnabled(false);
+  accountError = null;
+  accountNotice = null;
+  accountMode = "login";
+  utilityMenuOpen = false;
+  render();
 }
 
 async function openGithub(): Promise<void> {
@@ -2108,15 +2149,22 @@ function randomHex(byteLength: number): string {
 }
 
 async function bootstrap(): Promise<void> {
+  const rememberedLocalMode = accountLocalModeEnabled();
   try {
     account = await accountRestore();
+    accountLocalMode = !account.signedIn && rememberedLocalMode;
   } catch (error) {
     accountError = normalizeError(error);
+    accountLocalMode = rememberedLocalMode;
   } finally {
     accountLoading = false;
     render();
   }
-  if (!account.signedIn) return;
+  if (!account.signedIn && !accountLocalMode) return;
+  await startWorkspace();
+}
+
+async function startWorkspace(): Promise<void> {
   void getVersion().then((version) => {
     applicationVersion = version;
     if (activeView === "about") render();
@@ -2124,8 +2172,11 @@ async function bootstrap(): Promise<void> {
   }).catch(() => { applicationVersion = ""; });
   await initializeController(scheduleRender);
   await refreshSnapshot();
-  void listen("host-runtime-changed", () => void refreshSnapshot(false));
-  void listen("host-approval-changed", () => void refreshSnapshot(false));
+  if (!workspaceListenersBound) {
+    workspaceListenersBound = true;
+    void listen("host-runtime-changed", () => void refreshSnapshot(false));
+    void listen("host-approval-changed", () => void refreshSnapshot(false));
+  }
 }
 
 void bootstrap();
