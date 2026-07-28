@@ -1015,7 +1015,7 @@ pub unsafe extern "C" fn desklink_connect_directory(
         Ok(_) => return DesklinkResult::InvalidArgument,
         Err(_) => return DesklinkResult::InvalidUtf8,
     };
-    let result = start_secure_worker(
+    start_secure_worker(
         runtime,
         SecureConnectionConfigOwned {
             server_name,
@@ -1030,8 +1030,7 @@ pub unsafe extern "C" fn desklink_connect_directory(
                 access_code: config.access_code,
             }),
         },
-    );
-    result
+    )
 }
 
 fn start_secure_worker(

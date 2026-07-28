@@ -1,6 +1,6 @@
 # DeskLink
 
-DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正式发布目标仍是 Windows 10/11 x64；Apple 端已进入独立开发与验收阶段：macOS 支持 Apple Silicon controller/host，iOS 16+ 只支持 controller。中继只负责匹配会话与转发业务密文。
+DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正式发布目标是 Windows 10/11 x64；Apple 端已进入独立开发与验收阶段：macOS 支持 Apple Silicon controller/host，iOS 16+ 只支持 controller。中继只负责匹配会话与转发业务密文。
 
 ## 当前状态
 
@@ -48,7 +48,7 @@ DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正�
 - `server/relay`：会话匹配、限流和密文转发，不解码桌面或输入；
 - `tools/windows-installer`：只封装已验证的 `DeskLink.exe`；程序与用户数据分离保存。
 
-Windows 详细审计见 [`docs/windows-architecture-review.md`](docs/windows-architecture-review.md)。跨平台研究记录保留在 `docs/superpowers/`，不代表当前发布承诺。
+Windows 详细审计见 [`docs/windows-architecture-review.md`](docs/windows-architecture-review.md)。跨平台研究代码与研究记录保留在 `docs/superpowers/`，不代表当前发布承诺。
 
 ## 共享 Rust 验证
 

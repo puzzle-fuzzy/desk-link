@@ -86,7 +86,10 @@ impl AccountManager {
                 self.store
                     .save(&session)
                     .map_err(|error| error.to_string())?;
-                Ok(AccountSnapshot::signed_in(response.user, session.device_id))
+                Ok(AccountSnapshot::signed_in(
+                    response.user,
+                    session.device_id.clone(),
+                ))
             }
             Err(_) => {
                 let response: RefreshResponse = self
@@ -110,7 +113,10 @@ impl AccountManager {
                     .await?;
                 let me: MeResponse = serde_json::from_value(body)
                     .map_err(|_| "账号服务返回了无效的用户信息。".to_owned())?;
-                Ok(AccountSnapshot::signed_in(me.user, session.device_id))
+                Ok(AccountSnapshot::signed_in(
+                    me.user,
+                    session.device_id.clone(),
+                ))
             }
         }
     }

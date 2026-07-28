@@ -169,14 +169,16 @@ impl ControllerWorker {
                         relay_url,
                         platform,
                         config,
-                        receiver,
-                        cancellation_receiver,
-                        worker_phase.clone(),
-                        callback,
-                        worker_material_invalidator,
-                        worker_material_publisher,
-                        worker_release_events,
-                        worker_release_pending,
+                        WorkerContext {
+                            commands: receiver,
+                            cancellation: cancellation_receiver,
+                            phase: worker_phase.clone(),
+                            callback,
+                            material_invalidator: worker_material_invalidator,
+                            material_publisher: worker_material_publisher,
+                            release_events: worker_release_events,
+                            release_pending: worker_release_pending,
+                        },
                     )),
                     Err(error) => callback.emit_error(&error.to_string(), 0),
                 }
@@ -234,19 +236,33 @@ impl Drop for ControllerWorker {
     }
 }
 
-async fn run_worker(
-    relay_url: String,
-    platform: Platform,
-    config: SecureConnectionConfigOwned,
-    mut commands: mpsc::Receiver<ControllerCommand>,
-    mut cancellation: watch::Receiver<bool>,
+struct WorkerContext {
+    commands: mpsc::Receiver<ControllerCommand>,
+    cancellation: watch::Receiver<bool>,
     phase: Arc<AtomicU8>,
     callback: CallbackTarget,
     material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     material_publisher: Option<MaterialPublisher>,
     release_events: Arc<Mutex<Vec<InputEvent>>>,
     release_pending: Arc<AtomicU8>,
+}
+
+async fn run_worker(
+    relay_url: String,
+    platform: Platform,
+    config: SecureConnectionConfigOwned,
+    context: WorkerContext,
 ) {
+    let WorkerContext {
+        mut commands,
+        mut cancellation,
+        phase,
+        callback,
+        material_invalidator,
+        material_publisher,
+        release_events,
+        release_pending,
+    } = context;
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
     let mut pending_release: Option<Vec<InputEvent>> = None;
@@ -282,14 +298,18 @@ async fn run_worker(
                     if schedule_retry(
                         failure,
                         false,
-                        &mut schedule,
-                        &mut commands,
-                        &mut pending_release,
-                        &mut cancellation,
-                        callback,
-                        &release_events,
-                        &release_pending,
-                    ).await {
+                        RetryContext {
+                            schedule: &mut schedule,
+                            commands: &mut commands,
+                            pending_release: &mut pending_release,
+                            cancellation: &mut cancellation,
+                            callback,
+                            release_events: &release_events,
+                            release_pending: &release_pending,
+                        },
+                    )
+                    .await
+                    {
                         first_attempt = false;
                         continue;
                     }
@@ -326,13 +346,15 @@ async fn run_worker(
                 if schedule_retry(
                     failure,
                     stable,
-                    &mut schedule,
-                    &mut commands,
-                    &mut pending_release,
-                    &mut cancellation,
-                    callback,
-                    &release_events,
-                    &release_pending,
+                    RetryContext {
+                        schedule: &mut schedule,
+                        commands: &mut commands,
+                        pending_release: &mut pending_release,
+                        cancellation: &mut cancellation,
+                        callback,
+                        release_events: &release_events,
+                        release_pending: &release_pending,
+                    },
                 )
                 .await
                 {
@@ -502,17 +524,26 @@ async fn run_connected(
     }
 }
 
-async fn schedule_retry(
-    failure: ConnectFailure,
-    stable: bool,
-    schedule: &mut ReconnectSchedule,
-    commands: &mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &mut Option<Vec<InputEvent>>,
-    cancellation: &mut watch::Receiver<bool>,
+struct RetryContext<'a> {
+    schedule: &'a mut ReconnectSchedule,
+    commands: &'a mut mpsc::Receiver<ControllerCommand>,
+    pending_release: &'a mut Option<Vec<InputEvent>>,
+    cancellation: &'a mut watch::Receiver<bool>,
     callback: CallbackTarget,
-    release_events: &Arc<Mutex<Vec<InputEvent>>>,
-    release_pending: &Arc<AtomicU8>,
-) -> bool {
+    release_events: &'a Arc<Mutex<Vec<InputEvent>>>,
+    release_pending: &'a Arc<AtomicU8>,
+}
+
+async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryContext<'_>) -> bool {
+    let RetryContext {
+        schedule,
+        commands,
+        pending_release,
+        cancellation,
+        callback,
+        release_events,
+        release_pending,
+    } = context;
     if !failure.retryable {
         callback.emit_error(&failure.message, 0);
         return false;
