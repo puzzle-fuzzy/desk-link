@@ -1,17 +1,18 @@
 # DeskLink 上线 TODO
 
 > 目标：先把 Windows 两台电脑的远程控制做成可发布的稳定版本，再扩展 4K 和公网 P2P。
-> 当前判断（2026-07-23）：核心功能约 90% 实现；正式上线完备度约 65%～70%。
+> 当前判断（2026-07-28）：Windows 首发核心功能与自动化门禁约 90% 完成；正式上线仍受签名、发布 tag 和真实 Windows 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
 > 规则：`[x]` 只表示代码或自动验证已完成；需要两台真实 Windows 电脑的项目必须由人工验收后再勾选。
 
 ## 0. 发布基线与工作区（P1）
 
-- [ ] 整理当前工作区变更，确认所有 DirectLan、视频质量、UI 和诊断代码都属于本次发布范围。
+- [x] 整理当前工作区变更，确认 DirectLan、视频质量、UI、诊断和本机账号模式都属于本次发布范围。
 - [x] 删除未发布版本仍保留的旧 host 安装入口、旧设备记录解码器和旧 relay join/directory 信封路径；当前构建只维护单一安装入口与当前协议线。
 - [x] 将 Windows-only 发布边界接入 `verify-windows-release.py`，防止 README 重新宣传未纳入本版本的 macOS/mobile 产品面。
 - [x] 让发布验证、安装包清单和 GitHub Release 绑定同一份源码提交 SHA，并拒绝脏工作区进入签名发布。
+- [x] 将账号服务降为可选能力；未登录时主机仍启动，Windows 本机模式可直接使用，账号流程保留在“更多”菜单。
 - [ ] 更新版本号、变更日志和发布说明，形成唯一的发布提交。
-- [ ] 在干净 checkout 上通过 Rust、Bun、安装包和发布校验。
+- [x] 在干净工作区上通过 Rust、Bun、安装包和发布校验（2026-07-28，提交 `e6f8e6c`）。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
 
 ## 1. 云端诊断可用性（P1）
@@ -81,11 +82,10 @@
 
 ## 下一阶段执行顺序（发布冻结前）
 
-1. **收口当前直连诊断与回落改动**：重新跑 workspace 门禁，提交并推送当前变更；发布说明只描述已验证能力，不扩展 4K 承诺。
-2. **运行时 E2E 准备**：已完成 DirectLan transport 回环夹具；下一步把 HostRuntime ↔ ControllerRuntime 的候选交换接入 Windows 验收脚本，真实桌面采集仍单独走人工验收。
-3. **双机验收包**：使用现有 `verify-windows-resilience.py` 和安装包清单，记录同网直连、跨网中继、断线恢复、双屏/DPI、剪贴板和文件传输结果。
-4. **信任与安装**：用户提供 Authenticode 证书后执行签名构建、SmartScreen 和全新账户安装升级验收；没有证书时保持候选版，不伪装成正式发布。
-5. **发布冻结**：在干净 checkout 重跑所有门禁，生成 SHA-256/签名清单，最后创建 `v0.1.91` tag；4K、公网 P2P 和 macOS 继续留在后续版本。
+1. **候选基线**：以当前提交和安装包 SHA 生成候选验收记录模板，确认发布说明只描述已验证能力，不扩展 4K 承诺。
+2. **双机验收包**：使用现有 `verify-windows-resilience.py` 和候选安装包，记录同网直连、跨网中继、断线恢复、双屏/DPI、剪贴板和文件传输结果。
+3. **信任与安装**：用户提供 Authenticode 证书后执行签名构建、SmartScreen 和全新账户安装升级验收；没有证书时保持候选版，不伪装成正式发布。
+4. **发布冻结**：在干净 checkout 重跑所有门禁，生成 SHA-256/签名清单，最后创建 `v0.1.91` tag；4K、公网 P2P 和 macOS 继续留在后续版本。
 
 ## 自动门禁
 
@@ -101,10 +101,10 @@ python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
 ```
 
-### 最近一次自动门禁（2026-07-23）
+### 最近一次自动门禁（2026-07-28）
 
 - [x] Rust workspace：`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`。
-- [x] Windows 发布验证：`python scripts/verify-windows-release.py`（152 个前端测试通过，TypeScript/Vite/Rust release 构建通过）。
+- [x] Windows 发布验证：`python scripts/verify-windows-release.py`（155 个前端测试通过，TypeScript/Vite/Rust release 构建通过）。
 - [x] Windows 安装包构建：`python scripts/build-windows-installer.py`（安装包清单生成，当前 `signed: false`）。
 - [x] 主机 DirectLan 接入回环：`cargo test -p desklink-windows --lib runtime::direct_video_tests::host_acceptor_keeps_authenticated_direct_datagram_connection`。
 - [x] DirectLan 回环边界夹具：成功传输、候选过期、认证绑定失败和主动关闭；`cargo test -p desklink-transport direct_probe::tests`。
@@ -115,11 +115,13 @@ python scripts/audit-managed-diagnostics.py
 - [x] 增加统一 Windows 发布预检：`check-windows-release-ready.py` 汇总来源 SHA、安装包完整性、签名、tag、中继/诊断证据，并把真实双机验收明确列为人工阻塞项。
 - [x] 增加候选绑定的人工验收记录模板：版本、来源 SHA、安装包 SHA-256、操作者和 UTC 时间必须与预检候选一致。
 - [x] Windows CI 与签名工作流上传统一发布预检报告，保留来源 SHA、安装包完整性和未完成阻塞项的构建证据。
+- [x] 账号服务 CI 纳入 `server/account` 测试与类型检查；账号服务仍可不部署，Windows 本机模式不依赖它。
 
 ## 当前已知事实
 
 - 中继实况探测已通过：`101.35.246.159:4433`。
 - 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
 - 当前安装包 `dist/windows/DeskLinkSetup-0.1.91-x64.exe` 未签名。
+- 当前候选安装包来源提交为 `e6f8e6c`，SHA-256 为 `8d8112d7ae7943bcc2d786f43d5dc7f2a51bb3652ca801d8e3c8a9033ea57ddc`。
 - 候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，但尚未形成干净的唯一发布提交。
 - 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具和当前协议线收口；尚无本地 `v*` 发布 tag。
