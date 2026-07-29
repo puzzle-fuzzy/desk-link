@@ -20,4 +20,4 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 hex = "0.4"
-rand_chacha = "0.3"
+rand_chacha = "0.10"
