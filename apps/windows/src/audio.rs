@@ -8,6 +8,8 @@ use std::{
 };
 
 use desklink_protocol::{AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE};
+#[cfg(windows)]
+use desklink_protocol::{MAX_AUDIO_PAYLOAD_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES};
 use tokio::sync::{Notify, watch};
 
 pub const AUDIO_QUEUE_CAPACITY: usize = 8;
