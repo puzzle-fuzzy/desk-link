@@ -12,7 +12,7 @@
 - [x] 让发布验证、安装包清单和 GitHub Release 绑定同一份源码提交 SHA，并拒绝脏工作区进入签名发布。
 - [x] 将账号服务降为可选能力；未登录时主机仍启动，Windows 本机模式可直接使用，账号流程保留在“更多”菜单。
 - [ ] 更新版本号、变更日志和发布说明，形成唯一的发布提交。
-- [x] 在干净工作区上通过 Rust、Bun、安装包和发布校验（2026-07-31，提交 `f9d5925`；Windows CI run `30571054699`）。
+- [x] 在干净工作区上通过 Rust、Bun、安装包和发布校验（2026-07-31；Windows CI runs `30571054699` 与 `30572591597`）。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
 
 ## 1. 云端诊断可用性（P1）
@@ -107,7 +107,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 ### 最近一次自动门禁（2026-07-31）
 
 - [x] Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（提交 `f9d5925`）。
-- [x] 候选物料已完成来源绑定：版本 `0.1.91`，source commit `f9d59255c9c580e5a2a6b8ecc417f0772523c184`，安装器 SHA-256 `24446a222ae170e518f302a1bbde077d24353b7306719536460e23b2167ea27b`，工作区干净。
+- [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
 - [x] 发布脚本与签名工作流现在都会严格校验 readiness 报告，并把该报告作为 Release 证据上传；当前候选 `ready: false`，不会被误发布为正式版本。
 - [x] 远程 CI 仍保留 Node.js 20 deprecation warning（`actions/upload-artifact@v4`），不影响本次通过，后续应随 GitHub Actions 运行时升级单独处理。
 
@@ -131,7 +131,6 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 
 - 中继实况探测已通过：`101.35.246.159:4433`。
 - 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
-- 当前安装包 `dist/windows/DeskLinkSetup-0.1.91-x64.exe` 未签名。
-- 当前候选安装包来源提交为 `f9d5925`，SHA-256 为 `24446a222ae170e518f302a1bbde077d24353b7306719536460e23b2167ea27b`；该候选仍未签名。
+- 当前 Windows CI 候选物料保存在 run `30572591597` 的 artifact 中，安装器仍未签名；正式验收时以其中的 `windows-installer-manifest.json` 获取 source commit 与 SHA-256，不使用旧文档中的动态值。
 - 候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，但尚未形成干净的唯一发布提交。
 - 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具和当前协议线收口；尚无本地 `v*` 发布 tag。
