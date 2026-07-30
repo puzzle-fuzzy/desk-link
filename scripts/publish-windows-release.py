@@ -25,6 +25,7 @@ class ReleasePayload:
     installer: Path
     manifest: Path
     verification: Path
+    readiness: Path
     sha256: str
 
 
@@ -50,8 +51,10 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
     verification_path = (
         root / "dist" / "windows" / "windows-release-verification.json"
     )
+    readiness_path = root / "dist" / "windows" / "windows-release-readiness.json"
     manifest = read_json(manifest_path)
     verification = read_json(verification_path)
+    readiness = read_json(readiness_path)
 
     version = manifest.get("version")
     if not isinstance(version, str) or not VERSION_PATTERN.fullmatch(version):
@@ -72,6 +75,13 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
     verification_source_commit = verification.get("source_commit")
     if verification_source_commit != source_commit or verification.get("source_dirty") is not False:
         raise ValueError("Windows release verification does not match the clean source commit")
+    if readiness.get("schema") != 1 or readiness.get("ready") is not True:
+        raise ValueError("Windows release readiness did not pass all release gates")
+    if (
+        readiness.get("source_commit") != source_commit
+        or readiness.get("source_dirty") is not False
+    ):
+        raise ValueError("Windows release readiness does not match the clean source commit")
     github_sha = os.environ.get("GITHUB_SHA", "").strip().lower()
     if github_sha and github_sha != source_commit:
         raise ValueError("Release source commit does not match GITHUB_SHA")
@@ -112,6 +122,7 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
         installer=installer_path,
         manifest=manifest_path,
         verification=verification_path,
+        readiness=readiness_path,
         sha256=actual_sha256,
     )
 
@@ -141,6 +152,7 @@ def publish(payload: ReleasePayload, *, repository: str, tag: str) -> None:
             str(payload.installer),
             str(payload.manifest),
             str(payload.verification),
+            str(payload.readiness),
             "--repo",
             repository,
             "--verify-tag",

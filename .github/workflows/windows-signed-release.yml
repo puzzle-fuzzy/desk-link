@@ -58,6 +58,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Enforce strict release readiness before publishing
+        if: github.ref_type == 'tag'
+        run: python scripts/check-windows-release-ready.py --strict --report dist/windows/windows-release-readiness.json
+
       - name: Publish verified signed GitHub release
         if: github.ref_type == 'tag'
         env:

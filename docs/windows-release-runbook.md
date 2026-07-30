@@ -124,11 +124,12 @@ git tag -a v0.1.91 -m "DeskLink Windows 0.1.91"
 git push origin v0.1.91
 ```
 
-`Windows Signed Release` 会再次执行强制签名门禁；未签名或版本不匹配时不得上传 GitHub Release。发布内容至少包括：
+`Windows Signed Release` 会在上传候选证据后再次执行 `check-windows-release-ready.py --strict`，并由 `publish-windows-release.py` 进行第二次 readiness 校验；未签名、版本不匹配或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
 
 - `DeskLinkSetup-0.1.91-x64.exe`
 - `windows-installer-manifest.json`
 - `windows-release-verification.json`
+- `windows-release-readiness.json`
 - SHA-256 和签名状态
 - 已知限制与回滚说明
 

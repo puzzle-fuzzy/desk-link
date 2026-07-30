@@ -85,6 +85,19 @@ class WindowsReleasePublishTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        (release / "windows-release-readiness.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "version": "0.1.42",
+                    "source_commit": "a" * 40,
+                    "source_dirty": False,
+                    "ready": True,
+                    "blockers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
         return installer
 
     def test_accepts_only_a_matching_signed_verified_installer(self) -> None:
@@ -94,7 +107,20 @@ class WindowsReleasePublishTests(unittest.TestCase):
             payload = self.publish.validate_release_payload(root, "v0.1.42")
             self.assertEqual(payload.installer, installer)
             self.assertEqual(payload.version, "0.1.42")
+            self.assertTrue(payload.readiness.is_file())
             self.assertIn(payload.sha256, self.publish.release_notes(payload))
+
+    def test_rejects_a_candidate_that_is_not_release_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_release(root)
+            readiness = root / "dist" / "windows" / "windows-release-readiness.json"
+            payload = json.loads(readiness.read_text(encoding="utf-8"))
+            payload["ready"] = False
+            payload["blockers"] = [{"id": "two_windows_acceptance"}]
+            readiness.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "readiness"):
+                self.publish.validate_release_payload(root, "v0.1.42")
 
     def test_rejects_unsigned_or_mismatched_tags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -173,6 +199,7 @@ class WindowsReleasePublishTests(unittest.TestCase):
             installer=Path("installer.exe"),
             manifest=Path("manifest.json"),
             verification=Path("verification.json"),
+            readiness=Path("readiness.json"),
             sha256="a" * 64,
         )
         with self.assertRaises(ValueError):

@@ -97,3 +97,5 @@ Configure the controlled signing identity, run `python scripts/build-windows-ins
 - macOS and iOS verification scripts passed; these remain build/permission gates and do not replace physical Apple-device acceptance.
 - Managed relay bidirectional probe passed in `171 ms`; managed diagnostics audit passed.
 - Commit `7ddf697` was pushed to `origin/main`. The candidate readiness report remains `ready: false` only for artifact provenance/signing/tag and real two-Windows acceptance gates; no formal `v0.1.91` tag was created.
+- Windows CI run `30569603692` passed on commit `6d7d6d3`: Python policy tests, UI build, Rust fmt/Clippy/tests, Windows release verification, and unsigned candidate installer construction. The candidate installer SHA-256 is `4223032dfe2e806fd859b0eb6bd4dc22b56e1f237a04cf399aec55b31301ecbf`.
+- The signed workflow now fails closed before publishing unless readiness is true and source-bound; the readiness report is published as evidence alongside the installer and verification manifests.
