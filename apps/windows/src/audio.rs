@@ -7,9 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use desklink_protocol::{
-    AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE, MAX_AUDIO_PAYLOAD_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES,
-};
+use desklink_protocol::{AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE};
 use tokio::sync::{Notify, watch};
 
 pub const AUDIO_QUEUE_CAPACITY: usize = 8;

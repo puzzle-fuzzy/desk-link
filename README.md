@@ -2,6 +2,8 @@
 
 DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正式发布目标是 Windows 10/11 x64；Apple 端已进入独立开发与验收阶段：macOS 支持 Apple Silicon controller/host，iOS 16+ 只支持 controller。中继只负责匹配会话与转发业务密文。
 
+当前实现与发布边界以[当前架构契约](docs/current-architecture-contract.md)、[Windows 发布运行手册](docs/windows-release-runbook.md)和[上线 TODO](TODO.md)为准；早期跨平台详细设计文档不再单独定义当前版本的验收范围。
+
 ## 当前状态
 
 ### Windows 10/11 x64

@@ -93,12 +93,15 @@
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cd apps/windows-ui
 bun test
 bun run build
+cd ../..
 python scripts/verify-windows-release.py
 python scripts/build-windows-installer.py
 python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
+python -m unittest discover -s scripts/tests -p "test_*.py"
 ```
 
 ### 最近一次自动门禁（2026-07-28）

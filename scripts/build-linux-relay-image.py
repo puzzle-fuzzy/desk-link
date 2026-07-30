@@ -11,8 +11,9 @@ import sys
 import tarfile
 import tempfile
 import time
-import tomllib
 from pathlib import Path
+
+from cargo_manifest import package_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -236,8 +237,7 @@ def smoke_test(image: str) -> None:
 
 
 def main() -> int:
-    manifest = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
-    version = str(manifest["package"]["version"])
+    version = package_version(MANIFEST)
     image = f"desklink-relay:{version}"
     archive = OUTPUT_DIRECTORY / f"desklink-relay-{version}-amd64.tar"
 

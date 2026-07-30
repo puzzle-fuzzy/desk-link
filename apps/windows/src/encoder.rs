@@ -472,7 +472,7 @@ impl H264Encoder {
         #[cfg(not(windows))]
         {
             let _ = (width, height, settings);
-            return Err(EncoderError::BackendUnavailable);
+            Err(EncoderError::BackendUnavailable)
         }
     }
 

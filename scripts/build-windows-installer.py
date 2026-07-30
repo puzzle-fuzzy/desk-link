@@ -11,7 +11,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
 import time
 from pathlib import Path
 
@@ -23,6 +22,7 @@ from windows_native_build_env import (
     prepare_windows_native_build_environment,
     prepare_windows_release_environment,
 )
+from cargo_manifest import package_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,10 +122,7 @@ def main() -> int:
     prepare_windows_release_environment()
 
     arguments = parse_args()
-    package = tomllib.loads(
-        (ROOT / "tools" / "windows-installer" / "Cargo.toml").read_text(encoding="utf-8")
-    )["package"]
-    version = str(package["version"])
+    version = package_version(ROOT / "tools" / "windows-installer" / "Cargo.toml")
     enforce_release_ref(version)
     should_sign = signing_requested()
     enforce_signing_policy(

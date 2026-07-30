@@ -7,8 +7,8 @@ use std::{
 
 use blake2::{Blake2s256, Digest};
 use desklink_protocol::{
-    MAX_CLIPBOARD_TEXT_BYTES, MAX_TRANSFER_CHUNK_BYTES, MAX_TRANSFER_FILE_BYTES, TransferId,
-    TransferResult, is_valid_transfer_file_name,
+    MAX_TRANSFER_CHUNK_BYTES, MAX_TRANSFER_FILE_BYTES, TransferId, TransferResult,
+    is_valid_transfer_file_name,
 };
 use rand_core::{OsRng, RngCore};
 

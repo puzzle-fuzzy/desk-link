@@ -10,7 +10,6 @@ import re
 import struct
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 SCRIPTS_DIRECTORY = Path(__file__).resolve().parent
@@ -21,6 +20,7 @@ from windows_native_build_env import (
     prepare_windows_native_build_environment,
     prepare_windows_release_environment,
 )
+from cargo_manifest import package_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,8 +39,7 @@ def run(command: list[str], *, cwd: Path = ROOT) -> None:
 
 
 def cargo_version(path: str) -> str:
-    manifest = tomllib.loads((ROOT / path).read_text(encoding="utf-8"))
-    return str(manifest["package"]["version"])
+    return package_version(ROOT / path)
 
 
 def source_metadata() -> tuple[str, bool]:
