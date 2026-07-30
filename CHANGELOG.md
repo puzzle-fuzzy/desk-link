@@ -26,7 +26,14 @@
 - 安装器只维护单一 `DeskLink.exe` 入口，旧的独立 host 文件和旧设备记录格式不会再参与启动或恢复。
 - 4K 原生编码和公网 NAT 穿透 P2P 尚未开放或承诺，当前以 2560×1440 为清晰度上限。
 
-### 验证记录（2026-07-28）
+### 最新验证记录（2026-07-31）
+
+- GitHub Actions Windows CI run `30571054699` 在提交 `f9d59255c9c580e5a2a6b8ecc417f0772523c184` 上通过：前端、Rust fmt/Clippy/tests、Windows production verification 和候选安装包构建全部成功。
+- 当前候选安装包 `DeskLinkSetup-0.1.91-x64.exe` 未签名，SHA-256：`24446a222ae170e518f302a1bbde077d24353b7306719536460e23b2167ea27b`。
+- `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
+- 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。
+
+### 先前验证记录（2026-07-28）
 
 - `cargo fmt --all -- --check`
 - `cargo test --workspace`
