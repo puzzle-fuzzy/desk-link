@@ -445,7 +445,9 @@ def main() -> int:
     )
     arguments.report.parent.mkdir(parents=True, exist_ok=True)
     arguments.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    # Keep the UTF-8 report artifact human-readable while making console output
+    # safe on Windows runners whose default stdout is still CP1252.
+    print(json.dumps(report, ensure_ascii=True, indent=2))
     return 1 if arguments.strict and not report["ready"] else 0
 
 

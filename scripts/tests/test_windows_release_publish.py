@@ -30,6 +30,15 @@ class WindowsReleasePublishTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.publish = load_script()
 
+    def setUp(self) -> None:
+        self.github_sha_environment = patch.dict(
+            os.environ, {"GITHUB_SHA": ""}, clear=False
+        )
+        self.github_sha_environment.start()
+
+    def tearDown(self) -> None:
+        self.github_sha_environment.stop()
+
     def create_release(self, root: Path, *, signed: bool = True) -> Path:
         release = root / "dist" / "windows"
         release.mkdir(parents=True)
