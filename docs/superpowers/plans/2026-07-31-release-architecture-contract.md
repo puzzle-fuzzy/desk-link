@@ -39,9 +39,9 @@ Record the exact facts: Windows `0.1.91` candidate, protocol `12`, optional acco
 
 Add `docs/current-architecture-contract.md` and a maintenance notice at the top of the original detailed design.
 
-- [ ] **Step 3: Validate the documentation boundary**
+- [x] **Step 3: Validate the documentation boundary**
 
-Run `rg -n "current-architecture-contract|DirectLan|controller-only|host approval" README.md PRODUCT.md TODO.md docs/current-architecture-contract.md docs/Windows_macOS_iOS_个人远程桌面软件详细设计与开发文档.md` and `git diff --check`. Expected: the current contract is linked and the historical design is explicitly scoped.
+Run `rg -n "current-architecture-contract|DirectLan|controller-only|host approval" README.md PRODUCT.md TODO.md docs/current-architecture-contract.md docs/Windows_macOS_iOS_个人远程桌面软件详细设计与开发文档.md` and `git diff --check`. The current contract is linked and the historical design is explicitly scoped.
 
 ### Task 2: Keep release scripts runnable on Python 3.9
 
@@ -89,3 +89,11 @@ Run `python scripts/create-windows-acceptance-record.py --operator "release-team
 - [ ] **Step 3: Sign and publish only after readiness is true**
 
 Configure the controlled signing identity, run `python scripts/build-windows-installer.py --require-signing`, run `python scripts/check-windows-release-ready.py --strict`, create annotated tag `v0.1.91`, and push the verified commit/tag. Without signing or two physical Windows records, keep the result as a candidate and do not create the formal release.
+
+## Execution evidence (2026-07-31)
+
+- Rust format, workspace tests and Clippy passed on macOS; Windows UI tests passed (`185` tests across `44` files) and the UI production build passed (`1806` modules).
+- Python release script tests passed (`29` tests) under Python `3.9.6`; Cargo version parsing now uses `tomllib` when available and a bounded Python 3.9 fallback otherwise.
+- macOS and iOS verification scripts passed; these remain build/permission gates and do not replace physical Apple-device acceptance.
+- Managed relay bidirectional probe passed in `171 ms`; managed diagnostics audit passed.
+- Commit `7ddf697` was pushed to `origin/main`. The candidate readiness report remains `ready: false` only for artifact provenance/signing/tag and real two-Windows acceptance gates; no formal `v0.1.91` tag was created.
