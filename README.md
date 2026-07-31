@@ -159,7 +159,7 @@ python scripts/build-windows-installer.py
 python scripts/build-windows-installer.py --require-signing
 ```
 
-远程的 `Windows Signed Release` 工作流只接受 GitHub Secrets 中的可信 PFX，缺少证书、证书用途不正确、证书过期、签名失败或没有 RFC 3161 时间戳都会中止，不会上传未签名安装器。
+远程的 `Windows Signed Candidate` 工作流只接受 GitHub Secrets 中的可信 PFX，缺少证书、证书用途不正确、证书过期、签名失败或没有 RFC 3161 时间戳都会中止，不会上传未签名安装器；它只生成按 run ID 固定的候选 artifact，正式发布由 `Windows Publish Release` 在 tag、签名 artifact 和 source-bound evidence 均匹配后单独执行。
 
 ## Apple 开发代码
 

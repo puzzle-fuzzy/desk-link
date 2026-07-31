@@ -94,7 +94,7 @@ python scripts/create-windows-acceptance-record.py --operator "release-team"
 
 然后运行 `python scripts/check-windows-release-ready.py --manual-json <path>`。预检会拒绝版本、提交 SHA 或安装包哈希不一致的记录。该文件不应包含密码、私钥、设备完整 ID 或屏幕内容。
 
-## 3. 签名构建
+## 3. 签名候选构建
 
 正式构建必须在受控 Windows runner 或受控签名机完成：
 
@@ -102,7 +102,7 @@ python scripts/create-windows-acceptance-record.py --operator "release-team"
 python scripts/build-windows-installer.py --require-signing
 ```
 
-GitHub Actions 使用 `Windows Signed Release` 工作流。PFX 和密码只放在 GitHub Secrets：
+GitHub Actions 使用 `Windows Signed Candidate` 工作流。该工作流只生成并上传不可变的签名候选 artifact，不直接创建 GitHub Release。PFX 和密码只放在 GitHub Secrets：
 
 - `WINDOWS_SIGNING_PFX_BASE64`
 - `WINDOWS_SIGNING_PFX_PASSWORD`
@@ -115,16 +115,30 @@ GitHub Actions 使用 `Windows Signed Release` 工作流。PFX 和密码只放�
 - 发布清单中的 `signed` 为 `true`，哈希与最终文件一致。
 - 不在日志、artifact 名称或仓库中暴露 PFX、密码、私钥或临时签名文件。
 
-## 4. 创建 Release
+记录该工作流的 run ID。后续发布工作流会按 `DeskLink-Windows-signed-<run-id>` 下载同一份安装器，不重新构建或重新签名。
 
-只有签名构建和人工验收都完成后，才创建与版本一致的标签，例如：
+## 4. 发布证据交接
+
+正式发布前，将最终签名安装器的验收和运维报告提交到仅包含证据的分支或提交，并使用不可变的 40 位提交 SHA。目录约定为：
+
+```text
+release-evidence/v0.1.91/windows-acceptance-record.json
+release-evidence/v0.1.91/managed-relay-verification.json
+release-evidence/v0.1.91/managed-diagnostics-audit.json
+```
+
+证据提交不得修改产品源码、安装包或私钥；人工验收暂未完成时，不创建这些“通过”证据，也不要运行正式发布工作流。
+
+## 5. 创建 Release
+
+签名候选构建、人工验收和运维证据都完成后，才创建与候选源码提交一致的 annotated tag，例如：
 
 ```powershell
 git tag -a v0.1.91 -m "DeskLink Windows 0.1.91"
 git push origin v0.1.91
 ```
 
-`Windows Signed Release` 会在上传候选证据后再次执行 `check-windows-release-ready.py --strict`，并由 `publish-windows-release.py` 进行第二次 readiness 校验；未签名、版本不匹配或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
+在该 tag 上手动运行 `Windows Publish Release`，输入签名候选 workflow run ID 和证据提交 SHA。它会下载同一份签名 artifact，导入三份 source-bound 证据，执行 `check-windows-release-ready.py --strict`，并由 `publish-windows-release.py` 进行第二次 readiness 校验；未签名、版本不匹配或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
 
 - `DeskLinkSetup-0.1.91-x64.exe`
 - `windows-installer-manifest.json`
@@ -133,7 +147,7 @@ git push origin v0.1.91
 - SHA-256 和签名状态
 - 已知限制与回滚说明
 
-## 5. 回滚
+## 6. 回滚
 
 发现连接、权限、数据损坏或安全问题时：
 
@@ -143,7 +157,7 @@ git push origin v0.1.91
 4. 如果问题来自中继，先切换到已验证的 relay 配置，再保留故障节点日志用于分析。
 5. 将版本、提交 SHA、安装器 SHA-256、影响范围和修复版本写入变更记录。
 
-## 6. 诊断与隐私
+## 7. 诊断与隐私
 
 - 诊断必须由用户主动开启，默认关闭。
 - 客户端只上传脱敏事件、单向会话关联和有界性能计数。
@@ -151,7 +165,7 @@ git push origin v0.1.91
 - 云端只保留约定期限内的诊断数据；发布排查结束后清理临时导出。
 - 对外反馈优先提供报告 ID、时间窗口、版本和路径，不要求用户发送原始日志中的秘密字段。
 
-## 7. 发布后观察
+## 8. 发布后观察
 
 发布后首个观察窗口重点关注：
 

@@ -1,16 +1,13 @@
-name: Windows Signed Release
+name: Windows Signed Candidate
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: windows-signed-release-${{ github.ref }}
+  group: windows-signed-candidate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -49,7 +46,7 @@ jobs:
       - name: Upload signed installer
         uses: actions/upload-artifact@v4
         with:
-          name: DeskLink-Windows-signed-${{ github.ref_name }}
+          name: DeskLink-Windows-signed-${{ github.run_id }}
           path: |
             dist/windows/DeskLinkSetup-*-x64.exe
             dist/windows/windows-installer-manifest.json
@@ -57,13 +54,3 @@ jobs:
             dist/windows/windows-release-readiness.json
           if-no-files-found: error
           retention-days: 30
-
-      - name: Enforce strict release readiness before publishing
-        if: github.ref_type == 'tag'
-        run: python scripts/check-windows-release-ready.py --strict --report dist/windows/windows-release-readiness.json
-
-      - name: Publish verified signed GitHub release
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python scripts/publish-windows-release.py

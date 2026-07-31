@@ -88,7 +88,32 @@ Run `python scripts/create-windows-acceptance-record.py --operator "release-team
 
 - [ ] **Step 3: Sign and publish only after readiness is true**
 
-Configure the controlled signing identity, run `python scripts/build-windows-installer.py --require-signing`, run `python scripts/check-windows-release-ready.py --strict`, create annotated tag `v0.1.91`, and push the verified commit/tag. Without signing or two physical Windows records, keep the result as a candidate and do not create the formal release.
+   Configure the controlled signing identity, run `python scripts/build-windows-installer.py --require-signing`, run `python scripts/check-windows-release-ready.py --strict`, create annotated tag `v0.1.91`, and push the verified commit/tag. Without signing or two physical Windows records, keep the result as a candidate and do not create the formal release.
+
+### Task 4: Separate signed candidate construction from formal publication
+
+**Files:**
+- Modify: `.github/workflows/windows-signed-release.yml`
+- Create: `.github/workflows/windows-publish-release.yml`
+- Create: `scripts/import-windows-release-evidence.py`
+- Test: `scripts/tests/test_import_windows_release_evidence.py`
+- Modify: `docs/windows-release-runbook.md`
+
+**Interfaces:**
+- Consumes: one signed-candidate workflow run ID and one immutable evidence commit SHA.
+- Produces: a deterministic publish workflow that downloads the exact signed artifact, imports evidence for the same tag, and fails closed before `gh release create`.
+
+- [x] **Step 1: Make signed workflow candidate-only**
+
+The signed workflow is now manual-dispatch only, uploads an artifact named by its run ID, and never creates a tag or GitHub Release.
+
+- [x] **Step 2: Add evidence-driven publish workflow**
+
+The publish workflow runs only on a tag, downloads the exact candidate artifact, imports three JSON reports from an immutable evidence commit, runs strict readiness, and then invokes the existing source-bound publish validator.
+
+- [x] **Step 3: Add importer tests and document the handoff**
+
+Evidence paths and the two workflow inputs are documented. Mutable branch names are rejected as evidence refs; real acceptance is intentionally still a future external gate.
 
 ## Execution evidence (2026-07-31)
 
@@ -98,5 +123,6 @@ Configure the controlled signing identity, run `python scripts/build-windows-ins
 - Managed relay bidirectional probe passed in `171 ms`; managed diagnostics audit passed.
 - Commit `7ddf697` was pushed to `origin/main`. The candidate readiness report remains `ready: false` only for artifact provenance/signing/tag and real two-Windows acceptance gates; no formal `v0.1.91` tag was created.
 - Windows CI run `30569603692` passed on commit `6d7d6d3`: Python policy tests, UI build, Rust fmt/Clippy/tests, Windows release verification, and unsigned candidate installer construction. The candidate installer SHA-256 is `4223032dfe2e806fd859b0eb6bd4dc22b56e1f237a04cf399aec55b31301ecbf`.
-- The signed workflow now fails closed before publishing unless readiness is true and source-bound; the readiness report is published as evidence alongside the installer and verification manifests.
+- The previous signed workflow gate was source-bound and fail-closed; it has now been split so the signed candidate artifact and its non-strict readiness report are produced first, while strict readiness and publishing happen only in the separate tag-based publish workflow.
 - Windows CI run `30571054699` passed on commit `f9d5925`; the candidate installer is `DeskLinkSetup-0.1.91-x64.exe` with SHA-256 `24446a222ae170e518f302a1bbde077d24353b7306719536460e23b2167ea27b`. Its readiness report is source-bound and correctly remains `ready: false` until signing, tag, fresh operations evidence, and physical Windows acceptance are supplied.
+- The signed workflow is now candidate-only; formal publication is a separate workflow requiring the candidate run ID and an immutable evidence commit SHA. No tag or Release was created while real acceptance was intentionally skipped.

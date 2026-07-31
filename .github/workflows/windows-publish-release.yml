@@ -1,0 +1,68 @@
+name: Windows Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Windows Signed Candidate workflow run ID"
+        required: true
+        type: string
+      evidence_ref:
+        description: "Immutable commit SHA containing release-evidence/<tag>/ evidence files"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: windows-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require a release tag ref
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -ne "tag") {
+            throw "Windows Publish Release must be dispatched from an annotated release tag"
+          }
+
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch immutable evidence commit
+        shell: pwsh
+        run: git fetch --no-tags --depth=1 origin "${{ inputs.evidence_ref }}"
+
+      - name: Download exact signed candidate artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DeskLink-Windows-signed-${{ inputs.build_run_id }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: dist/windows
+
+      - name: Import source-bound release evidence
+        run: >-
+          python scripts/import-windows-release-evidence.py
+          --ref "${{ inputs.evidence_ref }}"
+          --tag "${{ github.ref_name }}"
+
+      - name: Enforce strict release readiness
+        run: >-
+          python scripts/check-windows-release-ready.py
+          --strict
+          --manual-json dist/windows/windows-acceptance-record.json
+          --report dist/windows/windows-release-readiness.json
+
+      - name: Publish verified signed GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/publish-windows-release.py

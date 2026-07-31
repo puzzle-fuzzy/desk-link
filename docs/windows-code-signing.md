@@ -55,7 +55,7 @@ Microsoft 官方要求 SignTool 至少来自 Windows SDK 10.0.2261.755，并建�
 
 ## GitHub 可信签名发布
 
-仓库的 `.github/workflows/windows-signed-release.yml` 可手动运行，也会在推送 `v*` 标签时运行。工作流在临时 Windows runner 中导入 PFX，验证证书同时满足以下条件后才构建：
+仓库的 `.github/workflows/windows-signed-release.yml` 通过 `Windows Signed Candidate` 手动运行。工作流在临时 Windows runner 中导入 PFX，验证证书同时满足以下条件后才构建：
 
 - 当前处于有效期；
 - 包含私钥；
@@ -68,7 +68,7 @@ Microsoft 官方要求 SignTool 至少来自 Windows SDK 10.0.2261.755，并建�
 python scripts/configure-github-windows-signing.py C:\secure\desklink-code-signing.pfx
 ```
 
-脚本会隐藏密码输入，通过标准输入写入 `WINDOWS_SIGNING_PFX_BASE64` 与 `WINDOWS_SIGNING_PFX_PASSWORD` 两个 GitHub Secrets，不会把 PFX、密码或 base64 私钥材料打印到终端或写进仓库。之后在 GitHub Actions 手动运行 `Windows Signed Release`，下载的 artifact 才是可分发候选包。
+脚本会隐藏密码输入，通过标准输入写入 `WINDOWS_SIGNING_PFX_BASE64` 与 `WINDOWS_SIGNING_PFX_PASSWORD` 两个 GitHub Secrets，不会把 PFX、密码或 base64 私钥材料打印到终端或写进仓库。之后在 GitHub Actions 手动运行 `Windows Signed Candidate`，下载按 run ID 命名的 artifact；它不会自动创建 tag 或 GitHub Release。正式发布必须再从 tag 手动运行 `Windows Publish Release`，输入候选 run ID 和不可变 evidence commit SHA。
 
 如果证书私钥只能保存在 USB 硬件令牌或供应商云 HSM，不能导出 PFX，就不要把它迁移到 GitHub Secrets。应在受控 Windows 签名机上使用方案 A，或使用方案 B 的 Microsoft 托管身份，再执行同一个强制签名构建命令。
 
