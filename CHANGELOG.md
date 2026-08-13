@@ -16,6 +16,7 @@
 - Windows UI 采用 RemoteFlow 设计系统：近白色画布、4px 基线、Inter / 中文系统回退、#2563eb 主操作色、8px 组件圆角和低对比边框层级。
 - 发布边界收敛为 Windows 10/11 x64；macOS 源码保留为暂存研究代码，不进入本候选版本的构建、测试和发布承诺。
 - 修复 DirectLan 被拒绝后未保留回落原因的问题，并增加 FFI 中继回落回归测试，确认视频回落后控制输入和关键帧请求仍可用。
+- 远程画面质量状态改为基于最近 10 秒滚动窗口，避免一次历史卡顿长期污染当前提示；检测到明显卡顿时可在状态徽标中一键切换到流畅画质，切换期间会锁定操作并在确认或超时后恢复状态。
 
 ### 当前明确限制
 
@@ -26,10 +27,10 @@
 - 安装器只维护单一 `DeskLink.exe` 入口，旧的独立 host 文件和旧设备记录格式不会再参与启动或恢复。
 - 4K 原生编码和公网 NAT 穿透 P2P 尚未开放或承诺，当前以 2560×1440 为清晰度上限。
 
-### 最新验证记录（2026-07-31）
+### 最新验证记录（2026-08-13）
 
-- GitHub Actions Windows CI run `30571054699` 在提交 `f9d59255c9c580e5a2a6b8ecc417f0772523c184` 上通过：前端、Rust fmt/Clippy/tests、Windows production verification 和候选安装包构建全部成功。
-- 当前候选安装包 `DeskLinkSetup-0.1.91-x64.exe` 未签名，SHA-256：`24446a222ae170e518f302a1bbde077d24353b7306719536460e23b2167ea27b`。
+- 本轮稳定性修复已推送 `main`；前端 161 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Windows release verification 和安装包构建全部通过。
+- 当前候选安装包仍未签名；具体来源提交和 SHA-256 以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
 - 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。
 
