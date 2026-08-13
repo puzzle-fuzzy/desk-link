@@ -2258,7 +2258,10 @@ async fn run_controller(
 ) {
     let ControllerOutputChannels { signals, audio } = outputs;
     let diagnostics = DiagnosticLog::controller_for_current_user().ok();
-    let _ = set_session_correlation(DiagnosticSource::Controller, settings.session_id());
+    // Keep the marker only for the lifetime of this worker. A stale marker
+    // would make a later diagnostic probe look like part of an old session.
+    let _session_correlation =
+        set_session_correlation(DiagnosticSource::Controller, settings.session_id()).ok();
     let host_device_id = settings.host_device_id();
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
     let mut attempt = 0_u32;

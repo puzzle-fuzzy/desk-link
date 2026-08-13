@@ -413,8 +413,9 @@ impl HostManager {
             supervisor,
             diagnostics,
             session,
+            session_id,
         } = prepared;
-        if !self.start_pairing_worker(app, supervisor, diagnostics, generation) {
+        if !self.start_pairing_worker(app, supervisor, diagnostics, session_id, generation) {
             return Err("配对任务已取消。".to_owned());
         }
         Ok(session)
@@ -457,6 +458,7 @@ impl HostManager {
         app: AppHandle,
         supervisor: Box<HostSupervisor>,
         diagnostics: DiagnosticLog,
+        session_id: desklink_crypto::SessionId,
         generation: u64,
     ) -> bool {
         let _guard = self
@@ -470,6 +472,10 @@ impl HostManager {
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let manager = self.clone();
         let task = tauri::async_runtime::spawn(async move {
+            // The correlation marker must follow the worker, not the prepared
+            // object. If preparation is cancelled, no stale marker remains.
+            let _session_correlation =
+                set_session_correlation(DiagnosticSource::Host, session_id).ok();
             let finished = tokio::select! {
                 _ = (*supervisor).run() => true,
                 _ = shutdown_receiver => false,
@@ -594,7 +600,10 @@ impl HostManager {
             Ok(Ok(PreparedHost::Ready {
                 supervisor,
                 diagnostics,
+                session_id,
             })) => {
+                let _session_correlation =
+                    set_session_correlation(DiagnosticSource::Host, session_id).ok();
                 tokio::select! {
                     result = (*supervisor).run() => {
                         match result {
@@ -665,6 +674,7 @@ enum PreparedHost {
     Ready {
         supervisor: Box<HostSupervisor>,
         diagnostics: DiagnosticLog,
+        session_id: desklink_crypto::SessionId,
     },
     Unconfigured {
         diagnostics: DiagnosticLog,
@@ -675,6 +685,7 @@ struct PreparedPairing {
     supervisor: Box<HostSupervisor>,
     diagnostics: DiagnosticLog,
     session: PairingSessionSummary,
+    session_id: desklink_crypto::SessionId,
 }
 
 enum HostPreparationFailure {
@@ -748,7 +759,6 @@ fn prepare_host(
     else {
         return Ok(PreparedHost::Unconfigured { diagnostics });
     };
-    let _ = set_session_correlation(DiagnosticSource::Host, connection.session_id());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| HostPreparationFailure::Identity)?
         .load_or_create(&mut OsRng)
@@ -817,6 +827,7 @@ fn prepare_host(
     Ok(PreparedHost::Ready {
         supervisor: Box::new(supervisor),
         diagnostics,
+        session_id: connection.session_id(),
     })
 }
 
@@ -837,7 +848,6 @@ fn prepare_pairing(
         .load()
         .map_err(|_| HostPreparationFailure::ConnectionProtection)?
         .ok_or(HostPreparationFailure::ConnectionProtection)?;
-    let _ = set_session_correlation(DiagnosticSource::Host, connection.session_id());
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| HostPreparationFailure::Identity)?
         .load_or_create(&mut OsRng)
@@ -918,6 +928,7 @@ fn prepare_pairing(
         supervisor: Box::new(supervisor),
         diagnostics,
         session,
+        session_id: connection.session_id(),
     })
 }
 

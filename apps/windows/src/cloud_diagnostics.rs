@@ -98,12 +98,39 @@ struct SignedRequest {
 pub fn set_session_correlation(
     source: DiagnosticSource,
     session_id: SessionId,
-) -> Result<(), CloudDiagnosticError> {
+) -> Result<SessionCorrelationGuard, CloudDiagnosticError> {
     let path = correlation_path(source)?;
     let parent = path.parent().ok_or(CloudDiagnosticError::Storage)?;
     fs::create_dir_all(parent).map_err(|_| CloudDiagnosticError::Storage)?;
-    fs::write(path, correlation_identifier(session_id.as_bytes()))
-        .map_err(|_| CloudDiagnosticError::Storage)
+    let expected = correlation_identifier(session_id.as_bytes());
+    fs::write(path, &expected).map_err(|_| CloudDiagnosticError::Storage)?;
+    Ok(SessionCorrelationGuard { source, expected })
+}
+
+/// Removes a correlation marker only when it still belongs to the session that
+/// created this guard. A newer connection can therefore safely replace an old
+/// one without the old task clearing the newer session's diagnostics link.
+pub struct SessionCorrelationGuard {
+    source: DiagnosticSource,
+    expected: String,
+}
+
+impl Drop for SessionCorrelationGuard {
+    fn drop(&mut self) {
+        let Ok(path) = correlation_path(self.source) else {
+            return;
+        };
+        let Ok(value) = fs::read_to_string(&path) else {
+            return;
+        };
+        if correlation_marker_matches(&value, &self.expected) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn correlation_marker_matches(value: &str, expected: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(expected)
 }
 
 pub fn start_background_uploader() {
@@ -379,5 +406,12 @@ mod tests {
             installation_identifier(identity.verify_key().as_bytes()).len(),
             32
         );
+    }
+
+    #[test]
+    fn correlation_guard_only_matches_its_own_marker() {
+        assert!(correlation_marker_matches(" ABCD ", "abcd"));
+        assert!(!correlation_marker_matches("abcd0", "abcd"));
+        assert!(!correlation_marker_matches("abcd", "efgh"));
     }
 }
