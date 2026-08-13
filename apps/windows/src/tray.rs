@@ -164,7 +164,7 @@ mod windows_ui {
     use std::{
         ffi::c_void,
         mem::size_of,
-        sync::mpsc::{self, Receiver, SyncSender},
+        sync::mpsc::{self, Receiver, SyncSender, TrySendError},
         thread,
     };
 
@@ -251,6 +251,8 @@ mod windows_ui {
         Startup(String),
         #[error("Windows 托盘命令通道已关闭")]
         Closed,
+        #[error("Windows 托盘命令队列暂时已满")]
+        QueueFull,
     }
 
     enum TrayCommand {
@@ -284,9 +286,10 @@ mod windows_ui {
         }
 
         fn send(&self, command: TrayCommand) -> Result<(), WindowsTrayError> {
-            self.sender
-                .send(command)
-                .map_err(|_| WindowsTrayError::Closed)?;
+            self.sender.try_send(command).map_err(|error| match error {
+                TrySendError::Full(_) => WindowsTrayError::QueueFull,
+                TrySendError::Disconnected(_) => WindowsTrayError::Closed,
+            })?;
             let hwnd = HWND(self.hwnd as *mut c_void);
             unsafe { PostMessageW(Some(hwnd), WM_TRAY_COMMAND, WPARAM(0), LPARAM(0))? };
             Ok(())
