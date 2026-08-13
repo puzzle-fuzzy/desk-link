@@ -80,6 +80,7 @@ import {
   connectionProgressPresentation,
   formatConnectionElapsed,
 } from "./connection-progress";
+import { connectionQualitySummary } from "./connection-quality";
 import { icon, renderLucideIcons } from "./icons";
 import { isH264Keyframe, prepareH264AccessUnit } from "./h264-annex-b";
 import { RemoteAudioPlayer } from "./remote-audio";
@@ -175,6 +176,8 @@ let videoPaintFrame: number | null = null;
 let receivedVideoFrames = 0;
 let submittedVideoFrames = 0;
 let transportCompletedFrames = 0;
+let transportReceivedVideoPackets = 0;
+let transportDroppedVideoPackets = 0;
 let activeVideoPath: VideoPathKind = "relay";
 let malformedVideoFrames = 0;
 let decoderRecoveries = 0;
@@ -294,6 +297,8 @@ function resetVideoTelemetry(): void {
   receivedVideoFrames = 0;
   submittedVideoFrames = 0;
   transportCompletedFrames = 0;
+  transportReceivedVideoPackets = 0;
+  transportDroppedVideoPackets = 0;
   activeVideoPath = "relay";
   malformedVideoFrames = 0;
   decodedFrames = 0;
@@ -942,6 +947,7 @@ function transferToolbarActivityView(): {
 
 function renderRemoteDesktop(): string {
   const config = videoConfig;
+  const quality = currentConnectionQualitySummary();
   const videoFailed = config ? failedVideoConfig === videoConfigKey(config) : false;
   const reconnecting = snapshot?.runtime.state !== "connected" && remoteSurfaceState === "retaining";
   const remoteStatusDetail = reconnecting
@@ -954,7 +960,7 @@ function renderRemoteDesktop(): string {
       <div class="remote-toolbar">
         <div class="remote-toolbar-status">
           <span class="remote-live-dot" data-controller-remote-live-dot data-state="${reconnecting ? "reconnecting" : "connected"}" aria-hidden="true"></span>
-          <div><strong data-controller-remote-status-title>${reconnecting ? "画面已保留，正在恢复连接" : "实时远程桌面"}</strong><small data-controller-metrics>${escapeHtml(remoteStatusDetail)}</small><span class="remote-video-path" data-controller-video-path data-path="${activeVideoPath}" title="${escapeHtml(remoteVideoPathDescription(activeVideoPath))}">${icon(activeVideoPath === "directLan" ? "monitor" : "globe-lock")}<span>${remoteVideoPathLabel(activeVideoPath)}</span></span></div>
+          <div><strong data-controller-remote-status-title>${reconnecting ? "画面已保留，正在恢复连接" : "实时远程桌面"}</strong><small data-controller-metrics>${escapeHtml(remoteStatusDetail)}</small><div class="remote-session-badges">${renderRemoteQualityBadge(quality)}<span class="remote-video-path" data-controller-video-path data-path="${activeVideoPath}" title="${escapeHtml(remoteVideoPathDescription(activeVideoPath))}">${icon(activeVideoPath === "directLan" ? "monitor" : "globe-lock")}<span>${remoteVideoPathLabel(activeVideoPath)}</span></span></div></div>
         </div>
         <div class="remote-toolbar-actions">
           <label class="remote-quality-picker" title="根据当前网络调整远程画面的清晰度和流畅度">
@@ -1606,7 +1612,10 @@ function handleSignal(signal: ControllerSignal): void {
     case "metrics": {
       transportCompletedFrames = signal.completedFrames;
       activeVideoPath = signal.videoPath;
+      transportReceivedVideoPackets = signal.receivedVideoPackets;
+      transportDroppedVideoPackets = signal.droppedVideoPackets;
       updateRemoteVideoPathBadge();
+      updateRemoteQualityBadge();
       updateVideoStartingMessage();
       reportRenderMetrics();
       break;
@@ -2736,6 +2745,7 @@ function reportRenderMetrics(force = false): void {
   }
   lastRenderMetricsReportedAtMs = now;
   const renderTiming = videoRenderTiming.snapshot(performance.now());
+  updateRemoteQualityBadge();
   const h264Profile = h264ProfileFromCodec(h264CodecFromSequenceHeader(videoSequenceHeader));
   void reportControllerRenderMetrics({
     streamId: videoConfig.streamId,
@@ -2910,6 +2920,41 @@ function updateRemoteVideoPathBadge(): void {
   element.title = remoteVideoPathDescription(activeVideoPath);
   element.innerHTML = `${icon(activeVideoPath === "directLan" ? "monitor" : "globe-lock")}<span>${remoteVideoPathLabel(activeVideoPath)}</span>`;
   renderLucideIcons(element);
+}
+
+function currentConnectionQualitySummary() {
+  const timing = videoRenderTiming.snapshot(performance.now());
+  return connectionQualitySummary({
+    decodedFrames,
+    displayedFpsX100: timing.displayedFpsX100,
+    maxFrameGapMs: timing.maxFrameGapMs,
+    receivedVideoPackets: transportReceivedVideoPackets,
+    droppedVideoPackets: transportDroppedVideoPackets,
+  });
+}
+
+function renderRemoteQualityBadge(summary = currentConnectionQualitySummary()): string {
+  const badgeIcon = summary.tone === "good"
+    ? "circle-check"
+    : summary.tone === "measuring"
+      ? "loader-circle"
+      : "triangle-alert";
+  return `<span class="remote-quality-status remote-quality-status--${summary.tone}" data-controller-quality-status data-tone="${summary.tone}" title="${escapeHtml(summary.detail)}">${icon(badgeIcon, summary.tone === "measuring" ? "controller-spinner" : "")}<span>${summary.label}</span></span>`;
+}
+
+function updateRemoteQualityBadge(): void {
+  const element = document.querySelector<HTMLElement>("[data-controller-quality-status]");
+  if (!element) {
+    return;
+  }
+  const summary = currentConnectionQualitySummary();
+  element.dataset.tone = summary.tone;
+  element.title = summary.detail;
+  element.outerHTML = renderRemoteQualityBadge(summary);
+  const replacement = document.querySelector<HTMLElement>("[data-controller-quality-status]");
+  if (replacement) {
+    renderLucideIcons(replacement);
+  }
 }
 
 function changeRemoteScaleMode(value: string): void {
