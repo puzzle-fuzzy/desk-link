@@ -116,6 +116,10 @@ impl ReconnectSchedule {
         self.policy.max_retries
     }
 
+    pub const fn max_delay(&self) -> Duration {
+        self.policy.max_delay
+    }
+
     /// Updates the lifetime of a session after a directory lookup resolves an
     /// invitation. Pairing-code connections know their expiry before the
     /// worker starts; directory connections only learn it asynchronously.

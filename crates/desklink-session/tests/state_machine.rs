@@ -247,6 +247,7 @@ fn reconnect_schedule_uses_bounded_exponential_delays_and_exhausts() {
         ]
     );
     assert_eq!(schedule.next(1_000), ReconnectDecision::Exhausted);
+    assert_eq!(schedule.max_delay(), Duration::from_secs(1));
 }
 
 #[test]

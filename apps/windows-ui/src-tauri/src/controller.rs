@@ -310,6 +310,18 @@ impl ControllerRuntimeSummary {
         }
     }
 
+    fn reconnecting_persistently(delay: Duration) -> Self {
+        Self {
+            state: "reconnecting",
+            title: "正在等待主机恢复".to_owned(),
+            detail: format!(
+                "固定密码连接仍在恢复中，DeskLink 将在 {} 毫秒后继续尝试。可以随时取消连接。",
+                delay.as_millis()
+            ),
+            stream_id: None,
+        }
+    }
+
     fn stopped(detail: impl Into<String>) -> Self {
         Self {
             state: "stopped",
@@ -2392,6 +2404,7 @@ async fn run_controller(
                             failure,
                             ControllerWaitChannels {
                                 generation,
+                                persistent: settings.is_persistent(),
                                 commands: &mut commands,
                                 cancellation: &mut cancellation,
                             },
@@ -2414,6 +2427,7 @@ async fn run_controller(
                 failure,
                 ControllerWaitChannels {
                     generation,
+                    persistent: settings.is_persistent(),
                     commands: &mut commands,
                     cancellation: &mut cancellation,
                 },
@@ -2435,6 +2449,7 @@ async fn run_controller(
                 failure,
                 ControllerWaitChannels {
                     generation,
+                    persistent: settings.is_persistent(),
                     commands: &mut commands,
                     cancellation: &mut cancellation,
                 },
@@ -3772,6 +3787,7 @@ async fn run_controller(
             failure,
             ControllerWaitChannels {
                 generation,
+                persistent: settings.is_persistent(),
                 commands: &mut commands,
                 cancellation: &mut cancellation,
             },
@@ -4306,6 +4322,7 @@ async fn schedule_failure(
     attempt: u32,
 ) -> bool {
     let generation = wait_channels.generation;
+    let persistent = wait_channels.persistent;
     if !failure.retryable {
         record_controller_diagnostic(
             diagnostics,
@@ -4354,6 +4371,35 @@ async fn schedule_failure(
                 }
             }
         }
+        ReconnectDecision::Exhausted if persistent => {
+            let delay = schedule.max_delay();
+            schedule.reset();
+            record_controller_diagnostic(
+                diagnostics,
+                ControllerDiagnosticStage::RetryScheduled,
+                attempt,
+                None,
+                Some(delay),
+                Some(&format!(
+                    "persistent session continues after retry budget: {}",
+                    failure.technical_reason
+                )),
+            );
+            manager.publish_if_current(
+                generation,
+                signals,
+                ControllerRuntimeSummary::reconnecting_persistently(delay),
+            );
+            match wait_for_retry_deadline(wait_channels.commands, wait_channels.cancellation, delay)
+                .await
+            {
+                RetryWaitOutcome::Retry => true,
+                RetryWaitOutcome::Cancelled => {
+                    finish_cancelled(manager, generation, signals, diagnostics, attempt, None);
+                    false
+                }
+            }
+        }
         ReconnectDecision::Exhausted | ReconnectDecision::SessionExpired => {
             record_controller_diagnostic(
                 diagnostics,
@@ -4377,6 +4423,7 @@ async fn schedule_failure(
 
 struct ControllerWaitChannels<'a> {
     generation: u64,
+    persistent: bool,
     commands: &'a mut mpsc::Receiver<ControllerCommand>,
     cancellation: &'a mut watch::Receiver<bool>,
 }
@@ -5558,6 +5605,17 @@ mod tests {
         assert!(failure.retryable);
         assert_eq!(failure.kind, "session_not_found");
         assert!(failure.detail.contains("自动重试"));
+    }
+
+    #[test]
+    fn persistent_reconnect_summary_explains_that_recovery_continues() {
+        let summary =
+            super::ControllerRuntimeSummary::reconnecting_persistently(Duration::from_secs(8));
+
+        assert_eq!(summary.state, "reconnecting");
+        assert!(summary.title.contains("等待主机恢复"));
+        assert!(summary.detail.contains("继续尝试"));
+        assert!(summary.detail.contains("取消连接"));
     }
 
     #[test]
