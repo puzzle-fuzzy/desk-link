@@ -201,6 +201,35 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                     expected_installer_sha256=manifest["installer"]["sha256"],
                 )
 
+    def test_manual_acceptance_rejects_a_different_installer_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            record = {
+                "schema": 1,
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {
+                    "file_name": "DeskLinkSetup-0.1.42-x64-copy.exe",
+                    "sha256": installer["sha256"],
+                },
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "installer"):
+                self.ready.load_manual_acceptance(
+                    path,
+                    expected_version="0.1.42",
+                    expected_commit="a" * 40,
+                    expected_installer_sha256=installer["sha256"],
+                )
+
     def test_release_tag_requires_an_annotated_tag_object(self) -> None:
         annotated = type("Completed", (), {"returncode": 0, "stdout": b"tag\n"})()
         with patch.object(self.ready.subprocess, "run", return_value=annotated) as run:

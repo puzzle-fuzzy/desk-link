@@ -62,12 +62,15 @@ def load_manual_acceptance(
     if value.get("source_commit") != expected_commit:
         raise ValueError("manual acceptance record source commit does not match the candidate")
     installer = value.get("installer")
+    expected_installer_name = (
+        f"DeskLinkSetup-{expected_version}-x64.exe" if expected_version else ""
+    )
     if (
         not isinstance(installer, dict)
         or not isinstance(expected_installer_sha256, str)
+        or installer.get("file_name") != expected_installer_name
         or re.fullmatch(r"[0-9a-f]{64}", installer.get("sha256", "")) is None
         or installer.get("sha256") != expected_installer_sha256
-        or not isinstance(installer.get("file_name"), str)
     ):
         raise ValueError("manual acceptance record is not bound to the candidate installer")
     operator = value.get("operator")
