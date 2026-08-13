@@ -86,6 +86,24 @@ describe("correlated diagnostic analysis", () => {
     ]);
   });
 
+  test("does not call a user-cancelled pre-connection retry loop oscillation", () => {
+    const rows = [
+      event("controller_connecting", 0),
+      ...[1, 2, 3, 4].map((retry) => event("controller_retry_scheduled", retry * 1_000, {
+        attempt: retry,
+        retry,
+        delay_ms: 1_000,
+        reason: "session_not_found: join rejected: SessionNotFound",
+      })),
+      event("controller_cancelled", 5_000),
+    ];
+    const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
+    expect(session.outcome).toBe("incomplete");
+    expect(session.findings.map((finding) => finding.code)).toEqual([
+      "incomplete_evidence",
+    ]);
+  });
+
   test("reports an expired approval wait without inventing a media failure", () => {
     const rows = [event("controller_waiting_for_approval", -5 * 60_000)];
     const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;

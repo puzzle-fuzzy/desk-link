@@ -179,6 +179,7 @@ function analyzeSession(
   const count = (name: string) => events.filter((event) => event.event === name).length;
   const retryCount = count("controller_retry_scheduled");
   const connectedCount = count("controller_connected");
+  const cancelledCount = count("controller_cancelled");
   const controllerStopped = events.filter((event) => event.event === "controller_stopped");
   const hostStopped = events.filter((event) => event.event === "host_stopped");
   const videoAttempts = videoByAttempt(events);
@@ -253,7 +254,11 @@ function analyzeSession(
       detail: "主机记录了停止事件，需要按同一关联编号检查停止前的恢复阶段。",
     });
   }
-  if (retryCount >= OSCILLATION_RETRY_COUNT) {
+  const userCancelledBeforeConnection = cancelledCount > 0
+    && connectedCount === 0
+    && controllerStopped.length === 0
+    && hostStopped.length === 0;
+  if (retryCount >= OSCILLATION_RETRY_COUNT && !userCancelledBeforeConnection) {
     findings.push({
       code: "reconnect_oscillation",
       severity: "warning",
