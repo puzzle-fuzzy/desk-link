@@ -3996,3 +3996,36 @@ textarea {
   cursor: wait;
   opacity: 0.7;
 }
+
+/* Keep the product surface usable when Windows forces a high-contrast theme.
+   These system colors intentionally replace the decorative palette only in
+   forced-colors mode; normal light-mode styling remains unchanged. */
+@media (forced-colors: active) {
+  :where(button, input, select, textarea, a):focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 3px;
+  }
+
+  :where(.button, .toolbar-button, .topbar-menu-toggle, .sidebar-nav-item, .utility-menu-item, .back-button) {
+    border-color: ButtonText;
+    background: ButtonFace;
+    color: ButtonText;
+  }
+
+  :where(.button--primary, .sidebar-nav-item--active, .utility-menu-item--active, .topbar-menu-toggle--active) {
+    border-color: Highlight;
+    background: Highlight;
+    color: HighlightText;
+  }
+
+  :where(.button:disabled, .toolbar-button:disabled, .topbar-menu-toggle:disabled) {
+    border-color: GrayText;
+    color: GrayText;
+  }
+
+  :where(.remote-video-path, .remote-quality-status, .remote-quality-status__action) {
+    border-color: ButtonText;
+    background: Canvas;
+    color: CanvasText;
+  }
+}
