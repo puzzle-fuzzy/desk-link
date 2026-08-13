@@ -84,6 +84,7 @@ const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
 const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
+const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
 
 #[derive(Clone)]
 pub struct RelaySessionTable {
@@ -458,6 +459,7 @@ struct RelayState {
     participants: Mutex<HashMap<u64, Participant>>,
     directory: Mutex<HashMap<u64, DirectoryRecord>>,
     lookup_attempts: Mutex<HashMap<(IpAddr, u64), LookupAttempt>>,
+    admission_rejection_slots: Arc<Semaphore>,
     next_connection_id: AtomicU64,
     active_connections: std::sync::atomic::AtomicUsize,
 }
@@ -864,6 +866,7 @@ impl RelayServer {
             participants: Mutex::new(HashMap::new()),
             directory: Mutex::new(HashMap::new()),
             lookup_attempts: Mutex::new(HashMap::new()),
+            admission_rejection_slots: Arc::new(Semaphore::new(MAX_ADMISSION_REJECTION_TASKS)),
             next_connection_id: AtomicU64::new(1),
             active_connections: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -911,15 +914,24 @@ impl RelayServer {
                     let Some(incoming) = incoming else { return Ok(()); };
                     let state = self.state.clone();
                     if !state.try_reserve_connection() {
-                        tokio::spawn(async move {
-                            if let Ok(connection) = incoming.await {
-                                connection.close(
-                                    quinn::VarInt::from_u32(RELAY_CONNECTION_LIMIT_CLOSE_CODE),
-                                    b"connection admission limit reached",
-                                );
-                                let _ = connection.closed().await;
-                            }
-                        });
+                        // Keep the stable connection-limit error for a bounded number of peers,
+                        // but never create an unbounded number of tasks while an admission flood
+                        // is waiting for its QUIC handshake. Excess peers are refused directly.
+                        if let Ok(permit) = state.admission_rejection_slots.clone().try_acquire_owned()
+                        {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Ok(connection) = incoming.await {
+                                    connection.close(
+                                        quinn::VarInt::from_u32(RELAY_CONNECTION_LIMIT_CLOSE_CODE),
+                                        b"connection admission limit reached",
+                                    );
+                                    let _ = connection.closed().await;
+                                }
+                            });
+                        } else {
+                            incoming.refuse();
+                        }
                         continue;
                     }
                     let connection_id = state.next_connection_id();
