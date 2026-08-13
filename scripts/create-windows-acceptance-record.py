@@ -20,6 +20,11 @@ MANUAL_CHECK_IDS = (
     "long_soak_acceptance",
     "smartscreen_acceptance",
 )
+EXPECTED_SCOPE = {
+    "target": "windows-10/11-x64",
+    "macos_release": False,
+    "mobile_release": False,
+}
 
 
 def git_head(root: Path) -> str:
@@ -68,6 +73,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_candidate_manifest(
+    manifest: dict[str, object],
+    *,
+    version: str,
+    source_commit: str,
+    installer_name: str,
+    installer_path: Path,
+) -> str:
+    if (
+        manifest.get("schema") != 1
+        or manifest.get("passed") is not True
+        or manifest.get("version") != version
+        or manifest.get("source_commit") != source_commit
+        or manifest.get("source_dirty") is not False
+        or manifest.get("release_scope") != EXPECTED_SCOPE
+    ):
+        raise ValueError("Installer manifest is stale or does not match the current Windows candidate")
+    installer = manifest.get("installer")
+    expected_sha256 = installer.get("sha256") if isinstance(installer, dict) else None
+    expected_size = installer.get("size_bytes") if isinstance(installer, dict) else None
+    if (
+        not isinstance(installer, dict)
+        or installer.get("file_name") != installer_name
+        or not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or expected_size != installer_path.stat().st_size
+        or expected_sha256 != file_sha256(installer_path)
+    ):
+        raise ValueError("Installer manifest is stale or does not match the current installer")
+    return expected_sha256
+
+
 def main() -> int:
     arguments = parse_args()
     operator = arguments.operator.strip()
@@ -81,22 +118,22 @@ def main() -> int:
     if not installer_path.is_file() or not manifest_path.is_file():
         raise SystemExit("Build the Windows candidate before creating its acceptance record")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    installer = manifest.get("installer")
-    if (
-        manifest.get("version") != version
-        or manifest.get("source_commit") != source_commit
-        or manifest.get("source_dirty") is not False
-        or not isinstance(installer, dict)
-        or installer.get("file_name") != installer_name
-        or installer.get("sha256") != file_sha256(installer_path)
-    ):
-        raise SystemExit("Installer manifest is stale or does not match the current source commit")
+    try:
+        installer_sha256 = validate_candidate_manifest(
+            manifest,
+            version=version,
+            source_commit=source_commit,
+            installer_name=installer_name,
+            installer_path=installer_path,
+        )
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     record = {
         "schema": 1,
         "product": "DeskLink Windows acceptance",
         "version": version,
         "source_commit": source_commit,
-        "installer": {"file_name": installer_name, "sha256": installer["sha256"]},
+        "installer": {"file_name": installer_name, "sha256": installer_sha256},
         "operator": operator,
         "recorded_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "checks": {check_id: False for check_id in MANUAL_CHECK_IDS},
