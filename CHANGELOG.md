@@ -42,6 +42,8 @@
 - 正式 Windows Release 上传前会再次调用 SignTool 验证最终安装器的 Authenticode 签名，不再只信任清单中的 `signed` 标记。
 - Windows 安装器现在在写入程序前检查 WebView2 Evergreen Runtime；缺失或无效时明确提示官方运行时安装地址，避免留下半安装程序后才显示空白页面。
 - 中继证书加载迁移到 rustls 内置 PEM 类型，移除已停止维护的 `rustls-pemfile` 依赖。
+- 将 `event-listener` 锁定到已修复线程安全问题的 `5.4.2`，并通过完整 Rust workspace 门禁。
+- Windows UI 增加强制高对比度颜色、焦点可见性、减少动效、1920/2560 宽屏和长文本溢出回归契约。
 
 ### 当前明确限制
 
@@ -54,7 +56,7 @@
 
 ### 最新验证记录（2026-08-13）
 
-- 本轮稳定性修复已推送 `main`；主机生命周期代数闸门和“更多”菜单键盘交互修复后的候选物料已重新生成。前端 169 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Windows release verification 和安装包构建全部通过。
+- 本轮稳定性修复已推送 `main`；候选提交 `0991ef634031c8e13858409fd06fdbd7598217ad` 的中继镜像、Windows 安装包和运维证据已重新生成并完成来源绑定。前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 50 项脚本测试、Windows release verification、安装包构建和 10 秒 resilience 门禁全部通过。
 - 当前候选安装包仍未签名；安装器来源、大小和 SHA-256 必须以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准，文档不固定写入会随候选构建变化的动态 SHA。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
 - 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。

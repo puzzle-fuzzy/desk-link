@@ -34,6 +34,7 @@
 - [x] 账号 HTTP 客户端初始化异常时保持账号能力快速失败，不回退到无界网络请求；本机模式仍可继续使用。
 - [x] 正式 Release 上传前重新验证最终安装器 Authenticode 签名，防止签名清单与实际二进制脱钩。
 - [x] 中继证书加载改用 `rustls::pki_types::pem::PemObject`，移除已停止维护的 `rustls-pemfile` 运行时依赖；workspace 级 RustSec 告警仍按平台依赖单独复核。
+- [x] 将 RustSec 标记为线程安全问题的 `event-listener` 从 5.4.1 升级到已修复的 5.4.2；剩余 GTK/GLib 告警仅来自非 Windows 桌面依赖链，继续按平台边界跟踪。
 - [x] 发布预检同时校验公网中继探针、线上容器源码 revision 与候选提交，避免旧中继通过网络探针但与候选版本不一致。
 - [x] 发布预检同时校验 annotated tag 的解引用提交必须等于候选 HEAD，避免旧提交上的同名 tag 错误放行。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
