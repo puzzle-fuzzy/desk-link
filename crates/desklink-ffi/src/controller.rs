@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -45,6 +46,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ASSEMBLY_CAPACITY: usize = 3;
 const ASSEMBLY_MAX_AGE: Duration = Duration::from_millis(500);
+const PENDING_VIDEO_DATAGRAM_CAPACITY: usize = 256;
 // A successful authenticated probe only proves that the endpoints can open a
 // datagram socket. If a firewall silently drops the subsequent video packets,
 // do not leave the controller on a permanently black direct surface.
@@ -117,6 +119,7 @@ pub struct ControllerRuntime {
     input_sequence: Mutex<InputSequencer>,
     assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
+    pending_video_datagrams: VecDeque<Vec<u8>>,
     active_stream: AtomicU64,
     metrics: AtomicControllerMetrics,
     keyframe_needed_after_config: bool,
@@ -217,6 +220,7 @@ impl ControllerRuntime {
             input_sequence: Mutex::new(InputSequencer::new()),
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
             video_config: None,
+            pending_video_datagrams: VecDeque::new(),
             active_stream: AtomicU64::new(0),
             metrics: AtomicControllerMetrics::default(),
             keyframe_needed_after_config: false,
@@ -353,6 +357,14 @@ impl ControllerRuntime {
 
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
         loop {
+            if self.video_config.is_some()
+                && let Some(ciphertext) = self.pending_video_datagrams.pop_front()
+            {
+                if let Some(event) = self.handle_video_datagram(ciphertext).await? {
+                    return Ok(event);
+                }
+                continue;
+            }
             match self.next_transport_event().await? {
                 TransportEvent::Control(ciphertext) => {
                     let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
@@ -430,57 +442,17 @@ impl ControllerRuntime {
                     self.metrics
                         .received_video_packets
                         .fetch_add(1, Ordering::Relaxed);
-                    let plaintext =
-                        open(&self.secure, SecureLane::VideoDatagram, &ciphertext).await?;
-                    let packet = decode_video_packet(&plaintext)?;
-                    let Some(config) = &self.video_config else {
-                        self.drop_video_packet();
+                    if self.video_config.is_none() {
+                        if self.pending_video_datagrams.len() >= PENDING_VIDEO_DATAGRAM_CAPACITY {
+                            self.pending_video_datagrams.pop_front();
+                            self.drop_video_packet();
+                        }
+                        self.pending_video_datagrams.push_back(ciphertext);
                         self.keyframe_needed_after_config = true;
                         continue;
-                    };
-                    if packet.header.stream_id != config.stream_id
-                        || packet.header.config_version != config.config_version
-                        || packet.header.width != config.width
-                        || packet.header.height != config.height
-                    {
-                        self.drop_video_packet();
-                        continue;
                     }
-                    let assembled = self.assembler.push(Instant::now(), packet);
-                    let dropped_chunks = self.assembler.take_dropped_chunks();
-                    if dropped_chunks > 0 {
-                        self.metrics
-                            .dropped_video_packets
-                            .fetch_add(dropped_chunks, Ordering::Relaxed);
-                        self.video_continuity.note_transport_loss();
-                    }
-                    match assembled {
-                        AssembleResult::Pending => {}
-                        AssembleResult::Dropped(_) => self.drop_video_packet(),
-                        AssembleResult::Complete(frame) => {
-                            let is_keyframe =
-                                frame.flags.0 & desklink_protocol::FrameFlags::KEYFRAME.0 != 0;
-                            match self.video_continuity.observe_frame(
-                                frame.frame_id,
-                                is_keyframe,
-                                Instant::now(),
-                            ) {
-                                VideoContinuityAction::Present => {
-                                    if self.assembler.accept_for_present(frame.clone()) {
-                                        self.metrics
-                                            .completed_frames
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        return Ok(ControllerEvent::H264AccessUnit(frame));
-                                    }
-                                    self.drop_video_packet();
-                                }
-                                VideoContinuityAction::Drop => self.drop_video_packet(),
-                                VideoContinuityAction::DropAndRequestKeyframe => {
-                                    self.drop_video_packet();
-                                    self.request_keyframe_for(config.stream_id).await?;
-                                }
-                            }
-                        }
+                    if let Some(event) = self.handle_video_datagram(ciphertext).await? {
+                        return Ok(event);
                     }
                 }
                 TransportEvent::CursorDatagram(ciphertext) => {
@@ -518,6 +490,72 @@ impl ControllerRuntime {
                 }
                 TransportEvent::Closed { reason } => {
                     return Ok(ControllerEvent::Closed { reason });
+                }
+            }
+        }
+    }
+
+    async fn handle_video_datagram(
+        &mut self,
+        ciphertext: Vec<u8>,
+    ) -> Result<Option<ControllerEvent>, ControllerError> {
+        let plaintext = open(&self.secure, SecureLane::VideoDatagram, &ciphertext).await?;
+        let packet = decode_video_packet(&plaintext)?;
+        let Some(config) = &self.video_config else {
+            self.drop_video_packet();
+            self.keyframe_needed_after_config = true;
+            return Ok(None);
+        };
+        if packet.header.stream_id != config.stream_id
+            || packet.header.config_version != config.config_version
+            || packet.header.width != config.width
+            || packet.header.height != config.height
+        {
+            self.drop_video_packet();
+            return Ok(None);
+        }
+        let stream_id = config.stream_id;
+        let assembled = self.assembler.push(Instant::now(), packet);
+        let dropped_chunks = self.assembler.take_dropped_chunks();
+        if dropped_chunks > 0 {
+            self.metrics
+                .dropped_video_packets
+                .fetch_add(dropped_chunks, Ordering::Relaxed);
+            self.video_continuity.note_transport_loss();
+        }
+        match assembled {
+            AssembleResult::Pending => Ok(None),
+            AssembleResult::Dropped(_) => {
+                self.drop_video_packet();
+                Ok(None)
+            }
+            AssembleResult::Complete(frame) => {
+                let is_keyframe = frame.flags.0 & desklink_protocol::FrameFlags::KEYFRAME.0 != 0;
+                match self.video_continuity.observe_frame(
+                    frame.frame_id,
+                    is_keyframe,
+                    Instant::now(),
+                ) {
+                    VideoContinuityAction::Present => {
+                        if self.assembler.accept_for_present(frame.clone()) {
+                            self.metrics
+                                .completed_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                            Ok(Some(ControllerEvent::H264AccessUnit(frame)))
+                        } else {
+                            self.drop_video_packet();
+                            Ok(None)
+                        }
+                    }
+                    VideoContinuityAction::Drop => {
+                        self.drop_video_packet();
+                        Ok(None)
+                    }
+                    VideoContinuityAction::DropAndRequestKeyframe => {
+                        self.drop_video_packet();
+                        self.request_keyframe_for(stream_id).await?;
+                        Ok(None)
+                    }
                 }
             }
         }

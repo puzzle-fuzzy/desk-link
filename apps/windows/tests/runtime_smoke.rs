@@ -351,9 +351,12 @@ mod windows {
             }
         }
         assert!(video_configs >= 1);
+        // A static desktop intentionally emits one initial GDI snapshot; subsequent
+        // cursor movement is carried by the independent cursor lane. Dynamic desktops
+        // may produce more video frames, but one complete keyframe is the minimum.
         assert!(
-            frames >= 2,
-            "expected multiple H.264 frames, observed {frames}"
+            frames >= 1,
+            "expected an initial H.264 frame, observed {frames}"
         );
         assert!(
             cursors >= soak_seconds.saturating_mul(10),

@@ -540,6 +540,28 @@ async fn run_fake_host(
         .await;
     }
 
+    let frame = EncodedFrame {
+        stream_id: 9,
+        frame_id: 11,
+        config_version: 3,
+        capture_timestamp_us: 123,
+        width: 1280,
+        height: 720,
+        flags: FrameFlags(FrameFlags::KEYFRAME.0 | FrameFlags::CONFIG.0),
+        data: vec![0x5a; 2_500],
+    };
+    let mut packets = packetize_frame(&frame).unwrap();
+    packets.reverse();
+    let first_packet = packets.pop().expect("fake frame has packets");
+    let first_plaintext = encode_video_packet(&first_packet).unwrap();
+    host.send_video_datagram(
+        secure
+            .seal(SecureLane::VideoDatagram, &first_plaintext)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,
         stream_id: 9,
@@ -557,18 +579,6 @@ async fn run_fake_host(
         .unwrap();
     continue_receiver.await.unwrap();
 
-    let frame = EncodedFrame {
-        stream_id: 9,
-        frame_id: 11,
-        config_version: 3,
-        capture_timestamp_us: 123,
-        width: 1280,
-        height: 720,
-        flags: FrameFlags(FrameFlags::KEYFRAME.0 | FrameFlags::CONFIG.0),
-        data: vec![0x5a; 2_500],
-    };
-    let mut packets = packetize_frame(&frame).unwrap();
-    packets.reverse();
     for packet in packets {
         let plaintext = encode_video_packet(&packet).unwrap();
         host.send_video_datagram(secure.seal(SecureLane::VideoDatagram, &plaintext).unwrap())
