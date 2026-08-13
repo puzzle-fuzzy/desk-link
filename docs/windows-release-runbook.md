@@ -21,6 +21,8 @@
 
 ## 2. 自动门禁
 
+两台真实 Windows 的手工项目按 [Windows 双机验收记录](windows-two-pc-acceptance.md) 执行；该记录只描述当前候选协议线，不包含旧版本兼容路径。
+
 在 Windows x64 工作目录执行：
 
 ```powershell

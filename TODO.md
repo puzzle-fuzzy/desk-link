@@ -84,6 +84,7 @@
 - [x] 统一 `DESIGN.md` 与 Windows UI 样式 token，删除多轮迭代产生的冲突规则。
 - [ ] 手动验收键盘导航、焦点可见性、高对比度、WebView2 缩放和中文文案溢出。
 - [x] 将发布前检查、服务器回滚和日志脱敏流程写入 [Windows 发布运行手册](docs/windows-release-runbook.md)。
+- [x] 将同网/跨网、断线恢复、双屏/DPI、剪贴板/文件和长稳验收步骤整理到 [Windows 双机验收记录](docs/windows-two-pc-acceptance.md)。
 
 ## 6. Apple 端开发与验收（2026-07-26）
 
