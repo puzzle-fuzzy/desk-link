@@ -57,7 +57,7 @@
 
 ### 最新验证记录（2026-08-13）
 
-- 本轮稳定性修复已推送 `main`；候选提交 `0991ef634031c8e13858409fd06fdbd7598217ad` 的中继镜像、Windows 安装包和运维证据已重新生成并完成来源绑定。前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 50 项脚本测试、Windows release verification、安装包构建和 10 秒 resilience 门禁全部通过。
+- 本轮稳定性修复已推送 `main`；中继镜像、Windows 安装包和运维证据会在每次候选提交后重新生成并完成来源绑定。除真实双机验收外，前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 50 项脚本测试、Windows release verification、安装包构建和 10 秒 resilience 门禁均已通过；原生 FFI 控制端和主机端的网络黑洞也已纳入有界超时。
 - 当前候选安装包仍未签名；安装器来源、大小和 SHA-256 必须以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准，文档不固定写入会随候选构建变化的动态 SHA。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
 - 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。
