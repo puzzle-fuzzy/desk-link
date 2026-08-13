@@ -63,4 +63,22 @@ describe("video render timing", () => {
       coalescedFrameDrops: 0,
     });
   });
+
+  test("quality snapshot recovers after an old stall leaves the rolling window", () => {
+    const timing = new VideoRenderTiming();
+    timing.observe(0);
+    timing.observe(33);
+    timing.observe(1_000);
+    expect(timing.recentSnapshot(1_000).maxFrameGapMs).toBe(967);
+
+    timing.observe(10_100);
+    timing.observe(10_133);
+    timing.observe(10_300);
+    expect(timing.recentSnapshot(10_500)).toEqual({
+      displayedFpsX100: 750,
+      maxFrameGapMs: 200,
+      coalescedFrameDrops: 0,
+    });
+    expect(timing.snapshot(10_500).maxFrameGapMs).toBe(9_100);
+  });
 });

@@ -6,6 +6,7 @@ export interface VideoRenderTimingSnapshot {
 
 const MAX_FRAME_GAP_MS = 60_000;
 const MAX_FPS_X100 = 12_000;
+const QUALITY_WINDOW_MS = 10_000;
 
 /**
  * Low-overhead timing for the canvas presentation path.
@@ -20,6 +21,10 @@ export class VideoRenderTiming {
   private maxGapMs = 0;
   private coalescedFrameDrops = 0;
   private pendingCoalescedFrameDrops = 0;
+  private recentWindowStartedAtMs: number | null = null;
+  private recentPreviousPresentedAtMs: number | null = null;
+  private recentDisplayedFrames = 0;
+  private recentMaxGapMs = 0;
 
   reset(): void {
     this.displayedFrames = 0;
@@ -28,6 +33,10 @@ export class VideoRenderTiming {
     this.maxGapMs = 0;
     this.coalescedFrameDrops = 0;
     this.pendingCoalescedFrameDrops = 0;
+    this.recentWindowStartedAtMs = null;
+    this.recentPreviousPresentedAtMs = null;
+    this.recentDisplayedFrames = 0;
+    this.recentMaxGapMs = 0;
   }
 
   recordCoalescedFrame(): void {
@@ -57,6 +66,25 @@ export class VideoRenderTiming {
     }
     this.previousPresentedAtMs = presentedAtMs;
     this.displayedFrames += 1;
+
+    if (
+      this.recentWindowStartedAtMs === null
+      || presentedAtMs - this.recentWindowStartedAtMs >= QUALITY_WINDOW_MS
+    ) {
+      this.recentWindowStartedAtMs = presentedAtMs;
+      this.recentPreviousPresentedAtMs = null;
+      this.recentDisplayedFrames = 0;
+      this.recentMaxGapMs = 0;
+    }
+    if (this.recentPreviousPresentedAtMs !== null) {
+      const recentGap = Math.min(
+        MAX_FRAME_GAP_MS,
+        Math.max(0, Math.round(presentedAtMs - this.recentPreviousPresentedAtMs)),
+      );
+      this.recentMaxGapMs = Math.max(this.recentMaxGapMs, recentGap);
+    }
+    this.recentPreviousPresentedAtMs = presentedAtMs;
+    this.recentDisplayedFrames += 1;
   }
 
   snapshot(nowMs: number): VideoRenderTimingSnapshot {
@@ -80,6 +108,43 @@ export class VideoRenderTiming {
     return {
       displayedFpsX100,
       maxFrameGapMs: this.maxGapMs,
+      coalescedFrameDrops: this.coalescedFrameDrops,
+    };
+  }
+
+  /**
+   * Returns a short rolling-window view for user-facing quality feedback.
+   * The cumulative snapshot above remains the source of truth for diagnostics.
+   */
+  recentSnapshot(nowMs: number): VideoRenderTimingSnapshot {
+    if (
+      this.recentDisplayedFrames < 2
+      || this.recentWindowStartedAtMs === null
+      || !Number.isFinite(nowMs)
+      || nowMs <= this.recentWindowStartedAtMs
+    ) {
+      return {
+        displayedFpsX100: null,
+        maxFrameGapMs: this.recentDisplayedFrames > 1 ? this.recentMaxGapMs : null,
+        coalescedFrameDrops: this.coalescedFrameDrops,
+      };
+    }
+    const elapsedMs = Math.max(
+      1,
+      Math.min(QUALITY_WINDOW_MS, nowMs - this.recentWindowStartedAtMs),
+    );
+    const staleGap = this.recentPreviousPresentedAtMs === null
+      ? 0
+      : Math.min(
+        MAX_FRAME_GAP_MS,
+        Math.max(0, Math.round(nowMs - this.recentPreviousPresentedAtMs)),
+      );
+    return {
+      displayedFpsX100: Math.min(
+        MAX_FPS_X100,
+        Math.max(0, Math.round((this.recentDisplayedFrames * 100_000) / elapsedMs)),
+      ),
+      maxFrameGapMs: Math.max(this.recentMaxGapMs, staleGap),
       coalescedFrameDrops: this.coalescedFrameDrops,
     };
   }

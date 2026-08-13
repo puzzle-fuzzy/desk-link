@@ -2923,7 +2923,7 @@ function updateRemoteVideoPathBadge(): void {
 }
 
 function currentConnectionQualitySummary() {
-  const timing = videoRenderTiming.snapshot(performance.now());
+  const timing = videoRenderTiming.recentSnapshot(performance.now());
   return connectionQualitySummary({
     decodedFrames,
     displayedFpsX100: timing.displayedFpsX100,
