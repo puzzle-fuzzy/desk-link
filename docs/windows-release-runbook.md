@@ -53,7 +53,7 @@ python scripts/package-windows-candidate.py
 - 正式发布前 `signed` 必须为 `true`；`signed: false` 只能用于本地候选包。
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测；`audit-managed-relay.py --expected-source-commit <HEAD>` 同时确认线上容器镜像的源码 revision 与候选提交一致。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
-- `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复和至少 10 秒加密媒体 soak。
+- `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复、本地加密媒体 soak，以及公网中继目录查询、Noise 握手、视频、输入和重连 E2E。soak 至少 10 秒，候选基线建议使用 300 秒。
 - Windows CI 和签名候选 artifact 会同时上传 `windows-acceptance-record.json` 模板；真实验收只能在这份绑定当前安装包 SHA 的模板上填写，不能重新手写版本或哈希。
 - 候选 ZIP 必须由 `package-windows-candidate.py` 生成；文件名包含当前源码提交短 SHA，且包内每份报告和安装器都经过同一候选绑定校验，不能使用无提交标识的旧 ZIP。
 

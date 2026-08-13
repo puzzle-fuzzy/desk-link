@@ -201,6 +201,17 @@ def main() -> int:
             "--ignored",
             "--nocapture",
         ],
+        [
+            "cargo",
+            "test",
+            "-p",
+            "desklink-windows",
+            "--test",
+            "managed_relay_live",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
     ]
     try:
         for command in commands:
