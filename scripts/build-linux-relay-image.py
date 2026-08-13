@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import ssl
 import subprocess
 import sys
@@ -24,6 +25,7 @@ CARGO_CACHE_VOLUME = "desklink-relay-cargo-cache"
 RUSTUP_CACHE_VOLUME = "desklink-relay-rustup-cache"
 CONTAINER_TARGET_DIRECTORY = ROOT / "target" / "linux-amd64"
 RUST_VERSION = "1.88.0"
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -44,6 +46,22 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def git_head() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    value = completed.stdout.strip().lower()
+    if completed.returncode != 0 or COMMIT_PATTERN.fullmatch(value) is None:
+        raise RuntimeError("could not read the current Git commit SHA")
+    return value
 
 
 def export_windows_trust_store(path: Path) -> None:
@@ -145,7 +163,7 @@ def build_static_binary() -> Path:
     return binary
 
 
-def import_minimal_image(binary: Path, image: str) -> str:
+def import_minimal_image(binary: Path, image: str, revision: str) -> str:
     with tempfile.TemporaryDirectory(prefix="desklink-relay-", dir=OUTPUT_DIRECTORY) as directory:
         rootfs = Path(directory) / "rootfs.tar"
         payload = binary.read_bytes()
@@ -167,6 +185,8 @@ def import_minimal_image(binary: Path, image: str) -> str:
                 "linux/amd64",
                 "--change",
                 'LABEL org.opencontainers.image.title="DeskLink Relay"',
+                "--change",
+                f'LABEL org.opencontainers.image.revision="{revision}"',
                 "--change",
                 "ENV DESKLINK_RELAY_ADDR=0.0.0.0:4433",
                 "--change",
@@ -238,17 +258,19 @@ def smoke_test(image: str) -> None:
 
 def main() -> int:
     version = package_version(MANIFEST)
+    source_commit = git_head()
     image = f"desklink-relay:{version}"
     archive = OUTPUT_DIRECTORY / f"desklink-relay-{version}-amd64.tar"
 
     OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
     binary = build_static_binary()
-    image_id = import_minimal_image(binary, image)
+    image_id = import_minimal_image(binary, image, source_commit)
     smoke_test(image)
     run(["docker", "save", "--output", str(archive), image])
     result = {
         "image": image,
         "image_id": image_id,
+        "source_commit": source_commit,
         "binary_size_bytes": binary.stat().st_size,
         "binary_sha256": sha256(binary),
         "archive": str(archive),

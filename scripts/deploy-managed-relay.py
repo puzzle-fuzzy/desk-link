@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARCHIVE = ROOT / "dist" / "linux" / "desklink-relay-0.1.0-amd64.tar"
 SAFE_LABEL = re.compile(r"^[A-Za-z0-9_./:@+-]+$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +55,13 @@ def validate_remote_value(label: str, value: str, *, absolute: bool = False) -> 
         raise RuntimeError(f"unsafe or missing {label}: {value!r}")
     if absolute and not PurePosixPath(value).is_absolute():
         raise RuntimeError(f"{label} must be an absolute path: {value!r}")
+    return value
+
+
+def validate_source_commit(value: str) -> str:
+    value = value.strip().lower()
+    if COMMIT_PATTERN.fullmatch(value) is None:
+        raise RuntimeError(f"relay image has no valid source revision label: {value!r}")
     return value
 
 
@@ -162,6 +170,7 @@ def main() -> int:
     )
     rollback_tag = f"desklink-relay:rollback-{int(time.time())}"
     deploy = compose_command(workdir, config_file, service)
+    source_commit = ""
 
     ssh.copy(arguments.archive, remote_archive)
     try:
@@ -171,6 +180,17 @@ def main() -> int:
         ssh.run(["docker", "tag", old_image, rollback_tag])
         try:
             ssh.run(["docker", "load", "--input", remote_archive])
+            source_commit = validate_source_commit(
+                ssh.run(
+                    [
+                        "docker",
+                        "inspect",
+                        "--format",
+                        '{{index .Config.Labels "org.opencontainers.image.revision"}}',
+                        "desklink-relay:0.1.0",
+                    ]
+                )
+            )
             ssh.run(deploy)
 
             deadline = time.monotonic() + max(5, arguments.health_timeout)
@@ -202,6 +222,7 @@ def main() -> int:
         "deployed_image_id": new_image,
         "rollback_tag": rollback_tag,
         "archive_sha256": archive_sha256,
+        "source_commit": source_commit,
         "healthy": True,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))

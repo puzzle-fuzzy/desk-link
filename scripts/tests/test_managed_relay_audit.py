@@ -88,6 +88,14 @@ class ManagedRelayDeployTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.deploy.validate_remote_value("path", "relative/compose.yml", absolute=True)
 
+    def test_requires_a_full_source_revision_on_the_relay_image(self) -> None:
+        revision = "a" * 40
+        self.assertEqual(self.deploy.validate_source_commit(revision), revision)
+        with self.assertRaises(RuntimeError):
+            self.deploy.validate_source_commit("a" * 39)
+        with self.assertRaises(RuntimeError):
+            self.deploy.validate_source_commit("not-a-commit")
+
     def test_rolls_back_when_deploy_health_check_fails(self) -> None:
         class FakeSsh:
             def __init__(self, target: str, identity_file: Path | None) -> None:
@@ -105,6 +113,11 @@ class ManagedRelayDeployTests(unittest.TestCase):
                         return "relay"
                     if ".Image" in format_argument:
                         return "sha256:old"
+                if (
+                    arguments[:2] == ["docker", "inspect"]
+                    and "org.opencontainers.image.revision" in arguments[-2]
+                ):
+                    return "a" * 40
                 if arguments[:1] == ["sha256sum"]:
                     return f"{archive_sha256}  {arguments[-1]}"
                 if arguments[:3] == ["docker", "inspect", "relay"]:
