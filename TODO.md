@@ -116,8 +116,8 @@
 
 ```text
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 cd apps/windows-ui
 bun test
 bun run build
