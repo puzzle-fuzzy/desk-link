@@ -7,7 +7,7 @@ use desklink_crypto::SessionId;
 use desklink_protocol::PROTOCOL_VERSION;
 use desklink_relay::{RelayConfig, RelayError, RelayServer, RelaySessionTable};
 use desklink_transport::{
-    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
+    ChannelKind, MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
     RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
     TransportError, TransportEvent,
 };
@@ -584,6 +584,80 @@ async fn replacement_controller_supersedes_stale_disconnect_and_rotates_host_str
             .await
             .is_err(),
         "a stale disconnect escaped the transport generation filter"
+    );
+}
+
+#[tokio::test]
+async fn replacement_host_supersedes_stale_disconnect_and_keeps_controller_attached() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(27);
+    let host_id = [15; 16];
+    let controller_id = [16; 16];
+    let first_host = QuicClient::connect(config(&relay)).await.unwrap();
+    first_host
+        .join(RelayJoin::host_with_participant(
+            session_id, [8; 32], host_id,
+        ))
+        .await
+        .unwrap();
+    let controller = QuicClient::connect(config(&relay)).await.unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            [8; 32],
+            controller_id,
+        ))
+        .await
+        .unwrap();
+
+    first_host
+        .send_control(b"first-host".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&controller).await,
+        TransportEvent::Control(b"first-host".to_vec())
+    );
+
+    let resumed_host = QuicClient::connect(config(&relay)).await.unwrap();
+    resumed_host
+        .join(RelayJoin::host_with_participant(
+            session_id, [8; 32], host_id,
+        ))
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), first_host.next_event())
+        .await
+        .expect("the superseded host was not closed")
+        .expect("the superseded host did not publish its close event");
+    assert!(matches!(closed, TransportEvent::Closed { .. }));
+
+    resumed_host
+        .send_control(b"resumed-host".to_vec())
+        .await
+        .unwrap();
+    loop {
+        match next_event(&controller).await {
+            TransportEvent::PeerDisconnected {
+                channel: ChannelKind::Control,
+            } => continue,
+            TransportEvent::Control(payload) => {
+                assert_eq!(payload, b"resumed-host");
+                break;
+            }
+            event => panic!("unexpected replacement host event: {event:?}"),
+        }
+    }
+
+    drop(first_host);
+    controller
+        .send_control(b"controller-after-old-host-drop".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&resumed_host).await,
+        TransportEvent::Control(b"controller-after-old-host-drop".to_vec()),
+        "the old host disconnect must not detach the replacement host"
     );
 }
 
