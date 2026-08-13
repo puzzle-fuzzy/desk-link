@@ -55,9 +55,15 @@ jobs:
       - name: Run native Windows resilience checks
         run: python scripts/verify-windows-resilience.py --soak-seconds 10
 
+      - name: Create candidate-bound Windows acceptance template
+        run: python scripts/create-windows-acceptance-record.py --operator "待真实 Windows 验收"
+
       - name: Generate Windows release readiness evidence
         if: always()
-        run: python scripts/check-windows-release-ready.py --report dist/windows/windows-release-readiness.json
+        run: >-
+          python scripts/check-windows-release-ready.py
+          --manual-json dist/windows/windows-acceptance-record.json
+          --report dist/windows/windows-release-readiness.json
 
       - name: Upload Windows candidate evidence
         if: always()
@@ -69,6 +75,7 @@ jobs:
             dist/windows/windows-installer-manifest.json
             dist/windows/windows-release-verification.json
             dist/windows/windows-resilience-report.json
+            dist/windows/windows-acceptance-record.json
             dist/windows/windows-release-readiness.json
           if-no-files-found: warn
           retention-days: 14

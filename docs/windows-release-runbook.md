@@ -51,6 +51,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测；`audit-managed-relay.py --expected-source-commit <HEAD>` 同时确认线上容器镜像的源码 revision 与候选提交一致。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
 - `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复和至少 10 秒加密媒体 soak。
+- Windows CI 和签名候选 artifact 会同时上传 `windows-acceptance-record.json` 模板；真实验收只能在这份绑定当前安装包 SHA 的模板上填写，不能重新手写版本或哈希。
 
 ## 2.1 发布预检
 
