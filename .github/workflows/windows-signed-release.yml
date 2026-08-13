@@ -40,7 +40,7 @@ jobs:
         run: python scripts/build-windows-installer.py --require-signing
 
       - name: Run native Windows resilience checks
-        run: python scripts/verify-windows-resilience.py --soak-seconds 10
+        run: python scripts/verify-windows-resilience.py --soak-seconds 300
 
       - name: Create candidate-bound Windows acceptance template
         run: python scripts/create-windows-acceptance-record.py --operator "待真实 Windows 验收"
