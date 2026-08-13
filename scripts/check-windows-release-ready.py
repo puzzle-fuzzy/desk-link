@@ -138,11 +138,15 @@ def git_dirty(root: Path) -> bool | None:
 
 def git_tag_exists(root: Path, tag: str) -> bool | None:
     completed = subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", f"refs/tags/{tag}"],
+        ["git", "cat-file", "-t", f"refs/tags/{tag}"],
         cwd=root,
         check=False,
+        capture_output=True,
     )
-    return completed.returncode == 0
+    if completed.returncode != 0:
+        return False
+    output = completed.stdout.decode("utf-8", errors="replace").strip()
+    return output == "tag"
 
 
 def package_version(root: Path) -> str | None:

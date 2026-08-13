@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -152,6 +153,17 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                     expected_commit="a" * 40,
                     expected_installer_sha256=manifest["installer"]["sha256"],
                 )
+
+    def test_release_tag_requires_an_annotated_tag_object(self) -> None:
+        annotated = type("Completed", (), {"returncode": 0, "stdout": b"tag\n"})()
+        with patch.object(self.ready.subprocess, "run", return_value=annotated) as run:
+            self.assertTrue(self.ready.git_tag_exists(Path("."), "v0.1.42"))
+        self.assertEqual(run.call_args.args[0][:3], ["git", "cat-file", "-t"])
+
+    def test_release_tag_rejects_a_lightweight_tag_object(self) -> None:
+        lightweight = type("Completed", (), {"returncode": 0, "stdout": b"commit\n"})()
+        with patch.object(self.ready.subprocess, "run", return_value=lightweight):
+            self.assertFalse(self.ready.git_tag_exists(Path("."), "v0.1.42"))
 
 
 if __name__ == "__main__":
