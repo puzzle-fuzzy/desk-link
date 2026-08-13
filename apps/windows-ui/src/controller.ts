@@ -120,6 +120,8 @@ import {
   type FileQueueActionToken,
 } from "./file-queue-action";
 import {
+  remoteVideoPathDescription,
+  remoteVideoPathLabel,
   remoteSessionSummary,
   remoteToolbarHideDelay,
   remoteToolbarVisible,
@@ -952,7 +954,7 @@ function renderRemoteDesktop(): string {
       <div class="remote-toolbar">
         <div class="remote-toolbar-status">
           <span class="remote-live-dot" data-controller-remote-live-dot data-state="${reconnecting ? "reconnecting" : "connected"}" aria-hidden="true"></span>
-          <div><strong data-controller-remote-status-title>${reconnecting ? "画面已保留，正在恢复连接" : "实时远程桌面"}</strong><small data-controller-metrics>${escapeHtml(remoteStatusDetail)}</small></div>
+          <div><strong data-controller-remote-status-title>${reconnecting ? "画面已保留，正在恢复连接" : "实时远程桌面"}</strong><small data-controller-metrics>${escapeHtml(remoteStatusDetail)}</small><span class="remote-video-path" data-controller-video-path data-path="${activeVideoPath}" title="${escapeHtml(remoteVideoPathDescription(activeVideoPath))}">${icon(activeVideoPath === "directLan" ? "monitor" : "globe-lock")}<span>${remoteVideoPathLabel(activeVideoPath)}</span></span></div>
         </div>
         <div class="remote-toolbar-actions">
           <label class="remote-quality-picker" title="根据当前网络调整远程画面的清晰度和流畅度">
@@ -1604,6 +1606,7 @@ function handleSignal(signal: ControllerSignal): void {
     case "metrics": {
       transportCompletedFrames = signal.completedFrames;
       activeVideoPath = signal.videoPath;
+      updateRemoteVideoPathBadge();
       updateVideoStartingMessage();
       reportRenderMetrics();
       break;
@@ -2896,6 +2899,17 @@ function updateRemoteSessionSummary(): void {
     videoQualityPreference,
     appliedVideoQuality,
   );
+}
+
+function updateRemoteVideoPathBadge(): void {
+  const element = document.querySelector<HTMLElement>("[data-controller-video-path]");
+  if (!element) {
+    return;
+  }
+  element.dataset.path = activeVideoPath;
+  element.title = remoteVideoPathDescription(activeVideoPath);
+  element.innerHTML = `${icon(activeVideoPath === "directLan" ? "monitor" : "globe-lock")}<span>${remoteVideoPathLabel(activeVideoPath)}</span>`;
+  renderLucideIcons(element);
 }
 
 function changeRemoteScaleMode(value: string): void {

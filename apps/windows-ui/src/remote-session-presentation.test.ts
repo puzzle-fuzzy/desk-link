@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import {
   REMOTE_TOOLBAR_IDLE_MS,
+  remoteVideoPathDescription,
+  remoteVideoPathLabel,
   remoteSessionSummary,
   remoteToolbarHideDelay,
   remoteToolbarVisible,
@@ -49,5 +51,14 @@ describe("远程会话状态摘要", () => {
   test("手动画质不伪装成自动状态", () => {
     expect(remoteSessionSummary(1_920, 1_080, "balanced", "balanced"))
       .toBe("1920 × 1080 · 均衡 · 已加密");
+  });
+});
+
+describe("远程视频路径", () => {
+  test("用用户能理解的名称展示直连和中继", () => {
+    expect(remoteVideoPathLabel("directLan")).toBe("局域网直连");
+    expect(remoteVideoPathDescription("directLan")).toContain("已认证");
+    expect(remoteVideoPathLabel("relay")).toBe("公网中继");
+    expect(remoteVideoPathDescription("relay")).toContain("只转发加密数据");
   });
 });

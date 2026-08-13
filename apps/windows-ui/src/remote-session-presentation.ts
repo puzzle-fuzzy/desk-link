@@ -1,4 +1,4 @@
-import type { VideoQualityPreference, VideoQualityPreset } from "./types";
+import type { VideoPathKind, VideoQualityPreference, VideoQualityPreset } from "./types";
 
 export const REMOTE_TOOLBAR_IDLE_MS = 3_000;
 
@@ -46,4 +46,14 @@ export function remoteSessionSummary(
     ? `自动（${presetLabel(preset)}）`
     : presetLabel(preference);
   return `${width} × ${height} · ${quality} · 已加密`;
+}
+
+export function remoteVideoPathLabel(path: VideoPathKind): string {
+  return path === "directLan" ? "局域网直连" : "公网中继";
+}
+
+export function remoteVideoPathDescription(path: VideoPathKind): string {
+  return path === "directLan"
+    ? "视频正在通过已认证的局域网直连传输；控制通道仍保持端到端加密。"
+    : "视频正在通过 DeskLink 公网中继传输；中继只转发加密数据。";
 }

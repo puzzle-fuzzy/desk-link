@@ -3892,3 +3892,32 @@ textarea {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Transport transparency: show the active video path without exposing
+   relay credentials or low-level protocol details. */
+.remote-video-path {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 3px 7px;
+  border: 1px solid rgb(126 154 199 / 48%);
+  border-radius: 999px;
+  background: rgb(48 82 137 / 30%);
+  color: #dce9ff;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 15px;
+}
+
+.remote-video-path .app-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.remote-video-path[data-path="directLan"] {
+  border-color: rgb(103 206 159 / 52%);
+  background: rgb(31 122 83 / 30%);
+  color: #d8f7e5;
+}
