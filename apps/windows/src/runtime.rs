@@ -70,6 +70,9 @@ const FILE_TRANSFER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 // completion notification bounded so a late task cannot retain an unbounded
 // backlog while the transfer loop is reconnecting or shutting down.
 const HOST_OUTGOING_EVENT_QUEUE_CAPACITY: usize = 1;
+// Capture commands are low-frequency, but they must not grow without bound if
+// a capture worker stalls while the controller keeps requesting changes.
+const CAPTURE_COMMAND_QUEUE_CAPACITY: usize = 4;
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
 const DEFAULT_VIDEO_QUALITY_PREFERENCE: VideoQualityPreference = VideoQualityPreference::Automatic;
@@ -1064,7 +1067,8 @@ impl HostRuntime {
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (worker_sender, worker_receiver) = oneshot::channel();
         let (start_sender, start_receiver) = std::sync::mpsc::sync_channel(0);
-        let (capture_command_sender, capture_command_receiver) = std::sync::mpsc::channel();
+        let (capture_command_sender, capture_command_receiver) =
+            std::sync::mpsc::sync_channel(CAPTURE_COMMAND_QUEUE_CAPACITY);
         let selected_desktop = Arc::new(Mutex::new(SelectedDesktop {
             display_id: 0,
             desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
@@ -1398,7 +1402,7 @@ struct CaptureWorkerContext {
 }
 
 struct HostInboundContext {
-    capture_commands: std::sync::mpsc::Sender<CaptureWorkerCommand>,
+    capture_commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
     displays: Arc<Vec<RemoteDisplay>>,
     audio_enabled: Arc<AtomicBool>,
@@ -2293,12 +2297,12 @@ async fn send_video_quality_state(
 }
 
 async fn apply_video_quality(
-    capture_commands: &std::sync::mpsc::Sender<CaptureWorkerCommand>,
+    capture_commands: &std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     preset: VideoQualityPreset,
 ) -> Result<Option<VideoQualityPreset>, HostRuntimeError> {
     let (reply, applied) = oneshot::channel();
     capture_commands
-        .send(CaptureWorkerCommand::SetVideoQuality { preset, reply })
+        .try_send(CaptureWorkerCommand::SetVideoQuality { preset, reply })
         .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
     Ok(tokio::time::timeout(Duration::from_secs(5), applied)
         .await
@@ -2307,12 +2311,12 @@ async fn apply_video_quality(
 }
 
 async fn apply_video_profile(
-    capture_commands: &std::sync::mpsc::Sender<CaptureWorkerCommand>,
+    capture_commands: &std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     profile: H264Profile,
 ) -> Result<H264Profile, HostRuntimeError> {
     let (reply, applied) = oneshot::channel();
     capture_commands
-        .send(CaptureWorkerCommand::SetVideoProfile { profile, reply })
+        .try_send(CaptureWorkerCommand::SetVideoProfile { profile, reply })
         .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
     Ok(tokio::time::timeout(Duration::from_secs(5), applied)
         .await
@@ -2369,7 +2373,7 @@ async fn receive_input_and_control(
                             let _ = input.release_all();
                             let (reply, switched) = oneshot::channel();
                             capture_commands
-                                .send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
+                                .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
                                 .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
                             if tokio::time::timeout(Duration::from_secs(5), switched)
                                 .await
