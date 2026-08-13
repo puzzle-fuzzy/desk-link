@@ -1397,7 +1397,7 @@ impl ControllerManager {
                                 delay,
                             ),
                         );
-                        tokio::time::sleep(delay).await;
+                        self.wait_for_current_retry_delay(generation, delay).await?;
                         continue;
                     }
                     Err(error) => return Err(directory_transport_error_message(&error).to_owned()),
@@ -1435,7 +1435,7 @@ impl ControllerManager {
                                 delay,
                             ),
                         );
-                        tokio::time::sleep(delay).await;
+                        self.wait_for_current_retry_delay(generation, delay).await?;
                     }
                     Err(TransportError::DirectoryNotFound) => {
                         return Err(source.not_found_message(recover_after_cancel).to_owned());
@@ -1457,7 +1457,7 @@ impl ControllerManager {
                                 delay,
                             ),
                         );
-                        tokio::time::sleep(delay).await;
+                        self.wait_for_current_retry_delay(generation, delay).await?;
                     }
                     Err(error) => {
                         return Err(directory_transport_error_message(&error).to_owned());
@@ -2119,6 +2119,23 @@ impl ControllerManager {
                     if !self.is_current(generation) {
                         return CurrentTransportWait::Cancelled;
                     }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_current_retry_delay(
+        &self,
+        generation: u64,
+        delay: Duration,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::sleep(delay);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => return self.ensure_current(generation),
+                _ = tokio::time::sleep(OPERATION_POLL_INTERVAL) => {
+                    self.ensure_current(generation)?;
                 }
             }
         }
@@ -5520,6 +5537,39 @@ mod tests {
             .await;
 
         assert!(matches!(result, CurrentTransportWait::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn directory_retry_delay_can_be_cancelled_before_deadline() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let canceller = manager.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            canceller.cancel_operations();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            manager.wait_for_current_retry_delay(generation, Duration::from_secs(1)),
+        )
+        .await
+        .expect("retry delay cancellation should not wait for the full backoff");
+        task.await.unwrap();
+
+        assert_eq!(result, Err("连接已取消。".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn directory_retry_delay_completes_when_generation_stays_current() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+
+        let result = manager
+            .wait_for_current_retry_delay(generation, Duration::from_millis(10))
+            .await;
+
+        assert_eq!(result, Ok(()));
     }
 
     #[tokio::test]
