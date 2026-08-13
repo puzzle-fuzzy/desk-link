@@ -91,7 +91,8 @@ class WindowsCandidatePackageTests(unittest.TestCase):
                 names = archive.namelist()
             self.assertIn(f"DeskLinkSetup-{version}-x64.exe", names)
             self.assertIn("windows-release-readiness.json", names)
-            self.assertEqual(len(names), 5)
+            self.assertIn("windows-installer-manifest.json", names)
+            self.assertEqual(len(names), 6)
 
 
 if __name__ == "__main__":

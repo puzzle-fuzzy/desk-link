@@ -122,7 +122,7 @@ def validate_candidate_artifacts(root: Path, dist: Path) -> tuple[str, str, list
         dist.parent / "linux" / "managed-relay-host-audit.json",
         dist.parent / "linux" / "managed-diagnostics-audit.json",
     ]
-    files = [installer_path, *(dist / name for name in report_names)]
+    files = [installer_path, manifest_path, *(dist / name for name in report_names)]
     files.extend(path for path in optional if path.is_file())
     return version, source_commit, files
 
