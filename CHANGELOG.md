@@ -32,8 +32,8 @@
 
 ### 最新验证记录（2026-08-13）
 
-- 本轮稳定性修复已推送 `main`；前端 161 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Windows release verification 和安装包构建全部通过。
-- 当前候选安装包仍未签名；具体来源提交和 SHA-256 以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准。
+- 本轮稳定性修复已推送 `main`（`fa6f1ec`）；前端 164 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Windows release verification 和安装包构建全部通过。
+- 当前候选安装包仍未签名；本次安装器 `DeskLinkSetup-0.1.91-x64.exe` 为 19,280,896 bytes，SHA-256 为 `e986cedfef795373271306590ddf2eaebc5cbf6179e8e4333705a406dc09bdbe`。完整来源和哈希以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
 - 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。
 
