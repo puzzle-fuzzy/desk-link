@@ -126,7 +126,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 
 ### 最近一次自动门禁（2026-08-13）
 
-- [x] 当前候选提交已通过前端 167 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 脚本测试、Windows release verification 和安装包构建；连接快照与主机生命周期竞态回归测试已纳入门禁。
+- [x] 当前候选提交已通过前端 169 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态与“更多”菜单键盘导航回归测试已纳入门禁。
 - [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复和 10 秒加密媒体 soak；报告已纳入 release readiness 并绑定当前提交。
 
 - [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。
