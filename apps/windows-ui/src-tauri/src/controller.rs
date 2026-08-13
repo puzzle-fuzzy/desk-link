@@ -4110,7 +4110,7 @@ impl ConnectFailure {
                 technical_reason,
             ),
             TransportError::JoinRejected(JoinRejectCode::SessionOccupied) => Self::with_reason(
-                true,
+                false,
                 "此会话已有控制端连接，请先断开原控制端后再试。",
                 "session_occupied",
                 technical_reason,
@@ -5471,9 +5471,12 @@ mod tests {
     }
 
     #[test]
-    fn expired_and_mismatched_pairing_sessions_stop_with_distinct_recovery_text() {
+    fn terminal_pairing_failures_stop_with_distinct_recovery_text() {
         let expired = ConnectFailure::from_transport(TransportError::JoinRejected(
             JoinRejectCode::SessionNotFound,
+        ));
+        let occupied = ConnectFailure::from_transport(TransportError::JoinRejected(
+            JoinRejectCode::SessionOccupied,
         ));
         let mismatch = ConnectFailure::from_transport(TransportError::JoinRejected(
             JoinRejectCode::AuthenticationMismatch,
@@ -5481,6 +5484,8 @@ mod tests {
 
         assert!(!expired.retryable);
         assert!(expired.detail.contains("失效"));
+        assert!(!occupied.retryable);
+        assert!(occupied.detail.contains("控制端连接"));
         assert!(!mismatch.retryable);
         assert!(mismatch.detail.contains("不匹配"));
     }

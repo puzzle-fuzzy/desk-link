@@ -659,8 +659,7 @@ fn transport_error_is_retryable(error: &TransportError) -> bool {
         | TransportError::PeerReplaced => true,
         TransportError::JoinRejected(code) => matches!(
             code,
-            JoinRejectCode::SessionOccupied
-                | JoinRejectCode::Internal
+            JoinRejectCode::Internal
                 | JoinRejectCode::ConnectionLimit
                 | JoinRejectCode::SessionLimit
         ),
@@ -920,9 +919,9 @@ mod tests {
         assert!(!transport_error_is_retryable(
             &TransportError::JoinRejected(JoinRejectCode::SessionNotFound)
         ));
-        assert!(transport_error_is_retryable(&TransportError::JoinRejected(
-            JoinRejectCode::SessionOccupied
-        )));
+        assert!(!transport_error_is_retryable(
+            &TransportError::JoinRejected(JoinRejectCode::SessionOccupied)
+        ));
         assert!(!transport_error_is_retryable(
             &TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch)
         ));
