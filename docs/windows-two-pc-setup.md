@@ -1,6 +1,6 @@
 # DeskLink 两台 Windows 电脑使用说明
 
-0.1.26 发布前的完整人工验收见 [windows-0.1.26-two-pc-acceptance.md](windows-0.1.26-two-pc-acceptance.md)。
+当前候选版本的正式发布验收流程见 [Windows 发布运行手册](windows-release-runbook.md)；历史版本验收记录不作为当前版本的兼容或发布依据。
 
 ## 当前支持范围
 
