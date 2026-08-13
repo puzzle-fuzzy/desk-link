@@ -55,7 +55,7 @@ python scripts/package-windows-candidate.py
 - 正式发布前 `signed` 必须为 `true`；`signed: false` 只能用于本地候选包。
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测；`audit-managed-relay.py --expected-source-commit <HEAD>` 同时确认线上容器镜像的源码 revision 与候选提交一致。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
-- `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复、本地加密媒体 soak，以及公网中继目录查询、Noise 握手、视频、输入和重连 E2E。soak 至少 10 秒，候选基线建议使用 300 秒。
+- `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复、本地加密媒体 soak，以及公网中继目录查询、Noise 握手、视频、输入和重连 E2E。普通 CI 至少 10 秒；候选基线应使用 300 秒，正式发布预检会强制 300 秒。
 - 捕获与编码验收还要确认首帧行为：静态桌面连接后应在 DXGI 无新帧时通过一次性 GDI 快照显示初始画面；如果系统权限、远程桌面驱动或安全桌面导致 10 秒内始终没有捕获首帧，或编码器持续不产出访问单元，主机必须进入可恢复的捕获/编码失败重连状态，而不是继续显示“已连接”并永久黑屏。
 - 静态桌面不要求持续产生视频帧：验收至少确认一张完整关键帧可显示，并确认鼠标位置仍由独立光标通道持续更新；动态桌面再记录后续视频帧率。
 - Windows CI 和签名候选 artifact 会同时上传 `windows-acceptance-record.json` 模板；真实验收只能在这份绑定当前安装包 SHA 的模板上填写，不能重新手写版本或哈希。
@@ -77,7 +77,13 @@ python scripts/check-windows-release-ready.py
 python scripts/check-windows-release-ready.py --strict
 ```
 
-严格模式在仍有任何阻塞项时返回 1。为了避免把验收结果误绑定到另一份安装包，先基于当前候选生成记录模板：
+严格模式在仍有任何阻塞项时返回 1。正式发布必须同时要求完整长稳证据：
+
+```powershell
+python scripts/check-windows-release-ready.py --strict --minimum-soak-seconds 300
+```
+
+为了避免把验收结果误绑定到另一份安装包，先基于当前候选生成记录模板：
 
 ### 2.2 Rust 依赖安全审计
 
@@ -166,7 +172,7 @@ git tag -a v0.1.91 -m "DeskLink Windows 0.1.91"
 git push origin v0.1.91
 ```
 
-在该 tag 上手动运行 `Windows Publish Release`，输入签名候选 workflow run ID 和证据提交 SHA。它会下载同一份签名 artifact，导入三份 source-bound 证据，执行 `check-windows-release-ready.py --strict`，并由 `publish-windows-release.py` 进行第二次 readiness 校验；未签名、版本不匹配或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
+在该 tag 上手动运行 `Windows Publish Release`，输入签名候选 workflow run ID 和证据提交 SHA。它会下载同一份签名 artifact，导入三份 source-bound 证据，执行带 `--minimum-soak-seconds 300` 的严格 readiness 检查，并由 `publish-windows-release.py` 进行第二次校验；未签名、版本不匹配、长稳不足或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
 
 - `DeskLinkSetup-0.1.91-x64.exe`
 - `windows-installer-manifest.json`

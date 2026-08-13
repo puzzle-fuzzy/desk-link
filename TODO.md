@@ -121,7 +121,7 @@
 ## 下一阶段执行顺序（发布冻结前）
 
 1. **候选基线**：以当前提交和安装包 SHA 生成候选验收记录模板，确认发布说明只描述已验证能力，不扩展 4K 承诺。
-2. **双机验收包**：使用现有 `verify-windows-resilience.py` 和候选安装包，记录同网直连、跨网中继、断线恢复、双屏/DPI、剪贴板和文件传输结果。
+2. **双机验收包**：使用现有 `verify-windows-resilience.py --soak-seconds 300` 和候选安装包，记录同网直连、跨网中继、断线恢复、双屏/DPI、剪贴板和文件传输结果；正式发布预检会拒绝低于 300 秒的 resilience 报告。
 3. **信任与安装**：用户提供 Authenticode 证书后执行签名构建、SmartScreen 和全新账户安装升级验收；没有证书时保持候选版，不伪装成正式发布。
 4. **发布冻结**：在干净 checkout 重跑所有门禁，生成 SHA-256/签名清单，最后创建 `v0.1.91` tag；4K、公网 P2P 和 macOS 继续留在后续版本。
 
@@ -148,7 +148,7 @@ python scripts/package-windows-candidate.py
 
 ### 最近一次自动门禁（2026-08-13）
 
-- [x] 当前候选提交已通过前端 173 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 50 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
+- [x] 当前候选提交已通过前端 173 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 55 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
 - [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复、本地 300 秒加密媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；报告已纳入 release readiness 并绑定当前提交。
 
 - [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。

@@ -239,6 +239,7 @@ def _resilience_report_status(
     *,
     now: int,
     expected_commit: str | None,
+    minimum_soak_seconds: int = 10,
 ) -> tuple[bool, str]:
     fresh, detail = _fresh_report(
         report,
@@ -255,8 +256,16 @@ def _resilience_report_status(
     if report.get("source_dirty") is not False:
         return False, "Windows resilience report was generated from a dirty checkout"
     soak_seconds = report.get("soak_seconds")
-    if not isinstance(soak_seconds, int) or isinstance(soak_seconds, bool) or soak_seconds < 10:
-        return False, "Windows resilience report does not contain the minimum 10-second soak"
+    if (
+        not isinstance(soak_seconds, int)
+        or isinstance(soak_seconds, bool)
+        or soak_seconds < minimum_soak_seconds
+    ):
+        return (
+            False,
+            "Windows resilience report does not contain the minimum "
+            f"{minimum_soak_seconds}-second soak",
+        )
     return True, detail
 
 
@@ -297,6 +306,7 @@ def evaluate_preflight(
     now: int | None = None,
     manual_checks: dict[str, bool] | None = None,
     manual_record: dict[str, str] | None = None,
+    minimum_soak_seconds: int = 10,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else now
     manual_checks = manual_checks or {}
@@ -431,6 +441,7 @@ def evaluate_preflight(
         resilience_report,
         now=now,
         expected_commit=head,
+        minimum_soak_seconds=minimum_soak_seconds,
     )
     _check(
         checks,
@@ -503,11 +514,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit 1 when any blocker remains; default only writes the report",
     )
+    parser.add_argument(
+        "--minimum-soak-seconds",
+        type=int,
+        default=10,
+        help=(
+            "Minimum Windows resilience soak required by this report "
+            "(10-300 seconds; formal release should use 300)"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     arguments = parse_args()
+    if not 10 <= arguments.minimum_soak_seconds <= 300:
+        raise SystemExit("--minimum-soak-seconds must be between 10 and 300")
     version = package_version(ROOT)
     installer = ROOT / "dist" / "windows" / (
         f"DeskLinkSetup-{version}-x64.exe" if version else "DeskLinkSetup-unknown-x64.exe"
@@ -550,6 +572,7 @@ def main() -> int:
         resilience_report=read_json(ROOT / "dist" / "windows" / "windows-resilience-report.json"),
         manual_checks=manual_checks,
         manual_record=manual_record,
+        minimum_soak_seconds=arguments.minimum_soak_seconds,
     )
     arguments.report.parent.mkdir(parents=True, exist_ok=True)
     arguments.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

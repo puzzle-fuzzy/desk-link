@@ -127,6 +127,17 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             report = self.ready.evaluate_preflight(**fixture)
         self.assertIn("windows_resilience_evidence", {item["id"] for item in report["blockers"]})
 
+    def test_formal_release_can_require_the_full_long_soak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.create_fixture(Path(directory))
+            report = self.ready.evaluate_preflight(
+                **fixture,
+                minimum_soak_seconds=300,
+            )
+        self.assertIn("windows_resilience_evidence", {item["id"] for item in report["blockers"]})
+        resilience_check = report["checks"]["windows_resilience_evidence"]
+        self.assertIn("300-second soak", resilience_check["detail"])
+
     def test_relay_evidence_must_match_the_candidate_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.create_fixture(Path(directory))

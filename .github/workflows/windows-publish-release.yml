@@ -59,6 +59,7 @@ jobs:
         run: >-
           python scripts/check-windows-release-ready.py
           --strict
+          --minimum-soak-seconds 300
           --manual-json dist/windows/windows-acceptance-record.json
           --report dist/windows/windows-release-readiness.json
 
