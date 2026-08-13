@@ -162,12 +162,13 @@ python scripts/check-windows-release-ready.py --manual-json dist/windows/windows
 python scripts/package-windows-candidate.py
 ```
 
-### 最近一次自动门禁（2026-08-14，候选 `c9e5ad3`）
+### 最近一次自动门禁（2026-08-14，候选 `a29b1f2`）
 
-- [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 64 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
-- [x] Windows CI run `31731362387` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `c9e5ad3`。
+- [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 67 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
+- [x] Windows CI run `31739227095` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `a29b1f2`。
 
-- [x] 安全扫描 run `31731362323`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
+- [x] 安全扫描 run `31739227082`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
+- [x] 签名候选工作流已强制 300 秒原生 resilience soak，并由 `test_windows_workflow_policy.py` 防止回退到普通 CI 的 10 秒快速门禁。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
 - [x] 发布脚本与签名工作流现在都会严格校验 readiness 报告，并把该报告作为 Release 证据上传；当前候选 `ready: false`，不会被误发布为正式版本。
 - [x] 远程 CI 仍保留 Node.js 20 deprecation warning（`actions/upload-artifact@v4`），不影响本次通过，后续应随 GitHub Actions 运行时升级单独处理。
