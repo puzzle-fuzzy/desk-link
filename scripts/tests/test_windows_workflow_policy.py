@@ -34,6 +34,17 @@ class WindowsWorkflowPolicyTests(unittest.TestCase):
         matches = re.findall(r"verify-windows-resilience\.py --soak-seconds (\d+)", signed)
         self.assertEqual(matches, ["300"])
 
+    def test_signed_workflow_requires_the_release_soak_in_readiness(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "windows-signed-release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            workflow,
+            r"python scripts/check-windows-release-ready\.py\s+"
+            r"--manual-json dist/windows/windows-acceptance-record\.json\s+"
+            r"--minimum-soak-seconds 300",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
