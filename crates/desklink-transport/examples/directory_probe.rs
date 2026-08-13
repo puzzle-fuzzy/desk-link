@@ -131,6 +131,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(io::Error::other("host-to-controller relay payload changed").into());
     }
 
+    // This is a short-lived monitor, not a persistent host. Explicitly close
+    // every QUIC connection so each probe releases its temporary directory
+    // registration immediately instead of consuming relay capacity until the
+    // idle timeout.
+    controller.close(b"desklink relay probe complete");
+    correct.close(b"desklink relay probe complete");
+    incompatible.close(b"desklink relay probe complete");
+    wrong.close(b"desklink relay probe complete");
+    host.close(b"desklink relay probe complete");
+
     println!(
         "DeskLink relay directory and bidirectional control probe passed: {relay_address} ({server_name}) in {} ms",
         started.elapsed().as_millis().max(1)

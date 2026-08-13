@@ -215,6 +215,18 @@ impl InboundReceivers {
 }
 
 impl QuicClient {
+    /// Closes the underlying QUIC connection immediately.
+    ///
+    /// Long-lived host/controller clients are normally dropped by their
+    /// owning runtime. Short-lived probes and diagnostics, however, must
+    /// explicitly close their connection so a relay does not retain a
+    /// directory registration until the idle timeout.
+    pub fn close(&self, reason: &[u8]) {
+        self.inner
+            .connection
+            .close(quinn::VarInt::from_u32(0), reason);
+    }
+
     /// Returns the relay peer address selected during the QUIC connection.
     /// LAN candidate discovery uses this only as an operating-system route
     /// hint; it is never advertised as a direct candidate.
