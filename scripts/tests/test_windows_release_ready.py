@@ -276,6 +276,68 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                     expected_installer_sha256=installer["sha256"],
                 )
 
+    def test_manual_acceptance_rejects_sensitive_release_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            record = {
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
+                "product": "DeskLink Windows acceptance",
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {"file_name": installer["file_name"], "sha256": installer["sha256"]},
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {
+                    "two_windows_acceptance": "验收完成，设备 ID：123 456 789 012。",
+                    "long_soak_acceptance": "验收完成。",
+                    "smartscreen_acceptance": "验收完成。",
+                },
+                **self.manual_evidence(),
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "prohibited sensitive data"):
+                self.ready.load_manual_acceptance(
+                    path,
+                    expected_version="0.1.42",
+                    expected_commit="a" * 40,
+                    expected_installer_sha256=installer["sha256"],
+                )
+
+    def test_manual_acceptance_rejects_unknown_evidence_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            evidence = self.manual_evidence()
+            evidence["long_soak"]["raw_log_path"] = "C:\\Users\\operator\\Desktop\\desklink.log"
+            record = {
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
+                "product": "DeskLink Windows acceptance",
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {"file_name": installer["file_name"], "sha256": installer["sha256"]},
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "验收完成。" for key in self.ready.MANUAL_CHECK_IDS},
+                **evidence,
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unsupported long-soak fields"):
+                self.ready.load_manual_acceptance(
+                    path,
+                    expected_version="0.1.42",
+                    expected_commit="a" * 40,
+                    expected_installer_sha256=installer["sha256"],
+                )
+
     def test_manual_acceptance_requires_structured_long_soak_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

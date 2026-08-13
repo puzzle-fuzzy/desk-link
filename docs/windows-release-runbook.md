@@ -99,7 +99,7 @@ cargo audit
 python scripts/create-windows-acceptance-record.py --operator "release-team"
 ```
 
-完成真实验收后，填写模板中的 `checks`、`notes`、`environment`、`installation` 和 `long_soak`，再传入 `--manual-json` 重新生成报告。每个标记为 `true` 的检查必须有非空 `notes`，说明设备范围、实际结果和异常处理；双机通过必须记录两台 Windows x64、局域网和中继模式，长稳通过必须记录至少 4 小时、采样指标和脱敏诊断导出。记录不得包含密码、私钥、完整设备 ID、屏幕内容或个人文件名：
+完成真实验收后，填写模板中的 `checks`、`notes`、`environment`、`installation` 和 `long_soak`，再传入 `--manual-json` 重新生成报告。每个标记为 `true` 的检查必须有非空 `notes`，说明设备范围、实际结果和异常处理；双机通过必须记录两台 Windows x64、局域网和中继模式，长稳通过必须记录至少 4 小时、采样指标和脱敏诊断导出。记录不得包含密码、私钥、完整设备 ID、屏幕内容或个人文件名；预检还会拒绝未定义字段、明显设备 ID、密码/密钥标签、PEM 内容和 Windows 本地路径：
 
 ```json
 {

@@ -4,6 +4,7 @@
 
 ### 已完成
 
+- Windows schema 2 人工验收记录现在采用字段白名单，并拒绝备注、安装结果和长稳说明中的设备 ID、密码/密钥标签、PEM 私钥和本地 Windows 路径；候选 ZIP 不再意外携带原始敏感证据。
 - Windows 控制端与主机端的视频链路增加认证 DirectLan 探测；探测失败时继续使用公网中继。
 - DirectLan 状态机、控制端主动探测窗口、主机端入站探测监听和 datagram 回环回归测试已接入。
 - H.264 Main/High Profile 协商、视频质量自适应和渲染诊断指标已纳入 Windows 构建门禁。
@@ -68,7 +69,7 @@
 
 ### 最新验证记录（2026-08-13）
 
-- 本轮稳定性修复已推送 `main`；中继镜像、Windows 安装包和运维证据会在每次候选提交后重新生成并完成来源绑定。除真实双机验收外，前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 58 项脚本测试、Windows release verification、安装包构建和 300 秒 resilience 门禁均已通过；原生 FFI 控制端和主机端的网络黑洞也已纳入有界超时。
+- 本轮稳定性修复已推送 `main`；中继镜像、Windows 安装包和运维证据会在每次候选提交后重新生成并完成来源绑定。除真实双机验收外，前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 60 项脚本测试、Windows release verification、安装包构建和 300 秒 resilience 门禁均已通过；原生 FFI 控制端和主机端的网络黑洞也已纳入有界超时。
 - 当前候选安装包仍未签名；安装器来源、大小和 SHA-256 必须以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准，文档不固定写入会随候选构建变化的动态 SHA。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
 - 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。

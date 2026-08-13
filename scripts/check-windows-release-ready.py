@@ -35,6 +35,67 @@ MANUAL_CHECK_IDS = (
 )
 MANUAL_ACCEPTANCE_SCHEMA = 2
 MIN_MANUAL_LONG_SOAK_SECONDS = 4 * 60 * 60
+MANUAL_RECORD_FIELDS = {
+    "schema",
+    "product",
+    "version",
+    "source_commit",
+    "installer",
+    "operator",
+    "recorded_at_utc",
+    "checks",
+    "notes",
+    "environment",
+    "installation",
+    "long_soak",
+}
+MANUAL_INSTALLER_FIELDS = {"file_name", "sha256"}
+MANUAL_ENVIRONMENT_FIELDS = {
+    "controller_os",
+    "host_os",
+    "controller_arch",
+    "host_arch",
+    "network_modes",
+    "webview2_verified",
+}
+MANUAL_INSTALLATION_FIELDS = {
+    "fresh_windows_account",
+    "install_upgrade_uninstall",
+    "smartscreen_result",
+}
+MANUAL_LONG_SOAK_FIELDS = {
+    "duration_seconds",
+    "sample_interval_seconds",
+    "metrics_recorded",
+    "diagnostic_exported",
+}
+SENSITIVE_MANUAL_TEXT_PATTERNS = (
+    ("设备 ID", re.compile(r"(?<!\d)(?:(?:\d{3}[\s-]){3}\d{3}|\d{12})(?!\d)")),
+    (
+        "密码或密钥",
+        re.compile(
+            r"(?i)(?:访问密码|临时密码|固定密码|access\s*(?:code|password)|password|secret|private\s*key|私钥)\s*[:=：]\s*\S+"
+        ),
+    ),
+    ("私钥内容", re.compile(r"-----BEGIN [A-Z0-9 ]+-----")),
+    ("本地路径", re.compile(r"(?i)(?:[a-z]:\\|\\\\)")),
+)
+
+
+def _reject_unknown_fields(value: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"manual acceptance record has unsupported {label} fields: {', '.join(unknown)}")
+
+
+def _validate_manual_text(value: Any, label: str, *, maximum: int) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"manual acceptance record {label} must be text")
+    if len(value) > maximum:
+        raise ValueError(f"manual acceptance record {label} is too long")
+    for category, pattern in SENSITIVE_MANUAL_TEXT_PATTERNS:
+        if pattern.search(value):
+            raise ValueError(f"manual acceptance record {label} contains prohibited sensitive data ({category})")
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -61,11 +122,14 @@ def load_manual_acceptance(
         raise ValueError(
             f"manual acceptance record must use schema {MANUAL_ACCEPTANCE_SCHEMA}"
         )
+    _reject_unknown_fields(value, MANUAL_RECORD_FIELDS, "top-level")
     if value.get("version") != expected_version:
         raise ValueError("manual acceptance record version does not match the candidate")
     if value.get("source_commit") != expected_commit:
         raise ValueError("manual acceptance record source commit does not match the candidate")
     installer = value.get("installer")
+    if isinstance(installer, dict):
+        _reject_unknown_fields(installer, MANUAL_INSTALLER_FIELDS, "installer")
     expected_installer_name = (
         f"DeskLinkSetup-{expected_version}-x64.exe" if expected_version else ""
     )
@@ -80,6 +144,7 @@ def load_manual_acceptance(
     operator = value.get("operator")
     if not isinstance(operator, str) or not operator.strip():
         raise ValueError("manual acceptance record must name the operator")
+    _validate_manual_text(operator.strip(), "operator", maximum=200)
     recorded_at = value.get("recorded_at_utc")
     if not isinstance(recorded_at, str):
         raise ValueError("manual acceptance record timestamp is missing")
@@ -97,15 +162,20 @@ def load_manual_acceptance(
     notes = value.get("notes")
     if not isinstance(notes, dict):
         raise ValueError("manual acceptance record notes are missing")
+    _reject_unknown_fields(notes, set(MANUAL_CHECK_IDS), "notes")
     for check_id in MANUAL_CHECK_IDS:
+        note = notes.get(check_id)
+        if note is not None:
+            _validate_manual_text(note, f"notes.{check_id}", maximum=2_000)
         if checks[check_id] and (
-            not isinstance(notes.get(check_id), str) or not notes[check_id].strip()
+            not isinstance(note, str) or not note.strip()
         ):
             raise ValueError(f"manual acceptance record needs notes for {check_id}")
 
     environment = value.get("environment")
     if not isinstance(environment, dict):
         raise ValueError("manual acceptance record environment is missing")
+    _reject_unknown_fields(environment, MANUAL_ENVIRONMENT_FIELDS, "environment")
     if checks["two_windows_acceptance"]:
         for field in ("controller_os", "host_os"):
             field_value = environment.get(field)
@@ -130,6 +200,10 @@ def load_manual_acceptance(
     installation = value.get("installation")
     if not isinstance(installation, dict):
         raise ValueError("manual acceptance record installation evidence is missing")
+    _reject_unknown_fields(installation, MANUAL_INSTALLATION_FIELDS, "installation")
+    smartscreen_result = installation.get("smartscreen_result")
+    if smartscreen_result is not None:
+        _validate_manual_text(smartscreen_result, "installation.smartscreen_result", maximum=500)
     if checks["smartscreen_acceptance"]:
         for field in ("fresh_windows_account", "install_upgrade_uninstall"):
             if not isinstance(installation.get(field), bool):
@@ -140,6 +214,7 @@ def load_manual_acceptance(
     long_soak = value.get("long_soak")
     if not isinstance(long_soak, dict):
         raise ValueError("manual acceptance record long-soak evidence is missing")
+    _reject_unknown_fields(long_soak, MANUAL_LONG_SOAK_FIELDS, "long-soak")
     duration_seconds = long_soak.get("duration_seconds")
     sample_interval_seconds = long_soak.get("sample_interval_seconds")
     if (
@@ -586,7 +661,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manual-json",
         type=Path,
-        help="Optional schema-1 acceptance record bound to this version, commit and installer",
+        help="Optional schema-2 acceptance record bound to this version, commit and installer",
     )
     parser.add_argument(
         "--strict",
