@@ -671,10 +671,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--minimum-soak-seconds",
         type=int,
-        default=10,
+        default=None,
         help=(
             "Minimum Windows resilience soak required by this report "
-            "(10-300 seconds; formal release should use 300)"
+            "(10-300 seconds; defaults to 300 with --strict, otherwise 10)"
         ),
     )
     return parser.parse_args()
@@ -682,7 +682,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     arguments = parse_args()
-    if not 10 <= arguments.minimum_soak_seconds <= 300:
+    minimum_soak_seconds = arguments.minimum_soak_seconds
+    if minimum_soak_seconds is None:
+        minimum_soak_seconds = 300 if arguments.strict else 10
+    if not 10 <= minimum_soak_seconds <= 300:
         raise SystemExit("--minimum-soak-seconds must be between 10 and 300")
     version = package_version(ROOT)
     installer = ROOT / "dist" / "windows" / (
@@ -726,7 +729,7 @@ def main() -> int:
         resilience_report=read_json(ROOT / "dist" / "windows" / "windows-resilience-report.json"),
         manual_checks=manual_checks,
         manual_record=manual_record,
-        minimum_soak_seconds=arguments.minimum_soak_seconds,
+        minimum_soak_seconds=minimum_soak_seconds,
     )
     arguments.report.parent.mkdir(parents=True, exist_ok=True)
     arguments.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

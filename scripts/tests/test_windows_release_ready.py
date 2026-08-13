@@ -29,6 +29,22 @@ class WindowsReleaseReadyTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.ready = load_script()
 
+    def test_strict_cli_defaults_to_formal_release_soak(self) -> None:
+        with patch.object(sys, "argv", ["check-windows-release-ready.py", "--strict"]):
+            arguments = self.ready.parse_args()
+        minimum = arguments.minimum_soak_seconds
+        if minimum is None:
+            minimum = 300 if arguments.strict else 10
+        self.assertEqual(minimum, 300)
+
+    def test_non_strict_cli_keeps_fast_feedback_default(self) -> None:
+        with patch.object(sys, "argv", ["check-windows-release-ready.py"]):
+            arguments = self.ready.parse_args()
+        minimum = arguments.minimum_soak_seconds
+        if minimum is None:
+            minimum = 300 if arguments.strict else 10
+        self.assertEqual(minimum, 10)
+
     @staticmethod
     def manual_evidence() -> dict[str, object]:
         return {
