@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   accountLocalModeEnabled,
+  canRecoverWorkspaceSnapshot,
   setAccountLocalModeEnabled,
   shouldStartInLocalMode,
   type AccountModeStorage,
@@ -41,6 +42,12 @@ describe("本机模式启动策略", () => {
 
   test("已登录用户不进入本机模式", () => {
     expect(shouldStartInLocalMode(true)).toBe(false);
+  });
+
+  test("本机模式也允许快照失败后的自动恢复", () => {
+    expect(canRecoverWorkspaceSnapshot(false, true)).toBe(true);
+    expect(canRecoverWorkspaceSnapshot(false, false)).toBe(false);
+    expect(canRecoverWorkspaceSnapshot(true, false)).toBe(true);
   });
 });
 

@@ -63,6 +63,7 @@ import { LatestRequest } from "./latest-request";
 import { RenderScheduler } from "./render-scheduler";
 import {
   setAccountLocalModeEnabled,
+  canRecoverWorkspaceSnapshot,
   shouldStartInLocalMode,
 } from "./account-mode";
 import { escapeHtml } from "./html";
@@ -1930,7 +1931,7 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
 }
 
 function scheduleSnapshotRecovery(): void {
-  if (snapshotRecoveryTimer !== null || !account.signedIn) {
+  if (snapshotRecoveryTimer !== null || !canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
     return;
   }
   snapshotRecoveryTimer = window.setTimeout(() => {

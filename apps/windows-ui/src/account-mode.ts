@@ -15,6 +15,10 @@ export function shouldStartInLocalMode(signedIn: boolean): boolean {
   return !signedIn;
 }
 
+export function canRecoverWorkspaceSnapshot(signedIn: boolean, localMode: boolean): boolean {
+  return signedIn || localMode;
+}
+
 function browserStorage(): AccountModeStorage | null {
   if (typeof window === "undefined") {
     return null;
