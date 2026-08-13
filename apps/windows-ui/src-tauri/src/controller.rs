@@ -4104,8 +4104,8 @@ impl ConnectFailure {
         let technical_reason = error.to_string();
         match error {
             TransportError::JoinRejected(JoinRejectCode::SessionNotFound) => Self::with_reason(
-                true,
-                "主机连接窗口尚未就绪或临时密码已经失效，请在主机上重新生成临时密码。",
+                false,
+                "找不到在线设备或访问密码已失效，请确认主机在线并重新检查设备 ID 和访问密码。",
                 "session_not_found",
                 technical_reason,
             ),
@@ -5471,7 +5471,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_and_mismatched_pairing_sessions_have_distinct_recovery_text() {
+    fn expired_and_mismatched_pairing_sessions_stop_with_distinct_recovery_text() {
         let expired = ConnectFailure::from_transport(TransportError::JoinRejected(
             JoinRejectCode::SessionNotFound,
         ));
@@ -5479,7 +5479,7 @@ mod tests {
             JoinRejectCode::AuthenticationMismatch,
         ));
 
-        assert!(expired.retryable);
+        assert!(!expired.retryable);
         assert!(expired.detail.contains("失效"));
         assert!(!mismatch.retryable);
         assert!(mismatch.detail.contains("不匹配"));
