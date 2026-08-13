@@ -662,6 +662,64 @@ async fn replacement_host_supersedes_stale_disconnect_and_keeps_controller_attac
 }
 
 #[tokio::test]
+async fn replacement_host_keeps_directory_registration_bound_to_new_connection() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(28);
+    let device_id = 323_456_789_012;
+    let access_code = *b"AB2DEF3G";
+    let invitation = b"replacement host invitation".to_vec();
+    let registration =
+        || RelayDirectoryRegistration::new(device_id, access_code, invitation.clone(), 0).unwrap();
+
+    let first_host = QuicClient::connect(config(&relay)).await.unwrap();
+    first_host
+        .join(
+            RelayJoin::host_with_participant(session_id, [9; 32], [17; 16])
+                .with_directory_registration(registration())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let lookup = || async {
+        let client = QuicClient::connect(config(&relay)).await.unwrap();
+        client
+            .lookup_directory(RelayDirectoryLookup::new(device_id, access_code).unwrap())
+            .await
+    };
+    assert_eq!(lookup().await.unwrap(), invitation);
+
+    let resumed_host = QuicClient::connect(config(&relay)).await.unwrap();
+    resumed_host
+        .join(
+            RelayJoin::host_with_participant(session_id, [9; 32], [17; 16])
+                .with_directory_registration(registration())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), first_host.next_event())
+        .await
+        .expect("the replaced host did not close");
+
+    assert_eq!(lookup().await.unwrap(), invitation);
+    drop(first_host);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        lookup().await.unwrap(),
+        invitation,
+        "the stale host cleanup must not remove the replacement directory entry"
+    );
+
+    drop(resumed_host);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        lookup().await,
+        Err(TransportError::DirectoryNotFound),
+        "the directory entry must disappear after the replacement host leaves"
+    );
+}
+
+#[tokio::test]
 async fn relay_enforces_connection_and_session_admission_caps() {
     let connection_limited = spawn_test_relay_with_config(RelayConfig {
         max_connections: 1,
