@@ -514,6 +514,19 @@ async fn explicit_lan_mode_accepts_a_self_signed_local_relay() {
     );
 }
 
+#[tokio::test]
+async fn explicit_client_close_wakes_the_closed_event() {
+    let relay = spawn_mock_relay(false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+
+    client.close(b"short probe complete");
+    let reason = tokio::time::timeout(Duration::from_secs(2), client.next_closed_reason())
+        .await
+        .expect("closed event timeout");
+    assert!(!reason.is_empty());
+}
+
 async fn next_n(client: &QuicClient, count: usize) -> Vec<TransportEvent> {
     let mut events = Vec::with_capacity(count);
     for _ in 0..count {
