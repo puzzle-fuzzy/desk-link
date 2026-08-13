@@ -102,6 +102,36 @@ class ManagedRelayDeployTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.deploy.validate_source_commit("not-a-commit")
 
+    def test_running_container_revision_must_match_loaded_image(self) -> None:
+        revision = "a" * 40
+        self.assertEqual(
+            self.deploy.validate_running_source_commit(revision, revision),
+            revision,
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            self.deploy.validate_running_source_commit(revision, "b" * 40)
+
+    def test_health_requires_a_structured_healthy_status(self) -> None:
+        class FakeSsh:
+            def __init__(self, output: str) -> None:
+                self.output = output
+
+            def run(self, arguments: list[str], *, check: bool = True) -> str:
+                return self.output
+
+        self.assertTrue(
+            self.deploy.healthy(
+                FakeSsh('{"Running":true,"Health":{"Status":"healthy"}}'),
+                "relay",
+            )
+        )
+        self.assertFalse(
+            self.deploy.healthy(FakeSsh('{"Running":true,"Health":null}'), "relay")
+        )
+        self.assertFalse(
+            self.deploy.healthy(FakeSsh('{"Running":true}'), "relay")
+        )
+
     def test_rolls_back_when_deploy_health_check_fails(self) -> None:
         class FakeSsh:
             def __init__(self, target: str, identity_file: Path | None) -> None:

@@ -30,7 +30,7 @@ python scripts/verify-managed-relay.py
 python scripts/deploy-managed-relay.py --target root@101.35.246.159 --identity-file C:\Users\18267\.ssh\p2p-tencent-ed25519
 ```
 
-部署结果会回报实际加载镜像的源码 SHA；如果镜像缺少完整 40 位 revision，部署会在重建容器前失败。
+部署结果会回报实际加载镜像的源码 SHA；部署完成后还会重新读取运行中容器的 revision，确保 compose 没有启动错误的镜像。如果镜像缺少完整 40 位 revision，或运行中容器与加载镜像不一致，部署会自动回滚并失败。
 
 加入信封或目录信封升级时，发布顺序固定为：先部署同时支持旧、新信封的 relay 并通过外部探针，再构建和分发新客户端。不得先发布依赖新信封的客户端。
 

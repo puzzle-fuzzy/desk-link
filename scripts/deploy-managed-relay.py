@@ -65,6 +65,16 @@ def validate_source_commit(value: str) -> str:
     return value
 
 
+def validate_running_source_commit(expected: str, actual: str) -> str:
+    expected = validate_source_commit(expected)
+    actual = validate_source_commit(actual)
+    if actual != expected:
+        raise RuntimeError(
+            "running relay container source revision does not match the loaded image"
+        )
+    return actual
+
+
 class Ssh:
     def __init__(self, target: str, identity_file: Path | None) -> None:
         self.target = validate_remote_value("SSH target", target)
@@ -134,7 +144,12 @@ def healthy(ssh: Ssh, container: str) -> bool:
         )
         or "{}"
     )
-    return state.get("Running") is True and state.get("Health", {}).get("Status") == "healthy"
+    health = state.get("Health")
+    return (
+        state.get("Running") is True
+        and isinstance(health, dict)
+        and health.get("Status") == "healthy"
+    )
 
 
 def main() -> int:
@@ -200,6 +215,18 @@ def main() -> int:
                 time.sleep(2)
             else:
                 raise RuntimeError("new relay did not become healthy before the deadline")
+            running_source_commit = validate_running_source_commit(
+                source_commit,
+                ssh.run(
+                    [
+                        "docker",
+                        "inspect",
+                        "--format",
+                        '{{index .Config.Labels "org.opencontainers.image.revision"}}',
+                        container,
+                    ]
+                )
+            )
         except Exception as error:
             try:
                 ssh.run(["docker", "tag", rollback_tag, "desklink-relay:0.1.0"])
