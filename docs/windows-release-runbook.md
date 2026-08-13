@@ -99,11 +99,11 @@ cargo audit
 python scripts/create-windows-acceptance-record.py --operator "release-team"
 ```
 
-完成真实验收后，只修改模板中的 `checks` 和 `notes`，再传入 `--manual-json` 重新生成报告。每个标记为 `true` 的检查必须有非空 `notes`，说明设备范围、实际结果和异常处理。记录必须保留版本、来源提交 SHA、安装包 SHA-256、操作者和 UTC 时间：
+完成真实验收后，填写模板中的 `checks`、`notes`、`environment`、`installation` 和 `long_soak`，再传入 `--manual-json` 重新生成报告。每个标记为 `true` 的检查必须有非空 `notes`，说明设备范围、实际结果和异常处理；双机通过必须记录两台 Windows x64、局域网和中继模式，长稳通过必须记录至少 4 小时、采样指标和脱敏诊断导出。记录不得包含密码、私钥、完整设备 ID、屏幕内容或个人文件名：
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "version": "0.1.91",
   "source_commit": "<40-char-source-sha>",
   "installer": {
@@ -121,11 +121,30 @@ python scripts/create-windows-acceptance-record.py --operator "release-team"
     "two_windows_acceptance": "两台 Windows 已完成配对、视频、鼠标、键盘和双屏验收；异常：无。",
     "long_soak_acceptance": "连续运行 4 小时并完成断网恢复、剪贴板和文件传输；异常：无。",
     "smartscreen_acceptance": "全新 Windows 账户完成安装、升级、卸载和 SmartScreen 验收；异常：无。"
+  },
+  "environment": {
+    "controller_os": "Windows 11 24H2",
+    "host_os": "Windows 10 22H2",
+    "controller_arch": "x64",
+    "host_arch": "x64",
+    "network_modes": ["lan", "relay"],
+    "webview2_verified": true
+  },
+  "installation": {
+    "fresh_windows_account": true,
+    "install_upgrade_uninstall": true,
+    "smartscreen_result": "通过"
+  },
+  "long_soak": {
+    "duration_seconds": 14400,
+    "sample_interval_seconds": 1800,
+    "metrics_recorded": true,
+    "diagnostic_exported": true
   }
 }
 ```
 
-然后运行 `python scripts/check-windows-release-ready.py --manual-json <path>`。预检会拒绝版本、提交 SHA 或安装包哈希不一致的记录。该文件不应包含密码、私钥、设备完整 ID 或屏幕内容。
+然后运行 `python scripts/check-windows-release-ready.py --manual-json <path>`。预检会拒绝版本、提交 SHA 或安装包哈希不一致的记录，也会拒绝缺少结构化环境、安装或长稳证据的记录。
 
 ## 3. 签名候选构建
 

@@ -55,7 +55,7 @@
 
 ## 6. 生成发布证据
 
-在验收完成后，只修改候选模板中的 `checks` 和 `notes`，不要改版本、源码提交或安装器哈希：
+在验收完成后，填写候选模板中的 `checks`、`notes`、`environment`、`installation` 和 `long_soak`，不要改版本、源码提交或安装器哈希。双机通过必须把两台系统和 `lan`/`relay` 写入 `environment`；长稳通过必须填写至少 `14400` 秒、采样指标和脱敏诊断导出：
 
 ```powershell
 python scripts/create-windows-acceptance-record.py --operator "实际操作者"

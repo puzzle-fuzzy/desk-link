@@ -29,6 +29,30 @@ class WindowsReleaseReadyTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.ready = load_script()
 
+    @staticmethod
+    def manual_evidence() -> dict[str, object]:
+        return {
+            "environment": {
+                "controller_os": "Windows 11 24H2",
+                "host_os": "Windows 10 22H2",
+                "controller_arch": "x64",
+                "host_arch": "x64",
+                "network_modes": ["lan", "relay"],
+                "webview2_verified": True,
+            },
+            "installation": {
+                "fresh_windows_account": True,
+                "install_upgrade_uninstall": True,
+                "smartscreen_result": "通过",
+            },
+            "long_soak": {
+                "duration_seconds": 4 * 60 * 60,
+                "sample_interval_seconds": 1800,
+                "metrics_recorded": True,
+                "diagnostic_exported": True,
+            },
+        }
+
     def create_fixture(self, root: Path, *, signed: bool = True) -> dict[str, object]:
         installer = root / "DeskLinkSetup-0.1.42-x64.exe"
         installer.write_bytes(b"desklink installer")
@@ -154,7 +178,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             manifest = fixture["manifest"]
             installer = manifest["installer"]
             record = {
-                "schema": 1,
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
                 "version": "0.1.42",
                 "source_commit": "a" * 40,
                 "installer": {
@@ -165,6 +189,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                 "recorded_at_utc": "2026-07-23T10:00:00Z",
                 "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
                 "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
+                **self.manual_evidence(),
             }
             path = root / "acceptance.json"
             path.write_text(json.dumps(record), encoding="utf-8")
@@ -177,6 +202,53 @@ class WindowsReleaseReadyTests(unittest.TestCase):
         self.assertTrue(all(checks.values()))
         self.assertEqual(metadata["operator"], "release-team")
 
+    def test_empty_manual_acceptance_template_is_allowed_before_real_testing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            evidence = self.manual_evidence()
+            evidence["environment"] = {
+                "controller_os": "",
+                "host_os": "",
+                "controller_arch": "x64",
+                "host_arch": "x64",
+                "network_modes": [],
+                "webview2_verified": False,
+            }
+            evidence["installation"] = {
+                "fresh_windows_account": False,
+                "install_upgrade_uninstall": False,
+                "smartscreen_result": "",
+            }
+            evidence["long_soak"] = {
+                "duration_seconds": 0,
+                "sample_interval_seconds": 1800,
+                "metrics_recorded": False,
+                "diagnostic_exported": False,
+            }
+            record = {
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {"file_name": installer["file_name"], "sha256": installer["sha256"]},
+                "operator": "待真实 Windows 验收",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: False for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "" for key in self.ready.MANUAL_CHECK_IDS},
+                **evidence,
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            checks, _ = self.ready.load_manual_acceptance(
+                path,
+                expected_version="0.1.42",
+                expected_commit="a" * 40,
+                expected_installer_sha256=installer["sha256"],
+            )
+        self.assertFalse(any(checks.values()))
+
     def test_manual_acceptance_requires_notes_for_passed_checks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -184,7 +256,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             manifest = fixture["manifest"]
             installer = manifest["installer"]
             record = {
-                "schema": 1,
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
                 "version": "0.1.42",
                 "source_commit": "a" * 40,
                 "installer": {"file_name": installer["file_name"], "sha256": installer["sha256"]},
@@ -192,10 +264,40 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                 "recorded_at_utc": "2026-07-23T10:00:00Z",
                 "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
                 "notes": {key: "" for key in self.ready.MANUAL_CHECK_IDS},
+                **self.manual_evidence(),
             }
             path = root / "acceptance.json"
             path.write_text(json.dumps(record), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "needs notes"):
+                self.ready.load_manual_acceptance(
+                    path,
+                    expected_version="0.1.42",
+                    expected_commit="a" * 40,
+                    expected_installer_sha256=installer["sha256"],
+                )
+
+    def test_manual_acceptance_requires_structured_long_soak_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            evidence = self.manual_evidence()
+            evidence["long_soak"]["duration_seconds"] = 3600
+            record = {
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {"file_name": installer["file_name"], "sha256": installer["sha256"]},
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
+                **evidence,
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "at least 4 hours"):
                 self.ready.load_manual_acceptance(
                     path,
                     expected_version="0.1.42",
@@ -209,7 +311,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             fixture = self.create_fixture(root)
             manifest = fixture["manifest"]
             record = {
-                "schema": 1,
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
                 "version": "0.1.42",
                 "source_commit": "a" * 40,
                 "installer": {"file_name": "DeskLinkSetup-0.1.42-x64.exe", "sha256": "b" * 64},
@@ -217,6 +319,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                 "recorded_at_utc": "2026-07-23T10:00:00Z",
                 "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
                 "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
+                **self.manual_evidence(),
             }
             path = root / "acceptance.json"
             path.write_text(json.dumps(record), encoding="utf-8")
@@ -235,7 +338,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             manifest = fixture["manifest"]
             installer = manifest["installer"]
             record = {
-                "schema": 1,
+                "schema": self.ready.MANUAL_ACCEPTANCE_SCHEMA,
                 "version": "0.1.42",
                 "source_commit": "a" * 40,
                 "installer": {
@@ -246,6 +349,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                 "recorded_at_utc": "2026-07-23T10:00:00Z",
                 "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
                 "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
+                **self.manual_evidence(),
             }
             path = root / "acceptance.json"
             path.write_text(json.dumps(record), encoding="utf-8")

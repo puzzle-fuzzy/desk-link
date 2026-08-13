@@ -33,6 +33,8 @@ MANUAL_CHECK_IDS = (
     "long_soak_acceptance",
     "smartscreen_acceptance",
 )
+MANUAL_ACCEPTANCE_SCHEMA = 2
+MIN_MANUAL_LONG_SOAK_SECONDS = 4 * 60 * 60
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -51,12 +53,14 @@ def load_manual_acceptance(
     expected_version: str | None,
     expected_commit: str | None,
     expected_installer_sha256: str | None,
-) -> tuple[dict[str, bool], dict[str, str]]:
+) -> tuple[dict[str, bool], dict[str, Any]]:
     """Load an acceptance record and bind it to this exact candidate artifact."""
 
     value = read_json(path)
-    if value is None or value.get("schema") != 1:
-        raise ValueError("manual acceptance record must use schema 1")
+    if value is None or value.get("schema") != MANUAL_ACCEPTANCE_SCHEMA:
+        raise ValueError(
+            f"manual acceptance record must use schema {MANUAL_ACCEPTANCE_SCHEMA}"
+        )
     if value.get("version") != expected_version:
         raise ValueError("manual acceptance record version does not match the candidate")
     if value.get("source_commit") != expected_commit:
@@ -98,12 +102,87 @@ def load_manual_acceptance(
             not isinstance(notes.get(check_id), str) or not notes[check_id].strip()
         ):
             raise ValueError(f"manual acceptance record needs notes for {check_id}")
+
+    environment = value.get("environment")
+    if not isinstance(environment, dict):
+        raise ValueError("manual acceptance record environment is missing")
+    if checks["two_windows_acceptance"]:
+        for field in ("controller_os", "host_os"):
+            field_value = environment.get(field)
+            if (
+                not isinstance(field_value, str)
+                or not re.fullmatch(r"Windows (10|11)(?:\b.*)?", field_value.strip())
+            ):
+                raise ValueError(f"manual acceptance record has invalid {field}")
+        for field in ("controller_arch", "host_arch"):
+            if environment.get(field) != "x64":
+                raise ValueError(f"manual acceptance record {field} must be x64")
+        network_modes = environment.get("network_modes")
+        if (
+            not isinstance(network_modes, list)
+            or any(not isinstance(mode, str) for mode in network_modes)
+            or not {"lan", "relay"}.issubset(network_modes)
+        ):
+            raise ValueError("manual acceptance record must include lan and relay network modes")
+        if environment.get("webview2_verified") is not True:
+            raise ValueError("manual acceptance record requires WebView2 verification")
+
+    installation = value.get("installation")
+    if not isinstance(installation, dict):
+        raise ValueError("manual acceptance record installation evidence is missing")
+    if checks["smartscreen_acceptance"]:
+        for field in ("fresh_windows_account", "install_upgrade_uninstall"):
+            if not isinstance(installation.get(field), bool):
+                raise ValueError(f"manual acceptance record {field} result is missing")
+        if not isinstance(installation.get("smartscreen_result"), str):
+            raise ValueError("manual acceptance record SmartScreen result is missing")
+
+    long_soak = value.get("long_soak")
+    if not isinstance(long_soak, dict):
+        raise ValueError("manual acceptance record long-soak evidence is missing")
+    duration_seconds = long_soak.get("duration_seconds")
+    sample_interval_seconds = long_soak.get("sample_interval_seconds")
+    if (
+        not isinstance(duration_seconds, int)
+        or isinstance(duration_seconds, bool)
+        or duration_seconds < 0
+    ):
+        raise ValueError("manual acceptance record long-soak duration is invalid")
+    if (
+        not isinstance(sample_interval_seconds, int)
+        or isinstance(sample_interval_seconds, bool)
+        or sample_interval_seconds < 0
+    ):
+        raise ValueError("manual acceptance record sample interval is invalid")
+    for field in ("metrics_recorded", "diagnostic_exported"):
+        if not isinstance(long_soak.get(field), bool):
+            raise ValueError(f"manual acceptance record {field} result is missing")
+
+    if checks["long_soak_acceptance"]:
+        if duration_seconds < MIN_MANUAL_LONG_SOAK_SECONDS:
+            raise ValueError("manual acceptance record long-soak duration must be at least 4 hours")
+        if not 60 <= sample_interval_seconds <= 3600:
+            raise ValueError("manual acceptance record sample interval must be between 60 and 3600 seconds")
+        if long_soak.get("metrics_recorded") is not True:
+            raise ValueError("manual acceptance record must include long-soak metrics")
+        if long_soak.get("diagnostic_exported") is not True:
+            raise ValueError("manual acceptance record must include a diagnostic export")
+    if checks["smartscreen_acceptance"]:
+        if installation.get("fresh_windows_account") is not True:
+            raise ValueError("manual acceptance record requires a fresh Windows account check")
+        if installation.get("install_upgrade_uninstall") is not True:
+            raise ValueError("manual acceptance record requires install, upgrade and uninstall checks")
+        if not installation.get("smartscreen_result", "").strip():
+            raise ValueError("manual acceptance record needs a SmartScreen result")
     return (
         {check_id: checks[check_id] for check_id in MANUAL_CHECK_IDS},
         {
             "operator": operator.strip(),
             "recorded_at_utc": recorded_at,
             "installer_sha256": installer["sha256"],
+            "environment": environment,
+            "installation": installation,
+            "long_soak": long_soak,
         },
     )
 

@@ -48,6 +48,7 @@
 - [x] 短时公网探针显式关闭所有临时 QUIC 连接，避免监控探针把中继主机登记和会话容量占用到空闲超时。
 - [x] 候选 Windows bundle 按当前提交和安装包哈希打包，防止同版本 ZIP 混入旧构建物料。
 - [x] 发布预检同时校验 annotated tag 的解引用提交必须等于候选 HEAD，避免旧提交上的同名 tag 错误放行。
+- [x] 人工验收记录升级为结构化 schema 2；双机、安装信任和 4 小时长稳通过时必须分别提供脱敏环境、安装和指标证据，不能只填写布尔值。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
 
 ## 1. 云端诊断可用性（P1）
@@ -148,7 +149,7 @@ python scripts/package-windows-candidate.py
 
 ### 最近一次自动门禁（2026-08-13）
 
-- [x] 当前候选提交已通过前端 173 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 55 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
+- [x] 当前候选提交已通过前端 173 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 58 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
 - [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复、本地 300 秒加密媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；报告已纳入 release readiness 并绑定当前提交。
 
 - [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。

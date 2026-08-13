@@ -66,6 +66,7 @@ class WindowsCandidatePackageTests(unittest.TestCase):
                 "passed": True,
             }
             if name == "windows-acceptance-record.json":
+                report["schema"] = self.package.MANUAL_ACCEPTANCE_SCHEMA
                 report["installer"] = {"sha256": manifest["installer"]["sha256"]}
             (dist / name).write_text(json.dumps(report), encoding="utf-8")
         return dist, version, commit
@@ -93,6 +94,16 @@ class WindowsCandidatePackageTests(unittest.TestCase):
             self.assertIn("windows-release-readiness.json", names)
             self.assertIn("windows-installer-manifest.json", names)
             self.assertEqual(len(names), 6)
+
+    def test_rejects_an_old_manual_acceptance_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist, _, _ = self.fixture(root)
+            report = json.loads((dist / "windows-acceptance-record.json").read_text())
+            report["schema"] = 1
+            (dist / "windows-acceptance-record.json").write_text(json.dumps(report))
+            with self.assertRaisesRegex(self.package.CandidatePackageError, "schema 2"):
+                self.package.validate_candidate_artifacts(root, dist)
 
     def test_rejects_stale_managed_relay_host_audit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

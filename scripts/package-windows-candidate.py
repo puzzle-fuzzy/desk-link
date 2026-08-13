@@ -25,6 +25,7 @@ EXPECTED_SCOPE = {
     "mobile_release": False,
 }
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+MANUAL_ACCEPTANCE_SCHEMA = 2
 
 
 class CandidatePackageError(ValueError):
@@ -111,6 +112,10 @@ def validate_candidate_artifacts(root: Path, dist: Path) -> tuple[str, str, list
         commit=source_commit,
         require_clean=False,
     )
+    if reports["windows-acceptance-record.json"].get("schema") != MANUAL_ACCEPTANCE_SCHEMA:
+        raise CandidatePackageError(
+            f"acceptance record must use schema {MANUAL_ACCEPTANCE_SCHEMA}"
+        )
     _require_source_binding(reports["windows-release-readiness.json"], name="readiness report", commit=source_commit)
     if reports["windows-release-verification.json"].get("version") != version:
         raise CandidatePackageError("release verification version does not match the installer")

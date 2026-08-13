@@ -20,6 +20,7 @@ MANUAL_CHECK_IDS = (
     "long_soak_acceptance",
     "smartscreen_acceptance",
 )
+MANUAL_ACCEPTANCE_SCHEMA = 2
 EXPECTED_SCOPE = {
     "target": "windows-10/11-x64",
     "macos_release": False,
@@ -129,7 +130,7 @@ def main() -> int:
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
     record = {
-        "schema": 1,
+        "schema": MANUAL_ACCEPTANCE_SCHEMA,
         "product": "DeskLink Windows acceptance",
         "version": version,
         "source_commit": source_commit,
@@ -138,13 +139,35 @@ def main() -> int:
         "recorded_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "checks": {check_id: False for check_id in MANUAL_CHECK_IDS},
         "notes": {check_id: "" for check_id in MANUAL_CHECK_IDS},
+        "environment": {
+            "controller_os": "",
+            "host_os": "",
+            "controller_arch": "x64",
+            "host_arch": "x64",
+            "network_modes": [],
+            "webview2_verified": False,
+        },
+        "installation": {
+            "fresh_windows_account": False,
+            "install_upgrade_uninstall": False,
+            "smartscreen_result": "",
+        },
+        "long_soak": {
+            "duration_seconds": 0,
+            "sample_interval_seconds": 1800,
+            "metrics_recorded": False,
+            "diagnostic_exported": False,
+        },
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(
         json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"Acceptance record template: {arguments.output.resolve()}")
-    print("完成真实验收后，将 checks 中对应项目改为 true，再运行 check-windows-release-ready.py。")
+    print(
+        "完成真实验收后填写 checks、notes、environment、installation 和 long_soak，"
+        "再运行 check-windows-release-ready.py。"
+    )
     return 0
 
 
