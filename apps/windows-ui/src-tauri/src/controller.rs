@@ -82,6 +82,7 @@ const DIRECTORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AUDIO_FRAME_DURATION_US: u64 = 10_000;
 const MAX_FILE_QUEUE_ITEMS: usize = MAX_FILE_QUEUE_RECOVERY_ITEMS;
+const OUTGOING_FILE_EVENT_QUEUE_CAPACITY: usize = 1;
 const TRANSFER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 const CLIPBOARD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const FILE_DECISION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
@@ -2477,7 +2478,11 @@ async fn run_controller(
         let mut pending_remote_file_request: Option<PendingRemoteFileRequest> = None;
         let mut pending_clipboard: Option<PendingClipboardOperation> = None;
         let mut audio_decoder = ControllerAudioDecoder::new();
-        let (outgoing_file_events, mut pending_outgoing_file_events) = mpsc::unbounded_channel();
+        // There can be at most one file sender for the active transfer. Keep
+        // completion notifications bounded so a late task from a disconnected
+        // session cannot retain an unbounded backlog during reconnects.
+        let (outgoing_file_events, mut pending_outgoing_file_events) =
+            mpsc::channel(OUTGOING_FILE_EVENT_QUEUE_CAPACITY);
         let mut transfer_watchdog = tokio::time::interval(TRANSFER_WATCHDOG_INTERVAL);
         transfer_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         publish_file_queue(
@@ -3421,7 +3426,7 @@ async fn run_controller(
                                         message,
                                     },
                                 };
-                                let _ = outgoing_file_events.send(event);
+                                let _ = outgoing_file_events.send(event).await;
                             });
                         }
                         TransferMessage::FileResult { transfer_id, result } => {
