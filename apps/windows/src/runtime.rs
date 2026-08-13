@@ -57,6 +57,7 @@ use crate::{
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
 const CURSOR_INTERVAL: Duration = Duration::from_millis(16);
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 // The authenticated handshake includes the native local-approval dialog. Give
 // the person at the host enough time to inspect and approve the controller.
@@ -560,7 +561,14 @@ impl HostSupervisor {
         stream_id: &mut u64,
         stable: &AtomicBool,
     ) -> Result<(), HostRuntimeError> {
-        let client = Arc::new(QuicClient::connect(self.transport.clone()).await?);
+        let client = Arc::new(
+            tokio::time::timeout(
+                RELAY_CONNECT_TIMEOUT,
+                QuicClient::connect(self.transport.clone()),
+            )
+            .await
+            .map_err(|_| TransportError::Connection("relay connection timed out".to_owned()))??,
+        );
         let mut join = RelayJoin::host_with_participant(
             self.session_id,
             *self.relay_authentication,
