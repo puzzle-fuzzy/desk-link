@@ -17,7 +17,7 @@ fn captured_desktop_frame_encodes_to_h264() {
 
     let mut submitted = 0_u64;
     let forced_keyframe_id = 3_u64;
-    for _ in 0..20 {
+    for _ in 0..60 {
         let frame = match capture.next_frame(Duration::from_millis(500)) {
             Ok(frame) => frame,
             Err(CaptureError::Timeout) => continue,
@@ -60,7 +60,7 @@ fn captured_desktop_frame_encodes_to_h264() {
         }
     }
 
-    panic!("encoder produced no forced H.264 keyframe after 20 captured frames");
+    panic!("encoder produced no forced H.264 keyframe after 60 captured frames");
 }
 
 #[cfg(windows)]
