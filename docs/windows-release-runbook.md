@@ -38,10 +38,12 @@ cd ../..
 
 python scripts/verify-windows-release.py
 python scripts/build-windows-installer.py
+python scripts/create-windows-acceptance-record.py --operator "待真实 Windows 验收"
 python scripts/verify-windows-resilience.py --soak-seconds 10
 python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
 python -m unittest discover -s scripts/tests -p "test_*.py"
+python scripts/check-windows-release-ready.py --manual-json dist/windows/windows-acceptance-record.json
 python scripts/package-windows-candidate.py
 ```
 
