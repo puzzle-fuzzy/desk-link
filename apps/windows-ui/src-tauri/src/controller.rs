@@ -4218,6 +4218,7 @@ fn record_controller_video_metrics(
                 DirectVideoPathFallbackReason::InvalidCandidate => "invalidCandidate",
                 DirectVideoPathFallbackReason::Rejected => "rejected",
                 DirectVideoPathFallbackReason::ProbeFailed => "probeFailed",
+                DirectVideoPathFallbackReason::DatagramSilence => "datagramSilence",
                 DirectVideoPathFallbackReason::TimedOut => "timedOut",
                 DirectVideoPathFallbackReason::Stopped => "stopped",
             }

@@ -25,6 +25,7 @@ pub enum DirectVideoPathFallbackReason {
     InvalidCandidate,
     Rejected,
     ProbeFailed,
+    DatagramSilence,
     TimedOut,
     Stopped,
 }
@@ -74,6 +75,7 @@ pub enum DirectVideoPathEvent {
     ProbeFailed {
         candidate_id: u64,
     },
+    DatagramSilence,
     Tick {
         now_unix_s: u64,
     },
@@ -278,6 +280,13 @@ impl DirectVideoPathMachine {
                     Vec::new()
                 }
             }
+            DatagramSilence => {
+                if matches!(self.state, DirectVideoPathState::Direct { .. }) {
+                    self.fallback(DirectVideoPathFallbackReason::DatagramSilence)
+                } else {
+                    Vec::new()
+                }
+            }
             Tick { now_unix_s } => {
                 let timed_out = matches!(
                     &self.state,
@@ -455,6 +464,33 @@ mod tests {
         assert_eq!(
             machine.last_fallback_reason(),
             Some(DirectVideoPathFallbackReason::Stopped)
+        );
+    }
+
+    #[test]
+    fn silent_direct_datagrams_fall_back_to_relay() {
+        let binding = [12; 16];
+        let mut machine = DirectVideoPathMachine::new(binding).with_direct_probe();
+        machine.apply(DirectVideoPathEvent::ReceiveOffer {
+            candidate: candidate(binding),
+            local_candidate: Some(candidate(binding)),
+            now_unix_s: 100,
+        });
+        machine.apply(DirectVideoPathEvent::ProbeSucceeded {
+            candidate_id: 7,
+            quality: good_quality(),
+        });
+
+        assert_eq!(
+            machine.apply(DirectVideoPathEvent::DatagramSilence),
+            vec![DirectVideoPathAction::UseRelay {
+                reason: DirectVideoPathFallbackReason::DatagramSilence,
+            }]
+        );
+        assert_eq!(machine.state(), &DirectVideoPathState::Relay);
+        assert_eq!(
+            machine.last_fallback_reason(),
+            Some(DirectVideoPathFallbackReason::DatagramSilence)
         );
     }
 

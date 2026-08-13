@@ -45,6 +45,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ASSEMBLY_CAPACITY: usize = 3;
 const ASSEMBLY_MAX_AGE: Duration = Duration::from_millis(500);
+// A successful authenticated probe only proves that the endpoints can open a
+// datagram socket. If a firewall silently drops the subsequent video packets,
+// do not leave the controller on a permanently black direct surface.
+const DIRECT_VIDEO_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
@@ -522,6 +526,8 @@ impl ControllerRuntime {
     async fn next_transport_event(&mut self) -> Result<TransportEvent, ControllerError> {
         loop {
             if let Some(connection) = self.direct_connection.clone() {
+                let silence_timeout = tokio::time::sleep(DIRECT_VIDEO_SILENCE_TIMEOUT);
+                tokio::pin!(silence_timeout);
                 tokio::select! {
                     relay = self.client.next_event() => return relay.map_err(ControllerError::from),
                         direct = connection.recv_datagram() => match direct {
@@ -532,6 +538,12 @@ impl ControllerRuntime {
                                 self.apply_video_path_actions(actions).await?;
                             }
                         },
+                    _ = &mut silence_timeout => {
+                        self.direct_connection = None;
+                        connection.close(b"desklink direct video silence timeout");
+                        let actions = self.video_path.apply(DirectVideoPathEvent::DatagramSilence);
+                        self.apply_video_path_actions(actions).await?;
+                    }
                 }
                 continue;
             }
