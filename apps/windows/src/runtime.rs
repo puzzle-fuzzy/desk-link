@@ -577,7 +577,9 @@ impl HostSupervisor {
         if let Some(registration) = &self.directory_registration {
             join = join.with_directory_registration(registration.clone())?;
         }
-        client.join(join).await?;
+        tokio::time::timeout(RELAY_CONNECT_TIMEOUT, client.join(join))
+            .await
+            .map_err(|_| TransportError::Connection("relay join timed out".to_owned()))??;
         self.publish(HostLifecycleEvent::Available {
             stream_id: *stream_id,
         });

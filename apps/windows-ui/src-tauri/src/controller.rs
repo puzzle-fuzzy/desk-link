@@ -3953,14 +3953,32 @@ async fn connect_once(
         .map_err(|_| ConnectFailure::permanent("控制端身份存储不可用"))?
         .load_or_create(&mut OsRng)
         .map_err(|_| ConnectFailure::permanent("无法打开控制端身份"))?;
-    client
-        .join(RelayJoin::controller_with_participant(
-            settings.session_id(),
-            *settings.authentication(),
-            identity.device_id,
-        ))
+    let join = client.join(RelayJoin::controller_with_participant(
+        settings.session_id(),
+        *settings.authentication(),
+        identity.device_id,
+    ));
+    match manager
+        .wait_for_current_transport(generation, join, DIRECTORY_OPERATION_TIMEOUT)
         .await
-        .map_err(ConnectFailure::from_transport)?;
+    {
+        CurrentTransportWait::Completed(result) => {
+            result.map_err(ConnectFailure::from_transport)?;
+        }
+        CurrentTransportWait::Cancelled => {
+            return Err(ConnectFailure::with_reason(
+                false,
+                "连接已取消。",
+                "cancelled",
+                "controller connection generation was cancelled",
+            ));
+        }
+        CurrentTransportWait::TimedOut => {
+            return Err(ConnectFailure::from_transport(TransportError::Connection(
+                "relay join timed out".to_owned(),
+            )));
+        }
+    }
     record_controller_diagnostic(
         diagnostics,
         ControllerDiagnosticStage::RelayJoined,
