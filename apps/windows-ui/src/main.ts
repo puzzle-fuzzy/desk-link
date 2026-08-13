@@ -62,8 +62,8 @@ import {
 import { LatestRequest } from "./latest-request";
 import { RenderScheduler } from "./render-scheduler";
 import {
-  accountLocalModeEnabled,
   setAccountLocalModeEnabled,
+  shouldStartInLocalMode,
 } from "./account-mode";
 import { escapeHtml } from "./html";
 import { icon, renderLucideIcons } from "./icons";
@@ -2147,13 +2147,12 @@ function randomHex(byteLength: number): string {
 }
 
 async function bootstrap(): Promise<void> {
-  const rememberedLocalMode = accountLocalModeEnabled();
   try {
     account = await accountRestore();
-    accountLocalMode = !account.signedIn && rememberedLocalMode;
+    accountLocalMode = shouldStartInLocalMode(account.signedIn);
   } catch (error) {
     accountError = normalizeError(error);
-    accountLocalMode = rememberedLocalMode;
+    accountLocalMode = shouldStartInLocalMode(account.signedIn);
   } finally {
     accountLoading = false;
     render();

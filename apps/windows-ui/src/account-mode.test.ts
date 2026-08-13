@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   accountLocalModeEnabled,
   setAccountLocalModeEnabled,
+  shouldStartInLocalMode,
   type AccountModeStorage,
 } from "./account-mode";
 
@@ -31,6 +32,16 @@ test("本机模式偏好可以保存并清除", () => {
 
   setAccountLocalModeEnabled(false, storage);
   expect(accountLocalModeEnabled(storage)).toBe(false);
+});
+
+describe("本机模式启动策略", () => {
+  test("未登录用户首次打开直接进入本机连接工作区", () => {
+    expect(shouldStartInLocalMode(false)).toBe(true);
+  });
+
+  test("已登录用户不进入本机模式", () => {
+    expect(shouldStartInLocalMode(true)).toBe(false);
+  });
 });
 
 describe("本机模式存储失败", () => {

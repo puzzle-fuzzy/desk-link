@@ -6,6 +6,15 @@ export interface AccountModeStorage {
 
 const LOCAL_MODE_KEY = "desklink.account.local-mode";
 
+/**
+ * The Windows client is useful without an account. A first-run user should
+ * land in the local connection workspace instead of being blocked by an
+ * optional cloud-account flow; signed-in users use the account workspace.
+ */
+export function shouldStartInLocalMode(signedIn: boolean): boolean {
+  return !signedIn;
+}
+
 function browserStorage(): AccountModeStorage | null {
   if (typeof window === "undefined") {
     return null;
