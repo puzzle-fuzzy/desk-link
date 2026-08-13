@@ -29,7 +29,7 @@ zeroize = "1.8"
 
 [target.'cfg(windows)'.dependencies]
 opus-head-sys = { version = "0.3.1", default-features = false }
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
