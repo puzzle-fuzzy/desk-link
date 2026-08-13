@@ -18,6 +18,7 @@ mod windows_installer {
     use crate::APPLICATION_PAYLOAD;
     use desklink_delivery_layout::{
         InstallLayout, PRODUCT_NAME, PRODUCT_VERSION, compare_release_versions,
+        webview2_version_is_suitable,
     };
     use windows::{
         Win32::{
@@ -32,9 +33,9 @@ mod windows_installer {
                     CoInitializeEx, CoUninitialize, IPersistFile,
                 },
                 Registry::{
-                    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
-                    REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
-                    RegDeleteValueW, RegGetValueW, RegSetValueExW,
+                    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD,
+                    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
+                    RegDeleteTreeW, RegDeleteValueW, RegGetValueW, RegSetValueExW,
                 },
                 Threading::{
                     OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_ACCESS_RIGHTS,
@@ -147,6 +148,77 @@ mod windows_installer {
         ))
     }
 
+    fn ensure_webview2_runtime() -> io::Result<()> {
+        const WEBVIEW2_MACHINE_CLIENT: &str = r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+        const WEBVIEW2_USER_CLIENT: &str =
+            r"Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+
+        for (root, path) in [
+            (HKEY_LOCAL_MACHINE, WEBVIEW2_MACHINE_CLIENT),
+            (HKEY_CURRENT_USER, WEBVIEW2_USER_CLIENT),
+        ] {
+            if let Some(version) = read_registry_value(root, path, "pv")?
+                && webview2_version_is_suitable(&version)
+            {
+                return Ok(());
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "未检测到 Microsoft Edge WebView2 Runtime。请先安装 Evergreen WebView2 Runtime：\r\nhttps://developer.microsoft.com/microsoft-edge/webview2/\r\n\r\n安装完成后重新运行 DeskLink 安装程序。",
+        ))
+    }
+
+    fn read_registry_value(root: HKEY, subkey: &str, value: &str) -> io::Result<Option<String>> {
+        let subkey = wide(subkey);
+        let value = wide(value);
+        let mut byte_count = 0u32;
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                PCWSTR(subkey.as_ptr()),
+                PCWSTR(value.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                None,
+                Some(&mut byte_count),
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        status.ok().map_err(windows_error_to_io)?;
+        if byte_count == 0 || byte_count > 512 || !byte_count.is_multiple_of(2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebView2 Runtime 注册表版本值无效",
+            ));
+        }
+        let mut data = vec![0u16; (byte_count as usize).div_ceil(2)];
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                PCWSTR(subkey.as_ptr()),
+                PCWSTR(value.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(data.as_mut_ptr().cast()),
+                Some(&mut byte_count),
+            )
+        };
+        status.ok().map_err(windows_error_to_io)?;
+        data.truncate(byte_count as usize / 2);
+        if data.last() == Some(&0) {
+            data.pop();
+        }
+        String::from_utf16(&data).map(Some).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebView2 Runtime 版本不是有效文本",
+            )
+        })
+    }
+
     fn install(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
         if APPLICATION_PAYLOAD.is_empty() {
             return Err(io::Error::new(
@@ -154,6 +226,7 @@ mod windows_installer {
                 "此开发版安装器不包含 DeskLink 应用程序文件",
             ));
         }
+        ensure_webview2_runtime()?;
         refuse_downgrade()?;
         let upgrading = layout.application.is_file();
         if !options.quiet {

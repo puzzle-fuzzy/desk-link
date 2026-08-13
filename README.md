@@ -108,6 +108,8 @@ python scripts/build-windows-installer.py
 
 安装器是单文件、当前用户、无需管理员权限的 GUI 安装包，只部署 `DeskLink.exe` 到 `%LOCALAPPDATA%\Programs\DeskLink`。静默安装使用 `--quiet`，同时指定 `--no-autostart` 可关闭登录启动。默认卸载保留 `%LOCALAPPDATA%\DeskLink` 下的身份、连接、信任和诊断数据；只有显式 `--remove-data` 才删除用户数据。
 
+DeskLink 界面依赖 Microsoft Edge WebView2 Evergreen Runtime。安装器会在写入程序前检查当前电脑的运行时版本；未安装或版本值无效时会停止安装并提示安装官方 WebView2 Runtime，避免安装完成后出现空白窗口或“页面不存在”。
+
 未设置签名环境变量时，构建结果会标记为 `unsigned`，只适合本地测试。正式分发必须先签应用、再封装并签最终安装器；配置见 [`docs/windows-code-signing.md`](docs/windows-code-signing.md)。
 
 正式发布必须使用强制签名门禁：

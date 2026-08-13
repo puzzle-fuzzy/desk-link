@@ -67,7 +67,7 @@
 - [ ] 获取 Windows Authenticode 代码签名证书并安全保存 PFX。
 - [ ] 配置 GitHub Actions secrets：`WINDOWS_SIGNING_PFX_BASE64`、`WINDOWS_SIGNING_PFX_PASSWORD`。
 - [ ] 运行签名构建，确认安装包和主程序签名有效、证书链完整。
-- [ ] 在全新 Windows 账户验证 SmartScreen、安装、升级、卸载和数据保留策略。
+- [ ] 在全新 Windows 账户验证 SmartScreen、WebView2 Runtime 检查、安装、升级、卸载和数据保留策略。
 - [ ] 生成带 SHA-256、签名状态和构建提交的发布清单。
 
 ## 5. 产品文档与 UI 收口（P2）

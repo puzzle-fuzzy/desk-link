@@ -47,6 +47,27 @@ pub fn quote_executable(path: &Path) -> String {
     format!("\"{}\"", path.display())
 }
 
+/// Returns whether a WebView2 Evergreen runtime version can be used by the
+/// Windows control surface. The registry reports `0.0.0.0` when the runtime
+/// is not installed, so every component must parse and at least one must be
+/// non-zero.
+pub fn webview2_version_is_suitable(value: &str) -> bool {
+    let mut parts = value.trim().split('.');
+    let Some(first) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(second) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(third) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(fourth) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return false;
+    };
+    parts.next().is_none() && (first, second, third, fourth) != (0, 0, 0, 0)
+}
+
 /// Compares two public DeskLink release versions.
 ///
 /// Installer versions deliberately use the strict `major.minor.patch` form. Returning
@@ -130,5 +151,14 @@ mod tests {
         assert_eq!(compare_release_versions("0.1", "0.1.25"), None);
         assert_eq!(compare_release_versions("v0.1.25", "0.1.25"), None);
         assert_eq!(compare_release_versions("0.1.25-beta", "0.1.25"), None);
+    }
+
+    #[test]
+    fn webview2_runtime_versions_fail_closed() {
+        assert!(webview2_version_is_suitable("120.0.2210.55"));
+        assert!(!webview2_version_is_suitable("0.0.0.0"));
+        assert!(!webview2_version_is_suitable(""));
+        assert!(!webview2_version_is_suitable("120.0.2210"));
+        assert!(!webview2_version_is_suitable("120.0.2210.55.extra"));
     }
 }
