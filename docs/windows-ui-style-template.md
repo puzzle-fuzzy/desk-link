@@ -1,6 +1,6 @@
 # DeskLink Windows UI 样式模板
 
-这套模板从 RemoteFlow 控制台参考页提取了可复用的视觉规则，服务于“连接设备”这个唯一首要任务。它不是新的组件库，而是围绕现有 HTML 类名的稳定设计约束；共享、批准设备和设置 / 诊断作为左侧导航的次级入口，关于和项目链接保留在“更多”菜单。
+这套模板从 RemoteFlow 控制台参考页提取了可复用的视觉规则，服务于“连接设备”这个唯一首要任务。它不是新的组件库，而是围绕现有 HTML 类名的稳定设计约束；共享、批准设备和设置 / 诊断统一进入“更多”菜单，关于和项目链接也保留在同一菜单。
 
 ## 视觉方向
 
@@ -8,7 +8,7 @@
 - **信息层级**：产品标题 → 连接设备 → 设备 ID / 访问密码 → 主按钮 → 已保存连接。
 - **版式**：4px 基线节奏、16px 功能间距、桌面端 32px 外边距；原生 Windows 标题栏下方使用 240px 导航栏、64px 工作区上下文栏，主连接卡片与已保存连接并列，小屏自动单列。
 - **形状**：按钮、输入框、卡片统一使用 8px 圆角；普通卡片不使用阴影，层次通过边框和背景色建立。
-- **字体**：`Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"`；设备 ID / 密码保留等宽字体以便核对。
+- **字体**：`v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"`；设备 ID / 密码保留等宽字体以便核对。
 - **交互**：蓝色只代表主动作、当前页或选中项；悬停只改变边界和背景，不移动布局。
 
 ## 设计令牌

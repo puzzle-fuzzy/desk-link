@@ -456,8 +456,6 @@ function renderSidebar(): string {
   const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
   const sidebarItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
     { id: "controller", label: "连接设备", icon: "monitor-up" },
-    { id: "devices", label: "已批准设备", icon: "shield-check" },
-    { id: "connection", label: "共享此设备", icon: "monitor-up" },
   ];
   const status = snapshot ? hostStatusSummary(snapshot) : null;
   return `

@@ -14,22 +14,22 @@ colors:
   on-primary: "#ffffff"
 typography:
   headline:
-    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "30px"
     fontWeight: 600
     lineHeight: 38px
   title:
-    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "20px"
     fontWeight: 600
     lineHeight: 28px
   body:
-    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "14px"
     fontWeight: 400
     lineHeight: 20px
   label:
-    fontFamily: "Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "v-sans, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "14px"
     fontWeight: 500
     lineHeight: 20px
@@ -69,7 +69,7 @@ components:
 
 **Product North Star: "RemoteFlow：让远程内容成为主角"**
 
-DeskLink should make the next connection obvious within one glance. The Windows surface follows the supplied RemoteFlow controller reference: a quiet left navigation rail, a compact workspace context bar, near-white canvas, Inter with the existing Chinese system fallback, one blue primary action, 8px component geometry and low-contrast outlines. Shared-device management, approved devices, settings and diagnostics remain complete but visually secondary to the connection workspace.
+DeskLink should make the next connection obvious within one glance. The Windows surface follows the supplied RemoteFlow controller reference: a quiet left navigation rail, a compact workspace context bar, near-white canvas, v-sans with the existing Chinese system fallback, one blue primary action, 8px component geometry and low-contrast outlines. Shared-device management, approved devices, settings and diagnostics remain complete but visually secondary to the connection workspace and are opened from the compact “更多” menu.
 
 This is a compact personal tool, not an enterprise console or a neon streaming overlay. Information density is moderate, controls retain native platform behavior, and security consequences are written in full Chinese sentences.
 
@@ -136,7 +136,7 @@ Near-white keeps the control surface neutral; #2563eb is reserved for primary ac
 
 ## Typography
 
-**Windows Font:** `Inter, v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` (with emoji fallbacks)
+**Windows Font:** `v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` (with emoji fallbacks)
 **macOS Font:** SF Pro through SwiftUI system typography
 
 **Character:** familiar, compact, and highly legible at desktop scale. Weight and spacing create hierarchy without introducing a second typeface on either platform.
@@ -181,7 +181,7 @@ The system is flat by default. Native window elevation comes from Windows itself
 
 ### Navigation
 
-The tray menu contains “Open DeskLink” and “Exit DeskLink.” The main window uses the native Windows title bar and a RemoteFlow-style left rail. “连接设备” is the primary destination; shared-device management, approved devices and settings / diagnostics are visible as secondary rail entries, while about and project links stay behind the compact “更多” menu. Closing the native window returns it to the tray; only “Exit DeskLink” stops the host.
+The tray menu contains “Open DeskLink” and “Exit DeskLink.” The main window uses the native Windows title bar and a RemoteFlow-style left rail. “连接设备” is the only primary rail destination; shared-device management, approved devices and settings / diagnostics stay behind the compact “更多” menu, while about and project links remain there as well. Closing the native window returns it to the tray; only “Exit DeskLink” stops the host.
 
 ### Pairing and Revocation
 
