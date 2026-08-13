@@ -28,7 +28,7 @@ jobs:
 
       - name: Preserve probe report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: managed-relay-probe-${{ github.run_id }}
           path: dist/windows/managed-relay-verification.json
