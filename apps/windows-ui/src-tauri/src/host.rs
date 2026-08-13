@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -312,6 +315,7 @@ pub struct HostManager {
     pairing_active: Arc<Mutex<bool>>,
     approval: Arc<HostApprovalBroker>,
     restart_lock: Arc<AsyncMutex<()>>,
+    lifecycle_generation: Arc<AtomicU64>,
 }
 
 impl Default for HostManager {
@@ -322,6 +326,7 @@ impl Default for HostManager {
             pairing_active: Arc::new(Mutex::new(false)),
             approval: Arc::new(HostApprovalBroker::default()),
             restart_lock: Arc::new(AsyncMutex::new(())),
+            lifecycle_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -346,6 +351,7 @@ impl HostManager {
 
     pub async fn restart(&self, app: AppHandle) {
         let _restart = self.restart_lock.lock().await;
+        self.next_lifecycle_generation();
         self.stop_current().await;
         self.set_pairing_active(false);
         self.publish(&app, HostRuntimeSummary::starting());
@@ -355,6 +361,7 @@ impl HostManager {
 
     pub async fn start_pairing(&self, app: AppHandle) -> Result<PairingSessionSummary, String> {
         let _restart = self.restart_lock.lock().await;
+        let generation = self.next_lifecycle_generation();
         self.stop_current().await;
         self.set_pairing_active(false);
         self.publish(&app, HostRuntimeSummary::pairing());
@@ -394,7 +401,7 @@ impl HostManager {
             session,
         } = prepared;
         self.set_pairing_active(true);
-        self.start_pairing_worker(app, supervisor, diagnostics);
+        self.start_pairing_worker(app, supervisor, diagnostics, generation);
         Ok(session)
     }
 
@@ -425,6 +432,7 @@ impl HostManager {
         app: AppHandle,
         supervisor: Box<HostSupervisor>,
         diagnostics: DiagnosticLog,
+        generation: u64,
     ) {
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let manager = self.clone();
@@ -436,8 +444,9 @@ impl HostManager {
             manager.set_pairing_active(false);
             record_diagnostic(&diagnostics, &DiagnosticEvent::ApplicationStopped);
             if finished {
-                manager.publish(&app, HostRuntimeSummary::pairing_finished());
-                manager.start_normal_worker(app);
+                manager
+                    .start_normal_worker_after_pairing(app, generation)
+                    .await;
             }
         });
         if let Ok(mut worker) = self.worker.lock() {
@@ -451,14 +460,33 @@ impl HostManager {
 
     pub async fn stop(&self) {
         let _restart = self.restart_lock.lock().await;
+        self.next_lifecycle_generation();
         self.stop_current().await;
     }
 
     pub fn request_stop(&self) {
+        self.next_lifecycle_generation();
         self.approval.cancel();
         if let Some(worker) = self.take_worker() {
             let _ = worker.shutdown.send(());
         }
+    }
+
+    /// Pairing completion is allowed to re-arm the normal host only when the
+    /// lifecycle that created it is still current.  A concurrent restart or
+    /// shutdown increments this generation before stopping the old worker,
+    /// preventing a stale pairing task from replacing the new worker.
+    fn next_lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    async fn start_normal_worker_after_pairing(&self, app: AppHandle, generation: u64) {
+        let _restart = self.restart_lock.lock().await;
+        if self.lifecycle_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.publish(&app, HostRuntimeSummary::pairing_finished());
+        self.start_normal_worker(app);
     }
 
     async fn stop_current(&self) {
@@ -815,7 +843,9 @@ pub fn tray_id() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostApprovalBroker, HostApprovalSummary, HostRuntimeSummary, PendingApproval};
+    use super::{
+        HostApprovalBroker, HostApprovalSummary, HostManager, HostRuntimeSummary, PendingApproval,
+    };
     use apps_windows::runtime::HostLifecycleEvent;
 
     #[test]
@@ -905,6 +935,28 @@ mod tests {
                 .unwrap()
                 .decision,
             Some(false)
+        );
+    }
+
+    #[test]
+    fn lifecycle_generation_invalidates_stale_pairing_completion() {
+        let manager = HostManager::default();
+        let pairing_generation = manager.next_lifecycle_generation();
+
+        assert_eq!(
+            manager
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            pairing_generation
+        );
+
+        let restart_generation = manager.next_lifecycle_generation();
+        assert_ne!(pairing_generation, restart_generation);
+        assert_ne!(
+            manager
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            pairing_generation
         );
     }
 }
