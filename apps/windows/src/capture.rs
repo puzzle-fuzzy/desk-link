@@ -31,6 +31,9 @@ pub struct DxgiDesktopCapturer {
     dimensions: (u32, u32),
     desktop_rect: DesktopRect,
     display_id: u32,
+    /// Desktop Duplication only reports changed frames. Keep a one-shot
+    /// fallback so a static desktop still produces the first remote frame.
+    initial_snapshot_pending: bool,
 }
 
 #[cfg(windows)]
@@ -45,6 +48,7 @@ pub struct DxgiDesktopCapturer {
     desktop_rect: DesktopRect,
     display_id: u32,
     access_lost: bool,
+    initial_snapshot_pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +85,7 @@ impl DxgiDesktopCapturer {
             desktop_rect: DesktopRect::new(0, 0, 1920, 1080),
             display_id: 0,
             access_lost: false,
+            initial_snapshot_pending: true,
         })
     }
 
@@ -164,6 +169,7 @@ impl DxgiDesktopCapturer {
                 height,
             ),
             display_id,
+            initial_snapshot_pending: true,
         })
     }
 
@@ -214,6 +220,7 @@ impl DxgiDesktopCapturer {
                 height,
             ),
             display_id,
+            initial_snapshot_pending: true,
         })
     }
 
@@ -225,6 +232,7 @@ impl DxgiDesktopCapturer {
             dimensions: (topology.primary.width, topology.primary.height),
             desktop_rect: topology.primary,
             display_id: 0,
+            initial_snapshot_pending: false,
         })
     }
 
@@ -239,6 +247,7 @@ impl DxgiDesktopCapturer {
             dimensions: (display.rect.width, display.rect.height),
             desktop_rect: display.rect,
             display_id,
+            initial_snapshot_pending: false,
         })
     }
 
@@ -477,11 +486,21 @@ impl DesktopCapturer for DxgiDesktopCapturer {
             };
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
-            unsafe {
-                duplication
-                    .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
-                    .map_err(map_dxgi_error)?;
+            let acquired =
+                unsafe { duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource) };
+            if let Err(error) = acquired {
+                if error.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT
+                    && self.initial_snapshot_pending
+                {
+                    // DXGI emits no frame until the desktop changes. Take a
+                    // single GDI snapshot for the initial keyframe, then
+                    // return to the low-overhead duplication path.
+                    self.initial_snapshot_pending = false;
+                    return capture_gdi_frame(self.desktop_rect);
+                }
+                return Err(map_dxgi_error(error));
             }
+            self.initial_snapshot_pending = false;
 
             // The desktop-duplication surface is only valid until ReleaseFrame. Copy it to
             // process-owned memory before releasing it; retaining the COM texture and reading it
