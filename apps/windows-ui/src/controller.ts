@@ -569,6 +569,9 @@ export function bindControllerInteractions(): void {
   document.querySelector<HTMLSelectElement>("[data-controller-video-quality]")?.addEventListener("change", (event) => {
     void changeVideoQuality((event.currentTarget as HTMLSelectElement).value as VideoQualityPreference);
   });
+  document.querySelector<HTMLButtonElement>("[data-controller-quality-recover]")?.addEventListener("click", () => {
+    void changeVideoQuality("smooth");
+  });
   document.querySelector<HTMLSelectElement>("[data-controller-scale]")?.addEventListener("change", (event) => {
     changeRemoteScaleMode((event.currentTarget as HTMLSelectElement).value);
   });
@@ -1607,6 +1610,7 @@ function handleSignal(signal: ControllerSignal): void {
         picker.disabled = false;
       }
       updateRemoteSessionSummary();
+      updateRemoteQualityBadge();
       break;
     }
     case "metrics": {
@@ -2851,6 +2855,7 @@ async function changeVideoQuality(preference: VideoQualityPreference): Promise<v
     return;
   }
   pendingVideoQuality = preference;
+  updateRemoteQualityBadge();
   const picker = document.querySelector<HTMLSelectElement>("[data-controller-video-quality]");
   if (picker) {
     picker.disabled = true;
@@ -2870,6 +2875,7 @@ async function changeVideoQuality(preference: VideoQualityPreference): Promise<v
       currentPicker.reportValidity();
       currentPicker.setCustomValidity("");
     }
+    updateRemoteQualityBadge();
     videoQualityAckTimer = null;
   }, 8_000);
   try {
@@ -2884,6 +2890,7 @@ async function changeVideoQuality(preference: VideoQualityPreference): Promise<v
       picker.reportValidity();
       picker.setCustomValidity("");
     }
+    updateRemoteQualityBadge();
   }
 }
 
@@ -2939,7 +2946,21 @@ function renderRemoteQualityBadge(summary = currentConnectionQualitySummary()): 
     : summary.tone === "measuring"
       ? "loader-circle"
       : "triangle-alert";
-  return `<span class="remote-quality-status remote-quality-status--${summary.tone}" data-controller-quality-status data-tone="${summary.tone}" title="${escapeHtml(summary.detail)}">${icon(badgeIcon, summary.tone === "measuring" ? "controller-spinner" : "")}<span>${summary.label}</span></span>`;
+  const recoveryAvailable = summary.tone === "poor" && videoQualityPreference !== "smooth";
+  const detail = recoveryAvailable
+    ? summary.detail
+    : summary.tone === "poor"
+      ? "画面出现明显卡顿，当前已使用流畅画质，请检查网络或中继。"
+      : summary.detail;
+  return `<span class="remote-quality-status remote-quality-status--${summary.tone}" data-controller-quality-status data-tone="${summary.tone}" title="${escapeHtml(detail)}">${renderRemoteQualityBadgeContents(summary, badgeIcon, recoveryAvailable)}</span>`;
+}
+
+function renderRemoteQualityBadgeContents(
+  summary: ReturnType<typeof currentConnectionQualitySummary>,
+  badgeIcon: "circle-check" | "loader-circle" | "triangle-alert",
+  recoveryAvailable: boolean,
+): string {
+  return `${icon(badgeIcon, summary.tone === "measuring" ? "controller-spinner" : "")}<span>${summary.label}</span>${recoveryAvailable ? `<button class="remote-quality-status__action" type="button" data-controller-quality-recover aria-label="检测到画面卡顿，切换到流畅画质" ${pendingVideoQuality === null ? "" : "disabled"}>${pendingVideoQuality === "smooth" ? "正在切换…" : "切换流畅"}</button>` : ""}`;
 }
 
 function updateRemoteQualityBadge(): void {
@@ -2948,13 +2969,26 @@ function updateRemoteQualityBadge(): void {
     return;
   }
   const summary = currentConnectionQualitySummary();
+  const detail = summary.tone === "poor" && videoQualityPreference === "smooth"
+    ? "画面出现明显卡顿，当前已使用流畅画质，请检查网络或中继。"
+    : summary.detail;
   element.dataset.tone = summary.tone;
-  element.title = summary.detail;
-  element.outerHTML = renderRemoteQualityBadge(summary);
-  const replacement = document.querySelector<HTMLElement>("[data-controller-quality-status]");
-  if (replacement) {
-    renderLucideIcons(replacement);
-  }
+  element.title = detail;
+  element.className = `remote-quality-status remote-quality-status--${summary.tone}`;
+  const badgeIcon = summary.tone === "good"
+    ? "circle-check"
+    : summary.tone === "measuring"
+      ? "loader-circle"
+      : "triangle-alert";
+  element.innerHTML = renderRemoteQualityBadgeContents(
+    summary,
+    badgeIcon,
+    summary.tone === "poor" && videoQualityPreference !== "smooth",
+  );
+  renderLucideIcons(element);
+  element.querySelector<HTMLButtonElement>("[data-controller-quality-recover]")?.addEventListener("click", () => {
+    void changeVideoQuality("smooth");
+  });
 }
 
 function changeRemoteScaleMode(value: string): void {
