@@ -94,6 +94,52 @@ class WindowsCandidatePackageTests(unittest.TestCase):
             self.assertIn("windows-installer-manifest.json", names)
             self.assertEqual(len(names), 6)
 
+    def test_rejects_stale_managed_relay_host_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist, _, commit = self.fixture(root)
+            relay_dist = root / "dist" / "linux"
+            relay_dist.mkdir(parents=True)
+            (relay_dist / "managed-relay-host-audit.json").write_text(
+                json.dumps(
+                    {
+                        "source_commit": "b" * 40,
+                        "source_revision_match": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.package.CandidatePackageError,
+                "managed relay host audit does not match candidate source commit",
+            ):
+                self.package.validate_candidate_artifacts(root, dist)
+
+    def test_packages_currently_bound_managed_relay_host_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist, version, commit = self.fixture(root)
+            relay_dist = root / "dist" / "linux"
+            relay_dist.mkdir(parents=True)
+            (relay_dist / "managed-relay-host-audit.json").write_text(
+                json.dumps(
+                    {
+                        "source_commit": commit,
+                        "source_revision_match": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(self.package, "git_output", side_effect=[commit, ""]):
+                output = root / "candidate.zip"
+                result = self.package.package_candidate(root, output)
+            self.assertEqual(result, output.resolve())
+            with zipfile.ZipFile(result) as archive:
+                names = archive.namelist()
+            self.assertIn("managed-relay-host-audit.json", names)
+            self.assertIn(f"DeskLinkSetup-{version}-x64.exe", names)
+            self.assertEqual(len(names), 7)
+
 
 if __name__ == "__main__":
     unittest.main()

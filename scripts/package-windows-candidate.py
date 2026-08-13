@@ -122,6 +122,17 @@ def validate_candidate_artifacts(root: Path, dist: Path) -> tuple[str, str, list
         dist.parent / "linux" / "managed-relay-host-audit.json",
         dist.parent / "linux" / "managed-diagnostics-audit.json",
     ]
+    relay_host_audit = dist.parent / "linux" / "managed-relay-host-audit.json"
+    if relay_host_audit.is_file():
+        relay_report = read_json(relay_host_audit)
+        if relay_report.get("source_commit") != source_commit:
+            raise CandidatePackageError(
+                "managed relay host audit does not match candidate source commit"
+            )
+        if relay_report.get("source_revision_match") is not True:
+            raise CandidatePackageError(
+                "managed relay host audit did not confirm the image source revision"
+            )
     files = [installer_path, manifest_path, *(dist / name for name in report_names)]
     files.extend(path for path in optional if path.is_file())
     return version, source_commit, files
