@@ -3938,9 +3938,31 @@ async fn connect_once(
     let config =
         crate::local_relay::client_config(settings.relay_address(), settings.server_name())
             .map_err(ConnectFailure::from_transport)?;
-    let client = QuicClient::connect(config)
+    let client = match manager
+        .wait_for_current_transport(
+            generation,
+            QuicClient::connect(config),
+            DIRECTORY_OPERATION_TIMEOUT,
+        )
         .await
-        .map_err(ConnectFailure::from_transport)?;
+    {
+        CurrentTransportWait::Completed(result) => {
+            result.map_err(ConnectFailure::from_transport)?
+        }
+        CurrentTransportWait::Cancelled => {
+            return Err(ConnectFailure::with_reason(
+                false,
+                "连接已取消。",
+                "cancelled",
+                "controller connection generation was cancelled",
+            ));
+        }
+        CurrentTransportWait::TimedOut => {
+            return Err(ConnectFailure::from_transport(TransportError::Connection(
+                "relay connection timed out".to_owned(),
+            )));
+        }
+    };
     record_controller_diagnostic(
         diagnostics,
         ControllerDiagnosticStage::RelayConnected,
