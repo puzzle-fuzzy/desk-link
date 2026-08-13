@@ -169,18 +169,29 @@ def main() -> int:
         if remote_sha256 != archive_sha256:
             raise RuntimeError("uploaded relay archive checksum does not match")
         ssh.run(["docker", "tag", old_image, rollback_tag])
-        ssh.run(["docker", "load", "--input", remote_archive])
-        ssh.run(deploy)
-
-        deadline = time.monotonic() + max(5, arguments.health_timeout)
-        while time.monotonic() < deadline:
-            if healthy(ssh, container):
-                break
-            time.sleep(2)
-        else:
-            ssh.run(["docker", "tag", rollback_tag, "desklink-relay:0.1.0"])
+        try:
+            ssh.run(["docker", "load", "--input", remote_archive])
             ssh.run(deploy)
-            raise RuntimeError(f"new relay did not become healthy; restored {rollback_tag}")
+
+            deadline = time.monotonic() + max(5, arguments.health_timeout)
+            while time.monotonic() < deadline:
+                if healthy(ssh, container):
+                    break
+                time.sleep(2)
+            else:
+                raise RuntimeError("new relay did not become healthy before the deadline")
+        except Exception as error:
+            try:
+                ssh.run(["docker", "tag", rollback_tag, "desklink-relay:0.1.0"])
+                ssh.run(deploy)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "new relay deployment failed and automatic rollback failed: "
+                    f"{error}; rollback error: {rollback_error}"
+                ) from error
+            raise RuntimeError(
+                f"new relay deployment failed; restored {rollback_tag}: {error}"
+            ) from error
     finally:
         ssh.run(["rm", "-f", "--", remote_archive], check=False)
 

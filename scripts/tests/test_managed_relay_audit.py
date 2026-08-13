@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -83,6 +87,61 @@ class ManagedRelayDeployTests(unittest.TestCase):
             self.deploy.validate_remote_value("service", "relay; reboot")
         with self.assertRaises(RuntimeError):
             self.deploy.validate_remote_value("path", "relative/compose.yml", absolute=True)
+
+    def test_rolls_back_when_deploy_health_check_fails(self) -> None:
+        class FakeSsh:
+            def __init__(self, target: str, identity_file: Path | None) -> None:
+                self.calls: list[tuple[list[str], bool]] = []
+
+            def run(self, arguments: list[str], *, check: bool = True) -> str:
+                self.calls.append((arguments, check))
+                if arguments[:3] == ["docker", "inspect", "relay"]:
+                    format_argument = arguments[-1]
+                    if "working_dir" in format_argument:
+                        return "/srv/desklink"
+                    if "config_files" in format_argument:
+                        return "/srv/desklink/compose.yml"
+                    if "service" in format_argument:
+                        return "relay"
+                    if ".Image" in format_argument:
+                        return "sha256:old"
+                if arguments[:1] == ["sha256sum"]:
+                    return f"{archive_sha256}  {arguments[-1]}"
+                if arguments[:3] == ["docker", "inspect", "relay"]:
+                    return ""
+                if arguments[:2] == ["docker", "inspect"]:
+                    return ""
+                return ""
+
+            def copy(self, source: Path, destination: str) -> None:
+                self.calls.append((["copy", str(source), destination], True))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive = Path(temporary_directory) / "relay.tar"
+            archive.write_bytes(b"relay archive")
+            archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+            arguments = SimpleNamespace(
+                target="root@example",
+                identity_file=None,
+                archive=archive,
+                container="relay",
+                health_timeout=5,
+            )
+            fake_ssh = FakeSsh("root@example", None)
+            with (
+                patch.object(self.deploy, "parse_args", return_value=arguments),
+                patch.object(self.deploy, "Ssh", return_value=fake_ssh),
+                patch.object(self.deploy, "healthy", return_value=False),
+                patch.object(self.deploy.time, "time", return_value=0),
+                patch.object(self.deploy.time, "monotonic", side_effect=[0, 10]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "restored desklink-relay:rollback-"):
+                    self.deploy.main()
+
+            commands = [call[0] for call in fake_ssh.calls]
+            self.assertIn(["docker", "tag", "sha256:old", "desklink-relay:rollback-0"], commands)
+            self.assertIn(["docker", "tag", "desklink-relay:rollback-0", "desklink-relay:0.1.0"], commands)
+            self.assertEqual(commands.count(self.deploy.compose_command("/srv/desklink", "/srv/desklink/compose.yml", "relay")), 2)
 
 
 if __name__ == "__main__":
