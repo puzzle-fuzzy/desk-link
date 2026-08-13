@@ -57,6 +57,7 @@ use crate::{
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const INITIAL_ENCODED_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const CURSOR_INTERVAL: Duration = Duration::from_millis(16);
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1854,6 +1855,8 @@ fn capture_encode_loop(
         VideoFramePacer::new(video_quality_settings_with_profile(video_quality, video_profile).fps);
     let mut first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
     let mut captured_any_frame = false;
+    let mut first_encoded_frame_deadline = None;
+    let mut encoded_any_frame = false;
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -1955,6 +1958,16 @@ fn capture_encode_loop(
                             .to_owned(),
                     )));
                 }
+                if initial_encoded_frame_deadline_expired(
+                    encoded_any_frame,
+                    first_encoded_frame_deadline,
+                    Instant::now(),
+                ) {
+                    return Err(HostRuntimeError::Encoder(EncoderError::Native(
+                        "desktop encoder did not produce an initial frame within 10 seconds"
+                            .to_owned(),
+                    )));
+                }
                 continue;
             }
             CaptureOutcome::Recovered => {
@@ -1986,6 +1999,18 @@ fn capture_encode_loop(
             }
         };
         captured_any_frame = true;
+        if first_encoded_frame_deadline.is_none() {
+            first_encoded_frame_deadline = Some(Instant::now() + INITIAL_ENCODED_FRAME_TIMEOUT);
+        }
+        if initial_encoded_frame_deadline_expired(
+            encoded_any_frame,
+            first_encoded_frame_deadline,
+            Instant::now(),
+        ) {
+            return Err(HostRuntimeError::Encoder(EncoderError::Native(
+                "desktop encoder did not produce an initial frame within 10 seconds".to_owned(),
+            )));
+        }
         let request_keyframe = force_keyframe.swap(false, Ordering::AcqRel);
         if !frame_pacer.should_encode(frame.timestamp_us, request_keyframe) {
             continue;
@@ -1993,6 +2018,7 @@ fn capture_encode_loop(
         let encoded = match encoder.encode(frame, request_keyframe) {
             Ok(encoded) => {
                 encoder_recovery_attempts = 0;
+                encoded_any_frame = true;
                 encoded
             }
             Err(EncoderError::NeedMoreInput) => continue,
@@ -2028,6 +2054,14 @@ fn initial_frame_deadline_expired(
     now: Instant,
 ) -> bool {
     !captured_any_frame && now >= deadline
+}
+
+fn initial_encoded_frame_deadline_expired(
+    encoded_any_frame: bool,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> bool {
+    !encoded_any_frame && deadline.is_some_and(|deadline| now >= deadline)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3135,7 +3169,8 @@ mod retry_policy_tests {
         AdaptiveVideoQuality, HostRuntimeError, VideoFramePacer, encoder_error_is_recoverable,
         host_error_is_retryable, host_error_is_retryable_for_session,
         host_error_rearms_on_connected_relay, host_runtime_denial_reason,
-        initial_frame_deadline_expired, video_quality_settings,
+        initial_encoded_frame_deadline_expired, initial_frame_deadline_expired,
+        video_quality_settings,
     };
     use desklink_protocol::{VideoQualityPreference, VideoQualityPreset};
 
@@ -3229,6 +3264,32 @@ mod retry_policy_tests {
         assert!(!initial_frame_deadline_expired(
             true,
             deadline + std::time::Duration::from_millis(1),
+            deadline + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn initial_encoder_watchdog_only_fires_after_capture_starts() {
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_secs(10);
+        assert!(!initial_encoded_frame_deadline_expired(
+            false,
+            None,
+            deadline + std::time::Duration::from_secs(1)
+        ));
+        assert!(!initial_encoded_frame_deadline_expired(
+            false,
+            Some(deadline),
+            start
+        ));
+        assert!(initial_encoded_frame_deadline_expired(
+            false,
+            Some(deadline),
+            deadline + std::time::Duration::from_millis(1)
+        ));
+        assert!(!initial_encoded_frame_deadline_expired(
+            true,
+            Some(deadline),
             deadline + std::time::Duration::from_secs(1)
         ));
     }
