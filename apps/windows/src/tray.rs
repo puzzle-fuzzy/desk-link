@@ -164,7 +164,7 @@ mod windows_ui {
     use std::{
         ffi::c_void,
         mem::size_of,
-        sync::mpsc::{self, Receiver, Sender, SyncSender},
+        sync::mpsc::{self, Receiver, SyncSender},
         thread,
     };
 
@@ -224,6 +224,7 @@ mod windows_ui {
     const TRAY_ICON_ID: u32 = 1;
     const WM_TRAY_ICON: u32 = WM_APP + 1;
     const WM_TRAY_COMMAND: u32 = WM_APP + 2;
+    const TRAY_COMMAND_QUEUE_CAPACITY: usize = 128;
 
     const MENU_OPEN: usize = 4001;
     const MENU_CONFIGURE: usize = 4002;
@@ -261,7 +262,7 @@ mod windows_ui {
 
     #[derive(Clone)]
     pub struct WindowsTrayHandle {
-        sender: Sender<TrayCommand>,
+        sender: SyncSender<TrayCommand>,
         hwnd: isize,
     }
 
@@ -314,7 +315,7 @@ mod windows_ui {
             store: WindowsTrustedControllerStore,
             diagnostics: Option<DiagnosticLog>,
         ) -> Result<Self, WindowsTrayError> {
-            let (sender, receiver) = mpsc::channel();
+            let (sender, receiver) = mpsc::sync_channel(TRAY_COMMAND_QUEUE_CAPACITY);
             let (exit_sender, exit_receiver) = watch::channel(false);
             let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
             let thread = thread::Builder::new()

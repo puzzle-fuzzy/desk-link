@@ -61,6 +61,16 @@ class WindowsReleaseScopeTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "unbounded channel"):
                 self.verify.verify_production_backpressure((Path(directory),))
 
+    def test_rejects_an_aliased_unbounded_mpsc_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "tray.rs"
+            source.write_text(
+                "use std::sync::mpsc;\nlet (_sender, _receiver) = mpsc::channel();\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "unbounded channel"):
+                self.verify.verify_production_backpressure((Path(directory),))
+
 
 if __name__ == "__main__":
     unittest.main()

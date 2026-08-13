@@ -193,6 +193,9 @@ def verify_production_backpressure(
     forbidden = (
         ("tokio::sync::mpsc::unbounded_channel", re.compile(r"\bunbounded_channel\s*\(")),
         ("std::sync::mpsc::channel", re.compile(r"std::sync::mpsc::channel\s*\(")),
+        # `mpsc::channel()` is also the unbounded std channel when the import
+        # is aliased. Bounded Tokio channels always carry an explicit capacity.
+        ("unbounded mpsc::channel", re.compile(r"\bmpsc::channel\s*\(\s*\)")),
     )
     checked_files = 0
     violations: list[str] = []
