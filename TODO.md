@@ -162,12 +162,13 @@ python scripts/check-windows-release-ready.py --manual-json dist/windows/windows
 python scripts/package-windows-candidate.py
 ```
 
-### 最近一次自动门禁（2026-08-14，候选 `a29b1f2`）
+### 最近一次自动门禁（2026-08-14，候选 `df16d38`）
 
 - [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 67 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
-- [x] Windows CI run `31739227095` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `a29b1f2`。
+- [x] Windows CI run `31741105788` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `df16d38`。
 
-- [x] 安全扫描 run `31739227082`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
+- [x] 安全扫描 run `31741105708`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
+- [x] Managed relay monitor run `31743019052` 已对 `df16d38` 通过；前一次 `31742715057` 为单次 GitHub runner 公网 QUIC 探测超时，重跑成功，未观察到中继健康或源码漂移。
 - [x] 签名候选工作流已强制 300 秒原生 resilience soak，并由 `test_windows_workflow_policy.py` 防止回退到普通 CI 的 10 秒快速门禁。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
 - [x] 发布脚本与签名工作流现在都会严格校验 readiness 报告，并把该报告作为 Release 证据上传；当前候选 `ready: false`，不会被误发布为正式版本。
@@ -195,4 +196,4 @@ python scripts/package-windows-candidate.py
 - 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断当前发布为 `8d92cdaee6d3`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
 - 当前候选物料以本地 `dist/windows/windows-installer-manifest.json`、`windows-release-verification.json` 和 `windows-release-readiness.json` 为准；安装器仍未签名，正式验收时必须读取同批清单中的 source commit 与 SHA-256，不使用旧文档中的动态值。
 - 当前候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，尚未形成正式发布 tag。
-- 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具、近期画质窗口和一键恢复动作；尚无本地 `v*` 发布 tag。
+- 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具、近期画质窗口、一键恢复动作以及签名候选 300 秒 soak 门禁；尚无本地 `v*` 发布 tag。
