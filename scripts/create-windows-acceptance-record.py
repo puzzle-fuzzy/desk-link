@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -107,6 +108,12 @@ def validate_candidate_manifest(
 
 
 def main() -> int:
+    # GitHub Windows runners keep the legacy cp1252 console encoding by
+    # default. The operator guidance is intentionally Chinese, so make the
+    # diagnostic output portable instead of failing after the record was
+    # already written.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     arguments = parse_args()
     operator = arguments.operator.strip()
     if not operator:
