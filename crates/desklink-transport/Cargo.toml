@@ -17,5 +17,5 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 rcgen.workspace = true
