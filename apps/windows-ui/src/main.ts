@@ -739,7 +739,7 @@ function renderConnection(state: HostSnapshot): string {
     <div class="page-layout page-layout--form">
       <header class="page-heading">
         <div>
-          <span class="editorial-kicker">02 / SHARE THIS DEVICE</span>
+          <span class="page-eyebrow">共享设置</span>
           <h1>共享此设备</h1>
           <p>保存后，这台电脑才能生成临时密码并等待另一台电脑连接。</p>
         </div>
