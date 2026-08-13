@@ -17,7 +17,7 @@ DeskLink 当前正式发布边界仍是最高 `2560×1440`。4K 不是默认能�
 cargo test -p desklink-windows --test encoder_smoke experimental_4k_media_foundation_captures_and_encodes -- --ignored --nocapture
 ```
 
-这个探针会实际捕获当前主屏，初始化 4K Media Foundation 编码器，编码最多 10 个访问单元，并验证首个访问单元包含关键帧和解码配置。它是能力探针，不会修改应用默认设置，也不会把 4K 标记为已发布能力。
+这个探针会实际捕获当前主屏；如果当前显示器不是 4K，会在测试边界内把捕获帧放大到 `3840×2160`，再初始化 4K Media Foundation 编码器并编码最多 10 个访问单元，验证首个访问单元包含关键帧和解码配置。它验证的是 4K 编码输入路径，不等同于原生 4K 显示器的捕获、解码和长稳验收；不会修改应用默认设置，也不会把 4K 标记为已发布能力。
 
 ## 放开 4K 前的门槛
 

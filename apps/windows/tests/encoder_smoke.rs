@@ -88,6 +88,10 @@ fn experimental_4k_media_foundation_captures_and_encodes() {
             Err(CaptureError::Timeout) => continue,
             Err(error) => panic!("capture failed: {error:?}"),
         };
+        // Keep the probe useful on a 1080p/1440p development monitor too: the
+        // encoder must receive a 4K input, otherwise it legitimately rebuilds
+        // itself back to the captured desktop size on the first frame.
+        let frame = upscale_bgra_to_4k(frame);
         match encoder.encode(frame, encoded_frames == 0) {
             Ok(encoded) => {
                 encoded_frames = encoded_frames.saturating_add(1);
@@ -122,4 +126,40 @@ fn experimental_4k_media_foundation_captures_and_encodes() {
         encoder.profile(),
         encoder.dimensions(),
     );
+}
+
+#[cfg(windows)]
+fn upscale_bgra_to_4k(
+    frame: apps_windows::capture::CapturedFrame,
+) -> apps_windows::capture::CapturedFrame {
+    const TARGET_WIDTH: usize = 3840;
+    const TARGET_HEIGHT: usize = 2160;
+    let source_width = usize::try_from(frame.width).expect("source width fits usize");
+    let source_height = usize::try_from(frame.height).expect("source height fits usize");
+    assert!(source_width > 0 && source_height > 0);
+    let source_stride = source_width
+        .checked_mul(4)
+        .expect("source stride fits usize");
+    let source_len = source_stride
+        .checked_mul(source_height)
+        .expect("source frame fits usize");
+    assert!(frame.pixels.len() >= source_len);
+
+    let mut pixels = vec![0_u8; TARGET_WIDTH * TARGET_HEIGHT * 4];
+    for target_y in 0..TARGET_HEIGHT {
+        let source_y = target_y * source_height / TARGET_HEIGHT;
+        for target_x in 0..TARGET_WIDTH {
+            let source_x = target_x * source_width / TARGET_WIDTH;
+            let source_offset = source_y * source_stride + source_x * 4;
+            let target_offset = (target_y * TARGET_WIDTH + target_x) * 4;
+            pixels[target_offset..target_offset + 4]
+                .copy_from_slice(&frame.pixels[source_offset..source_offset + 4]);
+        }
+    }
+    apps_windows::capture::CapturedFrame {
+        width: TARGET_WIDTH as u32,
+        height: TARGET_HEIGHT as u32,
+        timestamp_us: frame.timestamp_us,
+        pixels,
+    }
 }
