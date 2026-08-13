@@ -81,6 +81,7 @@ pub enum RelayError {
 
 const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
 const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
+const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 
 #[derive(Clone)]
 pub struct RelaySessionTable {
@@ -478,6 +479,30 @@ impl Drop for DirectoryRecord {
 struct LookupAttempt {
     window_started: Instant,
     failures: u8,
+    last_seen: Instant,
+}
+
+fn expire_lookup_attempts(attempts: &mut HashMap<(IpAddr, u64), LookupAttempt>, now: Instant) {
+    attempts
+        .retain(|_, attempt| now.duration_since(attempt.window_started) < DIRECTORY_LOOKUP_WINDOW);
+}
+
+fn prune_lookup_attempts(
+    attempts: &mut HashMap<(IpAddr, u64), LookupAttempt>,
+    now: Instant,
+    maximum: usize,
+) {
+    expire_lookup_attempts(attempts, now);
+    if attempts.len() < maximum.max(1) {
+        return;
+    }
+    if let Some(oldest) = attempts
+        .iter()
+        .min_by_key(|(_, attempt)| attempt.last_seen)
+        .map(|(key, _)| *key)
+    {
+        attempts.remove(&oldest);
+    }
 }
 
 impl RelayState {
@@ -617,9 +642,7 @@ impl RelayState {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            attempts.retain(|_, attempt| {
-                now.duration_since(attempt.window_started) < DIRECTORY_LOOKUP_WINDOW
-            });
+            expire_lookup_attempts(&mut attempts, now);
             if attempts
                 .get(&key)
                 .is_some_and(|attempt| attempt.failures >= DIRECTORY_LOOKUP_FAILURE_LIMIT)
@@ -659,15 +682,20 @@ impl RelayState {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if !attempts.contains_key(&key) {
+            prune_lookup_attempts(&mut attempts, now, MAX_DIRECTORY_LOOKUP_ATTEMPTS);
+        }
         let attempt = attempts.entry(key).or_insert(LookupAttempt {
             window_started: now,
             failures: 0,
+            last_seen: now,
         });
         if now.duration_since(attempt.window_started) >= DIRECTORY_LOOKUP_WINDOW {
             attempt.window_started = now;
             attempt.failures = 0;
         }
         attempt.failures = attempt.failures.saturating_add(1);
+        attempt.last_seen = now;
         Err((DIRECTORY_LOOKUP_NOT_FOUND, None))
     }
 
@@ -719,6 +747,76 @@ impl RelayState {
             Err(poisoned) => poisoned.into_inner(),
         };
         directory.retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LookupAttempt, prune_lookup_attempts};
+    use std::{
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn lookup_attempt_capacity_evicts_the_oldest_entry() {
+        let now = Instant::now();
+        let old_key = (IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let new_key = (IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let mut attempts = HashMap::from([
+            (
+                old_key,
+                LookupAttempt {
+                    window_started: now,
+                    failures: 1,
+                    last_seen: now - Duration::from_secs(2),
+                },
+            ),
+            (
+                new_key,
+                LookupAttempt {
+                    window_started: now,
+                    failures: 1,
+                    last_seen: now - Duration::from_secs(1),
+                },
+            ),
+        ]);
+
+        prune_lookup_attempts(&mut attempts, now, 2);
+
+        assert!(!attempts.contains_key(&old_key));
+        assert!(attempts.contains_key(&new_key));
+    }
+
+    #[test]
+    fn lookup_attempt_capacity_expires_old_windows_before_eviction() {
+        let now = Instant::now();
+        let expired_key = (IpAddr::V4(Ipv4Addr::LOCALHOST), 3);
+        let active_key = (IpAddr::V4(Ipv4Addr::LOCALHOST), 4);
+        let mut attempts = HashMap::from([
+            (
+                expired_key,
+                LookupAttempt {
+                    window_started: now - super::DIRECTORY_LOOKUP_WINDOW,
+                    failures: 5,
+                    last_seen: now - Duration::from_secs(4),
+                },
+            ),
+            (
+                active_key,
+                LookupAttempt {
+                    window_started: now,
+                    failures: 1,
+                    last_seen: now,
+                },
+            ),
+        ]);
+
+        prune_lookup_attempts(&mut attempts, now, 2);
+
+        assert!(!attempts.contains_key(&expired_key));
+        assert!(attempts.contains_key(&active_key));
     }
 }
 
