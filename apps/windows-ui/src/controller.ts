@@ -133,6 +133,7 @@ import {
   controllerRuntimeSurfaceChanged,
 } from "./controller-runtime-presentation";
 import type { ControllerRemoteSurfaceState } from "./controller-runtime-presentation";
+import { mergeControllerOperationSnapshot } from "./controller-snapshot";
 import { VideoPlaybackPressure } from "./video-playback-pressure";
 import { nextVideoPullFailureCount, SerialVideoPull } from "./video-pull-loop";
 import { LatestFrameScheduler } from "./render-scheduler";
@@ -150,6 +151,7 @@ const FRAME_PREFIX_BYTES = 17;
 const VIDEO_PRESSURE_REPORT_INTERVAL_MS = 1_000;
 const controllerWindow = getCurrentWindow();
 let snapshot: ControllerSnapshot | null = null;
+let runtimeSignalRevision = 0;
 let loading = true;
 let busy = false;
 let cancelling = false;
@@ -1290,13 +1292,19 @@ async function beginConnection(
   );
   activeChannels = channels;
   requestRender();
+  const operationSignalRevision = runtimeSignalRevision;
   let started = false;
   try {
     const nextSnapshot = await operation(channels);
     if (generation !== channelGeneration) {
       return false;
     }
-    snapshot = nextSnapshot;
+    snapshot = mergeControllerOperationSnapshot(
+      nextSnapshot,
+      snapshot,
+      operationSignalRevision,
+      runtimeSignalRevision,
+    );
     if (fileRecoveryAvailable && isFileTransferRetryable(fileTransfer?.state)) {
       const recoveryTarget = nextSnapshot.fileRecovery?.deviceId;
       if (!recoveryTarget || deviceIdsMatch(recoveryTarget, target)) {
@@ -1465,6 +1473,7 @@ async function clearStoredDevices(): Promise<void> {
 function handleSignal(signal: ControllerSignal): void {
   switch (signal.kind) {
     case "status": {
+      runtimeSignalRevision += 1;
       const previousRuntime = snapshot?.runtime;
       const previousSurfaceState = remoteSurfaceState;
       const nextSurfaceState = advanceControllerRemoteSurfaceState(
