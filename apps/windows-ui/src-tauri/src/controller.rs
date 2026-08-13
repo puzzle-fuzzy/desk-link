@@ -845,6 +845,7 @@ pub struct ControllerManager {
     file_queue_recovery_revision: Arc<AtomicU64>,
     operation_lock: Arc<AsyncMutex<()>>,
     operation_generation: Arc<AtomicU64>,
+    operation_guard: Arc<Mutex<()>>,
     recent_cancellation: Arc<Mutex<Option<Instant>>>,
     input_backpressure_count: Arc<AtomicU64>,
     playback_pressure: Arc<Mutex<Option<ControllerPlaybackPressure>>>,
@@ -868,6 +869,7 @@ impl Default for ControllerManager {
             file_queue_recovery_revision: Arc::new(AtomicU64::new(0)),
             operation_lock: Arc::new(AsyncMutex::new(())),
             operation_generation: Arc::new(AtomicU64::new(0)),
+            operation_guard: Arc::new(Mutex::new(())),
             recent_cancellation: Arc::new(Mutex::new(None)),
             input_backpressure_count: Arc::new(AtomicU64::new(0)),
             playback_pressure: Arc::new(Mutex::new(None)),
@@ -1508,6 +1510,7 @@ impl ControllerManager {
         let task = tauri::async_runtime::spawn(async move {
             run_controller(
                 manager,
+                generation,
                 settings,
                 save_after_approval,
                 receiver,
@@ -1517,6 +1520,15 @@ impl ControllerManager {
             .await;
             video_mailbox.close();
         });
+        let _generation_guard = self
+            .operation_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.is_current(generation) {
+            let _ = cancellation.send(true);
+            task.abort();
+            return Err("连接已取消。".to_owned());
+        }
         let mut worker = self
             .worker
             .lock()
@@ -1976,10 +1988,18 @@ impl ControllerManager {
     }
 
     fn begin_operation(&self) -> u64 {
+        let _guard = self
+            .operation_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.operation_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     fn cancel_operations(&self) {
+        let _guard = self
+            .operation_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.operation_generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -2025,6 +2045,10 @@ impl ControllerManager {
         signals: &Channel<ControllerSignal>,
         status: ControllerRuntimeSummary,
     ) {
+        let _guard = self
+            .operation_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.is_current(generation) {
             self.publish(signals, status);
         }
@@ -2138,6 +2162,7 @@ fn saved_device_summary(entry: &RecentAccessEntry) -> SavedDeviceCredentialSumma
 
 async fn run_controller(
     manager: ControllerManager,
+    generation: u64,
     settings: ControllerConnectionSettings,
     mut save_after_approval: bool,
     mut commands: mpsc::Receiver<ControllerCommand>,
@@ -2168,19 +2193,40 @@ async fn run_controller(
             None,
             None,
         );
-        let connection = connect_once(&manager, &settings, &signals, diagnostics.as_ref(), attempt);
+        let connection = connect_once(
+            &manager,
+            generation,
+            &settings,
+            &signals,
+            diagnostics.as_ref(),
+            attempt,
+        );
         tokio::pin!(connection);
         let mut runtime = loop {
             tokio::select! {
                 changed = cancellation.changed() => {
                     if cancellation_requested(changed, &cancellation) {
-                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
+                        finish_cancelled(
+                            &manager,
+                            generation,
+                            &signals,
+                            diagnostics.as_ref(),
+                            attempt,
+                            None,
+                        );
                         return;
                     }
                 }
                 command = commands.recv() => match command {
                     None => {
-                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
+                        finish_cancelled(
+                            &manager,
+                            generation,
+                            &signals,
+                            diagnostics.as_ref(),
+                            attempt,
+                            None,
+                        );
                         return;
                     }
                     Some(ControllerCommand::SetAudioEnabled(enabled)) => {
@@ -2215,6 +2261,7 @@ async fn run_controller(
                             &mut schedule,
                             failure,
                             ControllerWaitChannels {
+                                generation,
                                 commands: &mut commands,
                                 cancellation: &mut cancellation,
                             },
@@ -2236,6 +2283,7 @@ async fn run_controller(
                 &mut schedule,
                 failure,
                 ControllerWaitChannels {
+                    generation,
                     commands: &mut commands,
                     cancellation: &mut cancellation,
                 },
@@ -2256,6 +2304,7 @@ async fn run_controller(
                 &mut schedule,
                 failure,
                 ControllerWaitChannels {
+                    generation,
                     commands: &mut commands,
                     cancellation: &mut cancellation,
                 },
@@ -2363,7 +2412,14 @@ async fn run_controller(
             tokio::select! {
                 changed = cancellation.changed() => {
                     if cancellation_requested(changed, &cancellation) {
-                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
+                        finish_cancelled(
+                            &manager,
+                            generation,
+                            &signals,
+                            diagnostics.as_ref(),
+                            attempt,
+                            None,
+                        );
                         return;
                     }
                 }
@@ -2727,7 +2783,14 @@ async fn run_controller(
                         }
                     }
                     None => {
-                        finish_cancelled(&manager, &signals, diagnostics.as_ref(), attempt, None);
+                        finish_cancelled(
+                            &manager,
+                            generation,
+                            &signals,
+                            diagnostics.as_ref(),
+                            attempt,
+                            None,
+                        );
                         return;
                     }
                 },
@@ -2750,7 +2813,8 @@ async fn run_controller(
                                 .and_then(|store| store.save(&settings))
                                 .is_err()
                             {
-                                manager.publish(
+                                manager.publish_if_current(
+                                    generation,
                                     &signals,
                                     ControllerRuntimeSummary::stopped(
                                         "主机已批准此电脑，但 Windows 无法加密保护已保存的连接。",
@@ -2764,7 +2828,11 @@ async fn run_controller(
                             config.stream_id,
                             config.config_version,
                         ));
-                        manager.publish(&signals, ControllerRuntimeSummary::connected(config.stream_id));
+                        manager.publish_if_current(
+                            generation,
+                            &signals,
+                            ControllerRuntimeSummary::connected(config.stream_id),
+                        );
                         let _ = signals.send(ControllerSignal::VideoConfig {
                             stream_id: config.stream_id,
                             config_version: config.config_version,
@@ -3573,6 +3641,7 @@ async fn run_controller(
             &mut schedule,
             failure,
             ControllerWaitChannels {
+                generation,
                 commands: &mut commands,
                 cancellation: &mut cancellation,
             },
@@ -3789,12 +3858,13 @@ fn session_earned_fresh_retry_budget(connected_for: Duration) -> bool {
 
 async fn connect_once(
     manager: &ControllerManager,
+    generation: u64,
     settings: &ControllerConnectionSettings,
     signals: &Channel<ControllerSignal>,
     diagnostics: Option<&DiagnosticLog>,
     attempt: u32,
 ) -> Result<ControllerRuntime, ConnectFailure> {
-    manager.publish(signals, ControllerRuntimeSummary::connecting());
+    manager.publish_if_current(generation, signals, ControllerRuntimeSummary::connecting());
     let config =
         crate::local_relay::client_config(settings.relay_address(), settings.server_name())
             .map_err(ConnectFailure::from_transport)?;
@@ -3843,7 +3913,11 @@ async fn connect_once(
                 None,
                 None,
             );
-            manager.publish(signals, ControllerRuntimeSummary::waiting_for_approval());
+            manager.publish_if_current(
+                generation,
+                signals,
+                ControllerRuntimeSummary::waiting_for_approval(),
+            );
         },
     )
     .await
@@ -4051,6 +4125,7 @@ async fn schedule_failure(
     diagnostics: Option<&DiagnosticLog>,
     attempt: u32,
 ) -> bool {
+    let generation = wait_channels.generation;
     if !failure.retryable {
         record_controller_diagnostic(
             diagnostics,
@@ -4060,7 +4135,11 @@ async fn schedule_failure(
             None,
             Some(&format!("{}: {}", failure.kind, failure.technical_reason)),
         );
-        manager.publish(signals, ControllerRuntimeSummary::stopped(failure.detail));
+        manager.publish_if_current(
+            generation,
+            signals,
+            ControllerRuntimeSummary::stopped(failure.detail),
+        );
         return false;
     }
     match schedule.next(now_unix_s()) {
@@ -4073,7 +4152,8 @@ async fn schedule_failure(
                 Some(delay),
                 Some(&format!("{}: {}", failure.kind, failure.technical_reason)),
             );
-            manager.publish(
+            manager.publish_if_current(
+                generation,
                 signals,
                 ControllerRuntimeSummary::reconnecting(retry, schedule.max_retries(), delay),
             );
@@ -4082,7 +4162,14 @@ async fn schedule_failure(
             {
                 RetryWaitOutcome::Retry => true,
                 RetryWaitOutcome::Cancelled => {
-                    finish_cancelled(manager, signals, diagnostics, attempt, Some(retry));
+                    finish_cancelled(
+                        manager,
+                        generation,
+                        signals,
+                        diagnostics,
+                        attempt,
+                        Some(retry),
+                    );
                     false
                 }
             }
@@ -4096,7 +4183,8 @@ async fn schedule_failure(
                 None,
                 Some(&format!("{}: {}", failure.kind, failure.technical_reason)),
             );
-            manager.publish(
+            manager.publish_if_current(
+                generation,
                 signals,
                 ControllerRuntimeSummary::stopped(
                     "多次尝试后仍无法连接主机，请检查两台电脑后重试。",
@@ -4108,6 +4196,7 @@ async fn schedule_failure(
 }
 
 struct ControllerWaitChannels<'a> {
+    generation: u64,
     commands: &'a mut mpsc::Receiver<ControllerCommand>,
     cancellation: &'a mut watch::Receiver<bool>,
 }
@@ -4152,6 +4241,7 @@ fn cancellation_requested(
 
 fn finish_cancelled(
     manager: &ControllerManager,
+    generation: u64,
     signals: &Channel<ControllerSignal>,
     diagnostics: Option<&DiagnosticLog>,
     attempt: u32,
@@ -4165,7 +4255,7 @@ fn finish_cancelled(
         None,
         None,
     );
-    manager.publish(signals, ControllerRuntimeSummary::idle());
+    manager.publish_if_current(generation, signals, ControllerRuntimeSummary::idle());
 }
 
 fn record_controller_diagnostic(
