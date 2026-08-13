@@ -56,6 +56,7 @@ python scripts/package-windows-candidate.py
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测；`audit-managed-relay.py --expected-source-commit <HEAD>` 同时确认线上容器镜像的源码 revision 与候选提交一致。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
 - `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复、本地加密媒体 soak，以及公网中继目录查询、Noise 握手、视频、输入和重连 E2E。soak 至少 10 秒，候选基线建议使用 300 秒。
+- 捕获验收还要确认首帧行为：静态桌面连接后应在 DXGI 无新帧时通过一次性 GDI 快照显示初始画面；如果系统权限、远程桌面驱动或安全桌面导致 10 秒内始终没有首帧，主机必须进入可恢复的捕获失败/重连状态，而不是继续显示“已连接”并永久黑屏。
 - Windows CI 和签名候选 artifact 会同时上传 `windows-acceptance-record.json` 模板；真实验收只能在这份绑定当前安装包 SHA 的模板上填写，不能重新手写版本或哈希。
 - 候选 ZIP 必须由 `package-windows-candidate.py` 生成；文件名包含当前源码提交短 SHA，且包内每份报告和安装器都经过同一候选绑定校验，不能使用无提交标识的旧 ZIP。
 
