@@ -7,6 +7,16 @@ interface QueuedInput {
   streamId: number;
 }
 
+// Wheel events are discrete for ordering purposes, but a stalled IPC call can
+// otherwise let a high-resolution wheel generate an unbounded queue.  Keeping
+// a bounded accumulated delta preserves responsiveness without dropping key
+// or mouse-button transitions.
+const MAX_COALESCED_WHEEL_DELTA = 4_800;
+
+function clampCoalescedWheelDelta(value: number): number {
+  return Math.max(-MAX_COALESCED_WHEEL_DELTA, Math.min(MAX_COALESCED_WHEEL_DELTA, value));
+}
+
 /**
  * Keeps discrete input ordered while collapsing consecutive pointer moves.
  * At most one Tauri IPC call is in flight, so a high-polling-rate mouse cannot
@@ -31,6 +41,17 @@ export class RemoteInputDispatcher {
       : undefined;
     const queued = { input, streamId };
     if (
+      input.kind === "wheel"
+      && last?.input.kind === "wheel"
+      && last.streamId === streamId
+    ) {
+      last.input.deltaX = clampCoalescedWheelDelta(
+        (last.input.deltaX ?? 0) + (input.deltaX ?? 0),
+      );
+      last.input.deltaY = clampCoalescedWheelDelta(
+        (last.input.deltaY ?? 0) + (input.deltaY ?? 0),
+      );
+    } else if (
       input.kind === "mouseMove"
       && last?.input.kind === "mouseMove"
       && last.streamId === streamId

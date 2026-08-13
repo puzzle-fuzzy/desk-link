@@ -53,6 +53,7 @@
 - [x] 参考 RustDesk、MeshCentral、FreeRDP 的公开工程实践，整理当前产品不采纳项与后续 relay 高可用、安全扫描和会话诊断方向，见 [GitHub 同类项目架构对照](docs/github-architecture-benchmark.md)。
 - [x] 修复静态桌面导致编码 resilience smoke 只收到首帧的问题；测试复用最近捕获帧并推进单调时间戳，运行时避免按固定帧号重复触发关键帧请求。
 - [x] 接入独立安全扫描门禁：CodeQL 覆盖 Rust/TypeScript，Cargo audit 阻塞真实漏洞和 yanked 包；非 Windows Tauri 图形依赖的历史维护告警保留在日志中单独跟踪，见 [安全扫描门禁](docs/security-scanning.md)。
+- [x] 为控制端连续滚轮输入增加有界合并，避免 IPC/网络阻塞时输入队列无界增长；键盘和鼠标按键仍保持严格顺序。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
 
 ## 1. 云端诊断可用性（P1）

@@ -84,6 +84,30 @@ describe("remote input dispatcher", () => {
     ]);
   });
 
+  test("coalesces a stalled wheel burst into one bounded event", async () => {
+    const first = deferred();
+    const sent: Array<{ input: ControllerInput; streamId: number }> = [];
+    const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
+      sent.push({ input, streamId });
+      if (sent.length === 1) {
+        await first.promise;
+      }
+    });
+
+    dispatcher.enqueue({ kind: "key", key: "a", pressed: true }, 7);
+    for (let index = 0; index < 10_000; index += 1) {
+      dispatcher.enqueue({ kind: "wheel", deltaX: 1, deltaY: 1 }, 7);
+    }
+    first.resolve();
+    await dispatcher.drain();
+
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual({
+      input: { kind: "wheel", deltaX: 4_800, deltaY: 4_800 },
+      streamId: 7,
+    });
+  });
+
   test("preserves button ordering around coalesced movement", async () => {
     const sent: Array<{ input: ControllerInput; streamId: number }> = [];
     const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
