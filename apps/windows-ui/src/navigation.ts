@@ -36,3 +36,32 @@ export function nextTabIndex(
       return null;
   }
 }
+
+export type MenuNavigationKey = "ArrowDown" | "ArrowUp" | "Home" | "End";
+
+export function nextMenuIndex(
+  currentIndex: number,
+  itemCount: number,
+  key: string,
+): number | null {
+  if (itemCount <= 0 || currentIndex < -1 || currentIndex >= itemCount) {
+    return null;
+  }
+  if (currentIndex === -1) {
+    if (key === "ArrowDown" || key === "Home") return 0;
+    if (key === "ArrowUp" || key === "End") return itemCount - 1;
+    return null;
+  }
+  switch (key as MenuNavigationKey) {
+    case "ArrowDown":
+      return (currentIndex + 1) % itemCount;
+    case "ArrowUp":
+      return (currentIndex - 1 + itemCount) % itemCount;
+    case "Home":
+      return 0;
+    case "End":
+      return itemCount - 1;
+    default:
+      return null;
+  }
+}

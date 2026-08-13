@@ -56,6 +56,7 @@ import {
 } from "./product-config";
 import {
   navigationViewFor,
+  nextMenuIndex,
   nextTabIndex,
   type DeskLinkView,
 } from "./navigation";
@@ -359,7 +360,30 @@ function bindUtilityMenuDismiss(): void {
     utilityMenuOpen = false;
     render();
   });
+  document.addEventListener("keydown", (event) => {
+    if (!utilityMenuOpen || event.key !== "Escape") {
+      return;
+    }
+    event.preventDefault();
+    utilityMenuOpen = false;
+    render();
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.focus();
+    });
+  });
   utilityMenuDismissBound = true;
+}
+
+function handleUtilityMenuKeyboard(event: KeyboardEvent): void {
+  const menu = event.currentTarget as HTMLElement;
+  const items = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+  const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+  const nextIndex = nextMenuIndex(currentIndex, items.length, event.key);
+  if (nextIndex === null) {
+    return;
+  }
+  event.preventDefault();
+  items[nextIndex]?.focus();
 }
 
 function renderHostApproval(): string {
@@ -501,7 +525,7 @@ function renderWorkspaceTopbar(): string {
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
         ${accountLocalMode && !account.user ? `<span class="topbar-account-local" title="当前未登录账号，仅使用本机连接能力">本机模式</span>` : ""}
         ${snapshot ? renderHostStatusChip(snapshot) : ""}
-        <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-expanded="${utilityMenuOpen}" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
+        <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-expanded="${utilityMenuOpen}" aria-controls="utility-menu" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
         ${renderUtilityMenu()}
       </div>
     </header>
@@ -531,7 +555,7 @@ function renderUtilityMenu(): string {
     return "";
   }
   return `
-    <div class="utility-menu" role="menu" aria-label="更多功能">
+    <div id="utility-menu" class="utility-menu" role="menu" aria-label="更多功能">
       ${utilityItems.map(({ id, label, icon: iconName }) => `
         <button class="utility-menu-item ${activeNavigationView === id ? "utility-menu-item--active" : ""}" type="button" role="menuitem" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
           ${icon(iconName)}<span>${label}</span>
@@ -1574,7 +1598,17 @@ function bindInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.addEventListener("click", () => {
     utilityMenuOpen = !utilityMenuOpen;
     render();
+    if (utilityMenuOpen) {
+      window.requestAnimationFrame(() => {
+        document.querySelector<HTMLButtonElement>('.utility-menu [role="menuitem"]')?.focus();
+      });
+    } else {
+      window.requestAnimationFrame(() => {
+        document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.focus();
+      });
+    }
   });
+  document.querySelector<HTMLElement>(".utility-menu")?.addEventListener("keydown", handleUtilityMenuKeyboard);
   if (activeView === "controller") {
     bindControllerInteractions();
   }
@@ -1603,6 +1637,11 @@ function bindInteractions(): void {
       }
       feedback = null;
       render();
+      if (button.closest(".utility-menu")) {
+        window.requestAnimationFrame(() => {
+          document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.focus();
+        });
+      }
       if (activeView === "fixedAccess") {
         void loadFixedAccess();
       } else if (activeView === "settings" && !preferences) {

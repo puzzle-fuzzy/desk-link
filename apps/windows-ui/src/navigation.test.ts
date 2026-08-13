@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DESKTOP_NAV_ITEMS,
   navigationViewFor,
+  nextMenuIndex,
   nextTabIndex,
 } from "./navigation";
 
@@ -31,5 +32,21 @@ describe("keyboard tab navigation", () => {
     expect(nextTabIndex(2, 4, "Home")).toBe(0);
     expect(nextTabIndex(1, 4, "End")).toBe(3);
     expect(nextTabIndex(1, 4, "Enter")).toBeNull();
+  });
+});
+
+describe("utility menu keyboard navigation", () => {
+  test("moves vertically and wraps at both ends", () => {
+    expect(nextMenuIndex(0, 5, "ArrowDown")).toBe(1);
+    expect(nextMenuIndex(4, 5, "ArrowDown")).toBe(0);
+    expect(nextMenuIndex(0, 5, "ArrowUp")).toBe(4);
+  });
+
+  test("starts from the first or last item when the menu has just opened", () => {
+    expect(nextMenuIndex(-1, 5, "ArrowDown")).toBe(0);
+    expect(nextMenuIndex(-1, 5, "ArrowUp")).toBe(4);
+    expect(nextMenuIndex(-1, 5, "Home")).toBe(0);
+    expect(nextMenuIndex(-1, 5, "End")).toBe(4);
+    expect(nextMenuIndex(-1, 5, "Enter")).toBeNull();
   });
 });
