@@ -73,6 +73,7 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
         controller_verify_key,
         continue_receiver,
         false,
+        true,
     ));
 
     let mut runtime = ControllerRuntime::connect(controller, controller_identity, host_verify_key)
@@ -117,6 +118,16 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     assert_eq!(audio.sequence, 1);
     assert_eq!(audio.payload, vec![0x2a; 960]);
 
+    // The fake host intentionally repeats the first encrypted video packet.
+    // A duplicate datagram must be discarded without terminating the secure
+    // session or surfacing a replay error to the caller.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), runtime.next_event())
+            .await
+            .is_err(),
+        "duplicate video datagram must not terminate the controller"
+    );
+
     runtime
         .send_input(InputEvent::MouseWheel {
             delta_x: -120,
@@ -138,7 +149,7 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     );
     assert_eq!(keyframe, ControlMessage::RequestKeyframe { stream_id: 9 });
     assert_eq!(runtime.metrics().completed_frames, 1);
-    assert_eq!(runtime.metrics().dropped_video_packets, 0);
+    assert_eq!(runtime.metrics().dropped_video_packets, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -182,6 +193,7 @@ async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
         controller_verify_key,
         continue_receiver,
         true,
+        false,
     ));
 
     let mut runtime = ControllerRuntime::connect_for_platform(
@@ -459,6 +471,7 @@ async fn run_fake_host(
     expected_controller: ed25519_dalek::VerifyingKey,
     continue_receiver: oneshot::Receiver<()>,
     reject_direct_offer: bool,
+    duplicate_video_packet: bool,
 ) -> (InputEvent, ControlMessage) {
     let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
     assert_eq!(first.step, NoiseHandshakeStep::InitiatorHello);
@@ -554,13 +567,12 @@ async fn run_fake_host(
     packets.reverse();
     let first_packet = packets.pop().expect("fake frame has packets");
     let first_plaintext = encode_video_packet(&first_packet).unwrap();
-    host.send_video_datagram(
-        secure
-            .seal(SecureLane::VideoDatagram, &first_plaintext)
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let first_ciphertext = secure
+        .seal(SecureLane::VideoDatagram, &first_plaintext)
+        .unwrap();
+    host.send_video_datagram(first_ciphertext.clone())
+        .await
+        .unwrap();
 
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,
@@ -584,6 +596,9 @@ async fn run_fake_host(
         host.send_video_datagram(secure.seal(SecureLane::VideoDatagram, &plaintext).unwrap())
             .await
             .unwrap();
+    }
+    if duplicate_video_packet {
+        host.send_video_datagram(first_ciphertext).await.unwrap();
     }
     let cursor = encode_cursor_update(&CursorUpdate {
         protocol_version: PROTOCOL_VERSION,

@@ -10,6 +10,7 @@ mod windows {
     use desklink_protocol::{InputEvent, Platform};
     use desklink_transport::{
         QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
+        TransportError,
     };
     use ed25519_dalek::VerifyingKey;
     use rand_core::{OsRng, RngCore};
@@ -124,12 +125,18 @@ mod windows {
         directory_id: u64,
         access_code: [u8; 8],
     ) -> PairingInvite {
-        let client = QuicClient::connect(transport.clone()).await.unwrap();
-        let invitation = client
-            .lookup_directory(RelayDirectoryLookup::new(directory_id, access_code).unwrap())
-            .await
-            .unwrap();
-        PairingInvite::decode(&invitation, now_unix_s()).unwrap()
+        let lookup = RelayDirectoryLookup::new(directory_id, access_code).unwrap();
+        for attempt in 0..3 {
+            let client = QuicClient::connect(transport.clone()).await.unwrap();
+            match client.lookup_directory(lookup.clone()).await {
+                Ok(invitation) => return PairingInvite::decode(&invitation, now_unix_s()).unwrap(),
+                Err(TransportError::Connection(_)) | Err(TransportError::Closed) if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("managed relay directory lookup failed: {error}"),
+            }
+        }
+        unreachable!("managed relay directory lookup retry loop must return or panic")
     }
 
     async fn connect_controller(
@@ -151,7 +158,11 @@ mod windows {
             client,
             DeviceIdentity::from_secret_key(device_id, &secret),
             invite.host_verify_key(),
-            Platform::Windows,
+            // This probe is intentionally relay-only. Windows direct-LAN
+            // negotiation has dedicated coverage; mixing it into the managed
+            // relay test makes a same-runner private candidate race the
+            // public relay assertion.
+            Platform::MacOS,
         )
         .await
         .unwrap()
@@ -182,7 +193,11 @@ mod windows {
     }
 
     async fn wait_for_video(controller: &mut ControllerRuntime) -> u64 {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        // The Windows capture worker has a bounded ten-second first-frame
+        // watchdog, and a cold GitHub runner can spend another few seconds
+        // initializing Media Foundation. Keep this probe above that bound so
+        // a slow but healthy first frame is not reported as a relay failure.
+        tokio::time::timeout(Duration::from_secs(45), async {
             loop {
                 match controller.next_event().await.unwrap() {
                     ControllerEvent::H264AccessUnit(frame) => return frame.stream_id,

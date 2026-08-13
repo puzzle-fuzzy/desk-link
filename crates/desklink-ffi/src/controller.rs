@@ -456,8 +456,12 @@ impl ControllerRuntime {
                     }
                 }
                 TransportEvent::CursorDatagram(ciphertext) => {
-                    let plaintext =
-                        open(&self.secure, SecureLane::CursorDatagram, &ciphertext).await?;
+                    let Some(plaintext) =
+                        open_datagram(&self.secure, SecureLane::CursorDatagram, &ciphertext)
+                            .await?
+                    else {
+                        continue;
+                    };
                     let cursor = decode_cursor_update(&plaintext)?;
                     if self
                         .active_stream_id()
@@ -468,8 +472,11 @@ impl ControllerRuntime {
                     return Ok(ControllerEvent::Cursor(cursor));
                 }
                 TransportEvent::AudioDatagram(ciphertext) => {
-                    let plaintext =
-                        open(&self.secure, SecureLane::AudioDatagram, &ciphertext).await?;
+                    let Some(plaintext) =
+                        open_datagram(&self.secure, SecureLane::AudioDatagram, &ciphertext).await?
+                    else {
+                        continue;
+                    };
                     let packet = decode_audio_packet(&plaintext)?;
                     if self
                         .active_stream_id()
@@ -499,7 +506,16 @@ impl ControllerRuntime {
         &mut self,
         ciphertext: Vec<u8>,
     ) -> Result<Option<ControllerEvent>, ControllerError> {
-        let plaintext = open(&self.secure, SecureLane::VideoDatagram, &ciphertext).await?;
+        let Some(plaintext) =
+            open_datagram(&self.secure, SecureLane::VideoDatagram, &ciphertext).await?
+        else {
+            // QUIC datagrams may be duplicated by the network or by a relay
+            // retry. The packet is authenticated and the replay window has
+            // rejected it, so dropping it is safe and keeps a transient
+            // duplicate from tearing down the whole session.
+            self.drop_video_packet();
+            return Ok(None);
+        };
         let packet = decode_video_packet(&plaintext)?;
         let Some(config) = &self.video_config else {
             self.drop_video_packet();
@@ -925,6 +941,18 @@ async fn open(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, ControllerError> {
     Ok(secure.lock().await.open(lane, ciphertext)?)
+}
+
+async fn open_datagram(
+    secure: &Arc<Mutex<SecureSession>>,
+    lane: SecureLane,
+    ciphertext: &[u8],
+) -> Result<Option<Vec<u8>>, ControllerError> {
+    match secure.lock().await.open(lane, ciphertext) {
+        Ok(plaintext) => Ok(Some(plaintext)),
+        Err(CryptoError::ReplayRejected) => Ok(None),
+        Err(error) => Err(ControllerError::Crypto(error)),
+    }
 }
 
 fn now_micros() -> u64 {

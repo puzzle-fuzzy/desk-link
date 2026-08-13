@@ -57,6 +57,7 @@ jobs:
         run: python scripts/verify-windows-resilience.py --soak-seconds 10
 
       - name: Create candidate-bound Windows acceptance template
+        if: always()
         run: python scripts/create-windows-acceptance-record.py --operator "待真实 Windows 验收"
 
       - name: Generate Windows release readiness evidence
