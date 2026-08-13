@@ -13,10 +13,10 @@
 本机已加载 SSH 密钥后运行：
 
 ```text
-python scripts/audit-managed-relay.py --target root@101.35.246.159 --identity-file C:\Users\18267\.ssh\p2p-tencent-ed25519
+python scripts/audit-managed-relay.py --target root@101.35.246.159 --identity-file C:\Users\18267\.ssh\p2p-tencent-ed25519 --expected-source-commit $(git rev-parse HEAD)
 ```
 
-巡检会失败于以下任一条件：容器未运行或不健康、无自动重启策略、证书剩余不足 21 天、根分区使用率超过 80%、缺少容量样本、会话或连接容量达到 80%。报告写入 `dist/linux/managed-relay-host-audit.json`。
+巡检会失败于以下任一条件：容器未运行或不健康、镜像缺少完整源码 revision 或与 `--expected-source-commit` 不一致、无自动重启策略、证书剩余不足 21 天、根分区使用率超过 80%、缺少容量样本、会话或连接容量达到 80%。报告写入 `dist/linux/managed-relay-host-audit.json`。
 
 外部链路验证使用生产客户端完成 DNS 配置、UDP 4433、QUIC 与 TLS 身份校验：
 

@@ -57,6 +57,12 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             "passed": True,
         }
         relay = {"passed": True, "completed_at_unix_s": now}
+        relay_host = {
+            "passed": True,
+            "completed_at_unix_s": now,
+            "source_commit": commit,
+            "source_revision_match": True,
+        }
         diagnostics = {"passed": True, "completed_at_unix_s": now}
         resilience = {
             "schema": 1,
@@ -76,6 +82,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             "installer_path": installer,
             "tag_exists": True,
             "relay_report": relay,
+            "relay_host_report": relay_host,
             "diagnostics_report": diagnostics,
             "resilience_report": resilience,
             "now": now,
@@ -119,6 +126,15 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             fixture["resilience_report"] = resilience
             report = self.ready.evaluate_preflight(**fixture)
         self.assertIn("windows_resilience_evidence", {item["id"] for item in report["blockers"]})
+
+    def test_relay_evidence_must_match_the_candidate_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.create_fixture(Path(directory))
+            relay_host = dict(fixture["relay_host_report"])
+            relay_host["source_commit"] = "b" * 40
+            fixture["relay_host_report"] = relay_host
+            report = self.ready.evaluate_preflight(**fixture)
+        self.assertIn("managed_relay_evidence", {item["id"] for item in report["blockers"]})
 
     def test_manual_acceptance_record_is_bound_to_candidate_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

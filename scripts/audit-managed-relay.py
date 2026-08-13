@@ -19,6 +19,7 @@ CAPACITY_PATTERN = re.compile(
     r"relay_capacity active_sessions=(\d+) attached_participants=(\d+) "
     r"accepted_connections=(\d+) max_sessions=(\d+) max_connections=(\d+)"
 )
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +39,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--container", default="desklink-relay-relay-1")
+    parser.add_argument(
+        "--expected-source-commit",
+        default="",
+        help="Expected 40-character Git SHA for the running relay image",
+    )
     parser.add_argument(
         "--certificate",
         default="/etc/letsencrypt/live/p2p.yxswy.com/fullchain.pem",
@@ -110,6 +116,13 @@ def parse_capacity(logs: str) -> dict[str, int] | None:
     return dict(zip(names, values))
 
 
+def validate_source_commit(value: str) -> str:
+    value = value.strip().lower()
+    if COMMIT_PATTERN.fullmatch(value) is None:
+        raise ValueError("relay image source revision is missing or invalid")
+    return value
+
+
 def main() -> int:
     arguments = parse_args()
     if not arguments.target:
@@ -139,6 +152,12 @@ def main() -> int:
         arguments,
         f'docker inspect {arguments.container} --format "{{{{.Config.Image}}}}"',
     )
+    source_commit = validate_source_commit(
+        remote(
+            arguments,
+            f'docker inspect {arguments.container} --format "{{{{index .Config.Labels \\\"org.opencontainers.image.revision\\\"}}}}"',
+        )
+    )
     certificate_days = parse_certificate_expiry(
         remote(arguments, f"openssl x509 -in {arguments.certificate} -noout -enddate")
     )
@@ -158,6 +177,9 @@ def main() -> int:
         "disk_capacity": disk_percent <= arguments.maximum_disk_percent,
         "capacity_sample": capacity is not None,
     }
+    if arguments.expected_source_commit:
+        expected_source_commit = validate_source_commit(arguments.expected_source_commit)
+        checks["source_revision_match"] = source_commit == expected_source_commit
     if capacity:
         checks["session_capacity"] = (
             capacity["active_sessions"] * 100 < capacity["max_sessions"] * 80
@@ -171,6 +193,8 @@ def main() -> int:
         "schema": 1,
         "container": arguments.container,
         "image": image,
+        "source_commit": source_commit,
+        "source_revision_match": checks.get("source_revision_match", False),
         "running": state.get("Running") is True,
         "health": state.get("Health", {}).get("Status", "missing"),
         "restart_count": restart_count,

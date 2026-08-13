@@ -48,7 +48,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 - `dist/windows/windows-installer-manifest.json` 的版本、x64、应用哈希、安装器哈希和 `passed` 正确。
 - 两份清单的 `source_commit` 必须相同；正式签名构建的 `source_dirty` 必须为 `false`，并与 GitHub Actions 的 `GITHUB_SHA` 对齐。
 - 正式发布前 `signed` 必须为 `true`；`signed: false` 只能用于本地候选包。
-- `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测。
+- `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测；`audit-managed-relay.py --expected-source-commit <HEAD>` 同时确认线上容器镜像的源码 revision 与候选提交一致。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
 - `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复和至少 10 秒加密媒体 soak。
 

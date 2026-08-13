@@ -241,6 +241,27 @@ def _resilience_report_status(
     return True, detail
 
 
+def _managed_relay_report_status(
+    report: dict[str, Any] | None,
+    *,
+    now: int,
+    expected_commit: str | None,
+) -> tuple[bool, str]:
+    fresh, detail = _fresh_report(
+        report,
+        now=now,
+        max_age_seconds=24 * 60 * 60,
+        label="Managed relay verification",
+    )
+    if not fresh:
+        return False, detail
+    if report.get("source_commit") != expected_commit:
+        return False, "Managed relay report does not match the candidate source commit"
+    if report.get("source_revision_match") is not True:
+        return False, "Managed relay host audit did not confirm the image source revision"
+    return True, detail
+
+
 def evaluate_preflight(
     *,
     version: str | None,
@@ -251,6 +272,7 @@ def evaluate_preflight(
     installer_path: Path,
     tag_exists: bool | None,
     relay_report: dict[str, Any] | None,
+    relay_host_report: dict[str, Any] | None,
     diagnostics_report: dict[str, Any] | None,
     resilience_report: dict[str, Any] | None,
     now: int | None = None,
@@ -354,9 +376,14 @@ def evaluate_preflight(
         detail=f"Annotated release tag v{version or '?'} must exist before publishing",
     )
 
-    relay_ok, relay_detail = _fresh_report(
+    relay_probe_ok, relay_probe_detail = _fresh_report(
         relay_report, now=now, max_age_seconds=24 * 60 * 60, label="Managed relay verification"
     )
+    relay_host_ok, relay_host_detail = _managed_relay_report_status(
+        relay_host_report, now=now, expected_commit=head
+    )
+    relay_ok = relay_probe_ok and relay_host_ok
+    relay_detail = f"{relay_probe_detail}; {relay_host_detail}"
     _check(
         checks,
         blockers,
@@ -495,6 +522,7 @@ def main() -> int:
         installer_path=installer,
         tag_exists=git_tag_exists(ROOT, f"v{version}" if version else "vunknown"),
         relay_report=read_json(ROOT / "dist" / "windows" / "managed-relay-verification.json"),
+        relay_host_report=read_json(ROOT / "dist" / "linux" / "managed-relay-host-audit.json"),
         diagnostics_report=read_json(ROOT / "dist" / "linux" / "managed-diagnostics-audit.json"),
         resilience_report=read_json(ROOT / "dist" / "windows" / "windows-resilience-report.json"),
         manual_checks=manual_checks,
