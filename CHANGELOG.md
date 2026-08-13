@@ -41,6 +41,7 @@
 - Windows “更多”菜单支持 Escape 关闭、方向键/Home/End 导航，并在关闭或选择入口后恢复焦点，减少键盘操作迷失。
 - 正式 Windows Release 上传前会再次调用 SignTool 验证最终安装器的 Authenticode 签名，不再只信任清单中的 `signed` 标记。
 - Windows 安装器现在在写入程序前检查 WebView2 Evergreen Runtime；缺失或无效时明确提示官方运行时安装地址，避免留下半安装程序后才显示空白页面。
+- 中继证书加载迁移到 rustls 内置 PEM 类型，移除已停止维护的 `rustls-pemfile` 依赖。
 
 ### 当前明确限制
 

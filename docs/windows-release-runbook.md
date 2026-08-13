@@ -70,6 +70,16 @@ python scripts/check-windows-release-ready.py --strict
 
 严格模式在仍有任何阻塞项时返回 1。为了避免把验收结果误绑定到另一份安装包，先基于当前候选生成记录模板：
 
+### 2.2 Rust 依赖安全审计
+
+发布冻结前运行：
+
+```powershell
+cargo audit
+```
+
+该命令覆盖整个 workspace 和所有条件平台，因此可能报告不会进入 Windows 正常依赖树的 GTK/zbus 依赖。当前中继已直接使用 `rustls::pki_types::pem::PemObject`，不再引入已停止维护的 `rustls-pemfile`；任何真正进入 Windows 或中继运行时依赖树的 RUSTSEC 告警都必须在签名发布前处理或明确记录风险，不得用忽略参数掩盖。
+
 ```powershell
 python scripts/create-windows-acceptance-record.py --operator "release-team"
 ```

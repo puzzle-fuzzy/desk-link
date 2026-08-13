@@ -35,7 +35,6 @@ quinn = "0.11"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 subtle = "2.6"
 thiserror = "2"

@@ -1,18 +1,10 @@
 use std::{
-    env,
-    error::Error,
-    ffi::OsStr,
-    fs::File,
-    io::{self, BufReader},
-    net::SocketAddr,
-    path::Path,
-    sync::Arc,
-    time::Duration,
+    env, error::Error, ffi::OsStr, io, net::SocketAddr, path::Path, sync::Arc, time::Duration,
 };
 
 use desklink_relay::{RelayConfig, RelayServer};
 use quinn::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 const DEFAULT_SESSION_TTL_S: u64 = 86_400;
 const MIN_SESSION_TTL_S: u64 = 60;
@@ -38,9 +30,8 @@ fn pem_server_config(
     certificate_path: &Path,
     private_key_path: &Path,
 ) -> Result<ServerConfig, Box<dyn Error + Send + Sync>> {
-    let mut certificate_reader = BufReader::new(File::open(certificate_path)?);
     let certificates =
-        rustls_pemfile::certs(&mut certificate_reader).collect::<Result<Vec<_>, _>>()?;
+        CertificateDer::pem_file_iter(certificate_path)?.collect::<Result<Vec<_>, _>>()?;
     if certificates.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -48,13 +39,17 @@ fn pem_server_config(
         )
         .into());
     }
-    let mut private_key_reader = BufReader::new(File::open(private_key_path)?);
-    let private_key = rustls_pemfile::private_key(&mut private_key_reader)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DESKLINK_RELAY_KEY_PEM contains no supported private key",
-        )
-    })?;
+    let private_key = match PrivateKeyDer::from_pem_file(private_key_path) {
+        Ok(key) => key,
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DESKLINK_RELAY_KEY_PEM contains no supported private key",
+            )
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok(ServerConfig::with_single_cert(certificates, private_key)?)
 }
 
