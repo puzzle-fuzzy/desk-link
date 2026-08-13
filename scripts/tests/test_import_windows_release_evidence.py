@@ -33,6 +33,7 @@ class WindowsReleaseEvidenceImportTests(unittest.TestCase):
             "windows-acceptance-record.json": {"checks": {"two_windows_acceptance": False}},
             "windows-resilience-report.json": {"passed": True, "source_dirty": False},
             "managed-relay-verification.json": {"passed": True},
+            "managed-relay-host-audit.json": {"passed": True, "source_revision_match": True},
             "managed-diagnostics-audit.json": {"passed": True},
         }
 
@@ -49,7 +50,7 @@ class WindowsReleaseEvidenceImportTests(unittest.TestCase):
                     output_root=output_root,
                 )
 
-            self.assertEqual(len(imported), 4)
+            self.assertEqual(len(imported), 5)
             self.assertEqual(
                 json.loads(
                     (output_root / "windows" / "windows-acceptance-record.json").read_text()
@@ -67,6 +68,12 @@ class WindowsReleaseEvidenceImportTests(unittest.TestCase):
                     (output_root / "linux" / "managed-diagnostics-audit.json").read_text()
                 ),
                 values["managed-diagnostics-audit.json"],
+            )
+            self.assertEqual(
+                json.loads(
+                    (output_root / "linux" / "managed-relay-host-audit.json").read_text()
+                ),
+                values["managed-relay-host-audit.json"],
             )
 
     def test_rejects_a_mutable_evidence_ref(self) -> None:

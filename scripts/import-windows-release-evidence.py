@@ -18,6 +18,7 @@ EVIDENCE_FILES = {
     "windows-acceptance-record.json": Path("windows") / "windows-acceptance-record.json",
     "windows-resilience-report.json": Path("windows") / "windows-resilience-report.json",
     "managed-relay-verification.json": Path("windows") / "managed-relay-verification.json",
+    "managed-relay-host-audit.json": Path("linux") / "managed-relay-host-audit.json",
     "managed-diagnostics-audit.json": Path("linux") / "managed-diagnostics-audit.json",
 }
 

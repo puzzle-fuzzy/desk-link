@@ -177,6 +177,7 @@ GitHub Actions 使用 `Windows Signed Candidate` 工作流。该工作流只生�
 release-evidence/v0.1.91/windows-acceptance-record.json
 release-evidence/v0.1.91/windows-resilience-report.json
 release-evidence/v0.1.91/managed-relay-verification.json
+release-evidence/v0.1.91/managed-relay-host-audit.json
 release-evidence/v0.1.91/managed-diagnostics-audit.json
 ```
 
@@ -191,7 +192,7 @@ git tag -a v0.1.91 -m "DeskLink Windows 0.1.91"
 git push origin v0.1.91
 ```
 
-在该 tag 上手动运行 `Windows Publish Release`，输入签名候选 workflow run ID 和证据提交 SHA。它会下载同一份签名 artifact，导入三份 source-bound 证据，执行带 `--minimum-soak-seconds 300` 的严格 readiness 检查，并由 `publish-windows-release.py` 进行第二次校验；未签名、版本不匹配、长稳不足或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
+在该 tag 上手动运行 `Windows Publish Release`，输入签名候选 workflow run ID 和证据提交 SHA。它会下载同一份签名 artifact，导入五份 source-bound 证据（包含中继主机源码审计），执行带 `--minimum-soak-seconds 300` 的严格 readiness 检查，并由 `publish-windows-release.py` 进行第二次校验；未签名、版本不匹配、长稳不足或任何 P0/P1 门禁未完成时不得上传 GitHub Release。发布内容至少包括：
 
 - `DeskLinkSetup-0.1.91-x64.exe`
 - `windows-installer-manifest.json`
