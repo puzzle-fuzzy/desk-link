@@ -1,7 +1,7 @@
 # DeskLink 上线 TODO
 
 > 目标：先把 Windows 两台电脑的远程控制做成可发布的稳定版本，再扩展 4K 和公网 P2P。
-> 当前判断（2026-08-13）：Windows 首发核心功能与自动化门禁已通过；正式上线仍受签名、发布 tag、运维证据和真实 Windows 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
+> 当前判断（2026-08-14）：Windows 首发核心功能与自动化门禁已通过，稳定候选为 `c9e5ad3`；正式上线仍受签名、发布 tag 和真实 Windows 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
 > 规则：`[x]` 只表示代码或自动验证已完成；需要两台真实 Windows 电脑的项目必须由人工验收后再勾选。
 
 ## 0. 发布基线与工作区（P1）
@@ -162,12 +162,12 @@ python scripts/check-windows-release-ready.py --manual-json dist/windows/windows
 python scripts/package-windows-candidate.py
 ```
 
-### 最近一次自动门禁（2026-08-13）
+### 最近一次自动门禁（2026-08-14，候选 `c9e5ad3`）
 
-- [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 60 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
-- [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复、本地 300 秒加密媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；报告已纳入 release readiness 并绑定当前提交。
+- [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 64 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
+- [x] Windows CI run `31731362387` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `c9e5ad3`。
 
-- [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。
+- [x] 安全扫描 run `31731362323`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
 - [x] 发布脚本与签名工作流现在都会严格校验 readiness 报告，并把该报告作为 Release 证据上传；当前候选 `ready: false`，不会被误发布为正式版本。
 - [x] 远程 CI 仍保留 Node.js 20 deprecation warning（`actions/upload-artifact@v4`），不影响本次通过，后续应随 GitHub Actions 运行时升级单独处理。
