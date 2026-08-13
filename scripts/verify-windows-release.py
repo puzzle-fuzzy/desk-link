@@ -31,6 +31,10 @@ COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 PRODUCT_CONFIG = WINDOWS_UI / "src" / "product-config.ts"
 RUST_RELAY_CONFIG = WINDOWS_UI / "src-tauri" / "src" / "local_relay.rs"
 WINDOWS_ASSETS = ROOT / "apps" / "windows" / "assets"
+PRODUCTION_RUST_SOURCE_ROOTS = (
+    ROOT / "apps" / "windows" / "src",
+    ROOT / "apps" / "windows-ui" / "src-tauri" / "src",
+)
 
 
 def run(command: list[str], *, cwd: Path = ROOT) -> None:
@@ -181,6 +185,39 @@ def verify_static_windows_assets() -> dict[str, dict[str, object]]:
     return verified
 
 
+def verify_production_backpressure(
+    source_roots: tuple[Path, ...] = PRODUCTION_RUST_SOURCE_ROOTS,
+) -> dict[str, object]:
+    """Reject unbounded Rust channels in the Windows production data plane."""
+
+    forbidden = (
+        ("tokio::sync::mpsc::unbounded_channel", re.compile(r"\bunbounded_channel\s*\(")),
+        ("std::sync::mpsc::channel", re.compile(r"std::sync::mpsc::channel\s*\(")),
+    )
+    checked_files = 0
+    violations: list[str] = []
+    for source_root in source_roots:
+        if not source_root.is_dir():
+            raise SystemExit(f"Windows production Rust source directory is missing: {source_root}")
+        for path in sorted(source_root.rglob("*.rs")):
+            checked_files += 1
+            text = path.read_text(encoding="utf-8")
+            for label, pattern in forbidden:
+                if pattern.search(text):
+                    try:
+                        display_path = path.relative_to(ROOT)
+                    except ValueError:
+                        display_path = path
+                    violations.append(f"{display_path} ({label})")
+    if violations:
+        detail = ", ".join(violations)
+        raise SystemExit(
+            "Windows production Rust contains an unbounded channel; use a bounded "
+            f"queue with explicit backpressure: {detail}"
+        )
+    return {"checked_files": checked_files, "unbounded_channels": 0}
+
+
 def verify_frontend_assets() -> list[str]:
     index = WINDOWS_UI / "dist" / "index.html"
     if not index.is_file():
@@ -236,6 +273,7 @@ def main() -> int:
     release_scope = verify_release_scope()
     managed_relay = verify_managed_relay_profile()
     windows_assets = verify_static_windows_assets()
+    backpressure = verify_production_backpressure()
     run(["bun", "install", "--frozen-lockfile"], cwd=WINDOWS_UI)
     run(["bun", "run", "test"], cwd=WINDOWS_UI)
     run(["bun", "run", "build"], cwd=WINDOWS_UI)
@@ -267,6 +305,7 @@ def main() -> int:
         "frontend_assets": assets,
         "managed_relay": managed_relay,
         "windows_assets": windows_assets,
+        "production_backpressure": backpressure,
         "release": release,
         "passed": True,
     }

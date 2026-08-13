@@ -45,6 +45,22 @@ class WindowsReleaseScopeTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "non-Windows"):
                 self.verify.verify_release_scope(readme)
 
+    def test_production_rust_has_no_unbounded_channels(self) -> None:
+        result = self.verify.verify_production_backpressure(
+            (ROOT / "apps" / "windows" / "src", ROOT / "apps" / "windows-ui" / "src-tauri" / "src")
+        )
+        self.assertEqual(result["unbounded_channels"], 0)
+
+    def test_rejects_an_unbounded_production_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "runtime.rs"
+            source.write_text(
+                "let (_sender, _receiver) = std::sync::mpsc::channel();\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "unbounded channel"):
+                self.verify.verify_production_backpressure((Path(directory),))
+
 
 if __name__ == "__main__":
     unittest.main()
