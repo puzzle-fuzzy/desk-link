@@ -65,6 +65,10 @@ jobs:
           --manual-json dist/windows/windows-acceptance-record.json
           --report dist/windows/windows-release-readiness.json
 
+      - name: Package source-bound Windows candidate
+        if: always()
+        run: python scripts/package-windows-candidate.py
+
       - name: Upload Windows candidate evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -77,5 +81,6 @@ jobs:
             dist/windows/windows-resilience-report.json
             dist/windows/windows-acceptance-record.json
             dist/windows/windows-release-readiness.json
+            dist/windows/DeskLink-Windows-candidate-*.zip
           if-no-files-found: warn
           retention-days: 14

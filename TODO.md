@@ -136,6 +136,7 @@ python scripts/verify-windows-resilience.py --soak-seconds 10
 python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
 python -m unittest discover -s scripts/tests -p "test_*.py"
+python scripts/package-windows-candidate.py
 ```
 
 ### 最近一次自动门禁（2026-08-13）

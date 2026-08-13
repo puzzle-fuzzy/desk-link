@@ -42,6 +42,7 @@ python scripts/verify-windows-resilience.py --soak-seconds 10
 python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
 python -m unittest discover -s scripts/tests -p "test_*.py"
+python scripts/package-windows-candidate.py
 ```
 
 必须检查：
@@ -54,6 +55,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
 - `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复和至少 10 秒加密媒体 soak。
 - Windows CI 和签名候选 artifact 会同时上传 `windows-acceptance-record.json` 模板；真实验收只能在这份绑定当前安装包 SHA 的模板上填写，不能重新手写版本或哈希。
+- 候选 ZIP 必须由 `package-windows-candidate.py` 生成；文件名包含当前源码提交短 SHA，且包内每份报告和安装器都经过同一候选绑定校验，不能使用无提交标识的旧 ZIP。
 
 ## 2.1 发布预检
 
