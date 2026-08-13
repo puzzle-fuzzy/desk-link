@@ -462,6 +462,7 @@ impl HostManager {
         let _restart = self.restart_lock.lock().await;
         self.next_lifecycle_generation();
         self.stop_current().await;
+        self.set_pairing_active(false);
     }
 
     pub fn request_stop(&self) {
@@ -470,6 +471,7 @@ impl HostManager {
         if let Some(worker) = self.take_worker() {
             let _ = worker.shutdown.send(());
         }
+        self.set_pairing_active(false);
     }
 
     /// Pairing completion is allowed to re-arm the normal host only when the
@@ -958,5 +960,15 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             pairing_generation
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_host_clears_pairing_state_even_without_a_worker() {
+        let manager = HostManager::default();
+        manager.set_pairing_active(true);
+
+        manager.stop().await;
+
+        assert!(!manager.is_pairing_active());
     }
 }
