@@ -1,11 +1,10 @@
 #![cfg(windows)]
 
 use apps_windows::{
-    cloud_diagnostics::{DiagnosticSource, set_session_correlation, upload_all_once},
+    cloud_diagnostics::upload_all_once,
     diagnostic_sharing::WindowsDiagnosticSharing,
     diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
 };
-use desklink_crypto::SessionId;
 
 #[test]
 #[ignore = "live HTTPS diagnostic ingestion probe; run explicitly before publishing a Windows installer"]
@@ -17,17 +16,13 @@ fn windows_signed_diagnostic_batch_reaches_managed_service() {
         previous,
     };
     sharing.set_enabled(true).unwrap();
-    set_session_correlation(
-        DiagnosticSource::Controller,
-        SessionId::from_bytes([0x5a; 16]),
-    )
-    .unwrap();
+    // This probe validates ingestion only. Keep it uncorrelated so a synthetic
+    // event cannot be merged into a real user session in the managed report.
     DiagnosticLog::controller_for_current_user()
         .unwrap()
-        .record(&DiagnosticEvent::OperationFailed {
-            operation: DiagnosticOperation::RelayProbe,
-            reason: "managed cloud diagnostic live probe".to_owned(),
-        })
+        .record(&DiagnosticEvent::OperationSucceeded(
+            DiagnosticOperation::RelayProbe,
+        ))
         .unwrap();
 
     let result = upload_all_once().unwrap();
