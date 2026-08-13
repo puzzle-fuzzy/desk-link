@@ -6,6 +6,7 @@
 
 - Windows schema 2 人工验收记录现在采用字段白名单，并拒绝备注、安装结果和长稳说明中的设备 ID、密码/密钥标签、PEM 私钥和本地 Windows 路径；候选 ZIP 不再意外携带原始敏感证据。
 - 对照 RustDesk、MeshCentral 和 FreeRDP 的公开架构后，确认继续保持 Rust 数据平面、relay 回落和 Windows 首发边界；将第二 relay、安全扫描和分层会话诊断列入后续计划，不引入企业 RMM 或 RDP 兼容范围。
+- Windows 编码 resilience smoke 现在在静态桌面复用最近一帧并推进单调时间戳，不会因为 DXGI 只报告变化帧而假失败；运行时只在首帧或明确恢复请求时强制关键帧，普通 GOP 节奏交给 Media Foundation。
 - Windows 控制端与主机端的视频链路增加认证 DirectLan 探测；探测失败时继续使用公网中继。
 - DirectLan 状态机、控制端主动探测窗口、主机端入站探测监听和 datagram 回环回归测试已接入。
 - H.264 Main/High Profile 协商、视频质量自适应和渲染诊断指标已纳入 Windows 构建门禁。

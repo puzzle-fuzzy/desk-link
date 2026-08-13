@@ -5,7 +5,7 @@ fn captured_desktop_frame_encodes_to_h264() {
     use std::time::Duration;
 
     use apps_windows::{
-        capture::{CaptureError, DesktopCapturer, DxgiDesktopCapturer},
+        capture::{CaptureError, CapturedFrame, DesktopCapturer, DxgiDesktopCapturer},
         encoder::{EncoderError, H264Encoder, fit_h264_dimensions},
     };
 
@@ -17,12 +17,26 @@ fn captured_desktop_frame_encodes_to_h264() {
 
     let mut submitted = 0_u64;
     let forced_keyframe_id = 3_u64;
+    let mut last_frame: Option<CapturedFrame> = None;
+    let mut synthetic_timestamp_us = 0_u64;
     for _ in 0..60 {
         let frame = match capture.next_frame(Duration::from_millis(500)) {
-            Ok(frame) => frame,
-            Err(CaptureError::Timeout) => continue,
+            Ok(frame) => {
+                synthetic_timestamp_us = frame.timestamp_us;
+                frame
+            }
+            Err(CaptureError::Timeout) => {
+                let Some(previous) = last_frame.as_ref() else {
+                    continue;
+                };
+                synthetic_timestamp_us = synthetic_timestamp_us.saturating_add(33_333);
+                let mut frame = previous.clone();
+                frame.timestamp_us = synthetic_timestamp_us;
+                frame
+            }
             Err(error) => panic!("capture failed: {error:?}"),
         };
+        last_frame = Some(frame.clone());
         let request_keyframe = submitted + 1 == forced_keyframe_id;
         match encoder.encode(frame, request_keyframe) {
             Ok(encoded) => {

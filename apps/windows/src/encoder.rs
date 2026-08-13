@@ -495,9 +495,7 @@ impl H264Encoder {
         {
             let nv12 = native::frame_to_nv12(&frame, self.width, self.height)?;
             let next_frame_id = self.frame_id.wrapping_add(1).max(1);
-            let request_keyframe = force_keyframe
-                || next_frame_id == 1
-                || next_frame_id.is_multiple_of(u64::from(self.fps));
+            let request_keyframe = force_keyframe || next_frame_id == 1;
             let output = self
                 .backend
                 .encode(&nv12, frame.timestamp_us, request_keyframe)?;
