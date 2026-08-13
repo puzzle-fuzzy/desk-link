@@ -257,6 +257,18 @@ class WindowsReleaseReadyTests(unittest.TestCase):
         with patch.object(self.ready.subprocess, "run", return_value=lightweight):
             self.assertFalse(self.ready.git_tag_exists(Path("."), "v0.1.42"))
 
+    def test_release_tag_must_point_to_the_candidate_commit(self) -> None:
+        annotated = type("Completed", (), {"returncode": 0, "stdout": b"tag\n"})()
+        peeled = type("Completed", (), {"returncode": 0, "stdout": (b"a" * 40) + b"\n"})()
+        with patch.object(self.ready.subprocess, "run", side_effect=[annotated, peeled]):
+            self.assertTrue(self.ready.git_tag_matches_commit(Path("."), "v0.1.42", "a" * 40))
+
+    def test_release_tag_rejects_a_tag_pointing_to_another_commit(self) -> None:
+        annotated = type("Completed", (), {"returncode": 0, "stdout": b"tag\n"})()
+        peeled = type("Completed", (), {"returncode": 0, "stdout": (b"b" * 40) + b"\n"})()
+        with patch.object(self.ready.subprocess, "run", side_effect=[annotated, peeled]):
+            self.assertFalse(self.ready.git_tag_matches_commit(Path("."), "v0.1.42", "a" * 40))
+
 
 if __name__ == "__main__":
     unittest.main()

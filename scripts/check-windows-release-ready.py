@@ -160,6 +160,25 @@ def git_tag_exists(root: Path, tag: str) -> bool | None:
     return output == "tag"
 
 
+def git_tag_matches_commit(root: Path, tag: str, expected_commit: str | None) -> bool | None:
+    """Require an annotated tag whose peeled commit is this candidate SHA."""
+
+    if expected_commit is None or COMMIT_PATTERN.fullmatch(expected_commit) is None:
+        return False
+    if git_tag_exists(root, tag) is not True:
+        return False
+    completed = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{}}"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        return False
+    output = completed.stdout.decode("utf-8", errors="replace").strip().lower()
+    return output == expected_commit
+
+
 def package_version(root: Path) -> str | None:
     path = root / "tools" / "windows-installer" / "Cargo.toml"
     try:
@@ -373,7 +392,7 @@ def evaluate_preflight(
         "release_tag",
         tag_exists is True,
         category="release",
-        detail=f"Annotated release tag v{version or '?'} must exist before publishing",
+        detail=f"Annotated release tag v{version or '?'} must exist and point to the candidate HEAD",
     )
 
     relay_probe_ok, relay_probe_detail = _fresh_report(
@@ -520,7 +539,11 @@ def main() -> int:
         verification=read_json(ROOT / "dist" / "windows" / "windows-release-verification.json"),
         manifest=manifest,
         installer_path=installer,
-        tag_exists=git_tag_exists(ROOT, f"v{version}" if version else "vunknown"),
+        tag_exists=git_tag_matches_commit(
+            ROOT,
+            f"v{version}" if version else "vunknown",
+            head,
+        ),
         relay_report=read_json(ROOT / "dist" / "windows" / "managed-relay-verification.json"),
         relay_host_report=read_json(ROOT / "dist" / "linux" / "managed-relay-host-audit.json"),
         diagnostics_report=read_json(ROOT / "dist" / "linux" / "managed-diagnostics-audit.json"),
