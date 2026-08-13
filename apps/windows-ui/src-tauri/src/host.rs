@@ -364,12 +364,15 @@ impl HostManager {
         let generation = self.next_lifecycle_generation();
         self.stop_current().await;
         self.set_pairing_active(false);
+        if !self.is_lifecycle_generation_current(generation) {
+            return Err("配对任务已取消。".to_owned());
+        }
         self.publish(&app, HostRuntimeSummary::pairing());
 
         let manager = self.clone();
         let observer_app = app.clone();
         let observer: Arc<dyn HostLifecycleObserver> = Arc::new(move |event| {
-            manager.publish_event(&observer_app, event);
+            manager.publish_event_if_current(&observer_app, generation, event);
         });
         let approval = Box::new(TauriLocalApproval::new(self.approval.clone(), app.clone()));
         let prepared =
@@ -381,19 +384,27 @@ impl HostManager {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(failure)) => {
                 let message = failure.pairing_message().to_owned();
-                self.publish(&app, failure.summary());
-                self.start_normal_worker(app);
+                if self.is_lifecycle_generation_current(generation) {
+                    self.publish(&app, failure.summary());
+                    self.start_normal_worker(app);
+                }
                 return Err(message);
             }
             Err(message) => {
-                self.publish(
-                    &app,
-                    HostRuntimeSummary::unavailable("DeskLink 无法启动受保护的配对会话。"),
-                );
-                self.start_normal_worker(app);
+                if self.is_lifecycle_generation_current(generation) {
+                    self.publish(
+                        &app,
+                        HostRuntimeSummary::unavailable("DeskLink 无法启动受保护的配对会话。"),
+                    );
+                    self.start_normal_worker(app);
+                }
                 return Err(message);
             }
         };
+
+        if !self.is_lifecycle_generation_current(generation) {
+            return Err("配对任务已取消。".to_owned());
+        }
 
         let PreparedPairing {
             supervisor,
@@ -416,8 +427,11 @@ impl HostManager {
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let manager = self.clone();
         let worker_app = app.clone();
+        let generation = self.current_lifecycle_generation();
         let task = tauri::async_runtime::spawn(async move {
-            manager.run_worker(worker_app, shutdown_receiver).await;
+            manager
+                .run_worker(worker_app, shutdown_receiver, generation)
+                .await;
         });
         if let Ok(mut worker) = self.worker.lock() {
             *worker = Some(HostWorker { shutdown, task });
@@ -482,6 +496,14 @@ impl HostManager {
         self.lifecycle_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    fn current_lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation.load(Ordering::Acquire)
+    }
+
+    fn is_lifecycle_generation_current(&self, generation: u64) -> bool {
+        self.current_lifecycle_generation() == generation
+    }
+
     async fn start_normal_worker_after_pairing(&self, app: AppHandle, generation: u64) {
         let _restart = self.restart_lock.lock().await;
         if self.lifecycle_generation.load(Ordering::Acquire) != generation {
@@ -516,24 +538,25 @@ impl HostManager {
         }
     }
 
-    async fn run_worker(&self, app: AppHandle, shutdown: oneshot::Receiver<()>) {
+    async fn run_worker(&self, app: AppHandle, shutdown: oneshot::Receiver<()>, generation: u64) {
         let manager = self.clone();
         let observer_app = app.clone();
         let observer: Arc<dyn HostLifecycleObserver> = Arc::new(move |event| {
-            manager.publish_event(&observer_app, event);
+            manager.publish_event_if_current(&observer_app, generation, event);
         });
         let approval = Box::new(TauriLocalApproval::new(self.approval.clone(), app.clone()));
         let prepared =
             tauri::async_runtime::spawn_blocking(move || prepare_host(observer, approval)).await;
 
         match prepared {
-            Err(_) => self.publish(
+            Err(_) => self.publish_if_current(
                 &app,
+                generation,
                 HostRuntimeSummary::unavailable("DeskLink 无法启动本地主机任务，请重新启动应用。"),
             ),
-            Ok(Err(failure)) => self.publish(&app, failure.summary()),
+            Ok(Err(failure)) => self.publish_if_current(&app, generation, failure.summary()),
             Ok(Ok(PreparedHost::Unconfigured { diagnostics })) => {
-                self.publish(&app, HostRuntimeSummary::not_configured());
+                self.publish_if_current(&app, generation, HostRuntimeSummary::not_configured());
                 let _ = shutdown.await;
                 record_diagnostic(&diagnostics, &DiagnosticEvent::ApplicationStopped);
             }
@@ -544,9 +567,14 @@ impl HostManager {
                 tokio::select! {
                     result = (*supervisor).run() => {
                         match result {
-                            Ok(()) => self.publish(&app, HostRuntimeSummary::stopped_normally()),
-                            Err(error) => self.publish_event(
+                            Ok(()) => self.publish_if_current(
                                 &app,
+                                generation,
+                                HostRuntimeSummary::stopped_normally(),
+                            ),
+                            Err(error) => self.publish_event_if_current(
+                                &app,
+                                generation,
                                 HostLifecycleEvent::Stopped {
                                     reason: error.to_string(),
                                 },
@@ -560,8 +588,19 @@ impl HostManager {
         }
     }
 
-    fn publish_event(&self, app: &AppHandle, event: HostLifecycleEvent) {
-        self.publish(app, HostRuntimeSummary::from_event(&event));
+    fn publish_event_if_current(
+        &self,
+        app: &AppHandle,
+        generation: u64,
+        event: HostLifecycleEvent,
+    ) {
+        self.publish_if_current(app, generation, HostRuntimeSummary::from_event(&event));
+    }
+
+    fn publish_if_current(&self, app: &AppHandle, generation: u64, summary: HostRuntimeSummary) {
+        if self.is_lifecycle_generation_current(generation) {
+            self.publish(app, summary);
+        }
     }
 
     fn publish(&self, app: &AppHandle, summary: HostRuntimeSummary) {
@@ -945,21 +984,12 @@ mod tests {
         let manager = HostManager::default();
         let pairing_generation = manager.next_lifecycle_generation();
 
-        assert_eq!(
-            manager
-                .lifecycle_generation
-                .load(std::sync::atomic::Ordering::Acquire),
-            pairing_generation
-        );
+        assert!(manager.is_lifecycle_generation_current(pairing_generation));
 
         let restart_generation = manager.next_lifecycle_generation();
         assert_ne!(pairing_generation, restart_generation);
-        assert_ne!(
-            manager
-                .lifecycle_generation
-                .load(std::sync::atomic::Ordering::Acquire),
-            pairing_generation
-        );
+        assert!(!manager.is_lifecycle_generation_current(pairing_generation));
+        assert!(manager.is_lifecycle_generation_current(restart_generation));
     }
 
     #[tokio::test]
