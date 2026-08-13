@@ -123,6 +123,27 @@ def validate_source_commit(value: str) -> str:
     return value
 
 
+def source_commit_from_labels(value: str) -> str:
+    """Read the revision from Docker's JSON label output.
+
+    Docker's ``index`` template needs nested quotes inside a command that is
+    parsed by both SSH and the remote shell.  Asking Docker for the complete
+    labels object keeps that command quote-free and lets this process validate
+    the value without depending on shell-specific escaping.
+    """
+
+    try:
+        labels = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError("relay image labels are not valid JSON") from error
+    if not isinstance(labels, dict):
+        raise ValueError("relay image labels are not an object")
+    revision = labels.get("org.opencontainers.image.revision")
+    if not isinstance(revision, str):
+        raise ValueError("relay image source revision label is missing")
+    return validate_source_commit(revision)
+
+
 def main() -> int:
     arguments = parse_args()
     if not arguments.target:
@@ -152,10 +173,10 @@ def main() -> int:
         arguments,
         f'docker inspect {arguments.container} --format "{{{{.Config.Image}}}}"',
     )
-    source_commit = validate_source_commit(
+    source_commit = source_commit_from_labels(
         remote(
             arguments,
-            f'docker inspect {arguments.container} --format "{{{{index .Config.Labels \\\"org.opencontainers.image.revision\\\"}}}}"',
+            f'docker inspect {arguments.container} --format "{{{{json .Config.Labels}}}}"',
         )
     )
     certificate_days = parse_certificate_expiry(

@@ -79,6 +79,19 @@ class ManagedRelayAuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.audit.validate_source_commit("a" * 39)
 
+    def test_reads_relay_source_revision_from_json_labels(self) -> None:
+        revision = "b" * 40
+        self.assertEqual(
+            self.audit.source_commit_from_labels(
+                '{"org.opencontainers.image.revision":"%s"}' % revision
+            ),
+            revision,
+        )
+        with self.assertRaisesRegex(ValueError, "labels are not valid JSON"):
+            self.audit.source_commit_from_labels("not-json")
+        with self.assertRaisesRegex(ValueError, "label is missing"):
+            self.audit.source_commit_from_labels("{}")
+
 
 class ManagedRelayDeployTests(unittest.TestCase):
     @classmethod
