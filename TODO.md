@@ -139,7 +139,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 ### 最近一次自动门禁（2026-08-13）
 
 - [x] 当前候选提交已通过前端 173 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 50 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
-- [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复和 10 秒加密媒体 soak；报告已纳入 release readiness 并绑定当前提交。
+- [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复和 300 秒加密媒体 soak；报告已纳入 release readiness 并绑定当前提交。
 
 - [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
@@ -165,7 +165,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 ## 当前已知事实
 
 - 中继实况探测已通过：`101.35.246.159:4433`。
-- 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
+- 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断当前发布为 `8d92cdaee6d3`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
 - 当前候选物料以本地 `dist/windows/windows-installer-manifest.json`、`windows-release-verification.json` 和 `windows-release-readiness.json` 为准；安装器仍未签名，正式验收时必须读取同批清单中的 source commit 与 SHA-256，不使用旧文档中的动态值。
 - 当前候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，尚未形成正式发布 tag。
 - 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具、近期画质窗口和一键恢复动作；尚无本地 `v*` 发布 tag。
