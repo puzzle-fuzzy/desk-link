@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use apps_windows::{
     account::{AccountSession, WindowsAccountSessionStore},
@@ -53,6 +54,8 @@ struct ErrorResponse {
     message: Option<String>,
 }
 
+const ACCOUNT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+
 #[derive(Clone)]
 pub struct AccountManager {
     store: WindowsAccountSessionStore,
@@ -64,9 +67,13 @@ impl AccountManager {
     pub fn for_current_user() -> Result<Self, String> {
         let store =
             WindowsAccountSessionStore::for_current_user().map_err(|error| error.to_string())?;
+        let client = Client::builder()
+            .timeout(ACCOUNT_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| "账号请求客户端创建失败。".to_owned())?;
         Ok(Self {
             store,
-            client: Client::new(),
+            client,
             base_url: account_base_url(),
         })
     }
