@@ -205,6 +205,34 @@ class WindowsReleasePublishTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.publish.publish(payload, repository="owner/repo;rm", tag="v0.1.42")
 
+    def test_publish_reverifies_authenticode_before_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "DeskLinkSetup-0.1.42-x64.exe"
+            installer.write_bytes(b"signed desklink installer")
+            manifest = root / "windows-installer-manifest.json"
+            verification = root / "windows-release-verification.json"
+            readiness = root / "windows-release-readiness.json"
+            for path in (manifest, verification, readiness):
+                path.write_text("{}", encoding="utf-8")
+            payload = self.publish.ReleasePayload(
+                version="0.1.42",
+                source_commit="a" * 40,
+                installer=installer,
+                manifest=manifest,
+                verification=verification,
+                readiness=readiness,
+                sha256="a" * 64,
+            )
+            with patch.object(self.publish.subprocess, "run") as run:
+                self.publish.publish(payload, repository="owner/repo", tag="v0.1.42")
+
+            self.assertEqual(run.call_count, 2)
+            verify_command = run.call_args_list[0].args[0]
+            release_command = run.call_args_list[1].args[0]
+            self.assertEqual(verify_command[-1], "--verify-only")
+            self.assertEqual(release_command[:3], ["gh", "release", "create"])
+
 
 if __name__ == "__main__":
     unittest.main()

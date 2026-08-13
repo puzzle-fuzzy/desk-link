@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,9 +139,29 @@ def release_notes(payload: ReleasePayload) -> str:
     )
 
 
+def verify_authenticode(payload: ReleasePayload) -> None:
+    """Re-verify the exact installer immediately before publishing it.
+
+    The installer manifest is source-bound and hash-checked, but ``signed`` is
+    still metadata.  A final SignTool verification keeps the publish boundary
+    fail-closed if an artifact or manifest was replaced between build and
+    release.
+    """
+
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "sign-windows-artifact.py"),
+        str(payload.installer),
+        "--verify-only",
+    ]
+    print("+", subprocess.list2cmdline(command), flush=True)
+    subprocess.run(command, cwd=ROOT, check=True)
+
+
 def publish(payload: ReleasePayload, *, repository: str, tag: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("GITHUB_REPOSITORY is invalid")
+    verify_authenticode(payload)
     with tempfile.TemporaryDirectory(prefix="desklink-release-") as directory:
         notes_path = Path(directory) / "release-notes.md"
         notes_path.write_text(release_notes(payload), encoding="utf-8")
