@@ -5,7 +5,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use blake2::{Blake2s256, Digest};
@@ -56,6 +56,7 @@ use crate::{
 };
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
+const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const CURSOR_INTERVAL: Duration = Duration::from_millis(16);
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1851,6 +1852,8 @@ fn capture_encode_loop(
     let mut video_profile = encoder.profile();
     let mut frame_pacer =
         VideoFramePacer::new(video_quality_settings_with_profile(video_quality, video_profile).fps);
+    let mut first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+    let mut captured_any_frame = false;
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -1941,8 +1944,23 @@ fn capture_encode_loop(
             .map_err(HostRuntimeError::Capture)?
         {
             CaptureOutcome::Frame(frame) => frame,
-            CaptureOutcome::Idle => continue,
+            CaptureOutcome::Idle => {
+                if initial_frame_deadline_expired(
+                    captured_any_frame,
+                    first_capture_deadline,
+                    Instant::now(),
+                ) {
+                    return Err(HostRuntimeError::Capture(CaptureError::Native(
+                        "desktop capture did not produce an initial frame within 10 seconds"
+                            .to_owned(),
+                    )));
+                }
+                continue;
+            }
             CaptureOutcome::Recovered => {
+                if !captured_any_frame {
+                    first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+                }
                 coordinate_space = display_topology()
                     .map(|topology| topology.virtual_desktop)
                     .unwrap_or(coordinate_space);
@@ -1967,6 +1985,7 @@ fn capture_encode_loop(
                 continue;
             }
         };
+        captured_any_frame = true;
         let request_keyframe = force_keyframe.swap(false, Ordering::AcqRel);
         if !frame_pacer.should_encode(frame.timestamp_us, request_keyframe) {
             continue;
@@ -2001,6 +2020,14 @@ fn capture_encode_loop(
         notify.notify_one();
     }
     Ok(())
+}
+
+fn initial_frame_deadline_expired(
+    captured_any_frame: bool,
+    deadline: Instant,
+    now: Instant,
+) -> bool {
+    !captured_any_frame && now >= deadline
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3097,6 +3124,8 @@ fn now_unix_s() -> u64 {
 
 #[cfg(test)]
 mod retry_policy_tests {
+    use std::time::Instant;
+
     use crate::{capture::CaptureError, encoder::EncoderError};
 
     use desklink_protocol::AccessDenialReason;
@@ -3105,7 +3134,8 @@ mod retry_policy_tests {
     use super::{
         AdaptiveVideoQuality, HostRuntimeError, VideoFramePacer, encoder_error_is_recoverable,
         host_error_is_retryable, host_error_is_retryable_for_session,
-        host_error_rearms_on_connected_relay, host_runtime_denial_reason, video_quality_settings,
+        host_error_rearms_on_connected_relay, host_runtime_denial_reason,
+        initial_frame_deadline_expired, video_quality_settings,
     };
     use desklink_protocol::{VideoQualityPreference, VideoQualityPreset};
 
@@ -3184,6 +3214,23 @@ mod retry_policy_tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn initial_capture_watchdog_only_fires_before_the_first_frame() {
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_secs(10);
+        assert!(!initial_frame_deadline_expired(false, deadline, start));
+        assert!(initial_frame_deadline_expired(
+            false,
+            deadline,
+            deadline + std::time::Duration::from_millis(1)
+        ));
+        assert!(!initial_frame_deadline_expired(
+            true,
+            deadline + std::time::Duration::from_millis(1),
+            deadline + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[test]
