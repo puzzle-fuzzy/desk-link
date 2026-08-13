@@ -251,7 +251,7 @@ def _managed_relay_report_status(
         report,
         now=now,
         max_age_seconds=24 * 60 * 60,
-        label="Managed relay verification",
+        label="Managed relay host audit",
     )
     if not fresh:
         return False, detail

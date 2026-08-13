@@ -73,6 +73,12 @@ class ManagedRelayAuditTests(unittest.TestCase):
             48,
         )
 
+    def test_validates_relay_source_revision(self) -> None:
+        revision = "a" * 40
+        self.assertEqual(self.audit.validate_source_commit(revision), revision)
+        with self.assertRaises(ValueError):
+            self.audit.validate_source_commit("a" * 39)
+
 
 class ManagedRelayDeployTests(unittest.TestCase):
     @classmethod
