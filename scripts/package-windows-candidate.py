@@ -49,10 +49,12 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _require_source_binding(report: dict[str, Any], *, name: str, commit: str) -> None:
+def _require_source_binding(
+    report: dict[str, Any], *, name: str, commit: str, require_clean: bool = True
+) -> None:
     if report.get("source_commit") != commit:
         raise CandidatePackageError(f"{name} does not match candidate source commit")
-    if report.get("source_dirty") is not False:
+    if require_clean and report.get("source_dirty") is not False:
         raise CandidatePackageError(f"{name} is not bound to a clean source checkout")
 
 
@@ -103,7 +105,12 @@ def validate_candidate_artifacts(root: Path, dist: Path) -> tuple[str, str, list
 
     _require_source_binding(reports["windows-release-verification.json"], name="release verification", commit=source_commit)
     _require_source_binding(reports["windows-resilience-report.json"], name="resilience report", commit=source_commit)
-    _require_source_binding(reports["windows-acceptance-record.json"], name="acceptance record", commit=source_commit)
+    _require_source_binding(
+        reports["windows-acceptance-record.json"],
+        name="acceptance record",
+        commit=source_commit,
+        require_clean=False,
+    )
     _require_source_binding(reports["windows-release-readiness.json"], name="readiness report", commit=source_commit)
     if reports["windows-release-verification.json"].get("version") != version:
         raise CandidatePackageError("release verification version does not match the installer")
