@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     fs::File,
+    future::Future,
     io::Read,
     path::PathBuf,
     sync::{
@@ -69,6 +70,8 @@ const DIRECTORY_RECOVERY_DELAYS: [Duration; 2] =
     [Duration::from_millis(500), Duration::from_millis(1_250)];
 const DIRECTORY_TRANSPORT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(350), Duration::from_millis(900)];
+const DIRECTORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AUDIO_FRAME_DURATION_US: u64 = 10_000;
 const MAX_FILE_QUEUE_ITEMS: usize = MAX_FILE_QUEUE_RECOVERY_ITEMS;
 const TRANSFER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -380,6 +383,12 @@ impl Drop for ControllerDeviceInput {
 enum DeviceCredentialSource {
     Entered,
     Saved { persistent: bool },
+}
+
+enum CurrentTransportWait<T> {
+    Completed(Result<T, TransportError>),
+    Cancelled,
+    TimedOut,
 }
 
 impl DeviceCredentialSource {
@@ -1356,7 +1365,23 @@ impl ControllerManager {
             let mut transport_retry = 0;
             let mut invitation = loop {
                 self.ensure_current(generation)?;
-                let client = match QuicClient::connect(config.clone()).await {
+                let client_result = match self
+                    .wait_for_current_transport(
+                        generation,
+                        QuicClient::connect(config.clone()),
+                        DIRECTORY_OPERATION_TIMEOUT,
+                    )
+                    .await
+                {
+                    CurrentTransportWait::Completed(result) => result,
+                    CurrentTransportWait::Cancelled => {
+                        return Err("连接已取消。".to_owned());
+                    }
+                    CurrentTransportWait::TimedOut => {
+                        Err(TransportError::Connection("中继连接超时".to_owned()))
+                    }
+                };
+                let client = match client_result {
                     Ok(client) => client,
                     Err(error)
                         if directory_transport_error_is_retryable(&error)
@@ -1377,7 +1402,22 @@ impl ControllerManager {
                     }
                     Err(error) => return Err(directory_transport_error_message(&error).to_owned()),
                 };
-                let result = client.lookup_directory(lookup.clone()).await;
+                let result = match self
+                    .wait_for_current_transport(
+                        generation,
+                        client.lookup_directory(lookup.clone()),
+                        DIRECTORY_OPERATION_TIMEOUT,
+                    )
+                    .await
+                {
+                    CurrentTransportWait::Completed(result) => result,
+                    CurrentTransportWait::Cancelled => {
+                        return Err("连接已取消。".to_owned());
+                    }
+                    CurrentTransportWait::TimedOut => {
+                        Err(TransportError::Connection("设备查询超时".to_owned()))
+                    }
+                };
                 drop(client);
                 match result {
                     Ok(invitation) => break invitation,
@@ -2051,6 +2091,36 @@ impl ControllerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.is_current(generation) {
             self.publish(signals, status);
+        }
+    }
+
+    async fn wait_for_current_transport<T, F>(
+        &self,
+        generation: u64,
+        future: F,
+        timeout: Duration,
+    ) -> CurrentTransportWait<T>
+    where
+        F: Future<Output = Result<T, TransportError>>,
+    {
+        tokio::pin!(future);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                result = &mut future => {
+                    if self.is_current(generation) {
+                        return CurrentTransportWait::Completed(result);
+                    }
+                    return CurrentTransportWait::Cancelled;
+                }
+                _ = &mut deadline => return CurrentTransportWait::TimedOut,
+                _ = tokio::time::sleep(OPERATION_POLL_INTERVAL) => {
+                    if !self.is_current(generation) {
+                        return CurrentTransportWait::Cancelled;
+                    }
+                }
+            }
         }
     }
 }
@@ -4588,13 +4658,14 @@ mod tests {
         COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
         ControllerCommand, ControllerInput, ControllerManager, ControllerPlaybackPressure,
         ControllerRenderMetrics, ControllerRuntimeSummary, ControllerVideoPullInput,
-        H264ProfileProbe, LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
-        PendingRemoteFileRequest, PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
-        directory_transport_error_is_retryable, directory_transport_error_message,
-        file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
-        revalidate_queued_file, session_earned_fresh_retry_budget,
-        should_drop_buffered_pointer_move, transfer_result_message, transfer_result_state,
-        validate_text_input, wait_for_file_queue_command, wait_for_retry_deadline,
+        CurrentTransportWait, H264ProfileProbe, LastFileAction, MAX_BUFFERED_POINTER_MOVES,
+        PendingClipboardOperation, PendingRemoteFileRequest, PlaybackPressureSample,
+        RetryWaitOutcome, deadline_expired, directory_transport_error_is_retryable,
+        directory_transport_error_message, file_offer_matches_request, parse_input,
+        parse_transfer_id, remote_paste_shortcut_events, revalidate_queued_file,
+        session_earned_fresh_retry_budget, should_drop_buffered_pointer_move,
+        transfer_result_message, transfer_result_state, validate_text_input,
+        wait_for_file_queue_command, wait_for_retry_deadline,
     };
     use apps_windows::{
         audio::RemoteAudioEncoder, transfer::OutgoingFile,
@@ -5372,6 +5443,43 @@ mod tests {
         let retry = manager.begin_operation();
         assert!(retry > first);
         assert!(manager.ensure_current(retry).is_ok());
+    }
+
+    #[tokio::test]
+    async fn directory_transport_wait_can_be_cancelled_before_worker_registration() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let canceller = manager.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            canceller.cancel_operations();
+        });
+
+        let result = manager
+            .wait_for_current_transport(
+                generation,
+                std::future::pending::<Result<(), TransportError>>(),
+                Duration::from_secs(1),
+            )
+            .await;
+        task.await.unwrap();
+
+        assert!(matches!(result, CurrentTransportWait::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn directory_transport_wait_has_a_bounded_timeout() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let result = manager
+            .wait_for_current_transport(
+                generation,
+                std::future::pending::<Result<(), TransportError>>(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+        assert!(matches!(result, CurrentTransportWait::TimedOut));
     }
 
     #[tokio::test]
