@@ -31,6 +31,7 @@ class WindowsReleaseEvidenceImportTests(unittest.TestCase):
     def test_imports_all_evidence_files_from_an_immutable_ref(self) -> None:
         values = {
             "windows-acceptance-record.json": {"checks": {"two_windows_acceptance": False}},
+            "windows-resilience-report.json": {"passed": True, "source_dirty": False},
             "managed-relay-verification.json": {"passed": True},
             "managed-diagnostics-audit.json": {"passed": True},
         }
@@ -48,12 +49,18 @@ class WindowsReleaseEvidenceImportTests(unittest.TestCase):
                     output_root=output_root,
                 )
 
-            self.assertEqual(len(imported), 3)
+            self.assertEqual(len(imported), 4)
             self.assertEqual(
                 json.loads(
                     (output_root / "windows" / "windows-acceptance-record.json").read_text()
                 ),
                 values["windows-acceptance-record.json"],
+            )
+            self.assertEqual(
+                json.loads(
+                    (output_root / "windows" / "windows-resilience-report.json").read_text()
+                ),
+                values["windows-resilience-report.json"],
             )
             self.assertEqual(
                 json.loads(

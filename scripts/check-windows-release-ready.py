@@ -212,6 +212,32 @@ def _fresh_report(
     return True, f"{label} report passed and is fresh"
 
 
+def _resilience_report_status(
+    report: dict[str, Any] | None,
+    *,
+    now: int,
+    expected_commit: str | None,
+) -> tuple[bool, str]:
+    fresh, detail = _fresh_report(
+        report,
+        now=now,
+        max_age_seconds=24 * 60 * 60,
+        label="Windows resilience verification",
+    )
+    if not fresh:
+        return False, detail
+    if report.get("schema") != 1 or report.get("platform") != "win32":
+        return False, "Windows resilience report has an unsupported schema or platform"
+    if report.get("source_commit") != expected_commit:
+        return False, "Windows resilience report does not match the candidate source commit"
+    if report.get("source_dirty") is not False:
+        return False, "Windows resilience report was generated from a dirty checkout"
+    soak_seconds = report.get("soak_seconds")
+    if not isinstance(soak_seconds, int) or isinstance(soak_seconds, bool) or soak_seconds < 10:
+        return False, "Windows resilience report does not contain the minimum 10-second soak"
+    return True, detail
+
+
 def evaluate_preflight(
     *,
     version: str | None,
@@ -223,6 +249,7 @@ def evaluate_preflight(
     tag_exists: bool | None,
     relay_report: dict[str, Any] | None,
     diagnostics_report: dict[str, Any] | None,
+    resilience_report: dict[str, Any] | None,
     now: int | None = None,
     manual_checks: dict[str, bool] | None = None,
     manual_record: dict[str, str] | None = None,
@@ -351,6 +378,20 @@ def evaluate_preflight(
         detail=diagnostics_detail,
         severity="P1",
     )
+    resilience_ok, resilience_detail = _resilience_report_status(
+        resilience_report,
+        now=now,
+        expected_commit=head,
+    )
+    _check(
+        checks,
+        blockers,
+        "windows_resilience_evidence",
+        resilience_ok,
+        category="operations",
+        detail=resilience_detail,
+        severity="P1",
+    )
 
     warnings = [
         {
@@ -452,6 +493,7 @@ def main() -> int:
         tag_exists=git_tag_exists(ROOT, f"v{version}" if version else "vunknown"),
         relay_report=read_json(ROOT / "dist" / "windows" / "managed-relay-verification.json"),
         diagnostics_report=read_json(ROOT / "dist" / "linux" / "managed-diagnostics-audit.json"),
+        resilience_report=read_json(ROOT / "dist" / "windows" / "windows-resilience-report.json"),
         manual_checks=manual_checks,
         manual_record=manual_record,
     )

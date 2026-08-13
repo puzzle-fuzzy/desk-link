@@ -58,6 +58,15 @@ class WindowsReleaseReadyTests(unittest.TestCase):
         }
         relay = {"passed": True, "completed_at_unix_s": now}
         diagnostics = {"passed": True, "completed_at_unix_s": now}
+        resilience = {
+            "schema": 1,
+            "platform": "win32",
+            "source_commit": commit,
+            "source_dirty": False,
+            "soak_seconds": 10,
+            "passed": True,
+            "completed_at_unix_s": now,
+        }
         return {
             "version": "0.1.42",
             "head": commit,
@@ -68,6 +77,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             "tag_exists": True,
             "relay_report": relay,
             "diagnostics_report": diagnostics,
+            "resilience_report": resilience,
             "now": now,
             "manual_checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
         }
@@ -100,6 +110,15 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             fixture["manifest"] = manifest
             report = self.ready.evaluate_preflight(**fixture)
         self.assertIn("installer_integrity", {item["id"] for item in report["blockers"]})
+
+    def test_resilience_evidence_must_match_the_candidate_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.create_fixture(Path(directory))
+            resilience = dict(fixture["resilience_report"])
+            resilience["source_commit"] = "b" * 40
+            fixture["resilience_report"] = resilience
+            report = self.ready.evaluate_preflight(**fixture)
+        self.assertIn("windows_resilience_evidence", {item["id"] for item in report["blockers"]})
 
     def test_manual_acceptance_record_is_bound_to_candidate_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

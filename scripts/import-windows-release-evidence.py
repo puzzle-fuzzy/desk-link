@@ -16,6 +16,7 @@ VERSION_PATTERN = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 EVIDENCE_FILES = {
     "windows-acceptance-record.json": Path("windows") / "windows-acceptance-record.json",
+    "windows-resilience-report.json": Path("windows") / "windows-resilience-report.json",
     "managed-relay-verification.json": Path("windows") / "managed-relay-verification.json",
     "managed-diagnostics-audit.json": Path("linux") / "managed-diagnostics-audit.json",
 }

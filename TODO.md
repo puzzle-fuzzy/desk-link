@@ -16,6 +16,7 @@
 - [x] 将账号服务降为可选能力；未登录时主机仍启动，Windows 本机模式可直接使用，账号流程保留在“更多”菜单。
 - [x] 更新版本号、变更日志和发布说明，形成当前候选基线（正式 tag 仍等待签名与人工验收）。
 - [x] 在干净工作区上通过 Rust、Bun、安装包和发布校验（2026-08-13；本地候选门禁通过，Windows CI 历史基线 runs `30571054699` 与 `30572591597`）。
+- [x] 将原生 Windows resilience 报告绑定源码 SHA 并纳入 readiness；捕获、编码、主机恢复、电源恢复和媒体 soak 证据不可再脱离候选物料。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
 
 ## 1. 云端诊断可用性（P1）
@@ -102,6 +103,7 @@ bun run build
 cd ../..
 python scripts/verify-windows-release.py
 python scripts/build-windows-installer.py
+python scripts/verify-windows-resilience.py --soak-seconds 10
 python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
 python -m unittest discover -s scripts/tests -p "test_*.py"
@@ -110,6 +112,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 ### 最近一次自动门禁（2026-08-13）
 
 - [x] 当前候选提交已通过前端 164 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 脚本测试、Windows release verification 和安装包构建；连接快照竞态回归测试已纳入门禁。
+- [x] 原生 Windows resilience 门禁通过：GDI/显示器捕获、H.264 编码、主机异常恢复、电源恢复和 10 秒加密媒体 soak；报告已纳入 release readiness 并绑定当前提交。
 
 - [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。

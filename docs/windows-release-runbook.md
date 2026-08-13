@@ -34,6 +34,7 @@ cd ../..
 
 python scripts/verify-windows-release.py
 python scripts/build-windows-installer.py
+python scripts/verify-windows-resilience.py --soak-seconds 10
 python scripts/verify-managed-relay.py
 python scripts/audit-managed-diagnostics.py
 python -m unittest discover -s scripts/tests -p "test_*.py"
@@ -47,6 +48,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 - 正式发布前 `signed` 必须为 `true`；`signed: false` 只能用于本地候选包。
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
+- `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复和至少 10 秒加密媒体 soak。
 
 ## 2.1 发布预检
 
@@ -56,7 +58,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 python scripts/check-windows-release-ready.py
 ```
 
-报告默认写入 `dist/windows/windows-release-readiness.json`。它会把版本、当前提交 SHA、工作区洁净度、验证报告、安装包哈希、Windows-only 发布范围、签名、发布 tag 以及中继/诊断报告新鲜度放在一起检查；同时明确列出必须由发布负责人在两台真实 Windows 电脑上完成的验收项。当前命令默认只生成报告并返回 0，不会把未完成的手工验收伪装成通过。
+报告默认写入 `dist/windows/windows-release-readiness.json`。它会把版本、当前提交 SHA、工作区洁净度、验证报告、安装包哈希、Windows-only 发布范围、签名、发布 tag、原生 Windows resilience 证据以及中继/诊断报告新鲜度放在一起检查；同时明确列出必须由发布负责人在两台真实 Windows 电脑上完成的验收项。当前命令默认只生成报告并返回 0，不会把未完成的手工验收伪装成通过。
 
 用于 CI 或发布脚本时可启用严格模式：
 
@@ -127,6 +129,7 @@ GitHub Actions 使用 `Windows Signed Candidate` 工作流。该工作流只生�
 
 ```text
 release-evidence/v0.1.91/windows-acceptance-record.json
+release-evidence/v0.1.91/windows-resilience-report.json
 release-evidence/v0.1.91/managed-relay-verification.json
 release-evidence/v0.1.91/managed-diagnostics-audit.json
 ```

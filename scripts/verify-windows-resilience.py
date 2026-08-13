@@ -7,6 +7,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,6 +16,38 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT = ROOT / "dist" / "windows" / "windows-resilience-report.json"
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+
+def git_head(root: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    value = completed.stdout.strip().lower()
+    if completed.returncode != 0 or COMMIT_PATTERN.fullmatch(value) is None:
+        raise SystemExit("Could not read the current Git commit SHA")
+    return value
+
+
+def git_dirty(root: Path) -> bool:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise SystemExit("Could not determine whether the Git checkout is clean")
+    return bool(completed.stdout.strip())
 
 
 def display_topology() -> dict[str, object]:
@@ -92,9 +125,13 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     environment = os.environ.copy()
     environment["DESKLINK_SOAK_SECONDS"] = str(args.soak_seconds)
+    source_commit = git_head(ROOT)
+    source_dirty = git_dirty(ROOT)
     report: dict[str, object] = {
         "schema": 1,
         "platform": sys.platform,
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
         "soak_seconds": args.soak_seconds,
         "display_topology": display_topology(),
         "checks": [],

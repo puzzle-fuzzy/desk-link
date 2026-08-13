@@ -39,6 +39,9 @@ jobs:
       - name: Build, sign, and verify installer
         run: python scripts/build-windows-installer.py --require-signing
 
+      - name: Run native Windows resilience checks
+        run: python scripts/verify-windows-resilience.py --soak-seconds 10
+
       - name: Generate Windows release readiness evidence
         if: always()
         run: python scripts/check-windows-release-ready.py --report dist/windows/windows-release-readiness.json
@@ -51,6 +54,7 @@ jobs:
             dist/windows/DeskLinkSetup-*-x64.exe
             dist/windows/windows-installer-manifest.json
             dist/windows/windows-release-verification.json
+            dist/windows/windows-resilience-report.json
             dist/windows/windows-release-readiness.json
           if-no-files-found: error
           retention-days: 30
