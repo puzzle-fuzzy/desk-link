@@ -30,6 +30,8 @@ use crate::host::{
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // Nonterminal events may be dropped when this reserve would be consumed. That keeps the
 // bounded event path nonblocking while guaranteeing room for ReleaseAll, Error, and Closed.
 const TERMINAL_EVENT_RESERVE: usize = 3;
@@ -187,7 +189,7 @@ impl HostWorker {
                     .build();
                 match runtime {
                     Ok(runtime) => runtime.block_on(async move {
-                        match QuicClient::connect(initial_config).await {
+                        match connect_relay(initial_config).await {
                             Ok(client) => {
                                 run_worker(
                                     client,
@@ -575,18 +577,28 @@ async fn connect_and_join(
     relay_authentication: [u8; 32],
     host_participant_id: [u8; 16],
 ) -> Result<QuicClient, HostError> {
-    let client = QuicClient::connect(config.clone())
+    let client = connect_relay(config.clone())
         .await
         .map_err(transport_error)?;
-    client
-        .join(RelayJoin::host_with_participant(
-            session_id,
-            relay_authentication,
-            host_participant_id,
-        ))
-        .await
-        .map_err(transport_error)?;
+    join_relay(
+        &client,
+        RelayJoin::host_with_participant(session_id, relay_authentication, host_participant_id),
+    )
+    .await
+    .map_err(transport_error)?;
     Ok(client)
+}
+
+async fn connect_relay(config: QuicClientConfig) -> Result<QuicClient, TransportError> {
+    tokio::time::timeout(RELAY_CONNECT_TIMEOUT, QuicClient::connect(config))
+        .await
+        .map_err(|_| TransportError::Connection("relay connection timed out".to_owned()))?
+}
+
+async fn join_relay(client: &QuicClient, join: RelayJoin) -> Result<(), TransportError> {
+    tokio::time::timeout(RELAY_REQUEST_TIMEOUT, client.join(join))
+        .await
+        .map_err(|_| TransportError::Connection("relay join timed out".to_owned()))?
 }
 
 /*

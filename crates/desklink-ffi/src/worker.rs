@@ -31,6 +31,8 @@ const RELEASE_RESERVE: usize = 1;
 const PHASE_CONNECTING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
 
@@ -692,15 +694,18 @@ async fn connect_controller(
         .map_err(ConnectFailure::from_transport)?;
     let (session_id, relay_authentication, host_verify_key, expires_at_unix_s) =
         if let Some(directory) = &config.directory {
-            let lookup_client = QuicClient::connect(transport_config.clone())
+            let lookup_client = connect_relay(transport_config.clone())
                 .await
                 .map_err(ConnectFailure::from_transport)?;
             let lookup = RelayDirectoryLookup::new(directory.device_id, directory.access_code)
                 .map_err(ConnectFailure::from_transport)?;
-            let mut invitation = lookup_client
-                .lookup_directory(lookup)
-                .await
-                .map_err(ConnectFailure::from_transport)?;
+            let mut invitation = tokio::time::timeout(
+                RELAY_REQUEST_TIMEOUT,
+                lookup_client.lookup_directory(lookup),
+            )
+            .await
+            .map_err(|_| ConnectFailure::retryable("relay directory lookup timed out".into()))?
+            .map_err(ConnectFailure::from_transport)?;
             let result = PairingInvite::decode(&invitation, now_unix_s())
                 .map(|invite| {
                     let session_id = *invite.session_id().as_bytes();
@@ -737,17 +742,19 @@ async fn connect_controller(
                 config.expires_at_unix_s,
             )
         };
-    let client = QuicClient::connect(transport_config)
+    let client = connect_relay(transport_config)
         .await
         .map_err(ConnectFailure::from_transport)?;
-    client
-        .join(RelayJoin::controller_with_participant(
+    join_relay(
+        &client,
+        RelayJoin::controller_with_participant(
             SessionId::from_bytes(session_id),
             relay_authentication,
             config.controller_device_id,
-        ))
-        .await
-        .map_err(ConnectFailure::from_transport)?;
+        ),
+    )
+    .await
+    .map_err(ConnectFailure::from_transport)?;
     callback.emit_state(DesklinkState::SecureHandshake, 0);
     let identity =
         DeviceIdentity::from_secret_key(config.controller_device_id, &config.controller_secret_key);
@@ -762,6 +769,18 @@ async fn connect_controller(
             expires_at_unix_s,
         })
         .map_err(ConnectFailure::from_controller)
+}
+
+async fn connect_relay(config: QuicClientConfig) -> Result<QuicClient, TransportError> {
+    tokio::time::timeout(RELAY_CONNECT_TIMEOUT, QuicClient::connect(config))
+        .await
+        .map_err(|_| TransportError::Connection("relay connection timed out".to_owned()))?
+}
+
+async fn join_relay(client: &QuicClient, join: RelayJoin) -> Result<(), TransportError> {
+    tokio::time::timeout(RELAY_REQUEST_TIMEOUT, client.join(join))
+        .await
+        .map_err(|_| TransportError::Connection("relay join timed out".to_owned()))?
 }
 
 struct ResolvedControllerConnection {
