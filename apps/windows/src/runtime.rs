@@ -66,6 +66,10 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FILE_TRANSFER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+// Only one host-side file sender can be active for a session. Keep its
+// completion notification bounded so a late task cannot retain an unbounded
+// backlog while the transfer loop is reconnecting or shutting down.
+const HOST_OUTGOING_EVENT_QUEUE_CAPACITY: usize = 1;
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
 const DEFAULT_VIDEO_QUALITY_PREFERENCE: VideoQualityPreference = VideoQualityPreference::Automatic;
@@ -2587,7 +2591,7 @@ async fn receive_transfer_loop_inner(
 ) -> Result<(), HostRuntimeError> {
     let mut outgoing: Option<HostOutgoingTransfer> = None;
     let (outgoing_events, mut pending_outgoing_events) =
-        mpsc::unbounded_channel::<HostOutgoingEvent>();
+        mpsc::channel::<HostOutgoingEvent>(HOST_OUTGOING_EVENT_QUEUE_CAPACITY);
     loop {
         let encrypted = tokio::select! {
             event = pending_outgoing_events.recv() => {
@@ -2822,10 +2826,12 @@ async fn receive_transfer_loop_inner(
                         cancellation,
                     )
                     .await;
-                    let _ = outgoing_events.send(HostOutgoingEvent {
-                        transfer_id,
-                        result,
-                    });
+                    let _ = outgoing_events
+                        .send(HostOutgoingEvent {
+                            transfer_id,
+                            result,
+                        })
+                        .await;
                 });
             }
             TransferMessage::FileChunk {
