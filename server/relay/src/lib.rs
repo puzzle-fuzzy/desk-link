@@ -21,6 +21,7 @@ use desklink_transport::{
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -82,6 +83,7 @@ pub enum RelayError {
 const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
 const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
+const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
 
 #[derive(Clone)]
 pub struct RelaySessionTable {
@@ -1046,14 +1048,30 @@ async fn handle_connection(
         state.remove_connection(session_id, connection_id);
         return;
     }
+    let reliable_forward_slots =
+        Arc::new(Semaphore::new(MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION));
 
     loop {
         tokio::select! {
             accepted = connection.accept_bi() => {
                 let Ok((_send, receive)) = accepted else { break; };
+                let Some(permit) = reliable_forward_slots.clone().try_acquire_owned().ok() else {
+                    log_session_event(
+                        "reliable_stream_rejected",
+                        connection_id,
+                        session_id,
+                        role,
+                        None,
+                        None,
+                        "per_connection_limit",
+                    );
+                    close_connection(&connection, b"reliable stream limit");
+                    break;
+                };
                 let state = state.clone();
                 let source = connection.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     forward_reliable(
                         state,
                         source,
