@@ -25,7 +25,10 @@ use zeroize::Zeroize;
 
 use crate::storage::local_app_data_path;
 
-const CONTROLLER_MAGIC: &[u8; 8] = b"DLCCV1\0\0";
+// The persisted schema includes whether the invitation represents a persistent
+// host directory session. Older stores are intentionally rejected and rebuilt
+// because this application has not shipped to users yet.
+const CONTROLLER_MAGIC: &[u8; 8] = b"DLCCV2\0\0";
 const MAX_CONTROLLER_BYTES: usize = 4_096;
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -43,6 +46,7 @@ pub struct ControllerConnectionSettings {
     authentication: [u8; 32],
     host_device_id: [u8; 16],
     host_verify_key: VerifyingKey,
+    persistent: bool,
 }
 
 impl ControllerConnectionSettings {
@@ -58,6 +62,7 @@ impl ControllerConnectionSettings {
             *invite.relay_authentication(),
             invite.host_device_id(),
             invite.host_verify_key(),
+            invite.is_persistent(),
         )
     }
 
@@ -68,6 +73,7 @@ impl ControllerConnectionSettings {
         authentication: [u8; 32],
         host_device_id: [u8; 16],
         host_verify_key: VerifyingKey,
+        persistent: bool,
     ) -> Result<Self, ControllerConnectionInputError> {
         let relay_address = relay_address
             .trim()
@@ -89,6 +95,7 @@ impl ControllerConnectionSettings {
             authentication,
             host_device_id,
             host_verify_key,
+            persistent,
         })
     }
 
@@ -119,6 +126,10 @@ impl ControllerConnectionSettings {
     pub const fn host_verify_key(&self) -> VerifyingKey {
         self.host_verify_key
     }
+
+    pub const fn is_persistent(&self) -> bool {
+        self.persistent
+    }
 }
 
 impl fmt::Debug for ControllerConnectionSettings {
@@ -131,6 +142,7 @@ impl fmt::Debug for ControllerConnectionSettings {
             .field("authentication", &"[redacted]")
             .field("host_device_id", &self.host_device_id)
             .field("host_verify_key", &self.host_verify_key)
+            .field("persistent", &self.persistent)
             .finish()
     }
 }
@@ -241,7 +253,7 @@ fn encode(
     let server_length =
         u16::try_from(server.len()).map_err(|_| WindowsControllerConnectionError::CorruptStore)?;
     let mut output = Vec::with_capacity(
-        CONTROLLER_MAGIC.len() + 4 + relay.len() + server.len() + 16 + 32 + 16 + 32,
+        CONTROLLER_MAGIC.len() + 4 + relay.len() + server.len() + 16 + 32 + 16 + 32 + 1,
     );
     output.extend_from_slice(CONTROLLER_MAGIC);
     output.extend_from_slice(&relay_length.to_be_bytes());
@@ -252,11 +264,12 @@ fn encode(
     output.extend_from_slice(&settings.authentication);
     output.extend_from_slice(&settings.host_device_id);
     output.extend_from_slice(settings.host_verify_key.as_bytes());
+    output.push(u8::from(settings.persistent));
     Ok(output)
 }
 
 fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControllerConnectionError> {
-    if bytes.len() < CONTROLLER_MAGIC.len() + 4 + 16 + 32 + 16 + 32
+    if bytes.len() < CONTROLLER_MAGIC.len() + 4 + 16 + 32 + 16 + 32 + 1
         || &bytes[..CONTROLLER_MAGIC.len()] != CONTROLLER_MAGIC
     {
         return Err(WindowsControllerConnectionError::CorruptStore);
@@ -268,7 +281,8 @@ fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControlle
     let authentication_end = session_end.saturating_add(32);
     let device_end = authentication_end.saturating_add(16);
     let key_end = device_end.saturating_add(32);
-    if key_end != bytes.len() {
+    let persistent_end = key_end.saturating_add(1);
+    if persistent_end != bytes.len() {
         return Err(WindowsControllerConnectionError::CorruptStore);
     }
     let session_id = SessionId::from_bytes(
@@ -288,6 +302,11 @@ fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControlle
             .map_err(|_| WindowsControllerConnectionError::CorruptStore)?,
     )
     .map_err(|_| WindowsControllerConnectionError::CorruptStore)?;
+    let persistent = match bytes[key_end] {
+        0 => false,
+        1 => true,
+        _ => return Err(WindowsControllerConnectionError::CorruptStore),
+    };
     ControllerConnectionSettings::from_parts(
         &relay,
         &server,
@@ -295,6 +314,7 @@ fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControlle
         authentication,
         host_device_id,
         host_verify_key,
+        persistent,
     )
     .map_err(|_| WindowsControllerConnectionError::CorruptStore)
 }
@@ -426,6 +446,17 @@ mod tests {
         assert_eq!(settings.authentication(), &authentication);
         assert_eq!(settings.host_device_id(), host.device_id);
         assert_eq!(settings.host_verify_key(), host.verify_key());
+        assert!(!settings.is_persistent());
+
+        let persistent_invite =
+            PairingInvite::for_persistent_connection(&host, session_id, authentication);
+        let persistent = ControllerConnectionSettings::from_invite(
+            "127.0.0.1:4433",
+            "localhost",
+            &persistent_invite,
+        )
+        .unwrap();
+        assert!(persistent.is_persistent());
     }
 
     #[test]
@@ -454,6 +485,7 @@ mod tests {
                 0x66, 0x66, 0x66, 0x66,
             ])
             .unwrap(),
+            true,
         )
         .unwrap();
         store.save(&settings).unwrap();
@@ -471,6 +503,7 @@ mod tests {
         assert_eq!(loaded.authentication(), settings.authentication());
         assert_eq!(loaded.host_device_id(), settings.host_device_id());
         assert_eq!(loaded.host_verify_key(), settings.host_verify_key());
+        assert_eq!(loaded.is_persistent(), settings.is_persistent());
         assert!(store.clear().unwrap());
         assert!(store.load().unwrap().is_none());
         let _ = fs::remove_dir_all(directory);

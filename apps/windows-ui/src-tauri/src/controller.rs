@@ -68,6 +68,14 @@ const RECENT_CANCELLATION_WINDOW: Duration = Duration::from_secs(15);
 const RECONNECT_BUDGET_RESET_AFTER: Duration = Duration::from_secs(30);
 const DIRECTORY_RECOVERY_DELAYS: [Duration; 2] =
     [Duration::from_millis(500), Duration::from_millis(1_250)];
+const DIRECTORY_PERSISTENT_RECOVERY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1_250),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(6),
+    Duration::from_secs(8),
+];
 const DIRECTORY_TRANSPORT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(350), Duration::from_millis(900)];
 const DIRECTORY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
@@ -259,6 +267,19 @@ impl ControllerRuntimeSummary {
         }
     }
 
+    fn finding_after_host_restart(retry: usize, delay: Duration) -> Self {
+        Self {
+            state: "finding",
+            title: "正在等待主机上线".to_owned(),
+            detail: format!(
+                "固定密码连接暂时找不到主机，DeskLink 将在 {} 毫秒后自动重试（{retry}/{}）。",
+                delay.as_millis(),
+                DIRECTORY_PERSISTENT_RECOVERY_DELAYS.len()
+            ),
+            stream_id: None,
+        }
+    }
+
     fn waiting_for_approval() -> Self {
         Self {
             state: "waitingApproval",
@@ -392,6 +413,20 @@ enum CurrentTransportWait<T> {
 }
 
 impl DeviceCredentialSource {
+    fn is_persistent(self) -> bool {
+        matches!(self, Self::Saved { persistent: true })
+    }
+
+    fn recovery_delays(self, recover_after_cancel: bool) -> &'static [Duration] {
+        if self.is_persistent() {
+            &DIRECTORY_PERSISTENT_RECOVERY_DELAYS
+        } else if recover_after_cancel {
+            &DIRECTORY_RECOVERY_DELAYS
+        } else {
+            &[]
+        }
+    }
+
     fn not_found_message(self, recover_after_cancel: bool) -> &'static str {
         match self {
             Self::Entered if recover_after_cancel => {
@@ -1422,19 +1457,24 @@ impl ControllerManager {
                 match result {
                     Ok(invitation) => break invitation,
                     Err(TransportError::DirectoryNotFound)
-                        if recover_after_cancel
-                            && availability_retry < DIRECTORY_RECOVERY_DELAYS.len() =>
+                        if availability_retry
+                            < source.recovery_delays(recover_after_cancel).len() =>
                     {
-                        let delay = DIRECTORY_RECOVERY_DELAYS[availability_retry];
+                        let delay =
+                            source.recovery_delays(recover_after_cancel)[availability_retry];
                         availability_retry += 1;
-                        self.publish_if_current(
-                            generation,
-                            &signals,
+                        let summary = if source.is_persistent() {
+                            ControllerRuntimeSummary::finding_after_host_restart(
+                                availability_retry,
+                                delay,
+                            )
+                        } else {
                             ControllerRuntimeSummary::finding_after_cancel(
                                 availability_retry,
                                 delay,
-                            ),
-                        );
+                            )
+                        };
+                        self.publish_if_current(generation, &signals, summary);
                         self.wait_for_current_retry_delay(generation, delay).await?;
                     }
                     Err(TransportError::DirectoryNotFound) => {
@@ -3957,7 +3997,7 @@ async fn connect_once(
     manager.publish_if_current(generation, signals, ControllerRuntimeSummary::connecting());
     let config =
         crate::local_relay::client_config(settings.relay_address(), settings.server_name())
-            .map_err(ConnectFailure::from_transport)?;
+            .map_err(|error| ConnectFailure::from_transport(error, settings.is_persistent()))?;
     let client = match manager
         .wait_for_current_transport(
             generation,
@@ -3966,9 +4006,8 @@ async fn connect_once(
         )
         .await
     {
-        CurrentTransportWait::Completed(result) => {
-            result.map_err(ConnectFailure::from_transport)?
-        }
+        CurrentTransportWait::Completed(result) => result
+            .map_err(|error| ConnectFailure::from_transport(error, settings.is_persistent()))?,
         CurrentTransportWait::Cancelled => {
             return Err(ConnectFailure::with_reason(
                 false,
@@ -3978,9 +4017,10 @@ async fn connect_once(
             ));
         }
         CurrentTransportWait::TimedOut => {
-            return Err(ConnectFailure::from_transport(TransportError::Connection(
-                "relay connection timed out".to_owned(),
-            )));
+            return Err(ConnectFailure::from_transport(
+                TransportError::Connection("relay connection timed out".to_owned()),
+                settings.is_persistent(),
+            ));
         }
     };
     record_controller_diagnostic(
@@ -4005,7 +4045,8 @@ async fn connect_once(
         .await
     {
         CurrentTransportWait::Completed(result) => {
-            result.map_err(ConnectFailure::from_transport)?;
+            result
+                .map_err(|error| ConnectFailure::from_transport(error, settings.is_persistent()))?;
         }
         CurrentTransportWait::Cancelled => {
             return Err(ConnectFailure::with_reason(
@@ -4016,9 +4057,10 @@ async fn connect_once(
             ));
         }
         CurrentTransportWait::TimedOut => {
-            return Err(ConnectFailure::from_transport(TransportError::Connection(
-                "relay join timed out".to_owned(),
-            )));
+            return Err(ConnectFailure::from_transport(
+                TransportError::Connection("relay join timed out".to_owned()),
+                settings.is_persistent(),
+            ));
         }
     }
     record_controller_diagnostic(
@@ -4103,9 +4145,17 @@ impl ConnectFailure {
         )
     }
 
-    fn from_transport(error: TransportError) -> Self {
+    fn from_transport(error: TransportError, persistent: bool) -> Self {
         let technical_reason = error.to_string();
         match error {
+            TransportError::JoinRejected(JoinRejectCode::SessionNotFound) if persistent => {
+                Self::with_reason(
+                    true,
+                    "固定密码主机正在恢复在线，DeskLink 将自动重试。",
+                    "session_not_found",
+                    technical_reason,
+                )
+            }
             TransportError::JoinRejected(JoinRejectCode::SessionNotFound) => Self::with_reason(
                 false,
                 "找不到在线设备或访问密码已失效，请确认主机在线并重新检查设备 ID 和访问密码。",
@@ -5402,8 +5452,10 @@ mod tests {
 
     #[test]
     fn relay_connection_failure_explains_temporary_unavailability() {
-        let failure =
-            ConnectFailure::from_transport(TransportError::Connection("timed out".to_owned()));
+        let failure = ConnectFailure::from_transport(
+            TransportError::Connection("timed out".to_owned()),
+            false,
+        );
 
         assert!(failure.retryable);
         assert!(failure.detail.contains("中继服务器或主机"));
@@ -5475,15 +5527,18 @@ mod tests {
 
     #[test]
     fn terminal_pairing_failures_stop_with_distinct_recovery_text() {
-        let expired = ConnectFailure::from_transport(TransportError::JoinRejected(
-            JoinRejectCode::SessionNotFound,
-        ));
-        let occupied = ConnectFailure::from_transport(TransportError::JoinRejected(
-            JoinRejectCode::SessionOccupied,
-        ));
-        let mismatch = ConnectFailure::from_transport(TransportError::JoinRejected(
-            JoinRejectCode::AuthenticationMismatch,
-        ));
+        let expired = ConnectFailure::from_transport(
+            TransportError::JoinRejected(JoinRejectCode::SessionNotFound),
+            false,
+        );
+        let occupied = ConnectFailure::from_transport(
+            TransportError::JoinRejected(JoinRejectCode::SessionOccupied),
+            false,
+        );
+        let mismatch = ConnectFailure::from_transport(
+            TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch),
+            false,
+        );
 
         assert!(!expired.retryable);
         assert!(expired.detail.contains("失效"));
@@ -5491,6 +5546,39 @@ mod tests {
         assert!(occupied.detail.contains("控制端连接"));
         assert!(!mismatch.retryable);
         assert!(mismatch.detail.contains("不匹配"));
+    }
+
+    #[test]
+    fn persistent_sessions_retry_when_the_relay_session_is_recreated() {
+        let failure = ConnectFailure::from_transport(
+            TransportError::JoinRejected(JoinRejectCode::SessionNotFound),
+            true,
+        );
+
+        assert!(failure.retryable);
+        assert_eq!(failure.kind, "session_not_found");
+        assert!(failure.detail.contains("自动重试"));
+    }
+
+    #[test]
+    fn only_saved_persistent_connections_receive_the_long_host_recovery_window() {
+        assert_eq!(
+            super::DeviceCredentialSource::Saved { persistent: true }
+                .recovery_delays(false)
+                .len(),
+            super::DIRECTORY_PERSISTENT_RECOVERY_DELAYS.len()
+        );
+        assert!(
+            super::DeviceCredentialSource::Saved { persistent: false }
+                .recovery_delays(false)
+                .is_empty()
+        );
+        assert_eq!(
+            super::DeviceCredentialSource::Entered
+                .recovery_delays(true)
+                .len(),
+            super::DIRECTORY_RECOVERY_DELAYS.len()
+        );
     }
 
     #[test]
