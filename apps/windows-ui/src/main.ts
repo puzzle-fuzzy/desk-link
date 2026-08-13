@@ -192,11 +192,11 @@ function renderAccountGate(): string {
         <h1 id="account-title">${title}</h1>
         <p class="account-subtitle">登录可以同步账号状态；不登录也能直接使用本机远程控制。账号不会代替远程设备配对和主机审批。</p>
         <div class="account-mode-switch" role="tablist" aria-label="账号操作">
-          <button type="button" data-account-mode="login" class="${accountMode === "login" ? "is-active" : ""}">登录</button>
-          <button type="button" data-account-mode="register" class="${accountMode === "register" ? "is-active" : ""}">注册</button>
-          <button type="button" data-account-mode="forgot" class="${accountMode === "forgot" ? "is-active" : ""}">找回密码</button>
+          <button id="account-tab-login" role="tab" aria-selected="${accountMode === "login"}" aria-controls="account-form-panel" tabindex="${accountMode === "login" ? "0" : "-1"}" type="button" data-account-mode="login" class="${accountMode === "login" ? "is-active" : ""}">登录</button>
+          <button id="account-tab-register" role="tab" aria-selected="${accountMode === "register"}" aria-controls="account-form-panel" tabindex="${accountMode === "register" ? "0" : "-1"}" type="button" data-account-mode="register" class="${accountMode === "register" ? "is-active" : ""}">注册</button>
+          <button id="account-tab-forgot" role="tab" aria-selected="${accountMode === "forgot"}" aria-controls="account-form-panel" tabindex="${accountMode === "forgot" ? "0" : "-1"}" type="button" data-account-mode="forgot" class="${accountMode === "forgot" ? "is-active" : ""}">找回密码</button>
         </div>
-        <form data-account-form>
+        <form id="account-form-panel" role="tabpanel" aria-labelledby="account-tab-${accountMode}" data-account-form>
           <label class="account-field"><span>邮箱</span><input name="email" type="email" autocomplete="email" placeholder="name@example.com" required></label>
           ${accountMode === "forgot" ? "" : `<label class="account-field"><span>密码</span><input name="password" type="password" autocomplete="${accountMode === "login" ? "current-password" : "new-password"}" minlength="12" maxlength="128" placeholder="至少 12 个字符" required></label>`}
           ${accountMode === "register" ? `<label class="account-field"><span>确认密码</span><input name="confirmation" type="password" autocomplete="new-password" minlength="12" maxlength="128" placeholder="再次输入密码" required></label>` : ""}
@@ -212,15 +212,31 @@ function renderAccountGate(): string {
 }
 
 function bindAccountInteractions(): void {
-  document.querySelectorAll<HTMLButtonElement>("[data-account-mode]").forEach((button) => {
+  const accountTabs = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('[role="tab"][data-account-mode]'),
+  );
+  const selectAccountMode = (button: HTMLButtonElement): void => {
+    const mode = button.dataset.accountMode;
+    if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
+    accountMode = mode;
+    accountError = null;
+    accountNotice = null;
+    accountCanResendVerification = false;
+    render();
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>(`[data-account-mode="${mode}"]`)?.focus();
+    });
+  };
+  accountTabs.forEach((button, currentIndex) => {
     button.addEventListener("click", () => {
-      const mode = button.dataset.accountMode;
-      if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
-      accountMode = mode;
-      accountError = null;
-      accountNotice = null;
-      accountCanResendVerification = false;
-      render();
+      selectAccountMode(button);
+    });
+    button.addEventListener("keydown", (event) => {
+      const nextIndex = nextTabIndex(currentIndex, accountTabs.length, event.key);
+      if (nextIndex === null) return;
+      event.preventDefault();
+      const nextTab = accountTabs[nextIndex];
+      if (nextTab) selectAccountMode(nextTab);
     });
   });
   document.querySelector<HTMLFormElement>("[data-account-form]")?.addEventListener("submit", (event) => {
@@ -596,7 +612,7 @@ function renderFeedback(item: NonNullable<Feedback>): string {
 
 function renderLoading(): string {
   return `
-    <div class="loading-layout" aria-label="正在读取受保护的 DeskLink 状态">
+    <div class="loading-layout" role="status" aria-live="polite" aria-label="正在读取受保护的 DeskLink 状态">
       <div class="skeleton skeleton--status"></div>
       <div class="skeleton-row">
         <div class="skeleton"></div>
