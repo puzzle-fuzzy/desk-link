@@ -357,8 +357,18 @@ function bindUtilityMenuDismiss(): void {
     if (target instanceof Element && (target.closest("[data-toggle-utility-menu]") || target.closest(".utility-menu"))) {
       return;
     }
+    // Keep keyboard users anchored to the control that opened the menu when
+    // an empty area dismisses it. Do not steal focus when the user is moving
+    // directly to another navigation action (the click handler will focus or
+    // render that destination itself).
+    const restoreToggleFocus = !(target instanceof Element && target.closest("[data-view]"));
     utilityMenuOpen = false;
     render();
+    if (restoreToggleFocus) {
+      window.requestAnimationFrame(() => {
+        document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.focus();
+      });
+    }
   });
   document.addEventListener("keydown", (event) => {
     if (!utilityMenuOpen || event.key !== "Escape") {
@@ -1622,7 +1632,7 @@ function bindInteractions(): void {
   const navigationButtons = Array.from(
     document.querySelectorAll<HTMLButtonElement>("[data-view]"),
   );
-  navigationButtons.forEach((button, currentIndex) => {
+  navigationButtons.forEach((button) => {
     button.addEventListener("click", () => {
       if (activeView === "fixedAccess") {
         clearFixedAccessSecrets();
@@ -1651,14 +1661,23 @@ function bindInteractions(): void {
         void checkForWindowsUpdate();
       }
     });
+  });
+  // Only the primary sidebar is a horizontal tab list. Other [data-view]
+  // controls (the utility menu and inline links) have their own interaction
+  // model; including them here made ArrowLeft/ArrowRight jump into hidden or
+  // unrelated actions.
+  const primaryNavigationButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".sidebar-nav [data-view]"),
+  );
+  primaryNavigationButtons.forEach((button, currentIndex) => {
     button.addEventListener("keydown", (event) => {
-      const nextIndex = nextTabIndex(currentIndex, navigationButtons.length, event.key);
+      const nextIndex = nextTabIndex(currentIndex, primaryNavigationButtons.length, event.key);
       if (nextIndex === null) {
         return;
       }
       event.preventDefault();
-      navigationButtons[nextIndex]?.focus();
-      navigationButtons[nextIndex]?.click();
+      primaryNavigationButtons[nextIndex]?.focus();
+      primaryNavigationButtons[nextIndex]?.click();
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-setup-managed]").forEach((button) => {
