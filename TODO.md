@@ -150,7 +150,7 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 - [x] 主机 DirectLan 接入回环：`cargo test -p desklink-windows --lib runtime::direct_video_tests::host_acceptor_keeps_authenticated_direct_datagram_connection`。
 - [x] DirectLan 回环边界夹具：成功传输、候选过期、认证绑定失败和主动关闭；`cargo test -p desklink-transport direct_probe::tests`。
 - [x] 直连质量可观测性：记录当前路径、最近 RTT、丢包基点和回落原因；`cargo clippy --workspace --all-targets -- -D warnings` 与 Windows UI 控制器测试通过。
-- [x] 中继探测：`python scripts/verify-managed-relay.py`（双向控制探测通过，约 303 ms）。
+- [x] 中继探测：`python scripts/verify-managed-relay.py`（双向控制探测通过；实际耗时以同批 `managed-relay-verification.json` 为准）。
 - [x] 云诊断审计：`python scripts/audit-managed-diagnostics.py`（公网 health、服务、定时器和报告新鲜度通过）。
 - [x] 变更检查：`git diff --check`。
 - [x] 增加统一 Windows 发布预检：`check-windows-release-ready.py` 汇总来源 SHA、安装包完整性、签名、tag、中继/诊断证据，并把真实双机验收明确列为人工阻塞项。
