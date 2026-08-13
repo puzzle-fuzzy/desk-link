@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use apps_windows::{
-    cloud_diagnostics::upload_all_once,
+    cloud_diagnostics::upload_all_once_without_session_correlation,
     diagnostic_sharing::WindowsDiagnosticSharing,
     diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
 };
@@ -25,7 +25,7 @@ fn windows_signed_diagnostic_batch_reaches_managed_service() {
         ))
         .unwrap();
 
-    let result = upload_all_once().unwrap();
+    let result = upload_all_once_without_session_correlation().unwrap();
     assert!(result.uploaded_sources >= 1);
     assert!(result.uploaded_events >= 1);
 }

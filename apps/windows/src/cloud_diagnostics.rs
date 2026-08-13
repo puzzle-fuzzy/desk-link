@@ -161,6 +161,20 @@ pub fn start_background_uploader() {
 }
 
 pub fn upload_all_once() -> Result<DiagnosticUploadSummary, CloudDiagnosticError> {
+    upload_all_once_with_correlation(true)
+}
+
+/// Uploads a batch for infrastructure probes without inheriting a persisted
+/// user-session marker. The payload remains signed and sanitized; only the
+/// optional server-side session correlation is omitted.
+pub fn upload_all_once_without_session_correlation()
+-> Result<DiagnosticUploadSummary, CloudDiagnosticError> {
+    upload_all_once_with_correlation(false)
+}
+
+fn upload_all_once_with_correlation(
+    include_session_correlation: bool,
+) -> Result<DiagnosticUploadSummary, CloudDiagnosticError> {
     let sharing =
         WindowsDiagnosticSharing::for_current_user().map_err(|_| CloudDiagnosticError::Storage)?;
     if !sharing
@@ -175,7 +189,7 @@ pub fn upload_all_once() -> Result<DiagnosticUploadSummary, CloudDiagnosticError
         .map_err(|_| CloudDiagnosticError::Identity)?;
     let mut summary = DiagnosticUploadSummary::default();
     for source in [DiagnosticSource::Host, DiagnosticSource::Controller] {
-        let Some(request) = build_request(source, &identity)? else {
+        let Some(request) = build_request(source, &identity, include_session_correlation)? else {
             continue;
         };
         send_request(&request)?;
@@ -190,6 +204,7 @@ pub fn upload_all_once() -> Result<DiagnosticUploadSummary, CloudDiagnosticError
 fn build_request(
     source: DiagnosticSource,
     identity: &DeviceIdentity,
+    include_session_correlation: bool,
 ) -> Result<Option<SignedRequest>, CloudDiagnosticError> {
     let log = match source {
         DiagnosticSource::Host => DiagnosticLog::for_current_user(),
@@ -212,7 +227,9 @@ fn build_request(
     }
     let public_key = *identity.verify_key().as_bytes();
     let installation_id = installation_identifier(&public_key);
-    let correlation_id = read_correlation(source);
+    let correlation_id = include_session_correlation
+        .then(|| read_correlation(source))
+        .flatten();
     let mut batch = DiagnosticBatch {
         schema: 1,
         app_version: env!("CARGO_PKG_VERSION"),
