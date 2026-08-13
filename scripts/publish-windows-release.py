@@ -84,7 +84,9 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
     ):
         raise ValueError("Windows release readiness does not match the clean source commit")
     github_sha = os.environ.get("GITHUB_SHA", "").strip().lower()
-    if github_sha and github_sha != source_commit:
+    if COMMIT_PATTERN.fullmatch(github_sha) is None:
+        raise ValueError("GITHUB_SHA is missing or invalid")
+    if github_sha != source_commit:
         raise ValueError("Release source commit does not match GITHUB_SHA")
 
     installer_value = manifest.get("installer")

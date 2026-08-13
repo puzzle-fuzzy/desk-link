@@ -166,6 +166,8 @@ git push origin v0.1.91
 - SHA-256 和签名状态
 - 已知限制与回滚说明
 
+发布脚本还会强制要求 GitHub 提供有效的 GITHUB_SHA，并确认签名物料与当前 tag 指向同一提交。
+
 发布脚本在调用 GitHub CLI 上传前，会对即将上传的最终安装器再次运行
 `sign-windows-artifact.py --verify-only`。清单中的 `signed: true` 不是签名证明；
 最终 PE 文件的 Authenticode 验证失败时，上传会立即终止。

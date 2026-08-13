@@ -32,7 +32,7 @@ class WindowsReleasePublishTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.github_sha_environment = patch.dict(
-            os.environ, {"GITHUB_SHA": ""}, clear=False
+            os.environ, {"GITHUB_SHA": "a" * 40}, clear=False
         )
         self.github_sha_environment.start()
 
@@ -189,6 +189,14 @@ class WindowsReleasePublishTests(unittest.TestCase):
             with patch.dict(
                 os.environ, {"GITHUB_SHA": "b" * 40}, clear=False
             ):
+                with self.assertRaisesRegex(ValueError, "GITHUB_SHA"):
+                    self.publish.validate_release_payload(root, "v0.1.42")
+
+    def test_rejects_a_missing_github_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_release(root)
+            with patch.dict(os.environ, {"GITHUB_SHA": ""}, clear=False):
                 with self.assertRaisesRegex(ValueError, "GITHUB_SHA"):
                     self.publish.validate_release_payload(root, "v0.1.42")
 
