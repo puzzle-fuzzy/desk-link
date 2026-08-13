@@ -70,7 +70,7 @@ python scripts/check-windows-release-ready.py --strict
 python scripts/create-windows-acceptance-record.py --operator "release-team"
 ```
 
-完成真实验收后，只修改模板中的 `checks` 和 `notes`，再传入 `--manual-json` 重新生成报告。记录必须保留版本、来源提交 SHA、安装包 SHA-256、操作者和 UTC 时间：
+完成真实验收后，只修改模板中的 `checks` 和 `notes`，再传入 `--manual-json` 重新生成报告。每个标记为 `true` 的检查必须有非空 `notes`，说明设备范围、实际结果和异常处理。记录必须保留版本、来源提交 SHA、安装包 SHA-256、操作者和 UTC 时间：
 
 ```json
 {
@@ -88,7 +88,11 @@ python scripts/create-windows-acceptance-record.py --operator "release-team"
     "long_soak_acceptance": true,
     "smartscreen_acceptance": true
   },
-  "notes": {}
+  "notes": {
+    "two_windows_acceptance": "两台 Windows 已完成配对、视频、鼠标、键盘和双屏验收；异常：无。",
+    "long_soak_acceptance": "连续运行 4 小时并完成断网恢复、剪贴板和文件传输；异常：无。",
+    "smartscreen_acceptance": "全新 Windows 账户完成安装、升级、卸载和 SmartScreen 验收；异常：无。"
+  }
 }
 ```
 

@@ -118,6 +118,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                 "operator": "release-team",
                 "recorded_at_utc": "2026-07-23T10:00:00Z",
                 "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
             }
             path = root / "acceptance.json"
             path.write_text(json.dumps(record), encoding="utf-8")
@@ -129,6 +130,32 @@ class WindowsReleaseReadyTests(unittest.TestCase):
             )
         self.assertTrue(all(checks.values()))
         self.assertEqual(metadata["operator"], "release-team")
+
+    def test_manual_acceptance_requires_notes_for_passed_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = self.create_fixture(root)
+            manifest = fixture["manifest"]
+            installer = manifest["installer"]
+            record = {
+                "schema": 1,
+                "version": "0.1.42",
+                "source_commit": "a" * 40,
+                "installer": {"file_name": installer["file_name"], "sha256": installer["sha256"]},
+                "operator": "release-team",
+                "recorded_at_utc": "2026-07-23T10:00:00Z",
+                "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "" for key in self.ready.MANUAL_CHECK_IDS},
+            }
+            path = root / "acceptance.json"
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "needs notes"):
+                self.ready.load_manual_acceptance(
+                    path,
+                    expected_version="0.1.42",
+                    expected_commit="a" * 40,
+                    expected_installer_sha256=installer["sha256"],
+                )
 
     def test_manual_acceptance_rejects_a_different_installer_hash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +170,7 @@ class WindowsReleaseReadyTests(unittest.TestCase):
                 "operator": "release-team",
                 "recorded_at_utc": "2026-07-23T10:00:00Z",
                 "checks": {key: True for key in self.ready.MANUAL_CHECK_IDS},
+                "notes": {key: "验收完成，结果记录在发布日志。" for key in self.ready.MANUAL_CHECK_IDS},
             }
             path = root / "acceptance.json"
             path.write_text(json.dumps(record), encoding="utf-8")

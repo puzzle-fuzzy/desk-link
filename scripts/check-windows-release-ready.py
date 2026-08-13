@@ -87,6 +87,14 @@ def load_manual_acceptance(
         raise ValueError("manual acceptance record checks are missing")
     if any(check_id not in checks or not isinstance(checks[check_id], bool) for check_id in MANUAL_CHECK_IDS):
         raise ValueError("manual acceptance record must contain boolean results for every check")
+    notes = value.get("notes")
+    if not isinstance(notes, dict):
+        raise ValueError("manual acceptance record notes are missing")
+    for check_id in MANUAL_CHECK_IDS:
+        if checks[check_id] and (
+            not isinstance(notes.get(check_id), str) or not notes[check_id].strip()
+        ):
+            raise ValueError(f"manual acceptance record needs notes for {check_id}")
     return (
         {check_id: checks[check_id] for check_id in MANUAL_CHECK_IDS},
         {
