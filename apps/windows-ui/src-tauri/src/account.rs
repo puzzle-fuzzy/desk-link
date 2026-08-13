@@ -58,28 +58,30 @@ const ACCOUNT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone)]
 pub struct AccountManager {
-    store: WindowsAccountSessionStore,
+    store: Option<WindowsAccountSessionStore>,
     client: Client,
     base_url: String,
 }
 
 impl AccountManager {
-    pub fn for_current_user() -> Result<Self, String> {
-        let store =
-            WindowsAccountSessionStore::for_current_user().map_err(|error| error.to_string())?;
+    pub fn for_current_user() -> Self {
+        let store = WindowsAccountSessionStore::for_current_user().ok();
         let client = Client::builder()
             .timeout(ACCOUNT_REQUEST_TIMEOUT)
             .build()
-            .map_err(|_| "账号请求客户端创建失败。".to_owned())?;
-        Ok(Self {
+            .unwrap_or_else(|_| Client::new());
+        Self {
             store,
             client,
             base_url: account_base_url(),
-        })
+        }
     }
 
     pub async fn restore(&self) -> Result<AccountSnapshot, String> {
-        let Some(mut session) = self.store.load().map_err(|error| error.to_string())? else {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(AccountSnapshot::signed_out());
+        };
+        let Some(mut session) = store.load().map_err(|error| error.to_string())? else {
             return Ok(AccountSnapshot::signed_out());
         };
         match self
@@ -90,9 +92,7 @@ impl AccountManager {
                 let response: MeResponse = serde_json::from_value(body)
                     .map_err(|_| "账号服务返回了无效的登录状态。".to_owned())?;
                 session.email = response.user.email.clone();
-                self.store
-                    .save(&session)
-                    .map_err(|error| error.to_string())?;
+                store.save(&session).map_err(|error| error.to_string())?;
                 Ok(AccountSnapshot::signed_in(
                     response.user,
                     session.device_id.clone(),
@@ -112,9 +112,7 @@ impl AccountManager {
                     })?;
                 session.access_token = response.tokens.access_token;
                 session.refresh_token = response.tokens.refresh_token;
-                self.store
-                    .save(&session)
-                    .map_err(|error| error.to_string())?;
+                store.save(&session).map_err(|error| error.to_string())?;
                 let body = self
                     .request("GET", "v1/account/me", None, Some(&session.access_token))
                     .await?;
@@ -169,6 +167,9 @@ impl AccountManager {
     }
 
     pub async fn login(&self, email: String, password: String) -> Result<AccountSnapshot, String> {
+        if self.store.is_none() {
+            return Err("当前 Windows 账户无法安全保存账号会话，本机模式仍可继续使用。".to_owned());
+        }
         let device_id = self.device_id()?;
         let body = self
             .request(
@@ -194,6 +195,8 @@ impl AccountManager {
             refresh_token: response.tokens.refresh_token,
         };
         self.store
+            .as_ref()
+            .ok_or_else(|| "登录成功，但当前 Windows 账户无法安全保存账号会话。".to_owned())?
             .save(&session)
             .map_err(|error| error.to_string())?;
         Ok(AccountSnapshot::signed_in(response.user, device_id))
@@ -211,7 +214,10 @@ impl AccountManager {
     }
 
     pub async fn logout(&self) -> Result<(), String> {
-        if let Some(session) = self.store.load().map_err(|error| error.to_string())? {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        if let Some(session) = store.load().map_err(|error| error.to_string())? {
             let _ = self
                 .request(
                     "POST",
@@ -221,7 +227,7 @@ impl AccountManager {
                 )
                 .await;
         }
-        self.store.clear().map_err(|error| error.to_string())?;
+        store.clear().map_err(|error| error.to_string())?;
         Ok(())
     }
 

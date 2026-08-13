@@ -1609,9 +1609,7 @@ pub fn run() {
         }))
         .manage(HostManager::default())
         .manage(ControllerManager::for_current_user())
-        .manage(
-            AccountManager::for_current_user().expect("DeskLink account storage is unavailable"),
-        );
+        .manage(AccountManager::for_current_user());
     #[cfg(windows)]
     let builder = builder.manage(instance_guard);
     let application = builder
