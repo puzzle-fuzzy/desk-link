@@ -59,7 +59,7 @@ const ACCOUNT_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 #[derive(Clone)]
 pub struct AccountManager {
     store: Option<WindowsAccountSessionStore>,
-    client: Client,
+    client: Option<Client>,
     base_url: String,
 }
 
@@ -69,7 +69,7 @@ impl AccountManager {
         let client = Client::builder()
             .timeout(ACCOUNT_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .ok();
         Self {
             store,
             client,
@@ -258,8 +258,11 @@ impl AccountManager {
         );
         let method = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| "账号请求方法无效。".to_owned())?;
-        let mut request = self
+        let client = self
             .client
+            .as_ref()
+            .ok_or_else(|| "账号网络模块暂时不可用，本机模式仍可继续使用。".to_owned())?;
+        let mut request = client
             .request(method, url)
             .header("accept", "application/json");
         if let Some(body) = body {
