@@ -1,7 +1,7 @@
 # DeskLink 上线 TODO
 
 > 目标：先把 Windows 两台电脑的远程控制做成可发布的稳定版本，再扩展 4K 和公网 P2P。
-> 当前判断（2026-07-31）：Windows 首发核心功能与自动化门禁已通过远程 Windows CI；正式上线仍受签名、发布 tag、运维证据和真实 Windows 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
+> 当前判断（2026-08-13）：Windows 首发核心功能与自动化门禁已通过；正式上线仍受签名、发布 tag、运维证据和真实 Windows 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
 > 规则：`[x]` 只表示代码或自动验证已完成；需要两台真实 Windows 电脑的项目必须由人工验收后再勾选。
 
 ## 0. 发布基线与工作区（P1）
@@ -14,7 +14,7 @@
 - [x] 防止连接命令快照覆盖实时状态通道，避免连接成功后界面短暂回退到旧状态。
 - [x] 将账号服务降为可选能力；未登录时主机仍启动，Windows 本机模式可直接使用，账号流程保留在“更多”菜单。
 - [x] 更新版本号、变更日志和发布说明，形成当前候选基线（正式 tag 仍等待签名与人工验收）。
-- [x] 在干净工作区上通过 Rust、Bun、安装包和发布校验（2026-07-31；Windows CI runs `30571054699` 与 `30572591597`）。
+- [x] 在干净工作区上通过 Rust、Bun、安装包和发布校验（2026-08-13；本地候选门禁通过，Windows CI 历史基线 runs `30571054699` 与 `30572591597`）。
 - [ ] 创建 `v0.1.91`（或下一版本）发布 tag，并保留可回滚提交。
 
 ## 1. 云端诊断可用性（P1）
@@ -106,9 +106,11 @@ python scripts/audit-managed-diagnostics.py
 python -m unittest discover -s scripts/tests -p "test_*.py"
 ```
 
-### 最近一次自动门禁（2026-07-31）
+### 最近一次自动门禁（2026-08-13）
 
-- [x] Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（提交 `f9d5925`）。
+- [x] 当前候选提交已通过前端 164 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 脚本测试、Windows release verification 和安装包构建；连接快照竞态回归测试已纳入门禁。
+
+- [x] 远程 Windows CI run `30571054699`：Python signing policy、前端构建、Rust fmt/Clippy/tests、Windows production verification、未签名候选安装包构建、readiness 生成和 artifact 上传全部通过（历史基线提交 `f9d5925`）。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
 - [x] 发布脚本与签名工作流现在都会严格校验 readiness 报告，并把该报告作为 Release 证据上传；当前候选 `ready: false`，不会被误发布为正式版本。
 - [x] 远程 CI 仍保留 Node.js 20 deprecation warning（`actions/upload-artifact@v4`），不影响本次通过，后续应随 GitHub Actions 运行时升级单独处理。
@@ -133,6 +135,6 @@ python -m unittest discover -s scripts/tests -p "test_*.py"
 
 - 中继实况探测已通过：`101.35.246.159:4433`。
 - 本地诊断服务、定时器、公网诊断 health 和 Windows 脱敏 HTTPS 上报已通过审计；服务器诊断发布为 `d3365a49f138`，最近一次 Nginx 配置备份在 `/etc/nginx/conf.d/p2p.yxswy.com.conf.bak-desklink-1784743477`。
-- 当前 Windows CI 候选物料保存在 run `30572591597` 的 artifact 中，安装器仍未签名；正式验收时以其中的 `windows-installer-manifest.json` 获取 source commit 与 SHA-256，不使用旧文档中的动态值。
+- 当前候选物料以本地 `dist/windows/windows-installer-manifest.json`、`windows-release-verification.json` 和 `windows-release-readiness.json` 为准；安装器仍未签名，正式验收时必须读取同批清单中的 source commit 与 SHA-256，不使用旧文档中的动态值。
 - 当前候选版本变更边界已整理到 [CHANGELOG.md](CHANGELOG.md)，尚未形成正式发布 tag。
 - 当前 `main` 已推送直连诊断、回落改动、DirectLan 回环夹具、近期画质窗口和一键恢复动作；尚无本地 `v*` 发布 tag。
