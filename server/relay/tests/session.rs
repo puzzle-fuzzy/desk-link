@@ -7,7 +7,7 @@ use desklink_crypto::SessionId;
 use desklink_protocol::PROTOCOL_VERSION;
 use desklink_relay::{RelayConfig, RelayError, RelayServer, RelaySessionTable};
 use desklink_transport::{
-    ChannelKind, MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
+    MAX_DATAGRAM_BYTES, MAX_RELIABLE_MESSAGE_BYTES, QuicClient, QuicClientConfig,
     RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
     TransportError, TransportEvent,
 };
@@ -636,18 +636,11 @@ async fn replacement_host_supersedes_stale_disconnect_and_keeps_controller_attac
         .send_control(b"resumed-host".to_vec())
         .await
         .unwrap();
-    loop {
-        match next_event(&controller).await {
-            TransportEvent::PeerDisconnected {
-                channel: ChannelKind::Control,
-            } => continue,
-            TransportEvent::Control(payload) => {
-                assert_eq!(payload, b"resumed-host");
-                break;
-            }
-            event => panic!("unexpected replacement host event: {event:?}"),
-        }
-    }
+    assert_eq!(
+        next_event(&controller).await,
+        TransportEvent::Control(b"resumed-host".to_vec()),
+        "a replaced host must not surface its stale control-stream disconnect"
+    );
 
     drop(first_host);
     controller
@@ -716,6 +709,45 @@ async fn replacement_host_keeps_directory_registration_bound_to_new_connection()
         lookup().await,
         Err(TransportError::DirectoryNotFound),
         "the directory entry must disappear after the replacement host leaves"
+    );
+}
+
+#[tokio::test]
+async fn genuine_peer_disconnect_remains_visible_after_replacement_grace() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(29);
+    let host = QuicClient::connect(config(&relay)).await.unwrap();
+    host.join(RelayJoin::host_with_participant(
+        session_id, [10; 32], [18; 16],
+    ))
+    .await
+    .unwrap();
+    let controller = QuicClient::connect(config(&relay)).await.unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session_id, [10; 32], [19; 16],
+        ))
+        .await
+        .unwrap();
+
+    host.send_control(b"before-disconnect".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&controller).await,
+        TransportEvent::Control(b"before-disconnect".to_vec())
+    );
+    drop(host);
+
+    let event = tokio::time::timeout(Duration::from_secs(2), controller.next_event())
+        .await
+        .expect("a genuine peer disconnect was delayed indefinitely")
+        .expect("the controller transport closed before reporting the peer disconnect");
+    assert_eq!(
+        event,
+        TransportEvent::PeerDisconnected {
+            channel: desklink_transport::ChannelKind::Control,
+        }
     );
 }
 

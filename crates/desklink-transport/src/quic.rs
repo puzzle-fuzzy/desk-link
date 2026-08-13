@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -22,6 +23,13 @@ const INBOUND_DATAGRAM_QUEUE_CAPACITY: usize = 128;
 const INBOUND_AUDIO_QUEUE_CAPACITY: usize = 8;
 const INBOUND_CLOSED_QUEUE_CAPACITY: usize = 8;
 const INBOUND_LANE_COUNT: usize = 8;
+// A relay replacement closes the previous peer stream before the replacement
+// has necessarily emitted its first reliable payload.  Keep that disconnect
+// as a bounded hint briefly so the newer peer generation can supersede it.
+// This does not hide a real disconnect indefinitely: after the grace window
+// the original event is delivered unchanged.
+const PEER_REPLACEMENT_GRACE: Duration = Duration::from_millis(250);
+const PEER_REPLACEMENT_POLL: Duration = Duration::from_millis(10);
 
 pub struct QuicClient {
     _endpoint: quinn::Endpoint,
@@ -97,7 +105,7 @@ struct InboundReceiverChannels {
 }
 
 enum LanePoll {
-    Event(TransportEvent),
+    Event(InboundEvent),
     Empty,
     Closed,
     Locked,
@@ -174,23 +182,15 @@ impl InboundReceivers {
         loop {
             match receiver.try_recv() {
                 Ok(event) => {
-                    if let Some(event) = self.current_event(event) {
+                    if event.peer_generation.is_none_or(|generation| {
+                        generation == self.active_peer_generation.load(Ordering::Acquire)
+                    }) {
                         return LanePoll::Event(event);
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => return LanePoll::Empty,
                 Err(mpsc::error::TryRecvError::Disconnected) => return LanePoll::Closed,
             }
-        }
-    }
-
-    fn current_event(&self, event: InboundEvent) -> Option<TransportEvent> {
-        if event.peer_generation.is_some_and(|generation| {
-            generation != self.active_peer_generation.load(Ordering::Acquire)
-        }) {
-            None
-        } else {
-            Some(event.event)
         }
     }
 
@@ -506,7 +506,9 @@ impl QuicClient {
                 match self.inner.events.try_recv_lane(lane) {
                     LanePoll::Event(event) => {
                         self.inner.events.set_next_lane(lane);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     LanePoll::Closed => self.inner.events.close_lane(lane),
                     LanePoll::Empty | LanePoll::Locked => {}
@@ -517,62 +519,113 @@ impl QuicClient {
             }
 
             tokio::select! {
-                event = recv_lane(&self.inner.events.input, &self.inner.events.active_peer_generation), if self.inner.events.input_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.input, &self.inner.events.active_peer_generation), if self.inner.events.input_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(1);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(1);
                 }
-                event = recv_lane(&self.inner.events.control, &self.inner.events.active_peer_generation), if self.inner.events.control_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.control, &self.inner.events.active_peer_generation), if self.inner.events.control_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(0);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(0);
                 }
-                event = recv_lane(&self.inner.events.video_config, &self.inner.events.active_peer_generation), if self.inner.events.video_config_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.video_config, &self.inner.events.active_peer_generation), if self.inner.events.video_config_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(2);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(2);
                 }
-                event = recv_lane(&self.inner.events.video_datagram, &self.inner.events.active_peer_generation), if self.inner.events.video_datagram_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.video_datagram, &self.inner.events.active_peer_generation), if self.inner.events.video_datagram_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(3);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(3);
                 }
-                event = recv_lane(&self.inner.events.cursor_datagram, &self.inner.events.active_peer_generation), if self.inner.events.cursor_datagram_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.cursor_datagram, &self.inner.events.active_peer_generation), if self.inner.events.cursor_datagram_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(4);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(4);
                 }
-                event = recv_lane(&self.inner.events.closed, &self.inner.events.active_peer_generation), if self.inner.events.closed_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.closed, &self.inner.events.active_peer_generation), if self.inner.events.closed_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(5);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(5);
                 }
-                event = recv_lane(&self.inner.events.transfer, &self.inner.events.active_peer_generation), if self.inner.events.transfer_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.transfer, &self.inner.events.active_peer_generation), if self.inner.events.transfer_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(6);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(6);
                 }
-                event = recv_lane(&self.inner.events.audio_datagram, &self.inner.events.active_peer_generation), if self.inner.events.audio_datagram_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.audio_datagram, &self.inner.events.active_peer_generation), if self.inner.events.audio_datagram_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(7);
-                        return Ok(event);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
                     }
                     self.inner.events.close_lane(7);
                 }
+            }
+        }
+    }
+
+    async fn settle_peer_event(&self, event: InboundEvent) -> Option<TransportEvent> {
+        let InboundEvent {
+            peer_generation,
+            event,
+        } = event;
+        let TransportEvent::PeerDisconnected { .. } = &event else {
+            return Some(event);
+        };
+        let Some(disconnected_generation) = peer_generation else {
+            return Some(event);
+        };
+
+        let deadline = tokio::time::sleep(PEER_REPLACEMENT_GRACE);
+        tokio::pin!(deadline);
+        let mut poll = tokio::time::interval(PEER_REPLACEMENT_POLL);
+        loop {
+            if self
+                .inner
+                .events
+                .active_peer_generation
+                .load(Ordering::Acquire)
+                > disconnected_generation
+            {
+                // A newer reliable stream header has already announced a
+                // replacement. The stale disconnect must not reach the
+                // session state machine and trigger a needless reconnect.
+                return None;
+            }
+            tokio::select! {
+                _ = &mut deadline => return Some(event),
+                _ = poll.tick() => {}
             }
         }
     }
