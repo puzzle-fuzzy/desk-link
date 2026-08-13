@@ -33,7 +33,7 @@ use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, encode_
 use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -73,6 +73,10 @@ const HOST_OUTGOING_EVENT_QUEUE_CAPACITY: usize = 1;
 // Capture commands are low-frequency, but they must not grow without bound if
 // a capture worker stalls while the controller keeps requesting changes.
 const CAPTURE_COMMAND_QUEUE_CAPACITY: usize = 4;
+// A normal DirectLan negotiation has one candidate per peer. Keep a small
+// bounded allowance for retries, while preventing an authenticated peer from
+// turning repeated candidate offers into unbounded probe tasks.
+const DIRECT_PROBE_TASK_CAPACITY: usize = 2;
 const VIDEO_QUEUE_CAPACITY: usize = 2;
 const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
 const DEFAULT_VIDEO_QUALITY_PREFERENCE: VideoQualityPreference = VideoQualityPreference::Automatic;
@@ -2347,6 +2351,7 @@ async fn receive_input_and_control(
     } = context;
     let mut policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
+    let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
     loop {
         tokio::select! {
             direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
@@ -2461,30 +2466,40 @@ async fn receive_input_and_control(
                         {
                             let endpoint = session.endpoint();
                             let expected_binding = *session.session_binding();
+                            let local_candidate = session.candidate().clone();
                             let secure_for_probe = secure.clone();
                             let direct_connection_for_probe = direct_connection.clone();
                             let candidate_for_probe = candidate.clone();
-                            tokio::spawn(async move {
-                                let result = {
-                                    let mut secure = secure_for_probe.lock().await;
-                                    endpoint
-                                        .connect(
-                                            &candidate_for_probe,
-                                            &expected_binding,
-                                            &mut secure,
-                                            now_unix_s(),
-                                        )
-                                        .await
-                                };
-                                if let Ok((connection, _)) = result {
-                                    *direct_connection_for_probe.lock().await =
-                                        Some(Arc::new(connection));
-                                }
-                            });
+                            let accepted = if let Ok(permit) = direct_probe_slots
+                                .clone()
+                                .try_acquire_owned()
+                            {
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let result = {
+                                        let mut secure = secure_for_probe.lock().await;
+                                        endpoint
+                                            .connect(
+                                                &candidate_for_probe,
+                                                &expected_binding,
+                                                &mut secure,
+                                                now_unix_s(),
+                                            )
+                                            .await
+                                    };
+                                    if let Ok((connection, _)) = result {
+                                        *direct_connection_for_probe.lock().await =
+                                            Some(Arc::new(connection));
+                                    }
+                                });
+                                true
+                            } else {
+                                false
+                            };
                             ControlMessage::VideoPathCandidateAnswer {
                                 candidate_id: candidate.candidate_id(),
-                                accepted: true,
-                                candidate: Some(session.candidate().clone()),
+                                accepted,
+                                candidate: accepted.then_some(local_candidate),
                             }
                         } else {
                             ControlMessage::VideoPathCandidateAnswer {
