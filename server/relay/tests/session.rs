@@ -17,6 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 struct TestRelay {
     address: std::net::SocketAddr,
     client_config: quinn::ClientConfig,
+    server: Arc<RelayServer>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -60,6 +61,7 @@ async fn spawn_test_relay_with_config(config: RelayConfig) -> TestRelay {
     TestRelay {
         address,
         client_config,
+        server: relay,
         task,
     }
 }
@@ -183,6 +185,49 @@ async fn relay_matches_host_and_controller_and_forwards_opaque_bytes() {
         next_event(&host_client).await,
         TransportEvent::Transfer(transfer)
     );
+}
+
+#[tokio::test]
+async fn client_close_releases_session_and_connection_capacity() {
+    let relay = spawn_test_relay().await;
+    let session_id = session(31);
+    let authentication = [31; 32];
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    let controller_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(host(session_id, authentication))
+        .await
+        .unwrap();
+    controller_client
+        .join(controller(session_id, authentication))
+        .await
+        .unwrap();
+
+    let attached = relay.server.capacity_snapshot();
+    assert_eq!(attached.active_sessions, 1);
+    assert_eq!(attached.attached_participants, 2);
+    assert_eq!(attached.accepted_connections, 2);
+
+    host_client.close(b"relay close regression");
+    controller_client.close(b"relay close regression");
+    drop(host_client);
+    drop(controller_client);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = relay.server.capacity_snapshot();
+        if snapshot.active_sessions == 0
+            && snapshot.attached_participants == 0
+            && snapshot.accepted_connections == 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed clients retained relay capacity: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
