@@ -84,6 +84,12 @@ const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
 const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
+// Video keyframes are packetized into many QUIC datagrams. Forward each
+// packet independently so one paced `send_datagram_wait` cannot serialize a
+// whole keyframe behind the relay's read loop. The bound keeps a peer from
+// creating an unbounded task backlog while still covering the largest normal
+// keyframe burst (MAX_VIDEO_CHUNKS is currently below this limit).
+const MAX_DATAGRAM_FORWARD_TASKS_PER_CONNECTION: usize = 256;
 const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
 // A relay must not silently evict older video datagrams while a keyframe is
 // being forwarded. Wait briefly for QUIC send capacity, but keep a bounded
@@ -1068,6 +1074,8 @@ async fn handle_connection(
     }
     let reliable_forward_slots =
         Arc::new(Semaphore::new(MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION));
+    let datagram_forward_slots =
+        Arc::new(Semaphore::new(MAX_DATAGRAM_FORWARD_TASKS_PER_CONNECTION));
 
     loop {
         tokio::select! {
@@ -1103,18 +1111,43 @@ async fn handle_connection(
             }
             datagram = connection.read_datagram() => {
                 let Ok(datagram) = datagram else { break; };
-                if !forward_datagram(
-                    &state,
-                    &connection,
-                    connection_id,
-                    session_id,
-                    role,
-                    datagram,
-                )
-                .await
-                {
-                    break;
-                }
+                let Ok(permit) = datagram_forward_slots.clone().try_acquire_owned() else {
+                    // Bounded backpressure: once the in-flight forwarding
+                    // window is full, wait for one permit instead of dropping
+                    // a video chunk or spawning unbounded tasks.
+                    let Ok(permit) = datagram_forward_slots.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let state = state.clone();
+                    let source = connection.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _ = forward_datagram(
+                            &state,
+                            &source,
+                            connection_id,
+                            session_id,
+                            role,
+                            datagram,
+                        )
+                        .await;
+                    });
+                    continue;
+                };
+                let state = state.clone();
+                let source = connection.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = forward_datagram(
+                        &state,
+                        &source,
+                        connection_id,
+                        session_id,
+                        role,
+                        datagram,
+                    )
+                    .await;
+                });
             }
             _ = connection.closed() => break,
         }
