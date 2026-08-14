@@ -30,6 +30,7 @@ const INBOUND_LANE_COUNT: usize = 8;
 // the original event is delivered unchanged.
 const PEER_REPLACEMENT_GRACE: Duration = Duration::from_millis(250);
 const PEER_REPLACEMENT_POLL: Duration = Duration::from_millis(10);
+const VIDEO_DATAGRAM_WAIT_POLL: Duration = Duration::from_millis(100);
 
 pub struct QuicClient {
     _endpoint: quinn::Endpoint,
@@ -468,7 +469,8 @@ impl QuicClient {
     }
 
     pub async fn send_video_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
-        self.send_datagram(ChannelKind::VideoDatagram, None, bytes)
+        self.send_datagram_wait(ChannelKind::VideoDatagram, None, bytes)
+            .await
     }
 
     pub async fn send_video_datagram_for_generation(
@@ -476,7 +478,8 @@ impl QuicClient {
         expected_generation: u64,
         bytes: Vec<u8>,
     ) -> Result<(), TransportError> {
-        self.send_datagram(ChannelKind::VideoDatagram, Some(expected_generation), bytes)
+        self.send_datagram_wait(ChannelKind::VideoDatagram, Some(expected_generation), bytes)
+            .await
     }
 
     pub async fn send_cursor_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
@@ -950,6 +953,56 @@ impl QuicClient {
             .connection
             .send_datagram(Bytes::from(frame))
             .map_err(map_datagram_error)
+    }
+
+    async fn send_datagram_wait(
+        &self,
+        channel: ChannelKind,
+        expected_generation: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        if bytes.len() > MAX_DATAGRAM_BYTES {
+            return Err(TransportError::MessageTooLarge {
+                actual: bytes.len(),
+                maximum: MAX_DATAGRAM_BYTES,
+            });
+        }
+        self.ensure_joined()?;
+        let active_generation = self.inner.active_peer_generation.load(Ordering::Acquire);
+        let peer_generation = expected_generation.unwrap_or(active_generation);
+        if expected_generation.is_some() && peer_generation != active_generation {
+            return Err(TransportError::PeerReplaced);
+        }
+        let mut frame = Vec::with_capacity(bytes.len() + 9);
+        frame.push(channel as u8);
+        frame.extend_from_slice(&peer_generation.to_be_bytes());
+        frame.extend_from_slice(&bytes);
+        let frame = Bytes::from(frame);
+        loop {
+            if expected_generation.is_some()
+                && self.inner.active_peer_generation.load(Ordering::Acquire) != peer_generation
+            {
+                return Err(TransportError::PeerReplaced);
+            }
+            match tokio::time::timeout(
+                VIDEO_DATAGRAM_WAIT_POLL,
+                self.inner.connection.send_datagram_wait(frame.clone()),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result.map_err(map_datagram_error)?;
+                    if expected_generation.is_some()
+                        && self.inner.active_peer_generation.load(Ordering::Acquire)
+                            != peer_generation
+                    {
+                        return Err(TransportError::PeerReplaced);
+                    }
+                    return Ok(());
+                }
+                Err(_) => continue,
+            }
+        }
     }
 
     fn ensure_joined(&self) -> Result<(), TransportError> {

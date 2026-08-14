@@ -205,6 +205,19 @@ impl DirectLanConnection {
             .map_err(|error| TransportError::Datagram(error.to_string()))
     }
 
+    pub async fn send_datagram_wait(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
+        if bytes.len() > crate::MAX_DATAGRAM_BYTES {
+            return Err(TransportError::MessageTooLarge {
+                actual: bytes.len(),
+                maximum: crate::MAX_DATAGRAM_BYTES,
+            });
+        }
+        self.connection
+            .send_datagram_wait(Bytes::from(bytes))
+            .await
+            .map_err(|error| TransportError::Datagram(error.to_string()))
+    }
+
     pub async fn recv_datagram(&self) -> Result<Vec<u8>, TransportError> {
         self.connection
             .read_datagram()

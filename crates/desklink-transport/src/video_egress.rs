@@ -75,7 +75,7 @@ impl VideoDatagramBackend for DirectLanVideoPath {
         &'a self,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), TransportError>> + Send + 'a {
-        std::future::ready(self.connection.send_datagram(bytes))
+        self.connection.send_datagram_wait(bytes)
     }
 }
 
