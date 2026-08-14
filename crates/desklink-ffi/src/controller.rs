@@ -60,6 +60,12 @@ const INITIAL_KEYFRAME_GRACE: Duration = Duration::from_millis(1500);
 // do not leave the controller on a permanently black direct surface.
 const DIRECT_VIDEO_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy)]
+enum VideoPacketSource {
+    Datagram,
+    Reliable,
+}
+
 #[derive(Debug, Error)]
 pub enum ControllerError {
     #[error("transport error: {0}")]
@@ -131,6 +137,7 @@ pub struct ControllerRuntime {
     secure: Arc<Mutex<SecureSession>>,
     input_sequence: Mutex<InputSequencer>,
     assembler: FrameAssembler,
+    reliable_assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
     pending_video_datagrams: VecDeque<Vec<u8>>,
     pending_video_reliable: VecDeque<Vec<u8>>,
@@ -234,6 +241,7 @@ impl ControllerRuntime {
             secure,
             input_sequence: Mutex::new(InputSequencer::new()),
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
+            reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
             video_config: None,
             pending_video_datagrams: VecDeque::new(),
             pending_video_reliable: VecDeque::new(),
@@ -470,7 +478,9 @@ impl ControllerRuntime {
                         }
                     }
                     if self.active_stream_id() != Some(config.stream_id) {
-                        if !self.assembler.begin_stream(config.stream_id) {
+                        if !self.assembler.begin_stream(config.stream_id)
+                            || !self.reliable_assembler.begin_stream(config.stream_id)
+                        {
                             continue;
                         }
                         self.active_stream
@@ -588,8 +598,11 @@ impl ControllerRuntime {
             self.drop_video_packet();
             return Ok(None);
         };
-        self.handle_video_packet(decode_video_packet(&plaintext)?)
-            .await
+        self.handle_video_packet(
+            decode_video_packet(&plaintext)?,
+            VideoPacketSource::Datagram,
+        )
+        .await
     }
 
     async fn handle_video_reliable(
@@ -597,13 +610,17 @@ impl ControllerRuntime {
         ciphertext: Vec<u8>,
     ) -> Result<Option<ControllerEvent>, ControllerError> {
         let plaintext = open(&self.secure, SecureLane::VideoReliable, &ciphertext).await?;
-        self.handle_video_packet(decode_video_packet(&plaintext)?)
-            .await
+        self.handle_video_packet(
+            decode_video_packet(&plaintext)?,
+            VideoPacketSource::Reliable,
+        )
+        .await
     }
 
     async fn handle_video_packet(
         &mut self,
         packet: VideoPacket,
+        source: VideoPacketSource,
     ) -> Result<Option<ControllerEvent>, ControllerError> {
         let Some(config) = &self.video_config else {
             self.drop_video_packet();
@@ -634,12 +651,19 @@ impl ControllerRuntime {
                 return Ok(None);
             }
             if packet.header.chunk_index == 0 {
-                self.assembler.clear_pending();
+                match source {
+                    VideoPacketSource::Datagram => self.assembler.clear_pending(),
+                    VideoPacketSource::Reliable => self.reliable_assembler.clear_pending(),
+                }
             }
         }
         let stream_id = config.stream_id;
-        let assembled = self.assembler.push(Instant::now(), packet);
-        let dropped_chunks = self.assembler.take_dropped_chunks();
+        let assembler = match source {
+            VideoPacketSource::Datagram => &mut self.assembler,
+            VideoPacketSource::Reliable => &mut self.reliable_assembler,
+        };
+        let assembled = assembler.push(Instant::now(), packet);
+        let dropped_chunks = assembler.take_dropped_chunks();
         if dropped_chunks > 0 {
             self.metrics
                 .dropped_video_packets
@@ -660,7 +684,7 @@ impl ControllerRuntime {
                     Instant::now(),
                 ) {
                     VideoContinuityAction::Present => {
-                        if self.assembler.accept_for_present(frame.clone()) {
+                        if assembler.accept_for_present(frame.clone()) {
                             self.keyframe_fallback_deadline = None;
                             self.metrics
                                 .completed_frames
