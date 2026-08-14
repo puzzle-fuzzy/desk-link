@@ -454,7 +454,9 @@ impl ControllerRuntime {
                     // request one later if the buffered frame still fails.
                     let video_packet_buffered = !self.pending_video_reliable.is_empty()
                         || !self.pending_video_datagrams.is_empty();
-                    if self.keyframe_needed_after_config && !video_packet_buffered {
+                    if (config_changed || self.keyframe_needed_after_config)
+                        && !video_packet_buffered
+                    {
                         self.request_keyframe_for(config.stream_id).await?;
                         self.video_continuity.note_keyframe_request(Instant::now());
                     }
