@@ -31,6 +31,10 @@ const INBOUND_LANE_COUNT: usize = 8;
 const PEER_REPLACEMENT_GRACE: Duration = Duration::from_millis(250);
 const PEER_REPLACEMENT_POLL: Duration = Duration::from_millis(10);
 const VIDEO_DATAGRAM_WAIT_POLL: Duration = Duration::from_millis(100);
+// A video datagram may wait briefly for QUIC congestion credit, but it must
+// not hold the host's only video task forever. A bounded wait lets the host
+// rebuild the authenticated peer attempt when the datagram path is wedged.
+const VIDEO_DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct QuicClient {
     _endpoint: quinn::Endpoint,
@@ -978,11 +982,17 @@ impl QuicClient {
         frame.extend_from_slice(&peer_generation.to_be_bytes());
         frame.extend_from_slice(&bytes);
         let frame = Bytes::from(frame);
+        let deadline = tokio::time::Instant::now() + VIDEO_DATAGRAM_SEND_TIMEOUT;
         loop {
             if expected_generation.is_some()
                 && self.inner.active_peer_generation.load(Ordering::Acquire) != peer_generation
             {
                 return Err(TransportError::PeerReplaced);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(TransportError::Datagram(
+                    "video datagram send timed out".to_owned(),
+                ));
             }
             match tokio::time::timeout(
                 VIDEO_DATAGRAM_WAIT_POLL,

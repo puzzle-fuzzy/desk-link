@@ -78,6 +78,10 @@ const CAPTURE_COMMAND_QUEUE_CAPACITY: usize = 4;
 // turning repeated candidate offers into unbounded probe tasks.
 const DIRECT_PROBE_TASK_CAPACITY: usize = 2;
 const VIDEO_QUEUE_CAPACITY: usize = 2;
+// A single transient datagram failure is expected on a lossy path. Rebuild
+// the peer attempt only after a short burst of failures, otherwise a wedged
+// QUIC datagram queue leaves the host connected but permanently black.
+const MAX_CONSECUTIVE_VIDEO_DATAGRAM_FAILURES: u8 = 3;
 const DEFAULT_VIDEO_QUALITY: VideoQualityPreset = VideoQualityPreset::Sharp;
 const DEFAULT_VIDEO_QUALITY_PREFERENCE: VideoQualityPreference = VideoQualityPreference::Automatic;
 const VIDEO_FEEDBACK_MIN_PACKETS: u32 = 40;
@@ -2089,6 +2093,7 @@ async fn send_video_loop(
 ) -> Result<(), HostRuntimeError> {
     let mut pipeline = HostVideoPipeline::new(stream_id);
     let relay_video_path = RelayVideoPath::new(client.clone(), peer_generation);
+    let mut consecutive_datagram_failures = 0_u8;
     loop {
         notify.notified().await;
         let next = lock_queue(&queue).take_newest();
@@ -2126,14 +2131,26 @@ async fn send_video_loop(
                         *direct_connection.lock().await = None;
                     }
                     match send_result {
-                        Ok(_) => {}
-                        Err(TransportError::Datagram(_)) => {
+                        Ok(_) => {
+                            consecutive_datagram_failures = 0;
+                        }
+                        Err(error @ TransportError::Datagram(_)) => {
                             // QUIC datagrams are intentionally lossy. A
                             // transient congestion/MTU drop must not tear
                             // down the entire authenticated host runtime;
                             // request a fresh keyframe and let the next
                             // encoded frame recover the controller instead.
+                            consecutive_datagram_failures =
+                                consecutive_datagram_failures.saturating_add(1);
                             force_keyframe.store(true, Ordering::Release);
+                            if consecutive_datagram_failures
+                                >= MAX_CONSECUTIVE_VIDEO_DATAGRAM_FAILURES
+                            {
+                                eprintln!(
+                                    "DeskLink video datagram path requires a peer rebuild after {consecutive_datagram_failures} consecutive send failures (stream_id={stream_id}): {error}"
+                                );
+                                return Err(error.into());
+                            }
                             break;
                         }
                         Err(error) => return Err(error.into()),

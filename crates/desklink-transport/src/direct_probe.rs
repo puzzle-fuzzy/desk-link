@@ -17,6 +17,7 @@ const PROBE_NONCE_BYTES: usize = 16;
 const PROBE_WIRE_BYTES: usize = 4 + 2 + 1 + 8 + 8 + 16 + PROBE_NONCE_BYTES;
 const MAX_PROBE_MESSAGE_BYTES: usize = 512;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const VIDEO_DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_CLOCK_SKEW_S: u64 = 5;
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -212,10 +213,13 @@ impl DirectLanConnection {
                 maximum: crate::MAX_DATAGRAM_BYTES,
             });
         }
-        self.connection
-            .send_datagram_wait(Bytes::from(bytes))
-            .await
-            .map_err(|error| TransportError::Datagram(error.to_string()))
+        tokio::time::timeout(
+            VIDEO_DATAGRAM_SEND_TIMEOUT,
+            self.connection.send_datagram_wait(Bytes::from(bytes)),
+        )
+        .await
+        .map_err(|_| TransportError::Datagram("video datagram send timed out".to_owned()))?
+        .map_err(|error| TransportError::Datagram(error.to_string()))
     }
 
     pub async fn recv_datagram(&self) -> Result<Vec<u8>, TransportError> {
