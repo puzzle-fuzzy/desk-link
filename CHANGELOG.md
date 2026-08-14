@@ -82,11 +82,11 @@
 
 ### 最新验证记录（2026-08-15）
 
-- 2026-08-15：候选提交 `83d875e` 已通过 Windows CI run `31830428584`（Rust fmt、Clippy、workspace 测试、Windows 发布验证、候选安装包和 native resilience）与安全扫描 run `31830428758`。控制端现在会按视频流重置游标序列，并丢弃中继并发转发产生的重复/过期游标，避免远程鼠标位置回退或触发错误重连。
-- 当前提交在本机 Windows 上完成 300 秒 native resilience soak：2560×1440 单屏捕获、H.264 High Profile/4K 编码探针、主机恢复、DirectLan 回落、固定密码重连和公网中继 E2E 均通过；报告绑定 `83d875e` 且 `source_dirty=false`。
-- 腾讯云中继已用当前提交重新构建并部署，运行镜像 `sha256:c3d787238d31697c2f2160b60c6fa1144585ce5a3efb5b08b87f21a5932adb89`，容器 healthy、证书剩余 57 天、容量低于门槛；主机审计确认源码标签与 `83d875e` 匹配，公网 QUIC/TLS 双向探针约 202 ms 通过，诊断服务与分析定时器健康。
+- 2026-08-15：候选提交 `2d9410b` 已通过 Windows CI run `31837338047`（Rust fmt、Clippy、workspace 测试、Windows 发布验证、候选安装包和 native resilience）与安全扫描 run `31837338045`。控制端现在会按视频流重置游标序列，并丢弃中继并发转发产生的重复/过期游标，避免远程鼠标位置回退或触发错误重连。
+- 当前提交在本机 Windows 上完成 300 秒 native resilience soak：2560×1440 单屏捕获、H.264 High Profile/4K 编码探针、主机恢复、DirectLan 回落、固定密码重连和公网中继 E2E 均通过；报告绑定 `2d9410b` 且 `source_dirty=false`。
+- 腾讯云中继已用当前提交重新构建并部署，运行镜像 `sha256:8092ac62e352dcd9885320d68a4026394782a34a7c8ad9cff136a646c7df471a`，容器 healthy、证书剩余 57 天、容量低于门槛；主机审计确认源码标签与 `2d9410b` 匹配，公网 QUIC/TLS 双向探针通过，诊断服务与分析定时器健康。
 - 2026-08-15：`ef32f64` 的 Windows CI run `31796970078` 全部通过；Rust 格式、Clippy、workspace 测试、Windows 发布验证、候选安装包和原生 resilience 均通过。原生日志确认约 151 KiB / 148 分片首帧使用 3 个可靠批次，并记录最长 13.9 秒的组装计时；公网中继监控 run `31823044848` 与诊断监控 run `31822883512` 均通过并绑定同一提交。
-- 本轮稳定性修复已推送 `main`；中继镜像、Windows 安装包和运维证据会在每次候选提交后重新生成并完成来源绑定。除真实双机验收外，前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 60 项脚本测试、Windows release verification、安装包构建和 300 秒 resilience 门禁均已通过；原生 FFI 控制端和主机端的网络黑洞也已纳入有界超时。
+- 本轮稳定性修复已推送 `main`；中继镜像、Windows 安装包和运维证据会在每次候选提交后重新生成并完成来源绑定。除真实双机验收外，前端 177 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 75 项脚本测试、Windows release verification、安装包构建和 300 秒 resilience 门禁均已通过；原生 FFI 控制端和主机端的网络黑洞也已纳入有界超时。
 - 当前候选安装包仍未签名；安装器来源、大小和 SHA-256 必须以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准，文档不固定写入会随候选构建变化的动态 SHA。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
 - 发布脚本与签名工作流均已增加严格 readiness 校验，避免只凭安装器构建成功就发布。
