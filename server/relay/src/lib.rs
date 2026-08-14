@@ -90,6 +90,7 @@ const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
 // timeout so a dead/blocked peer cannot pin the participant read loop forever.
 const DATAGRAM_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 static DATAGRAM_FORWARD_FAILURES: AtomicU64 = AtomicU64::new(0);
+static DATAGRAM_FORWARD_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct RelaySessionTable {
@@ -1381,7 +1382,15 @@ async fn forward_datagram(
         )
         .await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => log_datagram_forward_success(
+                connection_id,
+                session_id,
+                role,
+                peer_id,
+                channel,
+                datagram.len(),
+                peer.max_datagram_size(),
+            ),
             Ok(Err(_)) => {
                 log_datagram_forward_failure(
                     connection_id,
@@ -1409,6 +1418,38 @@ async fn forward_datagram(
         }
     }
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_datagram_forward_success(
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    peer_connection_id: u64,
+    channel: ChannelKind,
+    datagram_bytes: usize,
+    peer_max_datagram_bytes: Option<usize>,
+) {
+    let sample = DATAGRAM_FORWARD_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+    if sample >= 8 && !sample.is_multiple_of(256) {
+        return;
+    }
+    let max_datagram =
+        peer_max_datagram_bytes.map_or_else(|| "null".to_owned(), |bytes| bytes.to_string());
+    eprintln!(
+        "{{\"schema\":1,\"timestamp_unix_ms\":{},\"event\":\"datagram_forwarded\",\"session_tag\":\"{}\",\"connection_id\":{},\"role\":\"{}\",\"peer_connection_id\":{},\"channel\":\"{}\",\"datagram_bytes\":{},\"peer_max_datagram_bytes\":{}}}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        session_tag(session_id),
+        connection_id,
+        role_label(role),
+        peer_connection_id,
+        channel_label(channel),
+        datagram_bytes,
+        max_datagram,
+    );
 }
 
 fn close_connection(connection: &quinn::Connection, reason: &[u8]) {
