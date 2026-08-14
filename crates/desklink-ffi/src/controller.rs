@@ -45,7 +45,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 // controller waits for capability negotiation while that dialog is visible.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ASSEMBLY_CAPACITY: usize = 3;
-const ASSEMBLY_MAX_AGE: Duration = Duration::from_millis(500);
+// A relay may pace a large keyframe burst over several seconds. Keep the
+// incomplete frame alive long enough to assemble it, while the controller
+// drops obsolete deltas and older keyframes below so memory remains bounded.
+const ASSEMBLY_MAX_AGE: Duration = Duration::from_secs(10);
 const PENDING_VIDEO_DATAGRAM_CAPACITY: usize = 256;
 // A successful authenticated probe only proves that the endpoints can open a
 // datagram socket. If a firewall silently drops the subsequent video packets,
@@ -534,6 +537,19 @@ impl ControllerRuntime {
         {
             self.drop_video_packet();
             return Ok(None);
+        }
+        let is_keyframe = packet.header.flags.0 & desklink_protocol::FrameFlags::KEYFRAME.0 != 0;
+        if self.video_continuity.awaiting_keyframe() {
+            if !is_keyframe {
+                self.drop_video_packet();
+                if self.video_continuity.retry_keyframe_request(Instant::now()) {
+                    self.request_keyframe_for(config.stream_id).await?;
+                }
+                return Ok(None);
+            }
+            if packet.header.chunk_index == 0 {
+                self.assembler.clear_pending();
+            }
         }
         let stream_id = config.stream_id;
         let assembled = self.assembler.push(Instant::now(), packet);

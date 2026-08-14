@@ -41,6 +41,27 @@ impl VideoContinuity {
         self.last_keyframe_request_at = Some(now);
     }
 
+    pub fn awaiting_keyframe(&self) -> bool {
+        self.awaiting_keyframe
+    }
+
+    /// Returns true at most once per retry interval while the decoder is
+    /// waiting for a complete keyframe. The controller uses this signal when
+    /// relay pacing delivers delta packets before the large keyframe burst
+    /// has finished.
+    pub fn retry_keyframe_request(&mut self, now: Instant) -> bool {
+        if !self.awaiting_keyframe {
+            return false;
+        }
+        let due = self.last_keyframe_request_at.is_none_or(|requested| {
+            now.saturating_duration_since(requested) >= KEYFRAME_RETRY_INTERVAL
+        });
+        if due {
+            self.last_keyframe_request_at = Some(now);
+        }
+        due
+    }
+
     pub fn observe_frame(
         &mut self,
         frame_id: u64,

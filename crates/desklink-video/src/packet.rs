@@ -257,6 +257,20 @@ impl FrameAssembler {
         std::mem::take(&mut self.dropped_chunks)
     }
 
+    /// Discards incomplete access units while preserving the active stream
+    /// and presentation watermark. This is used when a newer keyframe starts:
+    /// incomplete older keyframes cannot be presented and would otherwise
+    /// occupy the bounded assembly slots during a paced relay burst.
+    pub fn clear_pending(&mut self) {
+        self.dropped_chunks = self.dropped_chunks.saturating_add(
+            self.frames
+                .values()
+                .map(PartialFrame::missing_chunk_count)
+                .sum(),
+        );
+        self.frames.clear();
+    }
+
     pub fn accept_for_present(&mut self, frame: EncodedFrame) -> bool {
         if self.active_stream != Some(frame.stream_id) {
             return false;
