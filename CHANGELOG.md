@@ -4,6 +4,7 @@
 
 ### 已完成
 
+- 公网中继的首个大 H.264 关键帧现在会将已分片数据按 60 KiB 上限合并为少量可靠消息；控制端按批次解码并按分片计量，保留单包夹具路径。Windows 原生 CI 记录了约 151 KiB、148 分片关键帧只发送 3 批，组装耗时在不同网络样本中为 43 ms 至 13.9 s；可靠组装使用独立 30 秒有界窗口，避免中继拥塞时再次出现黑屏。
 - Windows schema 2 人工验收记录现在采用字段白名单，并拒绝备注、安装结果和长稳说明中的设备 ID、密码/密钥标签、PEM 私钥和本地 Windows 路径；候选 ZIP 不再意外携带原始敏感证据。
 - 对照 RustDesk、MeshCentral 和 FreeRDP 的公开架构后，确认继续保持 Rust 数据平面、relay 回落和 Windows 首发边界；将第二 relay、安全扫描和分层会话诊断列入后续计划，不引入企业 RMM 或 RDP 兼容范围。
 - Windows 编码 resilience smoke 现在在静态桌面复用最近一帧并推进单调时间戳，不会因为 DXGI 只报告变化帧而假失败；运行时只在首帧或明确恢复请求时强制关键帧，普通 GOP 节奏交给 Media Foundation。
@@ -79,8 +80,9 @@
 - 安装器只维护单一 `DeskLink.exe` 入口，旧的独立 host 文件和旧设备记录格式不会再参与启动或恢复。
 - 4K 原生编码和公网 NAT 穿透 P2P 尚未开放或承诺，当前以 2560×1440 为清晰度上限。
 
-### 最新验证记录（2026-08-13）
+### 最新验证记录（2026-08-15）
 
+- 2026-08-15：`ef32f64` 的 Windows CI run `31796970078` 全部通过；Rust 格式、Clippy、workspace 测试、Windows 发布验证、候选安装包和原生 resilience 均通过。原生日志确认约 151 KiB / 148 分片首帧使用 3 个可靠批次，并记录最长 13.9 秒的组装计时；公网中继监控 run `31823044848` 与诊断监控 run `31822883512` 均通过并绑定同一提交。
 - 本轮稳定性修复已推送 `main`；中继镜像、Windows 安装包和运维证据会在每次候选提交后重新生成并完成来源绑定。除真实双机验收外，前端 173 项测试、Vite 构建、Rust fmt/Clippy、workspace 测试、Python 60 项脚本测试、Windows release verification、安装包构建和 300 秒 resilience 门禁均已通过；原生 FFI 控制端和主机端的网络黑洞也已纳入有界超时。
 - 当前候选安装包仍未签名；安装器来源、大小和 SHA-256 必须以同批生成的 `windows-installer-manifest.json` 与 `windows-release-readiness.json` 为准，文档不固定写入会随候选构建变化的动态 SHA。
 - `windows-release-readiness.json` 已作为构建证据生成；当前为 `ready: false`，签名、发布 tag、运维证据和真实 Windows 验收完成前不会创建正式 Release。
