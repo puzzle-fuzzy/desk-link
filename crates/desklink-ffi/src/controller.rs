@@ -444,16 +444,21 @@ impl ControllerRuntime {
                     if config_changed {
                         self.video_continuity.reset_for_config();
                     }
-                    // A video config is reliable, but the following keyframe
-                    // datagrams are intentionally lossy. Request one for
-                    // every new config so a relay-side burst/drop cannot
-                    // leave the controller waiting forever with no packet
-                    // from which to infer transport loss.
-                    if config_changed || self.keyframe_needed_after_config {
+                    // Config and the first keyframe use separate reliable
+                    // streams, so the keyframe may already be queued while
+                    // this config event is being delivered. Requesting
+                    // another keyframe here would make the host emit a newer
+                    // datagram keyframe that can overtake and clear the
+                    // reliable frame in the assembler. Only request when no
+                    // video packet is buffered; continuity recovery will
+                    // request one later if the buffered frame still fails.
+                    let video_packet_buffered = !self.pending_video_reliable.is_empty()
+                        || !self.pending_video_datagrams.is_empty();
+                    if self.keyframe_needed_after_config && !video_packet_buffered {
                         self.request_keyframe_for(config.stream_id).await?;
-                        self.keyframe_needed_after_config = false;
                         self.video_continuity.note_keyframe_request(Instant::now());
                     }
+                    self.keyframe_needed_after_config = false;
                     return Ok(ControllerEvent::VideoConfig(config));
                 }
                 TransportEvent::VideoReliable(ciphertext) => {
