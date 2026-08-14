@@ -162,18 +162,18 @@ python scripts/check-windows-release-ready.py --manual-json dist/windows/windows
 python scripts/package-windows-candidate.py
 ```
 
-### 最近一次自动门禁（2026-08-14，候选 `2582351`）
+### 最近一次自动门禁（2026-08-14，候选 `e649b20`）
 
 - [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 72 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
-- [x] Windows CI run `31751624268` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `2582351`。
+- [x] Windows CI run `31755376313` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `e649b20560e8382055546c78db1bbcb6f3339f6b`。
 
-- [x] 安全扫描 run `31751624167`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
-- [x] Managed relay monitor run `31751836921` 已对 `2582351` 通过；本次探测脚本增加 3 次有界重试，瞬时公网超时不会直接制造误报警。
+- [x] 安全扫描 run `31755376312`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
+- [x] Backend services CI run `31755376304` 通过；Managed relay monitor run `31755577111` 与 Managed diagnostics monitor run `31755578886` 均通过。
 - [x] 签名候选 readiness 明确传入 `--minimum-soak-seconds 300`，不会因为默认值变化而把正式长稳门禁降级为普通 CI 的 10 秒。
 - [x] 签名候选工作流已强制 300 秒原生 resilience soak，并由 `test_windows_workflow_policy.py` 防止回退到普通 CI 的 10 秒快速门禁。
 - [x] 候选物料已由 Windows CI manifest 完成来源绑定；正式验收或发布时必须直接读取对应 run 的 artifact manifest，不把动态 SHA 回写到源码，避免证据提交改变被验证的 source commit。
 - [x] 发布脚本与签名工作流现在都会严格校验 readiness 报告，并把该报告作为 Release 证据上传；当前候选 `ready: false`，不会被误发布为正式版本。
-- [x] 远程 CI 仍保留 Node.js 20 deprecation warning（`actions/upload-artifact@v4`），不影响本次通过，后续应随 GitHub Actions 运行时升级单独处理。
+- [x] GitHub Actions 已统一到 `actions/checkout@v7`、`actions/upload-artifact@v7` 和 `actions/download-artifact@v8`，旧的 Node.js 20 deprecation warning 已不再作为当前候选的工作流风险。
 
 ### 先前自动门禁（2026-07-28）
 
