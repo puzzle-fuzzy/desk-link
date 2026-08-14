@@ -2157,14 +2157,6 @@ async fn send_video_loop(
                             index,
                         );
                     }
-                    let ciphertext = seal(&secure, SecureLane::VideoDatagram, &datagram).await?;
-                    if !reported_first_datagram_stage {
-                        eprintln!(
-                            "DeskLink video datagram encrypted (stream_id={} ciphertext_bytes={})",
-                            stream_id,
-                            ciphertext.len(),
-                        );
-                    }
                     let mut direct_path = direct_connection
                         .lock()
                         .await
@@ -2172,14 +2164,29 @@ async fn send_video_loop(
                         .map(DirectLanVideoPath::new);
                     let had_direct_path = direct_path.is_some();
                     let send_result = if reliable_relay_keyframe && direct_path.is_none() {
+                        let ciphertext =
+                            seal(&secure, SecureLane::VideoReliable, &datagram).await?;
+                        if !reported_first_datagram_stage {
+                            eprintln!(
+                                "DeskLink video keyframe encrypted (stream_id={} lane=video_reliable ciphertext_bytes={})",
+                                stream_id,
+                                ciphertext.len(),
+                            );
+                        }
                         client
-                            .send_video_reliable_for_generation(
-                                peer_generation,
-                                seal(&secure, SecureLane::VideoReliable, &datagram).await?,
-                            )
+                            .send_video_reliable_for_generation(peer_generation, ciphertext)
                             .await
                             .map(|()| VideoDatagramRoute::Relay)
                     } else {
+                        let ciphertext =
+                            seal(&secure, SecureLane::VideoDatagram, &datagram).await?;
+                        if !reported_first_datagram_stage {
+                            eprintln!(
+                                "DeskLink video datagram encrypted (stream_id={} lane=video_datagram ciphertext_bytes={})",
+                                stream_id,
+                                ciphertext.len(),
+                            );
+                        }
                         send_video_datagram_with_fallback(
                             &mut direct_path,
                             &relay_video_path,
