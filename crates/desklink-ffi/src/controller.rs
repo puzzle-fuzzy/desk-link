@@ -149,6 +149,7 @@ pub struct ControllerRuntime {
     keyframe_needed_after_config: bool,
     keyframe_fallback_deadline: Option<Instant>,
     video_continuity: VideoContinuity,
+    last_cursor_sequence: u64,
     reliable_trace_started: Option<Instant>,
     video_path: DirectVideoPathMachine,
     direct_session: Option<DirectLanSession>,
@@ -254,6 +255,7 @@ impl ControllerRuntime {
             keyframe_needed_after_config: false,
             keyframe_fallback_deadline: None,
             video_continuity: VideoContinuity::default(),
+            last_cursor_sequence: 0,
             reliable_trace_started: None,
             video_path,
             direct_session,
@@ -490,6 +492,7 @@ impl ControllerRuntime {
                         }
                         self.active_stream
                             .store(config.stream_id, Ordering::Release);
+                        self.last_cursor_sequence = 0;
                     }
                     self.video_config = Some(config.clone());
                     if config_changed {
@@ -553,6 +556,14 @@ impl ControllerRuntime {
                     {
                         continue;
                     }
+                    if !cursor_sequence_is_newer(self.last_cursor_sequence, cursor.sequence) {
+                        // Relay datagrams are forwarded by independent tasks
+                        // and may arrive out of order. A stale cursor must
+                        // never move the local pointer backwards after a
+                        // newer update has already been rendered.
+                        continue;
+                    }
+                    self.last_cursor_sequence = cursor.sequence;
                     return Ok(ControllerEvent::Cursor(cursor));
                 }
                 TransportEvent::AudioDatagram(ciphertext) => {
@@ -1133,6 +1144,10 @@ fn now_unix_s() -> u64 {
     now_micros() / 1_000_000
 }
 
+fn cursor_sequence_is_newer(last_sequence: u64, candidate_sequence: u64) -> bool {
+    candidate_sequence > last_sequence
+}
+
 fn next_direct_candidate_id() -> u64 {
     let mut candidate_id = 0_u64;
     while candidate_id == 0 {
@@ -1147,6 +1162,14 @@ mod tests {
     use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
     use desklink_protocol::DirectLanCandidate;
     use rand_core::OsRng;
+
+    #[test]
+    fn cursor_updates_reject_duplicates_and_out_of_order_datagrams() {
+        assert!(cursor_sequence_is_newer(0, 1));
+        assert!(cursor_sequence_is_newer(41, 42));
+        assert!(!cursor_sequence_is_newer(42, 42));
+        assert!(!cursor_sequence_is_newer(42, 41));
+    }
 
     #[tokio::test]
     async fn direct_probe_accepts_peer_initiated_connection_without_blocking() {
