@@ -7,9 +7,10 @@ use desklink_ffi::{ControllerEvent, ControllerRuntime};
 use desklink_protocol::{
     AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioCodec, AudioPacket, Codec, ControlMessage,
     CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent,
-    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
-    decode_input, decode_noise_handshake, encode_audio_packet, encode_control,
-    encode_cursor_update, encode_noise_handshake, encode_video_config, encode_video_packet,
+    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, TransferMessage,
+    TransferResult, VideoConfig, decode_control, decode_input, decode_noise_handshake,
+    decode_transfer, encode_audio_packet, encode_control, encode_cursor_update,
+    encode_noise_handshake, encode_transfer, encode_video_config, encode_video_packet,
 };
 use desklink_relay::{RelayConfig, RelayServer};
 use desklink_transport::{
@@ -74,6 +75,7 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
         continue_receiver,
         false,
         true,
+        true,
     ));
 
     let mut runtime = ControllerRuntime::connect(controller, controller_identity, host_verify_key)
@@ -117,6 +119,81 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     assert_eq!(audio.stream_id, 9);
     assert_eq!(audio.sequence, 1);
     assert_eq!(audio.payload, vec![0x2a; 960]);
+
+    // Exercise the same encrypted reliable lane used by the Windows UI for
+    // clipboard and file transfers. The fake host validates the complete
+    // offer/chunk/complete sequence and sends the expected acknowledgements
+    // back through the relay.
+    let transfer_id = [89; 16];
+    runtime
+        .send_transfer(TransferMessage::ClipboardSet {
+            request_id: 41,
+            text: "desklink transfer probe".to_owned(),
+        })
+        .await
+        .unwrap();
+    runtime
+        .send_transfer(TransferMessage::FileOffer {
+            transfer_id,
+            request_id: None,
+            name: "probe.txt".to_owned(),
+            size: 4,
+        })
+        .await
+        .unwrap();
+    runtime
+        .send_transfer(TransferMessage::FileChunk {
+            transfer_id,
+            offset: 0,
+            bytes: vec![1, 2, 3, 4],
+        })
+        .await
+        .unwrap();
+    runtime
+        .send_transfer(TransferMessage::FileComplete {
+            transfer_id,
+            content_hash: [90; 32],
+        })
+        .await
+        .unwrap();
+
+    let mut transfer_responses = Vec::new();
+    while transfer_responses.len() < 3 {
+        match tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ControllerEvent::Transfer(message) => transfer_responses.push(message),
+            ControllerEvent::Closed { reason } => {
+                panic!("transfer probe session closed unexpectedly: {reason}")
+            }
+            ControllerEvent::Control(_)
+            | ControllerEvent::VideoConfig(_)
+            | ControllerEvent::H264AccessUnit(_)
+            | ControllerEvent::Cursor(_)
+            | ControllerEvent::Audio(_) => {}
+        }
+    }
+    assert_eq!(
+        transfer_responses,
+        vec![
+            TransferMessage::ClipboardResult {
+                request_id: 41,
+                result: TransferResult::Completed,
+            },
+            TransferMessage::FileDecision {
+                transfer_id,
+                result: TransferResult::Completed,
+                resume_offset: 0,
+                resume_prefix_hash: None,
+            },
+            TransferMessage::FileResult {
+                transfer_id,
+                result: TransferResult::Completed,
+            },
+        ]
+    );
 
     // The fake host intentionally repeats the first encrypted video packet.
     // A duplicate datagram must be discarded without terminating the secure
@@ -193,6 +270,7 @@ async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
         controller_verify_key,
         continue_receiver,
         true,
+        false,
         false,
     ));
 
@@ -472,6 +550,7 @@ async fn run_fake_host(
     continue_receiver: oneshot::Receiver<()>,
     reject_direct_offer: bool,
     duplicate_video_packet: bool,
+    probe_transfers: bool,
 ) -> (InputEvent, ControlMessage) {
     let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
     assert_eq!(first.step, NoiseHandshakeStep::InitiatorHello);
@@ -629,11 +708,73 @@ async fn run_fake_host(
         .await
         .unwrap();
 
-    let (input, control) = tokio::join!(host.next_input(), host.next_control());
-    let input = secure.open(SecureLane::Input, &input.unwrap()).unwrap();
-    let input = decode_input(&input, now_micros()).unwrap().event;
-    let control = open_control(&mut secure, control.unwrap());
-    (input, control)
+    let mut input = None;
+    let mut control = None;
+    let mut transfer_count = 0;
+    while input.is_none() || control.is_none() || (probe_transfers && transfer_count < 4) {
+        tokio::select! {
+            input_result = host.next_input(), if input.is_none() => {
+                let plaintext = secure.open(SecureLane::Input, &input_result.unwrap()).unwrap();
+                input = Some(decode_input(&plaintext, now_micros()).unwrap().event);
+            }
+            control_result = host.next_control(), if control.is_none() => {
+                control = Some(open_control(&mut secure, control_result.unwrap()));
+            }
+            transfer_result = host.next_transfer(), if probe_transfers && transfer_count < 4 => {
+                let plaintext = secure.open(SecureLane::Transfer, &transfer_result.unwrap()).unwrap();
+                let message = decode_transfer(&plaintext).unwrap();
+                match message {
+                    TransferMessage::ClipboardSet { request_id, text } => {
+                        assert_eq!(request_id, 41);
+                        assert_eq!(text, "desklink transfer probe");
+                        send_transfer(
+                            &host,
+                            &mut secure,
+                            TransferMessage::ClipboardResult {
+                                request_id,
+                                result: TransferResult::Completed,
+                            },
+                        ).await;
+                    }
+                    TransferMessage::FileOffer { transfer_id, name, size, .. } => {
+                        assert_eq!(transfer_id, [89; 16]);
+                        assert_eq!(name, "probe.txt");
+                        assert_eq!(size, 4);
+                        send_transfer(
+                            &host,
+                            &mut secure,
+                            TransferMessage::FileDecision {
+                                transfer_id,
+                                result: TransferResult::Completed,
+                                resume_offset: 0,
+                                resume_prefix_hash: None,
+                            },
+                        ).await;
+                    }
+                    TransferMessage::FileChunk { transfer_id, offset, bytes } => {
+                        assert_eq!(transfer_id, [89; 16]);
+                        assert_eq!(offset, 0);
+                        assert_eq!(bytes, vec![1, 2, 3, 4]);
+                    }
+                    TransferMessage::FileComplete { transfer_id, content_hash } => {
+                        assert_eq!(transfer_id, [89; 16]);
+                        assert_eq!(content_hash, [90; 32]);
+                        send_transfer(
+                            &host,
+                            &mut secure,
+                            TransferMessage::FileResult {
+                                transfer_id,
+                                result: TransferResult::Completed,
+                            },
+                        ).await;
+                    }
+                    message => panic!("unexpected transfer probe message: {message:?}"),
+                }
+                transfer_count += 1;
+            }
+        }
+    }
+    (input.unwrap(), control.unwrap())
 }
 
 async fn run_reference_gap_host(
@@ -860,6 +1001,13 @@ fn open_control(secure: &mut SecureSession, ciphertext: Vec<u8>) -> ControlMessa
 async fn send_control(host: &QuicClient, secure: &mut SecureSession, message: ControlMessage) {
     let plaintext = encode_control(&message).unwrap();
     host.send_control(secure.seal(SecureLane::Control, &plaintext).unwrap())
+        .await
+        .unwrap();
+}
+
+async fn send_transfer(host: &QuicClient, secure: &mut SecureSession, message: TransferMessage) {
+    let plaintext = encode_transfer(&message).unwrap();
+    host.send_transfer(secure.seal(SecureLane::Transfer, &plaintext).unwrap())
         .await
         .unwrap();
 }
