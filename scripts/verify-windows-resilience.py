@@ -13,6 +13,12 @@ import sys
 import time
 from pathlib import Path
 
+SCRIPTS_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPTS_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIRECTORY))
+
+from windows_native_build_env import prepare_windows_native_build_environment
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT = ROOT / "dist" / "windows" / "windows-resilience-report.json"
@@ -119,6 +125,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     if sys.platform != "win32":
         raise SystemExit("Windows resilience verification must run on Windows")
+    prepare_windows_native_build_environment()
     args = parse_args()
     if not 10 <= args.soak_seconds <= 300:
         raise SystemExit("--soak-seconds must be between 10 and 300")
