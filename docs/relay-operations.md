@@ -52,3 +52,14 @@ python scripts/deploy-managed-relay.py --target root@101.35.246.159 --identity-f
 2. 把客户端托管配置升级为“中继端点列表”，主机同时登记，控制端按优先级查找；任一端点失败时带抖动退避切换。
 3. 会话目录保持无共享敏感数据；短期采用双登记，后续如需共享目录，只复制一次性邀请密文和过期时间。
 4. 演练主节点断网、证书失效、容量耗尽和整机故障，并以双机远程画面恢复时间作为验收指标。
+
+## GitHub 定时监控
+
+`.github/workflows/managed-relay-monitor.yml` 每小时运行两次公网 QUIC/TLS 探针。为让同一门禁同时检查腾讯云主机，请在仓库 Actions secrets 中成组配置：
+
+- `DESKLINK_RELAY_SSH_TARGET`：例如 `root@101.35.246.159`。
+- `DESKLINK_RELAY_SSH_PRIVATE_KEY`：仅用于监控的 SSH 私钥，不写入仓库和日志。
+- `DESKLINK_RELAY_SSH_KNOWN_HOSTS`：预先固定的目标主机公钥行；监控使用 `StrictHostKeyChecking=yes`，不会在运行时接受未知主机。
+- `DESKLINK_RELAY_EXPECTED_SOURCE_COMMIT`：当前线上中继镜像的 40 位源码提交，可选；每次中继部署后同步更新。
+
+前三项必须同时存在；只配置其中一部分会让工作流失败，避免误以为主机审计已启用。配置完整后，工作流会保存 `managed-relay-host-audit.json` 和 `managed-diagnostics-audit.json`，并在容器停止、不健康、重启策略异常、证书少于 21 天、磁盘或容量接近上限、诊断报告过期时失败。未配置 SSH 时，公网探针仍会运行，但不能把它解释为主机健康已验证。

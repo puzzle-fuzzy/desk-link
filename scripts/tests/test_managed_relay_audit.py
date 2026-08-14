@@ -79,6 +79,19 @@ class ManagedRelayAuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.audit.validate_source_commit("a" * 39)
 
+    def test_pins_ssh_host_when_a_known_hosts_file_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            known_hosts = Path(temporary_directory) / "known_hosts"
+            known_hosts.write_text("relay ssh-ed25519 AAAA\n", encoding="utf-8")
+            arguments = SimpleNamespace(
+                identity_file=None,
+                known_hosts_file=known_hosts,
+                target="root@example",
+            )
+            command = self.audit.ssh_command(arguments, "true")
+            self.assertIn("StrictHostKeyChecking=yes", command)
+            self.assertIn(f"UserKnownHostsFile={known_hosts}", command)
+
     def test_reads_relay_source_revision_from_json_labels(self) -> None:
         revision = "b" * 40
         self.assertEqual(

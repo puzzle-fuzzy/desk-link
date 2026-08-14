@@ -30,6 +30,22 @@ class WindowsWorkflowPolicyTests(unittest.TestCase):
                 msg=f"{name} must pin Rust 1.97.1",
             )
 
+    def test_relay_monitor_fails_partial_ssh_configuration_and_pins_hosts(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "managed-relay-monitor.yml").read_text(
+            encoding="utf-8"
+        )
+        for secret in (
+            "DESKLINK_RELAY_SSH_TARGET",
+            "DESKLINK_RELAY_SSH_PRIVATE_KEY",
+            "DESKLINK_RELAY_SSH_KNOWN_HOSTS",
+        ):
+            self.assertIn(f"secrets.{secret}", workflow)
+        self.assertIn("Validate optional host-audit configuration", workflow)
+        self.assertIn("Audit relay host and diagnostics (when configured)", workflow)
+        self.assertIn("--known-hosts-file", workflow)
+        self.assertIn("dist/linux/managed-relay-host-audit.json", workflow)
+        self.assertIn("dist/linux/managed-diagnostics-audit.json", workflow)
+
     def test_signed_candidates_require_the_release_soak_duration(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "windows-signed-release.yml").read_text(
             encoding="utf-8"

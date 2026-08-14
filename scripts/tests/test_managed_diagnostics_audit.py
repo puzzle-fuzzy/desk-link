@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,15 @@ class ManagedDiagnosticsAuditTests(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             self.audit.validate_summary(value, now)
+
+    def test_rejects_missing_pinned_known_hosts_file(self) -> None:
+        arguments = type(
+            "Arguments",
+            (),
+            {"identity_file": Path("identity"), "known_hosts_file": Path("missing")},
+        )()
+        with self.assertRaisesRegex(RuntimeError, "known-hosts file does not exist"):
+            self.audit.remote(arguments, ["true"])
 
 
 if __name__ == "__main__":

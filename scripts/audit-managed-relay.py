@@ -38,6 +38,16 @@ def parse_args() -> argparse.Namespace:
             else None
         ),
     )
+    parser.add_argument(
+        "--known-hosts-file",
+        type=Path,
+        default=(
+            Path(os.environ["DESKLINK_RELAY_SSH_KNOWN_HOSTS"])
+            if os.environ.get("DESKLINK_RELAY_SSH_KNOWN_HOSTS")
+            else None
+        ),
+        help="Pinned OpenSSH known_hosts file used for non-interactive audits",
+    )
     parser.add_argument("--container", default="desklink-relay-relay-1")
     parser.add_argument(
         "--expected-source-commit",
@@ -58,6 +68,19 @@ def ssh_command(arguments: argparse.Namespace, remote_command: str) -> list[str]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
     if arguments.identity_file:
         command.extend(["-i", str(arguments.identity_file)])
+    if arguments.known_hosts_file:
+        if not arguments.known_hosts_file.is_file():
+            raise SystemExit(
+                f"SSH known-hosts file does not exist: {arguments.known_hosts_file}"
+            )
+        command.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                f"UserKnownHostsFile={arguments.known_hosts_file}",
+            ]
+        )
     command.extend([arguments.target, remote_command])
     return command
 

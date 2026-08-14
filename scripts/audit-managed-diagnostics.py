@@ -49,20 +49,46 @@ def parse_args() -> argparse.Namespace:
             else Path.home() / ".ssh" / "p2p-tencent-ed25519"
         ),
     )
+    parser.add_argument(
+        "--known-hosts-file",
+        type=Path,
+        default=(
+            Path(os.environ["DESKLINK_DIAGNOSTICS_SSH_KNOWN_HOSTS"])
+            if os.environ.get("DESKLINK_DIAGNOSTICS_SSH_KNOWN_HOSTS")
+            else None
+        ),
+        help="Pinned OpenSSH known_hosts file used for non-interactive audits",
+    )
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     return parser.parse_args()
 
 
 def remote(arguments: argparse.Namespace, command: list[str]) -> str:
+    ssh_options = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+    ]
+    if arguments.known_hosts_file:
+        if not arguments.known_hosts_file.is_file():
+            raise RuntimeError(
+                f"SSH known-hosts file does not exist: {arguments.known_hosts_file}"
+            )
+        ssh_options.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                f"UserKnownHostsFile={arguments.known_hosts_file}",
+            ]
+        )
     completed = subprocess.run(
         [
             "ssh",
             "-i",
             str(arguments.identity_file),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
+            *ssh_options,
             arguments.target,
             shlex.join(command),
         ],

@@ -16,6 +16,11 @@ jobs:
   probe:
     runs-on: windows-latest
     timeout-minutes: 10
+    env:
+      DESKLINK_RELAY_SSH_TARGET: ${{ secrets.DESKLINK_RELAY_SSH_TARGET }}
+      DESKLINK_RELAY_SSH_PRIVATE_KEY: ${{ secrets.DESKLINK_RELAY_SSH_PRIVATE_KEY }}
+      DESKLINK_RELAY_SSH_KNOWN_HOSTS: ${{ secrets.DESKLINK_RELAY_SSH_KNOWN_HOSTS }}
+      DESKLINK_RELAY_EXPECTED_SOURCE_COMMIT: ${{ secrets.DESKLINK_RELAY_EXPECTED_SOURCE_COMMIT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -28,11 +33,57 @@ jobs:
       - name: Verify production TLS and QUIC handshake
         run: python scripts/verify-managed-relay.py
 
+      - name: Validate optional host-audit configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $configured = @(
+            [bool]$env:DESKLINK_RELAY_SSH_TARGET,
+            [bool]$env:DESKLINK_RELAY_SSH_PRIVATE_KEY,
+            [bool]$env:DESKLINK_RELAY_SSH_KNOWN_HOSTS
+          )
+          $configuredCount = ($configured | Where-Object { $_ }).Count
+          if ($configuredCount -gt 0 -and $configuredCount -lt 3) {
+            throw 'Set DESKLINK_RELAY_SSH_TARGET, DESKLINK_RELAY_SSH_PRIVATE_KEY, and DESKLINK_RELAY_SSH_KNOWN_HOSTS together.'
+          }
+          if ($configuredCount -eq 0) {
+            Write-Host 'SSH host audit is not configured; public relay probe remains active.'
+          }
+
+      - name: Audit relay host and diagnostics (when configured)
+        if: ${{ env.DESKLINK_RELAY_SSH_TARGET != '' && env.DESKLINK_RELAY_SSH_PRIVATE_KEY != '' && env.DESKLINK_RELAY_SSH_KNOWN_HOSTS != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keyPath = Join-Path $env:RUNNER_TEMP 'desklink-relay-ed25519'
+          $knownHostsPath = Join-Path $env:RUNNER_TEMP 'desklink-relay-known-hosts'
+          [IO.File]::WriteAllText($keyPath, $env:DESKLINK_RELAY_SSH_PRIVATE_KEY)
+          [IO.File]::WriteAllText($knownHostsPath, $env:DESKLINK_RELAY_SSH_KNOWN_HOSTS)
+          icacls $keyPath /inheritance:r /grant:r "$env:USERNAME`:R" | Out-Null
+          icacls $knownHostsPath /inheritance:r /grant:r "$env:USERNAME`:R" | Out-Null
+
+          $relayArgs = @(
+            '--target', $env:DESKLINK_RELAY_SSH_TARGET,
+            '--identity-file', $keyPath,
+            '--known-hosts-file', $knownHostsPath
+          )
+          if ($env:DESKLINK_RELAY_EXPECTED_SOURCE_COMMIT) {
+            $relayArgs += @('--expected-source-commit', $env:DESKLINK_RELAY_EXPECTED_SOURCE_COMMIT)
+          }
+          python scripts/audit-managed-relay.py @relayArgs
+          python scripts/audit-managed-diagnostics.py `
+            --target $env:DESKLINK_RELAY_SSH_TARGET `
+            --identity-file $keyPath `
+            --known-hosts-file $knownHostsPath
+
       - name: Preserve probe report
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: managed-relay-probe-${{ github.run_id }}
-          path: dist/windows/managed-relay-verification.json
+          path: |
+            dist/windows/managed-relay-verification.json
+            dist/linux/managed-relay-host-audit.json
+            dist/linux/managed-diagnostics-audit.json
           if-no-files-found: warn
           retention-days: 14
