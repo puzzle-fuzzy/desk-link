@@ -2116,14 +2116,27 @@ async fn send_video_loop(
                         .clone()
                         .map(DirectLanVideoPath::new);
                     let had_direct_path = direct_path.is_some();
-                    send_video_datagram_with_fallback(
+                    let send_result = send_video_datagram_with_fallback(
                         &mut direct_path,
                         &relay_video_path,
                         ciphertext,
                     )
-                    .await?;
+                    .await;
                     if had_direct_path && direct_path.is_none() {
                         *direct_connection.lock().await = None;
+                    }
+                    match send_result {
+                        Ok(_) => {}
+                        Err(TransportError::Datagram(_)) => {
+                            // QUIC datagrams are intentionally lossy. A
+                            // transient congestion/MTU drop must not tear
+                            // down the entire authenticated host runtime;
+                            // request a fresh keyframe and let the next
+                            // encoded frame recover the controller instead.
+                            force_keyframe.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
                     }
                     if index % 16 == 15 {
                         tokio::task::yield_now().await;
