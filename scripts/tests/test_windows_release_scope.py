@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -31,6 +32,22 @@ class WindowsReleaseScopeTests(unittest.TestCase):
         self.assertEqual(scope["target"], "windows-10/11-x64")
         self.assertFalse(scope["macos_release"])
         self.assertFalse(scope["mobile_release"])
+
+    def test_windows_release_uses_the_pinned_bun_version(self) -> None:
+        self.assertEqual(self.verify.expected_bun_version(), "1.3.14")
+        completed = self.verify.subprocess.CompletedProcess(
+            ["bun", "--version"], 0, stdout="1.3.14\n", stderr=""
+        )
+        with patch.object(self.verify.subprocess, "run", return_value=completed):
+            self.assertEqual(self.verify.verify_bun_version(), "1.3.14")
+
+    def test_windows_release_rejects_a_different_bun_version(self) -> None:
+        completed = self.verify.subprocess.CompletedProcess(
+            ["bun", "--version"], 0, stdout="1.4.0\n", stderr=""
+        )
+        with patch.object(self.verify.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(SystemExit, "Bun 1.3.14 is required"):
+                self.verify.verify_bun_version()
 
     def test_rejects_old_cross_platform_release_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

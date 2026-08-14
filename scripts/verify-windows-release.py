@@ -28,6 +28,7 @@ WINDOWS_UI = ROOT / "apps" / "windows-ui"
 TARGET = "x86_64-pc-windows-msvc"
 README = ROOT / "README.md"
 COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+BUN_VERSION = re.compile(r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$")
 PRODUCT_CONFIG = WINDOWS_UI / "src" / "product-config.ts"
 RUST_RELAY_CONFIG = WINDOWS_UI / "src-tauri" / "src" / "local_relay.rs"
 WINDOWS_ASSETS = ROOT / "apps" / "windows" / "assets"
@@ -97,6 +98,35 @@ def verify_versions() -> str:
         detail = ", ".join(f"{name}={version}" for name, version in versions.items())
         raise SystemExit(f"Windows release versions do not match: {detail}")
     return unique.pop()
+
+
+def expected_bun_version() -> str:
+    package = json.loads((WINDOWS_UI / "package.json").read_text(encoding="utf-8"))
+    package_manager = package.get("packageManager")
+    if not isinstance(package_manager, str) or not package_manager.startswith("bun@"):
+        raise SystemExit("Windows UI packageManager must pin Bun")
+    version = package_manager.removeprefix("bun@").strip()
+    if not BUN_VERSION.fullmatch(version):
+        raise SystemExit("Windows UI packageManager contains an invalid Bun version")
+    return version
+
+
+def verify_bun_version() -> str:
+    expected = expected_bun_version()
+    completed = subprocess.run(
+        ["bun", "--version"],
+        cwd=WINDOWS_UI,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    actual = completed.stdout.strip()
+    if completed.returncode != 0 or actual != expected:
+        raise SystemExit(
+            f"Bun {expected} is required for the Windows release; detected {actual or 'unavailable'}"
+        )
+    return actual
 
 
 def required_match(path: Path, pattern: str, label: str) -> str:
@@ -271,6 +301,7 @@ def main() -> int:
         raise SystemExit("Windows release verification must run on Windows")
     prepare_windows_native_build_environment()
     prepare_windows_release_environment()
+    verify_bun_version()
     version = verify_versions()
     source_commit, source_dirty = source_metadata()
     release_scope = verify_release_scope()
