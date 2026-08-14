@@ -50,12 +50,21 @@ fn video_pipeline_sends_config_before_first_idr_and_only_once_per_version() {
         packet.header.flags,
         FrameFlags(FrameFlags::KEYFRAME.0 | FrameFlags::CONFIG.0)
     );
+    assert!(first.keyframe);
 
     let PrepareVideo::Ready(next) = pipeline.prepare(encoded(3, 1, false), 1280, 720).unwrap()
     else {
         panic!("expected delta frame");
     };
     assert!(next.video_config.is_none());
+
+    let PrepareVideo::Ready(recovery_keyframe) =
+        pipeline.prepare(encoded(4, 1, true), 1280, 720).unwrap()
+    else {
+        panic!("expected recovery keyframe to be ready");
+    };
+    assert!(recovery_keyframe.video_config.is_none());
+    assert!(recovery_keyframe.keyframe);
 }
 
 #[test]

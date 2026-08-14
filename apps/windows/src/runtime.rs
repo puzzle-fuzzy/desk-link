@@ -319,6 +319,7 @@ impl VideoFramePacer {
 pub struct PreparedVideo {
     pub video_config: Option<Vec<u8>>,
     pub datagrams: Vec<Vec<u8>>,
+    pub keyframe: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -843,6 +844,7 @@ impl HostVideoPipeline {
         Ok(PrepareVideo::Ready(PreparedVideo {
             video_config,
             datagrams,
+            keyframe: frame.keyframe,
         }))
     }
 }
@@ -2124,13 +2126,13 @@ async fn send_video_loop(
                 force_keyframe.store(true, Ordering::Release);
             }
             PrepareVideo::Ready(prepared) => {
-                // The first keyframe is large enough to span many QUIC
-                // datagrams. Relay pacing can take seconds to drain that
-                // burst, so carry the config-bearing keyframe over a reliable
-                // stream; subsequent frames keep the low-latency datagram
-                // path. Direct-LAN peers stay on datagrams throughout.
+                // Any keyframe is large enough to span many QUIC datagrams.
+                // Relay pacing or loss during recovery must not leave the
+                // controller without a decodable reference frame, so carry
+                // every relay keyframe over the bounded reliable batches.
+                // Direct-LAN peers stay on datagrams throughout.
                 let reliable_relay_keyframe =
-                    prepared.video_config.is_some() && direct_connection.lock().await.is_none();
+                    prepared.keyframe && direct_connection.lock().await.is_none();
                 if !reported_first_ready {
                     eprintln!(
                         "DeskLink video pipeline prepared its first frame (stream_id={} datagrams={} config={})",
