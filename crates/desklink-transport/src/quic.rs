@@ -22,7 +22,7 @@ const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
 const INBOUND_DATAGRAM_QUEUE_CAPACITY: usize = 128;
 const INBOUND_AUDIO_QUEUE_CAPACITY: usize = 8;
 const INBOUND_CLOSED_QUEUE_CAPACITY: usize = 8;
-const INBOUND_LANE_COUNT: usize = 8;
+const INBOUND_LANE_COUNT: usize = 9;
 // A relay replacement closes the previous peer stream before the replacement
 // has necessarily emitted its first reliable payload.  Keep that disconnect
 // as a bounded hint briefly so the newer peer generation can supersede it.
@@ -48,6 +48,7 @@ struct ClientInner {
     control: Mutex<Option<ReliableSendStream>>,
     input: Mutex<Option<ReliableSendStream>>,
     video_config: Mutex<Option<ReliableSendStream>>,
+    video_reliable: Mutex<Option<ReliableSendStream>>,
     transfer: Mutex<Option<ReliableSendStream>>,
     active_peer_generation: Arc<AtomicU64>,
     events: InboundReceivers,
@@ -68,6 +69,7 @@ struct InboundSenders {
     control: mpsc::Sender<InboundEvent>,
     input: mpsc::Sender<InboundEvent>,
     video_config: mpsc::Sender<InboundEvent>,
+    video_reliable: mpsc::Sender<InboundEvent>,
     video_datagram: mpsc::Sender<InboundEvent>,
     cursor_datagram: mpsc::Sender<InboundEvent>,
     audio_datagram: mpsc::Sender<InboundEvent>,
@@ -81,6 +83,7 @@ struct InboundReceivers {
     pending_control: Mutex<Option<InboundEvent>>,
     input: Mutex<mpsc::Receiver<InboundEvent>>,
     video_config: Mutex<mpsc::Receiver<InboundEvent>>,
+    video_reliable: Mutex<mpsc::Receiver<InboundEvent>>,
     video_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
     cursor_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
     audio_datagram: Mutex<mpsc::Receiver<InboundEvent>>,
@@ -90,6 +93,7 @@ struct InboundReceivers {
     control_open: AtomicBool,
     input_open: AtomicBool,
     video_config_open: AtomicBool,
+    video_reliable_open: AtomicBool,
     video_datagram_open: AtomicBool,
     cursor_datagram_open: AtomicBool,
     audio_datagram_open: AtomicBool,
@@ -102,6 +106,7 @@ struct InboundReceiverChannels {
     control: mpsc::Receiver<InboundEvent>,
     input: mpsc::Receiver<InboundEvent>,
     video_config: mpsc::Receiver<InboundEvent>,
+    video_reliable: mpsc::Receiver<InboundEvent>,
     video_datagram: mpsc::Receiver<InboundEvent>,
     cursor_datagram: mpsc::Receiver<InboundEvent>,
     audio_datagram: mpsc::Receiver<InboundEvent>,
@@ -123,6 +128,7 @@ impl InboundReceivers {
             pending_control: Mutex::new(None),
             input: Mutex::new(channels.input),
             video_config: Mutex::new(channels.video_config),
+            video_reliable: Mutex::new(channels.video_reliable),
             video_datagram: Mutex::new(channels.video_datagram),
             cursor_datagram: Mutex::new(channels.cursor_datagram),
             audio_datagram: Mutex::new(channels.audio_datagram),
@@ -132,6 +138,7 @@ impl InboundReceivers {
             control_open: AtomicBool::new(true),
             input_open: AtomicBool::new(true),
             video_config_open: AtomicBool::new(true),
+            video_reliable_open: AtomicBool::new(true),
             video_datagram_open: AtomicBool::new(true),
             cursor_datagram_open: AtomicBool::new(true),
             audio_datagram_open: AtomicBool::new(true),
@@ -145,6 +152,7 @@ impl InboundReceivers {
         self.control_open.load(Ordering::Acquire)
             || self.input_open.load(Ordering::Acquire)
             || self.video_config_open.load(Ordering::Acquire)
+            || self.video_reliable_open.load(Ordering::Acquire)
             || self.video_datagram_open.load(Ordering::Acquire)
             || self.cursor_datagram_open.load(Ordering::Acquire)
             || self.audio_datagram_open.load(Ordering::Acquire)
@@ -157,6 +165,7 @@ impl InboundReceivers {
             0 => self.control_open.load(Ordering::Acquire),
             1 => self.input_open.load(Ordering::Acquire),
             2 => self.video_config_open.load(Ordering::Acquire),
+            8 => self.video_reliable_open.load(Ordering::Acquire),
             3 => self.video_datagram_open.load(Ordering::Acquire),
             4 => self.cursor_datagram_open.load(Ordering::Acquire),
             5 => self.closed_open.load(Ordering::Acquire),
@@ -171,6 +180,7 @@ impl InboundReceivers {
             0 => &self.control,
             1 => &self.input,
             2 => &self.video_config,
+            8 => &self.video_reliable,
             3 => &self.video_datagram,
             4 => &self.cursor_datagram,
             5 => &self.closed,
@@ -204,6 +214,7 @@ impl InboundReceivers {
             0 => self.control_open.store(false, Ordering::Release),
             1 => self.input_open.store(false, Ordering::Release),
             2 => self.video_config_open.store(false, Ordering::Release),
+            8 => self.video_reliable_open.store(false, Ordering::Release),
             3 => self.video_datagram_open.store(false, Ordering::Release),
             4 => self.cursor_datagram_open.store(false, Ordering::Release),
             5 => self.closed_open.store(false, Ordering::Release),
@@ -270,6 +281,8 @@ impl QuicClient {
         let (input_sender, input_receiver) = mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
         let (video_config_sender, video_config_receiver) =
             mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
+        let (video_reliable_sender, video_reliable_receiver) =
+            mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
         let (video_datagram_sender, video_datagram_receiver) =
             mpsc::channel(INBOUND_DATAGRAM_QUEUE_CAPACITY);
         let (cursor_datagram_sender, cursor_datagram_receiver) =
@@ -282,6 +295,7 @@ impl QuicClient {
             control: control_sender,
             input: input_sender,
             video_config: video_config_sender,
+            video_reliable: video_reliable_sender,
             video_datagram: video_datagram_sender,
             cursor_datagram: cursor_datagram_sender,
             audio_datagram: audio_datagram_sender,
@@ -297,6 +311,7 @@ impl QuicClient {
             control: Mutex::new(None),
             input: Mutex::new(None),
             video_config: Mutex::new(None),
+            video_reliable: Mutex::new(None),
             transfer: Mutex::new(None),
             active_peer_generation: active_peer_generation.clone(),
             events: InboundReceivers::new(
@@ -304,6 +319,7 @@ impl QuicClient {
                     control: control_receiver,
                     input: input_receiver,
                     video_config: video_config_receiver,
+                    video_reliable: video_reliable_receiver,
                     video_datagram: video_datagram_receiver,
                     cursor_datagram: cursor_datagram_receiver,
                     audio_datagram: audio_datagram_receiver,
@@ -449,6 +465,15 @@ impl QuicClient {
             .await
     }
 
+    pub async fn send_video_reliable_for_generation(
+        &self,
+        expected_generation: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_reliable(ChannelKind::VideoReliable, Some(expected_generation), bytes)
+            .await
+    }
+
     pub async fn send_transfer(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
         self.send_reliable(ChannelKind::Transfer, None, bytes).await
     }
@@ -469,6 +494,7 @@ impl QuicClient {
         finish_reliable_stream(&self.inner.control).await;
         finish_reliable_stream(&self.inner.input).await;
         finish_reliable_stream(&self.inner.video_config).await;
+        finish_reliable_stream(&self.inner.video_reliable).await;
         finish_reliable_stream(&self.inner.transfer).await;
     }
 
@@ -564,6 +590,15 @@ impl QuicClient {
                         }
                     }
                     self.inner.events.close_lane(2);
+                }
+                event = receive_current_inbound(&self.inner.events.video_reliable, &self.inner.events.active_peer_generation), if self.inner.events.video_reliable_open.load(Ordering::Acquire) => {
+                    if let Some(event) = event {
+                        self.inner.events.set_next_lane(8);
+                        if let Some(event) = self.settle_peer_event(event).await {
+                            return Ok(event);
+                        }
+                    }
+                    self.inner.events.close_lane(8);
                 }
                 event = receive_current_inbound(&self.inner.events.video_datagram, &self.inner.events.active_peer_generation), if self.inner.events.video_datagram_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
@@ -867,6 +902,7 @@ impl QuicClient {
             ChannelKind::Control => &self.inner.control,
             ChannelKind::Input => &self.inner.input,
             ChannelKind::VideoConfig => &self.inner.video_config,
+            ChannelKind::VideoReliable => &self.inner.video_reliable,
             ChannelKind::Transfer => &self.inner.transfer,
             ChannelKind::VideoDatagram
             | ChannelKind::CursorDatagram
@@ -1251,6 +1287,7 @@ async fn read_reliable_stream(
         ChannelKind::Control => events.control,
         ChannelKind::Input => events.input,
         ChannelKind::VideoConfig => events.video_config,
+        ChannelKind::VideoReliable => events.video_reliable,
         ChannelKind::Transfer => events.transfer,
         ChannelKind::VideoDatagram | ChannelKind::CursorDatagram | ChannelKind::AudioDatagram => {
             unreachable!()
@@ -1296,6 +1333,7 @@ async fn read_reliable_stream(
             ChannelKind::Control => TransportEvent::Control(bytes),
             ChannelKind::Input => TransportEvent::Input(bytes),
             ChannelKind::VideoConfig => TransportEvent::VideoConfig(bytes),
+            ChannelKind::VideoReliable => TransportEvent::VideoReliable(bytes),
             ChannelKind::Transfer => TransportEvent::Transfer(bytes),
             ChannelKind::VideoDatagram
             | ChannelKind::CursorDatagram

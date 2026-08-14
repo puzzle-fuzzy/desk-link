@@ -2124,6 +2124,13 @@ async fn send_video_loop(
                 force_keyframe.store(true, Ordering::Release);
             }
             PrepareVideo::Ready(prepared) => {
+                // The first keyframe is large enough to span many QUIC
+                // datagrams. Relay pacing can take seconds to drain that
+                // burst, so carry the config-bearing keyframe over a reliable
+                // stream; subsequent frames keep the low-latency datagram
+                // path. Direct-LAN peers stay on datagrams throughout.
+                let reliable_relay_keyframe =
+                    prepared.video_config.is_some() && direct_connection.lock().await.is_none();
                 if !reported_first_ready {
                     eprintln!(
                         "DeskLink video pipeline prepared its first frame (stream_id={} datagrams={} config={})",
@@ -2164,12 +2171,22 @@ async fn send_video_loop(
                         .clone()
                         .map(DirectLanVideoPath::new);
                     let had_direct_path = direct_path.is_some();
-                    let send_result = send_video_datagram_with_fallback(
-                        &mut direct_path,
-                        &relay_video_path,
-                        ciphertext,
-                    )
-                    .await;
+                    let send_result = if reliable_relay_keyframe && direct_path.is_none() {
+                        client
+                            .send_video_reliable_for_generation(
+                                peer_generation,
+                                seal(&secure, SecureLane::VideoReliable, &datagram).await?,
+                            )
+                            .await
+                            .map(|()| VideoDatagramRoute::Relay)
+                    } else {
+                        send_video_datagram_with_fallback(
+                            &mut direct_path,
+                            &relay_video_path,
+                            ciphertext,
+                        )
+                        .await
+                    };
                     if !reported_first_datagram_stage {
                         eprintln!(
                             "DeskLink video datagram send returned (stream_id={} route={:?} ok={})",

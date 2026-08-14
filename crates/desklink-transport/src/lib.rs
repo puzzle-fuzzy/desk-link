@@ -199,13 +199,14 @@ pub enum ChannelKind {
     CursorDatagram = 5,
     Transfer = 6,
     AudioDatagram = 7,
+    VideoReliable = 8,
 }
 
 impl ChannelKind {
     pub fn is_reliable(self) -> bool {
         matches!(
             self,
-            Self::Control | Self::Input | Self::VideoConfig | Self::Transfer
+            Self::Control | Self::Input | Self::VideoConfig | Self::Transfer | Self::VideoReliable
         )
     }
 }
@@ -222,6 +223,7 @@ impl TryFrom<u8> for ChannelKind {
             5 => Ok(Self::CursorDatagram),
             6 => Ok(Self::Transfer),
             7 => Ok(Self::AudioDatagram),
+            8 => Ok(Self::VideoReliable),
             _ => Err(()),
         }
     }
@@ -700,6 +702,7 @@ pub enum TransportEvent {
     CursorDatagram(Vec<u8>),
     Transfer(Vec<u8>),
     AudioDatagram(Vec<u8>),
+    VideoReliable(Vec<u8>),
     PeerDisconnected { channel: ChannelKind },
     Closed { reason: String },
 }

@@ -332,10 +332,11 @@ pub enum SecureLane {
     CursorDatagram = 4,
     Transfer = 5,
     AudioDatagram = 6,
+    VideoReliable = 7,
 }
 
 impl SecureLane {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Control,
@@ -345,6 +346,7 @@ impl SecureLane {
         Self::CursorDatagram,
         Self::Transfer,
         Self::AudioDatagram,
+        Self::VideoReliable,
     ];
 
     const fn index(self) -> usize {

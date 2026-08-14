@@ -14,7 +14,7 @@ use desklink_protocol::{
     AccessDenialReason, AudioPacket, Codec, ControlMessage, CursorUpdate, DeviceCapabilities,
     DeviceRole, DirectLanCandidate, H264Profile, InputEnvelope, InputEvent, NoiseHandshake,
     NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage, VideoConfig,
-    VideoQualityPreference, decode_audio_packet, decode_control, decode_cursor_update,
+    VideoPacket, VideoQualityPreference, decode_audio_packet, decode_control, decode_cursor_update,
     decode_noise_handshake, decode_transfer, decode_video_config, decode_video_packet,
     encode_control, encode_input, encode_noise_handshake, encode_transfer,
 };
@@ -123,6 +123,7 @@ pub struct ControllerRuntime {
     assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
     pending_video_datagrams: VecDeque<Vec<u8>>,
+    pending_video_reliable: VecDeque<Vec<u8>>,
     active_stream: AtomicU64,
     metrics: AtomicControllerMetrics,
     keyframe_needed_after_config: bool,
@@ -224,6 +225,7 @@ impl ControllerRuntime {
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
             video_config: None,
             pending_video_datagrams: VecDeque::new(),
+            pending_video_reliable: VecDeque::new(),
             active_stream: AtomicU64::new(0),
             metrics: AtomicControllerMetrics::default(),
             keyframe_needed_after_config: false,
@@ -361,6 +363,14 @@ impl ControllerRuntime {
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
         loop {
             if self.video_config.is_some()
+                && let Some(ciphertext) = self.pending_video_reliable.pop_front()
+            {
+                if let Some(event) = self.handle_video_reliable(ciphertext).await? {
+                    return Ok(event);
+                }
+                continue;
+            }
+            if self.video_config.is_some()
                 && let Some(ciphertext) = self.pending_video_datagrams.pop_front()
             {
                 if let Some(event) = self.handle_video_datagram(ciphertext).await? {
@@ -446,6 +456,20 @@ impl ControllerRuntime {
                     }
                     return Ok(ControllerEvent::VideoConfig(config));
                 }
+                TransportEvent::VideoReliable(ciphertext) => {
+                    if self.video_config.is_none() {
+                        if self.pending_video_reliable.len() >= PENDING_VIDEO_DATAGRAM_CAPACITY {
+                            self.pending_video_reliable.pop_front();
+                            self.drop_video_packet();
+                        }
+                        self.pending_video_reliable.push_back(ciphertext);
+                        self.keyframe_needed_after_config = true;
+                        continue;
+                    }
+                    if let Some(event) = self.handle_video_reliable(ciphertext).await? {
+                        return Ok(event);
+                    }
+                }
                 TransportEvent::VideoDatagram(ciphertext) => {
                     self.metrics
                         .received_video_packets
@@ -524,7 +548,23 @@ impl ControllerRuntime {
             self.drop_video_packet();
             return Ok(None);
         };
-        let packet = decode_video_packet(&plaintext)?;
+        self.handle_video_packet(decode_video_packet(&plaintext)?)
+            .await
+    }
+
+    async fn handle_video_reliable(
+        &mut self,
+        ciphertext: Vec<u8>,
+    ) -> Result<Option<ControllerEvent>, ControllerError> {
+        let plaintext = open(&self.secure, SecureLane::VideoReliable, &ciphertext).await?;
+        self.handle_video_packet(decode_video_packet(&plaintext)?)
+            .await
+    }
+
+    async fn handle_video_packet(
+        &mut self,
+        packet: VideoPacket,
+    ) -> Result<Option<ControllerEvent>, ControllerError> {
         let Some(config) = &self.video_config else {
             self.drop_video_packet();
             self.keyframe_needed_after_config = true;

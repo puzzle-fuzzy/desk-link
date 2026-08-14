@@ -1581,6 +1581,7 @@ const fn channel_label(channel: ChannelKind) -> &'static str {
         ChannelKind::Control => "control",
         ChannelKind::Input => "input",
         ChannelKind::VideoConfig => "video_config",
+        ChannelKind::VideoReliable => "video_reliable",
         ChannelKind::VideoDatagram => "video_datagram",
         ChannelKind::CursorDatagram => "cursor_datagram",
         ChannelKind::Transfer => "transfer",

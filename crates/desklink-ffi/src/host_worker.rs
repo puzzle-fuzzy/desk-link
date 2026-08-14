@@ -853,6 +853,7 @@ async fn run_connected(
                 return Err(HostError::Transport("controller disconnected".to_owned()));
             }
             TransportEvent::VideoConfig(_)
+            | TransportEvent::VideoReliable(_)
             | TransportEvent::VideoDatagram(_)
             | TransportEvent::CursorDatagram(_)
             | TransportEvent::AudioDatagram(_) => {
