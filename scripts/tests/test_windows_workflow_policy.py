@@ -14,6 +14,7 @@ class WindowsWorkflowPolicyTests(unittest.TestCase):
         self.assertRegex(toolchain, r'(?m)^channel\s*=\s*"1\.97\.1"\s*$')
         for name in (
             "windows-ci.yml",
+            "windows-resilience-nightly.yml",
             "windows-signed-release.yml",
             "security-scan.yml",
             "managed-relay-monitor.yml",
@@ -81,6 +82,19 @@ class WindowsWorkflowPolicyTests(unittest.TestCase):
             r"--manual-json dist/windows/windows-acceptance-record\.json\s+"
             r"--minimum-soak-seconds 300",
         )
+
+    def test_nightly_workflow_keeps_the_long_soak_guard(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "windows-resilience-nightly.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            workflow,
+            r"name: Run 300 second Windows resilience checks\s+"
+            r"run: >-\s+"
+            r"python scripts/verify-windows-resilience\.py\s+"
+            r"--soak-seconds 300",
+        )
+        self.assertIn("name: DeskLink-Windows-resilience-${{ github.run_id }}", workflow)
 
 
 if __name__ == "__main__":
