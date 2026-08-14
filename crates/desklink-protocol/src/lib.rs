@@ -3,9 +3,10 @@ mod codec;
 pub use codec::{
     ProtocolError, decode_audio_packet, decode_control, decode_cursor_update, decode_input,
     decode_noise_handshake, decode_session_input, decode_transfer, decode_video_config,
-    decode_video_header, decode_video_packet, encode_audio_packet, encode_control,
-    encode_cursor_update, encode_input, encode_noise_handshake, encode_transfer,
+    decode_video_header, decode_video_packet, decode_video_reliable_batch, encode_audio_packet,
+    encode_control, encode_cursor_update, encode_input, encode_noise_handshake, encode_transfer,
     encode_video_config, encode_video_header, encode_video_packet, encode_video_packet_parts,
+    encode_video_reliable_batch,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -58,6 +59,11 @@ pub const MAX_DIRECT_LAN_CANDIDATE_TTL_S: u16 = 10;
 /// Maximum H.264 datagrams in one frame; bounds per-frame assembly memory while
 /// allowing 4 MiB of encoded data at the 1024-byte MVP chunk size.
 pub const MAX_VIDEO_CHUNKS: u16 = 4096;
+/// Reliable relay keyframes are grouped into bounded batches so a large
+/// access unit does not become hundreds of independently scheduled stream
+/// messages. Keep the batch below the transport reliable-message limit while
+/// leaving room for framing and encryption overhead.
+pub const MAX_VIDEO_RELIABLE_BATCH_BYTES: usize = 60 * 1024;
 pub const MAX_INPUT_AGE_US: u64 = 5_000_000;
 pub const MAX_INPUT_FUTURE_SKEW_US: u64 = 1_000_000;
 pub const MAX_POINTER_COORDINATE: i32 = 1_000_000;

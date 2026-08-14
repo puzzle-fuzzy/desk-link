@@ -11,9 +11,10 @@ use desklink_protocol::{
     VideoFrameBudget, VideoFrameHeader, VideoPacket, VideoQualityPreference, VideoQualityPreset,
     decode_audio_packet, decode_control, decode_cursor_update, decode_input,
     decode_noise_handshake, decode_transfer, decode_video_config, decode_video_header,
-    decode_video_packet, encode_audio_packet, encode_control, encode_cursor_update, encode_input,
-    encode_noise_handshake, encode_transfer, encode_video_config, encode_video_header,
-    encode_video_packet, is_valid_transfer_file_name,
+    decode_video_packet, decode_video_reliable_batch, encode_audio_packet, encode_control,
+    encode_cursor_update, encode_input, encode_noise_handshake, encode_transfer,
+    encode_video_config, encode_video_header, encode_video_packet, encode_video_reliable_batch,
+    is_valid_transfer_file_name,
 };
 use std::net::SocketAddr;
 
@@ -837,4 +838,25 @@ fn raw_video_packet_wire_round_trip_and_rejection() {
         decode_video_packet(&bytes),
         Err(ProtocolError::PayloadLengthMismatch { .. })
     ));
+}
+
+#[test]
+fn reliable_video_batch_round_trips_and_is_tagged() {
+    let packets = (0..3)
+        .map(|chunk_index| {
+            let mut packet_header = header();
+            packet_header.chunk_index = chunk_index;
+            packet_header.chunk_count = 3;
+            encode_video_packet(
+                &VideoPacket::new(packet_header, vec![chunk_index as u8; 3]).expect("packet"),
+            )
+            .expect("encode packet")
+        })
+        .collect::<Vec<_>>();
+    let encoded = encode_video_reliable_batch(&packets).expect("encode reliable batch");
+    assert_eq!(encoded.first(), Some(&0xd7));
+    let decoded = decode_video_reliable_batch(&encoded).expect("decode reliable batch");
+    assert_eq!(decoded.len(), packets.len());
+    assert_eq!(decoded[2].header.chunk_index, 2);
+    assert!(decode_video_reliable_batch(&packets[0]).is_err());
 }

@@ -16,7 +16,8 @@ use desklink_protocol::{
     NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage, VideoConfig,
     VideoPacket, VideoQualityPreference, decode_audio_packet, decode_control, decode_cursor_update,
     decode_noise_handshake, decode_transfer, decode_video_config, decode_video_packet,
-    encode_control, encode_input, encode_noise_handshake, encode_transfer,
+    decode_video_reliable_batch, encode_control, encode_input, encode_noise_handshake,
+    encode_transfer,
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{
@@ -506,9 +507,6 @@ impl ControllerRuntime {
                     return Ok(ControllerEvent::VideoConfig(config));
                 }
                 TransportEvent::VideoReliable(ciphertext) => {
-                    self.metrics
-                        .received_video_reliable_packets
-                        .fetch_add(1, Ordering::Relaxed);
                     if self.video_config.is_none() {
                         if self.pending_video_reliable.len() >= PENDING_VIDEO_DATAGRAM_CAPACITY {
                             self.pending_video_reliable.pop_front();
@@ -612,11 +610,22 @@ impl ControllerRuntime {
         ciphertext: Vec<u8>,
     ) -> Result<Option<ControllerEvent>, ControllerError> {
         let plaintext = open(&self.secure, SecureLane::VideoReliable, &ciphertext).await?;
-        self.handle_video_packet(
-            decode_video_packet(&plaintext)?,
-            VideoPacketSource::Reliable,
-        )
-        .await
+        let packets = match decode_video_reliable_batch(&plaintext) {
+            Ok(packets) => packets,
+            Err(_) => vec![decode_video_packet(&plaintext)?],
+        };
+        self.metrics
+            .received_video_reliable_packets
+            .fetch_add(packets.len() as u64, Ordering::Relaxed);
+        for packet in packets {
+            if let Some(event) = self
+                .handle_video_packet(packet, VideoPacketSource::Reliable)
+                .await?
+            {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
     }
 
     async fn handle_video_packet(

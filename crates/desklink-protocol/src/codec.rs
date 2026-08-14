@@ -4,9 +4,9 @@ use crate::{
     MAX_AUDIO_PAYLOAD_BYTES, MAX_CONTROL_MESSAGE_BYTES, MAX_CURSOR_MESSAGE_BYTES,
     MAX_DATAGRAM_PAYLOAD_BYTES, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_MVP_HEIGHT,
     MAX_MVP_WIDTH, MAX_NOISE_HANDSHAKE_BYTES, MAX_OPUS_AUDIO_PAYLOAD_BYTES, MAX_POINTER_COORDINATE,
-    MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_BYTES, MAX_WHEEL_DELTA,
-    NoiseHandshake, PROTOCOL_VERSION, TransferMessage, VideoConfig, VideoFrameHeader, VideoPacket,
-    is_private_or_loopback_address,
+    MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_BYTES,
+    MAX_VIDEO_RELIABLE_BATCH_BYTES, MAX_WHEEL_DELTA, NoiseHandshake, PROTOCOL_VERSION,
+    TransferMessage, VideoConfig, VideoFrameHeader, VideoPacket, is_private_or_loopback_address,
 };
 use thiserror::Error;
 
@@ -381,6 +381,72 @@ pub fn decode_video_packet(bytes: &[u8]) -> Result<VideoPacket, ProtocolError> {
     let packet: VideoPacket = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
     VideoPacket::new(packet.header, packet.payload)
 }
+
+/// Encodes several already packetized video chunks into one bounded reliable
+/// relay message. The relay lane is ordered and reliable, so batching reduces
+/// per-message scheduling and flow-control overhead without changing frame
+/// assembly semantics.
+pub fn encode_video_reliable_batch(packets: &[Vec<u8>]) -> Result<Vec<u8>, ProtocolError> {
+    if packets.is_empty() || packets.len() > usize::from(MAX_VIDEO_CHUNKS) {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    let count = u16::try_from(packets.len()).map_err(|_| ProtocolError::InvalidFrame)?;
+    let mut bytes =
+        Vec::with_capacity(1 + 2 + packets.iter().map(|packet| 2 + packet.len()).sum::<usize>());
+    bytes.push(VIDEO_RELIABLE_BATCH_TAG);
+    bytes.extend(count.to_le_bytes());
+    for packet in packets {
+        let length = u16::try_from(packet.len()).map_err(|_| ProtocolError::MessageTooLarge {
+            actual: packet.len(),
+            maximum: usize::from(u16::MAX),
+        })?;
+        bytes.extend(length.to_le_bytes());
+        bytes.extend(packet);
+    }
+    bounded(bytes, MAX_VIDEO_RELIABLE_BATCH_BYTES)
+}
+
+/// Decodes one reliable relay batch and validates every contained video
+/// packet. The caller may still accept a single packet for test fixtures and
+/// direct callers; production relay keyframes use this batch form.
+pub fn decode_video_reliable_batch(bytes: &[u8]) -> Result<Vec<VideoPacket>, ProtocolError> {
+    ensure(bytes, MAX_VIDEO_RELIABLE_BATCH_BYTES)?;
+    if bytes.first().copied() != Some(VIDEO_RELIABLE_BATCH_TAG) {
+        return Err(ProtocolError::Malformed);
+    }
+    if bytes.len() < 3 {
+        return Err(ProtocolError::Malformed);
+    }
+    let count = usize::from(u16::from_le_bytes([bytes[1], bytes[2]]));
+    if count == 0 || count > usize::from(MAX_VIDEO_CHUNKS) {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    let mut offset = 3;
+    let mut packets = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len().saturating_sub(offset) < 2 {
+            return Err(ProtocolError::Malformed);
+        }
+        let length = usize::from(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]));
+        offset += 2;
+        if length == 0 || length > MAX_VIDEO_PACKET_BYTES {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        let end = offset.checked_add(length).ok_or(ProtocolError::Malformed)?;
+        if end > bytes.len() {
+            return Err(ProtocolError::Malformed);
+        }
+        packets.push(decode_video_packet(&bytes[offset..end])?);
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err(ProtocolError::Malformed);
+    }
+    Ok(packets)
+}
+
+const VIDEO_RELIABLE_BATCH_TAG: u8 = 0xd7;
+
 fn bounded(bytes: Vec<u8>, maximum: usize) -> Result<Vec<u8>, ProtocolError> {
     if bytes.len() > maximum {
         Err(ProtocolError::MessageTooLarge {
