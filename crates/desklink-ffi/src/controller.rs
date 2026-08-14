@@ -100,6 +100,7 @@ pub enum ControllerEvent {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ControllerMetrics {
     pub received_video_packets: u64,
+    pub received_video_reliable_packets: u64,
     pub dropped_video_packets: u64,
     pub completed_frames: u64,
 }
@@ -107,6 +108,7 @@ pub struct ControllerMetrics {
 #[derive(Default)]
 struct AtomicControllerMetrics {
     received_video_packets: AtomicU64,
+    received_video_reliable_packets: AtomicU64,
     dropped_video_packets: AtomicU64,
     completed_frames: AtomicU64,
 }
@@ -115,6 +117,9 @@ impl AtomicControllerMetrics {
     fn snapshot(&self) -> ControllerMetrics {
         ControllerMetrics {
             received_video_packets: self.received_video_packets.load(Ordering::Relaxed),
+            received_video_reliable_packets: self
+                .received_video_reliable_packets
+                .load(Ordering::Relaxed),
             dropped_video_packets: self.dropped_video_packets.load(Ordering::Relaxed),
             completed_frames: self.completed_frames.load(Ordering::Relaxed),
         }
@@ -489,6 +494,9 @@ impl ControllerRuntime {
                     return Ok(ControllerEvent::VideoConfig(config));
                 }
                 TransportEvent::VideoReliable(ciphertext) => {
+                    self.metrics
+                        .received_video_reliable_packets
+                        .fetch_add(1, Ordering::Relaxed);
                     if self.video_config.is_none() {
                         if self.pending_video_reliable.len() >= PENDING_VIDEO_DATAGRAM_CAPACITY {
                             self.pending_video_reliable.pop_front();

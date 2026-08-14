@@ -218,8 +218,9 @@ mod windows {
             Err(_) => {
                 let metrics = controller.metrics();
                 panic!(
-                    "managed relay did not deliver an H.264 frame: received_video_packets={} dropped_video_packets={} completed_frames={} video_path={:?}",
+                    "managed relay did not deliver an H.264 frame: received_video_packets={} received_video_reliable_packets={} dropped_video_packets={} completed_frames={} video_path={:?}",
                     metrics.received_video_packets,
+                    metrics.received_video_reliable_packets,
                     metrics.dropped_video_packets,
                     metrics.completed_frames,
                     controller.video_path_kind(),
