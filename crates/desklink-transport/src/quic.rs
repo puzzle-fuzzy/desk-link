@@ -1063,16 +1063,13 @@ async fn receive_payload(
 }
 
 async fn read_connection(connection: quinn::Connection, events: InboundSenders) {
+    let reliable_connection = connection.clone();
+    let reliable_events = events.clone();
+    tokio::spawn(async move {
+        accept_reliable_streams(reliable_connection, reliable_events).await;
+    });
     loop {
         tokio::select! {
-            accepted = connection.accept_bi() => {
-                let Ok((_send, receive)) = accepted else {
-                    emit_closed(&events.closed, "reliable stream accept failed");
-                    break;
-                };
-                let events = events.clone();
-                tokio::spawn(read_reliable_stream(connection.clone(), receive, events));
-            }
             datagram = connection.read_datagram() => {
                 let Ok(datagram) = datagram else {
                     emit_closed(&events.closed, "datagram receive failed");
@@ -1085,16 +1082,25 @@ async fn read_connection(connection: quinn::Connection, events: InboundSenders) 
                                 .active_peer_generation
                                 .fetch_max(peer_generation, Ordering::AcqRel);
                         }
+                        let is_video = matches!(event.event, TransportEvent::VideoDatagram(_));
                         let sender = match &event.event {
                             TransportEvent::VideoDatagram(_) => &events.video_datagram,
                             TransportEvent::CursorDatagram(_) => &events.cursor_datagram,
                             TransportEvent::AudioDatagram(_) => &events.audio_datagram,
                             _ => unreachable!(),
                         };
-                        // Datagram delivery is intentionally lossy at this bounded boundary:
-                        // drop the newest packet when its channel is saturated, while reliable
-                        // channels retain backpressure only within their own queue.
-                        let _ = sender.try_send(event);
+                        if is_video {
+                            // Video frames are packetized across many datagrams. Applying
+                            // backpressure here prevents a keyframe burst from dropping its
+                            // newest chunks before the controller can assemble a complete frame.
+                            // Reliable lanes are read by their own tasks, so this cannot starve
+                            // input, control, or transfer delivery.
+                            let _ = sender.send(event).await;
+                        } else {
+                            // Cursor and audio are intentionally lossy at this bounded boundary;
+                            // stale samples are less useful than keeping the event loop responsive.
+                            let _ = sender.try_send(event);
+                        }
                     }
                     Err(()) => {
                         connection.close(quinn::VarInt::from_u32(3), b"malformed datagram");
@@ -1108,6 +1114,19 @@ async fn read_connection(connection: quinn::Connection, events: InboundSenders) 
                 break;
             }
         }
+    }
+}
+
+async fn accept_reliable_streams(connection: quinn::Connection, events: InboundSenders) {
+    loop {
+        let Ok((_send, receive)) = connection.accept_bi().await else {
+            return;
+        };
+        tokio::spawn(read_reliable_stream(
+            connection.clone(),
+            receive,
+            events.clone(),
+        ));
     }
 }
 
