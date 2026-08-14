@@ -50,6 +50,11 @@ const ASSEMBLY_CAPACITY: usize = 3;
 // drops obsolete deltas and older keyframes below so memory remains bounded.
 const ASSEMBLY_MAX_AGE: Duration = Duration::from_secs(10);
 const PENDING_VIDEO_DATAGRAM_CAPACITY: usize = 256;
+// The config and the first relay keyframe use separate QUIC streams. Give
+// that keyframe a short grace window before asking the host to generate a
+// newer frame, which could otherwise overtake and invalidate the in-flight
+// assembly.
+const INITIAL_KEYFRAME_GRACE: Duration = Duration::from_millis(1500);
 // A successful authenticated probe only proves that the endpoints can open a
 // datagram socket. If a firewall silently drops the subsequent video packets,
 // do not leave the controller on a permanently black direct surface.
@@ -127,6 +132,7 @@ pub struct ControllerRuntime {
     active_stream: AtomicU64,
     metrics: AtomicControllerMetrics,
     keyframe_needed_after_config: bool,
+    keyframe_fallback_deadline: Option<Instant>,
     video_continuity: VideoContinuity,
     video_path: DirectVideoPathMachine,
     direct_session: Option<DirectLanSession>,
@@ -229,6 +235,7 @@ impl ControllerRuntime {
             active_stream: AtomicU64::new(0),
             metrics: AtomicControllerMetrics::default(),
             keyframe_needed_after_config: false,
+            keyframe_fallback_deadline: None,
             video_continuity: VideoContinuity::default(),
             video_path,
             direct_session,
@@ -378,7 +385,32 @@ impl ControllerRuntime {
                 }
                 continue;
             }
-            match self.next_transport_event().await? {
+            let transport_event = if let Some(deadline) = self.keyframe_fallback_deadline {
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.next_transport_event(),
+                )
+                .await
+                {
+                    Ok(event) => event?,
+                    Err(_) => {
+                        self.keyframe_fallback_deadline = None;
+                        if self.video_continuity.awaiting_keyframe()
+                            && self.pending_video_reliable.is_empty()
+                            && self.pending_video_datagrams.is_empty()
+                        {
+                            if let Some(stream_id) = self.active_stream_id() {
+                                self.request_keyframe_for(stream_id).await?;
+                                self.video_continuity.note_keyframe_request(Instant::now());
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                self.next_transport_event().await?
+            };
+            match transport_event {
                 TransportEvent::Control(ciphertext) => {
                     let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
                     let message = decode_control(&plaintext)?;
@@ -445,19 +477,13 @@ impl ControllerRuntime {
                         self.video_continuity.reset_for_config();
                     }
                     // Config and the first keyframe use separate reliable
-                    // streams, so the keyframe may already be queued while
-                    // this config event is being delivered. Requesting
-                    // another keyframe here would make the host emit a newer
-                    // datagram keyframe that can overtake and clear the
-                    // reliable frame in the assembler. Only request when no
-                    // video packet is buffered; continuity recovery will
-                    // request one later if the buffered frame still fails.
-                    let video_packet_buffered = !self.pending_video_reliable.is_empty()
-                        || !self.pending_video_datagrams.is_empty();
-                    if (config_changed || self.keyframe_needed_after_config)
-                        && !video_packet_buffered
-                    {
-                        self.request_keyframe_for(config.stream_id).await?;
+                    // streams. Keep a short fallback deadline instead of
+                    // requesting immediately; otherwise a newer datagram
+                    // keyframe can overtake and clear the reliable frame in
+                    // the assembler while it is still arriving.
+                    if config_changed || self.keyframe_needed_after_config {
+                        self.keyframe_fallback_deadline =
+                            Some(Instant::now() + INITIAL_KEYFRAME_GRACE);
                         self.video_continuity.note_keyframe_request(Instant::now());
                     }
                     self.keyframe_needed_after_config = false;
@@ -589,6 +615,12 @@ impl ControllerRuntime {
         if self.video_continuity.awaiting_keyframe() {
             if !is_keyframe {
                 self.drop_video_packet();
+                if self
+                    .keyframe_fallback_deadline
+                    .is_some_and(|deadline| Instant::now() < deadline)
+                {
+                    return Ok(None);
+                }
                 if self.video_continuity.retry_keyframe_request(Instant::now()) {
                     self.request_keyframe_for(config.stream_id).await?;
                 }
@@ -622,6 +654,7 @@ impl ControllerRuntime {
                 ) {
                     VideoContinuityAction::Present => {
                         if self.assembler.accept_for_present(frame.clone()) {
+                            self.keyframe_fallback_deadline = None;
                             self.metrics
                                 .completed_frames
                                 .fetch_add(1, Ordering::Relaxed);

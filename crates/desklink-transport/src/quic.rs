@@ -19,6 +19,11 @@ use crate::{
 };
 
 const INBOUND_RELIABLE_QUEUE_CAPACITY: usize = 128;
+// A single relay keyframe can contain hundreds of reliable video chunks.
+// Keep its bounded queue above the common frame burst so transport read
+// backpressure cannot stall config/control delivery while the controller is
+// assembling the first frame.
+const INBOUND_VIDEO_RELIABLE_QUEUE_CAPACITY: usize = 512;
 const INBOUND_DATAGRAM_QUEUE_CAPACITY: usize = 128;
 const INBOUND_AUDIO_QUEUE_CAPACITY: usize = 8;
 const INBOUND_CLOSED_QUEUE_CAPACITY: usize = 8;
@@ -282,7 +287,7 @@ impl QuicClient {
         let (video_config_sender, video_config_receiver) =
             mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
         let (video_reliable_sender, video_reliable_receiver) =
-            mpsc::channel(INBOUND_RELIABLE_QUEUE_CAPACITY);
+            mpsc::channel(INBOUND_VIDEO_RELIABLE_QUEUE_CAPACITY);
         let (video_datagram_sender, video_datagram_receiver) =
             mpsc::channel(INBOUND_DATAGRAM_QUEUE_CAPACITY);
         let (cursor_datagram_sender, cursor_datagram_receiver) =

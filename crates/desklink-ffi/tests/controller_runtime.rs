@@ -704,14 +704,22 @@ async fn run_reference_gap_host(
     host.send_video_config(secure.seal(SecureLane::VideoConfig, &config_bytes).unwrap())
         .await
         .unwrap();
-    assert_eq!(
-        open_control(&mut secure, host.next_control().await.unwrap()),
-        ControlMessage::RequestKeyframe { stream_id: 9 }
-    );
-    assert_eq!(
-        open_control(&mut secure, host.next_control().await.unwrap()),
-        ControlMessage::SetAudioEnabled { enabled: false }
-    );
+    let first_control = open_control(&mut secure, host.next_control().await.unwrap());
+    if first_control == (ControlMessage::RequestKeyframe { stream_id: 9 }) {
+        assert_eq!(
+            open_control(&mut secure, host.next_control().await.unwrap()),
+            ControlMessage::SetAudioEnabled { enabled: false }
+        );
+    } else {
+        assert_eq!(
+            first_control,
+            ControlMessage::SetAudioEnabled { enabled: false }
+        );
+        assert_eq!(
+            open_control(&mut secure, host.next_control().await.unwrap()),
+            ControlMessage::RequestKeyframe { stream_id: 9 }
+        );
+    }
     send_test_video_frame(&host, &mut secure, 10, true).await;
     assert_eq!(
         open_control(&mut secure, host.next_control().await.unwrap()),
