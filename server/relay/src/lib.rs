@@ -85,6 +85,10 @@ const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
 const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
+// A relay must not silently evict older video datagrams while a keyframe is
+// being forwarded. Wait briefly for QUIC send capacity, but keep a bounded
+// timeout so a dead/blocked peer cannot pin the participant read loop forever.
+const DATAGRAM_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 static DATAGRAM_FORWARD_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -1105,7 +1109,9 @@ async fn handle_connection(
                     session_id,
                     role,
                     datagram,
-                ) {
+                )
+                .await
+                {
                     break;
                 }
             }
@@ -1333,7 +1339,7 @@ async fn forward_reliable_message(
     }
 }
 
-fn forward_datagram(
+async fn forward_datagram(
     state: &RelayState,
     source: &quinn::Connection,
     connection_id: u64,
@@ -1369,16 +1375,37 @@ fn forward_datagram(
         forwarded.push(channel as u8);
         forwarded.extend_from_slice(&connection_id.to_be_bytes());
         forwarded.extend_from_slice(&datagram[9..]);
-        if peer.send_datagram(forwarded.into()).is_err() {
-            log_datagram_forward_failure(
-                connection_id,
-                session_id,
-                role,
-                peer_id,
-                channel,
-                datagram.len(),
-                peer.max_datagram_size(),
-            );
+        match tokio::time::timeout(
+            DATAGRAM_FORWARD_TIMEOUT,
+            peer.send_datagram_wait(forwarded.into()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                log_datagram_forward_failure(
+                    connection_id,
+                    session_id,
+                    role,
+                    peer_id,
+                    channel,
+                    datagram.len(),
+                    peer.max_datagram_size(),
+                    "peer_send_failed",
+                );
+            }
+            Err(_) => {
+                log_datagram_forward_failure(
+                    connection_id,
+                    session_id,
+                    role,
+                    peer_id,
+                    channel,
+                    datagram.len(),
+                    peer.max_datagram_size(),
+                    "peer_send_timeout",
+                );
+            }
         }
     }
     true
@@ -1398,6 +1425,7 @@ fn log_connection_event(event: &str, connection_id: u64, outcome: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_datagram_forward_failure(
     connection_id: u64,
     session_id: SessionId,
@@ -1406,6 +1434,7 @@ fn log_datagram_forward_failure(
     channel: ChannelKind,
     datagram_bytes: usize,
     peer_max_datagram_bytes: Option<usize>,
+    outcome: &str,
 ) {
     let sample = DATAGRAM_FORWARD_FAILURES.fetch_add(1, Ordering::Relaxed);
     if sample >= 8 && !sample.is_multiple_of(256) {
@@ -1414,7 +1443,7 @@ fn log_datagram_forward_failure(
     let max_datagram =
         peer_max_datagram_bytes.map_or_else(|| "null".to_owned(), |bytes| bytes.to_string());
     eprintln!(
-        "{{\"schema\":1,\"timestamp_unix_ms\":{},\"event\":\"datagram_forward_failed\",\"session_tag\":\"{}\",\"connection_id\":{},\"role\":\"{}\",\"peer_connection_id\":{},\"channel\":\"{}\",\"datagram_bytes\":{},\"peer_max_datagram_bytes\":{},\"outcome\":\"peer_send_failed\"}}",
+        "{{\"schema\":1,\"timestamp_unix_ms\":{},\"event\":\"datagram_forward_failed\",\"session_tag\":\"{}\",\"connection_id\":{},\"role\":\"{}\",\"peer_connection_id\":{},\"channel\":\"{}\",\"datagram_bytes\":{},\"peer_max_datagram_bytes\":{},\"outcome\":\"{}\"}}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1426,6 +1455,7 @@ fn log_datagram_forward_failure(
         channel_label(channel),
         datagram_bytes,
         max_datagram,
+        outcome,
     );
 }
 

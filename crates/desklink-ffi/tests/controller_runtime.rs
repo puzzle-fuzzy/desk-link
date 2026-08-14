@@ -706,6 +706,10 @@ async fn run_reference_gap_host(
         .unwrap();
     assert_eq!(
         open_control(&mut secure, host.next_control().await.unwrap()),
+        ControlMessage::RequestKeyframe { stream_id: 9 }
+    );
+    assert_eq!(
+        open_control(&mut secure, host.next_control().await.unwrap()),
         ControlMessage::SetAudioEnabled { enabled: false }
     );
     send_test_video_frame(&host, &mut secure, 10, true).await;

@@ -431,7 +431,12 @@ impl ControllerRuntime {
                     if config_changed {
                         self.video_continuity.reset_for_config();
                     }
-                    if self.keyframe_needed_after_config {
+                    // A video config is reliable, but the following keyframe
+                    // datagrams are intentionally lossy. Request one for
+                    // every new config so a relay-side burst/drop cannot
+                    // leave the controller waiting forever with no packet
+                    // from which to infer transport loss.
+                    if config_changed || self.keyframe_needed_after_config {
                         self.request_keyframe_for(config.stream_id).await?;
                         self.keyframe_needed_after_config = false;
                         self.video_continuity.note_keyframe_request(Instant::now());
