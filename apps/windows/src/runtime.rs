@@ -2106,6 +2106,7 @@ async fn send_video_loop(
     let mut consecutive_datagram_failures = 0_u8;
     let mut reported_first_ready = false;
     let mut reported_need_keyframe = false;
+    let mut reported_first_datagram_stage = false;
     loop {
         notify.notified().await;
         let next = lock_queue(&queue).take_newest();
@@ -2141,7 +2142,22 @@ async fn send_video_loop(
                         .await?;
                 }
                 for (index, datagram) in prepared.datagrams.into_iter().enumerate() {
+                    if !reported_first_datagram_stage {
+                        eprintln!(
+                            "DeskLink video datagram stage entered (stream_id={} plaintext_bytes={} index={})",
+                            stream_id,
+                            datagram.len(),
+                            index,
+                        );
+                    }
                     let ciphertext = seal(&secure, SecureLane::VideoDatagram, &datagram).await?;
+                    if !reported_first_datagram_stage {
+                        eprintln!(
+                            "DeskLink video datagram encrypted (stream_id={} ciphertext_bytes={})",
+                            stream_id,
+                            ciphertext.len(),
+                        );
+                    }
                     let mut direct_path = direct_connection
                         .lock()
                         .await
@@ -2154,6 +2170,15 @@ async fn send_video_loop(
                         ciphertext,
                     )
                     .await;
+                    if !reported_first_datagram_stage {
+                        eprintln!(
+                            "DeskLink video datagram send returned (stream_id={} route={:?} ok={})",
+                            stream_id,
+                            send_result.as_ref().ok(),
+                            send_result.is_ok(),
+                        );
+                        reported_first_datagram_stage = true;
+                    }
                     if had_direct_path && direct_path.is_none() {
                         *direct_connection.lock().await = None;
                     }
