@@ -9,6 +9,27 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WindowsWorkflowPolicyTests(unittest.TestCase):
+    def test_release_workflows_pin_the_repository_rust_toolchain(self) -> None:
+        toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+        self.assertRegex(toolchain, r'(?m)^channel\s*=\s*"1\.97\.1"\s*$')
+        for name in (
+            "windows-ci.yml",
+            "windows-signed-release.yml",
+            "security-scan.yml",
+            "managed-relay-monitor.yml",
+        ):
+            workflow = (ROOT / ".github" / "workflows" / name).read_text(
+                encoding="utf-8"
+            )
+            self.assertRegex(
+                workflow,
+                r"uses: dtolnay/rust-toolchain@stable\r?\n"
+                r"[ \t]+with:\r?\n"
+                r"(?:[ \t]+[^\r\n]*\r?\n)*"
+                r"[ \t]+toolchain: 1\.97\.1",
+                msg=f"{name} must pin Rust 1.97.1",
+            )
+
     def test_signed_candidates_require_the_release_soak_duration(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "windows-signed-release.yml").read_text(
             encoding="utf-8"
