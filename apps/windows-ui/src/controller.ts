@@ -910,7 +910,7 @@ function renderForgetConfirmation(deviceId: string): string {
 
 function renderTransferToolbarButton(): string {
   const activity = transferToolbarActivityView();
-  return `<button class="toolbar-button${activity.visible ? " toolbar-button--has-activity" : ""}" type="button" data-controller-transfer aria-expanded="${transferPanelOpen}" title="${activity.title}">${icon("share-2")}<span>传输</span><span class="remote-transfer-activity" data-controller-transfer-activity data-state="${activity.tone}" ${activity.visible ? "" : "hidden"} role="status" aria-live="polite" aria-label="${activity.ariaLabel}">${activity.badge}</span></button>`;
+  return `<button class="toolbar-button${activity.visible ? " toolbar-button--has-activity" : ""}" type="button" data-controller-transfer aria-expanded="${transferPanelOpen}" aria-controls="remote-transfer-panel" title="${activity.title}">${icon("share-2")}<span>传输</span><span class="remote-transfer-activity" data-controller-transfer-activity data-state="${activity.tone}" ${activity.visible ? "" : "hidden"} role="status" aria-live="polite" aria-label="${activity.ariaLabel}">${activity.badge}</span></button>`;
 }
 
 function transferToolbarActivityView(): {
@@ -1064,7 +1064,7 @@ function renderTransferPanel(): string {
   const details = fileTransfer ? formatTransferDetails(fileTransfer) : "";
   const receivedFile = hasCompletedDownload();
   return `
-    <section class="remote-transfer-panel" data-controller-transfer-panel ${transferPanelOpen ? "" : "hidden"} aria-label="剪贴板与文件传输">
+    <section id="remote-transfer-panel" class="remote-transfer-panel" data-controller-transfer-panel ${transferPanelOpen ? "" : "hidden"} aria-label="剪贴板与文件传输">
       <div class="remote-transfer-heading">
         <div>${icon("share-2")}<span><strong>剪贴板与文件</strong><small>可双向传输；获取文件时由远端电脑选择。</small></span></div>
         <div class="remote-transfer-actions">
