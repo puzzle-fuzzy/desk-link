@@ -85,6 +85,7 @@ const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
 const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
+static DATAGRAM_FORWARD_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct RelaySessionTable {
@@ -1368,7 +1369,17 @@ fn forward_datagram(
         forwarded.push(channel as u8);
         forwarded.extend_from_slice(&connection_id.to_be_bytes());
         forwarded.extend_from_slice(&datagram[9..]);
-        let _ = peer.send_datagram(forwarded.into());
+        if peer.send_datagram(forwarded.into()).is_err() {
+            log_datagram_forward_failure(
+                connection_id,
+                session_id,
+                role,
+                peer_id,
+                channel,
+                datagram.len(),
+                peer.max_datagram_size(),
+            );
+        }
     }
     true
 }
@@ -1384,6 +1395,37 @@ fn log_connection_event(event: &str, connection_id: u64, outcome: &str) {
         .as_millis();
     eprintln!(
         "{{\"schema\":1,\"timestamp_unix_ms\":{timestamp_unix_ms},\"event\":\"{event}\",\"connection_id\":{connection_id},\"outcome\":\"{outcome}\"}}"
+    );
+}
+
+fn log_datagram_forward_failure(
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    peer_connection_id: u64,
+    channel: ChannelKind,
+    datagram_bytes: usize,
+    peer_max_datagram_bytes: Option<usize>,
+) {
+    let sample = DATAGRAM_FORWARD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    if sample >= 8 && sample % 256 != 0 {
+        return;
+    }
+    let max_datagram =
+        peer_max_datagram_bytes.map_or_else(|| "null".to_owned(), |bytes| bytes.to_string());
+    eprintln!(
+        "{{\"schema\":1,\"timestamp_unix_ms\":{},\"event\":\"datagram_forward_failed\",\"session_tag\":\"{}\",\"connection_id\":{},\"role\":\"{}\",\"peer_connection_id\":{},\"channel\":\"{}\",\"datagram_bytes\":{},\"peer_max_datagram_bytes\":{},\"outcome\":\"peer_send_failed\"}}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        session_tag(session_id),
+        connection_id,
+        role_label(role),
+        peer_connection_id,
+        channel_label(channel),
+        datagram_bytes,
+        max_datagram,
     );
 }
 
