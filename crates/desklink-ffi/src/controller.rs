@@ -398,11 +398,10 @@ impl ControllerRuntime {
                         if self.video_continuity.awaiting_keyframe()
                             && self.pending_video_reliable.is_empty()
                             && self.pending_video_datagrams.is_empty()
+                            && let Some(stream_id) = self.active_stream_id()
                         {
-                            if let Some(stream_id) = self.active_stream_id() {
-                                self.request_keyframe_for(stream_id).await?;
-                                self.video_continuity.note_keyframe_request(Instant::now());
-                            }
+                            self.request_keyframe_for(stream_id).await?;
+                            self.video_continuity.note_keyframe_request(Instant::now());
                         }
                         continue;
                     }
