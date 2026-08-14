@@ -2697,23 +2697,29 @@ async fn receive_input_and_control(
                 let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
                 if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
                     input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
-                    match input.apply(event) {
-                        Ok(()) => {}
-                        // An individual Windows input injection can be rejected
-                        // temporarily (secure desktop, focus transition, UIPI),
-                        // and an unsupported key belongs only to that event. Do
-                        // not convert either case into a transport-wide failure.
-                        Err(InputInjectionError::Blocked | InputInjectionError::UnsupportedKey) => {}
-                        Err(error @ InputInjectionError::InvalidInput) => {
-                            return Err(HostRuntimeError::Input(error));
-                        }
-                    }
+                    apply_input_event(&mut input, event)?;
                 }
             }
             reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
         }
+    }
+}
+
+/// Input is a lossy edge of a remote session. A single sample can become
+/// invalid while the controller is resizing, switching displays, or crossing
+/// a stale WebView event boundary. It must never tear down the host worker or
+/// make the host appear stopped; the next valid sample will continue normally.
+fn apply_input_event<B: crate::input::InputBackend>(
+    input: &mut InputInjector<B>,
+    event: InputEvent,
+) -> Result<(), HostRuntimeError> {
+    match input.apply(event) {
+        Ok(())
+        | Err(InputInjectionError::Blocked)
+        | Err(InputInjectionError::UnsupportedKey)
+        | Err(InputInjectionError::InvalidInput) => Ok(()),
     }
 }
 
@@ -3358,7 +3364,11 @@ fn now_unix_s() -> u64 {
 mod retry_policy_tests {
     use std::time::Instant;
 
-    use crate::{capture::CaptureError, encoder::EncoderError};
+    use crate::{
+        capture::CaptureError,
+        encoder::EncoderError,
+        input::{InputBackend, InputInjectionError, InputInjector, VirtualDesktop},
+    };
 
     use desklink_protocol::AccessDenialReason;
     use desklink_transport::TransportError;
@@ -3370,7 +3380,20 @@ mod retry_policy_tests {
         initial_encoded_frame_deadline_expired, initial_frame_deadline_expired,
         video_quality_settings,
     };
-    use desklink_protocol::{VideoQualityPreference, VideoQualityPreset};
+    use desklink_protocol::{KeyCode, Modifiers, VideoQualityPreference, VideoQualityPreset};
+    use desklink_session::DesktopRect;
+
+    struct RejectingInputBackend(InputInjectionError);
+
+    impl InputBackend for RejectingInputBackend {
+        fn send(
+            &mut self,
+            _event: &desklink_protocol::InputEvent,
+            _desktop: VirtualDesktop,
+        ) -> Result<(), InputInjectionError> {
+            Err(self.0.clone())
+        }
+    }
 
     #[test]
     fn persistent_host_recovers_after_rejecting_a_stale_pairing_request() {
@@ -3398,6 +3421,54 @@ mod retry_policy_tests {
                 "runtime desktop failure must not stop persistent hosting: {error}"
             );
         }
+    }
+
+    #[test]
+    fn one_bad_remote_input_sample_isolated_from_host_lifecycle() {
+        let desktop = DesktopRect::new(0, 0, 1920, 1080);
+
+        let mut blocked = InputInjector::with_backend(
+            VirtualDesktop::single(desktop),
+            RejectingInputBackend(InputInjectionError::Blocked),
+        );
+        assert!(
+            super::apply_input_event(
+                &mut blocked,
+                desklink_protocol::InputEvent::MouseMove { x: 1, y: 1 },
+            )
+            .is_ok()
+        );
+
+        let mut unsupported = InputInjector::with_backend(
+            VirtualDesktop::single(desktop),
+            RejectingInputBackend(InputInjectionError::UnsupportedKey),
+        );
+        assert!(
+            super::apply_input_event(
+                &mut unsupported,
+                desklink_protocol::InputEvent::Key {
+                    code: KeyCode::Function(13),
+                    pressed: true,
+                    modifiers: Modifiers(0),
+                },
+            )
+            .is_ok()
+        );
+
+        let mut invalid = InputInjector::with_backend(
+            VirtualDesktop::single(desktop),
+            RejectingInputBackend(InputInjectionError::Blocked),
+        );
+        assert!(
+            super::apply_input_event(
+                &mut invalid,
+                desklink_protocol::InputEvent::MouseMove {
+                    x: desklink_protocol::MAX_POINTER_COORDINATE + 1,
+                    y: 1,
+                },
+            )
+            .is_ok()
+        );
     }
 
     #[test]
