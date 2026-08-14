@@ -46,15 +46,17 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 // controller waits for capability negotiation while that dialog is visible.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ASSEMBLY_CAPACITY: usize = 3;
-// A relay may pace a large keyframe burst over several seconds. Keep the
-// incomplete frame alive long enough to assemble it, while the controller
-// drops obsolete deltas and older keyframes below so memory remains bounded.
+// Datagram frames are low-latency and must not retain stale partials for long.
 const ASSEMBLY_MAX_AGE: Duration = Duration::from_secs(10);
+// The first relay keyframe is delivered on an ordered reliable stream and may
+// be paced by a public relay. Keep that one bounded but separate from lossy
+// datagram assembly so a slow burst cannot expire just before completion.
+const RELIABLE_ASSEMBLY_MAX_AGE: Duration = Duration::from_secs(30);
 const PENDING_VIDEO_DATAGRAM_CAPACITY: usize = 256;
 // The config and the first relay keyframe use separate QUIC streams. Give
 // that keyframe a short grace window before asking the host to generate a
 // newer frame, which could otherwise overtake and invalidate the in-flight
-// assembly.
+// assembly. The reliable assembler has its own longer expiry below.
 const INITIAL_KEYFRAME_GRACE: Duration = Duration::from_millis(1500);
 // A successful authenticated probe only proves that the endpoints can open a
 // datagram socket. If a firewall silently drops the subsequent video packets,
@@ -243,7 +245,7 @@ impl ControllerRuntime {
             secure,
             input_sequence: Mutex::new(InputSequencer::new()),
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
-            reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
+            reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, RELIABLE_ASSEMBLY_MAX_AGE),
             video_config: None,
             pending_video_datagrams: VecDeque::new(),
             pending_video_reliable: VecDeque::new(),
