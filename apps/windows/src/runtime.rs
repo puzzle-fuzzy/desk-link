@@ -1867,6 +1867,7 @@ fn capture_encode_loop(
     let mut encoder_recovery_attempts = 0_u8;
     let mut video_quality = DEFAULT_VIDEO_QUALITY;
     let mut video_profile = encoder.profile();
+    let mut reported_first_encoded_frame = false;
     let mut frame_pacer =
         VideoFramePacer::new(video_quality_settings_with_profile(video_quality, video_profile).fps);
     let mut first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
@@ -2034,6 +2035,15 @@ fn capture_encode_loop(
         let encoded = match encoder.encode(frame, request_keyframe) {
             Ok(encoded) => {
                 encoder_recovery_attempts = 0;
+                if !reported_first_encoded_frame {
+                    eprintln!(
+                        "DeskLink video capture produced its first encoded frame (bytes={} keyframe={} config_version={})",
+                        encoded.access_unit.len(),
+                        encoded.keyframe,
+                        encoded.config_version,
+                    );
+                    reported_first_encoded_frame = true;
+                }
                 encoded_any_frame = true;
                 encoded
             }
@@ -2094,6 +2104,8 @@ async fn send_video_loop(
     let mut pipeline = HostVideoPipeline::new(stream_id);
     let relay_video_path = RelayVideoPath::new(client.clone(), peer_generation);
     let mut consecutive_datagram_failures = 0_u8;
+    let mut reported_first_ready = false;
+    let mut reported_need_keyframe = false;
     loop {
         notify.notified().await;
         let next = lock_queue(&queue).take_newest();
@@ -2102,9 +2114,24 @@ async fn send_video_loop(
         };
         match pipeline.prepare(next.frame, next.width, next.height)? {
             PrepareVideo::NeedKeyframe => {
+                if !reported_need_keyframe {
+                    eprintln!(
+                        "DeskLink video pipeline is waiting for a keyframe (stream_id={stream_id})"
+                    );
+                    reported_need_keyframe = true;
+                }
                 force_keyframe.store(true, Ordering::Release);
             }
             PrepareVideo::Ready(prepared) => {
+                if !reported_first_ready {
+                    eprintln!(
+                        "DeskLink video pipeline prepared its first frame (stream_id={} datagrams={} config={})",
+                        stream_id,
+                        prepared.datagrams.len(),
+                        prepared.video_config.is_some(),
+                    );
+                    reported_first_ready = true;
+                }
                 if let Some(config) = prepared.video_config {
                     client
                         .send_video_config_for_generation(
