@@ -197,7 +197,7 @@ mod windows {
         // watchdog, and a cold GitHub runner can spend another few seconds
         // initializing Media Foundation. Keep this probe above that bound so
         // a slow but healthy first frame is not reported as a relay failure.
-        tokio::time::timeout(Duration::from_secs(45), async {
+        let result = tokio::time::timeout(Duration::from_secs(45), async {
             loop {
                 match controller.next_event().await.unwrap() {
                     ControllerEvent::H264AccessUnit(frame) => return frame.stream_id,
@@ -212,8 +212,20 @@ mod windows {
                 }
             }
         })
-        .await
-        .expect("managed relay did not deliver an H.264 frame")
+        .await;
+        match result {
+            Ok(stream_id) => stream_id,
+            Err(_) => {
+                let metrics = controller.metrics();
+                panic!(
+                    "managed relay did not deliver an H.264 frame: received_video_packets={} dropped_video_packets={} completed_frames={} video_path={:?}",
+                    metrics.received_video_packets,
+                    metrics.dropped_video_packets,
+                    metrics.completed_frames,
+                    controller.video_path_kind(),
+                );
+            }
+        }
     }
 
     async fn wait_for_cursor(controller: &mut ControllerRuntime) -> (i32, i32) {
