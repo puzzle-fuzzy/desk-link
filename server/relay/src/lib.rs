@@ -1408,7 +1408,7 @@ fn log_datagram_forward_failure(
     peer_max_datagram_bytes: Option<usize>,
 ) {
     let sample = DATAGRAM_FORWARD_FAILURES.fetch_add(1, Ordering::Relaxed);
-    if sample >= 8 && sample % 256 != 0 {
+    if sample >= 8 && !sample.is_multiple_of(256) {
         return;
     }
     let max_datagram =
