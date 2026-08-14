@@ -146,6 +146,7 @@ pub struct ControllerRuntime {
     keyframe_needed_after_config: bool,
     keyframe_fallback_deadline: Option<Instant>,
     video_continuity: VideoContinuity,
+    reliable_trace_started: Option<Instant>,
     video_path: DirectVideoPathMachine,
     direct_session: Option<DirectLanSession>,
     direct_connection: Option<Arc<DirectLanConnection>>,
@@ -250,6 +251,7 @@ impl ControllerRuntime {
             keyframe_needed_after_config: false,
             keyframe_fallback_deadline: None,
             video_continuity: VideoContinuity::default(),
+            reliable_trace_started: None,
             video_path,
             direct_session,
             direct_connection: None,
@@ -658,6 +660,24 @@ impl ControllerRuntime {
             }
         }
         let stream_id = config.stream_id;
+        if matches!(source, VideoPacketSource::Reliable) {
+            if packet.header.chunk_index == 0 && self.reliable_trace_started.is_none() {
+                self.reliable_trace_started = Some(Instant::now());
+                eprintln!(
+                    "DeskLink reliable keyframe assembly started (stream_id={} frame_id={} chunks={})",
+                    packet.header.stream_id, packet.header.frame_id, packet.header.chunk_count,
+                );
+            } else if packet.header.chunk_index + 1 == packet.header.chunk_count
+                && let Some(started) = self.reliable_trace_started
+            {
+                eprintln!(
+                    "DeskLink reliable keyframe assembly ended (stream_id={} frame_id={} elapsed_ms={})",
+                    packet.header.stream_id,
+                    packet.header.frame_id,
+                    started.elapsed().as_millis(),
+                );
+            }
+        }
         let assembler = match source {
             VideoPacketSource::Datagram => &mut self.assembler,
             VideoPacketSource::Reliable => &mut self.reliable_assembler,
