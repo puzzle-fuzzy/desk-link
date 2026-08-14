@@ -1,7 +1,7 @@
 # DeskLink 上线 TODO
 
 > 目标：先把 Windows 两台电脑的远程控制做成可发布的稳定版本，再扩展 4K 和公网 P2P。
-> 当前判断（2026-08-15）：Windows 首发核心功能、自动化门禁、公网中继和云诊断均已通过；稳定候选以 clean `main`、安装包 manifest、候选 ZIP、中继镜像和审计报告的同一源码 SHA `3299b1a` 为准。正式上线仍受 Authenticode 签名、发布 tag 和真实 Windows/SmartScreen 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
+> 当前判断（2026-08-15）：Windows 首发核心功能、自动化门禁、公网中继和云诊断均已通过；稳定候选以 clean `main`、安装包 manifest、候选 ZIP、中继镜像和审计报告的同一源码 SHA `83d875e` 为准。正式上线仍受 Authenticode 签名、发布 tag 和真实 Windows/SmartScreen 验收约束。账号服务已降为可选能力，未部署账号服务不再阻塞本机模式。
 > 规则：`[x]` 只表示代码或自动验证已完成；需要两台真实 Windows 电脑的项目必须由人工验收后再勾选。
 
 ## 0. 发布基线与工作区（P1）
@@ -162,12 +162,12 @@ python scripts/check-windows-release-ready.py --manual-json dist/windows/windows
 python scripts/package-windows-candidate.py
 ```
 
-### 最近一次自动门禁（2026-08-14，候选 `e649b20`）
+### 最近一次自动门禁（2026-08-15，候选 `83d875e`）
 
 - [x] 当前候选提交已通过前端 174 项测试、Vite 构建、Rust fmt/Clippy/workspace 测试、Python 72 项脚本测试、Windows release verification 和安装包构建；连接快照、主机生命周期竞态、字体契约、强制配色、1920/2560 宽屏和“更多”菜单键盘导航回归测试已纳入门禁。
-- [x] Windows CI run `31755376313` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `e649b20560e8382055546c78db1bbcb6f3339f6b`。
+- [x] Windows CI run `31830428584` 全部通过：GDI/显示器捕获、H.264 High Profile/4K 探针、主机异常恢复、电源恢复、本地媒体 soak，以及公网中继目录/Noise/视频/输入/重连 E2E；候选 artifact 和 resilience 报告均绑定 `83d875e58bc4de23dcb5a3b098dc0a5d837b768f`。
 
-- [x] 安全扫描 run `31755376312`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
+- [x] 安全扫描 run `31830428758`：Cargo advisory audit、Rust CodeQL、JavaScript/TypeScript CodeQL 全部通过。
 - [x] Backend services CI run `31755376304` 通过；Managed relay monitor run `31755577111` 与 Managed diagnostics monitor run `31755578886` 均通过。
 - [x] 签名候选 readiness 明确传入 `--minimum-soak-seconds 300`，不会因为默认值变化而把正式长稳门禁降级为普通 CI 的 10 秒。
 - [x] 签名候选工作流已强制 300 秒原生 resilience soak，并由 `test_windows_workflow_policy.py` 防止回退到普通 CI 的 10 秒快速门禁。
