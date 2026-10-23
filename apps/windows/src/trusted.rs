@@ -246,6 +246,13 @@ impl ControllerAuthorizer for WindowsPairingAuthorizer {
             Err(PairingApprovalError::Pairing(PairingError::Expired)) => {
                 return Ok(ControllerAuthorization::Expired);
             }
+            Err(PairingApprovalError::InvalidState)
+            | Err(PairingApprovalError::Pairing(PairingError::AlreadyConsumed)) => {
+                // A processed invitation cannot authorize another controller.
+                // Return a normal denial so the runtime informs the peer over
+                // its authenticated channel instead of silently disconnecting.
+                return Ok(ControllerAuthorization::Rejected);
+            }
             Err(error) => return Err(error.to_string()),
         };
         let pending = if identity_changed {

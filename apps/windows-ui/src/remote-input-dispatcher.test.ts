@@ -12,6 +12,57 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("remote input dispatcher", () => {
+  test("Unicode commits and subsequent Enter/mouse stay in the same ordered IPC queue", async () => {
+    const first = deferred();
+    const text = deferred();
+    const sent: string[] = [];
+    const dispatcher = new RemoteInputDispatcher(async (input) => {
+      sent.push(`${input.kind}:${input.key ?? input.button}:${input.pressed}`);
+      if (sent.length === 1) await first.promise;
+    }, undefined, async (value, streamId) => {
+      sent.push(`text:${value}:${streamId}`);
+      await text.promise;
+    });
+    dispatcher.enqueue({ kind: "key", key: "shift", pressed: true }, 7);
+    dispatcher.enqueue({ kind: "key", key: "shift", pressed: false }, 7);
+    const committed = dispatcher.enqueueText("中文", 7);
+    dispatcher.enqueue({ kind: "key", key: "enter", pressed: true }, 7);
+    dispatcher.enqueue({ kind: "key", key: "enter", pressed: false }, 7);
+    dispatcher.enqueue({ kind: "mouseButton", button: "left", pressed: true }, 7);
+    first.resolve();
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    expect(sent).toEqual(["key:shift:true", "key:shift:false", "text:中文:7"]);
+    text.resolve();
+    await committed;
+    await dispatcher.drain();
+    expect(sent).toEqual(["key:shift:true", "key:shift:false", "text:中文:7", "key:enter:true", "key:enter:false", "mouseButton:left:true"]);
+  });
+
+  test("long Unicode text is split at scalar boundaries within the native command limit", async () => {
+    const sent: string[] = [];
+    const dispatcher = new RemoteInputDispatcher(async () => {}, undefined, async (text) => { sent.push(text); });
+    await dispatcher.enqueueText("😀".repeat(300), 8);
+    expect(sent.map((text) => Array.from(text).length)).toEqual([256, 44]);
+    expect(sent.join("")).toBe("😀".repeat(300));
+    expect(new TextEncoder().encode(sent[0]).length).toBe(1024);
+  });
+
+  test("disconnect rejects queued text and never sends it to a later stream", async () => {
+    const first = deferred();
+    const texts: string[] = [];
+    const dispatcher = new RemoteInputDispatcher(async () => { await first.promise; }, undefined, async (text) => { texts.push(text); });
+    dispatcher.enqueue({ kind: "key", key: "enter", pressed: true }, 9);
+    const pending = dispatcher.enqueueText("旧会话", 9);
+    const rejected = pending.catch((error: Error) => error.message);
+    dispatcher.discardAll();
+    first.resolve();
+    expect(await rejected).toBe("Remote input was cleared");
+    await dispatcher.drain();
+    expect(texts).toEqual([]);
+    await dispatcher.enqueueText("新会话", 10);
+    expect(texts).toEqual(["新会话"]);
+  });
+
   test("keeps one IPC call in flight and collapses consecutive pointer moves", async () => {
     const first = deferred();
     const sent: Array<{ input: ControllerInput; streamId: number }> = [];

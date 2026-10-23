@@ -271,6 +271,22 @@ impl FrameAssembler {
         self.frames.clear();
     }
 
+    /// Discards incomplete frames older than the recovery frame in this stream.
+    /// Its nonzero chunks may already have arrived before chunk zero, so keep
+    /// those chunks as well as any newer pending frames.
+    pub fn discard_pending_before(&mut self, stream_id: u64, frame_id: u64) {
+        let mut dropped_chunks = 0_u64;
+        self.frames
+            .retain(|(pending_stream, pending_frame), frame| {
+                let keep = *pending_stream != stream_id || *pending_frame >= frame_id;
+                if !keep {
+                    dropped_chunks = dropped_chunks.saturating_add(frame.missing_chunk_count());
+                }
+                keep
+            });
+        self.dropped_chunks = self.dropped_chunks.saturating_add(dropped_chunks);
+    }
+
     pub fn accept_for_present(&mut self, frame: EncodedFrame) -> bool {
         if self.active_stream != Some(frame.stream_id) {
             return false;

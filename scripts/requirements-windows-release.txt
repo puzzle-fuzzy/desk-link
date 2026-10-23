@@ -1,0 +1,2 @@
+# Needed only for independent updater manifest signing and verification.
+cryptography>=45.0.2,<47

@@ -64,6 +64,25 @@ struct ReliableSendStream {
     stream: quinn::SendStream,
 }
 
+struct PendingReliableSend<'a> {
+    stream: &'a mut Option<ReliableSendStream>,
+    connection: &'a quinn::Connection,
+    completed: bool,
+}
+
+impl Drop for PendingReliableSend<'_> {
+    fn drop(&mut self) {
+        if !self.completed && self.stream.is_some() {
+            // A stream reset could discard earlier complete messages that the
+            // peer has not consumed yet. End the whole connection so existing
+            // recovery also releases input and rebuilds authenticated state.
+            self.connection
+                .close(quinn::VarInt::from_u32(0), b"reliable send interrupted");
+            self.stream.take();
+        }
+    }
+}
+
 struct InboundEvent {
     peer_generation: Option<u64>,
     event: TransportEvent,
@@ -932,43 +951,57 @@ impl QuicClient {
                 *stream = None;
             }
         }
-        if stream.is_none() {
-            let (mut send, _receive) = self
+        // write_all is not cancellation safe. Keep the stream guarded before
+        // writing even its channel header, so timeout/select cancellation never
+        // leaves a partial frame available for the next sender to append to.
+        let mut pending = PendingReliableSend {
+            stream: &mut stream,
+            connection: &self.inner.connection,
+            completed: false,
+        };
+        if pending.stream.is_none() {
+            let (send, _receive) = self
                 .inner
                 .connection
                 .open_bi()
                 .await
                 .map_err(map_connection_error)?;
-            send.write_all(&[channel as u8])
-                .await
-                .map_err(map_write_error)?;
-            send.write_all(&peer_generation.to_be_bytes())
-                .await
-                .map_err(map_write_error)?;
-            *stream = Some(ReliableSendStream {
+            *pending.stream = Some(ReliableSendStream {
                 peer_generation,
                 stream: send,
             });
+            let outbound = pending.stream.as_mut().expect("new reliable stream");
+            outbound
+                .stream
+                .write_all(&[channel as u8])
+                .await
+                .map_err(map_write_error)?;
+            outbound
+                .stream
+                .write_all(&peer_generation.to_be_bytes())
+                .await
+                .map_err(map_write_error)?;
         }
-        let Some(outbound) = stream.as_mut() else {
-            return Err(TransportError::Closed);
-        };
         if expected_generation.is_some()
             && self.inner.active_peer_generation.load(Ordering::Acquire) != peer_generation
         {
-            let _ = outbound.stream.finish();
-            *stream = None;
+            if let Some(mut outbound) = pending.stream.take() {
+                let _ = outbound.stream.finish();
+            }
+            pending.completed = true;
             return Err(TransportError::PeerReplaced);
         }
+        let Some(outbound) = pending.stream.as_mut() else {
+            return Err(TransportError::Closed);
+        };
         let length = (bytes.len() as u32).to_be_bytes();
         if let Err(error) = outbound.stream.write_all(&length).await {
-            *stream = None;
             return Err(map_write_error(error));
         }
         if let Err(error) = outbound.stream.write_all(&bytes).await {
-            *stream = None;
             return Err(map_write_error(error));
         }
+        pending.completed = true;
         Ok(())
     }
 

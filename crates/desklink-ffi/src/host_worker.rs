@@ -358,14 +358,12 @@ async fn run_worker(
 ) {
     let mut relay_authentication = relay_authentication;
     let host_participant_id = identity.device_id;
-    let join = client
-        .join(RelayJoin::host_with_participant(
-            session_id,
-            relay_authentication,
-            host_participant_id,
-        ))
-        .await
-        .map_err(transport_error);
+    let join = join_relay(
+        &client,
+        RelayJoin::host_with_participant(session_id, relay_authentication, host_participant_id),
+    )
+    .await
+    .map_err(transport_error);
     if let Err(error) = join {
         relay_authentication.zeroize();
         let _ = ready.send(Err(error.clone()));

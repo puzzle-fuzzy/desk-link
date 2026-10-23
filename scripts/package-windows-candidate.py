@@ -123,6 +123,7 @@ def validate_candidate_artifacts(root: Path, dist: Path) -> tuple[str, str, list
         raise CandidatePackageError("acceptance record does not reference this installer")
 
     optional = [
+        dist / "windows-installer-manifest.json.sig",
         dist / "managed-relay-verification.json",
         dist.parent / "linux" / "managed-relay-host-audit.json",
         dist.parent / "linux" / "managed-diagnostics-audit.json",

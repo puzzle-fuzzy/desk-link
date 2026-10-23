@@ -9,6 +9,7 @@ mod windows_installer {
     use std::{
         env, fs, io,
         io::Write as _,
+        os::windows::process::CommandExt,
         path::{Path, PathBuf},
         process::{self, Command},
         thread,
@@ -17,12 +18,19 @@ mod windows_installer {
 
     use crate::APPLICATION_PAYLOAD;
     use desklink_delivery_layout::{
-        InstallLayout, PRODUCT_NAME, PRODUCT_VERSION, compare_release_versions,
+        Action, InstallLayout, Options, PRODUCT_NAME, PRODUCT_VERSION, compare_release_versions,
+        update::{
+            InstallerLock, UpdateOperations, apply_update, check_application_start,
+            wait_for_shutdown_helper,
+        },
+        update_registration::InstalledRegistration,
         webview2_version_is_suitable,
     };
     use windows::{
         Win32::{
-            Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, LPARAM, WPARAM},
+            Foundation::{
+                CloseHandle, ERROR_FILE_NOT_FOUND, LPARAM, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
+            },
             Storage::FileSystem::{
                 MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
                 MoveFileExW,
@@ -38,8 +46,8 @@ mod windows_installer {
                     RegDeleteTreeW, RegDeleteValueW, RegGetValueW, RegSetValueExW,
                 },
                 Threading::{
-                    OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_ACCESS_RIGHTS,
-                    WaitForSingleObject,
+                    OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, ReleaseMutex,
+                    SYNCHRONIZATION_ACCESS_RIGHTS, WaitForSingleObject,
                 },
             },
             UI::{
@@ -61,79 +69,53 @@ mod windows_installer {
     const CONTROL_SURFACE_MUTEX: windows::core::PCWSTR =
         windows::core::w!("Local\\DeskLinkControlSurface");
     const SYNCHRONIZE_ACCESS: SYNCHRONIZATION_ACCESS_RIGHTS =
-        SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000);
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Action {
-        Install,
-        Uninstall,
-        UninstallWorker,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct Options {
-        action: Action,
-        quiet: bool,
-        no_autostart: bool,
-        remove_data: bool,
-    }
-
-    impl Options {
-        fn parse() -> Result<Self, String> {
-            let mut options = Self {
-                action: Action::Install,
-                quiet: false,
-                no_autostart: false,
-                remove_data: false,
-            };
-            for argument in env::args().skip(1) {
-                match argument.as_str() {
-                    "--quiet" => options.quiet = true,
-                    "--no-autostart" => options.no_autostart = true,
-                    "--remove-data" => options.remove_data = true,
-                    "--uninstall" => options.action = Action::Uninstall,
-                    "--uninstall-worker" => options.action = Action::UninstallWorker,
-                    _ => return Err(format!("未知的安装器选项：{argument}")),
-                }
-            }
-            if options.action == Action::Install && options.remove_data {
-                return Err("--remove-data 只能与 --uninstall 一起使用".to_owned());
-            }
-            Ok(options)
-        }
-    }
+        SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0001);
 
     pub fn run() -> i32 {
-        let options = match Options::parse() {
+        let options = match Options::parse(env::args().skip(1)) {
             Ok(options) => options,
             Err(error) => return report_error(false, &error),
         };
         let layout = match current_user_layout() {
             Ok(layout) => layout,
-            Err(error) => return report_error(options.quiet, &error.to_string()),
+            Err(error) => return report_error(!options.show_errors(), &error.to_string()),
         };
-        let result = match options.action {
-            Action::Install => install(&layout, options),
-            Action::Uninstall => uninstall(&layout, options),
-            Action::UninstallWorker => {
-                thread::sleep(Duration::from_millis(600));
-                uninstall_now(&layout, options)
+        let result = (|| {
+            // The handoff worker may start before its parent releases this
+            // guard. All other concurrent installers fail immediately.
+            let timeout = if options.action == Action::UninstallWorker {
+                Duration::from_secs(5)
+            } else {
+                Duration::ZERO
+            };
+            let _lock = InstallerLock::acquire(r"Local\DeskLinkInstaller", timeout)?;
+            match options.action {
+                Action::Install => install(&layout, options),
+                Action::Update => update(&layout),
+                Action::Uninstall => uninstall(&layout, options),
+                Action::UninstallWorker => {
+                    thread::sleep(Duration::from_millis(600));
+                    uninstall_now(&layout, options)
+                }
             }
-        };
+        })();
+        // In particular, release the guard before the uninstall parent's
+        // informational dialog: its worker must be free to acquire the lock.
         match result {
-            Ok(Outcome::Cancelled) => 0,
+            Ok(Outcome::Cancelled | Outcome::HandedOff) => 0,
             Ok(Outcome::Completed(message)) => {
-                if !options.quiet && options.action != Action::UninstallWorker {
+                if options.show_success() {
                     show_message(&message, MB_OK | MB_ICONINFORMATION);
                 }
                 0
             }
-            Err(error) => report_error(options.quiet, &error.to_string()),
+            Err(error) => report_error(!options.show_errors(), &error.to_string()),
         }
     }
 
     enum Outcome {
         Cancelled,
+        HandedOff,
         Completed(String),
     }
 
@@ -241,7 +223,7 @@ mod windows_installer {
             }
         }
 
-        stop_running_application(layout);
+        stop_running_application(layout)?;
         fs::create_dir_all(&layout.install_directory)?;
         atomic_write_with_retry(&layout.application, APPLICATION_PAYLOAD)?;
         let installer = env::current_exe()?;
@@ -251,7 +233,7 @@ mod windows_installer {
         create_start_menu_shortcut(layout)?;
         if options.no_autostart {
             delete_registry_value(RUN_KEY, PRODUCT_NAME)?;
-        } else {
+        } else if !upgrading {
             set_registry_string(RUN_KEY, PRODUCT_NAME, &layout.startup_command())?;
         }
         write_uninstall_registration(layout, APPLICATION_PAYLOAD.len())?;
@@ -270,6 +252,46 @@ mod windows_installer {
         Ok(Outcome::Completed(message))
     }
 
+    fn update(layout: &InstallLayout) -> io::Result<Outcome> {
+        // Validate before staging files, signalling a running process or opening
+        // any writable registry key. A portable/debug process cannot create an
+        // installation by accidentally invoking this mode.
+        let registration = InstalledRegistration::load(layout, UNINSTALL_KEY, PRODUCT_VERSION)?;
+        ensure_webview2_runtime()?;
+        let installer = env::current_exe()?;
+        let mut operations = WindowsUpdateOperations {
+            layout,
+            registration,
+        };
+        apply_update(layout, APPLICATION_PAYLOAD, &installer, &mut operations)?;
+        Ok(Outcome::Completed(String::new()))
+    }
+
+    struct WindowsUpdateOperations<'a> {
+        layout: &'a InstallLayout,
+        registration: InstalledRegistration,
+    }
+
+    impl UpdateOperations for WindowsUpdateOperations<'_> {
+        fn stop_application(&mut self) -> io::Result<()> {
+            stop_running_application(self.layout)
+        }
+
+        fn write_registration(&mut self) -> io::Result<()> {
+            self.registration
+                .write_version(PRODUCT_VERSION, APPLICATION_PAYLOAD.len())
+        }
+
+        fn restore_registration(&mut self) -> io::Result<()> {
+            self.registration.restore()
+        }
+
+        fn start_application(&mut self) -> io::Result<()> {
+            let mut application = Command::new(&self.layout.application).spawn()?;
+            check_application_start(&mut application, Duration::from_secs(1))
+        }
+    }
+
     fn uninstall(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
         if !options.quiet {
             let data_copy = if options.remove_data {
@@ -285,13 +307,15 @@ mod windows_installer {
         }
         if same_file_path(&env::current_exe()?, &layout.uninstaller) {
             spawn_uninstall_worker(options)?;
-            return Ok(Outcome::Completed("DeskLink 卸载程序已启动。".to_owned()));
+            // Exit without an informational dialog: the worker must be able
+            // to remove this executable after it acquires the installer lock.
+            return Ok(Outcome::HandedOff);
         }
         uninstall_now(layout, options)
     }
 
     fn uninstall_now(layout: &InstallLayout, options: Options) -> io::Result<Outcome> {
-        stop_running_application(layout);
+        stop_running_application(layout)?;
         delete_registry_value(RUN_KEY, PRODUCT_NAME)?;
         delete_registry_tree(UNINSTALL_KEY)?;
         remove_file_if_present(&layout.start_menu_shortcut)?;
@@ -317,7 +341,10 @@ mod windows_installer {
         let worker = env::temp_dir().join(format!("DeskLinkUninstallWorker-{}.exe", process::id()));
         fs::copy(current, &worker)?;
         let mut command = Command::new(worker);
-        command.arg("--uninstall-worker").arg("--quiet");
+        command.arg("--uninstall-worker");
+        if options.quiet {
+            command.arg("--quiet");
+        }
         if options.remove_data {
             command.arg("--remove-data");
         }
@@ -325,25 +352,41 @@ mod windows_installer {
         Ok(())
     }
 
-    fn stop_running_application(layout: &InstallLayout) {
+    fn stop_running_application(layout: &InstallLayout) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(15);
         let control_surface =
             unsafe { OpenMutexW(SYNCHRONIZE_ACCESS, false, CONTROL_SURFACE_MUTEX) }.ok();
-        if layout.application.is_file() {
-            let _ = Command::new(&layout.application)
-                .arg("--installer-shutdown")
-                .spawn()
-                .and_then(|mut child| child.wait());
+        let class = wide(WINDOW_CLASS);
+        let window = unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.ok();
+        if control_surface.is_none() && window.is_none() {
+            return Ok(());
         }
         if let Some(control_surface) = control_surface {
+            let stopped = (|| {
+                let mut helper = Command::new(&layout.application)
+                    .arg("--installer-shutdown")
+                    .creation_flags(0x0800_0000) // CREATE_NO_WINDOW; only our helper is terminated on timeout.
+                    .spawn()?;
+                wait_for_shutdown_helper(&mut helper, Duration::from_secs(5))?;
+                let result =
+                    unsafe { WaitForSingleObject(control_surface, remaining_ms(deadline)) };
+                if matches!(result, WAIT_OBJECT_0 | WAIT_ABANDONED) {
+                    unsafe {
+                        let _ = ReleaseMutex(control_surface);
+                    }
+                    Ok(())
+                } else {
+                    Err(shutdown_timeout())
+                }
+            })();
             unsafe {
-                let _ = WaitForSingleObject(control_surface, 6_000);
                 let _ = CloseHandle(control_surface);
             }
+            stopped?;
         }
-        let class = wide(WINDOW_CLASS);
         let hwnd = unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) };
         let Ok(hwnd) = hwnd else {
-            return;
+            return Ok(());
         };
         let mut process_id = 0;
         unsafe {
@@ -364,12 +407,11 @@ mod windows_installer {
                     WPARAM(0),
                     LPARAM(0),
                     SMTO_ABORTIFHUNG,
-                    3_000,
+                    remaining_ms(deadline).min(3_000),
                     None,
                 );
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(4);
         while Instant::now() < deadline {
             if unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.is_err() {
                 break;
@@ -377,11 +419,31 @@ mod windows_installer {
             thread::sleep(Duration::from_millis(75));
         }
         if let Some(process) = process {
+            let stopped = unsafe { WaitForSingleObject(process, remaining_ms(deadline)) };
             unsafe {
-                let _ = WaitForSingleObject(process, 4_000);
                 let _ = CloseHandle(process);
             }
+            if stopped != WAIT_OBJECT_0 {
+                return Err(shutdown_timeout());
+            }
+        } else if unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.is_ok() {
+            return Err(shutdown_timeout());
         }
+        Ok(())
+    }
+
+    fn remaining_ms(deadline: Instant) -> u32 {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u32::MAX as u128) as u32
+    }
+
+    fn shutdown_timeout() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "DeskLink 尚未退出。请从托盘完全退出后重试安装。",
+        )
     }
 
     fn atomic_write_with_retry(destination: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -732,7 +794,7 @@ mod windows_installer {
     }
 
     fn windows_error_to_io(error: windows::core::Error) -> io::Error {
-        io::Error::other(error)
+        desklink_delivery_layout::update::windows_error_to_io(error)
     }
 }
 

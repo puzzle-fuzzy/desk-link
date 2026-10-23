@@ -644,6 +644,77 @@ async fn host_rejects_controller_originated_video_lanes() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_host_join_times_out_when_the_relay_does_not_acknowledge() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate_der = certificate.cert.der().to_vec();
+    let server_config = ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate_der.clone())],
+        PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+    )
+    .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(certificate_der)).unwrap();
+    let client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+    ));
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let (joined_sender, joined_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = oneshot::channel();
+    let relay = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let (_send, mut receive) = connection.accept_bi().await.unwrap();
+        let mut length = [0; 4];
+        receive.read_exact(&mut length).await.unwrap();
+        let mut envelope = vec![0; u32::from_be_bytes(length) as usize];
+        receive.read_exact(&mut envelope).await.unwrap();
+        desklink_transport::decode_relay_join(&envelope).unwrap();
+        joined_sender.send(()).unwrap();
+        // Keep QUIC alive while deliberately withholding the join response.
+        // The release gate also makes a failing regression terminate cleanly.
+        let _ = release_receiver.await;
+        connection.close(quinn::VarInt::from_u32(0), b"test finished");
+        endpoint.wait_idle().await;
+    });
+    let mut startup = tokio::task::spawn_blocking(move || {
+        HostRuntime::start_from_config(
+            QuicClientConfig::with_client_config(address, "localhost", client_config),
+            HostIdentity::from_secret_key([31; 16], &[32; 32]),
+            SessionId::from_bytes([35; 16]),
+            [36; 32],
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(3), joined_receiver)
+        .await
+        .expect("host did not send its first join")
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(12), &mut startup).await;
+    let _ = release_sender.send(());
+    relay.await.unwrap();
+    let outcome = match outcome {
+        Ok(outcome) => outcome.unwrap(),
+        Err(_) => {
+            // spawn_blocking cannot be aborted; release and reap it before
+            // failing so the test never leaves a detached host worker behind.
+            let _ = startup.await;
+            panic!("first host join exceeded its bounded request deadline");
+        }
+    };
+    match outcome {
+        Err(HostError::Transport(message)) => assert!(message.contains("relay join timed out")),
+        Err(error) => panic!("unexpected startup failure: {error}"),
+        Ok(host) => {
+            host.destroy();
+            panic!("host became ready without a relay join acknowledgement");
+        }
+    }
+}
+
 async fn spawn_test_relay() -> TestRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();

@@ -1,10 +1,14 @@
 import type { ControllerInput } from "./types";
 
 type InputSender = (input: ControllerInput, streamId: number) => Promise<void>;
+type TextSender = (text: string, streamId: number) => Promise<void>;
 
 interface QueuedInput {
-  input: ControllerInput;
+  input?: ControllerInput;
+  text?: string;
   streamId: number;
+  resolve?: () => void;
+  reject?: (error: unknown) => void;
 }
 
 // Wheel events are discrete for ordering purposes, but a stalled IPC call can
@@ -32,6 +36,7 @@ export class RemoteInputDispatcher {
   constructor(
     private readonly sender: InputSender,
     private readonly onError: () => void = () => {},
+    private readonly textSender?: TextSender,
   ) {}
 
   enqueue(input: ControllerInput, streamId: number): void {
@@ -42,7 +47,7 @@ export class RemoteInputDispatcher {
     const queued = { input, streamId };
     if (
       input.kind === "wheel"
-      && last?.input.kind === "wheel"
+      && last?.input?.kind === "wheel"
       && last.streamId === streamId
     ) {
       last.input.deltaX = clampCoalescedWheelDelta(
@@ -53,7 +58,7 @@ export class RemoteInputDispatcher {
       );
     } else if (
       input.kind === "mouseMove"
-      && last?.input.kind === "mouseMove"
+      && last?.input?.kind === "mouseMove"
       && last.streamId === streamId
     ) {
       this.queue[this.queue.length - 1] = queued;
@@ -61,6 +66,20 @@ export class RemoteInputDispatcher {
       this.queue.push(queued);
     }
     this.startPump();
+  }
+
+  enqueueText(text: string, streamId: number): Promise<void> {
+    this.flushPendingMouseMove();
+    // The existing native text command accepts at most 256 Unicode scalars.
+    const characters = Array.from(text);
+    const pending: Promise<void>[] = [];
+    for (let offset = 0; offset < characters.length; offset += 256) {
+      pending.push(new Promise<void>((resolve, reject) => {
+        this.queue.push({ text: characters.slice(offset, offset + 256).join(""), streamId, resolve, reject });
+      }));
+    }
+    this.startPump();
+    return Promise.all(pending).then(() => {});
   }
 
   /**
@@ -72,7 +91,7 @@ export class RemoteInputDispatcher {
     const last = this.queue.length > this.queueHead
       ? this.queue[this.queue.length - 1]
       : undefined;
-    if (last?.input.kind === "mouseMove" && last.streamId === streamId) {
+    if (last?.input?.kind === "mouseMove" && last.streamId === streamId) {
       last.input.x = x;
       last.input.y = y;
     } else if (last) {
@@ -92,7 +111,7 @@ export class RemoteInputDispatcher {
   discardPendingMoves(): void {
     this.hasPendingMouseMove = false;
     for (let index = this.queue.length - 1; index >= this.queueHead; index -= 1) {
-      if (this.queue[index]?.input.kind === "mouseMove") {
+      if (this.queue[index]?.input?.kind === "mouseMove") {
         this.queue.splice(index, 1);
       }
     }
@@ -100,6 +119,9 @@ export class RemoteInputDispatcher {
   }
 
   discardAll(): void {
+    for (let index = this.queueHead; index < this.queue.length; index += 1) {
+      this.queue[index]?.reject?.(new Error("Remote input was cleared"));
+    }
     this.queue.length = 0;
     this.queueHead = 0;
     this.hasPendingMouseMove = false;
@@ -132,8 +154,15 @@ export class RemoteInputDispatcher {
           continue;
         }
         try {
-          await this.sender(queued.input, queued.streamId);
-        } catch {
+          if (queued.text !== undefined) {
+            if (!this.textSender) throw new Error("Remote text sender is unavailable");
+            await this.textSender(queued.text, queued.streamId);
+          } else if (queued.input) {
+            await this.sender(queued.input, queued.streamId);
+          }
+          queued.resolve?.();
+        } catch (error) {
+          queued.reject?.(error);
           this.onError();
         }
       }

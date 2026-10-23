@@ -468,6 +468,68 @@ mod native {
             },
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use desklink_protocol::{InputEnvelope, decode_input, encode_input};
+
+        #[test]
+        fn unicode_text_survives_protocol_and_builds_utf16_keyboard_packets() {
+            // Inspect the INPUT records only; never call SendInput or modify the
+            // desktop, active keyboard layout, or the user's foreground window.
+            let cases: [(char, &[u16]); 6] = [
+                ('中', &[0x4e2d]),
+                ('文', &[0x6587]),
+                ('，', &[0xff0c]),
+                ('。', &[0x3002]),
+                ('🙂', &[0xd83d, 0xde42]),
+                ('𠀀', &[0xd840, 0xdc00]),
+            ];
+            for (index, (character, expected_utf16)) in cases.into_iter().enumerate() {
+                for pressed in [true, false] {
+                    let envelope = InputEnvelope {
+                        sequence: index as u64 + 1,
+                        timestamp_us: 1_000,
+                        event: InputEvent::Key {
+                            code: KeyCode::Character(character),
+                            pressed,
+                            modifiers: Modifiers::default(),
+                        },
+                    };
+                    let bytes = encode_input(&envelope).unwrap();
+                    let decoded = decode_input(&bytes, 1_000).unwrap();
+                    assert_eq!(decoded, envelope);
+                    let InputEvent::Key {
+                        code,
+                        pressed,
+                        modifiers,
+                    } = decoded.event
+                    else {
+                        panic!("expected a character input");
+                    };
+                    let inputs = key_inputs(code, pressed, modifiers).unwrap();
+                    assert_eq!(inputs.len(), expected_utf16.len());
+                    for (input, unit) in inputs.iter().zip(expected_utf16.iter().copied()) {
+                        assert_eq!(input.r#type, INPUT_KEYBOARD);
+                        // The type was checked above and keyboard_input always
+                        // initializes the keyboard member of the INPUT union.
+                        let keyboard = unsafe { input.Anonymous.ki };
+                        assert_eq!(keyboard.wVk, VIRTUAL_KEY(0));
+                        assert_eq!(keyboard.wScan, unit);
+                        assert_eq!(
+                            keyboard.dwFlags,
+                            if pressed {
+                                KEYEVENTF_UNICODE
+                            } else {
+                                KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn supported_key(code: &KeyCode, modifiers: Modifiers) -> bool {

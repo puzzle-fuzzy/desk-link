@@ -647,6 +647,119 @@ async fn stalled_file_transfer_does_not_block_input_channel() {
 }
 
 #[tokio::test]
+async fn interrupted_reliable_send_closes_connection_with_unconsumed_complete_messages() {
+    for peer_stops_stream in [false, true] {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let mut server_config = ServerConfig::with_single_cert(
+            vec![CertificateDer::from(certificate_der.clone())],
+            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+        )
+        .unwrap();
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(32));
+        server_config.transport_config(Arc::new(transport));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(certificate_der)).unwrap();
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
+        let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let (stalled_sender, stalled_receiver) = tokio::sync::oneshot::channel();
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let mut length = [0; 4];
+            receive.read_exact(&mut length).await.unwrap();
+            let mut envelope = vec![0; u32::from_be_bytes(length) as usize];
+            receive.read_exact(&mut envelope).await.unwrap();
+            decode_relay_join(&envelope).unwrap();
+            send.write_all(&[0]).await.unwrap();
+            send.finish().unwrap();
+
+            let (_send, mut unread) = connection.accept_bi().await.unwrap();
+            // Do not consume even message A, whose complete send already
+            // returned. A lane reset must never silently lose A and continue C.
+            stalled_sender.send(()).unwrap();
+            if peer_stops_stream {
+                stop_receiver.await.unwrap();
+                unread.stop(quinn::VarInt::from_u32(1)).unwrap();
+            }
+            let closed = tokio::time::timeout(Duration::from_secs(2), connection.closed())
+                .await
+                .expect("interrupted write did not close the connection");
+            closed_sender.send(closed).unwrap();
+        });
+        let relay = MockRelay {
+            address,
+            client_config,
+            task,
+        };
+        let client = QuicClient::connect(config(&relay)).await.unwrap();
+        client.join(join(DeviceRole::Controller)).await.unwrap();
+        client.send_transfer(b"one".to_vec()).await.unwrap();
+        let mut pending = Box::pin(client.send_transfer(vec![0; MAX_RELIABLE_MESSAGE_BYTES]));
+        tokio::select! {
+            () = async { stalled_receiver.await.unwrap(); } => {}
+            result = &mut pending => panic!("send completed before the peer stalled: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(2)) => panic!("peer did not accept the unread stream"),
+        }
+        if peer_stops_stream {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                    .await
+                    .is_err()
+            );
+            stop_sender.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), pending)
+                    .await
+                    .is_err()
+            );
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(2), closed_receiver)
+            .await
+            .expect("peer did not observe the interrupted connection")
+            .unwrap();
+        assert!(matches!(
+            closed,
+            quinn::ConnectionError::ApplicationClosed(_)
+        ));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.send_transfer(b"three".to_vec())
+            )
+            .await
+            .expect("new send remained blocked on the interrupted frame")
+            .is_err(),
+            "message C must not continue on a session that may have lost A",
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), client.next_event())
+                .await
+                .unwrap()
+                .unwrap(),
+            TransportEvent::Closed { .. },
+        ));
+    }
+}
+
+#[tokio::test]
 async fn client_rejects_invalid_timeout_overrides_before_connecting() {
     let relay = spawn_mock_relay(false).await;
     let invalid_zero = config(&relay).with_timeouts(Duration::ZERO, DEAD_TIMEOUT);

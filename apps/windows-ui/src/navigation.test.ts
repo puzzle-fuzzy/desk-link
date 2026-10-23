@@ -11,14 +11,23 @@ test("uses remote tasks as the shared desktop navigation", () => {
   expect(DESKTOP_NAV_ITEMS.map((item) => item.label)).toEqual([
     "连接设备",
     "共享此设备",
-    "已批准设备",
-    "设置 / 诊断",
+    "设置与诊断",
   ]);
 });
 
 test("keeps pairing and fixed access as secondary pages", () => {
   expect(navigationViewFor("pairing")).toBe("connection");
-  expect(navigationViewFor("fixedAccess")).toBe("settings");
+  expect(navigationViewFor("fixedAccess")).toBe("connection");
+  expect(navigationViewFor("devices")).toBe("connection");
+  expect(navigationViewFor("about")).toBe("settings");
+});
+
+test("keeps connect and share as the two primary navigation actions", () => {
+  const primaryItems = DESKTOP_NAV_ITEMS.filter((item) => item.id !== "settings");
+  expect(primaryItems.map((item) => item.id)).toEqual(["controller", "connection"]);
+  expect(nextMenuIndex(0, primaryItems.length, "ArrowDown")).toBe(1);
+  expect(nextMenuIndex(1, primaryItems.length, "ArrowDown")).toBe(0);
+  expect(nextMenuIndex(0, primaryItems.length, "ArrowUp")).toBe(1);
 });
 
 describe("keyboard tab navigation", () => {

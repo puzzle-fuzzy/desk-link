@@ -367,11 +367,13 @@ async fn controller_runtime_requests_a_keyframe_after_a_reference_gap() {
     let host_verify_key = host_identity.verify_key();
     let controller_verify_key = controller_identity.verify_key();
     let (release_host, keep_host_alive) = oneshot::channel();
+    let (recovered_sender, recovered_receiver) = oneshot::channel();
     let host_task = tokio::spawn(run_reference_gap_host(
         host,
         host_identity,
         controller_verify_key,
         keep_host_alive,
+        recovered_receiver,
     ));
 
     let mut runtime = ControllerRuntime::connect(controller, controller_identity, host_verify_key)
@@ -404,6 +406,7 @@ async fn controller_runtime_requests_a_keyframe_after_a_reference_gap() {
         recovered,
         ControllerEvent::H264AccessUnit(EncodedFrame { frame_id: 13, .. })
     ));
+    recovered_sender.send(()).unwrap();
     let next = tokio::time::timeout(Duration::from_secs(3), runtime.next_event())
         .await
         .unwrap()
@@ -782,6 +785,7 @@ async fn run_reference_gap_host(
     identity: DeviceIdentity,
     expected_controller: ed25519_dalek::VerifyingKey,
     keep_host_alive: oneshot::Receiver<()>,
+    recovered: oneshot::Receiver<()>,
 ) -> ControlMessage {
     let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
     let (mut responder, response) =
@@ -870,6 +874,9 @@ async fn run_reference_gap_host(
 
     let request = open_control(&mut secure, host.next_control().await.unwrap());
     send_test_video_frame(&host, &mut secure, 13, true).await;
+    // UDP does not order frame 14 behind frame 13. Wait until the controller
+    // has presented the recovery frame before testing its contiguous delta.
+    recovered.await.unwrap();
     send_test_video_frame(&host, &mut secure, 14, false).await;
     let _ = keep_host_alive.await;
     request
@@ -985,7 +992,12 @@ async fn send_test_video_frame(
         },
         data: vec![frame_id as u8; 2_500],
     };
-    for packet in packetize_frame(&frame).unwrap() {
+    let mut packets = packetize_frame(&frame).unwrap();
+    if keyframe {
+        // Exercise a legal datagram order: the keyframe's chunk zero is last.
+        packets.reverse();
+    }
+    for packet in packets {
         let plaintext = encode_video_packet(&packet).unwrap();
         host.send_video_datagram(secure.seal(SecureLane::VideoDatagram, &plaintext).unwrap())
             .await

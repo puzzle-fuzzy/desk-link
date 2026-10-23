@@ -1,5 +1,6 @@
-import "./styles.css";
-import "./product-ui.css";
+import "./styles/layout.css";
+import "./styles/base.css";
+import "./styles/interaction.css";
 
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -12,14 +13,15 @@ import {
   accountResendVerification,
   accountRestore,
   cancelPairingSession,
+  cancelWindowsUpdate,
   checkWindowsRelease,
   disableFixedAccessPassword,
   exportDiagnosticReport,
   getFixedAccessPassword,
   getHostSnapshot,
   getWindowsPreferences,
+  installWindowsUpdate,
   openGithubRepository,
-  openWindowsReleases,
   quitDeskLink,
   regenerateFixedAccessPassword,
   respondHostApproval,
@@ -52,9 +54,9 @@ import {
 import {
   MANAGED_RELAY_ADDRESS,
   MANAGED_RELAY_SERVER_NAME,
-  isManagedRelay,
 } from "./product-config";
 import {
+  DESKTOP_NAV_ITEMS,
   navigationViewFor,
   nextMenuIndex,
   nextTabIndex,
@@ -68,26 +70,27 @@ import {
   shouldStartInLocalMode,
 } from "./account-mode";
 import { escapeHtml } from "./html";
+import { formatDeviceId } from "./device-credentials";
 import { icon, renderLucideIcons } from "./icons";
 import { hostStatusSummary } from "./host-status";
-import {
-  evaluateWindowsRelease,
-  type WindowsUpdateCheck,
-} from "./windows-update";
+import { hostSnapshotPresentationChanged } from "./host-snapshot-presentation";
+import { approvalNeedsFocus, approvalTabFocusIndex } from "./approval-focus";
+import { WindowsUpdater, windowsUpdateProgressLabel } from "./windows-update";
 
 type View = "controller" | "connection" | "devices" | "pairing" | "fixedAccess" | "settings" | "about";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
-type WindowsUpdateState =
-  | { kind: "idle" }
-  | { kind: "checking" }
-  | { kind: "error" }
-  | WindowsUpdateCheck;
-
 const applicationRoot = document.querySelector<HTMLElement>("#app");
 if (!applicationRoot) {
   throw new Error("未找到 DeskLink 应用界面根节点");
 }
 const app: HTMLElement = applicationRoot;
+const windowsUpdateBanner = document.createElement("aside");
+windowsUpdateBanner.className = "windows-update-banner";
+windowsUpdateBanner.dataset.windowsUpdateRegion = "banner";
+windowsUpdateBanner.hidden = true;
+windowsUpdateBanner.setAttribute("aria-label", "应用更新");
+app.before(windowsUpdateBanner);
+const windowsUpdateBoundRegions = new WeakSet<HTMLElement>();
 const renderScheduler = new RenderScheduler(
   (callback) => window.requestAnimationFrame(callback),
   (handle) => window.cancelAnimationFrame(handle),
@@ -121,10 +124,20 @@ let diagnosticsSharingBusy = false;
 let diagnosticsUploadBusy = false;
 let quitConfirming = false;
 let applicationVersion = "";
-let windowsUpdate: WindowsUpdateState = { kind: "idle" };
+const windowsUpdater = new WindowsUpdater({
+  version: async () => {
+    applicationVersion = applicationVersion || preferences?.version || await getVersion();
+    return applicationVersion;
+  },
+  check: checkWindowsRelease,
+  install: installWindowsUpdate,
+  cancel: cancelWindowsUpdate,
+  changed: updateWindowsUpdateRegions,
+});
 let utilityMenuOpen = false;
 let utilityMenuDismissBound = false;
 const snapshotRequests = new LatestRequest();
+const fixedAccessRequests = new LatestRequest();
 let account: AccountSnapshot = { signedIn: false, user: null, deviceId: null };
 let accountLocalMode = false;
 let accountLoading = true;
@@ -134,9 +147,14 @@ let accountBusy = false;
 let accountNotice: string | null = null;
 let accountCanResendVerification = false;
 let snapshotRecoveryTimer: number | null = null;
-let workspaceListenersBound = false;
+const workspaceHostEvents = ["host-runtime-changed", "host-approval-changed"] as const;
+const workspaceHostListeners = new Set<string>();
+const workspaceHostListenerAttempts = new Map<string, Promise<void>>();
+let workspaceRecoveryBound = false;
+let snapshotReadFeedback: Feedback = null;
 
 function render(): void {
+  prepareControllerRender();
   if (accountLoading) {
     app.innerHTML = renderAccountLoading();
     return;
@@ -149,7 +167,6 @@ function render(): void {
   const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
   const preservedScrollTop = renderedView === activeView ? (previousWorkspace?.scrollTop ?? 0) : 0;
   const animateSurface = renderedView !== activeView;
-  prepareControllerRender();
   app.innerHTML = `
     <div class="app-shell">
       ${renderSidebar()}
@@ -172,6 +189,7 @@ function render(): void {
   bindInteractions();
   bindUtilityMenuDismiss();
   focusNewApproval();
+  updateWindowsUpdateRegions();
 }
 
 function scheduleRender(): void {
@@ -179,7 +197,7 @@ function scheduleRender(): void {
 }
 
 function renderAccountLoading(): string {
-  return `<main class="account-gate"><section class="account-card account-card--loading"><div class="account-mark">D</div><strong>正在准备 DeskLink</strong><span>正在读取本机登录状态…</span></section></main>`;
+  return `<main class="account-gate"><section class="account-card account-card--loading" role="status"><strong>正在加载…</strong></section></main>`;
 }
 
 function renderAccountGate(): string {
@@ -188,9 +206,7 @@ function renderAccountGate(): string {
   return `
     <main class="account-gate">
       <section class="account-card" aria-labelledby="account-title">
-        <div class="account-card-brand"><div class="account-mark">D</div><div><strong>DeskLink</strong><span>端到端加密远程控制</span></div></div>
         <h1 id="account-title">${title}</h1>
-        <p class="account-subtitle">登录可以同步账号状态；不登录也能直接使用本机远程控制。账号不会代替远程设备配对和主机审批。</p>
         <div class="account-mode-switch" role="tablist" aria-label="账号操作">
           <button id="account-tab-login" role="tab" aria-selected="${accountMode === "login"}" aria-controls="account-form-panel" tabindex="${accountMode === "login" ? "0" : "-1"}" type="button" data-account-mode="login" class="${accountMode === "login" ? "is-active" : ""}">登录</button>
           <button id="account-tab-register" role="tab" aria-selected="${accountMode === "register"}" aria-controls="account-form-panel" tabindex="${accountMode === "register" ? "0" : "-1"}" type="button" data-account-mode="register" class="${accountMode === "register" ? "is-active" : ""}">注册</button>
@@ -205,7 +221,6 @@ function renderAccountGate(): string {
           <button class="button button--primary account-submit" type="submit" ${accountBusy ? "disabled aria-busy=\"true\"" : ""}>${accountBusy ? "正在处理…" : action}</button>
         </form>
         <button class="button button--secondary account-local-mode" type="button" data-account-local-mode>跳过登录，直接使用</button>
-        <p class="account-footnote">本机模式只保存当前 Windows 账户的连接设置，不上传账号资料；之后可在“更多”中登录账号。</p>
       </section>
     </main>
   `;
@@ -338,6 +353,9 @@ async function submitAccount(form: HTMLFormElement): Promise<void> {
 async function logoutAccount(): Promise<void> {
   if (accountBusy) return;
   accountBusy = true;
+  clearFixedAccessSecrets();
+  clearPairingSecrets();
+  pairingSession = null;
   render();
   try {
     await accountLogout();
@@ -417,9 +435,10 @@ function renderHostApproval(): string {
   if (!approval) {
     return "";
   }
+  const actionsDisabled = approvalBusy || approval.expiresAtUnixS <= Math.floor(Date.now() / 1000);
   return `
     <div class="approval-backdrop">
-      <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-description approval-warning">
+      <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-title" aria-describedby="approval-description approval-warning" tabindex="-1">
         <div class="approval-heading">
           ${icon(approval.identityChanged ? "shield-alert" : "shield-user", "approval-icon")}
           <div>
@@ -440,8 +459,8 @@ function renderHostApproval(): string {
         </dl>
         <p class="approval-warning" id="approval-warning">${icon("triangle-alert", "approval-warning-icon")}<span class="approval-warning-copy">${approval.identityChanged ? "仅当你确认对方刚刚重装或重置过 DeskLink 时才替换旧身份。" : "如果你没有主动发起连接，请选择“拒绝”。"}<strong data-approval-countdown>${escapeHtml(formatApprovalRemaining(approval.expiresAtUnixS))}</strong></span></p>
         <div class="approval-actions">
-          <button class="button button--secondary" type="button" data-reject-host-approval ${approvalBusy ? "disabled" : ""}>${approvalBusy ? "正在处理…" : "拒绝"}</button>
-          <button class="button button--primary" type="button" data-allow-host-approval ${approvalBusy ? "disabled" : ""}>${approval.identityChanged ? "确认并替换旧身份" : "允许本次控制"}</button>
+          <button class="button button--secondary" type="button" data-reject-host-approval ${actionsDisabled ? "disabled" : ""}>${approvalBusy ? "正在处理…" : "拒绝"}</button>
+          <button class="button button--primary" type="button" data-allow-host-approval ${actionsDisabled ? "disabled" : ""}>${approval.identityChanged ? "确认并替换旧身份" : "允许本次控制"}</button>
         </div>
       </section>
     </div>
@@ -459,19 +478,31 @@ function focusNewApproval(): void {
     expiredApprovalId = null;
     return;
   }
-  if (focusedApprovalId === requestId) {
+  const dialog = document.querySelector<HTMLElement>(".approval-dialog");
+  const activeElement = document.activeElement;
+  const focusInsideDialog = Boolean(dialog?.contains(activeElement))
+    && !(activeElement instanceof HTMLButtonElement && activeElement.disabled);
+  if (!approvalNeedsFocus(requestId, focusedApprovalId, focusInsideDialog)) {
     return;
   }
+  if (focusedApprovalId !== requestId) {
+    expiredApprovalId = null;
+  }
   focusedApprovalId = requestId;
-  expiredApprovalId = null;
   window.requestAnimationFrame(() => {
-    document.querySelector<HTMLButtonElement>("[data-reject-host-approval]")?.focus();
+    if (snapshot?.pendingApproval?.requestId !== requestId) return;
+    const reject = document.querySelector<HTMLButtonElement>("[data-reject-host-approval]");
+    if (reject && !reject.disabled) {
+      reject.focus();
+    } else {
+      document.querySelector<HTMLElement>(".approval-dialog")?.focus();
+    }
   });
 }
 
 function handleApprovalKeyboard(event: KeyboardEvent): void {
   const dialog = document.querySelector<HTMLElement>(".approval-dialog");
-  if (!dialog || approvalBusy) {
+  if (!dialog) {
     return;
   }
   if (event.key === "Escape") {
@@ -485,55 +516,38 @@ function handleApprovalKeyboard(event: KeyboardEvent): void {
   const controls = Array.from(
     dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])'),
   );
-  if (controls.length === 0) {
-    event.preventDefault();
+  const nextIndex = approvalTabFocusIndex(
+    controls.length,
+    controls.indexOf(document.activeElement as HTMLElement),
+    event.shiftKey,
+  );
+  if (nextIndex === null) {
     return;
   }
-  const first = controls[0];
-  const last = controls.at(-1);
-  if (!first || !last) {
-    return;
-  }
-  if (event.shiftKey && document.activeElement === first) {
-    event.preventDefault();
-    last.focus();
-  } else if (!event.shiftKey && document.activeElement === last) {
-    event.preventDefault();
-    first.focus();
-  }
+  event.preventDefault();
+  (nextIndex < 0 ? dialog : controls[nextIndex])?.focus();
 }
 
 function renderSidebar(): string {
   const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
-  const sidebarItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
-    { id: "controller", label: "连接设备", icon: "monitor-up" },
-  ];
-  const status = snapshot ? hostStatusSummary(snapshot) : null;
+  const sidebarItems = DESKTOP_NAV_ITEMS.filter(({ id }) => id !== "settings");
   return `
     <aside class="app-sidebar" aria-label="DeskLink 主导航">
       <div class="sidebar-brand">
         ${icon("monitor-check", "sidebar-brand-mark")}
-        <div><strong>DeskLink</strong><span>Windows 远程桌面</span></div>
+        <div><strong>DeskLink</strong></div>
       </div>
       <nav class="sidebar-nav" aria-label="主要功能">
-        <span class="sidebar-label">工作区</span>
-        ${sidebarItems.map(({ id, label, icon: iconName }) => `
+        ${sidebarItems.map(({ id, label }) => `
           <button class="sidebar-nav-item ${activeNavigationView === id ? "sidebar-nav-item--active" : ""}" type="button" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
-            ${icon(iconName)}<span>${label}</span>
+            ${icon(id === "controller" ? "monitor-up" : "monitor")}<span>${label}</span>
           </button>
         `).join("")}
       </nav>
       <div class="sidebar-bottom">
-        ${status ? `
-          <button class="sidebar-status sidebar-status--${status.tone}" type="button" data-open-overview>
-            <span class="sidebar-status-dot" aria-hidden="true"></span>
-            <span><strong>${escapeHtml(status.title)}</strong><small>${escapeHtml(status.detail)}</small></span>
-          </button>
-        ` : ""}
-        <button class="sidebar-nav-item sidebar-nav-item--secondary ${activeNavigationView === "settings" ? "sidebar-nav-item--active" : ""}" type="button" data-view="settings" aria-current="${activeNavigationView === "settings" ? "page" : "false"}">
-          ${icon("settings-2")}<span>设置与诊断</span>
+        <button class="sidebar-nav-item sidebar-nav-item--secondary ${activeNavigationView === "settings" ? "sidebar-nav-item--active" : ""}" type="button" data-view="settings" aria-label="设置与诊断" aria-current="${activeNavigationView === "settings" ? "page" : "false"}">
+          ${icon("settings-2")}<span class="sidebar-settings-label">设置与诊断</span>
         </button>
-        <div class="sidebar-footer-note"><span class="sidebar-footer-dot"></span><span>端到端加密连接</span></div>
       </div>
     </aside>
   `;
@@ -543,14 +557,10 @@ function renderWorkspaceTopbar(): string {
   return `
     <header class="workspace-topbar">
       <div class="workspace-context">
-        <span class="workspace-context-label">DeskLink 控制台</span>
-        <span class="workspace-context-divider" aria-hidden="true"></span>
-        <strong>${activeView === "controller" ? "连接设备" : escapeHtml(viewTitle(activeView))}</strong>
+        ${snapshot ? renderHostStatusChip(snapshot) : ""}
       </div>
       <div class="workspace-topbar-actions">
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
-        ${accountLocalMode && !account.user ? `<span class="topbar-account-local" title="当前未登录账号，仅使用本机连接能力">本机模式</span>` : ""}
-        ${snapshot ? renderHostStatusChip(snapshot) : ""}
         <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-haspopup="menu" aria-expanded="${utilityMenuOpen}" aria-controls="utility-menu" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
         ${renderUtilityMenu()}
       </div>
@@ -558,24 +568,9 @@ function renderWorkspaceTopbar(): string {
   `;
 }
 
-function viewTitle(view: View): string {
-  switch (view) {
-    case "connection": return "共享此设备";
-    case "devices": return "已批准设备";
-    case "pairing": return "共享此设备";
-    case "fixedAccess": return "固定访问密码";
-    case "settings": return "设置与诊断";
-    case "about": return "关于 DeskLink";
-    default: return "连接设备";
-  }
-}
-
 function renderUtilityMenu(): string {
-  const activeNavigationView = navigationViewFor(activeView as DeskLinkView);
   const utilityItems: ReadonlyArray<{ id: DeskLinkView; label: string; icon: Parameters<typeof icon>[0] }> = [
-    { id: "connection", label: "共享此设备", icon: "monitor-up" },
     { id: "devices", label: "已批准设备", icon: "shield-check" },
-    { id: "settings", label: "设置与诊断", icon: "settings-2" },
   ];
   if (!utilityMenuOpen) {
     return "";
@@ -583,7 +578,7 @@ function renderUtilityMenu(): string {
   return `
     <div id="utility-menu" class="utility-menu" role="menu" aria-label="更多功能" aria-orientation="vertical">
       ${utilityItems.map(({ id, label, icon: iconName }) => `
-        <button class="utility-menu-item ${activeNavigationView === id ? "utility-menu-item--active" : ""}" type="button" role="menuitem" data-view="${id}" aria-current="${activeNavigationView === id ? "page" : "false"}">
+        <button class="utility-menu-item ${activeView === id ? "utility-menu-item--active" : ""}" type="button" role="menuitem" data-view="${id}" aria-current="${activeView === id ? "page" : "false"}">
           ${icon(iconName)}<span>${label}</span>
         </button>
       `).join("")}
@@ -597,7 +592,9 @@ function renderUtilityMenu(): string {
 
 function renderHostStatusChip(state: HostSnapshot): string {
   const status = hostStatusSummary(state);
-  return `<button class="host-status-chip host-status-chip--${status.tone}" type="button" data-open-overview aria-label="${escapeHtml(status.title)}，${escapeHtml(status.detail)}，打开设置 / 诊断">${escapeHtml(status.title)}</button>`;
+  const action = status.tone === "attention" ? "data-open-overview" : "data-open-connection";
+  const destination = status.tone === "attention" ? "设置 / 诊断" : "共享此设备";
+  return `<button class="host-status-chip host-status-chip--${status.tone}" type="button" ${action} aria-label="${escapeHtml(status.title)}，${escapeHtml(status.detail)}，打开${destination}">${escapeHtml(status.title)}</button>`;
 }
 
 function renderFeedback(item: NonNullable<Feedback>): string {
@@ -612,14 +609,8 @@ function renderFeedback(item: NonNullable<Feedback>): string {
 
 function renderLoading(): string {
   return `
-    <div class="loading-layout" role="status" aria-live="polite" aria-label="正在读取受保护的 DeskLink 状态">
-      <div class="skeleton skeleton--status"></div>
-      <div class="skeleton-row">
-        <div class="skeleton"></div>
-        <div class="skeleton"></div>
-        <div class="skeleton"></div>
-      </div>
-      <div class="skeleton skeleton--list"></div>
+    <div class="loading-layout" role="status" aria-live="polite">
+      <p>正在加载…</p>
     </div>
   `;
 }
@@ -662,7 +653,6 @@ function renderAbout(): string {
         <div><dt>本地保护</dt><dd>设备记录和访问密码由当前 Windows 账户加密保存。</dd></div>
         <div><dt>源代码</dt><dd><button class="text-button about-github-link" type="button" data-open-github>${icon("git-fork")}查看 puzzle-fuzzy/desk-link</button></dd></div>
       </dl>
-      <p class="about-footnote">关闭窗口后 DeskLink 会继续在系统托盘运行。只有在“设置”中选择退出，才会停止本机服务。</p>
     </div>
   `;
 }
@@ -672,7 +662,7 @@ function renderFatalState(): string {
     <div class="empty-state empty-state--error">
       ${icon("circle-alert", "empty-symbol")}
       <h1>无法读取 DeskLink 状态</h1>
-      <p>当前界面无法读取此 Windows 账户的本地状态，主机设置没有被修改。DeskLink 会自动恢复状态，请稍候。</p>
+      <p>正在重试，请稍候。</p>
     </div>
   `;
 }
@@ -713,7 +703,6 @@ function renderDiagnosticSummary(state: HostSnapshot): string {
       <div class="section-heading">
         <div>
           <h2 id="diagnostic-summary-heading">双机连接诊断</h2>
-          <p>连接遇到问题时，可展开检查结果或导出报告。</p>
         </div>
         <div class="diagnostic-actions">
           <span class="diagnostic-overall">${summary}</span>
@@ -785,28 +774,27 @@ function renderConnection(state: HostSnapshot): string {
   }
   const fields = connectionDraft;
   return `
-    <div class="page-layout page-layout--form">
+    <div class="page-layout page-layout--form page-layout--share">
       <header class="page-heading">
         <div>
-          <span class="page-eyebrow">共享设置</span>
           <h1>共享此设备</h1>
-          <p>保存后，这台电脑才能生成临时密码并等待另一台电脑连接。</p>
-        </div>
-        <div class="page-actions">
-          <span class="storage-note">由 Windows DPAPI 加密保护</span>
         </div>
       </header>
 
       ${state.connectionError ? renderStateWarnings(state) : ""}
 
-      <div class="connection-guidance share-device-card">
-        ${icon("globe-lock", "connection-guidance-mark")}
-        <div>
-          <strong>${state.connection && isManagedRelay(state.connection.relayAddress, state.connection.serverName) ? "正在使用 DeskLink 公网中继" : "默认使用 DeskLink 公网中继"}</strong>
-          <p>公网中继可在不同网络之间连接。只有需要使用自己维护的中继基础设施时，才修改下面两项。</p>
-        </div>
-      </div>
+      <section class="share-device-card" aria-label="本机连接信息">
+        ${state.connection
+          ? `<div class="pairing-credential share-device-identity"><span>本机 ID</span><strong id="host-access-heading">${escapeHtml(state.deviceId ? formatDeviceId(state.deviceId) : "暂时无法读取")}</strong>${state.deviceId ? '<button class="button button--secondary button--compact" type="button" data-copy-host-id>复制 ID</button>' : ""}</div>
+             <div class="page-actions share-device-actions">
+               ${renderPairingAction(state, "primary")}
+               <button class="button button--secondary" type="button" data-open-fixed-access>${state.fixedPasswordEnabled ? "查看固定密码" : "设置固定密码"}</button>
+             </div>`
+          : `<button class="button button--primary" type="button" data-setup-managed ${managedSetupBusy ? 'disabled aria-busy="true"' : ""}>${managedSetupBusy ? "正在启用…" : "启用远程连接"}</button>`}
+      </section>
 
+      <details class="advanced-settings" data-connection-advanced ${connectionAdvancedOpen ? "open" : ""}>
+        <summary>高级设置</summary>
       <form class="connection-form" data-connection-form novalidate>
         <div class="field">
           <label for="relay-address">中继地址</label>
@@ -820,7 +808,7 @@ function renderConnection(state: HostSnapshot): string {
             spellcheck="false"
             required
           />
-          <small>默认 ${MANAGED_RELAY_ADDRESS}；自建中继必须填写控制端可以访问的 IP 与 UDP 端口。</small>
+          <small>自建中继的 IP 与 UDP 端口。</small>
         </div>
 
         <div class="field">
@@ -835,14 +823,10 @@ function renderConnection(state: HostSnapshot): string {
             spellcheck="false"
             required
           />
-          <small>默认 ${MANAGED_RELAY_SERVER_NAME}；自建中继必须与证书名称一致。</small>
+          <small>须与中继证书名称一致。</small>
         </div>
 
-        <details class="advanced-settings field--wide" data-connection-advanced ${connectionAdvancedOpen ? "open" : ""}>
-          <summary>
-            <span>高级连接设置</span>
-            <small>会话标识、密钥和视频流编号</small>
-          </summary>
+        <div class="field--wide">
           <div class="advanced-settings-grid">
             <div class="field field--wide">
               <label for="session-id">会话 ID</label>
@@ -859,7 +843,6 @@ function renderConnection(state: HostSnapshot): string {
                 spellcheck="false"
                 required
               />
-              <small>用于识别这台电脑的私有中继会话。</small>
             </div>
 
             <div class="field field--wide">
@@ -880,7 +863,7 @@ function renderConnection(state: HostSnapshot): string {
                 />
                 <button type="button" class="secret-toggle" data-toggle-secret aria-label="显示中继密钥">显示</button>
               </div>
-              <small>${state.connection?.hasSavedKey ? "密钥已保存，留空即可继续使用。" : "已自动生成，只会加密保存在当前 Windows 账户。"}</small>
+              ${state.connection?.hasSavedKey ? "<small>留空保留现有密钥。</small>" : ""}
             </div>
 
             <div class="field field--compact">
@@ -894,24 +877,24 @@ function renderConnection(state: HostSnapshot): string {
                 step="1"
                 required
               />
-              <small>通常保持为 1，安全重连时会自动递增。</small>
             </div>
             <div class="advanced-settings-action">
               <button class="button button--secondary button--compact" type="button" data-generate-connection ${saving ? "disabled" : ""}>重新生成连接凭据</button>
               <small>重新生成后，已经配对的电脑需要再次配对。</small>
             </div>
           </div>
-        </details>
+        </div>
 
         <div class="form-actions field--wide">
           <button class="button button--primary" type="submit" ${saving ? "disabled" : ""} ${saving ? 'aria-busy="true"' : ""}>
             ${saving ? "正在保存共享设置…" : "保存共享设置"}
           </button>
           <button class="button button--secondary" type="button" data-cancel-connection ${saving ? "disabled" : ""}>
-            返回设置 / 诊断
+            取消
           </button>
         </div>
       </form>
+      </details>
     </div>
   `;
 }
@@ -922,7 +905,6 @@ function renderDevices(state: HostSnapshot): string {
       <header class="page-heading">
         <div>
           <h1>已批准设备</h1>
-          <p>这些电脑已经在本机完成身份核对，可以再次连接。</p>
         </div>
         <div class="page-actions">
           ${renderPairingAction(state, "primary")}
@@ -939,13 +921,6 @@ function renderDevices(state: HostSnapshot): string {
         }
       </section>
 
-      <div class="security-note">
-        ${icon("shield-check", "security-note-mark")}
-        <div>
-          <strong>批准操作仅在本机完成</strong>
-          <p>新的控制端无法自行加入此列表，DeskLink 必须在这台 Windows 设备上获得确认。</p>
-        </div>
-      </div>
     </div>
   `;
 }
@@ -955,7 +930,6 @@ function renderDeviceEmptyState(): string {
     <div class="empty-state empty-state--devices">
       ${icon("monitor", "empty-device")}
       <h2>还没有已批准的电脑</h2>
-      <p>生成一份临时密码，在另一台电脑输入本机 ID 后回到这里确认身份。</p>
       ${snapshot ? renderPairingAction(snapshot, "primary") : ""}
     </div>
   `;
@@ -1027,15 +1001,15 @@ function renderPairingAction(
 }
 
 function renderPairing(state: HostSnapshot): string {
-  const session = pairingSession;
-  const active = state.pairingActive;
+  const expired = pairingSession !== null && pairingSession.expiresAtUnixS <= Math.floor(Date.now() / 1000);
+  const session = expired ? null : pairingSession;
+  const active = state.pairingActive && !expired;
   return `
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
         <div>
           <button class="back-button" type="button" data-open-connection aria-label="返回共享此设备">${icon("arrow-left")}共享此设备</button>
-          <h1>允许另一台电脑连接</h1>
-          <p>让 iPhone 扫描二维码，或在另一台电脑使用设备 ID 和临时密码。</p>
+          <h1>临时连接</h1>
         </div>
         <span class="pairing-state ${active ? "pairing-state--active" : ""}">
           <span aria-hidden="true"></span>${active ? "临时密码有效" : "临时密码已失效"}
@@ -1047,10 +1021,7 @@ function renderPairing(state: HostSnapshot): string {
           ? `
             <section class="pairing-card" aria-labelledby="pairing-credentials-heading">
               <div class="pairing-card-heading">
-                <div>
-                  <span class="eyebrow">本次连接凭据</span>
-                  <h2 id="pairing-credentials-heading">选择一种连接方式</h2>
-                </div>
+                <h2 id="pairing-credentials-heading">连接信息</h2>
                 <strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>
               </div>
               <div class="pairing-qr-layout">
@@ -1058,15 +1029,13 @@ function renderPairing(state: HostSnapshot): string {
                   ${session.qrSvg}
                 </div>
                 <div class="pairing-qr-copy">
-                  <strong>用 iPhone 扫描</strong>
-                  <p>打开 iPhone 的 DeskLink，选择“扫描二维码”，对准此处即可带入安全连接信息。</p>
-                  <span>${formatPairingRemaining(session.expiresAtUnixS)} 后失效</span>
+                  <strong>扫码连接</strong>
                 </div>
               </div>
               <div class="pairing-credentials">
                 <div class="pairing-credential">
                   <span>设备 ID</span>
-                  <strong id="pairing-device-id">${escapeHtml(session.deviceId)}</strong>
+                  <strong id="pairing-device-id">${escapeHtml(formatDeviceId(session.deviceId))}</strong>
                   <button class="button button--secondary button--compact" type="button" data-copy-device-id ${pairingBusy ? "disabled" : ""}>复制设备 ID</button>
                 </div>
                 <div class="pairing-credential pairing-credential--password">
@@ -1075,15 +1044,10 @@ function renderPairing(state: HostSnapshot): string {
                   <button class="button button--secondary button--compact" type="button" data-copy-temporary-password ${pairingBusy ? "disabled" : ""}>复制临时密码</button>
                 </div>
               </div>
-              <ol class="pairing-steps" aria-label="连接步骤">
-                <li><span>1</span><p>扫描二维码，或打开“连接设备”</p></li>
-                <li><span>2</span><p>使用设备 ID 和临时密码连接</p></li>
-                <li><span>3</span><p>回到本机确认连接请求</p></li>
-              </ol>
               <div class="pairing-card-actions">
                 <button class="button button--secondary" type="button" data-cancel-pairing ${pairingBusy ? "disabled" : ""}>${pairingBusy ? "正在结束…" : "结束本次连接窗口"}</button>
               </div>
-              <p class="secret-note" id="pairing-secret-note">临时密码仅供本次连接使用，请勿发送到公开聊天或工单。</p>
+              <p class="secret-note" id="pairing-secret-note">连接请求需在本机确认，请勿公开密码。</p>
             </section>
           `
           : `
@@ -1092,8 +1056,8 @@ function renderPairing(state: HostSnapshot): string {
               <h2>${active ? "本机正在等待连接" : "上次连接没有完成"}</h2>
               <p>${
                 active
-                  ? "为保护连接安全，临时密码只显示在生成它的窗口中。如需重新获取，请结束本次连接窗口后重新生成。"
-                  : "临时密码已过期或连接已经结束。请生成一份新密码后重新尝试。"
+                  ? "请在生成密码的窗口查看，或结束等待后重新生成。"
+                  : "请重新生成临时密码。"
               }</p>
               <div class="pairing-card-actions">
                 ${active
@@ -1104,13 +1068,6 @@ function renderPairing(state: HostSnapshot): string {
           `
       }
 
-      <div class="security-note security-note--pairing">
-        ${icon("shield-check", "security-note-mark")}
-        <div>
-          <strong>下一步需要回到这台电脑确认</strong>
-          <p>设备 ID 和临时密码只能用于找到本机。Windows 会显示控制端身份，确认后才允许查看画面和控制输入。</p>
-        </div>
-      </div>
     </div>
   `;
 }
@@ -1122,9 +1079,8 @@ function renderFixedAccess(state: HostSnapshot): string {
     <div class="page-layout page-layout--pairing">
       <header class="page-heading page-heading--pairing">
         <div>
-          <button class="back-button" type="button" data-open-overview aria-label="返回设置 / 诊断">${icon("arrow-left")}设置 / 诊断</button>
+          <button class="back-button" type="button" data-open-connection aria-label="返回共享此设备">${icon("arrow-left")}共享此设备</button>
           <h1>固定访问密码</h1>
-          <p>适合经常从自己的另一台电脑连接本机，无需每次重新生成临时密码。</p>
         </div>
         <span class="pairing-state ${enabled ? "pairing-state--active" : ""}">
           <span aria-hidden="true"></span>${enabled ? "固定密码已启用" : "固定密码未启用"}
@@ -1138,13 +1094,12 @@ function renderFixedAccess(state: HostSnapshot): string {
             ? `
               <section class="pairing-card" aria-labelledby="fixed-access-heading">
                 <div class="pairing-card-heading">
-                  <div><span class="eyebrow">长期访问凭据</span><h2 id="fixed-access-heading">输入到另一台电脑</h2></div>
-                  <strong>由 Windows 加密保护</strong>
+                  <h2 id="fixed-access-heading">连接信息</h2>
                 </div>
                 <div class="pairing-credentials">
                   <div class="pairing-credential">
                     <span>设备 ID</span>
-                    <strong id="fixed-access-device-id">${escapeHtml(fixedAccess.deviceId)}</strong>
+                    <strong id="fixed-access-device-id">${escapeHtml(formatDeviceId(fixedAccess.deviceId))}</strong>
                     <button class="button button--secondary button--compact" type="button" data-copy-fixed-device-id>复制设备 ID</button>
                   </div>
                   <div class="pairing-credential pairing-credential--password">
@@ -1156,32 +1111,26 @@ function renderFixedAccess(state: HostSnapshot): string {
                 <div class="pairing-card-actions">
                   ${fixedAccessConfirmation
                     ? `<div class="fixed-access-confirmation" role="group" aria-label="确认${fixedAccessConfirmation === "regenerate" ? "更换" : "关闭"}固定密码">
-                        <strong>${fixedAccessConfirmation === "regenerate" ? "更换后，其他电脑保存的旧密码会立即失效。" : "关闭后，其他电脑将无法再用固定密码查找本机。"}</strong>
+                        <strong>${fixedAccessConfirmation === "regenerate" ? "更换后旧密码立即失效，已批准设备不受影响。" : "关闭后将无法使用固定密码连接，已批准设备不受影响。"}</strong>
                         <button class="button button--secondary" type="button" data-cancel-fixed-access-action>保留当前密码</button>
                         <button class="button button--danger-quiet" type="button" data-confirm-fixed-access-action>${fixedAccessConfirmation === "regenerate" ? "更换并使旧密码失效" : "关闭固定密码"}</button>
                       </div>`
                     : `<button class="button button--secondary" type="button" data-regenerate-fixed-access ${fixedAccessBusy ? "disabled" : ""}>${fixedAccessBusy ? "正在更换…" : "更换固定密码"}</button>
                        <button class="button button--danger-quiet" type="button" data-disable-fixed-access ${fixedAccessBusy ? "disabled" : ""}>关闭固定密码</button>`}
                 </div>
-                <p class="secret-note">更换或关闭后，旧固定密码会立即失效；已批准设备仍可使用保存的安全连接。</p>
               </section>
             `
-            : `<section class="pairing-card pairing-card--unavailable">${icon("loader-circle", "controller-spinner")}<h2>正在读取固定密码</h2><p>密码只会在你主动打开此页面时解密显示。</p></section>`
+            : `<section class="pairing-card pairing-card--unavailable" role="status">${fixedAccessBusy ? "<h2>正在读取固定密码…</h2>" : '<button class="button button--primary" type="button" data-load-fixed-access>重试</button>'}</section>`
           : `
             <section class="pairing-card pairing-card--unavailable">
               ${icon("key-round", "empty-symbol")}
-              <h2>使用 ID 和固定密码快速查找本机</h2>
-              <p>DeskLink 会生成高强度的 8 位密码，并使用当前 Windows 账户加密保存。陌生控制端第一次连接时，仍必须在本机确认。</p>
               <div class="pairing-card-actions">
                 <button class="button button--primary" type="button" data-regenerate-fixed-access ${!canEnable || fixedAccessBusy ? "disabled" : ""}>${fixedAccessBusy ? "正在启用…" : "启用固定密码"}</button>
               </div>
             </section>
           `}
 
-      <div class="security-note security-note--pairing">
-        ${icon("shield-check", "security-note-mark")}
-        <div><strong>固定密码不等于静默授权</strong><p>密码只用于通过中继查找本机。新的控制端仍需通过端到端身份验证，并在这台电脑上获得一次本地批准。</p></div>
-      </div>
+      <p class="secret-note">新设备首次连接需在本机确认，请勿公开密码。</p>
     </div>
   `;
 }
@@ -1192,20 +1141,19 @@ function renderSettings(): string {
       <header class="page-heading">
         <div>
           <h1>设置 / 诊断</h1>
-          <p>管理 DeskLink 的后台运行、脱敏诊断和应用退出。</p>
         </div>
       </header>
 
       ${preferencesLoading && !preferences
-        ? `<div class="settings-loading" aria-label="正在读取 Windows 设置">
-            <div class="skeleton skeleton--list"></div>
+        ? `<div class="settings-loading" role="status">
+            <p>正在读取设置…</p>
           </div>`
         : preferences
           ? renderPreferences(preferences)
           : `<section class="settings-unavailable">
               ${icon("circle-alert", "empty-symbol")}
               <h2>无法读取 Windows 设置</h2>
-              <p>远程连接不会因此停止。返回其他页面后，DeskLink 会在下次打开设置时再次尝试。</p>
+              <p>请重新打开设置重试。</p>
             </section>`}
 
       ${snapshot ? renderDiagnosticSummary(snapshot) : ""}
@@ -1218,15 +1166,13 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
     <section class="settings-group" aria-labelledby="startup-settings-heading">
       <div class="settings-group-heading">
         <h2 id="startup-settings-heading">启动与后台运行</h2>
-        <p>这些设置只影响当前 Windows 账户。</p>
       </div>
       <div class="settings-row">
         <div class="settings-row-copy">
           <strong>登录 Windows 后自动启动</strong>
-          <p>在后台连接中继，让这台电脑无需手动打开 DeskLink 也能被查找。</p>
         </div>
         <label class="switch-control">
-          <input type="checkbox" data-launch-at-login ${settings.launchAtLogin ? "checked" : ""} ${launchAtLoginBusy ? "disabled" : ""}>
+          <input type="checkbox" aria-label="登录 Windows 后自动启动" data-launch-at-login ${settings.launchAtLogin ? "checked" : ""} ${launchAtLoginBusy ? "disabled" : ""}>
           <span aria-hidden="true"></span>
           <b>${launchAtLoginBusy ? "正在保存" : settings.launchAtLogin ? "已开启" : "已关闭"}</b>
         </label>
@@ -1234,7 +1180,7 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
       <div class="settings-row">
         <div class="settings-row-copy">
           <strong>关闭窗口后继续运行</strong>
-          <p>点击窗口关闭按钮只会隐藏主界面，远程主机继续在系统托盘运行。</p>
+          <p>关闭窗口后仍可被连接。</p>
         </div>
         <span class="settings-value">${settings.closeToTray ? "系统托盘" : "直接退出"}</span>
       </div>
@@ -1243,25 +1189,20 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
     <section class="settings-group" aria-labelledby="diagnostics-sharing-heading">
       <div class="settings-group-heading">
         <h2 id="diagnostics-sharing-heading">连接问题诊断</h2>
-        <p>仅在你明确开启后，将经过清理的连接状态自动发送到 DeskLink 诊断服务。</p>
       </div>
       <div class="settings-row settings-row--diagnostics">
         <div class="settings-row-copy">
           <strong>共享脱敏诊断</strong>
-          <p>不会上传屏幕、按键、访问密码、会话密钥或完整设备身份；记录最多保留 14 天，并在网络恢复后自动补传。</p>
+          <p>仅上传连接状态，保留 14 天；不含屏幕、按键、密码或密钥。</p>
         </div>
         <label class="switch-control">
-          <input type="checkbox" data-diagnostics-sharing ${settings.diagnosticsSharingEnabled ? "checked" : ""} ${diagnosticsSharingBusy ? "disabled" : ""}>
+          <input type="checkbox" aria-label="共享脱敏诊断" data-diagnostics-sharing ${settings.diagnosticsSharingEnabled ? "checked" : ""} ${diagnosticsSharingBusy ? "disabled" : ""}>
           <span aria-hidden="true"></span>
           <b>${diagnosticsSharingBusy ? "正在保存" : settings.diagnosticsSharingEnabled ? "已开启" : "已关闭"}</b>
         </label>
       </div>
       ${settings.diagnosticsSharingEnabled
         ? `<div class="settings-inline-action">
-            <div>
-              <strong>需要立即排查时</strong>
-              <p>点击后发送本机最近的主机端和控制端脱敏事件，重复事件会由服务器自动去重。</p>
-            </div>
             <button class="button button--secondary button--compact" type="button" data-upload-diagnostics ${diagnosticsUploadBusy ? "disabled" : ""}>
               ${diagnosticsUploadBusy ? "正在发送…" : "立即发送诊断"}
             </button>
@@ -1272,30 +1213,17 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
     <section class="settings-group" aria-labelledby="update-settings-heading">
       <div class="settings-group-heading">
         <h2 id="update-settings-heading">应用更新</h2>
-        <p>只检查 DeskLink GitHub 仓库中已经完成签名验证的正式 Windows 版本。</p>
       </div>
       ${renderWindowsUpdate(settings.version)}
     </section>
 
-    <section class="settings-group" aria-labelledby="application-settings-heading">
-      <div class="settings-group-heading">
-        <h2 id="application-settings-heading">应用信息</h2>
-      </div>
-      <dl class="settings-details">
-        <div><dt>界面语言</dt><dd>${escapeHtml(settings.interfaceLanguage)}</dd></div>
-        <div><dt>当前版本</dt><dd>DeskLink ${escapeHtml(settings.version)}</dd></div>
-        <div><dt>数据保护</dt><dd>Windows DPAPI，当前账户专用</dd></div>
-      </dl>
-    </section>
-
     <section class="settings-exit" aria-labelledby="exit-settings-heading">
       <div>
-        <h2 id="exit-settings-heading">停止后台服务并退出</h2>
-        <p>退出后，这台电脑会离线，另一台电脑将无法连接，直到再次启动 DeskLink。</p>
+        <h2 id="exit-settings-heading">退出</h2>
       </div>
       ${quitConfirming
         ? `<div class="settings-exit-confirm" role="group" aria-label="确认退出 DeskLink">
-            <strong>确定要让这台电脑离线吗？</strong>
+            <strong>退出后本机将离线，直到再次启动。</strong>
             <button class="button button--secondary" type="button" data-cancel-quit>继续在后台运行</button>
             <button class="button button--danger-quiet" type="button" data-confirm-quit>停止服务并退出</button>
           </div>`
@@ -1305,64 +1233,106 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
 }
 
 function renderWindowsUpdate(currentVersion: string): string {
-  let title = `当前版本 DeskLink ${escapeHtml(currentVersion)}`;
-  let detail = "尚未检查正式版本。检查不会上传设备 ID、访问密码或远程会话信息。";
-  let action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}检查更新</button>`;
-
-  if (windowsUpdate.kind === "checking") {
-    title = "正在检查正式版本";
-    detail = "正在读取 GitHub Release 和签名安装器清单，远程连接不会因此暂停。";
-    action = `<button class="button button--secondary button--compact" type="button" disabled>${icon("loader-circle")}正在检查…</button>`;
-  } else if (windowsUpdate.kind === "available") {
-    title = `发现 DeskLink ${escapeHtml(windowsUpdate.latestVersion)}`;
-    const releaseDate = windowsUpdate.publishedAt
-      ? `，发布于 ${formatUpdateDate(windowsUpdate.publishedAt)}`
-      : "";
-    detail = `此版本已包含匹配的签名 Windows 安装器清单${releaseDate}。升级会保留设备身份、已批准设备和本机设置。`;
-    action = `<button class="button button--primary button--compact" type="button" data-open-windows-release>${icon("file-down")}查看并安装</button>`;
-  } else if (windowsUpdate.kind === "current") {
-    title = "当前已是最新正式版本";
-    detail = `GitHub 最新稳定版本为 DeskLink ${escapeHtml(windowsUpdate.latestVersion)}。`;
-    action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}再次检查</button>`;
-  } else if (windowsUpdate.kind === "unavailable") {
-    if (windowsUpdate.reason === "noRelease") {
-      title = "暂时没有正式 Windows 版本";
-      detail = "GitHub 尚未发布通过签名门禁的安装包；当前开发版本可以继续使用。";
-    } else if (windowsUpdate.reason === "invalidRelease") {
-      title = "最新发布信息无法确认";
-      detail = "DeskLink 忽略了不符合稳定版本规则的 Release，不会提供下载入口。";
-    } else {
-      title = "最新版本尚未通过安装器验证";
-      detail = "Release 缺少匹配的 x64 安装器或签名清单，DeskLink 已阻止升级入口。";
-    }
-    action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}重新检查</button>`;
-  } else if (windowsUpdate.kind === "error") {
-    title = "暂时无法检查更新";
-    detail = "可能是网络不可用或 GitHub 暂时无法访问，不影响远程连接和本机共享。";
-    action = `<button class="button button--secondary button--compact" type="button" data-check-windows-update>${icon("refresh-cw")}重试</button>`;
-  }
-
-  return `
-    <div class="settings-inline-action settings-update" role="status" aria-live="polite">
-      <div>
-        <strong>${title}</strong>
-        <p>${detail}</p>
-      </div>
-      ${action}
-    </div>
-  `;
+  return `<div data-windows-update-region="settings" data-update-current-version="${escapeHtml(currentVersion)}"></div>`;
 }
 
-function formatUpdateDate(value: string): string {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) {
-    return "日期未知";
+function windowsUpdateMarkup(currentVersion: string, banner: boolean): string {
+  const state = windowsUpdater.state;
+  const button = (action: string, label: string, primary = false) =>
+    `<button class="button button--${primary ? "primary" : "secondary"} button--compact" type="button" data-update-action="${action}">${label}</button>`;
+  if (state.kind === "installing") {
+    return `<div class="windows-update-content"><div class="windows-update-copy"><strong data-update-message role="status" aria-live="polite"></strong><progress data-update-progress aria-label="更新下载进度"></progress><p data-update-cancel-error role="alert" hidden></p></div>${button("cancel", "取消下载")}</div>`;
   }
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  }).format(date);
+  let title = `当前版本 DeskLink ${escapeHtml(currentVersion)}`;
+  let action = button("check", "检查更新");
+  let error = "";
+  if (state.kind === "available") {
+    title = `DeskLink ${escapeHtml(state.latestVersion)} 可更新`;
+    action = button("install", "更新并重启", true);
+  } else if (state.kind === "installError") {
+    title = "更新失败";
+    error = `<p class="windows-update-error" role="alert">${escapeHtml(state.message)}</p>`;
+    action = button("install", "重试更新", true);
+  } else if (state.kind === "checking") {
+    title = "正在检查更新…";
+    action = "";
+  } else if (state.kind === "current") {
+    title = "已是最新版本";
+  } else if (state.kind === "unavailable") {
+    title = "暂时没有可用更新";
+  } else if (state.kind === "error") {
+    title = "暂时无法检查更新";
+    action = button("check", "重试");
+  }
+  return `<div class="windows-update-content"><div class="windows-update-copy"><strong role="status" aria-live="polite">${title}</strong>${error}</div><div class="windows-update-actions">${action}${banner ? button("dismiss", "稍后") : ""}</div></div>`;
+}
+
+function updateWindowsUpdateRegions(): void {
+  windowsUpdateBanner.hidden = !windowsUpdater.bannerVisible;
+  document.querySelectorAll<HTMLElement>("[data-windows-update-region]").forEach((region) => {
+    if (region.hidden) return;
+    const state = windowsUpdater.state;
+    const banner = region.dataset.windowsUpdateRegion === "banner";
+    const currentVersion = region.dataset.updateCurrentVersion || applicationVersion;
+    const key = state.kind === "installing" ? "installing" : JSON.stringify([state, currentVersion]);
+    const focused = document.activeElement;
+    const focusInside = focused === region || (focused instanceof HTMLElement && region.contains(focused));
+    const focusedAction = focused instanceof HTMLButtonElement && focusInside
+      ? focused.dataset.updateAction : region.dataset.updateFocusAction;
+    const restoreFocus = () => {
+      if (!focusInside) return;
+      if (focusedAction) region.dataset.updateFocusAction = focusedAction;
+      const actions = Array.from(region.querySelectorAll<HTMLButtonElement>("[data-update-action]"))
+        .filter((button) => !button.hidden && !button.disabled);
+      const next = actions.find((button) => button.dataset.updateAction === focusedAction) ?? actions[0] ?? region;
+      if (next === region) region.tabIndex = -1;
+      if (document.activeElement !== next) next.focus({ preventScroll: true });
+    };
+    if (region.dataset.updateKey !== key) {
+      region.innerHTML = windowsUpdateMarkup(currentVersion, banner);
+      region.dataset.updateKey = key;
+    }
+    if (!windowsUpdateBoundRegions.has(region)) {
+      region.addEventListener("click", (event) => {
+        const button = event.target instanceof Element
+          ? event.target.closest<HTMLButtonElement>("[data-update-action]") : null;
+        if (!button || !region.contains(button) || button.disabled) return;
+        if (button.dataset.updateAction === "install") void windowsUpdater.install();
+        else if (button.dataset.updateAction === "cancel") void windowsUpdater.cancel();
+        else if (button.dataset.updateAction === "dismiss") windowsUpdater.dismiss();
+        else if (button.dataset.updateAction === "check") void checkForWindowsUpdate();
+      });
+      windowsUpdateBoundRegions.add(region);
+    }
+    if (state.kind !== "installing") {
+      restoreFocus();
+      return;
+    }
+    const message = region.querySelector<HTMLElement>("[data-update-message]");
+    if (message) message.textContent = windowsUpdateProgressLabel(state.progress, state.cancelling);
+    const progress = region.querySelector<HTMLProgressElement>("[data-update-progress]");
+    if (progress) {
+      progress.hidden = state.progress.stage !== "downloading";
+      const total = state.progress.totalBytes;
+      if (total && Number.isFinite(total) && total > 0) {
+        progress.max = total;
+        progress.value = Math.max(0, Math.min(total, state.progress.downloadedBytes ?? 0));
+      } else {
+        progress.removeAttribute("value");
+      }
+    }
+    const cancel = region.querySelector<HTMLButtonElement>('[data-update-action="cancel"]');
+    if (cancel) {
+      cancel.hidden = state.progress.stage !== "downloading";
+      cancel.disabled = state.cancelling;
+    }
+    const error = region.querySelector<HTMLElement>("[data-update-cancel-error]");
+    if (error) {
+      error.hidden = !state.cancelError;
+      error.textContent = state.cancelError ?? "";
+    }
+    restoreFocus();
+  });
 }
 
 function connectionToInput(connection: ConnectionSummary | null): ConnectionSettingsInput {
@@ -1415,29 +1385,47 @@ function clearPairingSecrets(): void {
     return;
   }
   pairingSession.temporaryPassword = "";
+  pairingSession.qrSvg = "";
 }
 
 function clearFixedAccessSecrets(): void {
+  fixedAccessRequests.begin();
   if (fixedAccess) {
     fixedAccess.password = "";
   }
   fixedAccess = null;
+  fixedAccessConfirmation = null;
 }
 
 async function loadFixedAccess(): Promise<void> {
-  if (!snapshot?.fixedPasswordEnabled || fixedAccessBusy || fixedAccess) {
+  if (activeView !== "fixedAccess" || !snapshot?.fixedPasswordEnabled || fixedAccessBusy || fixedAccess) {
     return;
   }
   fixedAccessBusy = true;
+  const request = fixedAccessRequests.begin();
+  let reloadOnReturn = false;
   render();
   try {
-    fixedAccess = await getFixedAccessPassword();
+    const nextAccess = await getFixedAccessPassword();
+    if (!fixedAccessRequests.isCurrent(request) || activeView !== "fixedAccess" || accountBusy
+      || !canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
+      nextAccess.password = "";
+      reloadOnReturn = true;
+      return;
+    }
+    fixedAccess = nextAccess;
   } catch (error) {
-    clearFixedAccessSecrets();
-    feedback = { tone: "error", message: normalizeError(error) };
+    if (fixedAccessRequests.isCurrent(request) && activeView === "fixedAccess") {
+      clearFixedAccessSecrets();
+      feedback = { tone: "error", message: normalizeError(error) };
+    }
   } finally {
     fixedAccessBusy = false;
-    render();
+    if (activeView === "fixedAccess") {
+      render();
+      if (reloadOnReturn && snapshot?.fixedPasswordEnabled && !accountBusy
+        && canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) void loadFixedAccess();
+    }
   }
 }
 
@@ -1449,18 +1437,38 @@ async function regenerateFixedAccess(): Promise<void> {
   fixedAccessConfirmation = null;
   feedback = { tone: "info", message: snapshot.fixedPasswordEnabled ? "正在更换固定密码…" : "正在启用固定密码…" };
   clearFixedAccessSecrets();
+  const request = fixedAccessRequests.begin();
+  let reloadOnReturn = false;
   render();
   try {
-    fixedAccess = await regenerateFixedAccessPassword();
-    snapshot.fixedPasswordEnabled = true;
-    snapshot.fixedPasswordError = null;
-    feedback = { tone: "success", message: "固定密码已启用，本机正在向中继发布新的安全访问入口。" };
-    await refreshSnapshot(false);
+    const nextAccess = await regenerateFixedAccessPassword();
+    if (fixedAccessRequests.isCurrent(request) && activeView === "fixedAccess" && !accountBusy
+      && canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
+      fixedAccess = nextAccess;
+      feedback = { tone: "success", message: "固定密码已更新。" };
+    } else {
+      nextAccess.password = "";
+      reloadOnReturn = true;
+    }
+    if (canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
+      snapshotRequests.begin();
+      if (snapshot) {
+        snapshot.fixedPasswordEnabled = true;
+        snapshot.fixedPasswordError = null;
+      }
+      await refreshSnapshot(false);
+    }
   } catch (error) {
-    feedback = { tone: "error", message: normalizeError(error) };
+    if (fixedAccessRequests.isCurrent(request) && activeView === "fixedAccess") {
+      feedback = { tone: "error", message: normalizeError(error) };
+    }
   } finally {
     fixedAccessBusy = false;
-    render();
+    if (activeView === "fixedAccess") {
+      render();
+      if (reloadOnReturn && snapshot?.fixedPasswordEnabled && !accountBusy
+        && canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) void loadFixedAccess();
+    }
   }
 }
 
@@ -1474,8 +1482,15 @@ async function disableFixedAccess(): Promise<void> {
   feedback = { tone: "info", message: "正在关闭固定密码…" };
   render();
   try {
-    snapshot = await disableFixedAccessPassword();
+    const nextSnapshot = await disableFixedAccessPassword();
+    if (!canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode) || accountBusy) return;
+    snapshotRequests.begin();
+    if (snapshot) {
+      snapshot.fixedPasswordEnabled = nextSnapshot.fixedPasswordEnabled;
+      snapshot.fixedPasswordError = nextSnapshot.fixedPasswordError;
+    }
     feedback = { tone: "success", message: "固定密码已关闭，旧密码已经失效。" };
+    await refreshSnapshot(false);
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -1501,31 +1516,8 @@ async function loadPreferences(): Promise<void> {
   }
 }
 
-async function checkForWindowsUpdate(): Promise<void> {
-  if (windowsUpdate.kind === "checking") {
-    return;
-  }
-  const version = applicationVersion || preferences?.version;
-  if (!version) {
-    windowsUpdate = { kind: "error" };
-    if (activeView === "settings") {
-      render();
-    }
-    return;
-  }
-  windowsUpdate = { kind: "checking" };
-  if (activeView === "settings") {
-    render();
-  }
-  try {
-    windowsUpdate = evaluateWindowsRelease(version, await checkWindowsRelease());
-  } catch {
-    windowsUpdate = { kind: "error" };
-  } finally {
-    if (activeView === "settings") {
-      render();
-    }
-  }
+function checkForWindowsUpdate(force = true): Promise<void> {
+  return windowsUpdater.check(force);
 }
 
 async function updateLaunchAtLogin(enabled: boolean): Promise<void> {
@@ -1615,12 +1607,6 @@ function bindInteractions(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
     button.addEventListener("click", () => void openGithub());
   });
-  document.querySelector<HTMLButtonElement>("[data-check-windows-update]")?.addEventListener("click", () => {
-    void checkForWindowsUpdate();
-  });
-  document.querySelector<HTMLButtonElement>("[data-open-windows-release]")?.addEventListener("click", () => {
-    void openWindowsReleasePage();
-  });
   document.querySelector<HTMLButtonElement>("[data-toggle-utility-menu]")?.addEventListener("click", () => {
     utilityMenuOpen = !utilityMenuOpen;
     render();
@@ -1673,21 +1659,20 @@ function bindInteractions(): void {
       } else if (activeView === "settings" && !preferences) {
         void loadPreferences();
       }
-      if (activeView === "settings" && windowsUpdate.kind === "idle") {
-        void checkForWindowsUpdate();
+      if (activeView === "settings") {
+        void checkForWindowsUpdate(false);
       }
     });
   });
-  // Only the primary sidebar is a horizontal tab list. Other [data-view]
-  // controls (the utility menu and inline links) have their own interaction
-  // model; including them here made ArrowLeft/ArrowRight jump into hidden or
-  // unrelated actions.
+  // Keep the sidebar's arrow navigation separate from utility menu and inline
+  // actions, which have their own keyboard interaction.
   const primaryNavigationButtons = Array.from(
     document.querySelectorAll<HTMLButtonElement>(".sidebar-nav [data-view]"),
   );
   primaryNavigationButtons.forEach((button, currentIndex) => {
     button.addEventListener("keydown", (event) => {
-      const nextIndex = nextTabIndex(currentIndex, primaryNavigationButtons.length, event.key);
+      const nextIndex = nextMenuIndex(currentIndex, primaryNavigationButtons.length, event.key)
+        ?? nextTabIndex(currentIndex, primaryNavigationButtons.length, event.key);
       if (nextIndex === null) {
         return;
       }
@@ -1705,15 +1690,19 @@ function bindInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-export-diagnostics]")?.addEventListener("click", () => {
     void exportDiagnostics();
   });
-  document.querySelector<HTMLButtonElement>("[data-open-connection]")?.addEventListener("click", () => {
-    activeView = "connection";
-    utilityMenuOpen = false;
-    connectionDraft = null;
-    connectionAdvancedOpen = false;
-    feedback = null;
-    render();
+  document.querySelectorAll<HTMLButtonElement>("[data-open-connection]").forEach((button) => {
+    button.addEventListener("click", () => {
+      clearFixedAccessSecrets();
+      activeView = "connection";
+      utilityMenuOpen = false;
+      connectionDraft = null;
+      connectionAdvancedOpen = false;
+      feedback = null;
+      render();
+    });
   });
   document.querySelector<HTMLButtonElement>("[data-open-overview]")?.addEventListener("click", () => {
+    clearFixedAccessSecrets();
     activeView = "settings";
     utilityMenuOpen = false;
     feedback = null;
@@ -1723,6 +1712,7 @@ function bindInteractions(): void {
     render();
   });
   document.querySelector<HTMLButtonElement>("[data-open-devices]")?.addEventListener("click", () => {
+    clearFixedAccessSecrets();
     activeView = "devices";
     utilityMenuOpen = false;
     feedback = null;
@@ -1734,6 +1724,9 @@ function bindInteractions(): void {
     feedback = null;
     clearFixedAccessSecrets();
     render();
+    void loadFixedAccess();
+  });
+  document.querySelector<HTMLButtonElement>("[data-load-fixed-access]")?.addEventListener("click", () => {
     void loadFixedAccess();
   });
   document.querySelector<HTMLButtonElement>("[data-open-controller]")?.addEventListener("click", () => {
@@ -1844,7 +1837,7 @@ function bindInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-cancel-connection]")?.addEventListener("click", () => {
     connectionDraft = null;
     connectionAdvancedOpen = false;
-    activeView = "settings";
+    activeView = "connection";
     feedback = null;
     render();
   });
@@ -1885,6 +1878,7 @@ function bindInteractions(): void {
 }
 
 function enterAccountLogin(): void {
+  clearFixedAccessSecrets();
   accountLocalMode = false;
   setAccountLocalModeEnabled(false);
   accountError = null;
@@ -1897,15 +1891,6 @@ function enterAccountLogin(): void {
 async function openGithub(): Promise<void> {
   try {
     await openGithubRepository();
-  } catch (error) {
-    feedback = { tone: "error", message: normalizeError(error) };
-    render();
-  }
-}
-
-async function openWindowsReleasePage(): Promise<void> {
-  try {
-    await openWindowsReleases();
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
     render();
@@ -1947,8 +1932,9 @@ async function answerHostApproval(allow: boolean): Promise<void> {
 
 async function refreshSnapshot(showLoading = true): Promise<void> {
   const request = snapshotRequests.begin();
-  loading = showLoading;
+  let hostPresentationChanged = false;
   if (showLoading) {
+    loading = true;
     feedback = null;
     render();
   }
@@ -1957,7 +1943,13 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
     if (!snapshotRequests.isCurrent(request)) {
       return;
     }
+    hostPresentationChanged = hostSnapshotPresentationChanged(snapshot, nextSnapshot);
     snapshot = nextSnapshot;
+    if (snapshotReadFeedback && feedback === snapshotReadFeedback) {
+      feedback = null;
+      hostPresentationChanged = true;
+    }
+    snapshotReadFeedback = null;
     if (snapshotRecoveryTimer !== null) {
       window.clearTimeout(snapshotRecoveryTimer);
       snapshotRecoveryTimer = null;
@@ -1968,7 +1960,7 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
       if (activeView === "pairing") {
         activeView = "controller";
       }
-      feedback = { tone: "success", message: "连接已批准并成功建立。临时密码已从此窗口清除。" };
+      feedback = { tone: "success", message: "已连接。" };
     } else if (!snapshot.pairingActive && pairingSession) {
       clearPairingSecrets();
       pairingSession = null;
@@ -1984,21 +1976,26 @@ async function refreshSnapshot(showLoading = true): Promise<void> {
       return;
     }
     if (showLoading || !snapshot) {
+      hostPresentationChanged = snapshot !== null;
       snapshot = null;
       scheduleSnapshotRecovery();
     }
-    feedback = {
+    const nextFeedback: NonNullable<Feedback> = {
       tone: "error",
       message: showLoading
         ? normalizeError(error)
         : `无法读取最新状态，界面暂时保留上次结果。${normalizeError(error)}`,
     };
+    hostPresentationChanged ||= feedback?.tone !== nextFeedback.tone || feedback?.message !== nextFeedback.message;
+    feedback = nextFeedback;
+    snapshotReadFeedback = nextFeedback;
   } finally {
     if (!snapshotRequests.isCurrent(request)) {
       return;
     }
+    hostPresentationChanged ||= loading;
     loading = false;
-    if (showLoading || activeView !== "controller") {
+    if (showLoading || hostPresentationChanged) {
       render();
     }
   }
@@ -2037,14 +2034,13 @@ async function enableManagedConnection(): Promise<void> {
     return;
   }
   managedSetupBusy = true;
-  feedback = { tone: "info", message: "正在生成受保护的连接凭据并启用远程连接。" };
+  feedback = null;
   render();
   try {
     snapshot = await setupManagedConnection();
-    feedback = {
-      tone: "success",
-      message: "远程连接已启用。本机现在可以显示设备 ID，并生成临时密码供另一台电脑连接。",
-    };
+    connectionDraft = null;
+    connectionAdvancedOpen = false;
+    feedback = null;
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -2079,12 +2075,24 @@ async function beginPairing(): Promise<void> {
     return;
   }
   pairingBusy = true;
+  const originView = activeView;
+  clearPairingSecrets();
+  pairingSession = null;
   feedback = null;
   render();
   try {
-    pairingSession = await startPairingSession();
-    snapshot.pairingActive = true;
-    activeView = "pairing";
+    const nextSession = await startPairingSession();
+    if (!canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode) || accountBusy) {
+      nextSession.temporaryPassword = "";
+      nextSession.qrSvg = "";
+      return;
+    }
+    snapshotRequests.begin();
+    clearPairingSecrets();
+    pairingSession = nextSession;
+    if (snapshot) snapshot.pairingActive = true;
+    if (activeView === originView) activeView = "pairing";
+    await refreshSnapshot(false);
   } catch (error) {
     pairingSession = null;
     feedback = { tone: "error", message: normalizeError(error) };
@@ -2106,9 +2114,13 @@ async function cancelPairing(): Promise<void> {
   pairingSession = null;
   render();
   try {
-    snapshot = await cancelPairingSession();
-    activeView = "devices";
+    await cancelPairingSession();
+    if (!canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode) || accountBusy) return;
+    snapshotRequests.begin();
+    if (snapshot) snapshot.pairingActive = false;
+    if (activeView === "pairing") activeView = "connection";
     feedback = { tone: "success", message: "临时密码已清除，本机在线服务已恢复。" };
+    await refreshSnapshot(false);
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -2123,21 +2135,31 @@ async function copyCredential(text: string, fallbackElementId: string, successMe
       await navigator.clipboard.writeText(text);
     } catch {
       const source = fallbackElementId ? document.getElementById(fallbackElementId) : null;
-      if (source instanceof HTMLTextAreaElement || source instanceof HTMLInputElement) {
-        source.select();
-      } else if (source) {
-        const range = document.createRange();
-        range.selectNodeContents(source);
-        const selection = window.getSelection();
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-      } else {
+      if (!source) {
         throw new Error("此信息已不可用。");
       }
-      if (!document.execCommand("copy")) {
-        throw new Error("Windows 未允许 DeskLink 复制此信息。");
+      const focused = document.activeElement;
+      const copyInput = document.createElement("textarea");
+      copyInput.value = text;
+      copyInput.readOnly = true;
+      copyInput.tabIndex = -1;
+      copyInput.setAttribute("aria-hidden", "true");
+      copyInput.style.position = "fixed";
+      copyInput.style.left = "-9999px";
+      copyInput.style.top = "0";
+      document.body.append(copyInput);
+      try {
+        copyInput.select();
+        if (!document.execCommand("copy")) {
+          throw new Error("Windows 未允许 DeskLink 复制此信息。");
+        }
+      } finally {
+        copyInput.value = "";
+        copyInput.remove();
+        if (focused instanceof HTMLElement && focused.isConnected) {
+          focused.focus({ preventScroll: true });
+        }
       }
-      window.getSelection()?.removeAllRanges();
     }
     feedback = { tone: "success", message: successMessage };
   } catch (error) {
@@ -2194,7 +2216,7 @@ async function submitConnection(event: SubmitEvent): Promise<void> {
     connectionDraft = null;
     connectionAdvancedOpen = false;
     activeView = "controller";
-    feedback = { tone: "success", message: "连接设置已保存，并由当前 Windows 账户加密保护。" };
+    feedback = { tone: "success", message: "共享设置已保存。" };
   } catch (error) {
     if (connectionDraft) {
       connectionDraft.relayKey = "";
@@ -2222,6 +2244,7 @@ function randomHex(byteLength: number): string {
 }
 
 async function bootstrap(): Promise<void> {
+  startWindowsUpdateChecks();
   try {
     account = await accountRestore();
     accountLocalMode = shouldStartInLocalMode(account.signedIn);
@@ -2236,23 +2259,67 @@ async function bootstrap(): Promise<void> {
   await startWorkspace();
 }
 
-async function startWorkspace(): Promise<void> {
-  void getVersion().then((version) => {
-    applicationVersion = version;
-    if (activeView === "about") render();
-    void checkForWindowsUpdate();
-  }).catch(() => { applicationVersion = ""; });
-  await initializeController(scheduleRender);
-  await refreshSnapshot();
-  if (!workspaceListenersBound) {
-    workspaceListenersBound = true;
-    void listen("host-runtime-changed", () => void refreshSnapshot(false));
-    void listen("host-approval-changed", () => void refreshSnapshot(false));
-  }
+function startWindowsUpdateChecks(): void {
+  void checkForWindowsUpdate(false);
+  const recover = () => {
+    if (document.visibilityState === "visible") void checkForWindowsUpdate(false);
+  };
+  window.addEventListener("focus", recover);
+  window.addEventListener("online", recover);
+  document.addEventListener("visibilitychange", recover);
 }
 
-void bootstrap();
-window.setInterval(() => {
+function ensureWorkspaceHostListeners(): Promise<void> {
+  const attempts = workspaceHostEvents.map((eventName) => {
+    if (workspaceHostListeners.has(eventName)) return Promise.resolve();
+    const pending = workspaceHostListenerAttempts.get(eventName);
+    if (pending) return pending;
+    const attempt = (async () => {
+      await listen(eventName, () => {
+        if (canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
+          void refreshSnapshot(false);
+        }
+      });
+      workspaceHostListeners.add(eventName);
+    })().finally(() => workspaceHostListenerAttempts.delete(eventName));
+    workspaceHostListenerAttempts.set(eventName, attempt);
+    return attempt;
+  });
+  return Promise.allSettled(attempts).then(() => {});
+}
+
+function bindWorkspaceSnapshotRecovery(): void {
+  if (workspaceRecoveryBound) return;
+  const recover = () => {
+    if (document.visibilityState !== "visible"
+      || !canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) return;
+    void ensureWorkspaceHostListeners();
+    void refreshSnapshot(false);
+  };
+  window.addEventListener("focus", recover);
+  document.addEventListener("visibilitychange", recover);
+  window.setInterval(recover, 15_000);
+  workspaceRecoveryBound = true;
+}
+
+async function startWorkspace(): Promise<void> {
+  bindWorkspaceSnapshotRecovery();
+  let listenerWaitTimer: number | undefined;
+  try {
+    await Promise.race([
+      ensureWorkspaceHostListeners(),
+      new Promise<void>((resolve) => {
+        listenerWaitTimer = window.setTimeout(resolve, 3_000);
+      }),
+    ]);
+  } finally {
+    window.clearTimeout(listenerWaitTimer);
+  }
+  await initializeController(scheduleRender);
+  await refreshSnapshot();
+}
+
+function updateCredentialExpiry(): void {
   const nowUnixS = Math.floor(Date.now() / 1000);
   const approval = snapshot?.pendingApproval;
   const approvalCountdown = document.querySelector<HTMLElement>("[data-approval-countdown]");
@@ -2264,11 +2331,12 @@ window.setInterval(() => {
         .forEach((button) => {
           button.disabled = true;
         });
+      focusNewApproval();
       feedback = { tone: "info", message: "远程控制请求已过期，对方需要重新发起连接。" };
       void refreshSnapshot(false);
     }
   }
-  if (pairingSession && activeView === "pairing") {
+  if (pairingSession) {
     const countdown = document.querySelector<HTMLElement>("[data-pairing-countdown]");
     if (countdown) {
       countdown.textContent = formatPairingRemaining(pairingSession.expiresAtUnixS);
@@ -2276,9 +2344,14 @@ window.setInterval(() => {
     if (pairingSession.expiresAtUnixS <= nowUnixS) {
       clearPairingSecrets();
       pairingSession = null;
-      feedback = { tone: "info", message: "临时密码已过期，本次连接没有完成。请重新生成密码后再试。" };
-      render();
+      if (activeView === "pairing") {
+        feedback = { tone: "info", message: "临时密码已过期，本次连接没有完成。请重新生成密码后再试。" };
+        render();
+      }
       void refreshSnapshot(false);
     }
   }
-}, 1000);
+}
+
+void bootstrap();
+window.setInterval(updateCredentialExpiry, 1000);

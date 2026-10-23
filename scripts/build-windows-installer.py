@@ -38,6 +38,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail before building unless a signing identity is configured",
     )
+    parser.add_argument(
+        "--require-update-signing",
+        action="store_true",
+        help="require an independent update manifest signature (current-user release key)",
+    )
+    parser.add_argument(
+        "--public-test",
+        action="store_true",
+        help="build an explicitly unsigned public test update from a clean commit; requires independent update signing",
+    )
     return parser.parse_args()
 
 
@@ -84,6 +94,29 @@ def enforce_signing_policy(*, requested: bool, required: bool) -> None:
         )
 
 
+def public_test_source(root: Path) -> str:
+    """Bind public test builds to the actual clean checkout, never a CI hint."""
+    def git(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", *arguments], cwd=root, capture_output=True, text=True,
+            encoding="utf-8", check=True,
+        ).stdout.strip()
+    commit = git("rev-parse", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SystemExit("Public test source HEAD is invalid")
+    if git("status", "--porcelain", "--untracked-files=all"):
+        raise SystemExit("Public test builds require a clean source checkout")
+    hinted = os.environ.get("GITHUB_SHA", "").strip().lower()
+    if hinted and hinted != commit:
+        raise SystemExit("GITHUB_SHA does not match actual public test HEAD")
+    return commit
+
+
+def enforce_public_test_policy(*, public_test: bool, requested: bool, required: bool) -> None:
+    if public_test and (requested or required):
+        raise SystemExit("--public-test is explicitly unsigned and cannot be combined with Authenticode signing options; formal publishing is unchanged")
+
+
 def enforce_release_ref(version: str) -> None:
     """Prevent a tagged release from publishing a differently-versioned binary."""
     if os.environ.get("GITHUB_REF_TYPE", "").strip() != "tag":
@@ -125,11 +158,25 @@ def main() -> int:
     version = package_version(ROOT / "tools" / "windows-installer" / "Cargo.toml")
     enforce_release_ref(version)
     should_sign = signing_requested()
+    formal_signing_required = arguments.require_signing or environment_flag("DESKLINK_REQUIRE_SIGNING")
+    enforce_public_test_policy(public_test=arguments.public_test, requested=should_sign, required=formal_signing_required)
+    public_source = public_test_source(ROOT) if arguments.public_test else None
     enforce_signing_policy(
         requested=should_sign,
-        required=arguments.require_signing
-        or environment_flag("DESKLINK_REQUIRE_SIGNING"),
+        required=formal_signing_required,
     )
+
+    # Unlock before the build so a missing/mismatched release key fails early.
+    # An unsigned manifest is never accepted by the in-app updater.
+    from windows_update_signing import configured_key_path, load_release_key, sign_manifest
+    update_key_path = configured_key_path()
+    update_signing_required = arguments.require_update_signing or formal_signing_required or arguments.public_test
+    update_key = None
+    if update_key_path.is_file() or update_signing_required or os.environ.get("DESKLINK_UPDATE_SIGNING_KEY"):
+        try:
+            update_key = load_release_key(update_key_path)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Update signing key unavailable: {error}") from error
 
     run([sys.executable, str(ROOT / "scripts" / "verify-windows-release.py")])
     release = ROOT / "target" / TARGET / "release"
@@ -151,6 +198,13 @@ def main() -> int:
         raise SystemExit("Windows release verification has no source checkout status")
     if should_sign and source_dirty:
         raise SystemExit("Signed Windows releases require a clean source checkout")
+    if arguments.public_test and (
+        source_dirty or source_commit != public_source
+        or release_report.get("version") != version
+        or release_report.get("passed") is not True
+        or release_report.get("custom_protocol") is not True
+    ):
+        raise SystemExit("Public test verification must match the actual clean source/version/custom protocol")
     release_scope = release_report.get("release_scope")
     if not isinstance(release_scope, dict):
         raise SystemExit("Windows release verification has no release scope")
@@ -218,6 +272,7 @@ def main() -> int:
         "source_dirty": source_dirty,
         "release_scope": release_scope,
         "target": TARGET,
+        "update_mode": "perUserV1",
         "signed": should_sign,
         "application": {
             "file_name": "DeskLink.exe",
@@ -234,11 +289,24 @@ def main() -> int:
         "passed": True,
         "completed_at_unix_s": int(time.time()),
     }
+    if arguments.public_test:
+        if public_test_source(ROOT) != public_source:
+            raise SystemExit("Public test source changed during the build")
+        manifest["release_channel"] = "publicTest"
     manifest_path = destination.parent / "windows-installer-manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+    signature_path = manifest_path.with_name(manifest_path.name + ".sig")
+    if update_key is not None:
+        sign_manifest(manifest_path, update_key)
+        print(f"Independent update signature: {signature_path}")
+    else:
+        # Prevent an earlier build's signature from traveling with new bytes.
+        signature_path.unlink(missing_ok=True)
+        print("No update release key configured: this build cannot be offered by the in-app updater.")
 
     size_mib = destination.stat().st_size / (1024 * 1024)
     signature = "signed and verified" if should_sign else "unsigned"

@@ -71,9 +71,10 @@ import type {
 } from "./types";
 import { h264CodecFromSequenceHeader, h264ProfileFromCodec, videoConfigKey } from "./video-config";
 import { readLittleEndianTimestamp } from "./video-timestamp";
-import { deviceIdsMatch, formatLastUsed } from "./saved-device";
+import { deviceIdsMatch } from "./saved-device";
 import { RemoteInputDispatcher } from "./remote-input-dispatcher";
 import { RemoteKeyboardState, type ControllerKeyInput } from "./remote-keyboard-state";
+import { isCompositionKey, RemoteTextInput } from "./remote-text-input";
 import { isRemoteClipboardPasteShortcut } from "./remote-clipboard-shortcut";
 import {
   CONNECTION_PROGRESS_STEPS,
@@ -199,6 +200,7 @@ let remotePanMode = false;
 let pointerInsideViewport = false;
 let remoteCanvasElement: HTMLCanvasElement | null = null;
 let remoteViewportElement: HTMLElement | null = null;
+let remoteTextInput: { state: RemoteTextInput; element: HTMLTextAreaElement; viewport: HTMLElement } | null = null;
 let remoteCursorElement: HTMLElement | null = null;
 let remoteToolbarElement: HTMLElement | null = null;
 let remoteViewportScrollLeft = 0;
@@ -270,9 +272,13 @@ let h264ProfileProbe: H264ProfileProbe = "notChecked";
 let h264ProfileProbeMs: number | null = null;
 let h264ProfileFallbackReason: H264ProfileFallbackReason | null = null;
 let remoteSurfaceState: ControllerRemoteSurfaceState = "empty";
-const inputDispatcher = new RemoteInputDispatcher((input, streamId) => (
-  sendControllerInput({ ...input, streamId })
-));
+const inputDispatcher = new RemoteInputDispatcher(
+  (input, streamId) => sendControllerInput({ ...input, streamId }),
+  undefined,
+  (text, streamId) => snapshot?.runtime.state === "connected" && snapshot.runtime.streamId === streamId
+    ? sendControllerText(text, streamId)
+    : Promise.reject(new Error("Remote session changed")),
+);
 const remoteAudio = new RemoteAudioPlayer();
 const videoPlaybackPressure = new VideoPlaybackPressure();
 const videoPull = new SerialVideoPull<ControllerVideoPayload>();
@@ -321,6 +327,10 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
   void initializeNativeFileDrop();
   if (!fullscreenListenerInitialized) {
     window.addEventListener("resize", scheduleRemoteFullscreenSync);
+    window.addEventListener("blur", resetRemoteInputState);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) resetRemoteInputState();
+    });
     document.addEventListener("keydown", handleRemoteFullscreenEscape, true);
     document.addEventListener("pointermove", handleRemoteToolbarPointerMove, { passive: true });
     fullscreenListenerInitialized = true;
@@ -339,7 +349,7 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
       fileRecoveryAvailable = true;
       feedback = {
         tone: "info",
-        message: `${snapshot.fileRecovery.message} 目标设备：${snapshot.fileRecovery.deviceId}。恢复信息已由当前 Windows 账户加密保存。`,
+        message: `${snapshot.fileRecovery.message} 目标设备：${snapshot.fileRecovery.deviceId}。`,
       };
     } else if (snapshot.fileQueueRecovery) {
       feedback = {
@@ -360,7 +370,8 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
 }
 
 export function prepareControllerRender(): void {
-  releaseInputState();
+  resetRemoteInputState();
+  remoteTextInput = null;
   inputDispatcher.discardPendingMoves();
   if (pointerFrame !== null) {
     window.cancelAnimationFrame(pointerFrame);
@@ -392,7 +403,7 @@ export function renderControllerView(): string {
     return `
       <div class="controller-loading" aria-live="polite">
         ${icon("loader-circle", "controller-spinner")}
-        <div><strong>正在打开控制端</strong><p>正在读取当前 Windows 账户中受保护的连接。</p></div>
+        <strong>正在加载…</strong>
       </div>
     `;
   }
@@ -403,14 +414,13 @@ export function renderControllerView(): string {
   }
   const remoteSurfaceVisible = connected || remoteSurfaceState === "retaining";
   return `
-    <div class="controller-stack">
+    <div class="controller-stack${remoteSurfaceVisible ? " controller-stack--remote" : ""}">
       ${feedback ? renderFeedback(feedback) : ""}
-      <div class="controller-heading">
+      <div class="controller-heading${remoteSurfaceVisible ? " sr-only" : ""}">
         <div class="controller-heading-copy">
           <h1>连接设备</h1>
-          <p>连接未知设备，或从最近使用过的设备继续。</p>
         </div>
-        ${renderRuntimeBadge()}
+        ${!remoteSurfaceVisible && isActiveConnectionState(runtime?.state ?? "idle") ? "" : renderRuntimeBadge()}
       </div>
       ${remoteSurfaceVisible ? renderRemoteDesktop() : renderConnectionPanel()}
     </div>
@@ -640,6 +650,7 @@ function renderFeedback(item: NonNullable<ControllerFeedback>): string {
 function renderRuntimeBadge(): string {
   const runtime = snapshot?.runtime;
   const state = runtime?.state ?? "idle";
+  if (runtime && state === "idle") return "";
   const label = runtime?.title ?? "控制端不可用";
   return `
     <div class="controller-runtime controller-runtime--${state}">
@@ -717,38 +728,26 @@ function renderConnectionPanel(): string {
     ;
   const credentialsReady = deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft);
   const retryAvailable = feedback?.tone === "error" && credentialsReady;
-  const hasQuickConnections = Boolean(snapshot?.savedConnection) || (snapshot?.savedDevices.length ?? 0) > 0;
   return `
     ${connectionActive || cancelling ? renderConnectionProgress(connectionState) : ""}
     <div class="controller-connect-layout">
       <div class="controller-connect-column controller-connect-column--new">
         <section class="controller-card controller-card--primary controller-card--manual">
-          <div class="controller-card-heading">
-            <div><h2>${hasQuickConnections ? "连接新的设备" : "连接远程设备"}</h2><p>输入对方设备显示的 ID 和访问密码，开始安全连接。</p></div>
-          </div>
           <form class="controller-form controller-device-form" data-controller-device-form>
             <label class="field device-credential-field">
               <span>设备 ID</span>
-              <input class="device-id-input" name="deviceId" data-controller-device-id value="${escapeHtml(deviceIdDraft)}" inputmode="numeric" maxlength="15" placeholder="123 456 789 012" aria-describedby="controller-device-hint" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
+              <input class="device-id-input" name="deviceId" data-controller-device-id value="${escapeHtml(formatDeviceId(deviceIdDraft))}" inputmode="numeric" maxlength="15" placeholder="123 456 789 012" required autocomplete="off" spellcheck="false" ${isWorking ? "disabled" : ""}>
             </label>
             <label class="field device-credential-field">
               <span>访问密码</span>
-              <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="8" placeholder="8 位访问密码" aria-describedby="controller-device-hint" required autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" ${isWorking ? "disabled" : ""}>
+              <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="8" placeholder="8 位访问密码" required autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" ${isWorking ? "disabled" : ""}>
             </label>
-            <p class="controller-device-hint" id="controller-device-hint">验证成功后，凭据会由当前 Windows 账户加密保存。连接请求仍需对方在本机批准。</p>
             <div class="controller-form-actions">
               <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
-                ${connectionActive ? `${icon("loader-circle", "button-spinner")} ${escapeHtml(connectionActionLabel(connectionState))}` : connectionState === "stopped" || retryAvailable ? "重新尝试" : "查找并连接设备"}
+                ${connectionActive ? `${icon("loader-circle", "button-spinner")} 连接中…` : connectionState === "stopped" || retryAvailable ? "重试" : "连接"}
               </button>
-              <span>${connectionActive ? "取消后仍会保留当前输入。" : "找到设备后，需要在目标电脑上确认一次。"}</span>
             </div>
           </form>
-          <div class="controller-privacy-note" title="远程画面和输入经过端到端加密，新控制端必须在主机上获得本地批准。">
-            ${icon("shield-check")}<span>首次连接需主机确认，画面与输入端到端加密</span>
-          </div>
-          <button class="controller-share-link" type="button" data-view="connection">
-            ${icon("scan")}<span><strong>需要让 iPhone 连接？</strong><small>在“共享此设备”中生成二维码</small></span>${icon("arrow-left", "controller-share-link-arrow")}
-          </button>
         </section>
       </div>
       ${renderSavedDevices(isWorking)}
@@ -767,18 +766,13 @@ function renderConnectionProgress(state: string): string {
     : cancelling
       ? "正在取消连接"
       : "正在开始连接";
-  const detail = isActiveConnectionState(runtimeState)
-    ? snapshot?.runtime.detail
-    : cancelling
-      ? "DeskLink 正在停止本次连接并释放远程会话。"
-      : "DeskLink 正在准备设备查询和加密通道。";
+  const showGuidance = presentation.delayed || progressState === "waitingApproval";
   return `
     <section class="connection-progress" aria-labelledby="connection-progress-heading" aria-live="polite">
       <div class="connection-progress-heading">
         <div>
           <span class="connection-progress-kicker">正在连接 ${escapeHtml(target)}</span>
           <h2 id="connection-progress-heading">${escapeHtml(title ?? connectionActionLabel(state))}</h2>
-          <p>${escapeHtml(detail ?? "DeskLink 正在准备连接。")}</p>
         </div>
         <span class="connection-progress-time" data-controller-attempt-elapsed>${formatConnectionElapsed(elapsedSeconds)}</span>
       </div>
@@ -796,7 +790,7 @@ function renderConnectionProgress(state: string): string {
         }).join("")}
       </ol>
       <div class="connection-progress-footer">
-        <p class="connection-progress-guidance ${presentation.delayed ? "connection-progress-guidance--delayed" : ""}" data-controller-attempt-guidance>${escapeHtml(presentation.guidance)}</p>
+        <p class="connection-progress-guidance ${presentation.delayed ? "connection-progress-guidance--delayed" : ""}" data-controller-attempt-guidance ${showGuidance ? "" : "hidden"}>${escapeHtml(presentation.guidance)}</p>
         <button class="button button--secondary" type="button" data-controller-cancel ${cancelling ? "disabled" : ""}>${cancelling ? "正在取消…" : "取消连接"}</button>
       </div>
     </section>
@@ -813,7 +807,7 @@ function renderSavedDevices(isWorking: boolean): string {
   return `
     <aside class="saved-devices-panel" aria-label="最近连接过的设备">
       <div class="saved-devices-heading">
-        <div><h2>最近连接</h2><p>选择使用过的设备，直接开始连接。</p></div>
+        <h2>最近连接</h2>
         ${snapshot?.savedDevicesError ? `<button type="button" data-controller-saved-devices-clear ${isWorking ? "disabled" : ""}>清除异常记录</button>` : ""}
       </div>
       ${snapshot?.savedDevicesError ? `<p class="inline-error">${escapeHtml(snapshot.savedDevicesError)}</p>` : ""}
@@ -822,7 +816,7 @@ function renderSavedDevices(isWorking: boolean): string {
         ${hasSavedDevice
           ? `${savedDevices.map((saved) => renderSavedDevice(saved, approvedConnection, isWorking)).join("")}
              ${approvedConnection && !approvedListed ? renderApprovedConnection(approvedConnection, isWorking) : ""}`
-          : `<div class="saved-devices-empty">${icon("monitor-up")}<strong>还没有已保存设备</strong><p>成功连接后，设备会显示在这里，方便下次直接连接。</p></div>`}
+          : '<p class="saved-devices-empty">暂无最近设备</p>'}
       </div>
     </aside>
   `;
@@ -836,27 +830,19 @@ function renderSavedDevice(
   const approved = approvedConnection ? deviceIdsMatch(saved.deviceId, approvedConnection.deviceId) : false;
   const kind = approved ? "approved" : saved.persistent ? "fixed" : "temporary";
   const label = approved ? "已批准" : saved.persistent ? "固定密码" : "临时密码";
-  const detail = approved
-    ? "已保存安全连接，可直接重新连接。"
-    : saved.persistent
-      ? "固定密码已加密保存，可直接查找主机。"
-      : "临时密码可能过期，失败时请更新密码。";
-  const displayName = saved.alias || saved.deviceId;
-  const idDetail = saved.alias
-    ? `<span class="saved-device-public-id">${escapeHtml(saved.deviceId)}</span><span aria-hidden="true"> · </span>`
-    : "";
+  const displayName = saved.alias || formatDeviceId(saved.deviceId);
   return `
     <article class="saved-device-row">
       <div class="saved-device-identity">
-        <strong>${escapeHtml(displayName)}</strong>
+        <strong title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</strong>
         <span class="saved-device-kind saved-device-kind--${kind}">${label}</span>
-        <small>${idDetail}${detail} 最近使用：${escapeHtml(formatLastUsed(saved.lastUsedUnixS))}</small>
+        ${saved.alias ? `<small class="saved-device-public-id">${escapeHtml(formatDeviceId(saved.deviceId))}</small>` : ""}
       </div>
       <div class="saved-device-actions">
-        <button class="button button--primary" type="button" ${approved ? "data-controller-reconnect" : `data-controller-saved-device-connect="${escapeHtml(saved.deviceId)}"`} ${isWorking ? "disabled" : ""}>直接连接</button>
-        <button class="button button--secondary" type="button" data-controller-saved-device-rename="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>修改名称</button>
+        <button class="button button--primary" type="button" ${approved ? "data-controller-reconnect" : `data-controller-saved-device-connect="${escapeHtml(saved.deviceId)}"`} ${isWorking ? "disabled" : ""}>连接</button>
+        <button class="button button--secondary" type="button" data-controller-saved-device-rename="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>重命名</button>
         <button class="button button--secondary" type="button" data-controller-saved-device-update="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>更新密码</button>
-        <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除记录</button>
+        <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
       </div>
       ${renderRenameEditor(saved)}
       ${renderForgetConfirmation(saved.deviceId)}
@@ -870,7 +856,7 @@ function renderRenameEditor(saved: SavedDeviceCredentialSummary): string {
   }
   return `
     <form class="saved-device-rename" data-controller-device-rename-form>
-      <label for="saved-device-alias"><span>设备名称</span><small>仅保存在当前 Windows 账户中，不会发送给远程电脑。</small></label>
+      <label for="saved-device-alias">设备名称</label>
       <input id="saved-device-alias" name="alias" data-controller-device-alias value="${escapeHtml(renameDraft)}" maxlength="32" placeholder="例如：办公室电脑" autocomplete="off" spellcheck="false" ${renameBusy ? "disabled" : ""}>
       <button class="button button--secondary" type="button" data-controller-cancel-rename ${renameBusy ? "disabled" : ""}>取消修改</button>
       <button class="button button--primary" type="submit" ${renameBusy ? "disabled" : ""} ${renameBusy ? 'aria-busy="true"' : ""}>${renameBusy ? "正在保存…" : renameDraft.trim() ? "保存名称" : "清除名称"}</button>
@@ -882,13 +868,12 @@ function renderApprovedConnection(saved: SavedControllerConnectionSummary, isWor
   return `
     <article class="saved-device-row">
       <div class="saved-device-identity">
-        <strong>${escapeHtml(saved.deviceId)}</strong>
+        <strong>${escapeHtml(formatDeviceId(saved.deviceId))}</strong>
         <span class="saved-device-kind saved-device-kind--approved">已批准</span>
-        <small>已保存端到端安全连接，可直接重新连接。</small>
       </div>
       <div class="saved-device-actions">
-        <button class="button button--primary" type="button" data-controller-reconnect ${isWorking ? "disabled" : ""}>直接连接</button>
-        <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除记录</button>
+        <button class="button button--primary" type="button" data-controller-reconnect ${isWorking ? "disabled" : ""}>连接</button>
+        <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
       </div>
       ${renderForgetConfirmation(saved.deviceId)}
     </article>
@@ -1013,6 +998,7 @@ function renderRemoteDesktop(): string {
         <button class="toolbar-button" type="button" data-controller-text-cancel>取消</button>
       </form>
       <div class="remote-viewport" data-remote-viewport data-scale-mode="${remoteScaleMode}" data-interaction-mode="${remotePanMode ? "pan" : "control"}" tabindex="0" aria-label="远程 Windows 桌面，点击后可发送键盘和鼠标输入。">
+        <textarea class="remote-ime-input" data-remote-ime-input tabindex="-1" aria-label="远程键盘输入" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
         ${videoFailed
           ? '<div class="remote-waiting remote-waiting--error"><strong>远程画面暂时无法解码</strong><p>请更新 WebView2，或点击“刷新画面”再试一次。</p></div>'
           : config
@@ -1333,7 +1319,15 @@ async function beginConnection(
     }
     feedback = { tone: "error", message: normalizeError(error) };
     try {
-      snapshot = await getControllerSnapshot();
+      const recoverySignalRevision = runtimeSignalRevision;
+      const recoveredSnapshot = await getControllerSnapshot();
+      if (generation !== channelGeneration) return false;
+      snapshot = mergeControllerOperationSnapshot(
+        recoveredSnapshot,
+        snapshot,
+        recoverySignalRevision,
+        runtimeSignalRevision,
+      );
     } catch {
       // Keep the last known state; the actionable connection error remains visible.
     }
@@ -1407,7 +1401,7 @@ async function removeStoredDevice(deviceId: string): Promise<void> {
   requestRender();
   try {
     snapshot = await forgetSavedDevice({ deviceId });
-    feedback = { tone: "success", message: `已移除设备 ${deviceId} 的加密密码。` };
+    feedback = { tone: "success", message: `已移除设备 ${deviceId}。` };
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -1461,7 +1455,7 @@ async function clearStoredDevices(): Promise<void> {
   requestRender();
   try {
     snapshot = await clearSavedDevices();
-    feedback = { tone: "success", message: "已清除异常的加密设备记录，现在可以重新输入设备密码。" };
+    feedback = { tone: "success", message: "已清除异常记录，请重新输入设备密码。" };
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
@@ -1511,7 +1505,7 @@ function handleSignal(signal: ControllerSignal): void {
         resetRemoteToolbarState();
         smartPasteBusy = false;
         smartPastePending = false;
-        releaseInputState();
+        resetRemoteInputState();
         inputDispatcher.discardAll();
         if (pointerFrame !== null) {
           window.cancelAnimationFrame(pointerFrame);
@@ -2347,6 +2341,7 @@ function updateConnectionProgressClock(): void {
   const presentation = connectionProgressPresentation(progressState, elapsedSeconds);
   elapsed.textContent = formatConnectionElapsed(elapsedSeconds);
   guidance.textContent = presentation.guidance;
+  guidance.hidden = !presentation.delayed && progressState !== "waitingApproval";
   guidance.classList.toggle("connection-progress-guidance--delayed", presentation.delayed);
 }
 
@@ -2388,7 +2383,7 @@ function setupRemoteDesktop(): void {
   );
   armVideoPlaybackPressureReporter(config.streamId);
   bindRemoteInput(viewport, canvas);
-  viewport.focus({ preventScroll: true });
+  focusRemoteKeyboard(viewport);
 }
 
 function handleVideo(payload: ControllerVideoPayload): void {
@@ -2820,7 +2815,7 @@ async function changeRemoteDisplay(displayId: number): Promise<void> {
   )) {
     return;
   }
-  releaseInputState();
+  resetRemoteInputState();
   inputDispatcher.discardPendingMoves();
   if (pointerFrame !== null) {
     window.cancelAnimationFrame(pointerFrame);
@@ -3040,7 +3035,7 @@ function changeRemoteScaleMode(value: string): void {
 function setRemotePanMode(enabled: boolean): void {
   const next = enabled && remoteScaleMode === "actual";
   if (next !== remotePanMode) {
-    releaseInputState();
+    resetRemoteInputState();
     inputDispatcher.discardPendingMoves();
     if (pointerFrame !== null) {
       window.cancelAnimationFrame(pointerFrame);
@@ -3173,6 +3168,29 @@ const pressedKeys = new RemoteKeyboardState();
 const pressedButtons = new Set<"left" | "right" | "middle">();
 
 function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void {
+  const carrier = viewport.querySelector<HTMLTextAreaElement>("[data-remote-ime-input]");
+  const textState = new RemoteTextInput(fireRemoteText, releaseKeyboardState);
+  if (carrier) {
+    remoteTextInput = { state: textState, element: carrier, viewport };
+    carrier.addEventListener("focus", () => textState.focus());
+    viewport.addEventListener("focus", () => focusRemoteKeyboard(viewport));
+    viewport.addEventListener("compositionstart", () => {
+      if (remoteTextInput?.element === carrier && !remotePanMode && !smartPasteBusy) textState.compositionstart();
+    });
+    viewport.addEventListener("compositionend", (event) => {
+      if (remoteTextInput?.element === carrier) textState.compositionend(event.data);
+      carrier.value = "";
+    });
+    viewport.addEventListener("beforeinput", (event) => {
+      if (remotePanMode || smartPasteBusy || remoteTextInput?.element !== carrier) event.preventDefault();
+    });
+    viewport.addEventListener("input", (event) => {
+      if (remoteTextInput?.element !== carrier || remotePanMode || smartPasteBusy
+        || textState.input(carrier.value, event.data, event.inputType, event.isComposing)) {
+        carrier.value = "";
+      }
+    });
+  }
   const pendingPoint = { x: 0, y: 0 };
   let hasPendingPoint = false;
   let panDrag: (RemotePanOrigin & { pointerId: number }) | null = null;
@@ -3270,7 +3288,12 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       return;
     }
     event.preventDefault();
-    viewport.focus({ preventScroll: true });
+    if (carrier) {
+      const bounds = viewport.getBoundingClientRect();
+      carrier.style.left = `${Math.max(0, Math.min(viewport.clientWidth - 1, event.clientX - bounds.left)) + viewport.scrollLeft}px`;
+      carrier.style.top = `${Math.max(0, Math.min(viewport.clientHeight - 1, event.clientY - bounds.top)) + viewport.scrollTop}px`;
+    }
+    focusRemoteKeyboard(viewport);
     viewport.setPointerCapture(event.pointerId);
     hasPendingPoint = true;
     sendPendingPoint();
@@ -3325,6 +3348,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
         event.preventDefault();
         finishPanDrag();
         setRemotePanMode(false);
+        focusRemoteKeyboard(viewport);
       }
       return;
     }
@@ -3332,6 +3356,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       event.preventDefault();
       return;
     }
+    if (carrier && textState.keydown(event)) return;
     if (isRemoteClipboardPasteShortcut(event)) {
       event.preventDefault();
       event.stopPropagation();
@@ -3341,11 +3366,30 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     sendKeyboardEvent(event, true);
   });
   viewport.addEventListener("keyup", (event) => {
-    if (!remotePanMode) {
+    if (!remotePanMode && !(carrier && textState.keyup(event))) {
       sendKeyboardEvent(event, false);
     }
   });
-  viewport.addEventListener("blur", releaseCapturedInput);
+  viewport.addEventListener("focusout", (event) => {
+    if (!viewport.contains(event.relatedTarget as Node | null)) {
+      releaseCapturedInput();
+      resetRemoteTextInput();
+    }
+  });
+}
+
+function focusRemoteKeyboard(viewport = remoteTextInput?.viewport): void {
+  if (remoteTextInput && remoteTextInput.viewport === viewport && !remotePanMode) {
+    remoteTextInput.state.focus();
+    remoteTextInput.element.focus({ preventScroll: true });
+  } else {
+    viewport?.focus({ preventScroll: true });
+  }
+}
+
+function fireRemoteText(text: string): void {
+  const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
+  if (streamId !== null) void inputDispatcher.enqueueText(text, streamId).catch(() => {});
 }
 
 function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
@@ -3377,10 +3421,24 @@ function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
   }
 }
 
-function releaseInputState(): void {
+function releaseKeyboardState(): void {
   for (const input of pressedKeys.releaseAll()) {
     fireInput(input);
   }
+}
+
+function resetRemoteTextInput(): void {
+  remoteTextInput?.state.reset();
+  if (remoteTextInput) remoteTextInput.element.value = "";
+}
+
+function resetRemoteInputState(): void {
+  resetRemoteTextInput();
+  releaseInputState();
+}
+
+function releaseInputState(): void {
+  releaseKeyboardState();
   for (const button of pressedButtons) {
     fireInput({ kind: "mouseButton", button, pressed: false });
   }
@@ -3401,7 +3459,7 @@ async function pasteLocalClipboardText(): Promise<void> {
   };
   updateTransferPanel({ ledger: false });
   inputDispatcher.discardPendingMoves();
-  releaseInputState();
+  resetRemoteInputState();
   try {
     await inputDispatcher.drain();
     await pasteControllerClipboardText();
@@ -3417,7 +3475,7 @@ async function pasteLocalClipboardText(): Promise<void> {
     };
   } finally {
     updateTransferPanel({ ledger: false });
-    document.querySelector<HTMLElement>("[data-remote-viewport]")?.focus({ preventScroll: true });
+    focusRemoteKeyboard();
   }
 }
 
@@ -3442,7 +3500,7 @@ function fireMouseMove(x: number, y: number): void {
 function sendRemoteKeyTap(key: string): void {
   fireInput({ kind: "key", key, pressed: true, modifiers: 0 });
   fireInput({ kind: "key", key, pressed: false, modifiers: 0 });
-  document.querySelector<HTMLElement>("[data-remote-viewport]")?.focus({ preventScroll: true });
+  focusRemoteKeyboard();
 }
 
 async function submitTextInput(event: SubmitEvent): Promise<void> {
@@ -3465,7 +3523,10 @@ async function submitTextInput(event: SubmitEvent): Promise<void> {
     submit.setAttribute("aria-busy", "true");
   }
   try {
-    await sendControllerText(text);
+    const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
+    if (streamId === null) return;
+    releaseKeyboardState();
+    await inputDispatcher.enqueueText(text, streamId);
     input.value = "";
     closeTextInput();
   } catch (error) {
@@ -3489,7 +3550,7 @@ function closeTextInput(): void {
     panel.hidden = true;
   }
   revealRemoteToolbar();
-  viewport?.focus({ preventScroll: true });
+  focusRemoteKeyboard(viewport ?? undefined);
 }
 
 function writePointerPosition(
@@ -3651,7 +3712,7 @@ async function toggleFullscreen(): Promise<void> {
   }
   await setRemoteFullscreen(!remoteFullscreenDesired, true);
   if (remoteFullscreenActive) {
-    document.querySelector<HTMLElement>("[data-remote-viewport]")?.focus({ preventScroll: true });
+    focusRemoteKeyboard();
   }
 }
 
@@ -3674,7 +3735,7 @@ async function applyRemoteFullscreenRequests(reportErrors: boolean): Promise<voi
   try {
     while (remoteFullscreenActive !== remoteFullscreenDesired) {
       const target = remoteFullscreenDesired;
-      releaseInputState();
+      resetRemoteInputState();
       inputDispatcher.discardPendingMoves();
       await controllerWindow.setFullscreen(target);
       applyRemoteFullscreenState(target, false);
@@ -3736,7 +3797,8 @@ function scheduleRemoteFullscreenSync(): void {
 }
 
 function handleRemoteFullscreenEscape(event: KeyboardEvent): void {
-  if (!remoteFullscreenActive || event.key !== "Escape" || event.repeat) {
+  if (!remoteFullscreenActive || event.key !== "Escape" || event.repeat
+    || isCompositionKey(event) || remoteTextInput?.state.isComposing) {
     return;
   }
   event.preventDefault();
