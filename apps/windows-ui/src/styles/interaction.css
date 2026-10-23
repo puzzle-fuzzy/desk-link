@@ -1,0 +1,54 @@
+/* Remote media and interaction states. Keep overlays opaque and input-safe. */
+.remote-session { border: 1px solid var(--line); border-radius: 8px; }
+.remote-toolbar, .remote-transfer-panel, .remote-text-entry, .remote-video-starting, .remote-reconnect-overlay, .remote-fullscreen-guide, .remote-focus-hint {
+  color: var(--ink);
+  background: var(--surface);
+}
+.remote-toolbar { border-bottom: 1px solid var(--line); font-size: 12px; }
+.remote-toolbar-status strong { font-size: 13px; }
+.remote-toolbar-status small, .remote-file-drop-hint, .remote-transfer-heading small, .remote-transfer-list small, .remote-transfer-more { color: var(--muted); font-size: 11px; }
+.remote-toolbar select { font-size: 12px; padding: 4px; }
+.toolbar-button { border: 1px solid var(--control-line); border-radius: 5px; min-height: 30px; font-size: 12px; }
+.toolbar-button[aria-pressed=true]:not(:disabled) { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.toolbar-button--danger { color: var(--danger); }
+.remote-transfer-panel, .remote-text-entry { border-bottom: 1px solid var(--line); }
+.remote-transfer-status, .remote-queue-recovery { background: var(--surface-subtle); border-radius: 5px; font-size: 12px; }
+.remote-transfer-list li { border-top: 1px solid var(--line); font-size: 12px; }
+.remote-transfer-list li > button, .remote-file-queue-protection > button { color: var(--danger); }
+.remote-transfer-activity { background: var(--accent); color: var(--on-accent); border-radius: 8px; font-size: 10px; }
+.remote-transfer-activity[data-state=error] { background: var(--danger); }
+.remote-viewport, .remote-canvas { color: white; background: black; }
+.remote-viewport:focus-visible { outline-offset: -3px; }
+.remote-cursor { color: white; filter: drop-shadow(0 1px 1px black); }
+.remote-video-starting, .remote-reconnect-overlay { border: 1px solid var(--control-line); border-radius: 8px; }
+.remote-video-starting p, .remote-reconnect-overlay small { color: var(--muted); font-size: 12px; }
+.remote-focus-hint, .remote-fullscreen-guide { border-radius: 5px; font-size: 11px; }
+.remote-file-drop-overlay { color: var(--ink); background: var(--surface); border: 2px dashed var(--accent); border-radius: 8px; }
+.remote-video-path, .remote-quality-status { color: var(--muted); font-size: 11px; }
+.remote-quality-status__action { color: var(--accent); }
+.remote-file-queue-protection { color: var(--warning); font-size: 11px; }
+.remote-waiting { color: white; }
+.remote-waiting p { color: oklch(.8 0 0); font-size: 12px; }
+.pairing-qr { color: black; background: white; border: 1px solid var(--line); border-radius: 6px; }
+html[data-remote-fullscreen=true] .remote-session { border: 0; border-radius: 0; }
+html[data-remote-fullscreen=true] .remote-toolbar { flex-direction: row; align-items: center; border: 1px solid var(--control-line); border-radius: 6px; }
+html[data-remote-fullscreen=true] .remote-toolbar-actions { flex-wrap: nowrap; }
+html[data-remote-fullscreen=true] .remote-transfer-panel, html[data-remote-fullscreen=true] .remote-text-entry { border: 1px solid var(--control-line); border-radius: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.button-spinner, .controller-spinner, .icon-spin { animation: spin 1s linear infinite; }
+@media (forced-colors: active) {
+  :root {
+    --surface: Canvas; --surface-subtle: Canvas; --surface-hover: ButtonFace;
+    --ink: CanvasText; --muted: CanvasText; --line: ButtonBorder; --control-line: ButtonBorder;
+    --accent: Highlight; --accent-hover: Highlight; --accent-soft: ButtonFace; --on-accent: HighlightText;
+    --danger: LinkText; --danger-soft: Canvas; --warning: CanvasText; --warning-soft: Canvas;
+    --disabled: GrayText; --backdrop: Canvas;
+  }
+  .sidebar-nav-item--active, .sidebar-nav-item--active:hover, .toolbar-button[aria-pressed=true]:not(:disabled), .account-mode-switch button[aria-selected=true], .utility-menu-item[aria-current=page] { color: HighlightText; background: Highlight; outline: 1px solid Highlight; }
+  .button--primary { border: 1px solid ButtonText; }
+  .button:disabled, .toolbar-button:disabled, .saved-device-actions button:disabled, input:disabled, select:disabled, textarea:disabled { color: GrayText; border-color: GrayText; }
+  .pairing-qr, .remote-canvas, .remote-cursor { forced-color-adjust: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

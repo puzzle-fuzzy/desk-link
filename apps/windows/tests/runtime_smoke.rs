@@ -6,6 +6,7 @@ mod windows {
     };
 
     use apps_windows::{
+        controller_settings::{ControllerConnectionSettings, WindowsControllerConnectionStore},
         runtime::HostRuntime,
         trusted::{
             LocalControllerApproval, WindowsControllerAuthorizer, WindowsPairingAuthorizer,
@@ -13,11 +14,14 @@ mod windows {
         },
         window::PendingController,
     };
-    use desklink_crypto::{DeviceIdentity, PairingInvite};
+    use desklink_crypto::{DeviceIdentity, PairingCode, PairingInvite};
     use desklink_ffi::{ControllerEvent, ControllerRuntime};
     use desklink_protocol::{FrameFlags, Platform, VideoConfig};
     use desklink_relay::{RelayConfig, RelayServer};
-    use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
+    use desklink_transport::{
+        QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
+        TransportError,
+    };
     use desklink_video::EncodedFrame;
     use quinn::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -102,17 +106,51 @@ mod windows {
         let invite = PairingInvite::new(&host_identity, now, 60).unwrap();
         let session_id = invite.session_id();
         let authentication = *invite.relay_authentication();
-        host.join(RelayJoin::host_with_participant(
-            session_id,
-            authentication,
-            [1; 16],
-        ))
+        let device_id = 832_591_746_123;
+        let code = PairingCode::generate(&mut rand_core::OsRng);
+        let encoded_invite = invite.encode().unwrap();
+        let registration = RelayDirectoryRegistration::new(
+            device_id,
+            *code.as_bytes(),
+            encoded_invite.as_bytes().to_vec(),
+            60,
+        )
+        .unwrap();
+        host.join(
+            RelayJoin::host_with_participant(session_id, authentication, [1; 16])
+                .with_directory_registration(registration)
+                .unwrap(),
+        )
         .await
         .unwrap();
+
+        let mut wrong_code = *code.as_bytes();
+        wrong_code[0] = if wrong_code[0] == b'2' { b'3' } else { b'2' };
+        let wrong_code = PairingCode::from_bytes(wrong_code).unwrap();
+        let wrong_lookup = QuicClient::connect(config()).await.unwrap();
+        assert_eq!(
+            wrong_lookup
+                .lookup_directory(
+                    RelayDirectoryLookup::new(device_id, *wrong_code.as_bytes()).unwrap()
+                )
+                .await,
+            Err(TransportError::DirectoryNotFound)
+        );
+        drop(wrong_lookup);
+        let correct_lookup = QuicClient::connect(config()).await.unwrap();
+        let invitation = correct_lookup
+            .lookup_directory(RelayDirectoryLookup::new(device_id, *code.as_bytes()).unwrap())
+            .await
+            .unwrap();
+        let decoded = PairingInvite::decode(&invitation, now).unwrap();
+        assert_eq!(decoded.session_id(), session_id);
+        assert_eq!(decoded.host_verify_key(), host_verify_key);
+        assert!(!decoded.is_persistent());
+        drop(correct_lookup);
         controller
             .join(RelayJoin::controller_with_participant(
-                session_id,
-                authentication,
+                decoded.session_id(),
+                *decoded.relay_authentication(),
                 [2; 16],
             ))
             .await
@@ -125,6 +163,13 @@ mod windows {
             std::process::id()
         ));
         let trusted = WindowsTrustedControllerStore::new(directory.join("controllers.bin"));
+        let connections = WindowsControllerConnectionStore::new(directory.join("connection.bin"));
+        let settings = ControllerConnectionSettings::from_invite(
+            &relay.address.to_string(),
+            "localhost",
+            &decoded,
+        )
+        .unwrap();
         let authorizer =
             WindowsPairingAuthorizer::new(trusted.clone(), invite, Box::new(AcceptLocalPairing));
         let runtime =
@@ -174,6 +219,13 @@ mod windows {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].device_id(), [63; 16]);
         assert_eq!(records[0].verify_key(), controller_verify_key);
+        connections.save(&settings).unwrap();
+        drop(settings);
+        let saved = connections.load().unwrap().unwrap();
+        assert_eq!(saved.relay_address(), relay.address);
+        assert_eq!(saved.host_device_id(), decoded.host_device_id());
+        assert_eq!(saved.host_verify_key(), decoded.host_verify_key());
+        assert!(!saved.is_persistent());
         controller.request_keyframe().await.unwrap();
 
         runtime_task.abort();
@@ -181,18 +233,17 @@ mod windows {
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(controller);
 
-        let reconnect_relay = spawn_test_relay().await;
         let reconnect_config = || {
             QuicClientConfig::with_client_config(
-                reconnect_relay.address,
-                "localhost",
-                reconnect_relay.client_config.clone(),
+                saved.relay_address(),
+                saved.server_name(),
+                relay.client_config.clone(),
             )
         };
         let reconnect_host = QuicClient::connect(reconnect_config()).await.unwrap();
         let reconnect_controller = QuicClient::connect(reconnect_config()).await.unwrap();
-        let reconnect_session = session_id;
-        let reconnect_authentication = authentication;
+        let reconnect_session = saved.session_id();
+        let reconnect_authentication = *saved.authentication();
         reconnect_host
             .join(RelayJoin::host_with_participant(
                 reconnect_session,
@@ -221,7 +272,7 @@ mod windows {
         let mut reconnect_controller = ControllerRuntime::connect_for_platform(
             reconnect_controller,
             DeviceIdentity::from_secret_key([63; 16], &[64; 32]),
-            host_verify_key,
+            saved.host_verify_key(),
             Platform::Windows,
         )
         .await
@@ -232,7 +283,7 @@ mod windows {
                     .await
                     .unwrap()
                     .unwrap(),
-                ControllerEvent::VideoConfig(_)
+                ControllerEvent::H264AccessUnit(frame) if !frame.data.is_empty()
             ) {
                 break;
             }

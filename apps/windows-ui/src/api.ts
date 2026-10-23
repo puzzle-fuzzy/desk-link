@@ -22,7 +22,7 @@ import type {
   WindowsPreferencesSummary,
 } from "./types";
 import type { H264Profile, VideoQualityPreference } from "./types";
-import type { WindowsReleaseSource } from "./windows-update";
+import type { WindowsReleaseSource, WindowsUpdateProgress } from "./windows-update";
 
 export interface AccountUser {
   id: string;
@@ -93,6 +93,16 @@ export function uploadDiagnosticsNow(): Promise<DiagnosticUploadResult> {
 
 export function checkWindowsRelease(): Promise<WindowsReleaseSource> {
   return invoke<WindowsReleaseSource>("check_windows_release");
+}
+
+export function installWindowsUpdate(onProgress: (value: WindowsUpdateProgress) => void): Promise<void> {
+  const progress = new Channel<WindowsUpdateProgress>();
+  progress.onmessage = onProgress;
+  return invoke<void>("install_windows_update", { progress });
+}
+
+export function cancelWindowsUpdate(): Promise<boolean> {
+  return invoke<boolean>("cancel_windows_update");
 }
 
 export function quitDeskLink(): Promise<void> {
@@ -204,8 +214,8 @@ export function sendControllerInput(input: StreamBoundControllerInput): Promise<
   return invoke<void>("send_controller_input", { input });
 }
 
-export function sendControllerText(text: string): Promise<void> {
-  return invoke<void>("send_controller_text", { text });
+export function sendControllerText(text: string, streamId?: number): Promise<void> {
+  return invoke<void>("send_controller_text", { text, streamId });
 }
 
 export function pasteControllerClipboardText(): Promise<void> {

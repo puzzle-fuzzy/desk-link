@@ -10,6 +10,10 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from windows_update_signing import public_bytes, sign_manifest_bytes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,6 +56,8 @@ class WindowsReleasePublishTests(unittest.TestCase):
                     "version": "0.1.42",
                     "source_commit": "a" * 40,
                     "source_dirty": False,
+                    "target": "x86_64-pc-windows-msvc",
+                    "update_mode": "perUserV1",
                     "release_scope": {
                         "target": "windows-10/11-x64",
                         "macos_release": False,
@@ -68,6 +74,12 @@ class WindowsReleasePublishTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        key = Ed25519PrivateKey.generate()
+        public_path = root / "apps/windows-ui/src-tauri/update-public-key.hex"
+        public_path.parent.mkdir(parents=True)
+        public_path.write_text(public_bytes(key).hex() + "\n", encoding="ascii")
+        manifest = release / "windows-installer-manifest.json"
+        manifest.with_name(manifest.name + ".sig").write_bytes(sign_manifest_bytes(manifest.read_bytes(), key))
         (release / "windows-release-verification.json").write_text(
             json.dumps(
                 {
@@ -121,6 +133,20 @@ class WindowsReleasePublishTests(unittest.TestCase):
             readiness.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "readiness"):
                 self.publish.validate_release_payload(root, "v0.1.42")
+
+    def test_rejects_missing_or_tampered_update_signatures(self) -> None:
+        for content in (None, b"0" * 128):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.create_release(root)
+                    signature = root / "dist/windows/windows-installer-manifest.json.sig"
+                    if content is None:
+                        signature.unlink()
+                    else:
+                        signature.write_bytes(content)
+                    with self.assertRaisesRegex(ValueError, "signature"):
+                        self.publish.validate_release_payload(root, "v0.1.42")
 
     def test_rejects_unsigned_or_mismatched_tags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -232,12 +258,15 @@ class WindowsReleasePublishTests(unittest.TestCase):
                 readiness=readiness,
                 sha256="a" * 64,
             )
-            with patch.object(self.publish.subprocess, "run") as run:
+            with patch.object(self.publish.subprocess, "run") as run, patch.object(self.publish, "verify_update_manifest") as verify_update:
                 self.publish.publish(payload, repository="owner/repo", tag="v0.1.42")
+
+            verify_update.assert_called_once_with(manifest)
 
             self.assertEqual(run.call_count, 2)
             verify_command = run.call_args_list[0].args[0]
             release_command = run.call_args_list[1].args[0]
+            self.assertIn(str(payload.manifest_signature), release_command)
             self.assertEqual(verify_command[-1], "--verify-only")
             self.assertEqual(release_command[:3], ["gh", "release", "create"])
 

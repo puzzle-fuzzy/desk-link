@@ -5,7 +5,7 @@
 ## 发布边界
 
 - 目标平台：Windows 10/11 x64。
-- 当前候选版本：`0.1.91`。
+- 当前公开测试版本：`0.1.93`；正式发布仍受本手册全部门禁约束。
 - 发布入口：单一 `DeskLink.exe` 和单一 `DeskLinkSetup-<version>-x64.exe`。
 - 发布构建工具链固定为 Rust `1.97.1` 与 Bun `1.3.14`；本机、CI 和签名候选不得使用未锁定的 `stable`。
 - 视频：最高约 2560×1440；DirectLan 只优化视频数据面，控制、审批、剪贴板和文件继续使用端到端加密中继。
@@ -53,7 +53,7 @@ python scripts/package-windows-candidate.py
 - `dist/windows/windows-release-verification.json` 的 `passed` 为 `true`。
 - `dist/windows/windows-installer-manifest.json` 的版本、x64、应用哈希、安装器哈希和 `passed` 正确。
 - 两份清单的 `source_commit` 必须相同；正式签名构建的 `source_dirty` 必须为 `false`，并与 GitHub Actions 的 `GITHUB_SHA` 对齐。
-- 正式发布前 `signed` 必须为 `true`；`signed: false` 只能用于本地候选包。
+- 正式发布前 `signed` 必须为 `true`。`signed: false` 可用于本地候选，或 [客户端更新](windows-client-updates.md) 中明确标记的独立签名公开测试通道；公开测试不能冒充正式发布或人工验收通过。
 - `verify-managed-relay.py` 成功完成系统证书链和 QUIC 双向控制探测；`audit-managed-relay.py --expected-source-commit <HEAD>` 同时确认线上容器镜像的源码 revision 与候选提交一致。
 - 诊断审计的公网 health、服务进程、定时任务和报告新鲜度均为通过。
 - `windows-resilience-report.json` 必须来自干净的当前提交，并通过捕获、编码、主机恢复、电源恢复、本地加密媒体 soak，以及公网中继目录查询、Noise 握手、视频、输入和重连 E2E。普通 CI 至少 10 秒；候选基线应使用 300 秒，正式发布预检会强制 300 秒。

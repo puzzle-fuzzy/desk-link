@@ -18,7 +18,13 @@ DeskLink can be used immediately in local mode without an email account. An opti
 
 ## Brand Personality
 
-Calm, precise, trustworthy. Windows and macOS share one information architecture, status vocabulary, color system, and Chinese interface while preserving native platform behavior. Security information is explicit and legible, while routine background operation stays unobtrusive.
+Calm, precise, trustworthy. Windows and macOS share task vocabulary and a Chinese interface while preserving native platform behavior. Windows uses a clean, light desktop-tool interface with narrow navigation, a single green or teal accent, and clear hierarchy. Security information stays explicit and legible, while routine background operation stays unobtrusive. System dark mode and high-contrast settings remain supported.
+
+## Windows Task Structure
+
+“连接” and “共享” are the two primary entry points. Connection opens by default and centers on a device ID, an access password, and one primary connect action; recent connections support repeat use as a compact secondary list. Sharing centers on this device's ID, availability, and the controls needed to enable access and manage its password.
+
+Approved devices, settings, diagnostics, about, and the optional account remain available with less visual weight. Each page has one task title and one primary focus. Keep copy to labels, necessary state, actionable recovery, and security decisions; avoid decorative panels, promotional descriptions, repeated headings, gradients, and visual effects. Exact colors, spacing, and component details are defined by the current Windows UI styles and [DESIGN.md](DESIGN.md).
 
 ## Anti-references
 
@@ -29,11 +35,11 @@ Calm, precise, trustworthy. Windows and macOS share one information architecture
 
 ## Design Principles
 
-1. Put current control state first: the owner must know at a glance whether anyone can see or control the desktop.
+1. Make connection and sharing immediate: foreground the current task and make it clear whether this desktop is available or controlled.
 2. Make dangerous actions exact: identify the device and describe the consequence before approval, disconnect, or revocation.
 3. Stay quiet when healthy: background availability belongs in the platform status area, not in a permanently intrusive window.
 4. Explain recovery honestly: distinguish connecting, connected, retrying, expired, and permanently stopped states.
-5. Preserve platform familiarity: share the same page structure and terminology while using native Windows and macOS behavior, keyboard access, system metrics, and standard interaction patterns.
+5. Preserve platform familiarity: share task structure and terminology while using native Windows and macOS behavior, keyboard access, system metrics, and standard interaction patterns.
 
 ## Accessibility & Inclusion
 

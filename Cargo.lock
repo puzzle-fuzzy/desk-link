@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "desklink-installer"
-version = "0.1.91"
+version = "0.1.93"
 dependencies = [
  "embed-resource",
  "windows",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "desklink-windows"
-version = "0.1.91"
+version = "0.1.93"
 dependencies = [
  "blake2 0.10.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "desklink-crypto",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "desklink-windows-ui"
-version = "0.1.91"
+version = "0.1.93"
 dependencies = [
  "blake2 0.10.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "bytes",
@@ -1019,11 +1019,13 @@ dependencies = [
  "desklink-transport",
  "desklink-video",
  "desklink-windows",
+ "ed25519-dalek",
  "qrcode",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",

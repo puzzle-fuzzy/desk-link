@@ -45,9 +45,9 @@ pub fn parse_access_code(value: &str) -> Result<[u8; DIRECTORY_ACCESS_CODE_BYTES
     if bytes.len() != DIRECTORY_ACCESS_CODE_BYTES
         || !bytes.iter().all(|byte| ACCESS_CODE_ALPHABET.contains(byte))
     {
-        return Err("临时密码应为 8 位大写字母或数字。");
+        return Err("访问密码应为 8 位大写字母或数字。");
     }
-    bytes.try_into().map_err(|_| "临时密码无效。")
+    bytes.try_into().map_err(|_| "访问密码无效。")
 }
 
 #[cfg(test)]

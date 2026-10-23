@@ -25,10 +25,10 @@ use zeroize::Zeroize;
 
 use crate::storage::local_app_data_path;
 
-// The persisted schema includes whether the invitation represents a persistent
-// host directory session. Older stores are intentionally rejected and rebuilt
-// because this application has not shipped to users yet.
+// V2 adds the persistent-session flag. Read the original V1 layout without
+// rewriting it or promoting its credentials to persistent-directory access.
 const CONTROLLER_MAGIC: &[u8; 8] = b"DLCCV2\0\0";
+const LEGACY_CONTROLLER_MAGIC: &[u8; 8] = b"DLCCV1\0\0";
 const MAX_CONTROLLER_BYTES: usize = 4_096;
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -269,8 +269,13 @@ fn encode(
 }
 
 fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControllerConnectionError> {
-    if bytes.len() < CONTROLLER_MAGIC.len() + 4 + 16 + 32 + 16 + 32 + 1
-        || &bytes[..CONTROLLER_MAGIC.len()] != CONTROLLER_MAGIC
+    let has_persistent_flag = match bytes.get(..CONTROLLER_MAGIC.len()) {
+        Some(magic) if magic == CONTROLLER_MAGIC => true,
+        Some(magic) if magic == LEGACY_CONTROLLER_MAGIC => false,
+        _ => return Err(WindowsControllerConnectionError::CorruptStore),
+    };
+    if bytes.len()
+        < CONTROLLER_MAGIC.len() + 4 + 16 + 32 + 16 + 32 + usize::from(has_persistent_flag)
     {
         return Err(WindowsControllerConnectionError::CorruptStore);
     }
@@ -281,7 +286,7 @@ fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControlle
     let authentication_end = session_end.saturating_add(32);
     let device_end = authentication_end.saturating_add(16);
     let key_end = device_end.saturating_add(32);
-    let persistent_end = key_end.saturating_add(1);
+    let persistent_end = key_end.saturating_add(usize::from(has_persistent_flag));
     if persistent_end != bytes.len() {
         return Err(WindowsControllerConnectionError::CorruptStore);
     }
@@ -302,10 +307,14 @@ fn decode(bytes: &[u8]) -> Result<ControllerConnectionSettings, WindowsControlle
             .map_err(|_| WindowsControllerConnectionError::CorruptStore)?,
     )
     .map_err(|_| WindowsControllerConnectionError::CorruptStore)?;
-    let persistent = match bytes[key_end] {
-        0 => false,
-        1 => true,
-        _ => return Err(WindowsControllerConnectionError::CorruptStore),
+    let persistent = if has_persistent_flag {
+        match bytes[key_end] {
+            0 => false,
+            1 => true,
+            _ => return Err(WindowsControllerConnectionError::CorruptStore),
+        }
+    } else {
+        false
     };
     ControllerConnectionSettings::from_parts(
         &relay,
@@ -430,6 +439,132 @@ mod tests {
     };
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn legacy_v1_fixture() -> (ControllerConnectionSettings, Vec<u8>) {
+        let host = DeviceIdentity::from_secret_key([0x31; 16], &[0x32; 32]);
+        let session_id = SessionId::from_bytes([0x33; 16]);
+        let authentication = [0x34; 32];
+        let settings = ControllerConnectionSettings::from_parts(
+            "127.0.0.1:4433",
+            "localhost",
+            session_id,
+            authentication,
+            host.device_id,
+            host.verify_key(),
+            false,
+        )
+        .unwrap();
+        // The original V1 schema predates the persistent-session flag. Build
+        // its historical bytes independently of the current encoder.
+        let mut bytes = b"DLCCV1\0\0".to_vec();
+        for text in ["127.0.0.1:4433", "localhost"] {
+            bytes.extend_from_slice(&(text.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        bytes.extend_from_slice(session_id.as_bytes());
+        bytes.extend_from_slice(&authentication);
+        bytes.extend_from_slice(&host.device_id);
+        bytes.extend_from_slice(host.verify_key().as_bytes());
+        (settings, bytes)
+    }
+
+    #[test]
+    fn legacy_v1_dpapi_connection_load_preserves_credentials_and_original_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "desklink-controller-v1-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let store = WindowsControllerConnectionStore::new(directory.join("controller.bin"));
+        let (expected, mut plaintext) = legacy_v1_fixture();
+        let protected = protect(&plaintext).unwrap();
+        plaintext.zeroize();
+        fs::write(store.path(), &protected).unwrap();
+
+        let loaded = store
+            .load()
+            .expect("valid DPAPI V1 store must remain readable")
+            .unwrap();
+        assert_eq!(loaded.relay_address(), expected.relay_address());
+        assert_eq!(loaded.server_name(), expected.server_name());
+        assert_eq!(loaded.session_id(), expected.session_id());
+        assert_eq!(loaded.authentication(), expected.authentication());
+        assert_eq!(loaded.host_device_id(), expected.host_device_id());
+        assert_eq!(loaded.host_verify_key(), expected.host_verify_key());
+        assert!(
+            !loaded.is_persistent(),
+            "legacy records cannot acquire persistent access"
+        );
+        assert!(store.load().unwrap().is_some());
+        assert_eq!(
+            fs::read(store.path()).unwrap(),
+            protected,
+            "reads must not migrate or overwrite the user's record"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_decoder_keeps_exact_lengths_and_version_validation() {
+        let (_, bytes) = legacy_v1_fixture();
+        for end in 0..bytes.len() {
+            assert!(matches!(
+                decode(&bytes[..end]),
+                Err(WindowsControllerConnectionError::CorruptStore)
+            ));
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(1);
+        assert!(matches!(
+            decode(&trailing),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+        let mut unknown = bytes;
+        unknown[..8].copy_from_slice(b"DLCCV0\0\0");
+        assert!(matches!(
+            decode(&unknown),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+    }
+
+    #[test]
+    fn compatible_decoder_keeps_field_and_v2_flag_validation() {
+        let (_, legacy) = legacy_v1_fixture();
+        let mut invalid_relay = legacy.clone();
+        invalid_relay[10] = b'x';
+        assert!(matches!(
+            decode(&invalid_relay),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+        let mut invalid_server = legacy.clone();
+        invalid_server[13 + "127.0.0.1:4433".len()] = b'\n';
+        assert!(matches!(
+            decode(&invalid_server),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+        let mut invalid_length = legacy.clone();
+        invalid_length[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            decode(&invalid_length),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+        let mut v2 = legacy;
+        v2[..8].copy_from_slice(CONTROLLER_MAGIC);
+        assert!(matches!(
+            decode(&v2),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+        v2.push(2);
+        assert!(matches!(
+            decode(&v2),
+            Err(WindowsControllerConnectionError::CorruptStore)
+        ));
+    }
 
     #[test]
     fn approved_invitation_preserves_the_hosts_normal_reconnect_credentials() {

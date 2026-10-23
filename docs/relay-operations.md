@@ -42,6 +42,14 @@ python scripts/deploy-managed-relay.py --target root@101.35.246.159 --identity-f
 3. 容量达到 80%：先提高实例规格或限制，再部署第二节点；不要直接移除准入上限。
 4. 容器反复重启：停止自动发布，保留当前日志和镜像 ID，回滚到上一份已通过探针的镜像。
 
+## 证书加载与续期
+
+DeskLink 从 `/etc/letsencrypt/live/p2p.yxswy.com` 获取证书，在同一云主机内同步至独立的 `/opt/desklink-relay/tls/versions`。Compose 只读挂载该目录，进程通过 `current` 相对符号链接读取证书；不要再读取 coturn 目录中的旧副本。
+
+仓库脚本 `deploy/tencent-relay/renew-tls.sh` 安装到 `/etc/letsencrypt/renewal-hooks/deploy/desklink-relay-tls`。它仅处理该 lineage，先校验域名、至少一天有效期以及公私钥匹配，再原子切换链接并只重启 DeskLink relay。私钥归属容器 UID 65534，权限 0400；重启命令失败时恢复上一组证书。手动同步可以直接运行该 hook，随后必须运行 `python scripts/verify-managed-relay.py` 验证公网 QUIC/TLS。
+
+2026-10-21 的缺失服务恢复、镜像来源与验证结果见 [连接与共享修复记录](2026-10-21-connection-repair.md)。
+
 ## 第二节点与切换
 
 真正的自动容灾还需要第二台具有独立公网 IP 的主机。当前客户端配置保存的是 `SocketAddr`，不能仅通过 DNS 改记录完成无损切换；在第二节点存在前，不应声称已经具备自动故障转移。

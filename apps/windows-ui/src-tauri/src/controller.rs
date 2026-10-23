@@ -602,7 +602,10 @@ enum ControllerCommand {
         stream_id: u64,
         event: InputEvent,
     },
-    Text(String),
+    Text {
+        stream_id: u64,
+        text: String,
+    },
     RequestKeyframe,
     SelectDisplay(u32),
     SetAudioEnabled(bool),
@@ -1648,9 +1651,19 @@ impl ControllerManager {
             .await
     }
 
-    pub async fn send_text(&self, text: String) -> Result<(), String> {
+    pub async fn send_text(&self, text: String, stream_id: Option<u64>) -> Result<(), String> {
         validate_text_input(&text)?;
-        self.send(ControllerCommand::Text(text)).await
+        let stream_id = match stream_id {
+            Some(0) => return Err("文字输入缺少有效的视频流标识。".to_owned()),
+            Some(stream_id) => stream_id,
+            None => self
+                .active_stream_id()
+                .ok_or_else(|| "当前没有正在运行的远程控制会话。".to_owned())?,
+        };
+        if self.active_stream_id() != Some(stream_id) {
+            return Ok(());
+        }
+        self.send(ControllerCommand::Text { stream_id, text }).await
     }
 
     pub async fn request_keyframe(&self) -> Result<(), String> {
@@ -2380,7 +2393,7 @@ async fn run_controller(
                     }
                     Some(ControllerCommand::SetVideoProfile(_)) => {}
                     Some(ControllerCommand::Input { .. })
-                    | Some(ControllerCommand::Text(_))
+                    | Some(ControllerCommand::Text { .. })
                     | Some(ControllerCommand::RequestKeyframe)
                     | Some(ControllerCommand::SelectDisplay(_))
                     | Some(ControllerCommand::SendClipboard(_))
@@ -2587,7 +2600,10 @@ async fn run_controller(
                             break ConnectFailure::from_controller(error);
                         }
                     }
-                    Some(ControllerCommand::Text(text)) => {
+                    Some(ControllerCommand::Text { stream_id, text }) => {
+                        if manager.active_stream_id() != Some(stream_id) {
+                            continue;
+                        }
                         if let Err(error) = send_text_input(&runtime, &text).await {
                             break ConnectFailure::from_controller(error);
                         }
@@ -4839,6 +4855,7 @@ mod tests {
         H264Profile, InputEvent, KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton,
         PROTOCOL_VERSION, ProtocolError, TransferResult,
     };
+    use desklink_session::{ReconnectPolicy, ReconnectSchedule};
     use desklink_transport::{JoinRejectCode, TransportError};
 
     use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
@@ -5411,6 +5428,50 @@ mod tests {
         assert!(manager.send_input(missing).await.is_err());
     }
 
+    #[tokio::test]
+    async fn stale_composed_text_is_discarded_without_entering_a_new_session_queue() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        // No worker is registered: reaching the command queue would fail.
+        assert!(manager.send_text("中文".to_owned(), Some(41)).await.is_ok());
+        assert!(manager.send_text("中文".to_owned(), Some(0)).await.is_err());
+        manager.set_status(ControllerRuntimeSummary::idle());
+        assert!(manager.send_text("中文".to_owned(), Some(42)).await.is_ok());
+        assert!(manager.send_text("中文".to_owned(), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn composed_and_explicit_text_commands_keep_their_submission_stream() {
+        let manager = ControllerManager::default();
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        let (commands, mut receiver) = mpsc::channel(2);
+        let (cancellation, _cancellation_receiver) = watch::channel(false);
+        *manager.worker.lock().unwrap() = Some(super::ControllerWorker {
+            host_device_id: [1; 16],
+            commands,
+            cancellation,
+            task: tauri::async_runtime::spawn(async {}),
+        });
+        manager
+            .send_text("中文".to_owned(), Some(42))
+            .await
+            .unwrap();
+        manager
+            .send_text("文字面板".to_owned(), None)
+            .await
+            .unwrap();
+        manager.set_status(ControllerRuntimeSummary::connected(43));
+        for expected in ["中文", "文字面板"] {
+            let ControllerCommand::Text { stream_id, text } = receiver.recv().await.unwrap() else {
+                panic!("expected queued text command");
+            };
+            assert_eq!(stream_id, 42);
+            assert_eq!(text, expected);
+            assert_ne!(manager.active_stream_id(), Some(stream_id));
+        }
+        manager.stop_current().await;
+    }
+
     #[test]
     fn browser_input_maps_to_bounded_protocol_events() {
         let mut pointer = empty_input("mouseMove");
@@ -5659,6 +5720,118 @@ mod tests {
         let retry = manager.begin_operation();
         assert!(retry > first);
         assert!(manager.ensure_current(retry).is_ok());
+    }
+
+    #[tokio::test]
+    async fn persistent_recovery_continues_after_budget_and_remains_cancellable() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let signals = tauri::ipc::Channel::new(|_| Ok(()));
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_secs(10), 1).unwrap();
+        let mut schedule = ReconnectSchedule::new(policy, None);
+        assert!(matches!(
+            schedule.next(0),
+            desklink_session::ReconnectDecision::RetryAfter { .. }
+        ));
+        let (_commands, mut receiver) = mpsc::channel(1);
+        let (cancellation, mut cancellation_receiver) = watch::channel(false);
+        let recovery = super::schedule_failure(
+            &manager,
+            &signals,
+            &mut schedule,
+            ConnectFailure::retryable("synthetic relay outage"),
+            super::ControllerWaitChannels {
+                generation,
+                persistent: true,
+                commands: &mut receiver,
+                cancellation: &mut cancellation_receiver,
+            },
+            None,
+            2,
+        );
+        tokio::pin!(recovery);
+        tokio::select! {
+            outcome = &mut recovery => panic!("persistent recovery stopped early: {outcome}"),
+            result = tokio::time::timeout(Duration::from_millis(100), async {
+                while manager.snapshot().state != "reconnecting" {
+                    tokio::task::yield_now().await;
+                }
+            }) => { result.expect("persistent recovery must expose its retry state"); }
+        }
+        assert!(manager.snapshot().detail.contains("继续"));
+        cancellation.send(true).unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(100), recovery)
+                .await
+                .expect("cancelling must not wait for the ten-second backoff")
+        );
+        assert_eq!(manager.snapshot().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn temporary_recovery_stops_when_retry_budget_is_exhausted() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let signals = tauri::ipc::Channel::new(|_| Ok(()));
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(1), 1).unwrap();
+        let mut schedule = ReconnectSchedule::new(policy, None);
+        schedule.next(0);
+        let (_commands, mut receiver) = mpsc::channel(1);
+        let (_cancellation, mut cancellation_receiver) = watch::channel(false);
+        assert!(
+            !super::schedule_failure(
+                &manager,
+                &signals,
+                &mut schedule,
+                ConnectFailure::retryable("synthetic relay outage"),
+                super::ControllerWaitChannels {
+                    generation,
+                    persistent: false,
+                    commands: &mut receiver,
+                    cancellation: &mut cancellation_receiver,
+                },
+                None,
+                2,
+            )
+            .await
+        );
+        assert_eq!(manager.snapshot().state, "stopped");
+    }
+
+    #[tokio::test]
+    async fn fixed_password_recovery_does_not_retry_an_explicit_rejection() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let signals = tauri::ipc::Channel::new(|_| Ok(()));
+        let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+        let (_commands, mut receiver) = mpsc::channel(1);
+        let (_cancellation, mut cancellation_receiver) = watch::channel(false);
+        let failure = ConnectFailure::from_controller(ControllerError::AccessDenied(
+            AccessDenialReason::ApprovalRejected,
+        ));
+        let expected_detail = failure.detail;
+        assert!(
+            !super::schedule_failure(
+                &manager,
+                &signals,
+                &mut schedule,
+                failure,
+                super::ControllerWaitChannels {
+                    generation,
+                    persistent: true,
+                    commands: &mut receiver,
+                    cancellation: &mut cancellation_receiver,
+                },
+                None,
+                1,
+            )
+            .await
+        );
+        assert_eq!(manager.snapshot().state, "stopped");
+        assert_eq!(manager.snapshot().detail, expected_detail);
+        assert_eq!(schedule.retries_used(), 0);
     }
 
     #[tokio::test]

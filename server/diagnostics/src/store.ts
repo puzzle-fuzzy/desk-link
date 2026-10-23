@@ -54,54 +54,56 @@ export class DiagnosticStore {
     remoteAddress: string,
     receivedAtUnixS = Math.floor(Date.now() / 1_000),
   ): StoredBatchResult {
-    const insertBatch = this.database.query(`
-      INSERT OR IGNORE INTO batches (
-        batch_id, received_at_unix_s, installation_id, correlation_id,
-        app_version, source, event_count, remote_address
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const result = insertBatch.run(
-      batchId,
-      receivedAtUnixS,
-      batch.installation_id,
-      batch.correlation_id,
-      batch.app_version,
-      batch.source,
-      batch.events.length,
-      remoteAddress.slice(0, 96),
-    );
-    if (result.changes === 0) {
-      return { duplicate: true, acceptedEvents: 0 };
-    }
-
-    const insertEvent = this.database.query(`
-      INSERT OR IGNORE INTO events (
-        event_id, batch_id, received_at_unix_s, installation_id, correlation_id,
-        app_version, source, timestamp_unix_ms, level, event, payload_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    let acceptedEvents = 0;
-    for (const event of batch.events) {
-      const payload = JSON.stringify(event);
-      const eventId = eventIdentifier(batch, event, payload);
-      const inserted = insertEvent.run(
-        eventId,
+    return this.database.transaction((): StoredBatchResult => {
+      const insertBatch = this.database.query(`
+        INSERT OR IGNORE INTO batches (
+          batch_id, received_at_unix_s, installation_id, correlation_id,
+          app_version, source, event_count, remote_address
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const result = insertBatch.run(
         batchId,
         receivedAtUnixS,
         batch.installation_id,
         batch.correlation_id,
         batch.app_version,
         batch.source,
-        event.timestamp_unix_ms,
-        event.level,
-        event.event,
-        payload,
+        batch.events.length,
+        remoteAddress.slice(0, 96),
       );
-      acceptedEvents += Number(inserted.changes > 0);
-    }
+      if (result.changes === 0) {
+        return { duplicate: true, acceptedEvents: 0 };
+      }
 
-    this.purge(receivedAtUnixS - RETENTION_SECONDS);
-    return { duplicate: false, acceptedEvents };
+      const insertEvent = this.database.query(`
+        INSERT OR IGNORE INTO events (
+          event_id, batch_id, received_at_unix_s, installation_id, correlation_id,
+          app_version, source, timestamp_unix_ms, level, event, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      let acceptedEvents = 0;
+      for (const event of batch.events) {
+        const payload = JSON.stringify(event);
+        const eventId = eventIdentifier(batch, event, payload);
+        const inserted = insertEvent.run(
+          eventId,
+          batchId,
+          receivedAtUnixS,
+          batch.installation_id,
+          batch.correlation_id,
+          batch.app_version,
+          batch.source,
+          event.timestamp_unix_ms,
+          event.level,
+          event.event,
+          payload,
+        );
+        acceptedEvents += Number(inserted.changes > 0);
+      }
+
+      this.purge(receivedAtUnixS - RETENTION_SECONDS);
+      return { duplicate: false, acceptedEvents };
+    })();
   }
 
   purge(beforeUnixS: number): void {

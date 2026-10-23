@@ -3,6 +3,76 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod update;
+#[cfg(windows)]
+pub mod update_registration;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Action {
+    Install,
+    Update,
+    Uninstall,
+    UninstallWorker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Options {
+    pub action: Action,
+    pub quiet: bool,
+    pub no_autostart: bool,
+    pub remove_data: bool,
+}
+
+impl Options {
+    pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut options = Self {
+            action: Action::Install,
+            quiet: false,
+            no_autostart: false,
+            remove_data: false,
+        };
+        for argument in arguments {
+            let action = match argument.as_str() {
+                "--quiet" => {
+                    options.quiet = true;
+                    continue;
+                }
+                "--no-autostart" => {
+                    options.no_autostart = true;
+                    continue;
+                }
+                "--remove-data" => {
+                    options.remove_data = true;
+                    continue;
+                }
+                "--update" => Action::Update,
+                "--uninstall" => Action::Uninstall,
+                "--uninstall-worker" => Action::UninstallWorker,
+                _ => return Err(format!("未知的安装器选项：{argument}")),
+            };
+            if options.action != Action::Install && options.action != action {
+                return Err("安装器操作选项不能同时使用".to_owned());
+            }
+            options.action = action;
+        }
+        if matches!(options.action, Action::Install | Action::Update) && options.remove_data {
+            return Err("--remove-data 只能与 --uninstall 一起使用".to_owned());
+        }
+        if options.action == Action::Update && options.no_autostart {
+            return Err("升级会保留原有的开机启动设置，不能指定 --no-autostart".to_owned());
+        }
+        Ok(options)
+    }
+
+    pub fn show_errors(self) -> bool {
+        self.action == Action::Update || !self.quiet
+    }
+
+    pub fn show_success(self) -> bool {
+        !self.quiet && !matches!(self.action, Action::Update | Action::UninstallWorker)
+    }
+}
+
 pub const PRODUCT_NAME: &str = "DeskLink";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APPLICATION_FILE_NAME: &str = "DeskLink.exe";
@@ -160,5 +230,33 @@ mod tests {
         assert!(!webview2_version_is_suitable(""));
         assert!(!webview2_version_is_suitable("120.0.2210"));
         assert!(!webview2_version_is_suitable("120.0.2210.55.extra"));
+    }
+
+    #[test]
+    fn update_keeps_success_quiet_but_never_hides_errors() {
+        let options = Options::parse(["--update", "--quiet"].map(str::to_owned)).unwrap();
+        assert_eq!(options.action, Action::Update);
+        assert!(!options.show_success());
+        assert!(options.show_errors());
+        assert!(!options.no_autostart);
+        assert!(!options.remove_data);
+        let normal = Options::parse(["--quiet", "--no-autostart"].map(str::to_owned)).unwrap();
+        assert_eq!(normal.action, Action::Install);
+        assert!(!normal.show_errors());
+        assert!(normal.no_autostart);
+    }
+
+    #[test]
+    fn update_rejects_data_removal_startup_changes_and_conflicting_actions() {
+        for arguments in [
+            vec!["--update", "--remove-data"],
+            vec!["--update", "--no-autostart"],
+            vec!["--update", "--uninstall"],
+            vec!["--uninstall", "--update"],
+            vec!["--update", "--uninstall-worker"],
+        ] {
+            assert!(Options::parse(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+        assert!(Options::parse(["--uninstall", "--remove-data"].map(str::to_owned)).is_ok());
     }
 }

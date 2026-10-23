@@ -10,6 +10,14 @@ mod windows {
         ControllerAuthorization, ControllerAuthorizer, HostLifecycleEvent, HostRuntimeError,
         HostSupervisor, HostSupervisorError,
     };
+    use apps_windows::{
+        fixed_access::WindowsFixedAccessStore,
+        trusted::{
+            LocalControllerApproval, WindowsControllerAuthorizer,
+            WindowsPersistentAccessAuthorizer, WindowsTrustedControllerStore,
+        },
+        window::PendingController,
+    };
     use desklink_crypto::{DeviceIdentity, PairingInvite, PeerIdentity, SessionId};
     use desklink_ffi::{ControllerEvent, ControllerRuntime};
     use desklink_relay::{RelayConfig, RelayServer};
@@ -20,6 +28,7 @@ mod windows {
     };
     use ed25519_dalek::VerifyingKey;
     use quinn::ServerConfig;
+    use rand_core::OsRng;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     struct TestTls {
@@ -295,7 +304,7 @@ mod windows {
             host_key,
         )
         .await;
-        let first_stream = next_video_config(&mut first_controller).await;
+        let first_stream = next_video_frame(&mut first_controller).await;
         assert_eq!(first_stream, 1);
 
         first_relay.shutdown().await;
@@ -310,7 +319,7 @@ mod windows {
             host_key,
         )
         .await;
-        let second_stream = next_video_config(&mut second_controller).await;
+        let second_stream = next_video_frame(&mut second_controller).await;
         assert!(second_stream > first_stream);
 
         second_relay.shutdown().await;
@@ -325,7 +334,7 @@ mod windows {
             host_key,
         )
         .await;
-        let third_stream = next_video_config(&mut third_controller).await;
+        let third_stream = next_video_frame(&mut third_controller).await;
         assert!(third_stream > second_stream);
         {
             let recorded = events.lock().unwrap();
@@ -399,7 +408,7 @@ mod windows {
                 host_key,
             )
             .await;
-            let stream = next_video_config(&mut controller).await;
+            let stream = next_video_frame(&mut controller).await;
             assert!(
                 stream > previous_stream,
                 "cycle {cycle} reused an old stream ID"
@@ -585,6 +594,283 @@ mod windows {
         drop(second);
         relay.shutdown().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires access to the interactive Windows desktop"]
+    async fn stored_fixed_password_rotates_disables_and_preserves_approved_reconnects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StorageDirectory(std::path::PathBuf);
+        impl Drop for StorageDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct ApproveOnce(Arc<AtomicUsize>);
+        impl LocalControllerApproval for ApproveOnce {
+            fn approve(&self, _pending: PendingController) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let _serial = host_test_lock().lock().await;
+        let tls = TestTls::new();
+        let relay = TestRelay::spawn("127.0.0.1:0".parse().unwrap(), &tls).await;
+        let directory = StorageDirectory(std::env::temp_dir().join(format!(
+            "desklink-fixed-lifecycle-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        let password_path = directory.0.join("fixed-access.bin");
+        let password_store = WindowsFixedAccessStore::new(&password_path);
+        let trusted = WindowsTrustedControllerStore::new(directory.0.join("controllers.bin"));
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let session_id = SessionId::from_bytes([161; 16]);
+        let authentication = [162; 32];
+        let host_key = DeviceIdentity::from_secret_key([163; 16], &[164; 32]).verify_key();
+        let directory_id = 959_282_312_056;
+
+        let start_host = || {
+            let host = DeviceIdentity::from_secret_key([163; 16], &[164; 32]);
+            let password = WindowsFixedAccessStore::new(&password_path).load().unwrap();
+            let authorizer: Arc<dyn ControllerAuthorizer> = if password.is_some() {
+                Arc::new(WindowsPersistentAccessAuthorizer::new(
+                    trusted.clone(),
+                    session_id,
+                    Box::new(ApproveOnce(approvals.clone())),
+                ))
+            } else {
+                Arc::new(WindowsControllerAuthorizer::new(trusted.clone()))
+            };
+            let mut host = HostSupervisor::new(
+                tls.client_config(relay.address),
+                session_id,
+                authentication,
+                1,
+                host,
+                authorizer,
+                None,
+            )
+            .unwrap();
+            if let Some(password) = password {
+                let identity = DeviceIdentity::from_secret_key([163; 16], &[164; 32]);
+                let invite =
+                    PairingInvite::for_persistent_connection(&identity, session_id, authentication);
+                host = host.with_directory_registration(
+                    RelayDirectoryRegistration::new(
+                        directory_id,
+                        *password.as_bytes(),
+                        invite.encode().unwrap().as_bytes().to_vec(),
+                        0,
+                    )
+                    .unwrap(),
+                );
+            }
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = events.clone();
+            let host =
+                host.with_observer(Arc::new(move |event| observed.lock().unwrap().push(event)));
+            (tokio::spawn(host.run()), events)
+        };
+
+        let original = password_store.generate_and_save(&mut OsRng).unwrap();
+        assert!(
+            WindowsFixedAccessStore::new(&password_path)
+                .load()
+                .unwrap()
+                .unwrap()
+                == original
+        );
+        let (host_task, events) = start_host();
+        wait_for_available(&events, 0).await;
+        let invitation =
+            lookup_fixed_password(&tls, relay.address, directory_id, *original.as_bytes())
+                .await
+                .unwrap();
+        assert_eq!(invitation.host_verify_key(), host_key);
+        assert!(invitation.is_persistent());
+        let mut previous_stream = 0;
+        for _ in 0..2 {
+            let resolved =
+                lookup_fixed_password(&tls, relay.address, directory_id, *original.as_bytes())
+                    .await
+                    .unwrap();
+            let mut controller = connect_controller(
+                &tls,
+                relay.address,
+                resolved.session_id(),
+                *resolved.relay_authentication(),
+                DeviceIdentity::from_secret_key([165; 16], &[166; 32]),
+                resolved.host_verify_key(),
+            )
+            .await;
+            let stream = next_video_frame(&mut controller).await;
+            assert!(stream > previous_stream);
+            previous_stream = stream;
+            drop(controller);
+            wait_for_available(&events, stream).await;
+        }
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+        host_task.abort();
+        let _ = host_task.await;
+        wait_for_no_participants(&relay).await;
+
+        let replacement = password_store.generate_and_save(&mut OsRng).unwrap();
+        assert!(replacement != original);
+        assert!(
+            WindowsFixedAccessStore::new(&password_path)
+                .load()
+                .unwrap()
+                .unwrap()
+                == replacement
+        );
+        let (host_task, events) = start_host();
+        wait_for_available(&events, 0).await;
+        assert!(matches!(
+            lookup_fixed_password(&tls, relay.address, directory_id, *original.as_bytes()).await,
+            Err(TransportError::DirectoryNotFound),
+        ));
+        let resolved =
+            lookup_fixed_password(&tls, relay.address, directory_id, *replacement.as_bytes())
+                .await
+                .unwrap();
+        let mut controller = connect_controller(
+            &tls,
+            relay.address,
+            resolved.session_id(),
+            *resolved.relay_authentication(),
+            DeviceIdentity::from_secret_key([165; 16], &[166; 32]),
+            resolved.host_verify_key(),
+        )
+        .await;
+        next_video_frame(&mut controller).await;
+        drop(controller);
+        host_task.abort();
+        let _ = host_task.await;
+        wait_for_no_participants(&relay).await;
+
+        assert!(password_store.clear().unwrap());
+        assert!(!password_store.clear().unwrap());
+        assert!(
+            WindowsFixedAccessStore::new(&password_path)
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        let (host_task, events) = start_host();
+        wait_for_available(&events, 0).await;
+        assert!(matches!(
+            lookup_fixed_password(&tls, relay.address, directory_id, *replacement.as_bytes()).await,
+            Err(TransportError::DirectoryNotFound),
+        ));
+        let unknown = QuicClient::connect(tls.client_config(relay.address))
+            .await
+            .unwrap();
+        unknown
+            .join(RelayJoin::controller_with_participant(
+                session_id,
+                authentication,
+                [3; 16],
+            ))
+            .await
+            .unwrap();
+        let denied = tokio::time::timeout(
+            Duration::from_secs(3),
+            ControllerRuntime::connect(
+                unknown,
+                DeviceIdentity::from_secret_key([167; 16], &[168; 32]),
+                host_key,
+            ),
+        )
+        .await
+        .expect("disabled password access did not reject an unknown peer");
+        assert!(matches!(
+            denied,
+            Err(desklink_ffi::ControllerError::AccessDenied(
+                desklink_protocol::AccessDenialReason::ControllerNotTrusted,
+            ))
+        ));
+        wait_for_available(&events, 1).await;
+        // Disabling password discovery does not revoke an already approved peer.
+        let mut controller = connect_controller(
+            &tls,
+            relay.address,
+            invitation.session_id(),
+            *invitation.relay_authentication(),
+            DeviceIdentity::from_secret_key([165; 16], &[166; 32]),
+            invitation.host_verify_key(),
+        )
+        .await;
+        next_video_frame(&mut controller).await;
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+        assert_eq!(trusted.list().unwrap().len(), 1);
+        drop(controller);
+        host_task.abort();
+        let _ = host_task.await;
+        wait_for_no_participants(&relay).await;
+        relay.shutdown().await;
+    }
+
+    async fn wait_for_available(events: &Arc<Mutex<Vec<HostLifecycleEvent>>>, after_stream: u64) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if events.lock().unwrap().iter().any(|event| matches!(
+                    event, HostLifecycleEvent::Available { stream_id } if *stream_id > after_stream
+                )) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host did not publish availability");
+    }
+
+    async fn next_video_frame(controller: &mut ControllerRuntime) -> u64 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match controller.next_event().await.unwrap() {
+                    ControllerEvent::H264AccessUnit(frame) => {
+                        assert!(!frame.data.is_empty());
+                        return frame.stream_id;
+                    }
+                    ControllerEvent::Closed { reason } => {
+                        panic!("local video session closed: {reason}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("local controller did not receive an encoded frame")
+    }
+
+    async fn wait_for_no_participants(relay: &TestRelay) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while relay.relay.capacity_snapshot().attached_participants != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stopped synthetic host or controller retained a relay slot");
+    }
+
+    async fn lookup_fixed_password(
+        tls: &TestTls,
+        address: SocketAddr,
+        device_id: u64,
+        code: [u8; 8],
+    ) -> Result<PairingInvite, TransportError> {
+        let client = QuicClient::connect(tls.client_config(address)).await?;
+        let invitation = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.lookup_directory(RelayDirectoryLookup::new(device_id, code)?),
+        )
+        .await
+        .expect("local directory lookup exceeded its deadline")?;
+        Ok(PairingInvite::decode(&invitation, now_unix_s()).unwrap())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

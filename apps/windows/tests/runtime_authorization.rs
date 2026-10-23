@@ -14,8 +14,8 @@ mod windows {
         window::{PairingApprovalGate, PendingController},
     };
     use desklink_crypto::{
-        DeviceIdentity, NoiseInitiator, NoiseResponder, PairingInvite, PeerIdentity, SecureLane,
-        SecureRole, SecureSession, SessionId,
+        DeviceIdentity, NoiseInitiator, NoiseResponder, PairingCode, PairingInvite, PeerIdentity,
+        SecureLane, SecureRole, SecureSession, SessionId,
     };
     use desklink_protocol::{
         ControlMessage, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, decode_control,
@@ -23,7 +23,8 @@ mod windows {
     };
     use desklink_relay::{RelayConfig, RelayServer};
     use desklink_transport::{
-        JoinRejectCode, QuicClient, QuicClientConfig, RelayJoin, TransportError,
+        JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryLookup,
+        RelayDirectoryRegistration, RelayJoin, TransportError,
     };
     use quinn::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -271,6 +272,109 @@ mod windows {
         assert!(store.list().unwrap().is_empty());
         if directory.exists() {
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn temporary_directory_password_expires_while_host_stays_connected() {
+        let relay = spawn_test_relay().await;
+        let host = QuicClient::connect(config(&relay)).await.unwrap();
+        let identity = DeviceIdentity::from_secret_key([46; 16], &[47; 32]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let invite = PairingInvite::new(&identity, now, 1).unwrap();
+        let encoded = invite.encode().unwrap();
+        let device_id = 734_512_968_273;
+        let code = PairingCode::generate(&mut rand_core::OsRng);
+        let registration = RelayDirectoryRegistration::new(
+            device_id,
+            *code.as_bytes(),
+            encoded.as_bytes().to_vec(),
+            1,
+        )
+        .unwrap();
+        host.join(
+            RelayJoin::host_with_participant(
+                invite.session_id(),
+                *invite.relay_authentication(),
+                [48; 16],
+            )
+            .with_directory_registration(registration)
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let lookup = RelayDirectoryLookup::new(device_id, *code.as_bytes()).unwrap();
+        let before = QuicClient::connect(config(&relay)).await.unwrap();
+        let received = before.lookup_directory(lookup.clone()).await.unwrap();
+        assert!(PairingInvite::decode(&received, now).is_ok());
+        drop(before);
+
+        // The host remains online; only the one-second directory grant expires.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let after = QuicClient::connect(config(&relay)).await.unwrap();
+        assert_eq!(
+            after.lookup_directory(lookup).await,
+            Err(TransportError::DirectoryNotFound)
+        );
+        assert!(matches!(
+            PairingInvite::decode(&received, invite.expires_at_unix_s()),
+            Err(desklink_crypto::PairingError::Expired)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consumed_pairing_invite_returns_an_explicit_denial_before_capture() {
+        for accepted in [false, true] {
+            let (directory, store) = temporary_store("consumed");
+            let host = DeviceIdentity::from_secret_key([40; 16], &[41; 32]);
+            let first_peer = authenticated_peer([42; 16], [43; 32]);
+            let next_controller = DeviceIdentity::from_secret_key([44; 16], &[45; 32]);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let invite = PairingInvite::new(&host, now, 60).unwrap();
+            let session_id = invite.session_id();
+            let authentication = *invite.relay_authentication();
+            let authorizer = Arc::new(WindowsPairingAuthorizer::new(
+                store.clone(),
+                invite,
+                Box::new(FixedApproval(accepted)),
+            ));
+            assert_eq!(
+                authorizer.authorize(first_peer).unwrap(),
+                if accepted {
+                    apps_windows::runtime::ControllerAuthorization::Authorized
+                } else {
+                    apps_windows::runtime::ControllerAuthorization::Rejected
+                },
+            );
+
+            // Reusing a processed one-time invite is a normal denial, not a
+            // backend failure that drops the connection without AccessDenied.
+            assert_eq!(
+                authorization_error(
+                    host,
+                    next_controller,
+                    session_id,
+                    authentication,
+                    authorizer
+                )
+                .await,
+                HostRuntimeError::PairingRejected,
+            );
+            let records = store.list().unwrap();
+            assert_eq!(records.len(), usize::from(accepted));
+            if let Some(record) = records.first() {
+                assert_eq!(record.device_id(), first_peer.device_id());
+                assert_eq!(record.verify_key(), first_peer.verify_key());
+            }
+            if directory.exists() {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
         }
     }
 

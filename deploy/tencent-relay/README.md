@@ -8,9 +8,9 @@
 - TLS 服务器名称：`turn.p2p.yxswy.com`
 - 公网协议：仅 UDP `4433`
 - 容器目录：`/opt/desklink-relay`
-- 证书来源：只读挂载 `/opt/p2p-transmission/deploy/coturn/.local/tls`
+- 证书来源：从 `/etc/letsencrypt/live/p2p.yxswy.com` 同步到独立的 `/opt/desklink-relay/tls`，只读挂载
 
-DeskLink 复用现有 `turn.p2p.yxswy.com` 证书，但使用独立 UDP 端口。不要把 coturn 的 TURN secret、p2p API `.env` 或 SQLite 数据复制进 DeskLink 目录。
+DeskLink 复用覆盖 `turn.p2p.yxswy.com` 的有效证书，但使用独立 UDP 端口。不要把 coturn 的 TURN secret、p2p API `.env` 或 SQLite 数据复制进 DeskLink 目录。证书私钥只在同一云主机内同步，归属容器 UID 65534、权限 0400。
 
 ## 1. 腾讯云和主机防火墙
 
@@ -40,16 +40,19 @@ python scripts/build-linux-relay-image.py
 ```sh
 scp dist/linux/desklink-relay-0.1.0-amd64.tar root@101.35.246.159:/tmp/
 scp deploy/tencent-relay/compose.yml root@101.35.246.159:/tmp/desklink-relay-compose.yml
+scp deploy/tencent-relay/renew-tls.sh root@101.35.246.159:/tmp/desklink-relay-renew-tls.sh
 ```
 
 在服务器上执行：
 
 ```sh
 set -eu
-test -r /opt/p2p-transmission/deploy/coturn/.local/tls/fullchain.pem
-test -r /opt/p2p-transmission/deploy/coturn/.local/tls/privkey.pem
+test -r /etc/letsencrypt/live/p2p.yxswy.com/fullchain.pem
+test -r /etc/letsencrypt/live/p2p.yxswy.com/privkey.pem
 install -d -m 0755 /opt/desklink-relay
 install -m 0644 /tmp/desklink-relay-compose.yml /opt/desklink-relay/compose.yml
+install -m 0755 /tmp/desklink-relay-renew-tls.sh /etc/letsencrypt/renewal-hooks/deploy/desklink-relay-tls
+/etc/letsencrypt/renewal-hooks/deploy/desklink-relay-tls
 docker load -i /tmp/desklink-relay-0.1.0-amd64.tar
 docker compose -f /opt/desklink-relay/compose.yml config --quiet
 docker compose -f /opt/desklink-relay/compose.yml up -d
@@ -67,25 +70,25 @@ cargo run -p desklink-transport --example relay_probe -- \
   101.35.246.159:4433 turn.p2p.yxswy.com
 ```
 
-输出 `中继连接成功` 才表示完整的公网 QUIC/TLS 握手已经通过；仅看到 UDP 端口监听不足以代替这项验证。
+输出 `DeskLink relay TLS/QUIC probe passed` 才表示完整的公网 QUIC/TLS 握手已经通过；仅看到 UDP 端口监听不足以代替这项验证。
 
 ## 4. 两台 Windows 电脑验收
 
-在作为主机的 DeskLink 中进入“本机连接”，填写：
+在作为主机的 DeskLink 中进入“共享此设备”，展开高级设置。托管中继默认使用：
 
 - 中继地址：`101.35.246.159:4433`
 - TLS 服务器名称：`turn.p2p.yxswy.com`
 
-保存后创建连接码。在另一台电脑的“控制另一台”页面粘贴连接码，先点击“先检测网络”，检测通过后再点击“连接并请求批准”。回到主机核对身份并批准，然后验证画面、鼠标、键盘、断网重连和睡眠恢复。
+确认页面显示“本机可被连接”，生成临时密码。在另一台电脑的“连接设备”页面输入设备 ID 和访问密码并连接，回到主机核对身份并批准，然后验证画面、鼠标、键盘、断网重连和睡眠恢复。需要持续访问时可以使用固定密码。
 
 UDP 无法用普通 HTTP 健康检查代替。服务器 `healthy` 只证明进程和证书可读，最终必须以 Windows 客户端完成 QUIC/TLS 握手。
 
 ## 5. 更新、证书续期和回滚
 
-更新只需要加载新镜像并重新执行 `docker compose up -d`。证书文件更新后必须重启 DeskLink 中继，Rustls 才会重新加载证书：
+更新只需要加载新镜像并重新执行 `docker compose up -d`。Certbot deploy hook 会校验证书域名、有效期和公私钥匹配，再同步到独立目录并只重启 DeskLink 中继。手动同步与重载使用：
 
 ```sh
-docker compose -f /opt/desklink-relay/compose.yml restart relay
+/etc/letsencrypt/renewal-hooks/deploy/desklink-relay-tls
 ```
 
 需要立即停用 DeskLink 时，仅停止自己的 Compose 项目：

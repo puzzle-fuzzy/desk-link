@@ -676,8 +676,12 @@ impl ControllerRuntime {
             }
             if packet.header.chunk_index == 0 {
                 match source {
-                    VideoPacketSource::Datagram => self.assembler.clear_pending(),
-                    VideoPacketSource::Reliable => self.reliable_assembler.clear_pending(),
+                    VideoPacketSource::Datagram => self
+                        .assembler
+                        .discard_pending_before(packet.header.stream_id, packet.header.frame_id),
+                    VideoPacketSource::Reliable => self
+                        .reliable_assembler
+                        .discard_pending_before(packet.header.stream_id, packet.header.frame_id),
                 }
             }
         }

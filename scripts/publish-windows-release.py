@@ -13,6 +13,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+SCRIPTS_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPTS_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIRECTORY))
+from windows_update_signing import PUBLIC_KEY, read_public_key, verify_manifest_signature
+
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_PATTERN = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -28,6 +33,10 @@ class ReleasePayload:
     verification: Path
     readiness: Path
     sha256: str
+
+    @property
+    def manifest_signature(self) -> Path:
+        return self.manifest.with_name(self.manifest.name + ".sig")
 
 
 def file_sha256(path: Path) -> str:
@@ -119,6 +128,9 @@ def validate_release_payload(root: Path, tag: str) -> ReleasePayload:
         or scope.get("mobile_release") is not False
     ):
         raise ValueError("Windows release scope includes a non-Windows product")
+    if manifest.get("target") != "x86_64-pc-windows-msvc" or manifest.get("update_mode") != "perUserV1":
+        raise ValueError("Windows release does not support the in-app updater")
+    verify_update_manifest(manifest_path, root / PUBLIC_KEY.relative_to(ROOT))
     return ReleasePayload(
         version=version,
         source_commit=source_commit,
@@ -160,10 +172,22 @@ def verify_authenticode(payload: ReleasePayload) -> None:
     subprocess.run(command, cwd=ROOT, check=True)
 
 
+def verify_update_manifest(manifest: Path, public_key: Path = PUBLIC_KEY) -> None:
+    try:
+        verify_manifest_signature(
+            manifest.read_bytes(),
+            manifest.with_name(manifest.name + ".sig").read_bytes(),
+            read_public_key(public_key),
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError("Windows update manifest signature did not verify") from error
+
+
 def publish(payload: ReleasePayload, *, repository: str, tag: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("GITHUB_REPOSITORY is invalid")
     verify_authenticode(payload)
+    verify_update_manifest(payload.manifest)
     with tempfile.TemporaryDirectory(prefix="desklink-release-") as directory:
         notes_path = Path(directory) / "release-notes.md"
         notes_path.write_text(release_notes(payload), encoding="utf-8")
@@ -174,6 +198,7 @@ def publish(payload: ReleasePayload, *, repository: str, tag: str) -> None:
             tag,
             str(payload.installer),
             str(payload.manifest),
+            str(payload.manifest_signature),
             str(payload.verification),
             str(payload.readiness),
             "--repo",

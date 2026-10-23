@@ -37,6 +37,44 @@ describe("signed diagnostic ingestion", () => {
     store.close();
   });
 
+  test("rolls back a partially written batch so every event can be retried", () => {
+    const fixture = signedFixture({
+      events: [
+        eventFixture({ event: "controller_connected" }),
+        eventFixture({ event: "controller_stopped" }),
+      ],
+    });
+    const verified = verifyBatch(fixture.body, fixture.headers, fixture.now);
+    const store = new DiagnosticStore(":memory:");
+    try {
+      store.database.exec(`
+        CREATE TRIGGER synthetic_event_failure BEFORE INSERT ON events
+        WHEN NEW.event = 'controller_stopped'
+        BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;
+      `);
+      const insert = () => store.insert(
+        verified.batchId,
+        verified.batch,
+        "127.0.0.1",
+        Math.floor(fixture.now / 1_000),
+      );
+
+      expect(insert).toThrow("synthetic write failure");
+      for (const table of ["batches", "events"]) {
+        const row = store.database.query(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
+        expect(row.count).toBe(0);
+      }
+
+      store.database.exec("DROP TRIGGER synthetic_event_failure");
+      expect(insert()).toEqual({ duplicate: false, acceptedEvents: 2 });
+      expect(insert()).toEqual({ duplicate: true, acceptedEvents: 0 });
+      const row = store.database.query("SELECT COUNT(*) AS count FROM events").get() as { count: number };
+      expect(row.count).toBe(2);
+    } finally {
+      store.close();
+    }
+  });
+
   test("rejects tampering, identities that do not match and secret-shaped text", () => {
     const fixture = signedFixture();
     const tampered = Uint8Array.from(fixture.body);

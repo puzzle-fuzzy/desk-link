@@ -346,6 +346,21 @@ async fn check_windows_release() -> Result<updates::WindowsReleaseSource, String
 }
 
 #[tauri::command]
+async fn install_windows_update(
+    manager: State<'_, updates::UpdateManager>,
+    progress: Channel<updates::WindowsUpdateProgress>,
+) -> Result<(), String> {
+    // The installer requests shutdown only after validation and staging succeed.
+    // A failed installer preflight must leave this client usable for retry.
+    manager.install(progress).await
+}
+
+#[tauri::command]
+fn cancel_windows_update(manager: State<'_, updates::UpdateManager>) -> bool {
+    manager.cancel()
+}
+
+#[tauri::command]
 async fn quit_desklink(
     app: AppHandle,
     host_manager: State<'_, HostManager>,
@@ -490,8 +505,9 @@ async fn send_controller_input(
 async fn send_controller_text(
     manager: State<'_, ControllerManager>,
     text: String,
+    stream_id: Option<u64>,
 ) -> Result<(), String> {
-    manager.send_text(text).await
+    manager.send_text(text, stream_id).await
 }
 
 fn local_clipboard_error(result: desklink_protocol::TransferResult) -> String {
@@ -1059,6 +1075,12 @@ fn build_diagnostic_checks(
             "中继连接状态",
             "尚未保存中继配置，暂时无法建立远程连接。",
         ),
+        (true, "available") => diagnostic_check(
+            "DL-NET-201",
+            "passed",
+            "中继连接状态",
+            "中继连接已建立，正在等待远程设备。",
+        ),
         (true, "connected") => diagnostic_check(
             "DL-NET-201",
             "passed",
@@ -1085,7 +1107,9 @@ fn build_diagnostic_checks(
         ),
     };
     let host_check = match runtime.state {
-        "connected" => diagnostic_check("DL-HOST-301", "passed", "主机运行状态", &runtime.detail),
+        "available" | "connected" => {
+            diagnostic_check("DL-HOST-301", "passed", "主机运行状态", &runtime.detail)
+        }
         "stopped" => diagnostic_check("DL-HOST-301", "failed", "主机运行状态", &runtime.detail),
         _ => diagnostic_check("DL-HOST-301", "warning", "主机运行状态", &runtime.detail),
     };
@@ -1609,7 +1633,8 @@ pub fn run() {
         }))
         .manage(HostManager::default())
         .manage(ControllerManager::for_current_user())
-        .manage(AccountManager::for_current_user());
+        .manage(AccountManager::for_current_user())
+        .manage(updates::UpdateManager::default());
     #[cfg(windows)]
     let builder = builder.manage(instance_guard);
     let application = builder
@@ -1663,6 +1688,8 @@ pub fn run() {
             set_diagnostics_sharing,
             upload_diagnostics_now,
             check_windows_release,
+            install_windows_update,
+            cancel_windows_update,
             quit_desklink,
             respond_host_approval,
             restart_host,
@@ -1798,6 +1825,25 @@ mod tests {
     fn fingerprint_validation_rejects_wrong_length_and_non_hex() {
         assert!(normalize_fingerprint("ab").is_err());
         assert!(normalize_fingerprint(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn available_host_waiting_for_a_controller_is_healthy() {
+        let runtime = HostRuntimeSummary {
+            state: "available",
+            title: "可被连接".to_owned(),
+            detail: "正在等待远程设备。".to_owned(),
+            tooltip: "DeskLink".to_owned(),
+        };
+        let connection = ConnectionSummary {
+            relay_address: "127.0.0.1:4433".to_owned(),
+            server_name: "localhost".to_owned(),
+            session_id: "synthetic-session".to_owned(),
+            stream_id: 1,
+            has_saved_key: true,
+        };
+        let checks = build_diagnostic_checks(&runtime, Some(&connection), None, None, None);
+        assert!(checks.iter().all(|check| check.status == "passed"));
     }
 
     #[test]

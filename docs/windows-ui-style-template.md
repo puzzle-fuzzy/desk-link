@@ -1,79 +1,65 @@
-# DeskLink Windows UI 样式模板
+# DeskLink Windows UI 设计约定
 
-这套模板从 RemoteFlow 控制台参考页提取了可复用的视觉规则，服务于“连接设备”这个唯一首要任务。它不是新的组件库，而是围绕现有 HTML 类名的稳定设计约束；共享、批准设备和设置 / 诊断统一进入“更多”菜单，关于和项目链接也保留在同一菜单。
+更新日期：2026-10-21
 
-## 视觉方向
-
-- **基调**：RemoteFlow 系统化极简；近白色工作区、低对比中性灰、清晰的蓝色主动作。
-- **信息层级**：产品标题 → 连接设备 → 设备 ID / 访问密码 → 主按钮 → 已保存连接。
-- **版式**：4px 基线节奏、16px 功能间距、桌面端 32px 外边距；原生 Windows 标题栏下方使用 240px 导航栏、64px 工作区上下文栏，主连接卡片与已保存连接并列，小屏自动单列。
-- **形状**：按钮、输入框、卡片统一使用 8px 圆角；普通卡片不使用阴影，层次通过边框和背景色建立。
-- **字体**：`v-sans, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"`；设备 ID / 密码保留等宽字体以便核对。
-- **交互**：蓝色只代表主动作、当前页或选中项；悬停只改变边界和背景，不移动布局。
-
-## 设计令牌
-
-```css
-:root {
-  --background: #f9f9ff;
-  --surface: #ffffff;
-  --surface-subtle: #f8fafc;
-  --surface-quiet: #f0f3ff;
-  --ink: #111c2d;
-  --ink-secondary: #434655;
-  --ink-muted: #64748b;
-  --border: #e2e8f0;
-  --border-strong: #c3c6d7;
-  --primary: #2563eb;
-  --primary-hover: #1d4ed8;
-  --primary-pressed: #1e40af;
-  --on-primary: #ffffff;
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 8px;
-}
-```
+Windows 界面围绕“连接”和“共享”两个主要任务重新设计。采用清爽浅色桌面工具风格、窄导航和单一绿色或青绿色强调色；保持系统暗色、高对比度与减少动效适配。旧 RemoteFlow 视觉模板不再作为基线，具体色值与尺寸以当前源码为准。
 
 ## 页面骨架
 
 ```html
 <div class="app-shell">
-  <aside class="app-sidebar">DeskLink / 主要功能</aside>
+  <aside class="app-sidebar">连接 / 共享，次要功能在下方</aside>
   <div class="app-main">
-    <header class="workspace-topbar">工作区上下文与更多菜单</header>
+    <header class="workspace-topbar">简短任务标题与必要工具</header>
     <main class="workspace">
-  <section class="controller-stack">
-    <header class="controller-heading">
-      <div>
-        <h1>连接设备</h1>
-        <p>一句话说明用户下一步要做什么。</p>
-      </div>
-    </header>
-    <div class="controller-connect-layout">
-      <section class="controller-card controller-card--primary">输入设备 ID 和访问密码</section>
-      <aside class="saved-devices-panel">已保存连接</aside>
-    </div>
-  </section>
+      <section class="controller-stack">
+        <div class="controller-connect-layout">
+          <section class="controller-card--manual">设备 ID、访问密码、连接</section>
+          <aside class="saved-devices-panel">紧凑的最近连接列表</aside>
+        </div>
+      </section>
     </main>
   </div>
 </div>
 ```
 
-## 组件规则
+骨架用于说明内容关系，不要求逐字复制 DOM；真实类名和页面结构以实现为准。
 
-| 组件 | 规则 |
-| --- | --- |
-| 主按钮 | `#2563eb` 填充、白色文字、8px 圆角、44px 高 |
-| 次按钮 | 白色底、`#c3c6d7` 边框，悬停变浅灰 / 蓝色 |
-| 连接标题 | 30px、600 字重、38px 行高，宽屏不使用过大的展示字 |
-| 输入框 | 1px 边框、8px 圆角、ID/密码使用等宽字体、48px 高；聚焦为 2px 蓝色边框 |
-| 卡片 | 1px `#e2e8f0` 边框、8px 圆角、无阴影 |
-| 错误提示 | 保留原有语义色与可访问性，不用动画推动布局 |
+## 页面与层级
 
-## 交互与无障碍约束
+- 默认连接页：连接表单是主要焦点，最近连接是辅助入口，避免把两者做成同等权重的宣传卡片。
+- 共享页：本机设备 ID 与复制动作直接可见，共享状态、启用和密码操作就近排列；高级中继与会话参数折叠。
+- 导航：连接与共享优先，已批准设备和设置等次要功能降低权重；窄屏可压缩导航，但须保留明确的可访问名称与当前页状态。
+- 文案：标题只出现一次，按钮直接说明动作，空态一句；只在批准、等待、异常和下一步操作需要时增加说明。
 
-- 保留现有 `data-*` 选择器、键盘焦点和 `aria-*` 属性，不为了视觉重构删除功能钩子。
-- 窗口控制交给 Windows 原生标题栏，不在 WebView 中重绘最小化、最大化和关闭按钮。
-- 选中态必须同时有颜色和文字/边线差异，不能只靠颜色传达状态。
-- `prefers-reduced-motion` 和 `forced-colors` 下继续可用。
-- 响应式断点：宽度低于 860px 时两列变单列，低于 640px 时标题和操作垂直排列。
+## 视觉与适配
+
+- 浅色中性背景和实心表面，主要区域通过留白、对齐与轻边界区分；无装饰图案、渐变、发光、玻璃或大阴影。
+- 强调色集中用于主动作与当前导航。警告和错误同时使用文字与语义属性，不把色彩作为唯一信号。
+- 使用系统字体与稳定的字号层级，输入、按钮、列表和开关保持一致；身份值可选中、可复制，安全指纹完整可核对。
+- 暗色模式切换表面和文本 token，保持相同任务结构；高对比模式使用系统色与可见边界，焦点不能只靠阴影。
+- 宽屏保持连接表单与最近连接的并列关系和合理内容宽度，窄屏转单列。页面按内容高度增长，内部弹层单独滚动，不裁切必要操作。
+
+## 必须保留
+
+- Grid / Flex、尺寸、间距、对齐、位置、层级与溢出处理。
+- 标签、原生表单校验、真实 checkbox、禁用状态和键盘焦点，不以装饰元素代替控件语义。
+- 菜单和弹窗的实心背景与清晰层级，以及黑色视频画布、可辨认光标和二维码对比度。
+- `data-*`、ARIA、键盘导航、审批焦点和安全输入边界。
+
+## 修改约束
+
+1. 页面布局在 `styles/layout.css` 修改现有规则；远程媒体、工具栏和全屏几何由它引入的 `styles/remote.css` 维护，不追加一层同义覆盖。
+2. 统一视觉与基础控件放 `styles/base.css`；与视频、覆盖层和系统辅助设置有关的规则放 `styles/interaction.css`。主题从统一 token 派生，不复制多套组件规则。
+3. 全屏隐藏工具栏时同时禁止指针命中；隐藏传输面板和旧操作入口不能被其他 display 规则重新显示。
+4. 表单、最近设备与长文本必须按内容高度布局，不能靠固定行高遮住后续内容。
+5. 重设计保留连接、批准、共享、文件和账号流程，不因视觉精简删除功能或改变授权边界。
+
+## 验证要求
+
+- 检查连接和共享在宽屏、窄屏及 DPI 缩放下是否可用，长设备名、空态、错误与等待状态不遮挡操作。
+- 检查浅色、暗色、高对比度、键盘焦点、审批焦点约束及减少动效。
+- 检查全屏画布、工具栏隐藏、文件传输面板、输入释放与返回页面后的资源重建。
+- 测试约束应保护上述行为与样式职责；不再用“禁止任何主题色”或历史导航宽度约束新设计。源码测试与 build 不能代替实际页面视觉核对，也不能代替 WebView2 和真实双机验收。
+
+当前总约束见 [DESIGN.md](../DESIGN.md)。

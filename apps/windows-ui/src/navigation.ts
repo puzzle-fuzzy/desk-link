@@ -3,13 +3,12 @@ export type DeskLinkView = "controller" | "connection" | "devices" | "pairing" |
 export const DESKTOP_NAV_ITEMS: ReadonlyArray<{ id: DeskLinkView; label: string }> = [
   { id: "controller", label: "连接设备" },
   { id: "connection", label: "共享此设备" },
-  { id: "devices", label: "已批准设备" },
-  { id: "settings", label: "设置 / 诊断" },
+  { id: "settings", label: "设置与诊断" },
 ];
 
 export function navigationViewFor(view: DeskLinkView): DeskLinkView {
-  if (view === "pairing") return "connection";
-  if (view === "fixedAccess" || view === "about") return "settings";
+  if (view === "pairing" || view === "fixedAccess" || view === "devices") return "connection";
+  if (view === "about") return "settings";
   return view;
 }
 

@@ -155,6 +155,51 @@ fn older_frame_cannot_be_presented() {
 }
 
 #[test]
+fn recovery_keyframe_keeps_chunks_received_before_chunk_zero() {
+    let mut assembler = FrameAssembler::new(3, Duration::from_millis(120));
+    assert!(assembler.begin_stream(1));
+    let recovery_packet = |chunk_index| {
+        let mut packet = packet(13, chunk_index, 3);
+        packet.header.flags = FrameFlags::KEYFRAME;
+        packet
+    };
+    assert_eq!(
+        assembler.push(instant(0), packet(12, 0, 2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(1), recovery_packet(2)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(2), recovery_packet(1)),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(2), packet(14, 0, 2)),
+        AssembleResult::Pending
+    );
+
+    // Chunk zero can arrive after the other UDP chunks. Starting recovery
+    // must discard older partial frames without discarding this frame's data.
+    assembler.discard_pending_before(1, 13);
+    let mut expected = frame(13);
+    expected.flags = FrameFlags::KEYFRAME;
+    expected.data = vec![13; 3];
+    assert_eq!(
+        assembler.push(instant(3), recovery_packet(0)),
+        AssembleResult::Complete(expected),
+    );
+    assert_eq!(assembler.take_dropped_chunks(), 1);
+    let mut future = frame(14);
+    future.data = vec![14; 2];
+    assert_eq!(
+        assembler.push(instant(4), packet(14, 1, 2)),
+        AssembleResult::Complete(future),
+    );
+}
+
+#[test]
 fn duplicate_chunk_and_mismatched_metadata_are_dropped() {
     let mut assembler = FrameAssembler::new(3, Duration::from_millis(120));
     assert_eq!(
