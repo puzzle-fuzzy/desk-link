@@ -333,10 +333,12 @@ pub enum SecureLane {
     Transfer = 5,
     AudioDatagram = 6,
     VideoReliable = 7,
+    /// Slow authenticated path probes have independent replay/order state.
+    DirectProbe = 8,
 }
 
 impl SecureLane {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Control,
@@ -347,6 +349,7 @@ impl SecureLane {
         Self::Transfer,
         Self::AudioDatagram,
         Self::VideoReliable,
+        Self::DirectProbe,
     ];
 
     const fn index(self) -> usize {
