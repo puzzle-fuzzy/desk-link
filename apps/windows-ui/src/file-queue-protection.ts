@@ -1,7 +1,7 @@
-export type FileQueueRecoveryState = "empty" | "protected" | "memoryOnly";
+export type FileQueueRecoveryState = "empty" | "protecting" | "protected" | "memoryOnly";
 
 export interface FileQueueProtectionPresentation {
-  tone: "protected" | "warning";
+  tone: "protecting" | "protected" | "warning";
   message: string;
   retryLabel: string | null;
   retryDisabled: boolean;
@@ -13,6 +13,14 @@ export function fileQueueProtectionPresentation(
   retryBusy: boolean,
 ): FileQueueProtectionPresentation | null {
   if (state === "empty") return null;
+  if (state === "protecting") {
+    return {
+      tone: "protecting",
+      message: recoveryMessage?.trim() || "正在加密保存等待队列；保存完成后可在重启后恢复。",
+      retryLabel: null,
+      retryDisabled: true,
+    };
+  }
   if (state === "protected") {
     return {
       tone: "protected",
