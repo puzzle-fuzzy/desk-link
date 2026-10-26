@@ -16,7 +16,7 @@ use crate::storage::{downloads_path, local_app_data_path};
 
 use thiserror::Error;
 
-use crate::runtime::HostLifecycleEvent;
+use crate::runtime::{HostLifecycleEvent, HostMediaDiagnostic};
 
 const DEFAULT_MAX_BYTES: u64 = 512 * 1024;
 const DEFAULT_RETAINED_FILES: usize = 3;
@@ -136,6 +136,7 @@ pub enum DiagnosticEvent {
     },
     PowerResumeDetected,
     Lifecycle(HostLifecycleEvent),
+    HostMedia(HostMediaDiagnostic),
     OperationSucceeded(DiagnosticOperation),
     OperationFailed {
         operation: DiagnosticOperation,
@@ -394,6 +395,24 @@ fn encode_event(event: &DiagnosticEvent) -> String {
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Stopped { reason }) => format!(
             "\"level\":\"error\",\"event\":\"host_stopped\",\"reason\":{}",
             json_string(&bounded_redacted_text(reason))
+        ),
+        DiagnosticEvent::HostMedia(HostMediaDiagnostic::CursorSend {
+            stream_id,
+            send_attempts,
+            send_errors,
+            disabled,
+            reason,
+        }) => format!(
+            "\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":{stream_id},\"send_attempts\":{send_attempts},\"send_errors\":{send_errors},\"disabled\":{disabled},\"reason\":\"{}\"",
+            reason.as_str()
+        ),
+        DiagnosticEvent::HostMedia(HostMediaDiagnostic::DirectListenerStopped {
+            stream_id,
+            retired_active,
+            reason,
+        }) => format!(
+            "\"level\":\"warning\",\"event\":\"host_direct_listener_stopped\",\"stream_id\":{stream_id},\"retired_active\":{retired_active},\"reason\":\"{}\"",
+            reason.as_str()
         ),
         DiagnosticEvent::OperationSucceeded(operation) => format!(
             "\"level\":\"info\",\"event\":{}",
@@ -693,6 +712,44 @@ mod tests {
     use super::*;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn host_listener_terminal_diagnostic_has_only_fixed_reason_and_retirement_state() {
+        let encoded = encode_event(&DiagnosticEvent::HostMedia(
+            HostMediaDiagnostic::DirectListenerStopped {
+                stream_id: 7,
+                retired_active: true,
+                reason: crate::runtime::DirectListenerStopReason::ListenerClosed,
+            },
+        ));
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["event"], "host_direct_listener_stopped");
+        assert_eq!(value["reason"], "listener_closed");
+        assert_eq!(value["retired_active"], true);
+        assert!(value.get("endpoint").is_none());
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn host_cursor_diagnostic_keeps_operation_counters_and_fixed_reason() {
+        let encoded = encode_event(&DiagnosticEvent::HostMedia(
+            HostMediaDiagnostic::CursorSend {
+                stream_id: 7,
+                send_attempts: 2,
+                send_errors: 1,
+                disabled: true,
+                reason: crate::runtime::CursorDisableReason::CapabilityOrSize,
+            },
+        ));
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["event"], "host_cursor_send");
+        assert_eq!(value["reason"], "capability_or_size");
+        assert_eq!(value["send_attempts"], 2);
+        assert_eq!(value["send_errors"], 1);
+        assert_eq!(value["disabled"], true);
+        assert!(value.get("total_drops").is_none());
+        assert!(value.get("delivery_rate").is_none());
+    }
 
     fn temporary_log_path(name: &str) -> PathBuf {
         env::temp_dir()

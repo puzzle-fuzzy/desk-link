@@ -2,7 +2,7 @@ use desklink_protocol::{
     FrameFlags, MAX_VIDEO_CHUNKS, MAX_VIDEO_PACKET_PAYLOAD_BYTES, PROTOCOL_VERSION, ProtocolError,
     VideoFrameHeader, VideoPacket, encode_video_packet_parts,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,12 +179,14 @@ impl FrameAssembler {
             ) {
                 return AssembleResult::Dropped(DropReason::MetadataMismatch);
             }
-            if !partial
-                .chunks
-                .insert(h.chunk_index, packet.payload)
-                .is_none()
-            {
-                return AssembleResult::Dropped(DropReason::DuplicateChunk);
+            match partial.chunks.entry(h.chunk_index) {
+                Entry::Occupied(_) => {
+                    self.dropped_chunks = self.dropped_chunks.saturating_add(1);
+                    return AssembleResult::Dropped(DropReason::DuplicateChunk);
+                }
+                Entry::Vacant(chunk) => {
+                    chunk.insert(packet.payload);
+                }
             }
             return Self::finish_if_ready(&mut self.frames, key);
         }

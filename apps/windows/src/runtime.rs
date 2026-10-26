@@ -1,27 +1,43 @@
+mod cursor_send;
+mod media_diagnostics;
+pub use cursor_send::CursorDisableReason;
+pub use media_diagnostics::{
+    DirectListenerStopReason, HostMediaDiagnostic, HostMediaDiagnosticsObserver,
+    rejected_host_media_diagnostics,
+};
+mod adaptive_bitrate;
+#[cfg(test)]
+mod direct_arbitration_tests;
+mod direct_path_slot;
+use adaptive_bitrate::AdaptiveBitrate;
+mod configuration_queue;
+use configuration_queue::{
+    ConfigurationAction, ConfigurationKind, ConfigurationOperation, ConfigurationQueue,
+};
+
 use std::{
-    fs::File,
-    io::Read,
+    collections::VecDeque,
+    num::{NonZeroU32, NonZeroU64},
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use blake2::{Blake2s256, Digest};
 use desklink_crypto::{
     CryptoError, DeviceIdentity, NoiseResponder, PeerIdentity, SecureLane, SecureRole,
     SecureSession,
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, Codec, ControlMessage, CursorUpdate,
-    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, InputRestrictionReason,
-    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_TRANSFER_CHUNK_BYTES, NoiseHandshake,
+    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputContext, InputEnvelope,
+    InputEvent, InputRestrictionReason, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake,
     NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId,
     TransferMessage, TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset,
-    decode_control, decode_noise_handshake, decode_session_input, decode_transfer,
-    encode_audio_packet, encode_control, encode_cursor_update, encode_noise_handshake,
-    encode_transfer, encode_video_config, encode_video_reliable_batch,
+    VideoReliableBatchBuilder, decode_control, decode_noise_handshake, decode_session_input,
+    decode_transfer, encode_audio_packet, encode_control, encode_cursor_update,
+    encode_noise_handshake, encode_transfer, encode_video_config,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -42,21 +58,23 @@ use crate::{
         run_loopback_capture,
     },
     capture::{
-        CaptureError, CapturedFrame, DesktopCapturer, DxgiDesktopCapturer, available_displays,
-        display_topology,
+        CaptureError, CapturedFrame, DesktopCapturer, DisplayDescriptor, DisplayTopologySnapshot,
+        DxgiDesktopCapturer, available_displays, display_topology,
     },
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
     input_restriction::{InputRestrictionTracker, forward_latest_input_state},
     transfer::{
-        IncomingFileWorker, OutgoingFile, chunk_after_resume, confirm_file_offer,
+        IncomingFileWorker, OutgoingFile, OutgoingFileReader, confirm_file_offer,
         notify_file_received, pick_outgoing_file, prepare_outgoing_file, read_clipboard_text,
-        verify_resume_prefix, write_clipboard_text,
+        write_clipboard_text,
     },
     window::ApprovalState,
 };
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
+const DISPLAY_TOPOLOGY_INTERVAL: Duration = Duration::from_secs(1);
+const STATIC_KEYFRAME_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_ENCODED_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const CURSOR_INTERVAL: Duration = Duration::from_millis(16);
@@ -257,6 +275,23 @@ impl AdaptiveVideoQuality {
     }
 }
 
+fn bitrate_feedback_decision(
+    preference: VideoQualityPreference,
+    policy: &mut AdaptiveBitrate,
+    received: u32,
+    dropped: u32,
+    decode_queue: u16,
+    freshness: u16,
+) -> (Option<u32>, bool) {
+    if preference != VideoQualityPreference::Automatic {
+        return (None, false);
+    }
+    let requested = policy.observe(received, dropped, decode_queue, freshness);
+    let handled = policy.can_handle_network_pressure(received, dropped, decode_queue, freshness)
+        || policy.should_recover_rate_first(received, dropped, decode_queue, freshness);
+    (requested, handled)
+}
+
 fn manual_video_quality(preference: VideoQualityPreference) -> Option<VideoQualityPreset> {
     match preference {
         VideoQualityPreference::Automatic => None,
@@ -358,6 +393,12 @@ pub enum HostRuntimeError {
     Encoder(EncoderError),
     #[error("input injection error: {0:?}")]
     Input(InputInjectionError),
+    #[error("the process input epoch allocator is exhausted")]
+    InputEpochExhausted,
+    #[error("secure randomness for the process input epoch is unavailable")]
+    InputEpochRandomUnavailable,
+    #[error("secure randomness produced an invalid zero input epoch")]
+    InputEpochZeroSeed,
     #[error("controller capabilities are invalid or incompatible")]
     InvalidControllerCapabilities,
     #[error("controller capability negotiation timed out")]
@@ -451,6 +492,7 @@ pub struct HostSupervisor {
     directory_registration: Option<RelayDirectoryRegistration>,
     observer: Option<Arc<dyn HostLifecycleObserver>>,
     session_control: HostSessionControl,
+    media_observer: Option<HostMediaDiagnosticsObserver>,
 }
 
 impl HostSupervisor {
@@ -480,6 +522,7 @@ impl HostSupervisor {
             directory_registration: None,
             observer: None,
             session_control: HostSessionControl::default(),
+            media_observer: None,
         })
     }
 
@@ -494,6 +537,15 @@ impl HostSupervisor {
 
     pub fn with_observer(mut self, observer: Arc<dyn HostLifecycleObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Delivery is queued to one bounded worker, never inline on media/input.
+    pub fn with_media_diagnostics_observer(
+        mut self,
+        observer: HostMediaDiagnosticsObserver,
+    ) -> Self {
+        self.media_observer = Some(observer);
         self
     }
 
@@ -619,17 +671,19 @@ impl HostSupervisor {
         loop {
             let identity =
                 DeviceIdentity::from_secret_key(self.host_device_id, &self.host_secret_key);
-            let outcome = HostRuntime::with_shared_authorizer(
+            let mut runtime = HostRuntime::with_shared_authorizer(
                 client.clone(),
                 *stream_id,
                 identity,
                 self.authorizer.clone(),
             )?
-            .with_session_control(self.session_control.clone())
-            .run_tracking_stability(stable, |stream_id| {
-                self.publish(HostLifecycleEvent::Connected { stream_id });
-            })
-            .await;
+            .with_session_control(self.session_control.clone());
+            runtime.media_observer = self.media_observer.clone();
+            let outcome = runtime
+                .run_tracking_stability(stable, |stream_id| {
+                    self.publish(HostLifecycleEvent::Connected { stream_id });
+                })
+                .await;
             match outcome {
                 Err(error)
                     if self.expires_at_unix_s.is_none()
@@ -684,6 +738,9 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         HostRuntimeError::ApprovalRequired
         | HostRuntimeError::PairingRejected
         | HostRuntimeError::PairingExpired
+        | HostRuntimeError::InputEpochExhausted
+        | HostRuntimeError::InputEpochRandomUnavailable
+        | HostRuntimeError::InputEpochZeroSeed
         | HostRuntimeError::AuthorizationBackend(_)
         | HostRuntimeError::LocalControlEnded
         | HostRuntimeError::LocalControlEndUnconfirmed => false,
@@ -789,7 +846,7 @@ impl ControllerAuthorizer for PinnedControllerAuthorizer {
 
 pub struct HostVideoPipeline {
     stream_id: u64,
-    sent_config: Option<(u32, u16, u16)>,
+    sent_config: Option<(u32, u16, u16, u64)>,
 }
 
 impl HostVideoPipeline {
@@ -805,7 +862,13 @@ impl HostVideoPipeline {
         frame: EncodedFrame,
         width: u32,
         height: u32,
+        input_epoch: u64,
     ) -> Result<PrepareVideo, HostRuntimeError> {
+        InputContext {
+            stream_id: self.stream_id,
+            input_epoch,
+        }
+        .validate()?;
         let width = u16::try_from(width).map_err(|_| HostRuntimeError::InvalidDimensions)?;
         let height = u16::try_from(height).map_err(|_| HostRuntimeError::InvalidDimensions)?;
         if width == 0 || height == 0 {
@@ -813,16 +876,19 @@ impl HostVideoPipeline {
         }
         if self
             .sent_config
-            .is_some_and(|(version, sent_width, sent_height)| {
-                version == frame.config_version && (sent_width, sent_height) != (width, height)
+            .is_some_and(|(version, sent_width, sent_height, sent_epoch)| {
+                frame.config_version < version
+                    || (version == frame.config_version
+                        && ((sent_width, sent_height) != (width, height)
+                            || sent_epoch != input_epoch))
             })
         {
             return Err(HostRuntimeError::InconsistentVideoConfig);
         }
 
-        let needs_config = self
-            .sent_config
-            .is_none_or(|(version, _, _)| version != frame.config_version);
+        let needs_config = self.sent_config.is_none_or(|(version, _, _, sent_epoch)| {
+            version != frame.config_version || sent_epoch != input_epoch
+        });
         if needs_config && (!frame.keyframe || frame.sequence_header.is_none()) {
             return Ok(PrepareVideo::NeedKeyframe);
         }
@@ -830,7 +896,7 @@ impl HostVideoPipeline {
             Some(encode_video_config(&VideoConfig {
                 protocol_version: PROTOCOL_VERSION,
                 stream_id: self.stream_id,
-                input_epoch: 0,
+                input_epoch,
                 config_version: frame.config_version,
                 codec: desklink_protocol::Codec::H264,
                 width,
@@ -860,7 +926,7 @@ impl HostVideoPipeline {
         };
         let datagrams = encode_video_frame(&wire_frame)?;
         if needs_config {
-            self.sent_config = Some((frame.config_version, width, height));
+            self.sent_config = Some((frame.config_version, width, height, input_epoch));
         }
         Ok(PrepareVideo::Ready(PreparedVideo {
             video_config,
@@ -904,8 +970,35 @@ impl HostInboundPolicy {
         now_us: u64,
     ) -> Result<Option<InputEvent>, HostRuntimeError> {
         let envelope = decode_session_input(bytes)?;
+        let context = envelope.context();
+        Ok(self
+            .admit_input_envelope(envelope, now_us, context)
+            .map(|envelope| envelope.event))
+    }
+
+    /// Keep the admitted wire identity intact until the selected-desktop lock
+    /// validates and injects it. Rejected identities cannot advance ordering.
+    pub fn decode_input_envelope(
+        &mut self,
+        bytes: &[u8],
+        now_us: u64,
+        expected_context: InputContext,
+    ) -> Result<Option<InputEnvelope>, HostRuntimeError> {
+        expected_context.validate()?;
+        Ok(self.admit_input_envelope(decode_session_input(bytes)?, now_us, expected_context))
+    }
+
+    fn admit_input_envelope(
+        &mut self,
+        envelope: InputEnvelope,
+        now_us: u64,
+        expected_context: InputContext,
+    ) -> Option<InputEnvelope> {
+        if envelope.stream_id != self.stream_id || envelope.context() != expected_context {
+            return None;
+        }
         if !sequence_is_newer(envelope.sequence, self.last_input_sequence) {
-            return Ok(None);
+            return None;
         }
         if !self.input_timestamp_is_fresh(envelope.timestamp_us, now_us) {
             // A Windows time synchronization, resume from sleep, or manual clock
@@ -918,7 +1011,7 @@ impl HostInboundPolicy {
             });
         }
         self.last_input_sequence = envelope.sequence;
-        Ok(Some(envelope.event))
+        Some(envelope)
     }
 
     fn input_timestamp_is_fresh(&mut self, remote_us: u64, local_us: u64) -> bool {
@@ -989,6 +1082,53 @@ struct EncodedDesktopFrame {
     frame: EncodedFrame,
     width: u32,
     height: u32,
+    input_epoch: u64,
+}
+
+#[derive(Default)]
+struct FrameInputContexts {
+    configuration: Option<(u32, InputContext)>,
+    pending: VecDeque<(u64, u32, InputContext)>,
+}
+
+impl FrameInputContexts {
+    // Independent of the native encoder's smaller pending-input budget. Never
+    // let a stalled backend accumulate input authorization metadata unboundedly.
+    const CAPACITY: usize = 32;
+
+    fn record_submission(
+        &mut self,
+        sample: crate::encoder::EncoderPerformanceSample,
+        context: InputContext,
+    ) -> bool {
+        if !context.is_valid() || sample.frame_id == 0 || sample.config_version == 0 {
+            return false;
+        }
+        let configuration = (sample.config_version, context);
+        if self.configuration != Some(configuration) {
+            self.pending.clear();
+            self.configuration = Some(configuration);
+        }
+        if self.pending.len() == Self::CAPACITY
+            || self
+                .pending
+                .iter()
+                .any(|(id, version, _)| *id == sample.frame_id && *version == sample.config_version)
+        {
+            self.pending.clear();
+            return false;
+        }
+        self.pending
+            .push_back((sample.frame_id, sample.config_version, context));
+        true
+    }
+
+    fn take_output(&mut self, frame: &EncodedFrame) -> Option<InputContext> {
+        let index = self.pending.iter().position(|(id, version, _)| {
+            *id == frame.frame_id && *version == frame.config_version
+        })?;
+        self.pending.remove(index).map(|(_, _, context)| context)
+    }
 }
 
 pub struct HostRuntime {
@@ -997,6 +1137,7 @@ pub struct HostRuntime {
     identity: DeviceIdentity,
     authorizer: Arc<dyn ControllerAuthorizer>,
     session_control: HostSessionControl,
+    media_observer: Option<HostMediaDiagnosticsObserver>,
 }
 
 impl HostRuntime {
@@ -1041,17 +1182,27 @@ impl HostRuntime {
         if stream_id == 0 {
             return Err(HostRuntimeError::InvalidControllerCapabilities);
         }
+        media_diagnostics::initialize();
         Ok(Self {
             client,
             stream_id,
             identity,
             authorizer,
             session_control: HostSessionControl::default(),
+            media_observer: None,
         })
     }
 
     fn with_session_control(mut self, control: HostSessionControl) -> Self {
         self.session_control = control;
+        self
+    }
+
+    pub fn with_media_diagnostics_observer(
+        mut self,
+        observer: HostMediaDiagnosticsObserver,
+    ) -> Self {
+        self.media_observer = Some(observer);
         self
     }
 
@@ -1071,6 +1222,7 @@ impl HostRuntime {
             identity,
             authorizer,
             session_control,
+            media_observer,
         } = self;
         let (secure, peer_generation) =
             perform_noise_handshake(&client, identity, authorizer.as_ref()).await?;
@@ -1108,10 +1260,13 @@ impl HostRuntime {
         let (start_sender, start_receiver) = std::sync::mpsc::sync_channel(0);
         let (capture_command_sender, capture_command_receiver) =
             std::sync::mpsc::sync_channel(CAPTURE_COMMAND_QUEUE_CAPACITY);
-        let selected_desktop = Arc::new(Mutex::new(SelectedDesktop {
-            display_id: 0,
-            desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
-        }));
+        let selected_desktop = Arc::new(Mutex::new(SelectedDesktop::unconfigured(stream_id)?));
+        let input = Arc::new(Mutex::new(InputInjector::new(VirtualDesktop::single(
+            DesktopRect::new(0, 0, 1, 1),
+        ))));
+        let input_suspended = Arc::new(AtomicBool::new(false));
+        let input_epochs = process_input_epochs()?;
+        let (topology_updates, mut topology_receiver) = watch::channel(0_u64);
         let capture_context = CaptureWorkerContext {
             commands: capture_command_receiver,
             queue: video_queue.clone(),
@@ -1119,6 +1274,10 @@ impl HostRuntime {
             force_keyframe: force_keyframe.clone(),
             shutdown: shutdown.clone(),
             selected_desktop: selected_desktop.clone(),
+            input: input.clone(),
+            input_epochs,
+            input_suspended: input_suspended.clone(),
+            topology_updates,
             profile: negotiated_profile,
         };
         let capture_thread = std::thread::Builder::new()
@@ -1173,6 +1332,8 @@ impl HostRuntime {
                 )
                 .await?;
         }
+        // Initial capabilities already contained this generation's display list.
+        topology_receiver.borrow_and_update();
         capture_worker.start()?;
         let audio_queue = Arc::new(Mutex::new(AudioFrameQueue::new(AUDIO_QUEUE_CAPACITY)));
         let audio_notify = Arc::new(Notify::new());
@@ -1209,7 +1370,6 @@ impl HostRuntime {
                 None
             }
         };
-        let input = InputInjector::new(VirtualDesktop::new(ready.desktop, ready.coordinate_space));
         stable.store(true, Ordering::Release);
         let active_session = session_control.activate(stream_id);
         on_connected(stream_id);
@@ -1236,19 +1396,22 @@ impl HostRuntime {
             secure.clone(),
             peer_generation,
             stream_id,
-            input,
+            input.clone(),
             force_keyframe,
             HostInboundContext {
                 input_state_updates,
                 capture_commands: capture_command_sender,
                 selected_desktop: selected_desktop.clone(),
-                displays: Arc::new(ready.displays),
+                input,
+                input_suspended,
+                topology_updates: topology_receiver,
                 audio_enabled: audio_enabled.clone(),
                 audio_enabled_updates,
                 audio_queue: audio_queue.clone(),
                 audio_notify: audio_notify.clone(),
                 direct_session: direct_session.clone(),
                 direct_connection: direct_connection.clone(),
+                media_observer: media_observer.clone(),
             },
         ));
         let mut cursor = Box::pin(send_cursor_loop(
@@ -1257,6 +1420,7 @@ impl HostRuntime {
             peer_generation,
             stream_id,
             selected_desktop,
+            media_observer,
         ));
         let mut transfer = Box::pin(receive_transfer_loop(
             client.clone(),
@@ -1429,8 +1593,6 @@ impl Drop for AudioWorkerGuard {
 
 #[derive(Clone)]
 struct CaptureWorkerReady {
-    desktop: DesktopRect,
-    coordinate_space: DesktopRect,
     width: u32,
     height: u32,
     displays: Vec<RemoteDisplay>,
@@ -1438,10 +1600,117 @@ struct CaptureWorkerReady {
     profile: H264Profile,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SelectedDesktop {
+    stream_id: NonZeroU64,
+    input_epoch: Option<NonZeroU64>,
+    input_config_anchor: Option<NonZeroU32>,
     display_id: u32,
     desktop: VirtualDesktop,
+    topology: Option<DisplayTopologySnapshot>,
+    selection_pending: bool,
+    input_invalidated: bool,
+    input_closed: bool,
+}
+
+struct InputEpochAllocator(AtomicU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputEpochSeedError {
+    RandomUnavailable,
+    Zero,
+}
+
+impl InputEpochAllocator {
+    #[cfg(test)]
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    fn from_seed(first: u64) -> Result<Self, InputEpochSeedError> {
+        let before_first = first.checked_sub(1).ok_or(InputEpochSeedError::Zero)?;
+        Ok(Self(AtomicU64::new(before_first)))
+    }
+
+    fn from_rng(random: &mut impl RngCore) -> Result<Self, InputEpochSeedError> {
+        let mut bytes = [0_u8; 8];
+        random
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| InputEpochSeedError::RandomUnavailable)?;
+        Self::from_seed(u64::from_be_bytes(bytes))
+    }
+
+    fn allocate(&self) -> Result<NonZeroU64, HostRuntimeError> {
+        let previous = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| HostRuntimeError::InputEpochExhausted)?;
+        NonZeroU64::new(previous + 1).ok_or(HostRuntimeError::InputEpochExhausted)
+    }
+}
+
+static INPUT_EPOCHS: OnceLock<Result<InputEpochAllocator, InputEpochSeedError>> = OnceLock::new();
+
+fn process_input_epochs() -> Result<&'static InputEpochAllocator, HostRuntimeError> {
+    // Stream IDs persist across restarts, and old plaintext can be encrypted
+    // again by a new transport. Draw one full-width nonzero process seed, then
+    // issue checked monotonic epochs from it. Restart separation is random,
+    // not a persistence guarantee. Zero/RNG failure and exhaustion fail closed;
+    // never mask, clamp, wrap, redraw, or fall back to a fixed active epoch.
+    match INPUT_EPOCHS.get_or_init(|| InputEpochAllocator::from_rng(&mut OsRng)) {
+        Ok(epochs) => Ok(epochs),
+        Err(InputEpochSeedError::RandomUnavailable) => {
+            Err(HostRuntimeError::InputEpochRandomUnavailable)
+        }
+        Err(InputEpochSeedError::Zero) => Err(HostRuntimeError::InputEpochZeroSeed),
+    }
+}
+
+impl SelectedDesktop {
+    fn unconfigured(stream_id: u64) -> Result<Self, HostRuntimeError> {
+        Ok(Self {
+            stream_id: NonZeroU64::new(stream_id).ok_or(ProtocolError::InvalidInput)?,
+            input_epoch: None,
+            input_config_anchor: None,
+            display_id: 0,
+            desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
+            topology: None,
+            selection_pending: false,
+            input_invalidated: true,
+            input_closed: false,
+        })
+    }
+
+    fn from_snapshot(
+        topology: DisplayTopologySnapshot,
+        stream_id: NonZeroU64,
+        input_epoch: NonZeroU64,
+        input_config_anchor: NonZeroU32,
+    ) -> Self {
+        Self {
+            stream_id,
+            input_epoch: Some(input_epoch),
+            input_config_anchor: Some(input_config_anchor),
+            display_id: topology.active_display_id(),
+            desktop: VirtualDesktop::new(
+                topology.active_display().rect,
+                topology.virtual_desktop(),
+            ),
+            topology: Some(topology),
+            selection_pending: false,
+            input_invalidated: false,
+            input_closed: false,
+        }
+    }
+
+    fn input_context(&self) -> Option<InputContext> {
+        self.input_epoch.map(|input_epoch| InputContext {
+            stream_id: self.stream_id.get(),
+            input_epoch: input_epoch.get(),
+        })
+    }
 }
 
 enum CaptureWorkerCommand {
@@ -1451,11 +1720,15 @@ enum CaptureWorkerCommand {
     },
     SetVideoQuality {
         preset: VideoQualityPreset,
-        reply: oneshot::Sender<VideoQualityPreset>,
+        reply: oneshot::Sender<(VideoQualityPreset, u32)>,
     },
     SetVideoProfile {
         profile: H264Profile,
-        reply: oneshot::Sender<H264Profile>,
+        reply: oneshot::Sender<(H264Profile, u32)>,
+    },
+    SetVideoBitrate {
+        bitrate: u32,
+        reply: oneshot::Sender<Option<u32>>,
     },
 }
 
@@ -1466,6 +1739,10 @@ struct CaptureWorkerContext {
     force_keyframe: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    input: Arc<Mutex<InputInjector>>,
+    input_epochs: &'static InputEpochAllocator,
+    input_suspended: Arc<AtomicBool>,
+    topology_updates: watch::Sender<u64>,
     profile: H264Profile,
 }
 
@@ -1473,13 +1750,170 @@ struct HostInboundContext {
     input_state_updates: watch::Sender<Option<InputRestrictionReason>>,
     capture_commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
-    displays: Arc<Vec<RemoteDisplay>>,
+    input: Arc<Mutex<InputInjector>>,
+    input_suspended: Arc<AtomicBool>,
+    topology_updates: watch::Receiver<u64>,
     audio_enabled: Arc<AtomicBool>,
     audio_enabled_updates: watch::Sender<bool>,
     audio_queue: Arc<Mutex<AudioFrameQueue>>,
     audio_notify: Arc<Notify>,
     direct_session: Option<Arc<DirectLanSession>>,
     direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    media_observer: Option<HostMediaDiagnosticsObserver>,
+}
+
+struct CaptureDesktopCoordinator<
+    'a,
+    B: crate::input::InputBackend = crate::input::NativeInputBackend,
+> {
+    selected: &'a Mutex<SelectedDesktop>,
+    input: &'a Mutex<InputInjector<B>>,
+    epochs: &'a InputEpochAllocator,
+    input_suspended: &'a AtomicBool,
+    updates: &'a watch::Sender<u64>,
+}
+
+impl<B: crate::input::InputBackend> CaptureDesktopCoordinator<'_, B> {
+    fn current(&self) -> Result<DisplayTopologySnapshot, HostRuntimeError> {
+        lock_unpoisoned(self.selected)
+            .topology
+            .clone()
+            .ok_or(HostRuntimeError::CaptureWorkerStopped)
+    }
+
+    fn suspend(&self) -> bool {
+        let mut selected = lock_unpoisoned(self.selected);
+        self.input_suspended.store(true, Ordering::Release);
+        selected.input_invalidated = true;
+        lock_unpoisoned(self.input).release_all().is_ok()
+    }
+
+    fn publish(
+        &self,
+        topology: DisplayTopologySnapshot,
+        encoder_config_version: u32,
+    ) -> Result<bool, HostRuntimeError> {
+        let generation = topology.generation();
+        let mut selected = lock_unpoisoned(self.selected);
+        if selected.input_closed {
+            return Ok(false);
+        }
+        let selection_pending = selected.selection_pending;
+        let boundary = selected.input_invalidated
+            || selected
+                .topology
+                .as_ref()
+                .is_none_or(|previous| topology.requires_capture_reconfigure(previous));
+        let encoder_config_version = NonZeroU32::new(encoder_config_version)
+            .ok_or(HostRuntimeError::InconsistentVideoConfig)?;
+        let previous_anchor = selected.input_config_anchor;
+        if let Some(anchor) = previous_anchor
+            && (encoder_config_version < anchor || (boundary && encoder_config_version <= anchor))
+        {
+            return Err(HostRuntimeError::InconsistentVideoConfig);
+        }
+        let mut input = lock_unpoisoned(self.input);
+        let input_epoch = if boundary {
+            self.input_suspended.store(true, Ordering::Release);
+            selected.input_invalidated = true;
+            if input.release_all().is_err() {
+                return Ok(false);
+            }
+            self.epochs.allocate()?
+        } else {
+            selected
+                .input_epoch
+                .ok_or(HostRuntimeError::CaptureWorkerStopped)?
+        };
+        let stream_id = selected.stream_id;
+        let input_config_anchor = if boundary {
+            encoder_config_version
+        } else {
+            previous_anchor.ok_or(HostRuntimeError::InconsistentVideoConfig)?
+        };
+        input.set_desktop(VirtualDesktop::new(
+            topology.active_display().rect,
+            topology.virtual_desktop(),
+        ));
+        *selected =
+            SelectedDesktop::from_snapshot(topology, stream_id, input_epoch, input_config_anchor);
+        selected.selection_pending = selection_pending;
+        self.input_suspended.store(false, Ordering::Release);
+        self.updates.send_replace(generation);
+        Ok(true)
+    }
+}
+
+fn refreshed_display_topology(
+    current: &DisplayTopologySnapshot,
+) -> Result<Option<DisplayTopologySnapshot>, HostRuntimeError> {
+    let displays = available_displays().map_err(HostRuntimeError::Capture)?;
+    remote_displays(&displays)?;
+    let bounds = display_topology()
+        .map_err(HostRuntimeError::Capture)?
+        .virtual_desktop;
+    current
+        .refreshed(displays, bounds)
+        .map_err(HostRuntimeError::Capture)
+}
+
+fn prepare_capture_topology(
+    capture: &mut DxgiDesktopCapturer,
+    encoder: &mut H264Encoder,
+    topology: &DisplayTopologySnapshot,
+    settings: H264EncoderSettings,
+    retain_recovered_capture: bool,
+) -> Result<(), HostRuntimeError> {
+    let next_capture = if retain_recovered_capture
+        && capture.display_id() == topology.active_display_id()
+        && capture.desktop_rect() == topology.active_display().rect
+    {
+        None
+    } else {
+        Some(
+            DxgiDesktopCapturer::new_display(topology.active_display_id())
+                .map_err(HostRuntimeError::Capture)?,
+        )
+    };
+    let source = next_capture.as_ref().unwrap_or(capture);
+    if source.desktop_rect() != topology.active_display().rect {
+        return Err(HostRuntimeError::Capture(CaptureError::AccessLost));
+    }
+    let observed_bounds = display_topology()
+        .map_err(HostRuntimeError::Capture)?
+        .virtual_desktop;
+    let observed_displays = available_displays().map_err(HostRuntimeError::Capture)?;
+    if topology
+        .refreshed(observed_displays, observed_bounds)
+        .map_err(HostRuntimeError::Capture)?
+        .is_some()
+    {
+        // Resource creation can take long enough for another hotplug/rotation.
+        // Reject a candidate prepared from an already superseded OS snapshot.
+        return Err(HostRuntimeError::Capture(CaptureError::AccessLost));
+    }
+    let (width, height) = source.dimensions();
+    // reconfigure_for_source commits its backend/settings only after successful
+    // creation. Keep the old capture and published coordinates on any error.
+    encoder
+        .reconfigure_for_source(
+            width,
+            height,
+            H264EncoderSettings {
+                bitrate: encoder.bitrate(),
+                ..settings
+            },
+        )
+        .map_err(HostRuntimeError::Encoder)?;
+    if refreshed_display_topology(topology)?.is_some() {
+        // Encoder/driver creation can also span another display change. Keep
+        // input gated and retry instead of publishing superseded geometry.
+        return Err(HostRuntimeError::Capture(CaptureError::AccessLost));
+    }
+    if let Some(next_capture) = next_capture {
+        *capture = next_capture;
+    }
+    Ok(())
 }
 
 type SharedSecureSession = Arc<AsyncMutex<SecureSession>>;
@@ -1593,7 +2027,8 @@ async fn next_initiator_hello(
                     let _ = tokio::time::timeout(
                         PROTOCOL_REJECTION_TIMEOUT,
                         client.send_control_for_generation(peer_generation, rejection),
-                    ).await;
+                    )
+                    .await;
                     return Err(HostRuntimeError::Protocol(error));
                 }
                 Ok(_) | Err(_) => {
@@ -1663,6 +2098,33 @@ async fn open(
     Ok(secure.lock().await.open(lane, ciphertext)?)
 }
 
+fn remote_displays(displays: &[DisplayDescriptor]) -> Result<Vec<RemoteDisplay>, HostRuntimeError> {
+    displays
+        .iter()
+        .map(|display| {
+            Ok(RemoteDisplay {
+                id: display.id,
+                width: u16::try_from(display.rect.width)
+                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
+                height: u16::try_from(display.rect.height)
+                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
+                primary: display.primary,
+            })
+        })
+        .collect()
+}
+
+fn selected_display_list(
+    selected_desktop: &Mutex<SelectedDesktop>,
+) -> Result<(Vec<RemoteDisplay>, u32), HostRuntimeError> {
+    let selected = lock_unpoisoned(selected_desktop);
+    let topology = selected
+        .topology
+        .as_ref()
+        .ok_or(HostRuntimeError::CaptureWorkerStopped)?;
+    Ok((remote_displays(topology.displays())?, selected.display_id))
+}
+
 fn capture_worker_entry(
     ready: oneshot::Sender<Result<CaptureWorkerReady, HostRuntimeError>>,
     start: std::sync::mpsc::Receiver<()>,
@@ -1676,20 +2138,7 @@ fn capture_worker_entry(
             return Ok(());
         }
     };
-    let displays = match display_descriptors
-        .iter()
-        .map(|display| {
-            Ok(RemoteDisplay {
-                id: display.id,
-                width: u16::try_from(display.rect.width)
-                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
-                height: u16::try_from(display.rect.height)
-                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
-                primary: display.primary,
-            })
-        })
-        .collect::<Result<Vec<_>, HostRuntimeError>>()
-    {
+    let displays = match remote_displays(&display_descriptors) {
         Ok(displays) => displays,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -1724,13 +2173,40 @@ fn capture_worker_entry(
         }
     };
     let active_display_id = capture.display_id();
-    *lock_unpoisoned(&context.selected_desktop) = SelectedDesktop {
-        display_id: active_display_id,
-        desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
-    };
-    let worker_ready = CaptureWorkerReady {
-        desktop: capture.desktop_rect(),
+    let topology = match DisplayTopologySnapshot::new(
+        display_descriptors,
+        active_display_id,
         coordinate_space,
+    ) {
+        Ok(topology) if topology.active_display().rect == capture.desktop_rect() => topology,
+        Ok(_) => {
+            let _ = ready.send(Err(HostRuntimeError::Capture(CaptureError::AccessLost)));
+            return Ok(());
+        }
+        Err(error) => {
+            let _ = ready.send(Err(HostRuntimeError::Capture(error)));
+            return Ok(());
+        }
+    };
+    let coordinator = CaptureDesktopCoordinator {
+        selected: &context.selected_desktop,
+        input: &context.input,
+        epochs: context.input_epochs,
+        input_suspended: &context.input_suspended,
+        updates: &context.topology_updates,
+    };
+    match coordinator.publish(topology, encoder.config_version()) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = ready.send(Err(HostRuntimeError::CaptureWorkerStopped));
+            return Ok(());
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return Ok(());
+        }
+    }
+    let worker_ready = CaptureWorkerReady {
         width,
         height,
         displays,
@@ -1740,7 +2216,7 @@ fn capture_worker_entry(
     if ready.send(Ok(worker_ready)).is_err() || start.recv().is_err() {
         return Ok(());
     }
-    capture_encode_loop(capture, encoder, context, coordinate_space)
+    capture_encode_loop(capture, encoder, context)
 }
 
 async fn receive_controller_capabilities(
@@ -1962,11 +2438,20 @@ fn encoder_error_is_recoverable(error: &EncoderError) -> bool {
     )
 }
 
+fn recoverable_configuration<T>(
+    result: Result<T, HostRuntimeError>,
+) -> Result<Option<T>, HostRuntimeError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error @ HostRuntimeError::Encoder(EncoderError::ConfigVersionExhausted)) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
 fn capture_encode_loop(
     mut capture: DxgiDesktopCapturer,
     mut encoder: H264Encoder,
     context: CaptureWorkerContext,
-    mut coordinate_space: DesktopRect,
 ) -> Result<(), HostRuntimeError> {
     let CaptureWorkerContext {
         commands,
@@ -1975,69 +2460,168 @@ fn capture_encode_loop(
         force_keyframe,
         shutdown,
         selected_desktop,
+        input,
+        input_epochs,
+        input_suspended,
+        topology_updates,
         profile: _,
     } = context;
+    let desktop_state = CaptureDesktopCoordinator {
+        selected: &selected_desktop,
+        input: &input,
+        epochs: input_epochs,
+        input_suspended: &input_suspended,
+        updates: &topology_updates,
+    };
+    let mut next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+    let mut topology_recovery_pending = false;
     let mut encoder_recovery_attempts = 0_u8;
+    let mut frame_input_contexts = FrameInputContexts::default();
     let mut video_quality = DEFAULT_VIDEO_QUALITY;
     let mut video_profile = encoder.profile();
     let mut reported_first_encoded_frame = false;
     let mut frame_pacer =
         VideoFramePacer::new(video_quality_settings_with_profile(video_quality, video_profile).fps);
     let mut first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+    let mut static_recovery = StaticKeyframeRecovery::default();
     let mut captured_any_frame = false;
     let mut first_encoded_frame_deadline = None;
     let mut encoded_any_frame = false;
     while !shutdown.load(Ordering::Acquire) {
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                CaptureWorkerCommand::SelectDisplay { display_id, reply } => {
-                    let current_display_id = lock_unpoisoned(&selected_desktop).display_id;
-                    if display_id == current_display_id {
-                        let _ = reply.send(true);
-                        continue;
-                    }
-                    let switched = (|| {
-                        let next_capture = DxgiDesktopCapturer::new_display(display_id)
-                            .map_err(HostRuntimeError::Capture)?;
-                        let next_coordinate_space = display_topology()
-                            .map(|topology| topology.virtual_desktop)
-                            .unwrap_or(coordinate_space);
-                        let (source_width, source_height) = next_capture.dimensions();
-                        encoder
-                            .reconfigure_for_source(
-                                source_width,
-                                source_height,
-                                video_quality_settings_with_profile(video_quality, video_profile),
-                            )
-                            .map_err(HostRuntimeError::Encoder)?;
-                        capture = next_capture;
-                        coordinate_space = next_coordinate_space;
+        {
+            let selected = lock_unpoisoned(&selected_desktop);
+            if selected.input_closed {
+                break;
+            }
+            topology_recovery_pending |= selected.input_invalidated;
+        }
+        if Instant::now() >= next_topology_poll {
+            next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+            let current = desktop_state.current()?;
+            let next = match refreshed_display_topology(&current) {
+                Ok(Some(next)) => Some(next),
+                Ok(None) if topology_recovery_pending => {
+                    Some(current.renewed().map_err(HostRuntimeError::Capture)?)
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    // A transient empty/inconsistent OS enumeration must not
+                    // replace the last coherent list or inject into new bounds.
+                    desktop_state.suspend();
+                    topology_recovery_pending = true;
+                    None
+                }
+            };
+            if let Some(next) = next {
+                let reset_media =
+                    topology_recovery_pending || next.requires_capture_reconfigure(&current);
+                if reset_media {
+                    desktop_state.suspend();
+                    topology_recovery_pending = true;
+                    if recoverable_configuration(prepare_capture_topology(
+                        &mut capture,
+                        &mut encoder,
+                        &next,
+                        video_quality_settings_with_profile(video_quality, video_profile),
+                        false,
+                    ))?
+                    .is_some()
+                    {
                         video_profile = encoder.profile();
                         frame_pacer.reset(
                             video_quality_settings_with_profile(video_quality, video_profile).fps,
                         );
                         lock_queue(&queue).clear();
-                        *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
-                            display_id,
-                            desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
-                        };
                         force_keyframe.store(true, Ordering::Release);
-                        notify.notify_one();
-                        Ok::<(), HostRuntimeError>(())
-                    })()
-                    .is_ok();
+                        if !captured_any_frame {
+                            first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+                        }
+                        if !encoded_any_frame {
+                            first_encoded_frame_deadline = None;
+                        }
+                        if desktop_state.publish(next, encoder.config_version())? {
+                            notify.notify_one();
+                            topology_recovery_pending = false;
+                        }
+                    }
+                } else {
+                    // Hotplug of an unused output or a primary/name change may
+                    // update the list without rebuilding unchanged media.
+                    if !desktop_state.publish(next, encoder.config_version())? {
+                        topology_recovery_pending = true;
+                    }
+                }
+            }
+        }
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                CaptureWorkerCommand::SelectDisplay { display_id, reply } => {
+                    if topology_recovery_pending {
+                        let _ = reply.send(false);
+                        continue;
+                    }
+                    let current = desktop_state.current()?;
+                    let candidate = current.select(display_id);
+                    let switched = match candidate {
+                        Ok(None) => true,
+                        Ok(Some(next)) => {
+                            desktop_state.suspend();
+                            let prepared = recoverable_configuration(prepare_capture_topology(
+                                &mut capture,
+                                &mut encoder,
+                                &next,
+                                video_quality_settings_with_profile(video_quality, video_profile),
+                                false,
+                            ))?;
+                            if prepared.is_some() {
+                                video_profile = encoder.profile();
+                                frame_pacer.reset(
+                                    video_quality_settings_with_profile(
+                                        video_quality,
+                                        video_profile,
+                                    )
+                                    .fps,
+                                );
+                                lock_queue(&queue).clear();
+                                force_keyframe.store(true, Ordering::Release);
+                                if !captured_any_frame {
+                                    first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+                                }
+                                if !encoded_any_frame {
+                                    first_encoded_frame_deadline = None;
+                                }
+                                if desktop_state.publish(next, encoder.config_version())? {
+                                    notify.notify_one();
+                                    true
+                                } else {
+                                    topology_recovery_pending = true;
+                                    false
+                                }
+                            } else {
+                                topology_recovery_pending = true;
+                                next_topology_poll = Instant::now();
+                                false
+                            }
+                        }
+                        Err(_) => false,
+                    };
                     let _ = reply.send(switched);
                 }
                 CaptureWorkerCommand::SetVideoQuality { preset, reply } => {
-                    if preset != video_quality {
+                    if preset != video_quality
+                        || encoder.bitrate() != video_quality_settings(preset).bitrate
+                    {
                         let (source_width, source_height) = capture.dimensions();
-                        if encoder
-                            .reconfigure_for_source(
-                                source_width,
-                                source_height,
-                                video_quality_settings_with_profile(preset, video_profile),
-                            )
-                            .is_ok()
+                        if recoverable_configuration(
+                            encoder
+                                .reconfigure_for_source(
+                                    source_width,
+                                    source_height,
+                                    video_quality_settings_with_profile(preset, video_profile),
+                                )
+                                .map_err(HostRuntimeError::Encoder),
+                        )?
+                        .is_some()
                         {
                             video_quality = preset;
                             video_profile = encoder.profile();
@@ -2050,18 +2634,27 @@ fn capture_encode_loop(
                             notify.notify_one();
                         }
                     }
-                    let _ = reply.send(video_quality);
+                    let _ = reply.send((video_quality, encoder.bitrate()));
                 }
                 CaptureWorkerCommand::SetVideoProfile { profile, reply } => {
                     if profile != video_profile {
                         let (source_width, source_height) = capture.dimensions();
-                        if encoder
-                            .reconfigure_for_source(
-                                source_width,
-                                source_height,
-                                video_quality_settings_with_profile(video_quality, profile),
-                            )
-                            .is_ok()
+                        if recoverable_configuration(
+                            encoder
+                                .reconfigure_for_source(
+                                    source_width,
+                                    source_height,
+                                    H264EncoderSettings {
+                                        bitrate: encoder.bitrate(),
+                                        ..video_quality_settings_with_profile(
+                                            video_quality,
+                                            profile,
+                                        )
+                                    },
+                                )
+                                .map_err(HostRuntimeError::Encoder),
+                        )?
+                        .is_some()
                         {
                             video_profile = encoder.profile();
                             lock_queue(&queue).clear();
@@ -2069,13 +2662,53 @@ fn capture_encode_loop(
                             notify.notify_one();
                         }
                     }
-                    let _ = reply.send(video_profile);
+                    let _ = reply.send((video_profile, encoder.bitrate()));
+                }
+                CaptureWorkerCommand::SetVideoBitrate { bitrate, reply } => {
+                    let actual = match encoder.try_set_bitrate(bitrate) {
+                        Ok(true) => Some(encoder.bitrate()),
+                        Ok(false) => None,
+                        Err(_) => {
+                            // Native rollback was uncertain. Recreate the last
+                            // verified settings before encoding any more frames.
+                            let (width, height) = encoder.dimensions();
+                            encoder
+                                .rebuild(width, height)
+                                .map_err(HostRuntimeError::Encoder)?;
+                            video_profile = encoder.profile();
+                            lock_queue(&queue).clear();
+                            force_keyframe.store(true, Ordering::Release);
+                            notify.notify_one();
+                            None
+                        }
+                    };
+                    let _ = reply.send(actual);
                 }
             }
         }
-        let frame = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT)
-            .map_err(HostRuntimeError::Capture)?
-        {
+        if topology_recovery_pending {
+            std::thread::sleep(CAPTURE_TIMEOUT);
+            continue;
+        }
+        let captured_context = lock_unpoisoned(&selected_desktop)
+            .input_context()
+            .ok_or(HostRuntimeError::CaptureWorkerStopped)?;
+        let outcome = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // An active monitor can disappear between the once-per-second
+                // checks. Try the new topology before treating capture as fatal.
+                let current = desktop_state.current()?;
+                if matches!(refreshed_display_topology(&current), Ok(None)) {
+                    return Err(HostRuntimeError::Capture(error));
+                }
+                desktop_state.suspend();
+                topology_recovery_pending = true;
+                next_topology_poll = Instant::now();
+                continue;
+            }
+        };
+        let frame = match outcome {
             CaptureOutcome::Frame(frame) => frame,
             CaptureOutcome::Idle => {
                 if initial_frame_deadline_expired(
@@ -2098,33 +2731,57 @@ fn capture_encode_loop(
                             .to_owned(),
                     )));
                 }
-                continue;
+                // DXGI reports only changes. Recover a decoder using a fresh
+                // owned snapshot, without copying every normal captured frame.
+                if static_recovery
+                    .snapshot_due(force_keyframe.load(Ordering::Acquire), Instant::now())
+                {
+                    capture
+                        .snapshot_frame()
+                        .map_err(HostRuntimeError::Capture)?
+                } else {
+                    continue;
+                }
             }
             CaptureOutcome::Recovered => {
+                desktop_state.suspend();
+                topology_recovery_pending = true;
+                let current = desktop_state.current()?;
+                let next = match refreshed_display_topology(&current) {
+                    Ok(Some(next)) => next,
+                    Ok(None) => current.renewed().map_err(HostRuntimeError::Capture)?,
+                    Err(_) => {
+                        next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+                        continue;
+                    }
+                };
+                if recoverable_configuration(prepare_capture_topology(
+                    &mut capture,
+                    &mut encoder,
+                    &next,
+                    video_quality_settings_with_profile(video_quality, video_profile),
+                    true,
+                ))?
+                .is_none()
+                {
+                    next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+                    continue;
+                }
                 if !captured_any_frame {
                     first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
                 }
-                coordinate_space = display_topology()
-                    .map(|topology| topology.virtual_desktop)
-                    .unwrap_or(coordinate_space);
-                let (source_width, source_height) = capture.dimensions();
-                encoder
-                    .reconfigure_for_source(
-                        source_width,
-                        source_height,
-                        video_quality_settings_with_profile(video_quality, video_profile),
-                    )
-                    .map_err(HostRuntimeError::Encoder)?;
+                if !encoded_any_frame {
+                    first_encoded_frame_deadline = None;
+                }
                 video_profile = encoder.profile();
                 frame_pacer
                     .reset(video_quality_settings_with_profile(video_quality, video_profile).fps);
                 lock_queue(&queue).clear();
-                *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
-                    display_id: capture.display_id(),
-                    desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
-                };
                 force_keyframe.store(true, Ordering::Release);
-                notify.notify_one();
+                if desktop_state.publish(next, encoder.config_version())? {
+                    notify.notify_one();
+                    topology_recovery_pending = false;
+                }
                 continue;
             }
         };
@@ -2145,8 +2802,24 @@ fn capture_encode_loop(
         if !frame_pacer.should_encode(frame.timestamp_us, request_keyframe) {
             continue;
         }
-        let encoded = match encoder.encode(frame, request_keyframe) {
+        let result = encoder.encode(frame, request_keyframe);
+        if !encoder
+            .last_performance_sample()
+            .is_some_and(|sample| frame_input_contexts.record_submission(sample, captured_context))
+        {
+            force_keyframe.store(true, Ordering::Release);
+        }
+        let (encoded, encoded_context) = match result {
             Ok(encoded) => {
+                let Some(output_context) = frame_input_contexts
+                    .take_output(&encoded)
+                    .filter(|context| *context == captured_context)
+                else {
+                    // An asynchronous MFT may return an older buffered frame.
+                    // Never relabel it with the current geometry's input epoch.
+                    force_keyframe.store(true, Ordering::Release);
+                    continue;
+                };
                 encoder_recovery_attempts = 0;
                 if !reported_first_encoded_frame {
                     eprintln!(
@@ -2158,9 +2831,19 @@ fn capture_encode_loop(
                     reported_first_encoded_frame = true;
                 }
                 encoded_any_frame = true;
-                encoded
+                (encoded, output_context)
             }
-            Err(EncoderError::NeedMoreInput) => continue,
+            Err(EncoderError::NeedMoreInput) => {
+                // Some MFTs need another submission before returning output.
+                // Preserve recovery intent so an idle DXGI desktop can supply
+                // another bounded snapshot instead of losing the request.
+                static_recovery.encoder_buffered_output(
+                    &force_keyframe,
+                    request_keyframe,
+                    encoded_any_frame,
+                );
+                continue;
+            }
             Err(error)
                 if encoder_error_is_recoverable(&error)
                     && encoder_recovery_attempts < MAX_ENCODER_RECOVERY_ATTEMPTS =>
@@ -2181,10 +2864,36 @@ fn capture_encode_loop(
             frame: encoded,
             width,
             height,
+            input_epoch: encoded_context.input_epoch,
         });
         notify.notify_one();
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct StaticKeyframeRecovery {
+    last_snapshot: Option<Instant>,
+}
+
+impl StaticKeyframeRecovery {
+    fn encoder_buffered_output(&self, requested: &AtomicBool, keyframe: bool, encoded_any: bool) {
+        if keyframe || !encoded_any {
+            requested.store(true, Ordering::Release);
+        }
+    }
+
+    fn snapshot_due(&mut self, requested: bool, now: Instant) -> bool {
+        if !requested
+            || self
+                .last_snapshot
+                .is_some_and(|last| now.saturating_duration_since(last) < STATIC_KEYFRAME_INTERVAL)
+        {
+            return false;
+        }
+        self.last_snapshot = Some(now);
+        true
+    }
 }
 
 fn initial_frame_deadline_expired(
@@ -2226,7 +2935,7 @@ async fn send_video_loop(
         let Some(next) = next else {
             continue;
         };
-        match pipeline.prepare(next.frame, next.width, next.height)? {
+        match pipeline.prepare(next.frame, next.width, next.height, next.input_epoch)? {
             PrepareVideo::NeedKeyframe => {
                 if !reported_need_keyframe {
                     eprintln!(
@@ -2288,12 +2997,8 @@ async fn send_video_loop(
                             index,
                         );
                     }
-                    let mut direct_path = direct_connection
-                        .lock()
-                        .await
-                        .clone()
-                        .map(DirectLanVideoPath::new);
-                    let had_direct_path = direct_path.is_some();
+                    let direct_snapshot = direct_connection.lock().await.clone();
+                    let mut direct_path = direct_snapshot.clone().map(DirectLanVideoPath::new);
                     let send_result = if reliable_relay_keyframe && direct_path.is_none() {
                         let ciphertext =
                             seal(&secure, SecureLane::VideoReliable, &datagram).await?;
@@ -2334,8 +3039,16 @@ async fn send_video_loop(
                         );
                         reported_first_datagram_stage = true;
                     }
-                    if had_direct_path && direct_path.is_none() {
-                        *direct_connection.lock().await = None;
+                    if direct_path.is_none()
+                        && let Some(failed) = direct_snapshot.as_ref()
+                    {
+                        let retired = {
+                            let mut active = direct_connection.lock().await;
+                            direct_path_slot::retire_if_current(&mut active, failed)
+                        };
+                        if let Some(retired) = retired {
+                            retired.close(b"desklink direct egress failed");
+                        }
                     }
                     match send_result {
                         Ok(_) => {
@@ -2378,27 +3091,20 @@ async fn send_video_reliable_batches(
     datagrams: Vec<Vec<u8>>,
 ) -> Result<usize, HostRuntimeError> {
     let mut batches = 0_usize;
-    let mut current = Vec::new();
+    let mut batch = VideoReliableBatchBuilder::new();
     for datagram in datagrams {
-        if current.is_empty() {
-            current.push(datagram);
-            continue;
-        }
-        let mut candidate = current.clone();
-        candidate.push(datagram.clone());
-        match encode_video_reliable_batch(&candidate) {
-            Ok(_) => current.push(datagram),
-            Err(ProtocolError::MessageTooLarge { .. }) => {
-                send_video_reliable_batch(client, secure, peer_generation, &current).await?;
-                batches += 1;
-                current.clear();
-                current.push(datagram);
-            }
-            Err(error) => return Err(error.into()),
+        if !batch.try_push(&datagram)? {
+            send_video_reliable_batch(client, secure, peer_generation, batch.bytes()).await?;
+            batches += 1;
+            batch.clear();
+            // Execute the push in release too; the debug assertion is only
+            // proof that a legal single packet fits in an empty batch.
+            let added = batch.try_push(&datagram)?;
+            debug_assert!(added);
         }
     }
-    if !current.is_empty() {
-        send_video_reliable_batch(client, secure, peer_generation, &current).await?;
+    if !batch.is_empty() {
+        send_video_reliable_batch(client, secure, peer_generation, batch.bytes()).await?;
         batches += 1;
     }
     Ok(batches)
@@ -2408,10 +3114,9 @@ async fn send_video_reliable_batch(
     client: &QuicClient,
     secure: &SharedSecureSession,
     peer_generation: u64,
-    datagrams: &[Vec<u8>],
+    plaintext: &[u8],
 ) -> Result<(), HostRuntimeError> {
-    let plaintext = encode_video_reliable_batch(datagrams)?;
-    let ciphertext = seal(secure, SecureLane::VideoReliable, &plaintext).await?;
+    let ciphertext = seal(secure, SecureLane::VideoReliable, plaintext).await?;
     client
         .send_video_reliable_for_generation(peer_generation, ciphertext)
         .await?;
@@ -2587,30 +3292,125 @@ async fn send_video_quality_state(
 async fn apply_video_quality(
     capture_commands: &std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     preset: VideoQualityPreset,
-) -> Result<Option<VideoQualityPreset>, HostRuntimeError> {
+) -> Result<Option<(VideoQualityPreset, u32)>, HostRuntimeError> {
     let (reply, applied) = oneshot::channel();
     capture_commands
         .try_send(CaptureWorkerCommand::SetVideoQuality { preset, reply })
         .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-    Ok(tokio::time::timeout(Duration::from_secs(5), applied)
-        .await
-        .ok()
-        .and_then(Result::ok))
+    Ok(Some(
+        applied
+            .await
+            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?,
+    ))
 }
 
 async fn apply_video_profile(
     capture_commands: &std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     profile: H264Profile,
-) -> Result<H264Profile, HostRuntimeError> {
+) -> Result<Option<(H264Profile, u32)>, HostRuntimeError> {
     let (reply, applied) = oneshot::channel();
     capture_commands
         .try_send(CaptureWorkerCommand::SetVideoProfile { profile, reply })
         .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-    Ok(tokio::time::timeout(Duration::from_secs(5), applied)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(H264Profile::Main))
+    Ok(Some(
+        applied
+            .await
+            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?,
+    ))
+}
+
+enum ConfigurationApplied {
+    Display,
+    Quality(Option<(VideoQualityPreset, u32)>),
+    Profile(Option<(H264Profile, u32)>),
+    Bitrate(Option<u32>),
+}
+
+type ConfigurationFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(ConfigurationOperation, ConfigurationApplied), HostRuntimeError>,
+            > + Send,
+    >,
+>;
+
+struct PendingConfiguration {
+    operation: ConfigurationOperation,
+    future: ConfigurationFuture,
+}
+
+fn start_configuration(
+    commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
+    operation: ConfigurationOperation,
+) -> PendingConfiguration {
+    PendingConfiguration {
+        operation,
+        future: Box::pin(async move {
+            let applied = match operation.action {
+                ConfigurationAction::SelectDisplay(display_id) => {
+                    let (reply, switched) = oneshot::channel();
+                    commands
+                        .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
+                        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                    let _ = switched
+                        .await
+                        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                    ConfigurationApplied::Display
+                }
+                ConfigurationAction::SetVideoQuality(preset) => {
+                    ConfigurationApplied::Quality(apply_video_quality(&commands, preset).await?)
+                }
+                ConfigurationAction::SetVideoProfile(profile) => {
+                    ConfigurationApplied::Profile(apply_video_profile(&commands, profile).await?)
+                }
+                ConfigurationAction::SetVideoBitrate(bitrate) => {
+                    let (reply, applied) = oneshot::channel();
+                    commands
+                        .try_send(CaptureWorkerCommand::SetVideoBitrate { bitrate, reply })
+                        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                    ConfigurationApplied::Bitrate(
+                        applied
+                            .await
+                            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?,
+                    )
+                }
+            };
+            Ok((operation, applied))
+        }),
+    }
+}
+
+fn queue_media_configuration(
+    queue: &mut ConfigurationQueue,
+    bitrate: &mut AdaptiveBitrate,
+    action: ConfigurationAction,
+) {
+    queue.invalidate_kind(ConfigurationKind::Bitrate);
+    bitrate.rejected();
+    queue.request(action);
+}
+
+fn configuration_blocks_bitrate(
+    queue: &ConfigurationQueue,
+    pending: &Option<PendingConfiguration>,
+) -> bool {
+    queue.has_pending(ConfigurationKind::Quality)
+        || queue.has_pending(ConfigurationKind::Profile)
+        || pending.as_ref().is_some_and(|work| {
+            matches!(
+                work.operation.action.kind(),
+                ConfigurationKind::Quality | ConfigurationKind::Profile
+            )
+        })
+}
+
+async fn next_configuration(
+    pending: &mut Option<PendingConfiguration>,
+) -> Result<(ConfigurationOperation, ConfigurationApplied), HostRuntimeError> {
+    match pending {
+        Some(operation) => operation.future.as_mut().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2619,12 +3419,11 @@ async fn receive_input_and_control(
     secure: SharedSecureSession,
     peer_generation: u64,
     stream_id: u64,
-    input: InputInjector,
+    input: Arc<Mutex<InputInjector>>,
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
 ) -> Result<(), HostRuntimeError> {
-    let release_input = Arc::new(Notify::new());
-    let input_suspended = Arc::new(AtomicBool::new(false));
+    let input_suspended = context.input_suspended.clone();
     run_inbound_lanes(
         receive_host_input(
             client.clone(),
@@ -2634,7 +3433,6 @@ async fn receive_input_and_control(
             input,
             context.selected_desktop.clone(),
             context.input_state_updates.clone(),
-            release_input.clone(),
             input_suspended.clone(),
         ),
         receive_host_control(
@@ -2644,8 +3442,6 @@ async fn receive_input_and_control(
             stream_id,
             force_keyframe,
             context,
-            release_input,
-            input_suspended,
         ),
     )
     .await
@@ -2665,44 +3461,134 @@ where
     }
 }
 
+struct HostInputExitGuard<B: crate::input::InputBackend = crate::input::NativeInputBackend> {
+    selected: Arc<Mutex<SelectedDesktop>>,
+    input: Arc<Mutex<InputInjector<B>>>,
+    input_suspended: Arc<AtomicBool>,
+}
+
+impl<B: crate::input::InputBackend> Drop for HostInputExitGuard<B> {
+    fn drop(&mut self) {
+        let mut selected = lock_unpoisoned(&self.selected);
+        selected.input_closed = true;
+        selected.input_invalidated = true;
+        self.input_suspended.store(true, Ordering::Release);
+        // Intentional host teardown, not a remotely supplied release command.
+        // The capture worker may still own an Arc, so injector Drop is too late.
+        let _ = lock_unpoisoned(&self.input).release_all();
+    }
+}
+
+fn begin_desktop_selection<B: crate::input::InputBackend>(
+    selected: &Mutex<SelectedDesktop>,
+    input: &Mutex<InputInjector<B>>,
+    input_suspended: &AtomicBool,
+) {
+    let mut selected = lock_unpoisoned(selected);
+    selected.selection_pending = true;
+    if lock_unpoisoned(input).release_all().is_err() {
+        selected.input_invalidated = true;
+        input_suspended.store(true, Ordering::Release);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_host_input(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
     peer_generation: u64,
     stream_id: u64,
-    mut input: InputInjector,
+    input: Arc<Mutex<InputInjector>>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
     input_state_updates: watch::Sender<Option<InputRestrictionReason>>,
-    release_input: Arc<Notify>,
     input_suspended: Arc<AtomicBool>,
 ) -> Result<(), HostRuntimeError> {
+    let _exit = HostInputExitGuard {
+        selected: selected_desktop.clone(),
+        input: input.clone(),
+        input_suspended: input_suspended.clone(),
+    };
     let mut policy = HostInboundPolicy::new(stream_id);
     let mut input_restriction = InputRestrictionTracker::default();
     loop {
         tokio::select! {
             biased;
-            _ = release_input.notified() => { let _ = input.release_all(); }
             reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
             result = client.next_input_for_generation(peer_generation) => {
                 let bytes = result?;
                 let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
-                if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
-                    // Consume and discard coordinates produced during a monitor
-                    // transition. ReleaseAll remains safe and must still run.
-                    if !input_suspended.load(Ordering::Acquire) || matches!(event, InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }) {
-                        input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
-                        let failure = apply_input_event(&mut input, event.clone());
-                        if let Some(reason) = input_restriction.observe(&event, failure) {
+                inject_desktop_input_with_feedback(
+                    &mut policy, &input, &plaintext, now_micros(),
+                    &selected_desktop, &input_suspended,
+                    |event, failure| {
+                        if let Some(reason) = input_restriction.observe(event, failure) {
                             input_state_updates.send_replace(reason);
                         }
-                    }
-                }
+                    },
+                )?;
             }
         }
     }
+}
+
+#[cfg(test)]
+fn inject_desktop_input<B: crate::input::InputBackend>(
+    policy: &mut HostInboundPolicy,
+    input: &Mutex<InputInjector<B>>,
+    plaintext: &[u8],
+    now_us: u64,
+    selected_desktop: &Mutex<SelectedDesktop>,
+    input_suspended: &AtomicBool,
+) -> Result<bool, HostRuntimeError> {
+    inject_desktop_input_with_feedback(
+        policy,
+        input,
+        plaintext,
+        now_us,
+        selected_desktop,
+        input_suspended,
+        |_, _| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inject_desktop_input_with_feedback<B: crate::input::InputBackend>(
+    policy: &mut HostInboundPolicy,
+    input: &Mutex<InputInjector<B>>,
+    plaintext: &[u8],
+    now_us: u64,
+    selected_desktop: &Mutex<SelectedDesktop>,
+    input_suspended: &AtomicBool,
+    on_applied: impl FnOnce(&InputEvent, Option<InputRestrictionReason>),
+) -> Result<bool, HostRuntimeError> {
+    // Context is checked before ordering state, release handling, or touching
+    // the injector. A delayed release from A cannot release a key pressed in B.
+    let selected = lock_unpoisoned(selected_desktop);
+    let Some(context) = selected.input_context() else {
+        return Ok(false);
+    };
+    if selected.input_closed {
+        return Ok(false);
+    }
+    let Some(envelope) = policy.decode_input_envelope(plaintext, now_us, context)? else {
+        return Ok(false);
+    };
+    let release = matches!(
+        envelope.event,
+        InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }
+    );
+    if !release && (input_suspended.load(Ordering::Acquire) || selected.selection_pending) {
+        return Ok(false);
+    }
+    // Maintain one lock order everywhere: selected mapping, then injector.
+    let mut input = lock_unpoisoned(input);
+    input.set_desktop(selected.desktop);
+    let event = envelope.event;
+    let failure = apply_input_event(&mut input, event.clone());
+    on_applied(&event, failure);
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2713,31 +3599,79 @@ async fn receive_host_control(
     stream_id: u64,
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
-    release_input: Arc<Notify>,
-    input_suspended: Arc<AtomicBool>,
 ) -> Result<(), HostRuntimeError> {
     let HostInboundContext {
         input_state_updates: _,
         capture_commands,
         selected_desktop,
-        displays,
+        input,
+        input_suspended,
+        mut topology_updates,
         audio_enabled,
         audio_enabled_updates,
         audio_queue,
         audio_notify,
         mut direct_session,
         direct_connection,
+        media_observer,
     } = context;
     let policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
+    let mut bitrate_policy = AdaptiveBitrate::new(video_quality.preset);
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
+    let mut direct_probes = tokio::task::JoinSet::new();
+    let direct_enabled = Arc::new(AtomicBool::new(true));
+    let mut configurations = ConfigurationQueue::default();
+    let mut pending_configuration = None;
     loop {
+        if pending_configuration.is_none()
+            && let Some(operation) = configurations.pop_next()
+        {
+            pending_configuration = Some(start_configuration(capture_commands.clone(), operation));
+        }
         tokio::select! {
+            completed = next_configuration(&mut pending_configuration) => {
+                let (operation, applied) = completed?;
+                pending_configuration = None;
+                if configurations.is_current(&operation) {
+                    match applied {
+                        ConfigurationApplied::Display => {
+                            if !configurations.has_pending_display() {
+                                lock_unpoisoned(&selected_desktop).selection_pending = false;
+                            }
+                            let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
+                            send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+                        }
+                        ConfigurationApplied::Quality(Some((actual, bitrate))) => {
+                            video_quality.record_applied(actual);
+                            bitrate_policy.reset_to_actual(actual, bitrate);
+                            send_video_quality_state(&client, &secure, peer_generation, video_quality.preference, actual).await?;
+                        }
+                        ConfigurationApplied::Profile(Some((actual, bitrate))) => {
+                            bitrate_policy.reset_to_actual(video_quality.preset, bitrate);
+                            if operation.action != ConfigurationAction::SetVideoProfile(actual) {
+                                force_keyframe.store(true, Ordering::Release);
+                            }
+                        }
+                        ConfigurationApplied::Bitrate(Some(actual)) => { bitrate_policy.record_applied(actual); }
+                        ConfigurationApplied::Bitrate(None) => { bitrate_policy.rejected(); }
+                        ConfigurationApplied::Quality(None) | ConfigurationApplied::Profile(None) => {}
+                    }
+                }
+            }
+            updated = topology_updates.changed() => {
+                updated.map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
+                send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+            }
+            _ = direct_probes.join_next(), if !direct_probes.is_empty() => {}
             direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
                 if let Some(connection) = direct {
-                    *direct_connection.lock().await = Some(connection);
+                    install_direct_connection(&direct_connection, connection, &direct_enabled).await;
                 } else {
-                    direct_session = None;
+                    direct_probes.abort_all();
+                    stop_direct_listener(&mut direct_session, &direct_connection, &direct_enabled,
+                        &force_keyframe, &media_observer, stream_id).await;
                 }
             }
             result = client.next_control_for_generation(peer_generation) => {
@@ -2748,37 +3682,17 @@ async fn receive_host_control(
                 }
                 match decode_control(&plaintext)? {
                     ControlMessage::SelectDisplay { display_id } => {
-                        let known_display = displays.iter().any(|display| display.id == display_id);
+                        let known_display = lock_unpoisoned(&selected_desktop)
+                            .topology.as_ref().is_some_and(|topology| {
+                                topology.displays().iter().any(|display| display.id == display_id)
+                            });
                         if known_display {
-                            // A transient Windows input rejection while switching
-                            // monitors must not close the video and control lanes.
-                            // Retained pressed-state entries are retried by later
-                            // release events and once more when the injector drops.
-                            input_suspended.store(true, Ordering::Release);
-                            release_input.notify_one();
-                            let (reply, switched) = oneshot::channel();
-                            capture_commands
-                                .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
-                                .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-                            if tokio::time::timeout(Duration::from_secs(5), switched)
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .unwrap_or(false)
-                            {
-                                release_input.notify_one();
-                            }
-                            input_suspended.store(false, Ordering::Release);
+                            begin_desktop_selection(&selected_desktop, &input, &input_suspended);
+                            configurations.request(ConfigurationAction::SelectDisplay(display_id));
+                        } else {
+                            let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
+                            send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
                         }
-                        let active_display_id = lock_unpoisoned(&selected_desktop).display_id;
-                        send_display_list(
-                            &client,
-                            &secure,
-                            peer_generation,
-                            &displays,
-                            active_display_id,
-                        )
-                        .await?;
                     }
                     ControlMessage::SetAudioEnabled { enabled } => {
                         audio_enabled.store(enabled, Ordering::Release);
@@ -2790,57 +3704,34 @@ async fn receive_host_control(
                     }
                     ControlMessage::SetVideoQuality { preference } => {
                         let requested = video_quality.set_preference(preference);
-                        let actual = match requested {
-                            Some(preset) => apply_video_quality(&capture_commands, preset).await?,
-                            None => Some(video_quality.preset),
-                        };
-                        if let Some(actual) = actual {
-                            video_quality.record_applied(actual);
-                            send_video_quality_state(
-                                &client,
-                                &secure,
-                                peer_generation,
-                                video_quality.preference,
-                                actual,
-                            )
-                            .await?;
-                        }
+                        // Reassert the applied tier even for Automatic/same-tier
+                        // choices: a previous slow native operation may be in flight.
+                        configurations.invalidate_kind(ConfigurationKind::Quality);
+                        queue_media_configuration(&mut configurations, &mut bitrate_policy, ConfigurationAction::SetVideoQuality(requested.unwrap_or(video_quality.preset)));
                     }
                     ControlMessage::SetVideoProfile { profile } => {
-                        let actual = apply_video_profile(&capture_commands, profile).await?;
-                        if actual != profile {
-                            force_keyframe.store(true, Ordering::Release);
-                        }
+                        queue_media_configuration(&mut configurations, &mut bitrate_policy, ConfigurationAction::SetVideoProfile(profile));
                     }
                     ControlMessage::VideoNetworkFeedback {
-                        received_packets,
-                        dropped_packets,
-                        decode_queue_peak,
-                        freshness_recoveries,
+                        received_packets, dropped_packets, decode_queue_peak, freshness_recoveries,
                     } => {
-                        if let Some(preset) =
-                            video_quality.observe(
-                                received_packets,
-                                dropped_packets,
-                                decode_queue_peak,
-                                freshness_recoveries,
-                            )
-                            && let Some(actual) =
-                                apply_video_quality(&capture_commands, preset).await?
-                        {
-                            video_quality.record_applied(actual);
-                            send_video_quality_state(
-                                &client,
-                                &secure,
-                                peer_generation,
-                                video_quality.preference,
-                                actual,
-                            )
-                            .await?;
+                        if configuration_blocks_bitrate(&configurations, &pending_configuration) { continue; }
+                        let (rate, handled) = bitrate_feedback_decision(video_quality.preference, &mut bitrate_policy,
+                            received_packets, dropped_packets, decode_queue_peak, freshness_recoveries);
+                        if let Some(bitrate) = rate {
+                            configurations.request(ConfigurationAction::SetVideoBitrate(bitrate));
+                        }
+                        if handled { continue; }
+                        if let Some(preset) = video_quality.observe(
+                            received_packets, dropped_packets, decode_queue_peak, freshness_recoveries,
+                        ) {
+                            queue_media_configuration(&mut configurations, &mut bitrate_policy, ConfigurationAction::SetVideoQuality(preset));
                         }
                     }
                     ControlMessage::VideoPathCandidateOffer { candidate } => {
+                        let has_active = direct_connection.lock().await.as_ref().is_some_and(|path| !path.is_closed());
                         let answer = if let Some(session) = direct_session.as_ref()
+                            && !has_active
                             && candidate
                                 .validate(now_unix_s(), session.session_binding())
                                 .is_ok()
@@ -2850,27 +3741,26 @@ async fn receive_host_control(
                             let local_candidate = session.candidate().clone();
                             let secure_for_probe = secure.clone();
                             let direct_connection_for_probe = direct_connection.clone();
+                            let direct_enabled_for_probe = direct_enabled.clone();
                             let candidate_for_probe = candidate.clone();
                             let accepted = if let Ok(permit) = direct_probe_slots
                                 .clone()
                                 .try_acquire_owned()
                             {
-                                tokio::spawn(async move {
+                                // JoinSet aborts pending probes when this peer
+                                // generation exits; no task can publish an old path.
+                                direct_probes.spawn(async move {
                                     let _permit = permit;
-                                    let result = {
-                                        let mut secure = secure_for_probe.lock().await;
-                                        endpoint
-                                            .connect(
-                                                &candidate_for_probe,
-                                                &expected_binding,
-                                                &mut secure,
-                                                now_unix_s(),
-                                            )
-                                            .await
-                                    };
+                                    let result = endpoint
+                                        .connect_shared(
+                                            &candidate_for_probe,
+                                            &expected_binding,
+                                            &secure_for_probe,
+                                            now_unix_s(),
+                                        )
+                                        .await;
                                     if let Ok((connection, _)) = result {
-                                        *direct_connection_for_probe.lock().await =
-                                            Some(Arc::new(connection));
+                                        install_direct_connection(&direct_connection_for_probe, Arc::new(connection), &direct_enabled_for_probe).await;
                                     }
                                 });
                                 true
@@ -2909,8 +3799,8 @@ async fn receive_host_control(
 
 /// Input is a lossy edge of a remote session. A single sample can become
 /// invalid while the controller is resizing, switching displays, or crossing
-/// a stale WebView event boundary. Report a stable reason without tearing down
-/// the host worker; the session tracker handles persistence and real recovery.
+/// a stale WebView event boundary. It must never tear down the host worker or
+/// make the host appear stopped; the next valid sample will continue normally.
 fn apply_input_event<B: crate::input::InputBackend>(
     input: &mut InputInjector<B>,
     event: InputEvent,
@@ -2946,6 +3836,70 @@ async fn send_input_state_loop(
     .await
 }
 
+async fn install_direct_connection(
+    slot: &Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    candidate: Arc<DirectLanConnection>,
+    enabled: &AtomicBool,
+) -> bool {
+    let outcome = {
+        let mut active = slot.lock().await;
+        if enabled.load(Ordering::Acquire) {
+            direct_path_slot::install(&mut active, candidate, DirectLanConnection::is_closed)
+        } else {
+            direct_path_slot::InstallOutcome::Retained {
+                rejected: candidate,
+            }
+        }
+    };
+    // No network close/drop while holding the path arbitration mutex.
+    match outcome {
+        direct_path_slot::InstallOutcome::Installed { retired } => {
+            if let Some(retired) = retired {
+                retired.close(b"desklink retired closed direct path");
+            }
+            true
+        }
+        direct_path_slot::InstallOutcome::Retained { rejected } => {
+            rejected.close(b"desklink direct path not selected");
+            false
+        }
+        direct_path_slot::InstallOutcome::AlreadyCurrent => true,
+    }
+}
+
+async fn stop_direct_listener(
+    session: &mut Option<Arc<DirectLanSession>>,
+    slot: &Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    enabled: &AtomicBool,
+    force_keyframe: &AtomicBool,
+    observer: &Option<HostMediaDiagnosticsObserver>,
+    stream_id: u64,
+) {
+    if session.take().is_none() {
+        return;
+    }
+    let retired = {
+        let mut active = slot.lock().await;
+        // Serializes with late successful probes: abort_all alone cannot stop
+        // a task already executing its installation step on another worker.
+        enabled.store(false, Ordering::Release);
+        active.take()
+    };
+    let retired_active = retired.is_some();
+    if let Some(connection) = retired {
+        connection.close(b"desklink direct listener closed");
+    }
+    force_keyframe.store(true, Ordering::Release);
+    media_diagnostics::emit(
+        observer,
+        HostMediaDiagnostic::DirectListenerStopped {
+            stream_id,
+            retired_active,
+            reason: DirectListenerStopReason::ListenerClosed,
+        },
+    );
+}
+
 async fn accept_host_direct_connection(
     session: Option<Arc<DirectLanSession>>,
     secure: SharedSecureSession,
@@ -2961,18 +3915,15 @@ async fn accept_host_direct_connection(
         let Ok(connection) = incoming else {
             continue;
         };
-        let accepted = {
-            let mut secure = secure.lock().await;
-            endpoint
-                .accept_probe_connection(
-                    connection,
-                    expected_candidate_id,
-                    &expected_binding,
-                    &mut secure,
-                    now_unix_s(),
-                )
-                .await
-        };
+        let accepted = endpoint
+            .accept_probe_connection_shared(
+                connection,
+                expected_candidate_id,
+                &expected_binding,
+                &secure,
+                now_unix_s(),
+            )
+            .await;
         if let Ok((connection, _)) = accepted {
             return Some(Arc::new(connection));
         }
@@ -3127,6 +4078,7 @@ async fn receive_transfer_loop_inner(
                     file,
                     cancellation: Arc::new(AtomicBool::new(false)),
                     phase: HostOutgoingPhase::AwaitingDecision,
+                    sender_task: None,
                 });
             }
             TransferMessage::FileSelectionCancel { request_id } => {
@@ -3219,7 +4171,7 @@ async fn receive_transfer_loop_inner(
                 let client = client.clone();
                 let secure = secure.clone();
                 let outgoing_events = outgoing_events.clone();
-                tokio::spawn(async move {
+                transfer.sender_task = Some(tokio::spawn(async move {
                     let result = stream_host_outgoing_file(
                         client,
                         secure,
@@ -3236,7 +4188,7 @@ async fn receive_transfer_loop_inner(
                             result,
                         })
                         .await;
-                });
+                }));
             }
             TransferMessage::FileChunk {
                 transfer_id,
@@ -3298,10 +4250,9 @@ async fn receive_transfer_loop_inner(
                 if incoming
                     .as_ref()
                     .is_some_and(|file| file.transfer_id() == transfer_id)
+                    && let Some(file) = incoming.take()
                 {
-                    if let Some(file) = incoming.take() {
-                        file.cancel();
-                    }
+                    file.cancel();
                 }
                 if outgoing
                     .as_ref()
@@ -3354,6 +4305,18 @@ struct HostOutgoingTransfer {
     file: OutgoingFile,
     cancellation: Arc<AtomicBool>,
     phase: HostOutgoingPhase,
+    sender_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HostOutgoingTransfer {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+        // Dropping the async receiver also wakes a disk producer blocked on
+        // the bounded chunk queue. Prefix scans observe cancellation per chunk.
+        if let Some(task) = self.sender_task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct HostOutgoingEvent {
@@ -3364,7 +4327,7 @@ struct HostOutgoingEvent {
 enum HostFileReadEvent {
     Chunk { offset: u64, bytes: Vec<u8> },
     Complete([u8; 32]),
-    Failed,
+    Failed(TransferResult),
 }
 
 async fn stream_host_outgoing_file(
@@ -3379,55 +4342,31 @@ async fn stream_host_outgoing_file(
     if resume_offset > file.size {
         return Err(TransferResult::InvalidData);
     }
-    let proof_path = file.path.clone();
-    tokio::task::spawn_blocking(move || {
-        verify_resume_prefix(&proof_path, resume_offset, resume_prefix_hash)
-    })
-    .await
-    .unwrap_or(Err(TransferResult::IoFailed))?;
     let (events, mut receiver) = mpsc::channel(2);
     let producer_cancellation = cancellation.clone();
-    let path = file.path.clone();
-    let size = file.size;
+    let source = file.clone();
     tokio::task::spawn_blocking(move || {
         let result = (|| {
-            let mut file = File::open(path).map_err(|_| ())?;
-            let mut hasher = Blake2s256::new();
-            let mut offset = 0_u64;
-            loop {
-                if producer_cancellation.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let mut bytes = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
-                let read = file.read(&mut bytes).map_err(|_| ())?;
-                if read == 0 {
-                    break;
-                }
-                bytes.truncate(read);
-                hasher.update(&bytes);
-                let end = offset.checked_add(read as u64).ok_or(())?;
-                if let Some((chunk_offset, bytes)) =
-                    chunk_after_resume(offset, bytes, resume_offset).map_err(|_| ())?
-                {
-                    events
-                        .blocking_send(HostFileReadEvent::Chunk {
-                            offset: chunk_offset,
-                            bytes,
-                        })
-                        .map_err(|_| ())?;
-                }
-                offset = end;
-            }
-            if offset != size {
-                return Err(());
+            // Prefix proof and complete-content hashing share one opened source
+            // and hasher. A retry no longer reads the prefix twice.
+            let mut reader = OutgoingFileReader::open(
+                &source,
+                resume_offset,
+                resume_prefix_hash,
+                producer_cancellation,
+            )?;
+            while let Some((offset, bytes)) = reader.read_chunk()? {
+                events
+                    .blocking_send(HostFileReadEvent::Chunk { offset, bytes })
+                    .map_err(|_| TransferResult::IoFailed)?;
             }
             events
-                .blocking_send(HostFileReadEvent::Complete(hasher.finalize().into()))
-                .map_err(|_| ())?;
-            Ok(())
+                .blocking_send(HostFileReadEvent::Complete(reader.finish()?))
+                .map_err(|_| TransferResult::IoFailed)?;
+            Ok::<(), TransferResult>(())
         })();
-        if result.is_err() {
-            let _ = events.blocking_send(HostFileReadEvent::Failed);
+        if let Err(error) = result {
+            let _ = events.blocking_send(HostFileReadEvent::Failed(error));
         }
     });
 
@@ -3445,7 +4384,7 @@ async fn stream_host_outgoing_file(
                 transfer_id: file.transfer_id,
                 content_hash,
             },
-            HostFileReadEvent::Failed => return Err(TransferResult::IoFailed),
+            HostFileReadEvent::Failed(error) => return Err(error),
         };
         let complete = matches!(message, TransferMessage::FileComplete { .. });
         tokio::time::timeout(
@@ -3482,24 +4421,70 @@ async fn send_cursor_loop(
     peer_generation: u64,
     stream_id: u64,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    observer: Option<HostMediaDiagnosticsObserver>,
 ) -> Result<(), HostRuntimeError> {
+    send_cursor_samples(stream_id, observer, |sequence| {
+        let desktop = lock_unpoisoned(&selected_desktop).desktop.rect;
+        let cursor = sample_cursor(desktop, stream_id, sequence);
+        let client = &client;
+        let secure = &secure;
+        async move {
+            let Some(cursor) = cursor else {
+                return Ok(None);
+            };
+            let plaintext = encode_cursor_update(&cursor)?;
+            let sent = client
+                .send_cursor_datagram_for_generation(
+                    peer_generation,
+                    seal(secure, SecureLane::CursorDatagram, &plaintext).await?,
+                )
+                .await;
+            Ok(Some(sent))
+        }
+    })
+    .await
+}
+
+async fn send_cursor_samples<F, Fut>(
+    stream_id: u64,
+    observer: Option<HostMediaDiagnosticsObserver>,
+    mut sample_and_send: F,
+) -> Result<(), HostRuntimeError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Result<(), TransportError>>, HostRuntimeError>>,
+{
     let mut interval = tokio::time::interval(CURSOR_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sequence = 0_u64;
+    let mut state = cursor_send::CursorSendState::default();
     loop {
+        if state.is_disabled() {
+            // QUIC capability/size limits are fixed for this peer. Park this
+            // optional future; connection closure is consumed by inbound.
+            return std::future::pending().await;
+        }
         interval.tick().await;
         sequence = sequence.wrapping_add(1).max(1);
-        let desktop = lock_unpoisoned(&selected_desktop).desktop.rect;
-        let Some(cursor) = sample_cursor(desktop, stream_id, sequence) else {
+        let Some(sent) = sample_and_send(sequence).await? else {
             continue;
         };
-        let plaintext = encode_cursor_update(&cursor)?;
-        client
-            .send_cursor_datagram_for_generation(
-                peer_generation,
-                seal(&secure, SecureLane::CursorDatagram, &plaintext).await?,
-            )
-            .await?;
+        let outcome = state.record(sent)?;
+        if outcome.should_report()
+            && let cursor_send::CursorSendOutcome::OptionalDisabled { reason, .. } = outcome
+        {
+            let snapshot = outcome.snapshot();
+            media_diagnostics::emit(
+                &observer,
+                HostMediaDiagnostic::CursorSend {
+                    stream_id,
+                    send_attempts: snapshot.send_attempts,
+                    send_errors: snapshot.send_errors,
+                    disabled: snapshot.disabled,
+                    reason,
+                },
+            );
+        }
     }
 }
 
@@ -3595,6 +4580,954 @@ mod retry_policy_tests {
 
     struct RejectingInputBackend(InputInjectionError);
 
+    use desklink_protocol::{
+        InputContext, InputEnvelope, InputEvent, decode_video_config, encode_input,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    type RecordedTopologyInputs = Arc<Mutex<Vec<(InputEvent, VirtualDesktop)>>>;
+
+    #[derive(Clone)]
+    struct RecordingTopologyInputBackend {
+        sent: RecordedTopologyInputs,
+        block_releases: Arc<AtomicBool>,
+    }
+
+    impl InputBackend for RecordingTopologyInputBackend {
+        fn send(
+            &mut self,
+            event: &InputEvent,
+            desktop: VirtualDesktop,
+        ) -> Result<(), InputInjectionError> {
+            if self.block_releases.load(Ordering::Acquire)
+                && matches!(
+                    event,
+                    InputEvent::Key { pressed: false, .. }
+                        | InputEvent::MouseButton { pressed: false, .. }
+                )
+            {
+                return Err(InputInjectionError::Blocked);
+            }
+            self.sent.lock().unwrap().push((event.clone(), desktop));
+            Ok(())
+        }
+    }
+
+    fn topology_pair() -> crate::capture::DisplayTopologySnapshot {
+        crate::capture::DisplayTopologySnapshot::new(
+            vec![
+                crate::capture::DisplayDescriptor {
+                    id: 7,
+                    name: "secondary".into(),
+                    rect: DesktopRect::new(-1280, 0, 1280, 720),
+                    primary: false,
+                },
+                crate::capture::DisplayDescriptor {
+                    id: 19,
+                    name: "primary".into(),
+                    rect: DesktopRect::new(0, 0, 1920, 1080),
+                    primary: true,
+                },
+            ],
+            7,
+            DesktopRect::new(-1280, 0, 3200, 1080),
+        )
+        .unwrap()
+    }
+
+    fn key_event(pressed: bool) -> InputEvent {
+        InputEvent::Key {
+            code: KeyCode::Character('a'),
+            pressed,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn test_encoded_frame(
+        frame_id: u64,
+        config_version: u32,
+        keyframe: bool,
+    ) -> crate::encoder::EncodedFrame {
+        crate::encoder::EncodedFrame {
+            frame_id,
+            config_version,
+            keyframe,
+            timestamp_us: frame_id * 1_000,
+            access_unit: vec![frame_id as u8; 2_500],
+            sequence_header: Some(vec![0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2]),
+        }
+    }
+
+    struct EpochFixture<'a> {
+        epochs: &'a super::InputEpochAllocator,
+        selected: Arc<Mutex<super::SelectedDesktop>>,
+        input: Arc<Mutex<InputInjector<RecordingTopologyInputBackend>>>,
+        suspended: Arc<AtomicBool>,
+        updates: tokio::sync::watch::Sender<u64>,
+        sent: RecordedTopologyInputs,
+        block_releases: Arc<AtomicBool>,
+        pipeline: super::HostVideoPipeline,
+        policy: super::HostInboundPolicy,
+        next_frame_id: u64,
+        #[cfg(windows)]
+        encoder: crate::encoder::H264Encoder,
+        #[cfg(not(windows))]
+        model_config_version: u32,
+    }
+
+    impl EpochFixture<'static> {
+        fn new() -> Self {
+            Self::with_epochs(super::process_input_epochs().unwrap())
+        }
+    }
+
+    impl<'a> EpochFixture<'a> {
+        fn with_epochs(epochs: &'a super::InputEpochAllocator) -> Self {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let block_releases = Arc::new(AtomicBool::new(false));
+            let (updates, _) = tokio::sync::watch::channel(0);
+            let fixture = Self {
+                epochs,
+                selected: Arc::new(Mutex::new(super::SelectedDesktop::unconfigured(9).unwrap())),
+                input: Arc::new(Mutex::new(InputInjector::with_backend(
+                    VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
+                    RecordingTopologyInputBackend {
+                        sent: sent.clone(),
+                        block_releases: block_releases.clone(),
+                    },
+                ))),
+                suspended: Arc::new(AtomicBool::new(false)),
+                updates,
+                sent,
+                block_releases,
+                pipeline: super::HostVideoPipeline::new(9),
+                policy: super::HostInboundPolicy::new(9),
+                next_frame_id: 1,
+                #[cfg(windows)]
+                encoder: crate::encoder::H264Encoder::new_with_settings_and_backend(
+                    1280,
+                    720,
+                    crate::encoder::H264EncoderSettings::default(),
+                    crate::encoder::EncoderBackendPreference::SoftwareOnly,
+                )
+                .unwrap(),
+                #[cfg(not(windows))]
+                model_config_version: 1,
+            };
+            assert!(
+                fixture
+                    .coordinator()
+                    .publish(topology_pair(), fixture.encoder_version())
+                    .unwrap()
+            );
+            fixture
+        }
+
+        fn coordinator(
+            &self,
+        ) -> super::CaptureDesktopCoordinator<'_, RecordingTopologyInputBackend> {
+            super::CaptureDesktopCoordinator {
+                selected: &self.selected,
+                input: &self.input,
+                epochs: self.epochs,
+                input_suspended: &self.suspended,
+                updates: &self.updates,
+            }
+        }
+
+        fn encoder_version(&self) -> u32 {
+            #[cfg(windows)]
+            {
+                self.encoder.config_version()
+            }
+            #[cfg(not(windows))]
+            {
+                self.model_config_version
+            }
+        }
+
+        fn reconfigure_encoder(&mut self, rect: DesktopRect) {
+            #[cfg(windows)]
+            self.encoder
+                .reconfigure_for_source(
+                    rect.width,
+                    rect.height,
+                    crate::encoder::H264EncoderSettings::default(),
+                )
+                .unwrap();
+            #[cfg(not(windows))]
+            {
+                // Portable policy tests have no Media Foundation backend. The
+                // native Windows fixture above uses the real encoder getter.
+                let _ = rect;
+                self.model_config_version = self.model_config_version.checked_add(1).unwrap();
+            }
+        }
+
+        fn publish_prepared(
+            &mut self,
+            topology: crate::capture::DisplayTopologySnapshot,
+        ) -> Result<bool, HostRuntimeError> {
+            self.reconfigure_encoder(topology.active_display().rect);
+            self.coordinator().publish(topology, self.encoder_version())
+        }
+
+        fn advance_codec_only(&mut self) {
+            let rect = self.selected.lock().unwrap().desktop.rect;
+            self.reconfigure_encoder(rect);
+        }
+
+        fn wire_context(&mut self) -> InputContext {
+            let selected = self.selected.lock().unwrap();
+            let context = selected.input_context().unwrap();
+            let rect = selected.desktop.rect;
+            drop(selected);
+            let frame = test_encoded_frame(self.next_frame_id, self.encoder_version(), true);
+            self.next_frame_id += 1;
+            let super::PrepareVideo::Ready(prepared) = self
+                .pipeline
+                .prepare(frame, rect.width, rect.height, context.input_epoch)
+                .unwrap()
+            else {
+                panic!("expected host video configuration");
+            };
+            let configuration =
+                decode_video_config(prepared.video_config.as_deref().expect("new configuration"))
+                    .unwrap();
+            // All strict-input tests take their identity from the real host
+            // pipeline's encoded/decoded VideoConfig, never a default epoch.
+            InputContext {
+                stream_id: configuration.stream_id,
+                input_epoch: configuration.input_epoch,
+            }
+        }
+
+        fn inject(&mut self, context: InputContext, sequence: u64, event: InputEvent) -> bool {
+            let envelope = InputEnvelope {
+                stream_id: context.stream_id,
+                input_epoch: context.input_epoch,
+                sequence,
+                timestamp_us: 1_000_000 + sequence,
+                event,
+            };
+            super::inject_desktop_input(
+                &mut self.policy,
+                &self.input,
+                &encode_input(&envelope).unwrap(),
+                1_000_000 + sequence,
+                &self.selected,
+                &self.suspended,
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn topology_publication_keeps_list_active_output_and_input_context_together() {
+        let mut fixture = EpochFixture::new();
+        let before = fixture.wire_context();
+        let current = fixture.coordinator().current().unwrap();
+        let surviving = current
+            .displays()
+            .iter()
+            .find(|display| display.id == 19)
+            .unwrap()
+            .clone();
+        let next = current
+            .refreshed(vec![surviving.clone()], surviving.rect)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(fixture.publish_prepared(next).unwrap());
+        let after = fixture.wire_context();
+        assert_ne!(before.input_epoch, after.input_epoch);
+        let published = fixture.selected.lock().unwrap();
+        assert_eq!(published.display_id, 19);
+        assert_eq!(published.desktop, VirtualDesktop::single(surviving.rect));
+        assert_eq!(published.input_context(), Some(after));
+        drop(published);
+        let (list, active) = super::selected_display_list(&fixture.selected).unwrap();
+        assert_eq!(active, 19);
+        assert_eq!(
+            (list.len(), list[0].id, list[0].width, list[0].height),
+            (1, 19, 1920, 1080)
+        );
+        assert!(!fixture.suspended.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn old_wire_releases_and_pending_samples_cannot_touch_new_epoch_or_reused_display() {
+        let mut fixture = EpochFixture::new();
+        let first_a = fixture.wire_context();
+        assert!(fixture.inject(first_a, 1, key_event(true)));
+        let b = fixture
+            .coordinator()
+            .current()
+            .unwrap()
+            .select(19)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.publish_prepared(b).unwrap());
+        let context_b = fixture.wire_context();
+        assert!(fixture.inject(context_b, 2, key_event(true)));
+        let before = fixture.sent.lock().unwrap().len();
+        let old_events = [
+            InputEvent::MouseMove {
+                x: 500_000,
+                y: 500_000,
+            },
+            key_event(true),
+            key_event(false),
+            InputEvent::Key {
+                code: KeyCode::Character('中'),
+                pressed: true,
+                modifiers: Modifiers::default(),
+            },
+            InputEvent::Key {
+                code: KeyCode::Character('中'),
+                pressed: false,
+                modifiers: Modifiers::default(),
+            },
+            InputEvent::MouseButton {
+                button: desklink_protocol::MouseButton::Left,
+                pressed: true,
+            },
+            InputEvent::MouseButton {
+                button: desklink_protocol::MouseButton::Left,
+                pressed: false,
+            },
+            InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 120,
+            },
+        ];
+        // Includes the key/button-up expansion used by a queued ReleaseAll.
+        for (index, event) in old_events.into_iter().enumerate() {
+            assert!(!fixture.inject(first_a, 1_000 + index as u64, event));
+        }
+        assert_eq!(fixture.sent.lock().unwrap().len(), before);
+        assert!(!fixture.inject(
+            InputContext {
+                stream_id: 8,
+                ..context_b
+            },
+            9_000,
+            key_event(false)
+        ));
+        // Rejected old high sequences must not poison current ordering either.
+        assert!(fixture.inject(context_b, 3, InputEvent::MouseMove { x: 100, y: 100 }));
+        let second_a = fixture
+            .coordinator()
+            .current()
+            .unwrap()
+            .select(7)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.publish_prepared(second_a).unwrap());
+        let second_a = fixture.wire_context();
+        assert_ne!(second_a, first_a);
+        assert_ne!(second_a, context_b);
+        assert!(fixture.inject(second_a, 4, key_event(true)));
+        let before = fixture.sent.lock().unwrap().len();
+        assert!(!fixture.inject(first_a, 2_000, key_event(false)));
+        assert!(!fixture.inject(context_b, 2_001, key_event(false)));
+        assert_eq!(fixture.sent.lock().unwrap().len(), before);
+        assert!(fixture.inject(second_a, 5, key_event(false)));
+    }
+
+    #[test]
+    fn metadata_and_media_configuration_versions_preserve_epoch_and_held_keys() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context();
+        let initial_anchor = fixture.selected.lock().unwrap().input_config_anchor;
+        assert!(fixture.inject(context, 1, key_event(true)));
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays[0].name = "updated source label".into();
+        displays[0].primary = true;
+        displays[1].primary = false;
+        let next = current
+            .refreshed(displays, current.virtual_desktop())
+            .unwrap()
+            .unwrap();
+        assert!(
+            fixture
+                .coordinator()
+                .publish(next, fixture.encoder_version())
+                .unwrap()
+        );
+        assert_eq!(
+            fixture.sent.lock().unwrap().len(),
+            1,
+            "metadata must not release a held key"
+        );
+        // Quality/profile changes advance codec config versions, not geometry
+        // epochs. Both identities come back from actual host VideoConfig bytes.
+        fixture.advance_codec_only();
+        assert_eq!(fixture.wire_context(), context);
+        assert_eq!(
+            fixture.selected.lock().unwrap().input_config_anchor,
+            initial_anchor
+        );
+        fixture.advance_codec_only();
+        assert_eq!(fixture.wire_context(), context);
+        assert_eq!(fixture.sent.lock().unwrap().len(), 1);
+        assert!(fixture.inject(context, 2, key_event(false)));
+    }
+
+    #[test]
+    fn same_dimensions_selection_and_virtual_origin_require_prepared_encoder_version() {
+        let mut fixture = EpochFixture::new();
+        let first = fixture.wire_context();
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays[1].rect = DesktopRect::new(0, 0, 1280, 720);
+        let same_size = current
+            .refreshed(displays, DesktopRect::new(-1280, 0, 2560, 720))
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.publish_prepared(same_size).unwrap());
+        let normalized = fixture.wire_context();
+        assert_ne!(normalized, first);
+        let current = fixture.coordinator().current().unwrap();
+        let selected = current.select(19).unwrap().unwrap();
+        assert_eq!(
+            current.active_display().rect.width,
+            selected.active_display().rect.width
+        );
+        assert_eq!(
+            current.active_display().rect.height,
+            selected.active_display().rect.height
+        );
+        let old_version = fixture.encoder_version();
+        assert!(fixture.coordinator().suspend());
+        assert_eq!(
+            fixture.coordinator().publish(selected.clone(), old_version),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+        assert_eq!(
+            fixture.selected.lock().unwrap().input_context(),
+            Some(normalized)
+        );
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(fixture.publish_prepared(selected).unwrap());
+        assert!(fixture.encoder_version() > old_version);
+        let selected_context = fixture.wire_context();
+        assert_ne!(selected_context, normalized);
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays[0].rect.left = -1400;
+        let origin_changed = current
+            .refreshed(displays, DesktopRect::new(-1400, 0, 2680, 720))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            origin_changed.active_display().rect,
+            current.active_display().rect
+        );
+        assert!(fixture.coordinator().suspend());
+        assert_eq!(
+            fixture
+                .coordinator()
+                .publish(origin_changed.clone(), fixture.encoder_version()),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+        assert!(fixture.publish_prepared(origin_changed).unwrap());
+        let shifted_context = fixture.wire_context();
+        assert_ne!(shifted_context, selected_context);
+        assert_eq!(
+            fixture
+                .coordinator()
+                .publish(fixture.coordinator().current().unwrap(), 0),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+        assert!(!fixture.inject(selected_context, 100, key_event(true)));
+        assert!(fixture.inject(shifted_context, 1, key_event(true)));
+    }
+
+    #[test]
+    fn encoder_version_exhaustion_ends_configuration_instead_of_retrying_or_wrapping() {
+        let failure = HostRuntimeError::Encoder(EncoderError::ConfigVersionExhausted);
+        assert!(!super::encoder_error_is_recoverable(
+            &EncoderError::ConfigVersionExhausted
+        ));
+        assert_eq!(
+            super::recoverable_configuration::<()>(Err(failure)),
+            Err(HostRuntimeError::Encoder(
+                EncoderError::ConfigVersionExhausted
+            ))
+        );
+        assert_eq!(
+            super::recoverable_configuration::<()>(Err(HostRuntimeError::Encoder(
+                EncoderError::Native("transient".into())
+            ))),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn invalidity_renewal_rotates_epoch_and_blocked_releases_keep_old_mapping_gated() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context();
+        assert!(fixture.inject(context, 1, key_event(true)));
+        fixture.block_releases.store(true, Ordering::Release);
+        let current = fixture.coordinator().current().unwrap();
+        let next = current.select(19).unwrap().unwrap();
+        assert!(!fixture.coordinator().suspend());
+        assert!(!fixture.publish_prepared(next).unwrap());
+        assert_eq!(
+            fixture.selected.lock().unwrap().input_context(),
+            Some(context)
+        );
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(fixture.suspended.load(Ordering::Acquire));
+        assert!(!fixture.inject(context, 2, key_event(true)));
+        fixture.block_releases.store(false, Ordering::Release);
+        // Restore the same physical display after an invalid interval. Identity
+        // still advances even though active ID and all geometry are unchanged.
+        assert!(
+            fixture
+                .publish_prepared(current.renewed().unwrap())
+                .unwrap()
+        );
+        let restored = fixture.wire_context();
+        assert_ne!(restored, context);
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(!fixture.inject(context, 1_000, key_event(false)));
+        assert!(fixture.inject(restored, 3, key_event(true)));
+    }
+
+    #[test]
+    fn input_epoch_allocator_never_wraps_or_reuses_an_exhausted_counter() {
+        let allocator = super::InputEpochAllocator::new();
+        assert_eq!(allocator.allocate().unwrap().get(), 1);
+        assert_eq!(allocator.allocate().unwrap().get(), 2);
+        allocator.0.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
+        assert_eq!(
+            allocator.allocate(),
+            Err(HostRuntimeError::InputEpochExhausted)
+        );
+        assert_eq!(
+            allocator.allocate(),
+            Err(HostRuntimeError::InputEpochExhausted)
+        );
+        assert_eq!(allocator.0.load(Ordering::Acquire), u64::MAX);
+        assert!(!super::host_error_is_retryable(
+            &HostRuntimeError::InputEpochExhausted
+        ));
+    }
+
+    #[test]
+    fn process_epoch_seed_is_full_width_fallible_and_never_redrawn_or_clamped() {
+        struct FixedRandom {
+            seed: u64,
+            fail: bool,
+            calls: usize,
+        }
+        impl rand_core::RngCore for FixedRandom {
+            fn next_u32(&mut self) -> u32 {
+                panic!("use fallible entropy only")
+            }
+            fn next_u64(&mut self) -> u64 {
+                panic!("use fallible entropy only")
+            }
+            fn fill_bytes(&mut self, _: &mut [u8]) {
+                panic!("use fallible entropy only")
+            }
+            fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand_core::Error> {
+                self.calls += 1;
+                if self.fail {
+                    return Err(rand_core::Error::from(
+                        std::num::NonZeroU32::new(rand_core::Error::CUSTOM_START).unwrap(),
+                    ));
+                }
+                destination.copy_from_slice(&self.seed.to_be_bytes());
+                Ok(())
+            }
+        }
+        let mut full_width = FixedRandom {
+            seed: u64::MAX,
+            fail: false,
+            calls: 0,
+        };
+        let allocator = super::InputEpochAllocator::from_rng(&mut full_width).unwrap();
+        assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
+        assert_eq!(
+            allocator.allocate(),
+            Err(HostRuntimeError::InputEpochExhausted)
+        );
+        assert_eq!(full_width.calls, 1);
+        let mut zero = FixedRandom {
+            seed: 0,
+            fail: false,
+            calls: 0,
+        };
+        assert!(matches!(
+            super::InputEpochAllocator::from_rng(&mut zero),
+            Err(super::InputEpochSeedError::Zero)
+        ));
+        assert_eq!(zero.calls, 1);
+        let mut failed = FixedRandom {
+            seed: 123,
+            fail: true,
+            calls: 0,
+        };
+        assert!(matches!(
+            super::InputEpochAllocator::from_rng(&mut failed),
+            Err(super::InputEpochSeedError::RandomUnavailable)
+        ));
+        assert_eq!(failed.calls, 1);
+        assert!(!super::host_error_is_retryable(
+            &HostRuntimeError::InputEpochZeroSeed
+        ));
+        assert!(!super::host_error_is_retryable(
+            &HostRuntimeError::InputEpochRandomUnavailable
+        ));
+    }
+
+    #[test]
+    fn new_process_seed_and_new_authenticated_attempt_reject_old_plaintext_with_same_stream_id() {
+        let old_process = super::InputEpochAllocator::from_seed(9_007_199_254_740_993).unwrap();
+        let new_process = super::InputEpochAllocator::from_seed(18_014_398_509_481_987).unwrap();
+        let mut old = EpochFixture::with_epochs(&old_process);
+        let old_context = old.wire_context();
+        assert_eq!(old_context.input_epoch, 9_007_199_254_740_993);
+        let mut restarted = EpochFixture::with_epochs(&new_process);
+        let new_context = restarted.wire_context();
+        assert_eq!(new_context.input_epoch, 18_014_398_509_481_987);
+        assert_eq!(old_context.stream_id, new_context.stream_id);
+        assert!(!restarted.inject(old_context, 100, key_event(true)));
+        assert!(restarted.inject(new_context, 1, key_event(true)));
+        let mut new_attempt = EpochFixture::with_epochs(&new_process);
+        let next_context = new_attempt.wire_context();
+        assert_eq!(next_context.input_epoch, new_context.input_epoch + 1);
+        assert!(!new_attempt.inject(old_context, 100, key_event(true)));
+        assert!(!new_attempt.inject(new_context, 101, key_event(false)));
+        assert!(new_attempt.inject(next_context, 1, key_event(true)));
+    }
+
+    #[test]
+    fn buffered_old_encoder_output_cannot_be_relabelled_with_new_geometry_epoch() {
+        let mut fixture = EpochFixture::new();
+        let old_context = fixture.wire_context();
+        let old_version = fixture.encoder_version();
+        let mut bindings = super::FrameInputContexts::default();
+        assert!(bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 41,
+                config_version: old_version,
+                ..Default::default()
+            },
+            old_context
+        ));
+        // The native MFT buffers frame 41. Switch geometry before it returns.
+        let next = fixture
+            .coordinator()
+            .current()
+            .unwrap()
+            .select(19)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.publish_prepared(next).unwrap());
+        let new_version = fixture.encoder_version();
+        assert!(new_version > old_version);
+        let captured_new_context = fixture.selected.lock().unwrap().input_context().unwrap();
+        assert!(bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 42,
+                config_version: new_version,
+                ..Default::default()
+            },
+            captured_new_context
+        ));
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(41, old_version, true)),
+            None
+        );
+        // Even a buggy old output with a current config number cannot inherit
+        // the new sample's identity just because encode() returned it now.
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(41, new_version, true)),
+            None
+        );
+        let output = test_encoded_frame(42, new_version, true);
+        let encoded_context = bindings.take_output(&output).unwrap();
+        let super::PrepareVideo::Ready(prepared) = fixture
+            .pipeline
+            .prepare(output, 1920, 1080, encoded_context.input_epoch)
+            .unwrap()
+        else {
+            panic!("new frame must produce configuration");
+        };
+        let configuration = decode_video_config(prepared.video_config.as_deref().unwrap()).unwrap();
+        assert_eq!(configuration.config_version, new_version);
+        let actual_wire_context = InputContext {
+            stream_id: configuration.stream_id,
+            input_epoch: configuration.input_epoch,
+        };
+        assert_eq!(actual_wire_context, captured_new_context);
+        assert_ne!(actual_wire_context, old_context);
+        assert!(!fixture.inject(old_context, 100, key_event(true)));
+        assert!(fixture.inject(actual_wire_context, 1, key_event(true)));
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(42, new_version, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn buffered_outputs_keep_submission_identity_and_context_storage_is_bounded() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context();
+        let mut bindings = super::FrameInputContexts::default();
+        for frame_id in [41, 42] {
+            assert!(bindings.record_submission(
+                crate::encoder::EncoderPerformanceSample {
+                    frame_id,
+                    config_version: 1,
+                    ..Default::default()
+                },
+                context
+            ));
+        }
+        // A normal delayed output remains legal within the same epoch.
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(41, 1, true)),
+            Some(context)
+        );
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(42, 1, false)),
+            Some(context)
+        );
+        for frame_id in 1..=super::FrameInputContexts::CAPACITY as u64 {
+            assert!(bindings.record_submission(
+                crate::encoder::EncoderPerformanceSample {
+                    frame_id,
+                    config_version: 1,
+                    ..Default::default()
+                },
+                context
+            ));
+        }
+        assert!(!bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 100,
+                config_version: 1,
+                ..Default::default()
+            },
+            context
+        ));
+        assert!(bindings.pending.is_empty());
+        assert!(bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 101,
+                config_version: 1,
+                ..Default::default()
+            },
+            context
+        ));
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(101, 1, true)),
+            Some(context)
+        );
+    }
+
+    #[test]
+    fn input_exit_releases_pressed_state_while_capture_retains_its_injector_arc() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context();
+        assert!(fixture.inject(context, 1, key_event(true)));
+        let capture_input = fixture.input.clone();
+        let exit = super::HostInputExitGuard {
+            selected: fixture.selected.clone(),
+            input: fixture.input.clone(),
+            input_suspended: fixture.suspended.clone(),
+        };
+        drop(exit);
+        assert_eq!(Arc::strong_count(&capture_input), 2);
+        assert_eq!(
+            fixture.sent.lock().unwrap().last().unwrap().0,
+            key_event(false)
+        );
+        assert!(!fixture.inject(context, 2, key_event(true)));
+        assert!(
+            !fixture
+                .coordinator()
+                .publish(
+                    fixture.coordinator().current().unwrap().renewed().unwrap(),
+                    fixture.encoder_version()
+                )
+                .unwrap()
+        );
+        assert!(fixture.suspended.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn topology_publication_lock_remains_held_through_context_check_and_injection() {
+        struct BlockingBackend {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl InputBackend for BlockingBackend {
+            fn send(
+                &mut self,
+                _: &InputEvent,
+                _: VirtualDesktop,
+            ) -> Result<(), InputInjectionError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context();
+        let selected = fixture.selected.clone();
+        let desktop = selected.lock().unwrap().desktop;
+        let (entered, wait_entered) = std::sync::mpsc::sync_channel(0);
+        let (release, wait_release) = std::sync::mpsc::sync_channel(0);
+        let inject = std::thread::spawn({
+            let selected = selected.clone();
+            move || {
+                let input = Mutex::new(InputInjector::with_backend(
+                    desktop,
+                    BlockingBackend {
+                        entered,
+                        release: wait_release,
+                    },
+                ));
+                let suspended = AtomicBool::new(false);
+                let mut policy = super::HostInboundPolicy::new(context.stream_id);
+                let envelope = InputEnvelope {
+                    stream_id: context.stream_id,
+                    input_epoch: context.input_epoch,
+                    sequence: 1,
+                    timestamp_us: 1_000,
+                    event: InputEvent::MouseMove { x: 100, y: 100 },
+                };
+                super::inject_desktop_input(
+                    &mut policy,
+                    &input,
+                    &encode_input(&envelope).unwrap(),
+                    1_000,
+                    &selected,
+                    &suspended,
+                )
+                .unwrap()
+            }
+        });
+        wait_entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            selected.try_lock().is_err(),
+            "publication must wait for the complete sample"
+        );
+        release.send(()).unwrap();
+        assert!(inject.join().unwrap());
+        assert!(selected.try_lock().is_ok());
+    }
+
+    #[test]
+    fn mapped_input_feedback_ignores_stale_suspended_and_release_only_samples() {
+        struct PermissionBackend(Arc<AtomicBool>);
+        impl InputBackend for PermissionBackend {
+            fn send(
+                &mut self,
+                _event: &InputEvent,
+                _desktop: VirtualDesktop,
+            ) -> Result<(), InputInjectionError> {
+                if self.0.load(Ordering::Acquire) {
+                    Err(InputInjectionError::Blocked)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let context = InputContext {
+            stream_id: 9,
+            input_epoch: 100,
+        };
+        let selected = Mutex::new(super::SelectedDesktop::from_snapshot(
+            topology_pair(),
+            super::NonZeroU64::new(context.stream_id).unwrap(),
+            super::NonZeroU64::new(context.input_epoch).unwrap(),
+            super::NonZeroU32::new(1).unwrap(),
+        ));
+        let blocked = Arc::new(AtomicBool::new(true));
+        let input = Mutex::new(InputInjector::with_backend(
+            selected.lock().unwrap().desktop,
+            PermissionBackend(blocked.clone()),
+        ));
+        let suspended = AtomicBool::new(false);
+        let mut policy = super::HostInboundPolicy::new(context.stream_id);
+        let mut tracker = crate::input_restriction::InputRestrictionTracker::default();
+        let (updates, mut states) = tokio::sync::watch::channel(None);
+        let mut inject = |captured: InputContext, sequence: u64, event: InputEvent| {
+            let envelope = InputEnvelope {
+                stream_id: captured.stream_id,
+                input_epoch: captured.input_epoch,
+                sequence,
+                timestamp_us: 1_000,
+                event,
+            };
+            super::inject_desktop_input_with_feedback(
+                &mut policy,
+                &input,
+                &encode_input(&envelope).unwrap(),
+                1_000,
+                &selected,
+                &suspended,
+                |event, failure| {
+                    if let Some(state) = tracker.observe(event, failure) {
+                        updates.send_replace(state);
+                    }
+                },
+            )
+            .unwrap()
+        };
+        for sequence in 1..=3 {
+            assert!(inject(context, sequence, key_event(true)));
+        }
+        assert_eq!(
+            *states.borrow_and_update(),
+            Some(desklink_protocol::InputRestrictionReason::Blocked)
+        );
+        blocked.store(false, Ordering::Release);
+        assert!(!inject(
+            InputContext {
+                input_epoch: 99,
+                ..context
+            },
+            100,
+            key_event(true)
+        ));
+        suspended.store(true, Ordering::Release);
+        assert!(!inject(context, 4, key_event(true)));
+        suspended.store(false, Ordering::Release);
+        assert!(inject(context, 5, key_event(false)));
+        assert!(
+            !states.has_changed().unwrap(),
+            "cleanup and unadmitted samples cannot prove recovery"
+        );
+        assert!(inject(context, 6, key_event(true)));
+        assert_eq!(
+            *states.borrow_and_update(),
+            None,
+            "a real admitted same-class input proves recovery"
+        );
+    }
+
     impl InputBackend for RejectingInputBackend {
         fn send(
             &mut self,
@@ -3603,6 +5536,220 @@ mod retry_policy_tests {
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn bitrate_waits_for_late_verified_native_completion_instead_of_inventing_rejection() {
+        let (commands, received) = std::sync::mpsc::sync_channel(1);
+        let mut queue = super::ConfigurationQueue::default();
+        queue.request(super::ConfigurationAction::SetVideoBitrate(12_000_000));
+        let mut pending = Some(super::start_configuration(
+            commands,
+            queue.pop_next().unwrap(),
+        ));
+        tokio::select! {
+            _ = super::next_configuration(&mut pending) => panic!("must await native worker"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        let super::CaptureWorkerCommand::SetVideoBitrate { bitrate, reply } =
+            received.try_recv().unwrap()
+        else {
+            panic!("wrong command")
+        };
+        let native = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
+            reply.send(Some(bitrate)).unwrap();
+        });
+        let (_, applied) = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            super::next_configuration(&mut pending),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            applied,
+            super::ConfigurationApplied::Bitrate(Some(12_000_000))
+        ));
+        native.await.unwrap();
+    }
+
+    #[test]
+    fn preset_or_profile_work_invalidates_old_rate_intent_and_blocks_new_rate_observations() {
+        use super::{ConfigurationAction as Action, ConfigurationQueue};
+        let mut queue = ConfigurationQueue::default();
+        let mut rate = super::AdaptiveBitrate::new(VideoQualityPreset::Sharp);
+        rate.observe(90, 10, 1, 0);
+        let target = rate.observe(90, 10, 1, 0).unwrap();
+        queue.request(Action::SetVideoBitrate(target));
+        let old_rate = queue.pop_next().unwrap();
+        super::queue_media_configuration(
+            &mut queue,
+            &mut rate,
+            Action::SetVideoProfile(desklink_protocol::H264Profile::High),
+        );
+        assert!(!queue.is_current(&old_rate));
+        assert!(super::configuration_blocks_bitrate(&queue, &None));
+        let (commands, _received) = std::sync::mpsc::sync_channel(4);
+        let profile = queue.pop_next().unwrap();
+        let pending = Some(super::start_configuration(commands, profile));
+        assert!(super::configuration_blocks_bitrate(&queue, &pending));
+        assert_eq!(rate.observe(90, 10, 1, 0), None);
+        drop(pending);
+        rate.reset_to_actual(VideoQualityPreset::Sharp, 14_400_000);
+        assert!(rate.should_recover_rate_first(1000, 0, 1, 0));
+        super::queue_media_configuration(
+            &mut queue,
+            &mut rate,
+            Action::SetVideoQuality(VideoQualityPreset::Balanced),
+        );
+        assert!(super::configuration_blocks_bitrate(&queue, &None));
+    }
+
+    #[test]
+    fn bitrate_feedback_keeps_manual_quality_and_render_pressure_out_of_rate_adaptation() {
+        let mut policy = super::AdaptiveBitrate::new(VideoQualityPreset::Sharp);
+        for preference in [
+            VideoQualityPreference::Smooth,
+            VideoQualityPreference::Balanced,
+            VideoQualityPreference::Sharp,
+        ] {
+            for _ in 0..100 {
+                assert_eq!(
+                    super::bitrate_feedback_decision(preference, &mut policy, 80, 20, 1, 0),
+                    (None, false)
+                );
+            }
+        }
+        assert_eq!(policy.current(), policy.max());
+        assert_eq!(
+            super::bitrate_feedback_decision(
+                VideoQualityPreference::Automatic,
+                &mut policy,
+                80,
+                20,
+                5,
+                0
+            ),
+            (None, false)
+        );
+        assert_eq!(
+            super::bitrate_feedback_decision(
+                VideoQualityPreference::Automatic,
+                &mut policy,
+                80,
+                20,
+                1,
+                0
+            ),
+            (None, true)
+        );
+        assert!(
+            super::bitrate_feedback_decision(
+                VideoQualityPreference::Automatic,
+                &mut policy,
+                80,
+                20,
+                1,
+                0
+            )
+            .0
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn outgoing_peer_drop_cancels_source_and_wakes_blocked_disk_producer() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (chunks, receiver) = tokio::sync::mpsc::channel(2);
+        chunks.try_send(1).unwrap();
+        chunks.try_send(2).unwrap();
+        let sender_task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(receiver);
+        });
+        // Ensure the sender owns the receiver before cancelling the peer.
+        tokio::task::yield_now().await;
+        let (started, reached) = tokio::sync::oneshot::channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            chunks.blocking_send(3)
+        });
+        reached.await.unwrap();
+        assert!(
+            !producer.is_finished(),
+            "full live queue must backpressure the producer"
+        );
+        let outgoing = super::HostOutgoingTransfer {
+            request_id: 1,
+            file: crate::transfer::OutgoingFile {
+                transfer_id: [1; 16],
+                path: "synthetic.bin".into(),
+                name: "synthetic.bin".into(),
+                size: 1,
+                modified_at_unix_ns: 0,
+            },
+            cancellation: cancelled.clone(),
+            phase: super::HostOutgoingPhase::Sending,
+            sender_task: Some(sender_task),
+        };
+        drop(outgoing);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), producer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_configuration_coalesces_new_requests_without_restarting_in_flight_work() {
+        use super::{ConfigurationAction as Action, ConfigurationQueue};
+        let (commands, received) = std::sync::mpsc::sync_channel(4);
+        let mut queue = ConfigurationQueue::default();
+        queue.request(Action::SelectDisplay(1));
+        let first = queue.pop_next().unwrap();
+        let mut pending = Some(super::start_configuration(commands.clone(), first));
+        // Poll the actual production future until it has queued its native
+        // command and is waiting for the slow worker's response.
+        tokio::select! {
+            result = super::next_configuration(&mut pending) => panic!("unexpected completion: {}", result.is_ok()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+        }
+        let super::CaptureWorkerCommand::SelectDisplay { display_id, reply } =
+            received.try_recv().unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(display_id, 1);
+        for id in 2..=1000 {
+            queue.request(Action::SelectDisplay(id));
+        }
+        assert!(received.try_recv().is_err());
+        reply.send(true).unwrap();
+        let (completed, _) = super::next_configuration(&mut pending).await.unwrap();
+        assert!(!queue.is_current(&completed));
+        let latest = queue.pop_next().unwrap();
+        assert_eq!(latest.action, Action::SelectDisplay(1000));
+        assert!(queue.pop_next().is_none());
+        pending = Some(super::start_configuration(commands, latest));
+        tokio::select! {
+            _ = super::next_configuration(&mut pending) => panic!("must await worker"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+        }
+        let super::CaptureWorkerCommand::SelectDisplay { display_id, reply } =
+            received.try_recv().unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(display_id, 1000);
+        drop(pending);
+        assert!(
+            reply.send(true).is_err(),
+            "cancelled peer must discard late configuration completion"
+        );
     }
 
     #[tokio::test]
@@ -3637,6 +5784,34 @@ mod retry_policy_tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[test]
+    fn buffered_keyframe_recovery_can_submit_again_on_an_idle_desktop() {
+        let now = Instant::now();
+        let requested = std::sync::atomic::AtomicBool::new(true);
+        let mut recovery = super::StaticKeyframeRecovery::default();
+        assert!(recovery.snapshot_due(requested.load(std::sync::atomic::Ordering::Acquire), now));
+        let request_keyframe = requested.swap(false, std::sync::atomic::Ordering::AcqRel);
+        assert!(request_keyframe);
+        recovery.encoder_buffered_output(&requested, request_keyframe, true);
+        assert!(!recovery.snapshot_due(requested.load(std::sync::atomic::Ordering::Acquire), now));
+        assert!(recovery.snapshot_due(
+            requested.load(std::sync::atomic::Ordering::Acquire),
+            now + super::STATIC_KEYFRAME_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn static_keyframe_recovery_is_request_driven_and_rate_limited() {
+        let now = Instant::now();
+        let mut recovery = super::StaticKeyframeRecovery::default();
+        assert!(!recovery.snapshot_due(false, now));
+        assert!(recovery.snapshot_due(true, now));
+        assert!(!recovery.snapshot_due(true, now));
+        assert!(!recovery.snapshot_due(true, now + std::time::Duration::from_millis(249)));
+        assert!(recovery.snapshot_due(true, now + super::STATIC_KEYFRAME_INTERVAL));
+        assert!(!recovery.snapshot_due(false, now + std::time::Duration::from_secs(10)));
     }
 
     #[test]
@@ -4119,3 +6294,7 @@ mod session_control_tests;
 #[cfg(test)]
 #[path = "protocol_rejection_tests.rs"]
 mod protocol_rejection_tests;
+
+#[cfg(test)]
+#[path = "windows_joint_tests.rs"]
+mod windows_joint_tests;

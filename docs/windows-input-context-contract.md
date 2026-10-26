@@ -8,4 +8,4 @@ Rust 和 wire 使用 `InputContext { stream_id: u64, input_epoch: u64 }`。Windo
 
 Native 使用一个拥有 InputSender 的输入 future，沿原有有界命令队列回压；媒体、配置和会话取消继续在同一 select 被处理。当前完整输入帧发送后才检查是否继续文字/粘贴序列，避免取消半个可靠消息。失效 pair 属于本地操作取消，不变成远端权限限制或重连。粘贴等待远端 ACK 后仍使用原 pair，并保持 busy 到 Ctrl+V 序列完成。
 
-自动验证覆盖真实绘制入口的调度与可见门禁、实际 IPC 参数、完整 u64、队列背压、新配置在输入 pending 时被消费，以及加密输入序号和上下文。它不能证明浏览器合成器或物理屏幕已经呈现。主机真实 epoch 分配/发布及两端整合、WebView 呈现、双机拓扑/输入法和硬件验收仍保留未完成。
+自动验证覆盖真实绘制入口的调度与可见门禁、实际 IPC 参数、完整 u64、队列背压、新配置在输入 pending 时被消费，以及加密输入序号和上下文。联合回归另以真实 SoftwareOnly MFT 编码合成 BGRA，由 HostVideoPipeline 发布配置和 IDR，经 localhost QUIC/Noise 到 ControllerRuntime，再将捕获的 context 加密发送回 Host 映射门禁和记录后端；覆盖同尺寸切屏、新 Noise 会话及旧 release 拒绝。它不能证明浏览器合成器或物理屏幕已经呈现。真实 WebView 呈现、双机拓扑/输入法、FFI Mac Host epoch 接线和硬件验收仍保留未完成。联合证据见 `windows-joint-integration.md`。

@@ -175,6 +175,11 @@ impl IncomingFileWorker {
                     file.resume_prefix_hash(),
                 );
                 if ready.send(Ok(metadata)).is_err() {
+                    // Initialization may finish after the awaiting create
+                    // future is cancelled. Keep an existing validated prefix
+                    // just as on a later transport disconnect; cleanup and
+                    // permit release must stay on this disk thread.
+                    let _ = file.preserve();
                     return;
                 }
                 while let Some(command) = pending.blocking_recv() {
@@ -306,6 +311,141 @@ pub struct OutgoingFile {
     pub modified_at_unix_ns: u64,
 }
 
+/// One opened source and one incremental hash for both resume proof and final
+/// integrity. The already verified prefix is never read a second time.
+/// All methods perform blocking IO and must run on a file producer thread.
+pub struct OutgoingFileReader {
+    file: File,
+    hasher: Blake2s256,
+    offset: u64,
+    expected_size: u64,
+    modified_at_unix_ns: u64,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl OutgoingFileReader {
+    pub fn open(
+        source: &OutgoingFile,
+        resume_offset: u64,
+        expected_prefix_hash: Option<[u8; 32]>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, TransferResult> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(TransferResult::Cancelled);
+        }
+        if resume_offset > source.size || (resume_offset == 0) != expected_prefix_hash.is_none() {
+            return Err(TransferResult::InvalidData);
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Hold a stable source snapshot: another Windows handle cannot
+            // modify, replace, or truncate this file while it is being sent.
+            options.share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0);
+        }
+        let file = options
+            .open(&source.path)
+            .map_err(|_| TransferResult::IoFailed)?;
+        let mut reader = Self {
+            file,
+            hasher: Blake2s256::new(),
+            offset: 0,
+            expected_size: source.size,
+            modified_at_unix_ns: source.modified_at_unix_ns,
+            cancellation,
+        };
+        reader.check_source()?;
+        let mut buffer = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
+        while reader.offset < resume_offset {
+            reader.check_cancelled()?;
+            let limit = usize::try_from((resume_offset - reader.offset).min(buffer.len() as u64))
+                .map_err(|_| TransferResult::InvalidData)?;
+            let read = reader
+                .file
+                .read(&mut buffer[..limit])
+                .map_err(|_| TransferResult::IoFailed)?;
+            if read == 0 {
+                return Err(TransferResult::SourceChanged);
+            }
+            reader.hasher.update(&buffer[..read]);
+            reader.offset += read as u64;
+        }
+        if let Some(expected) = expected_prefix_hash {
+            let actual: [u8; 32] = reader.hasher.clone().finalize().into();
+            if expected != actual {
+                return Err(TransferResult::SourceChanged);
+            }
+        }
+        reader.check_cancelled()?;
+        Ok(reader)
+    }
+
+    pub fn read_chunk(&mut self) -> Result<Option<(u64, Vec<u8>)>, TransferResult> {
+        self.check_cancelled()?;
+        if self.offset == self.expected_size {
+            return Ok(None);
+        }
+        let limit = usize::try_from(
+            (self.expected_size - self.offset).min(MAX_TRANSFER_CHUNK_BYTES as u64),
+        )
+        .map_err(|_| TransferResult::InvalidData)?;
+        let mut bytes = vec![0_u8; limit];
+        let read = self
+            .file
+            .read(&mut bytes)
+            .map_err(|_| TransferResult::IoFailed)?;
+        if read == 0 {
+            return Err(TransferResult::SourceChanged);
+        }
+        bytes.truncate(read);
+        let offset = self.offset;
+        self.offset += read as u64;
+        self.hasher.update(&bytes);
+        Ok(Some((offset, bytes)))
+    }
+
+    pub fn finish(self) -> Result<[u8; 32], TransferResult> {
+        self.check_cancelled()?;
+        if self.offset != self.expected_size {
+            return Err(TransferResult::InvalidData);
+        }
+        self.check_source()?;
+        Ok(self.hasher.finalize().into())
+    }
+
+    fn check_cancelled(&self) -> Result<(), TransferResult> {
+        if self.cancellation.load(Ordering::Acquire) {
+            Err(TransferResult::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_source(&self) -> Result<(), TransferResult> {
+        let metadata = self.file.metadata().map_err(|_| TransferResult::IoFailed)?;
+        if !metadata.is_file()
+            || metadata.len() != self.expected_size
+            || (self.modified_at_unix_ns != 0
+                && modified_at_unix_ns(&metadata) != self.modified_at_unix_ns)
+        {
+            Err(TransferResult::SourceChanged)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn modified_at_unix_ns(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
 pub fn prepare_outgoing_file(path: PathBuf) -> Result<OutgoingFile, TransferResult> {
     let metadata = fs::metadata(&path).map_err(|_| TransferResult::IoFailed)?;
     if !metadata.is_file() {
@@ -330,12 +470,7 @@ pub fn prepare_outgoing_file(path: PathBuf) -> Result<OutgoingFile, TransferResu
         path,
         name,
         size: metadata.len(),
-        modified_at_unix_ns: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
-            .unwrap_or(0),
+        modified_at_unix_ns: modified_at_unix_ns(&metadata),
     })
 }
 
@@ -542,6 +677,24 @@ impl IncomingFile {
         directory: PathBuf,
         destination_directory: PathBuf,
     ) -> Result<Self, TransferResult> {
+        Self::create_in_with_open_hook(
+            transfer_id,
+            name,
+            expected_size,
+            directory,
+            destination_directory,
+            || {},
+        )
+    }
+
+    fn create_in_with_open_hook(
+        transfer_id: TransferId,
+        name: String,
+        expected_size: u64,
+        directory: PathBuf,
+        destination_directory: PathBuf,
+        after_open: impl FnOnce(),
+    ) -> Result<Self, TransferResult> {
         if !is_valid_transfer_file_name(&name) {
             return Err(TransferResult::InvalidData);
         }
@@ -556,7 +709,10 @@ impl IncomingFile {
             .create_new(true)
             .open(&temporary_path)
         {
-            Ok(file) => (file, 0),
+            Ok(file) => {
+                after_open();
+                (file, 0)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let metadata =
                     fs::symlink_metadata(&temporary_path).map_err(|_| TransferResult::IoFailed)?;
@@ -576,6 +732,7 @@ impl IncomingFile {
                     let _ = fs::remove_file(&temporary_path);
                     return Err(TransferResult::InvalidData);
                 }
+                after_open();
                 let mut buffer = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
                 loop {
                     let read = file
@@ -1063,10 +1220,10 @@ fn human_size(bytes: u64) -> String {
 mod tests {
     use super::{
         INCOMING_DISK_QUEUE_CAPACITY, IncomingDiskCommand, IncomingFile, IncomingFileWorker,
-        MIN_FREE_SPACE_AFTER_RECEIVE, STALE_INCOMING_FILE_AGE, chunk_after_resume,
-        cleanup_stale_incoming_files, discard_incoming_resume_in, incoming_staging_directory,
-        incoming_temporary_path, prepare_outgoing_file, receive_capacity_is_sufficient,
-        verify_resume_prefix,
+        MIN_FREE_SPACE_AFTER_RECEIVE, OutgoingFileReader, STALE_INCOMING_FILE_AGE,
+        chunk_after_resume, cleanup_stale_incoming_files, discard_incoming_resume_in,
+        incoming_staging_directory, incoming_temporary_path, prepare_outgoing_file,
+        receive_capacity_is_sufficient, verify_resume_prefix,
     };
     use blake2::{Blake2s256, Digest};
     use desklink_protocol::{MAX_TRANSFER_FILE_BYTES, TransferResult};
@@ -1075,6 +1232,11 @@ mod tests {
         path::PathBuf,
         time::{Duration, SystemTime},
     };
+
+    // Worker tests share the production process-wide eight-thread admission
+    // budget. Serialize these fixtures while unrelated library tests stay
+    // parallel, so resource contention is not mistaken for an IO failure.
+    static DISK_WORKER_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn roots(test: &str) -> (PathBuf, PathBuf, PathBuf) {
         let nonce = SystemTime::now()
@@ -1090,8 +1252,404 @@ mod tests {
         (root, staging, downloads)
     }
 
+    struct DiskThreadExit(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DiskThreadExit {
+        fn drop(&mut self) {
+            if let Some(exit) = self.0.take() {
+                let _ = exit.send(());
+            }
+        }
+    }
+
+    fn disk_thread_exit_notice() -> (impl Fn() + Send, tokio::sync::oneshot::Receiver<()>) {
+        let (exit, exited) = tokio::sync::oneshot::channel();
+        let notice = DiskThreadExit(Some(exit));
+        (
+            move || {
+                let _ = &notice;
+            },
+            exited,
+        )
+    }
+
+    async fn abandon_opening_worker(
+        transfer_id: [u8; 16],
+        expected_size: u64,
+        staging: &std::path::Path,
+        downloads: &std::path::Path,
+    ) {
+        use std::{
+            future::Future,
+            sync::{Arc, Condvar, Mutex},
+            task::Poll,
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let worker_staging = staging.to_owned();
+                let worker_downloads = downloads.to_owned();
+                let gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let worker_gate = gate.clone();
+                let (entered, opened) = tokio::sync::oneshot::channel();
+                let (before_write, mut exited) = disk_thread_exit_notice();
+                let mut creating = Box::pin(IncomingFileWorker::spawn_with(
+                    move || {
+                        IncomingFile::create_in_with_open_hook(
+                            transfer_id,
+                            "initializing.bin".to_owned(),
+                            expected_size,
+                            worker_staging,
+                            worker_downloads,
+                            move || {
+                                let _ = entered.send(());
+                                let (lock, wake) = &*worker_gate;
+                                let mut open = lock.lock().unwrap();
+                                while !*open {
+                                    open = wake.wait(open).unwrap();
+                                }
+                            },
+                        )
+                    },
+                    before_write,
+                ));
+                let initial =
+                    std::future::poll_fn(|cx| Poll::Ready(creating.as_mut().poll(cx))).await;
+                if matches!(initial, Poll::Ready(Err(TransferResult::Busy))) {
+                    // Other worker tests can temporarily use all eight slots.
+                    drop(creating);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    continue;
+                }
+                assert!(matches!(initial, Poll::Pending));
+                opened.await.unwrap();
+                assert_eq!(
+                    exited.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                );
+                assert!(matches!(
+                    IncomingFile::create_in(
+                        transfer_id,
+                        "initializing.bin".to_owned(),
+                        expected_size,
+                        staging.to_owned(),
+                        downloads.to_owned(),
+                    ),
+                    Err(TransferResult::Busy)
+                ));
+                // This is the real opened.await future, not a synthetic ready
+                // channel: cancellation happens while the disk thread owns an
+                // open file and has not yet hashed its existing prefix.
+                drop(creating);
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_one();
+                // before_write remains owned by the worker closure; its exit
+                // notice drops after local file and worker-permit cleanup.
+                exited.await.unwrap();
+                break;
+            }
+        })
+        .await
+        .expect("cancelled initialization must eventually release its worker");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_creation_preserves_verified_prefix_and_releases_worker_and_path_ownership() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("cancel-create-resume");
+        let transfer_id = [29; 16];
+        let partial = incoming_temporary_path(&staging, transfer_id);
+        let mut first = IncomingFile::create_in(
+            transfer_id,
+            "initializing.bin".to_owned(),
+            8,
+            staging.clone(),
+            downloads.clone(),
+        )
+        .unwrap();
+        first.write_chunk(0, b"desk").unwrap();
+        first.preserve().unwrap();
+        // More cancellations than the worker cap prove cancelled initialization
+        // does not retain a thread slot. Do not inspect unrelated live workers.
+        for _ in 0..=super::MAX_INCOMING_DISK_WORKERS {
+            abandon_opening_worker(transfer_id, 8, &staging, &downloads).await;
+            assert_eq!(fs::read(&partial).unwrap(), b"desk");
+            let reopened = IncomingFile::create_in(
+                transfer_id,
+                "initializing.bin".to_owned(),
+                8,
+                staging.clone(),
+                downloads.clone(),
+            )
+            .unwrap();
+            assert_eq!(reopened.transfer_id(), transfer_id);
+            assert_eq!(reopened.name, "initializing.bin");
+            assert_eq!(reopened.expected_size, 8);
+            assert_eq!(reopened.resume_offset(), 4);
+            assert_eq!(
+                reopened.resume_prefix_hash(),
+                Some(Blake2s256::digest(b"desk").into())
+            );
+            reopened.preserve().unwrap();
+        }
+        let mut resumed = IncomingFile::create_in(
+            transfer_id,
+            "initializing.bin".to_owned(),
+            8,
+            staging,
+            downloads,
+        )
+        .unwrap();
+        resumed.write_chunk(4, b"link").unwrap();
+        let published = resumed
+            .finish(Blake2s256::digest(b"desklink").into())
+            .unwrap();
+        assert_eq!(fs::read(published).unwrap(), b"desklink");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_empty_creation_preserves_an_empty_part_but_explicit_cancel_still_removes_it()
+    {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("cancel-create-empty");
+        let transfer_id = [30; 16];
+        let partial = incoming_temporary_path(&staging, transfer_id);
+        abandon_opening_worker(transfer_id, 3, &staging, &downloads).await;
+        assert_eq!(fs::metadata(&partial).unwrap().len(), 0);
+        let (before_write, exited) = disk_thread_exit_notice();
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    transfer_id,
+                    "initializing.bin".to_owned(),
+                    3,
+                    staging,
+                    downloads,
+                )
+            },
+            before_write,
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.resume_offset(), 0);
+        assert_eq!(worker.resume_prefix_hash(), None);
+        worker.cancel();
+        tokio::time::timeout(Duration::from_secs(2), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!partial.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialization_failure_reports_its_error_without_deleting_a_staged_prefix() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("create-failed");
+        let transfer_id = [31; 16];
+        let partial = incoming_temporary_path(&staging, transfer_id);
+        let mut first = IncomingFile::create_in(
+            transfer_id,
+            "initializing.bin".to_owned(),
+            8,
+            staging.clone(),
+            downloads.clone(),
+        )
+        .unwrap();
+        first.write_chunk(0, b"desk").unwrap();
+        first.preserve().unwrap();
+        let (before_write, exited) = disk_thread_exit_notice();
+        let result = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    transfer_id,
+                    "initializing.bin".to_owned(),
+                    MAX_TRANSFER_FILE_BYTES + 1,
+                    staging,
+                    downloads,
+                )
+            },
+            before_write,
+        )
+        .await;
+        assert!(matches!(result, Err(TransferResult::TooLarge)));
+        tokio::time::timeout(Duration::from_secs(2), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(partial).unwrap(), b"desk");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_flush_failure_is_reported_without_publishing_completion() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("preserve-flush-failed");
+        let published = downloads.join("not-published.bin");
+        let (before_write, exited) = disk_thread_exit_notice();
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                let mut file = IncomingFile::create_in(
+                    [32; 16],
+                    "not-published.bin".to_owned(),
+                    3,
+                    staging,
+                    downloads,
+                )?;
+                file.write_chunk(0, b"new")?;
+                file.file.take();
+                // Windows FlushFileBuffers requires write access. Reopen the
+                // real staging handle read-only to exercise an actual failure.
+                file.file =
+                    Some(File::open(&file.temporary_path).map_err(|_| TransferResult::IoFailed)?);
+                Ok(file)
+            },
+            before_write,
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.preserve().await, Err(TransferResult::IoFailed));
+        tokio::time::timeout(Duration::from_secs(2), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!published.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelled_source_reader_does_not_open_a_source_or_take_a_share_lock() {
+        let source = super::OutgoingFile {
+            transfer_id: [39; 16],
+            path: "must-not-be-opened.bin".into(),
+            name: "must-not-be-opened.bin".into(),
+            size: 1,
+            modified_at_unix_ns: 0,
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(matches!(
+            super::OutgoingFileReader::open(&source, 0, None, cancelled),
+            Err(desklink_protocol::TransferResult::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn one_pass_source_reader_resumes_at_exact_chunk_boundaries_and_keeps_final_hash() {
+        use std::{
+            io::Seek,
+            sync::{Arc, atomic::AtomicBool},
+        };
+        let (root, _, _) = roots("reader-boundaries");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        let chunk = desklink_protocol::MAX_TRANSFER_CHUNK_BYTES;
+        let payload: Vec<u8> = (0..chunk * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&path, &payload).unwrap();
+        let source = prepare_outgoing_file(path).unwrap();
+        let expected: [u8; 32] = Blake2s256::digest(&payload).into();
+        for resumed in [0, 1, chunk - 1, chunk, chunk + 3, payload.len()] {
+            let proof = (resumed > 0).then(|| Blake2s256::digest(&payload[..resumed]).into());
+            let mut reader = OutgoingFileReader::open(
+                &source,
+                resumed as u64,
+                proof,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(reader.file.stream_position().unwrap(), resumed as u64);
+            let mut sent = Vec::new();
+            let mut next_offset = resumed as u64;
+            while let Some((offset, bytes)) = reader.read_chunk().unwrap() {
+                assert_eq!(offset, next_offset);
+                assert!(bytes.len() <= chunk);
+                next_offset += bytes.len() as u64;
+                sent.extend(bytes);
+            }
+            assert_eq!(reader.file.stream_position().unwrap(), payload.len() as u64);
+            assert_eq!(sent, payload[resumed..]);
+            assert_eq!(reader.finish().unwrap(), expected);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_reader_checks_proof_and_metadata_before_sending_any_suffix() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let (root, _, _) = roots("reader-changed");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        fs::write(&path, b"desklink").unwrap();
+        let source = prepare_outgoing_file(path.clone()).unwrap();
+        assert!(matches!(
+            OutgoingFileReader::open(&source, 4, Some([0; 32]), Arc::new(AtomicBool::new(false))),
+            Err(TransferResult::SourceChanged)
+        ));
+        assert!(matches!(
+            OutgoingFileReader::open(&source, 0, Some([0; 32]), Arc::new(AtomicBool::new(false))),
+            Err(TransferResult::InvalidData)
+        ));
+        fs::write(&path, b"replaced").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(matches!(
+            OutgoingFileReader::open(&source, 0, None, Arc::new(AtomicBool::new(false))),
+            Err(TransferResult::SourceChanged)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_reader_stops_on_cancel_and_never_finalizes_a_partial_read() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (root, _, _) = roots("reader-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        fs::write(&path, b"desklink").unwrap();
+        let source = prepare_outgoing_file(path).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let reader = OutgoingFileReader::open(&source, 0, None, cancelled.clone()).unwrap();
+        assert_eq!(reader.finish(), Err(TransferResult::InvalidData));
+        let mut reader = OutgoingFileReader::open(&source, 0, None, cancelled.clone()).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(reader.read_chunk(), Err(TransferResult::Cancelled));
+        assert_eq!(reader.finish(), Err(TransferResult::Cancelled));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_reader_holds_a_read_only_windows_snapshot_until_finished() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let (root, _, _) = roots("reader-snapshot");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        fs::write(&path, b"desklink").unwrap();
+        let source = prepare_outgoing_file(path.clone()).unwrap();
+        let mut reader =
+            OutgoingFileReader::open(&source, 0, None, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(File::options().write(true).open(&path).is_err());
+        assert!(fs::remove_file(&path).is_err());
+        assert_eq!(reader.read_chunk().unwrap().unwrap().1, b"desklink");
+        reader.finish().unwrap();
+        fs::write(&path, b"changed!").unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_orders_chunks_and_only_acknowledges_verified_publication() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         let (root, staging, downloads) = roots("worker-publish");
         let target = downloads.join("worker.bin");
         let mut worker = IncomingFileWorker::spawn_with(
@@ -1117,6 +1675,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_disk_worker_does_not_block_async_timers() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-slow");
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1158,6 +1717,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_preserve_then_resume_keeps_only_acknowledged_prefix() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         let (root, staging, downloads) = roots("worker-resume");
         let worker_staging = staging.clone();
         let worker_downloads = downloads.clone();
@@ -1196,6 +1756,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_queue_has_a_fixed_chunk_budget_and_cancel_discards_pending_work() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-budget");
         let partial = incoming_temporary_path(&staging, [24; 16]);
@@ -1254,6 +1815,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_rejects_oversized_chunks_and_invalid_hashes() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         let (root, staging, downloads) = roots("worker-invalid");
         let mut worker = IncomingFileWorker::spawn_with(
             move || {
@@ -1279,6 +1841,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dropped_worker_keeps_writer_ownership_until_pending_write_and_preserve_finish() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-reconnect-preserve");
         let worker_staging = staging.clone();
@@ -1371,6 +1934,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_worker_cannot_delete_a_new_receiver_staging_file() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-reconnect-cancel");
         let worker_staging = staging.clone();

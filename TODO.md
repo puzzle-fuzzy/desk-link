@@ -165,6 +165,12 @@
 - **方案：** 请求独立唤醒媒体生产者；以配置版本绑定最近合法帧，限频重编码或强制捕获；不把静态桌面改为常态高频全屏轮询。
 - **验收：** 静态桌面主动重置解码器/丢弃 DirectLan 关键帧后，无需移动鼠标或窗口即可恢复；建议请求至显示 ≤1 秒；覆盖与 DL2-002 的组合场景。
 
+- [x] **已实现并自动验证（`fix(DL2-010): recover requested keyframes on idle desktops`）：** DXGI Idle 时响应待处理关键帧，按需抓取当前屏幕的独立 GDI 快照；250ms 限频，捕获循环最多一次50ms等待，不增加正常静态桌面的持续截图。配置切换后从当前输出抓取，不复用旧纹理。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib static_keyframe --locked`，1通过；覆盖无请求零快照、连续请求限频及间隔后可重试；Windows原生库编译通过。
+- [ ] **仍待真机：** 静态桌面重置解码器、DirectLan丢关键帧及DL2-002组合的请求至显示≤1秒验收；本次未建立真实远控会话。
+
+- [x] **缓冲编码器跟进（`fix(DL2-010): retain idle recovery through buffered encoder output`）：** NeedMoreInput时保留关键帧/首输出恢复意图，使静态DXGI在250ms预算后再次提交快照；`--lib keyframe_recovery --locked` 2通过，覆盖缓冲结果后仍能触发下一次限频快照。
+
 ### DL2-011 · P1 · DirectLan 探测不能长期占用会话加密锁
 
 - [ ] 将探测网络等待移出共享加密锁的临界区。
@@ -172,6 +178,15 @@
 - **边界：** 已有并发槽位和逐阶段 3 秒超时，问题不是无限死锁。入站 `apps/windows/src/runtime.rs:2741-2751` 也持锁，但外层 select 可在输入/控制就绪时取消该 future；不能写成入站必然阻塞输入 3 秒。
 - **方案：** 短锁生成/验证探测消息，网络 I/O 在锁外执行；必要时派生专用探测上下文，仍绑定已认证会话；停止时取消任务并释放连接。
 - **验收：** relay 正常而候选黑洞、慢响应、半包时，测锁持有时间、输入及画面 p95/p99；不能出现由探测锁造成的秒级停顿，探测失败正常回退。
+
+- [x] **已实现并自动验证（`fix(DL2-011): release shared crypto lock during direct probes`）：** transport增加shared探测接口，原有独占接口复用同一状态机；seal/open短锁，连接/开流/读写无锁；Windows出入站均切换，出站任务由JoinSet随peer代数退出取消。
+- **验证：** `test -p desklink-transport --lib direct_probe::tests --locked` 8通过；新回环在已建TLS但未响应探测时100ms内仍取得crypto锁并成功加解密Control；入站无流时30ms取消后锁可取得。`test -p desklink-windows --lib direct_video_tests --locked` 2通过（经scripts/run-windows-cargo.py）。
+- [ ] **仍待双机测量：** 黑洞、慢响应、半包期间的输入/画面p95/p99和锁持有分布。原实现有阶段超时；入站原select可取消，此修复不把它描述为无限死锁。
+
+- [x] **并发加密跟进（`fix(DL2-011): isolate delayed probes from video replay windows`）：** 短锁后探测不得与视频共用128包重放窗；追加DirectProbe=8独立密钥/计数/窗口，现有lane 0～7不变，所有probe入口统一使用。未另升业务协议版本。
+- **验证：** crypto+transport `--lib --tests --locked` 79通过；真实共享endpoint探测等待期间推进256视频包仍完成认证；双向迟到probe、重放与跨lane拒绝均覆盖。修复前共享视频lane的窗口会把这类迟到密文误拒，不能仅把seal移到connect后缩短概率。
+
+- [x] **加密边界补充（`test(DL2-011): cover delayed responses and probe lane authentication`）：** probe测试12通过、transport lib+tests严格Clippy通过；新增干净窗口错lane认证失败后正确打开仍成功、反射包拒绝不污染双向真实包、真实QUIC响应已seal后等待期间共享锁100ms可取得且256个反向视频密文不挤出probe。视频密文在真实共享session上处理；不把这项fixture描述为已认证前QUIC视频数据面测试。DirectProbe自身仍是128包窗口，不保证无限乱序，新旧probe实现需同批构建或失败回落。
 
 ### DL2-012 · P1 · 编码器重配与显示切换不能阻塞输入消费
 
@@ -183,7 +198,10 @@
 
 - [x] **已实现并自动验证（`fix(DL2-012): consume input independently from slow host controls`）：** peer内输入与控制改为两个并行且共同取消的future；重配5秒等待不再阻止输入解密/消费。显示切换独立通知释放，过渡期间丢弃坐标/按下事件而允许按键/鼠标释放；断开取消两条路径，不派生迟到输入任务。
 - **验证：** `test -p desklink-windows --lib slow_configuration --locked` 1通过，合成5秒控制等待期间输入/释放队列在250ms预算内完成；`clippy -p desklink-windows --lib --locked -- -D warnings`通过（均经scripts/run-windows-cargo.py）。
-- [ ] **仍待后续切片/实机：** 配置请求的独立代数/过时请求合并与原生延迟重配下键鼠p95/p99及旧配置覆盖回归；本提交关闭输入快路径隔离，不冒称完整控制编排已完成。
+- [ ] **仍待实机：** 原生延迟重配下键鼠p95/p99、无积压回放及显示切换/配置完成的双机回归。
+
+- [x] **控制编排切片（`fix(DL2-012): coalesce configuration work beside control consumption`）：** 控制select独立轮询单个配置future，Display/Quality/Profile各保留最新1项、最多3待执行+1进行中；serial过滤旧完成，跨类别保序。快速新请求、关键帧及断开不再等5秒配置应答。显示选择的独立gate跨拓扑发布保留，直到最新选择完成，防止旧完成提前恢复输入。
+- **验证：** `--lib configuration --locked` 9通过，含实际生产future被慢worker挂起时1000次选择只下发首项+最终项、旧完成失效、取消后迟到oneshot拒绝，以及5个固定队列/代数回归；lib+tests严格Clippy通过。此前完整lib 138通过/2忽略。
 
 ### DL2-013 · P1 · 连接中刷新显示拓扑并稳定识别屏幕
 
@@ -197,12 +215,52 @@
 - [x] Windows 共享 Rust API 来源切片 `feat(DL2-013): expose the captured-context runtime input bridge`：准确提取 Apple 已提交 `9ad7154b365de875d725188cfa091f5c21da0b5a` 的 ControllerRuntime::send_input_with_context(&self, InputContext, InputEvent)、必要 import、旧 send_input 明确拒绝及 encrypted controller_runtime 回归；未引入 C/Swift/worker 队列依赖。唯一必要前置为 `bc6c0a62` 的共享合同。`python scripts/run-windows-cargo.py test -p desklink-ffi --test controller_runtime --locked` 5 通过，包含真实加密输入传输；不表示主机/呈现/生产者整链已接通。
 - [x] 独立发送所有权切片 `feat(DL2-013): share an ordered input sender outside runtime event polling`：ControllerInputSender/input_sender 与 Runtime 共用同一发送实现及序号，输入专用锁覆盖完整 wire 写入；共享加密锁在网络等待前释放，热路径不逐包 clone Arc。FFI lib 12 通过、真实 encrypted controller_runtime 6 通过；36 帧含 32 并发 sender clone 严格 1..36，原 context 保留、零 context 不发包/不消耗序号。完整 FFI 尚有 2 个旧 Host 零 input_epoch 配置测试失败，保留为生产者未接通证据，不算全通过。
 - [x] Windows 生产者切片 `feat(DL2-013): bind Windows input to painted full-width contexts`：所有 context/VideoConfig 身份 IPC 使用规范十进制字符串，Rust 内部保留完整 u64；覆盖 2^53 前后、u64::MAX 与非法格式拒绝。DOM 事件/pending pointer/滚轮/文字/IME/快捷键/粘贴/释放均固定原 pair；精确 frame/config/channel token 在 drawImage 成功后的可见 rAF 屏障才激活，同 epoch 画质变更保留 DOM 与 held keys。稳态不重复排激活 rAF，输入热路径不读布局。Native 仅持一个输入 future，主循环继续配置/媒体/取消；ACK 粘贴至 Ctrl+V 完成前保持 busy，旧 epoch 后半段局部取消而不拆正在写的可靠帧。Bun 1.3.14 全套 474 通过、构建通过；管理库 135 通过/1 签名资产忽略，Windows 库 113 通过/1 交互桌面忽略。含既有智能粘贴完成/失败后可再次操作回归；不冒称硬件呈现或整链已可交付。
-- [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
 
-## 4. 性能与数据通道
+- [x] **已实现并自动验证（`fix(DL2-013): preserve stable monitor identities across enumeration`）：** 使用EnumDisplayDevicesW监视器接口路径稳定映射，进程内最多1024身份且不复用ID；枚举重排/主屏变化不再使旧ID指向另一输出。GDI主屏保留实际descriptor ID；身份不可用/歧义时安全失败。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked capture::identity_tests` 3通过，覆盖重排、拔插重现、大小写归一和注册表耗尽；原生API编译通过。
+
+- [x] **连接内拓扑切片（`fix(DL2-013): publish live display topology with coordinated input mapping`）：** 每秒元数据枚举，稳定ID排序下相同拓扑不重建；活动输出移除明确回退主屏/首屏。准备捕获/编码器并复核OS快照后，以同一锁发布列表/活动屏/坐标/代数，清空旧编码队列并请求IDR；watch推送列表。枚举/驱动失败保留旧发布状态、暂停输入并有界重试。注入持映射锁，跨发布等待的非释放事件丢弃。
+- **验证：** Windows lib 128通过/2忽略，含7拓扑和4注入/发布帮助器回归；严格lib+tests Clippy通过；补充编码器准备后OS快照复核后再跑 `--lib topology --locked` 11通过。所有输入用记录/阻塞合成后端，无真实注入或远控。
+
+
+- [x] **Host严格绑定（`fix(DL2-013): authorize host input with published geometry epochs`）：** 全宽非零随机起点+checked进程共享分配，真实VideoConfig发布；映射锁内先匹配完整context再处理所有事件，旧release不能清除新按键。共享injector统一锁顺序完成旧状态释放/epoch/映射协调，受阻保持暂停重试；纯编码与列表元数据不换epoch。固定32项frame/config→采集context绑定拒绝异步旧输出被贴新epoch，peer退出主动清理。
+- **验证：** `test -p desklink-windows --lib --test runtime_contract --locked` 170库通过/2忽略+11契约通过，lib+tests严格Clippy通过。真实生产pipeline配置编码/解码后取token，记录后端覆盖旧移动/Unicode/release、A→B→A、新Noise/进程相同stream、纯编码保持、旧MFT输出、RNG失败/零值/u64耗尽。规则/复跑见 `docs/windows-host-input-epochs.md`；无真实注入/共享。
+
+- [x] **配置版本边界（`fix(DL2-013): prevent encoder configuration version reuse`）：** 编码器三个配置推进点均在替换后端/设置前checked预留非零后继，u32耗尽返回ConfigVersionExhausted，不wrap或重置1；提供实际config_version读取供Host原子配对校验。encoder 20项通过，边界失败后COM后端/设置/帧计数/pending引用不变，lib严格Clippy通过。
+
+- [x] **真实配置配对（`fix(DL2-013): pair input epoch publication with actual encoder versions`）：** Coordinator所有发布显式读取encoder.config_version；几何/有效性边界在分配epoch前验证真实新版本大于epoch出生版本，metadata保持anchor。HostPipeline拒绝倒退/同版本换epoch或尺寸，正确新版本仍需IDR。保留ControllerRuntime原有相同身份字段变更拒绝，不冒称已复现旧帧误激活。配置u32耗尽在各捕获重配入口退出peer，不做无穷重试/复用1。
+- **验证：** 174库通过/2忽略+11契约通过，lib+tests严格Clippy通过；同尺寸/同SPS选屏与虚拟原点、旧MFT输出回归均从实际SoftwareOnly编码器重配/getter取得版本并由真实pipeline发布token，非修改常量fixture求绿。
 
 - [x] **输入发送类型静态检查跟进（`refactor(DL2-013): name the owned input send future type`）：** 为既有 owned future 提取等价类型别名，消除 `clippy::type_complexity`，不改变发送、锁、取消或队列语义。管理库 `test -p desklink-windows-ui --lib --locked` 135通过/1签名资产忽略；本包 `clippy -p desklink-windows-ui --lib --tests --no-deps --locked -- -D warnings` 通过。基线依赖的021 cancellation lint已由媒体来源提交修复，跨包严格检查由联合门禁复跑。
 
+- [x] **Windows 联合自动验证（保留来源历史的产品／媒体 merge）：** 产品 `16594c4` + 独立013类型别名 `27fec75` 与媒体 `65c70fd`（含89版号配对及后继044/045/046/021初始化取消修复）逐段整合；真实 SoftwareOnly BGRA→HostPipeline→localhost QUIC/Noise→ControllerRuntime captured sender→Host原子mapping→RecordingBackend的2项回归通过。覆盖同尺寸同SPS新版本/epoch、纯编码保持held、新Noise拒绝旧context与旧release；精确旧plaintext重加密另为packet级检查。最终Rust脚本计数634通过/2个未接入完整Apple ABI/MacHost失败/19忽略；Windows283、管理库135、共享178通过，FFI38通过；八包严格Clippy无allow/无no-deps通过，Bun1.3.14 474通过与build通过。477源码摘要运行前后不变，详见 `docs/windows-joint-integration.md` 与外部最终handoff清单。主013、真实WebView/双机/硬件及MacHost接线仍未完成。
+
+### DL2-044 · P1 · 可选光标数据报降级与发送诊断
+
+- [ ] 完成可选光标降级及用户可见诊断接入验收。
+- **源码复核修正：** 锁定Quinn 0.11.11/proto 0.11.16的send_datagram在队列压力下逐出旧报文并返回Ok，不存在公开QueueFull；TransportError::Datagram只覆盖该发送API的UnsupportedByPeer/Disabled/TooLarge。不能用连续失败预算模拟队列压力，也不能把Ok或发送错误次数当作送达/丢包统计。
+- [x] **生产策略（`fix(DL2-044): disable unsupported cursor datagrams without ending peers`）：** 首个Datagram错误仅停用当前peer的可选光标，后续不采样、不加密、不重发，future保持pending等待主peer取消。连接/代数/身份/preflight错误仍立即传播。每个peer独立状态，一次固定capability_or_size原因；send_attempts/send_errors/disabled字段只表示本地操作。
+- [x] **有界诊断接线：** HostSupervisor/HostRuntime提供with_media_diagnostics_observer，构造时初始化进程唯一32槽队列/工作线程；热路径try_send、不做同步文件或HTTP，回调异常不杀接收器。DiagnosticEvent::HostMedia提供固定JSON字段映射；队列拒绝数与网络丢包明确分离。未绑定observer时仅后台stderr回退，不视为用户导出/服务端可见性已交付。接口见docs/windows-host-media-diagnostics.md。
+- **验证：** 光标10项（含真实生产循环停止采样但不完成peer future）+诊断分发2项通过；真实127.0.0.1传输20项通过，包括对端禁用、低于应用preflight上限的TooLarge、终态/代数检查及1字节Quinn发送缓冲下1000次Ok，之后同连接控制/输入可用。Windows+transport lib/tests严格Clippy通过。
+- [ ] 产品层绑定observer到实际诊断导出/服务端schema并验证最终可见性；真实网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
+
+### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
+
+- [ ] 区分监听终态并使禁用原因可观测。
+- **源码复核修正：** a905b88与本分支 `DirectLanEndpoint::accept` 都返回Option<Result>；握手失败/超时是Some(Err)，Host已continue。`endpoint.accept().await?`只传播None监听终态，不能把“任何Err永久禁用”当作已确认缺陷；实际剩余缺项是None后的明确降级诊断。
+- [x] **已有正确行为的真实回归（`test(DL2-045): distinguish transient direct handshakes from listener shutdown`）：** 空truststore触发真实127.0.0.1 QUIC证书握手失败，确认Some(Err)，同一listener随后使用生产配置+Noise会话成功认证probe并收发datagram；显式endpoint关闭才在100ms内返回None（重复等待一致）。probe 14项通过，transport lib+tests严格Clippy通过。
+- [x] **终态生产处理（`fix(DL2-045): retire direct paths when the listener terminates`）：** accept返回None时一次性take本代session、abort探测，路径锁内同时禁用后续安装并取走活动Arc，锁外关闭、请求IDR；继续控制/配置/输入消费。迟到探测在同一路径锁内检查禁用标记，不能在清理后复活路径。固定DirectListenerStopped/ListenerClosed原因通过044后台observer分发，DiagnosticEvent映射host_direct_listener_stopped；session=None的accept future保持pending防刷屏。
+- **验证：** Windows新增2项通过：真实认证双路径的活动Arc清理/IDR、已完成probe但尚未安装的迟到连接被关闭、诊断只一次与禁用后accept pending；固定日志字段测试。原有Some(Err)continue与真实endpoint.close→None边界另由probe回归证明，不冒称复现原本不存在的“握手错误禁用”缺陷。
+- [ ] 产品层实际诊断导出/服务端schema绑定和真实监听故障状态验收；后台事件producer不等于用户可见性完成。
+
+### DL2-046 · P1 · 出站探测生命周期与活动直连仲裁
+
+- [x] 探测任务纳入会话取消树；活动路径按同一peer槽位和连接分配身份仲裁。
+- **审查/修复边界：** 基线出站spawn脱离生命周期与无条件覆盖存在；011的JoinSet已接管取消，本条补实际回归及剩余抢占/旧egress清空新路径问题，不重复冒称取消是本笔才实现。
+- **修复（`fix(DL2-046): retain active direct paths and retire only matching connections`）：** 入/出站认证完成统一安装，健康活动连接保留、关闭连接才替换，相同Arc不误关；健康路径期间拒绝冗余offer。旧发送失败只移除同一Arc实例，不能按候选ID清掉后继；拒绝/退役连接在释放槽锁后关闭。
+- **验证：** 6个固定槽位用例+3个真实127.0.0.1 QUIC/Noise回归通过，lib+tests严格Clippy通过。两条竞争路径共用同Noise会话，晚出站被关闭后原入站仍双向传输加密VideoDatagram；关闭旧路径可替换且旧egress不能清新路径；真实connect_shared响应等待时Drop JoinSet后250ms内guard/permit释放、crypto锁可取。未建立实际远控/输入会话；011的双机p95/p99仍单列。
+
+## 4. 性能与数据通道
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
@@ -212,6 +270,12 @@
 - **验收：** 输出可复跑的硬件/网络/画面矩阵与 p50/p95/p99，记录分配率、copy bytes、功耗/温度、队列年龄、音画延迟和长稳斜率；每次性能变更附同机对照，禁止只报平均 FPS。
 - **依赖：** 为 DL2-015～024 提供量化依据；不能为了追求单项 FPS 牺牲输入、文字清晰度或恢复正确性。
 
+- [x] **已实现并自动验证（`perf(DL2-014): add reproducible offline media stage baseline`）：** 编码器固定单样本记录本机单调时钟convert/MFT/输出驻留与显式复制字节；离线合成基线命令见 `docs/windows-media-baseline.md`，输出p50/p95/p99、运行前后源码指纹，未测GPU/网络/端到端字段为null。
+- **验证：** 经 `scripts/run-windows-cargo.py` 执行 `test -p desklink-windows --test encoder_contract --example media_baseline --locked`（11+1通过，1个既有人工基准忽略）；`clippy -p desklink-windows --lib --example media_baseline --locked -- -D warnings`通过；Python编译与64×64/3帧工具烟测通过。并行编辑期间报告正确标记源码变化，烟测不是稳定性能结论。
+- [ ] **仍待完整基线：** GPU/双机、队列及端到端、分配/功耗/温度/长稳矩阵与同条件前后实测；本切片不宣称性能收益。
+
+- [x] **缓冲输出归因（`fix(DL2-014): distinguish submitted and buffered output frame timings`）：** 固定样本新增output_frame_id，frame_id仍表示当前输入；输出驻留使用实际匹配的旧PendingFrame，避免异步缓冲时把上一帧时间归到本帧。encoder 15项通过，含input12/output11事件fixture及实际软件64×64编码输出ID核对；lib严格Clippy通过。
+
 ### DL2-015 · P1 · 将 Windows 捕获与颜色转换尽量留在 GPU
 
 - [ ] 重构 texture 生命周期，减少每帧 CPU 回读、逐像素转换与临时分配。
@@ -220,6 +284,13 @@
 - **验收：** 1080p/1440p、集显/独显/混合 GPU 下比较复制字节、分配、CPU/GPU 时间及帧龄；GPU 常驻路径故障可降级且不破坏输入。收益待实测。
 - **依据：** [Microsoft 的 Direct3D-aware MFT 说明](https://learn.microsoft.com/en-us/windows/win32/medfound/direct3d-aware-mfts)给出了 surface 输入和 D3D manager 接口；是否能用于具体编码器必须实测能力。
 
+- [x] **已实现并自动验证（`perf(DL2-015): reuse owned staging textures for desktop readback`）：** 捕获进程持有staging/context缓存，以D3D device身份和完整texture布局失效；Map/复制/Unmap在ReleaseFrame前完成，不保留失效桌面surface。
+- **验证：** `test -p desklink-windows --lib --locked capture::` 10通过、2忽略；3个WARP合成用例验证复用后新像素、尺寸/device失效、row pitch/padding；显式dev WARP基准1通过、staging创建60→1。命令与release复跑规范见 `docs/windows-capture-readback-benchmark.md`。上述是软件D3D工具/正确性验证，不代表真实GPU收益；CPU回读字节不变。
+- [ ] **仍待实现/硬件验收：** GPU缩放/转色/NV12 surface编码链、CPU捕获输出buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照。
+
+- [x] **转换buffer切片（`perf(DL2-015): reuse encoder NV12 scratch buffers`）：** 生产编码器复用NV12 Vec，新增checked `convert_to_nv12_into`，保留原分配API；1:1转换不再为x/y索引建临时Vec。基线工具支持 `--reuse-buffer` 并记录增长次数，GPU与CPU输入复制未改变。
+- **验证：** 新buffer 3项、原encoder_contract 11项、backend 3项、percentile 1项通过，严格Clippy通过；显式release `--test encoder_buffers conversion_buffer_reuse_release_baseline -- --ignored --nocapture` 1通过。30样本/API、5次预热，同进程1080p分配/复用p50=4.8271/4.3698ms、p95=4.9710/4.4706ms、p99=5.0626/4.8022ms；1440p p50=8.6875/7.8823ms、p95=8.9543/8.0388ms、p99=9.0792/8.2324ms；预热后buffer增长0。仅为本机CPU转换API对照，非旧commit/真实GPU/端到端收益。
+
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
 - [ ] 建立编码后端能力探测、选择、诊断与恢复机制。
@@ -227,6 +298,16 @@
 - **边界：** 可确认没有显式硬件选择链路，不能仅凭此断言所有设备的实际编码都已测定为纯软件。
 - **方案：** 枚举并选择合适的异步硬件 MFT，查询实际能力/低延迟参数，处理设备丢失及软件回退；记录真正使用的后端、profile、分辨率、帧率与原因。[MFTEnumEx 官方说明](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mftenumex)区分了同步、异步和硬件类别。
 - **验收：** Intel/AMD/NVIDIA 与无可用硬件编码器矩阵；同画质对照 CPU、GPU、帧龄和恢复时间，驱动拒绝参数时能够快速选择可用配置。与 DL2-015 联合实现。
+
+- [x] **已实现并自动验证（`feat(DL2-016): select hardware MFTs with bounded software fallback`）：** 显式MFTEnumEx枚举NV12→H264硬件候选（最多尝试16），async unlock/事件credit授权/100ms进展预算；失败以相同帧在新config_version强制IDR重试软件，后续重配保持软件避免振荡。backend_info及基线报告记录实际后端/候选/稳定原因；见 `docs/windows-encoder-backends.md`。
+- **验证：** 2个新增credit/合成硬件故障用例通过，encoder_contract 11通过/1人工项忽略，基线percentile 1通过；lib+example严格Clippy通过。64×64合成软件及prefer-hardware各3帧烟测通过；后者真实枚举1候选、拒绝该配置后软件完成，报告source_unchanged=true。
+- [ ] **仍待硬件验收：** 本机未实际成功激活硬件异步编码；Intel/AMD/NVIDIA/混合GPU、真实device-loss与参数拒绝矩阵、CPU/GPU/帧龄恢复测量及GPU surface输入联合DL2-015验证。当前硬件输入仍为CPU NV12，不宣称零复制；进展预算不能中断驱动内部阻塞COM调用。
+
+- [x] **异步缓冲跟进（`fix(DL2-016): pump asynchronous MFT events across buffered inputs`）：** 合法NeedInput→输入1→NeedInput可返回等待下一输入，不再强求每输入100ms内必有输出；先排空旧输出、接收本次输入再交付旧帧，保留各时间戳/IDR元数据，不因INCOMPLETE把不同sample合为一帧。128 credit、16 pending、8MiB输出和100ms无事件/跨调用1秒无输出预算保持有界。
+- **验证：** encoder 14项通过（新增6个事件序列/容量/截止回归），lib严格Clippy通过；此为注入事件状态机验证，未代替真实硬件MFT事件执行与恢复矩阵。
+
+- [x] **输出时间戳跟进（`fix(DL2-016): reject unmatched encoder output timestamps`）：** 硬件缺失/未知输出时间戳在既有错误边界重试同一输入为软件IDR并锁定软件；软件未知明确时间戳产生可恢复错误，保留pending元数据，不再假装NeedMoreInput。软件未提供时间戳时保留FIFO契约。
+- **验证：** encoder 18项通过，新增当前/旧/未知/缺失时间戳矩阵及合成硬件损坏输出的同帧软件恢复；lib严格Clippy通过。真实厂商时间戳差异继续保留矩阵验收。
 
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
@@ -255,10 +336,14 @@
 
 ### DL2-020 · P2 · 关键帧可靠批次一次计长、一次编码
 
-- [ ] 移除组批时反复克隆并序列化整个候选批次。
+- [x] 移除组批时反复克隆并序列化整个候选批次。
 - **证据 / 类型：性能结构。** `apps/windows/src/runtime.rs:2263-2293` 每增加分片先 clone 当前批次/datagram，再 encode 判断大小；`2302` 发送时再次编码。`crates/desklink-protocol/src/lib.rs:66` 批次上限 60 KiB。
 - **方案：** 依据 wire header 与分片长度增量计算边界，最终一次编码；复用 Bytes/切片，保留协议长度验证。
 - **验收：** 最大合法关键帧的分配/复制次数下降；精确边界、跨批、超限和 round-trip 不变。此重复工作有单批大小上限，不是整个会话无限增长。
+
+- [x] **已实现并验证（`perf(DL2-020): build reliable video batches once in reusable buffers`）：** 协议builder一次预留60KiB，按3字节header+2字节片长增量校验/复制，Host发送直接复用最终wire切片，clear保留同一allocation；旧wire及编码入口保持。
+- **验证：** protocol `--lib --tests --locked` 34既有+4新增通过、1基准忽略；Windows `--lib direct_video_tests --locked` 2通过；两crate lib Clippy严格通过。覆盖精确60KiB、4096片、跨批无丢失/重复、超限不修改、round-trip及固定buffer指针。
+- **可复跑构造基准：** `python scripts/run-windows-cargo.py test -p desklink-protocol --release --test video_batch_builder benchmark_maximal_keyframe_batch_construction --locked -- --ignored --nocapture`：4096片/71批/4276309 wire字节，两实现输出相同；单次本地CPU样本旧候选克隆编码8946μs、builder1665μs。此结果仅说明该构造工作负载，不外推网络/GPU/端到端收益。
 
 ### DL2-021 · P1 · 慢磁盘写入与远控 async 调度隔离
 
@@ -271,11 +356,16 @@
 - **验收：** 慢盘、云盘、杀毒扫描、空间耗尽、取消同时发生时，媒体/输入仍满足预算、内存有界、残留可清理；不能显示尚未落盘的虚假完成。
 
 - [x] **已实现并自动验证（`fix(DL2-021): isolate host receive writes on bounded disk workers`）：** `IncomingFileWorker` 每文件长驻磁盘线程，进程最多8线程，队列2×48KiB（另有当前块）；写入/hash/sync/rename及Drop保留均离开async线程。Host接入create/write/finish/preserve/cancel，校验并sync成功后才回完成；原出站有界blocking生产者保持。
-- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 16通过；覆盖人工阻塞磁盘时current-thread Tokio定时器仍执行、队列预算、取消清理、保留续传、错hash、完成后发布。Windows删除前先关闭staging文件句柄。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 16通过；后续静态检查收口取消分支（`style(DL2-021): simplify incoming transfer cancellation`）；覆盖人工阻塞磁盘时current-thread Tokio定时器仍执行、队列预算、取消清理、保留续传、错hash、完成后发布。Windows删除前先关闭staging文件句柄。
 - [ ] **跨组及实机未完成：** Windows控制端接入由产品组负责；慢盘/云盘/杀毒/空间耗尽时媒体与输入预算需双机测量。取消不能中断已进入OS的磁盘syscall，线程总量有界，不宣称立即物理清理。
 
 - [x] **暂存所有权跟进（`fix(DL2-021): hold exclusive staging ownership through disk cleanup`）：** 异步Drop/保留期间，以规范化暂存路径RAII许可持有至文件关闭和清理结束；同文件重连先返回Busy，避免旧新worker并写/旧取消删除新文件。Windows写句柄只共享读取，续传先独占打开同一handle再扫描前缀；丢弃/陈旧清理同样遵守许可。
 - **验证：** transfer单测23通过、lib严格Clippy通过；3个新增回归覆盖旧写阻塞→Drop→别名路径重连Busy→释放后精确续传、旧cancel不删新文件、Windows绕过API的写/删除也被拒绝。未把不能中断的OS写线程视为已经退出。
+
+- [x] **初始化取消窗口（`fix(DL2-021): preserve resumed files when receiver creation is cancelled`）：** create future在opened.await期间被断连取消，磁盘线程后续ready发送失败时，先走同一preserve/sync路径再退出，避免直接Drop误删已校验旧prefix；文件/写许可/线程额度仍在磁盘线程释放。保留失败不发布完成，也不宣称成功保留。
+- **验证：** transfer 28通过、lib/tests严格Clippy及定向rustfmt/diff检查通过。真实spawn_with→create路径在已取得独占句柄、读取/哈希前阻塞，poll Pending后丢创建future，放行并等实际线程退出；9次取消后原4字节prefix/offset/hash/元数据不变，再续传通过完整哈希。另覆盖新空part保留、显式cancel删除、实际初始化TooLarge错误不删旧prefix、Windows只读handle导致sync_data返回IoFailed且未发布。资源型worker测试共享异步测试锁，未提高生产8线程上限或把外部忙碌当作泄漏。
+
+- **联合复跑：** `65c70fd` 的实际初始化取消保留回归、worker测试限流与新鲜路径清理同入最终Windows283项通过计数；未删改该来源测试或退回旧worker版本。最终证据见 `docs/windows-joint-integration.md`。
 
 ### DL2-022 · P2 · 从 GDI 兜底恢复到高性能捕获后端
 
@@ -283,6 +373,10 @@
 - **证据 / 类型：能力缺口、性能结构。** `apps/windows/src/capture.rs:551-565` 在运行时 DXGI 故障后永久替换成 GDI；`483-485` GDI 等待后完整截图，本会话没有回到 DXGI 的路径。
 - **方案：** 保留现有可靠兜底，后台探测设备/桌面恢复，再按代数切回；显示实际后端和降级原因，防止来回振荡。
 - **验收：** 睡眠、RDP/桌面切换、显示器恢复后，DXGI 可在不结束会话的情况下恢复；比较恢复前后资源与帧龄。不得为追求 DXGI 反复打断稳定 GDI。
+
+- [x] **已实现并自动验证（`fix(DL2-022): retry DXGI recovery while retaining GDI fallback`）：** GDI期间1秒后探测真实DXGI帧，失败按2/4/8/16/32秒退避、6次后60秒冷却；恢复后30秒内再次失败进入60秒迟滞。构造成功不足以切换，探测失败保留GDI；几何变化留给拓扑协调而不暗改输入坐标。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked capture::` 7通过，1个桌面依赖项忽略；3个新增用例覆盖预算、冷却与稳定窗口。
+- [ ] **仍待真机/诊断接通：** 睡眠/RDP/桌面切换和显示器恢复矩阵、后端/降级原因界面及资源/帧龄对照；连接内拓扑变化依赖DL2-013剩余工作。
 
 ### DL2-023 · P2 · 分离清晰度、帧率、码率与内容模式
 
@@ -292,12 +386,26 @@
 - **方案：** 连续码率与受约束的分辨率/帧率协商，加入编码耗时、排队年龄、吞吐和渲染压力；静态文字、滚动、视频模式分别决策并有迟滞。先完成 DL2-014～016。
 - **验收：** 带宽阶跃、丢包、弱 CPU/GPU、静态文字及视频播放对照清晰度、帧龄、切档次数和恢复速度；不能把 4K60 对所有设备一刀切开启。
 
+- [x] **原生码率API切片（`feat(DL2-023): add transactional native bitrate updates`）：** `H264Encoder::try_set_bitrate` 在能力可修改/可回读时事务写Mean/Peak并验证，成功不重建reference/config/dims/fps；拒绝只有确认恢复旧值才返回false，不确定恢复返回错误要求调用方重建旧设置。见 `docs/windows-encoder-backends.md`。
+- **验证：** encoder 8项通过，含4事务故障/回滚、软件合成编码前后配置/参考连续性；lib严格Clippy通过。当前软件MFT返回“不支持动态修改”，未声称真实动态成功或硬件收益。
+- [ ] **完整策略/硬件仍待：** 独立帧率/内容模式、扩充能力协商及4K/60门槛；带宽/弱硬件/清晰度/帧龄/切档与恢复矩阵尚待。
+
+- [x] **生产策略接入（`feat(DL2-023): adapt bitrate independently within video presets`）：** Automatic下档内20%/严重35%降码率，原生确认后8反馈窗口冷却、12健康窗口后5%恢复；保持分辨率/帧率，手动偏好恢复档位ceiling。实际值随质量/Profile应答回传，拓扑/Profile保留码率；跨配置失效旧目标且阻止新rate观察，避免旧档位rate晚到。队列扩为4+1有界。配置future等真实原生完成、随peer取消，不把5秒超时当已拒绝；不支持/下限/渲染压力沿既有档位回退。
+- **验证：** Windows lib 159通过/2忽略、独立policy 8通过、配置队列6通过，严格lib+tests Clippy通过；含5.1秒迟到原生应答仍正确确认、手动门控、跨配置旧请求失效、精确上下限及回滚。说明/复跑见 `docs/windows-adaptive-bitrate.md`。当前软件MFT不支持动态码率，未宣称硬件成功或网络性能收益。
+
 ### DL2-024 · P2 · 将低延迟直连从视频优化扩展为完整数据路径
 
 - [ ] 设计认证后的多通道 LAN 数据面，再按测量决定公网 NAT 穿透方案。
 - **证据 / 类型：架构能力限制。** `crates/desklink-transport/src/video_egress.rs:5-8` 明确只优化视频；`apps/windows/src/runtime.rs:2424-2428` 音频仍通过 relay QuicClient；可靠通道位于 `crates/desklink-transport/src/quic.rs:925-930`。因此同网视频直连不代表键鼠/文件也在 LAN 内传输。
 - **方案：** 同一已认证路径承载独立优先级的输入、控制、音频和文件，并支持逐通道切换、回退和去重；完善局域网发现/本地配对与 relay 不可达时的行为。公网打洞作为独立实验，不把“换 WebRTC”本身当性能结论。
 - **验收：** 同网输入延迟符合实际 LAN 路径；断开公网后按定义保持本地连接；切换不重放按键、不串会话、不中断授权。公网方案另测不同 NAT/IPv6/UDP 限制与回退时间。
+
+### DL2-050 · P3 · FrameAssembler 重复分片先覆盖后判重
+
+- [x] 重复分片保留首次内容并丢弃后续。
+- **证据 / 类型：源码缺陷。** 审查基线 `crates/desklink-video/src/packet.rs:182-188` 的chunks.insert先替换旧值再返回DuplicateChunk，内容不一致重传可污染组帧；CodeGraph定位后以本分支实际源码确认。
+- **修复（`fix(DL2-050): preserve first payload when video chunks repeat`）：** BTreeMap entry已占用时拒绝新payload并饱和增加dropped_chunks，未占用才插入；重复不延长原分片期限。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-video --lib --tests --locked` 6单元+17排序=23通过；同package严格Clippy通过。新增不同payload首内容保留/相同内容重复/1000包洪泛三项，覆盖乱序补片、计数取走复位、单partial与120ms原期限。该条不依赖真实硬件验收。
 
 ## 5. 功能完备与用户流程
 
@@ -344,6 +452,13 @@
 - **证据 / 类型：能力限制、性能结构。** `crates/desklink-protocol/src/lib.rs:40-42` 单文件上限 **256 MiB**，`apps/windows/src/transfer.rs:35-41` 发送准备即拒绝；当前以单文件 offer/chunk 表达。`apps/windows/src/transfer.rs:90-119,265-307` 和 `apps/windows/src/runtime.rs:3172-3198` 恢复会重复扫描已有前缀进行 hash。
 - **方案：** 保留协议已有的 u64 尺寸/偏移（`crates/desklink-protocol/src/lib.rs:463,473,481`），贯通大文件上限、UI/FFI 计数与空间预估；增加文件树 manifest、分块校验和可复用断点证明。重名冲突、符号链接/路径边界、部分成功、失败项重试与取消组成同一工作流，不能仅调大上限，把慢扫描转移给用户等待。
 - **验收：** >4 GiB 文件、深层目录、中文/长名称、同名、稀疏文件和慢盘；断网/重启后仅在身份及源内容匹配时恢复；完整校验后才显示完成。保留现有双向传输和确认机制，不能误当它们未实现。
+
+- [x] **已实现并自动验证（`perf(DL2-030): verify resumed sources with one streaming hash`）：** 新 `OutgoingFileReader` 在同一已打开句柄/hasher上只扫描一次已收前缀，再从精确u64 offset发送后缀及完整hash；Host出站接入，保留mpsc(2)背压。首尾验证size/mtime，Windows只读共享禁止发送期间写入/删除源文件；不改变既有确认和身份约束。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 20通过；新增中块续传/最终hash、源变化先拒绝、取消/未读完不允许完成、Windows源写入删除排斥4项。此切片消除单次重试的重复扫描，仍有每次重试O(prefix)校验。
+- [ ] **仍待功能/真机：** >256MiB与>4GiB全链边界、目录manifest/冲突/符号链接、持久分块证明及空间预估、控制端复用reader、深目录/稀疏/慢盘实测；未仅调大上限或新增不兼容wire字段。
+
+- [x] **会话退出切片（`fix(DL2-030): cancel file producers when host peers disconnect`）：** 出站任务由HostOutgoingTransfer RAII持有，peer退出/错误/取消均置取消并abort异步sender，释放receiver唤醒堵在有界队列的磁盘producer；已取消reader在打开源/取得Windows共享锁前退出。取消仍不声称能中断已进入OS的read。
+- **验证：** `--lib outgoing_peer_drop --locked` 1通过，确认满队列producer原先受背压、peer Drop后250ms内退出；transfer 24通过，新增取消不打开不存在源文件回归；lib+tests严格Clippy通过。
 
 ### DL2-031 · P2 · 让等待队列中所有文件都能管理
 
