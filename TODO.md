@@ -392,6 +392,10 @@
 - **方案：** fast：format/typecheck/领域与契约测试；integration：本地 transport、慢发送/慢盘、取消/代数、跨 ABI；native：捕获/编码/权限/设备；performance：可重复基准与 soak。固定 Bun 1.3.14 与仓库 Rust toolchain，输出版本、源码 SHA、命令、跳过原因。
 - **新增关键覆盖：** TS→Rust 滚轮边界；FFI→Swift 可恢复错误；AppKit 实际键盘/输入法接线；shell 更新不销毁会话；backpressure 下关停；静态关键帧；拖放坐标；拓扑变化；并发注册与依赖失效 readiness。
 - **验收：** 从干净依赖环境可重复运行；缺少 Apple/设备条件时明确 skipped，不能算 pass；不以源码正则匹配代替关键用户流程。只为已稳定且有明确验收标准的界面增加 DOM/交互测试。
+- [x] **统一入口代码与 Windows 自动验证切片（`feat(DL2-041): add layered local verification with source-bound reports`）：** `python scripts/verify.py` 统一 fast / integration / native / perf，PowerShell/POSIX 薄入口转发；固定 Bun 1.3.14、仓库 Rust toolchain 与 frozen/locked 安装，Windows Cargo 经原生环境 wrapper；任务可单选且自动带前置，记录源码 SHA/dirty、工具版本、命令、耗时和原始日志，零测试不能误通过，超时清理整个子进程树，清理失败阻断后续任务。说明见 `docs/local-verification.md`。
+- [x] **入口回归：** Python 全套 127 项通过（新增入口回归 25 项，含真实子进程/子进程树、固定版本、零测试、skipped、失败阻断与间接 Cargo 依赖）；三个 Bun 项目的类型检查和测试通过（246 / 20 / 14 项），前端生产构建、Rust fmt/Clippy/workspace lib、protocol/video/session/crypto、localhost transport/relay、FFI runtime、媒体恢复和 Windows runtime 契约均通过。实际命令与结果另存 `dist/verify/verified-local.json`，运行时源码为基线 `a905b88` 加本切片，dirty=true；不是跨分支集成基线。
+- [x] **跳过语义：** `python scripts/verify.py native perf --report dist/verify/verified-device-skips.json` 实际记录 Apple/交互设备缺条件与 DL2-014 未集成，`passed=false` / incomplete；固定错误 Bun 与零匹配测试分别验证为 failed。
+- [ ] **仍需验收：** macOS/Xcode 实际运行、原生权限/硬件/双机/长稳与 DL2-014 同条件性能对照；离线媒体基线入口待媒体分支独立提交 `254f8be` 集成后执行。跨层新增关键覆盖仍随对应 DL2 修复补齐，主项保持未完成，不以本地入口成功代替用户流程验收。
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 
