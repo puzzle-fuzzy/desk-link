@@ -120,8 +120,11 @@ impl HostTestFixture {
             self.relay_authentication,
             [2; 16],
         );
-        let controller_client = tokio::time::timeout(Duration::from_secs(3), QuicClient::connect(config()))
-            .await.expect("raw controller QUIC connect timed out").unwrap();
+        let controller_client =
+            tokio::time::timeout(Duration::from_secs(3), QuicClient::connect(config()))
+                .await
+                .expect("raw controller QUIC connect timed out")
+                .unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if controller_client.join(join.clone()).await.is_ok() {
@@ -129,7 +132,9 @@ impl HostTestFixture {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("raw controller relay join timed out");
+        })
+        .await
+        .expect("raw controller relay join timed out");
         controller_client
     }
 
@@ -139,15 +144,21 @@ impl HostTestFixture {
             loop {
                 let snapshot = self.relay.server.capacity_snapshot();
                 if !table.has_connection(self.session_id, previous_host_generation)
-                    && snapshot.attached_participants == 1 && snapshot.accepted_connections == 1
+                    && snapshot.attached_participants == 1
+                    && snapshot.accepted_connections == 1
                 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await;
-        assert!(result.is_ok(), "retired host registration was not replaced: previous_still_attached={}, snapshot={:?}",
-                table.has_connection(self.session_id, previous_host_generation), self.relay.server.capacity_snapshot());
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "retired host registration was not replaced: previous_still_attached={}, snapshot={:?}",
+            table.has_connection(self.session_id, previous_host_generation),
+            self.relay.server.capacity_snapshot()
+        );
     }
 
     async fn approve(&self, host: &HostRuntime) {
@@ -299,28 +310,44 @@ impl RawController {
             });
         let (mut initiator, hello) =
             NoiseInitiator::start(identity, fixture.host_identity.verify_key()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), client.send_control(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.send_control(
                 encode_noise_handshake(&NoiseHandshake {
                     protocol_version: PROTOCOL_VERSION,
                     step: NoiseHandshakeStep::InitiatorHello,
                     payload: hello,
                 })
                 .unwrap(),
-            )).await.expect("Noise initiator hello send timed out").unwrap();
+            ),
+        )
+        .await
+        .expect("Noise initiator hello send timed out")
+        .unwrap();
         let (host_generation, response_bytes) = tokio::time::timeout(
-            Duration::from_secs(3), client.next_control_with_generation(),
-        ).await.expect("Noise responder hello receive timed out").unwrap();
+            Duration::from_secs(3),
+            client.next_control_with_generation(),
+        )
+        .await
+        .expect("Noise responder hello receive timed out")
+        .unwrap();
         let response = desklink_protocol::decode_noise_handshake(&response_bytes).unwrap();
         assert_eq!(response.step, NoiseHandshakeStep::ResponderHello);
         let finish = initiator.receive(&response.payload).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), client.send_control(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.send_control(
                 encode_noise_handshake(&NoiseHandshake {
                     protocol_version: PROTOCOL_VERSION,
                     step: NoiseHandshakeStep::InitiatorFinish,
                     payload: finish,
                 })
                 .unwrap(),
-            )).await.expect("Noise initiator finish send timed out").unwrap();
+            ),
+        )
+        .await
+        .expect("Noise initiator finish send timed out")
+        .unwrap();
         Self {
             client,
             secure: initiator
@@ -338,7 +365,8 @@ impl RawController {
             self.send_control(ControlMessage::Hello {
                 platform: Platform::MacOS,
                 role: DeviceRole::Controller,
-            }).await;
+            })
+            .await;
             self.send_control(ControlMessage::Capabilities(DeviceCapabilities {
                 platform: Platform::MacOS,
                 role: DeviceRole::Controller,
@@ -346,8 +374,11 @@ impl RawController {
                 h264_profiles: vec![H264Profile::Main],
                 width: 1920,
                 height: 1080,
-            })).await;
-        }).await.expect("raw capability negotiation sends timed out");
+            }))
+            .await;
+        })
+        .await
+        .expect("raw capability negotiation sends timed out");
     }
 
     async fn send_input(&mut self) {
@@ -374,17 +405,23 @@ impl RawController {
         timestamp_us: u64,
     ) {
         self.input_sequence += 1;
-        let plaintext = encode_input(&InputEnvelope {
+        self.send_input_envelope(InputEnvelope {
             sequence: self.input_sequence,
             timestamp_us,
             stream_id: context.stream_id,
             input_epoch: context.input_epoch,
             event,
         })
-        .unwrap();
+        .await;
+    }
+
+    async fn send_input_envelope(&mut self, input: InputEnvelope) {
+        let plaintext = encode_input(&input).unwrap();
         let ciphertext = self.secure.seal(SecureLane::Input, &plaintext).unwrap();
         tokio::time::timeout(Duration::from_secs(3), self.client.send_input(ciphertext))
-            .await.expect("raw input send timed out").unwrap();
+            .await
+            .expect("raw input send timed out")
+            .unwrap();
     }
 
     async fn receive_video_config(&mut self) -> VideoConfig {
@@ -448,7 +485,9 @@ impl RawController {
         let plaintext = encode_control(&message).unwrap();
         let ciphertext = self.secure.seal(SecureLane::Control, &plaintext).unwrap();
         tokio::time::timeout(Duration::from_secs(3), self.client.send_control(ciphertext))
-            .await.expect("raw control/negotiation send timed out").unwrap();
+            .await
+            .expect("raw control/negotiation send timed out")
+            .unwrap();
     }
 }
 
@@ -871,7 +910,9 @@ async fn a_new_noise_session_never_reuses_the_same_stream_and_geometry_context()
         .close(b"test reconnect with the same capture stream");
     drop(first_controller);
     wait_for_state(&host, HostState::Connecting).await;
-    fixture.wait_for_new_host_registration(retired_host_generation).await;
+    fixture
+        .wait_for_new_host_registration(retired_host_generation)
+        .await;
 
     // The authenticated controller identity remains approved, but a new Noise
     // session with reused capture metadata still needs a fresh input context.
@@ -910,12 +951,145 @@ async fn a_new_noise_session_never_reuses_the_same_stream_and_geometry_context()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_calibrates_positive_and_negative_ten_minute_input_clock_offsets() {
+    for offset in [-600_000_000_i64, 600_000_000_i64] {
+        let fixture = HostTestFixture::new().await;
+        let (host, mut controller) = start_approved_raw(&fixture).await;
+        publish_raw_config(&host, &mut controller, 9, 1, 640, 360).await;
+        let context = controller.input_context.unwrap();
+        let input = InputEvent::MouseMove { x: 10, y: 20 };
+        controller
+            .send_input_for_context_at(
+                context,
+                input.clone(),
+                now_micros().saturating_add_signed(offset),
+            )
+            .await;
+        expect_input(&host, input).await;
+        assert_eq!(host.state(), HostState::Connected, "offset={offset}");
+        host.destroy();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_clock_jumps_mid_session_preserve_inputs_and_do_not_resurrect_a_replay() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    publish_raw_config(&host, &mut controller, 9, 1, 640, 360).await;
+    let context = controller.input_context.unwrap();
+    for (index, offset) in [0_i64, 600_000_000, -600_000_000, 0]
+        .into_iter()
+        .enumerate()
+    {
+        let input = InputEvent::MouseMove {
+            x: index as i32 + 1,
+            y: 20,
+        };
+        controller
+            .send_input_for_context_at(
+                context,
+                input.clone(),
+                now_micros().saturating_add_signed(offset),
+            )
+            .await;
+        expect_input(&host, input).await;
+    }
+    // A fresh encrypted packet carrying an old application sequence is still
+    // a replay; an extreme timestamp cannot recalibrate it back into admission.
+    controller
+        .send_input_envelope(InputEnvelope {
+            sequence: 1,
+            timestamp_us: u64::MAX,
+            stream_id: context.stream_id,
+            input_epoch: context.input_epoch,
+            event: InputEvent::Key {
+                code: KeyCode::Enter,
+                pressed: true,
+                modifiers: Modifiers::default(),
+            },
+        })
+        .await;
+    expect_no_input_until_quiet(&host).await;
+    let input = InputEvent::MouseWheel {
+        delta_x: 1,
+        delta_y: 2,
+    };
+    controller
+        .send_input_for_context(context, input.clone())
+        .await;
+    expect_input(&host, input).await;
+    assert_eq!(host.state(), HostState::Connected);
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_target_high_sequence_cannot_poison_successor_clock_calibration() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    publish_raw_config(&host, &mut controller, 9, 1, 640, 360).await;
+    let old = controller.input_context.unwrap();
+    let initial = InputEvent::MouseMove { x: 1, y: 2 };
+    controller
+        .send_input_for_context_at(
+            old,
+            initial.clone(),
+            now_micros().saturating_add(600_000_000),
+        )
+        .await;
+    expect_input(&host, initial).await;
+    let resized = publish_raw_config(&host, &mut controller, 9, 2, 800, 600).await;
+    expect_release_all(&host).await;
+    controller
+        .send_input_envelope(InputEnvelope {
+            sequence: u64::MAX,
+            timestamp_us: u64::MAX,
+            stream_id: old.stream_id,
+            input_epoch: old.input_epoch,
+            event: InputEvent::Key {
+                code: KeyCode::Enter,
+                pressed: false,
+                modifiers: Modifiers::default(),
+            },
+        })
+        .await;
+    let current = controller.input_context.unwrap();
+    let input = InputEvent::MouseMove { x: 10, y: 20 };
+    controller
+        .send_input_for_context_at(
+            current,
+            input.clone(),
+            now_micros().saturating_sub(600_000_000),
+        )
+        .await;
+    expect_input(&host, input).await;
+    let quality_only = publish_raw_config(&host, &mut controller, 9, 3, 800, 600).await;
+    assert_eq!(quality_only.input_epoch, resized.input_epoch);
+    let input = InputEvent::MouseMove { x: 30, y: 40 };
+    controller
+        .send_input_for_context_at(
+            current,
+            input.clone(),
+            now_micros().saturating_sub(600_000_000),
+        )
+        .await;
+    expect_input(&host, input).await;
+    assert_eq!(host.state(), HostState::Connected);
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resize_cannot_publish_a_new_epoch_with_an_old_frame_configuration_version() {
     let fixture = HostTestFixture::new().await;
     let (host, mut controller) = start_approved_raw(&fixture).await;
     publish_raw_config(&host, &mut controller, 9, 1, 640, 360).await;
-    host.send(HostCommand::SendVideoConfig { stream_id: 9, version: 1, width: 800,
-        height: 600, bytes: vec![0, 0, 0, 1, 0x67, 0x4d] }).unwrap();
+    host.send(HostCommand::SendVideoConfig {
+        stream_id: 9,
+        version: 1,
+        width: 800,
+        height: 600,
+        bytes: vec![0, 0, 0, 1, 0x67, 0x4d],
+    })
+    .unwrap();
     wait_for_state(&host, HostState::Closed).await;
     let events = terminal_events(&host).await;
     assert!(matches!(events.first(), Some(HostEvent::ReleaseAll)));

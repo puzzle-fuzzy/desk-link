@@ -560,6 +560,18 @@
 - [x] 持久 direct 接收时间/绝对截止；只有 direct 收包刷新，relay事件或取消轮询不刷新。真实localhost relay QUIC + Noise认证direct探测：旧实现黑洞/relaycursor红测超5.75s；修后黑洞与持续6s direct双回归均通过（生产5s预算，750ms测试调度容差），并已跑本分支FFI完整62项通过。主题 `fix(DL2-061): keep direct silence deadlines across relay events`。
 - [ ] 真双机/防火墙与Mac/iOS生产direct启用验收未执行。现源码仅Platform::Windows创建direct_session；这是FFI共用启用路径证明，不能称当前Mac实机缺陷或H264显示/性能证明。
 
+### DL2-060 · P2 · FFI Host 输入新鲜度用本机墙钟，时钟偏差直接终态关闭
+
+- [ ] 建立会话级时钟偏移，或把超窗输入降级为丢弃并告警。
+- **证据 / 类型：源码缺陷。** `crates/desklink-ffi/src/host_worker.rs:840` 用 `decode_input(&plaintext, now_micros())` 做墙钟校验（5 秒 age / 1 秒 future skew），而 `crates/desklink-protocol/src/codec.rs:287-299` 专门提供了不做墙钟比较的 `decode_session_input`，注释明确说明两台机器的时钟不保证同步。控制端时间戳来自其自身 `now_micros()`（`crates/desklink-ffi/src/controller.rs:315`）。超窗时第一条输入即 `TimestampOutsideWindow` → `HostError::Protocol`，`is_retryable_host_error`（`host_worker.rs:517-519`）只放行 Transport 类错误，会话进入终态 Closed 且不重连。
+- **用户影响：** 控制端机器时钟偏差超出窗口（新装机、虚拟机、双系统切换后常见）时，连接成功但第一次键鼠操作就断线，且表现为不可重试的协议错误。
+- **方案：** 握手互换时间戳建立 per-session 偏移，用 `decode_session_input` 加偏移校验；或降级为丢弃单条输入并发可恢复告警。Windows 原生 host 侧一并核对是否存在同类用法。
+- **验收：** 人为偏移控制端时钟 ±10 分钟，会话保持且输入可用（或明确提示校时）；不出现终态协议错误。
+
+- [x] FFI Host 会话输入策略：每个认证 Noise 会话独立校准 controller / host 墙钟；目标切换重新校准，纯画质重配保留锚点，严格递增序号门槛在同一会话中保持。先丢弃未发布 / 旧 context，再处理时钟及序号，避免旧目标的极值污染后继；时钟跳变重新校准最新认证输入，不再终态关闭；序号耗尽必须新建 Noise 会话。主题 `fix(DL2-060): calibrate host input clocks per authenticated session`。
+- [x] Windows 实跑：4 项纯策略测试和 3 项真实 QUIC / Noise 本地回环覆盖正负 10 分钟、双端时钟跳变、重复序号、旧 context 极值、u64 边界；整套 `python scripts/run-windows-cargo.py test -p desklink-ffi --lib --tests --locked` 共 71 项通过。
+- [ ] Apple 真机：Mac Host 与真实 Windows / iOS controller 的时钟偏差、系统校时及输入恢复仍需设备验收；本地回环不代表系统事件注入或硬件证明。
+
 ## 10. 第一阶段历史记录
 
 以下原文按本次审查前状态保留，仅供追溯。里面的“当前”“未验收”“下一阶段”、旧版本、线上探针结果和勾选项均属于原记录日期；第二阶段以本文前九节为准。尚未完成的签名、安装或设备组合验收可以继续引用，但不能用来否定用户本次已确认的两条远控路径。

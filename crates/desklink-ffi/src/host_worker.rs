@@ -12,8 +12,8 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputContext,
-    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep,
-    PROTOCOL_VERSION, Platform, ProtocolError, VideoConfig, decode_control, decode_cursor_update,
+    InputEnvelope, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep,
+    PROTOCOL_VERSION, Platform, VideoConfig, decode_control, decode_cursor_update,
     decode_noise_handshake, decode_session_input, decode_transfer, encode_control,
     encode_noise_handshake, encode_transfer, encode_video_config,
 };
@@ -863,6 +863,7 @@ async fn run_connected(
     events: &mpsc::Sender<HostEvent>,
 ) -> Result<(), HostError> {
     let mut video = VideoState::default();
+    let mut input_policy = HostInputPolicy::default();
     let mut metrics = HostMetrics::default();
     loop {
         if *cancellation.borrow() {
@@ -894,16 +895,8 @@ async fn run_connected(
                     TransportEvent::Input(ciphertext) => {
                         let plaintext = secure.open(SecureLane::Input, &ciphertext).map_err(crypto_error)?;
                         let input = decode_session_input(&plaintext).map_err(protocol_error)?;
-                        if video.input_context() != Some(input.context()) {
+                        if !input_policy.admit(&input, video.input_context(), now_micros()) {
                             continue;
-                        }
-                        // Discard retired contexts before checking freshness, so
-                        // a delayed old key-up cannot terminate its successor.
-                        let now = now_micros();
-                        if input.timestamp_us < now.saturating_sub(MAX_INPUT_AGE_US)
-                            || input.timestamp_us > now.saturating_add(MAX_INPUT_FUTURE_SKEW_US)
-                        {
-                            return Err(protocol_error(ProtocolError::TimestampOutsideWindow));
                         }
                         emit_required(events, HostEvent::Input(input.event))?;
                         metrics.received_input_events = metrics.received_input_events.saturating_add(1);
@@ -932,6 +925,71 @@ async fn run_connected(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputClockAnchor {
+    remote_us: u64,
+    local_us: u64,
+}
+
+/// One policy per authenticated Noise session. Target changes reset only the
+/// clock calibration; the session's sequence high-water mark never moves back.
+/// At u64::MAX, only a new Noise session can reopen sequence admission.
+#[derive(Default)]
+struct HostInputPolicy {
+    context: Option<InputContext>,
+    last_sequence: u64,
+    clock_anchor: Option<InputClockAnchor>,
+}
+
+impl HostInputPolicy {
+    fn admit(
+        &mut self,
+        input: &InputEnvelope,
+        published: Option<InputContext>,
+        now_us: u64,
+    ) -> bool {
+        let context = input.context();
+        // Retired/unpublished targets cannot poison either calibration or the
+        // sequence gate, even with an extreme timestamp or sequence number.
+        if !context.is_valid() || published != Some(context) || input.sequence <= self.last_sequence
+        {
+            return false;
+        }
+        if self.context != Some(context) {
+            self.context = Some(context);
+            self.clock_anchor = None;
+        }
+        if !self.timestamp_is_fresh(input.timestamp_us, now_us) {
+            // Mirror the native Windows host's recovery behavior: a correction
+            // to either wall clock re-anchors the newest authenticated input,
+            // instead of turning ordinary clock skew into a terminal error.
+            self.clock_anchor = Some(InputClockAnchor {
+                remote_us: input.timestamp_us,
+                local_us: now_us,
+            });
+        }
+        self.last_sequence = input.sequence;
+        true
+    }
+
+    fn timestamp_is_fresh(&mut self, remote_us: u64, local_us: u64) -> bool {
+        let Some(anchor) = self.clock_anchor else {
+            self.clock_anchor = Some(InputClockAnchor {
+                remote_us,
+                local_us,
+            });
+            return true;
+        };
+        let mapped_local_us = if remote_us >= anchor.remote_us {
+            anchor.local_us.saturating_add(remote_us - anchor.remote_us)
+        } else {
+            anchor.local_us.saturating_sub(anchor.remote_us - remote_us)
+        };
+        mapped_local_us >= local_us.saturating_sub(MAX_INPUT_AGE_US)
+            && mapped_local_us <= local_us.saturating_add(MAX_INPUT_FUTURE_SKEW_US)
+    }
+}
+
 #[derive(Default)]
 struct VideoState {
     config: Option<PublishedVideoConfig>,
@@ -951,13 +1009,21 @@ impl VideoState {
         self.config.map(|config| config.context)
     }
 
-    fn validate_geometry_version(&self, stream_id: u64, version: u32, width: u16, height: u16) -> Result<(), HostError> {
+    fn validate_geometry_version(
+        &self,
+        stream_id: u64,
+        version: u32,
+        width: u16,
+        height: u16,
+    ) -> Result<(), HostError> {
         if let Some(current) = self.config
             && current.context.stream_id == stream_id
             && (current.width, current.height) != (width, height)
             && version <= current.version
         {
-            return Err(HostError::Protocol("input geometry requires a new video configuration version".into()));
+            return Err(HostError::Protocol(
+                "input geometry requires a new video configuration version".into(),
+            ));
         }
         Ok(())
     }
@@ -1195,13 +1261,143 @@ mod tests {
     };
 
     use super::{
-        HostCommand, HostError, HostEvent, HostState, PublishedVideoConfig, VideoState,
-        WorkerPhase, advance_input_epoch, allocate_input_epoch_with, command_is_admissible,
-        contains_idr, emit_nonterminal, emit_required, emit_terminal, is_retryable_host_error,
-        record_terminal_admission, try_advance_worker_phase, wait_for_approval_with_timeout,
+        HostCommand, HostError, HostEvent, HostInputPolicy, HostState, InputClockAnchor,
+        PublishedVideoConfig, VideoState, WorkerPhase, advance_input_epoch,
+        allocate_input_epoch_with, command_is_admissible, contains_idr, emit_nonterminal,
+        emit_required, emit_terminal, is_retryable_host_error, record_terminal_admission,
+        try_advance_worker_phase, wait_for_approval_with_timeout,
     };
+    use desklink_protocol::{InputContext, InputEnvelope, InputEvent};
     use ed25519_dalek::SigningKey;
     use tokio::sync::{mpsc, watch};
+
+    fn clock_input(context: InputContext, sequence: u64, timestamp_us: u64) -> InputEnvelope {
+        InputEnvelope {
+            sequence,
+            timestamp_us,
+            stream_id: context.stream_id,
+            input_epoch: context.input_epoch,
+            event: InputEvent::MouseMove { x: 1, y: 2 },
+        }
+    }
+
+    #[test]
+    fn input_clock_calibrates_both_ten_minute_offsets_and_preserves_a_same_target_anchor() {
+        let target = InputContext {
+            stream_id: 7,
+            input_epoch: 15,
+        };
+        let local = 10_000_000_000_u64;
+        for remote in [local - 600_000_000, local + 600_000_000] {
+            let mut policy = HostInputPolicy::default();
+            assert!(policy.admit(&clock_input(target, 1, remote), Some(target), local));
+            let anchor = policy.clock_anchor;
+            assert!(policy.admit(
+                &clock_input(target, 2, remote + 100),
+                Some(target),
+                local + 100
+            ));
+            assert_eq!(
+                policy.clock_anchor, anchor,
+                "same-target quality changes must not recalibrate clocks"
+            );
+        }
+    }
+
+    #[test]
+    fn input_clock_reanchors_remote_and_local_wall_clock_jumps_without_replaying_sequence() {
+        let target = InputContext {
+            stream_id: 7,
+            input_epoch: 15,
+        };
+        let base = 10_000_000_000_u64;
+        let mut policy = HostInputPolicy::default();
+        let samples = [
+            (base, base),
+            (base + 600_000_000, base + 100),
+            (base - 600_000_000, base + 200),
+            (base - 600_000_000 + 100, base + 600_000_000),
+            (base - 600_000_000 + 200, base - 600_000_000),
+        ];
+        for (index, (remote_us, local_us)) in samples.into_iter().enumerate() {
+            assert!(policy.admit(
+                &clock_input(target, index as u64 + 1, remote_us),
+                Some(target),
+                local_us
+            ));
+            assert_eq!(
+                policy.clock_anchor,
+                Some(InputClockAnchor {
+                    remote_us,
+                    local_us
+                })
+            );
+        }
+        let anchor = policy.clock_anchor;
+        assert!(!policy.admit(&clock_input(target, 1, u64::MAX), Some(target), 0));
+        assert!(!policy.admit(&clock_input(target, 5, 0), Some(target), u64::MAX));
+        assert_eq!(policy.last_sequence, 5);
+        assert_eq!(policy.clock_anchor, anchor);
+    }
+
+    #[test]
+    fn old_or_unpublished_target_cannot_poison_clock_or_sequence_even_at_u64_max() {
+        let old = InputContext {
+            stream_id: 7,
+            input_epoch: 15,
+        };
+        let current = InputContext {
+            stream_id: 7,
+            input_epoch: 16,
+        };
+        let base = 10_000_000_000_u64;
+        let mut policy = HostInputPolicy::default();
+        assert!(!policy.admit(&clock_input(old, u64::MAX, u64::MAX), None, 0));
+        assert_eq!(policy.clock_anchor, None);
+        assert_eq!(policy.last_sequence, 0);
+        assert!(policy.admit(&clock_input(old, 1, base), Some(old), base));
+        let anchor = policy.clock_anchor;
+        assert!(!policy.admit(&clock_input(old, u64::MAX, u64::MAX), Some(current), 0));
+        assert_eq!(policy.last_sequence, 1);
+        assert_eq!(policy.clock_anchor, anchor);
+        assert!(policy.admit(
+            &clock_input(current, 2, base + 200),
+            Some(current),
+            base + 100
+        ));
+        assert_eq!(
+            policy.clock_anchor,
+            Some(InputClockAnchor {
+                remote_us: base + 200,
+                local_us: base + 100
+            })
+        );
+        assert_eq!(policy.context, Some(current));
+    }
+
+    #[test]
+    fn input_clock_handles_u64_limits_and_never_wraps_sequence_within_one_noise_session() {
+        let target = InputContext {
+            stream_id: u64::MAX,
+            input_epoch: u64::MAX,
+        };
+        let mut policy = HostInputPolicy::default();
+        assert!(policy.admit(
+            &clock_input(target, 1, u64::MAX - 1),
+            Some(target),
+            10_000_000
+        ));
+        assert!(policy.admit(&clock_input(target, 2, u64::MAX), Some(target), u64::MAX));
+        assert!(policy.admit(&clock_input(target, 3, 0), Some(target), 0));
+        assert!(policy.admit(&clock_input(target, u64::MAX, 1), Some(target), 1));
+        let anchor = policy.clock_anchor;
+        for sequence in [0, 1, 3, u64::MAX] {
+            assert!(!policy.admit(&clock_input(target, sequence, 2), Some(target), 2));
+        }
+        assert_eq!(policy.clock_anchor, anchor);
+        let mut next_noise = HostInputPolicy::default();
+        assert!(next_noise.admit(&clock_input(target, 1, 2), Some(target), 2));
+    }
 
     #[test]
     fn epoch_seed_rejects_zero_maximum_and_entropy_errors_without_fallback_or_retry() {
