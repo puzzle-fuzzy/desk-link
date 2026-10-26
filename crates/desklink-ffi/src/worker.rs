@@ -45,6 +45,7 @@ pub(crate) struct SecureConnectionConfigOwned {
     pub controller_secret_key: [u8; 32],
     pub host_verify_key: [u8; 32],
     pub expires_at_unix_s: Option<u64>,
+    pub authorization_type: u32,
     pub directory: Option<DirectoryConnectionConfigOwned>,
 }
 
@@ -56,6 +57,7 @@ impl Drop for SecureConnectionConfigOwned {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DirectoryConnectionConfigOwned {
     pub device_id: u64,
     pub access_code: [u8; 8],
@@ -269,7 +271,7 @@ struct WorkerContext {
 async fn run_worker(
     relay_url: String,
     platform: Platform,
-    config: SecureConnectionConfigOwned,
+    mut config: SecureConnectionConfigOwned,
     context: WorkerContext,
 ) {
     let WorkerContext {
@@ -298,19 +300,15 @@ async fn run_worker(
             },
             0,
         );
-        let connection = connect_controller(
-            &relay_url,
-            platform,
-            &config,
-            callback,
-            material_publisher.clone(),
-        );
+        let connection = connect_controller(&relay_url, platform, &config, callback);
         let controller = tokio::select! {
             result = connection => match result {
                 Ok(connection) => {
-                    if let Some(expires_at_unix_s) = connection.expires_at_unix_s {
-                        schedule.set_expiry(Some(expires_at_unix_s));
-                    }
+                    schedule.set_expiry(connection.expires_at_unix_s);
+                    config.host_verify_key = connection.material.host_verify_key;
+                    config.authorization_type = connection.material.authorization_type;
+                    config.expires_at_unix_s = connection.expires_at_unix_s;
+                    if let Some(publish) = &material_publisher { publish(connection.material); }
                     connection.controller
                 },
                 Err(failure) => {
@@ -325,6 +323,7 @@ async fn run_worker(
                             callback,
                             release_events: &release_events,
                             release_pending: &release_pending,
+                            persistent: config.authorization_type == 2,
                         },
                     )
                     .await
@@ -398,6 +397,7 @@ async fn run_worker(
                         callback,
                         release_events: &release_events,
                         release_pending: &release_pending,
+                        persistent: config.authorization_type == 2,
                     },
                 )
                 .await
@@ -604,6 +604,7 @@ struct RetryContext<'a> {
     callback: CallbackTarget,
     release_events: &'a Arc<Mutex<Vec<InputEvent>>>,
     release_pending: &'a Arc<AtomicU8>,
+    persistent: bool,
 }
 
 async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryContext<'_>) -> bool {
@@ -615,6 +616,7 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
         callback,
         release_events,
         release_pending,
+        persistent,
     } = context;
     if !failure.retryable {
         callback.emit_error(&failure.message, 0);
@@ -650,6 +652,23 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
             .await
         }
         ReconnectDecision::Exhausted => {
+            if persistent {
+                callback.emit_state(DesklinkState::Reconnecting, 0);
+                callback.emit_error_with_state(
+                    "waiting for the approved persistent host",
+                    0,
+                    DesklinkState::Reconnecting,
+                );
+                return wait_for_retry(
+                    schedule.max_delay(),
+                    commands,
+                    pending_release,
+                    cancellation,
+                    release_events,
+                    release_pending,
+                )
+                .await;
+            }
             callback.emit_error(
                 &format!(
                     "reconnect retry budget exhausted after {} attempts: {}",
@@ -760,8 +779,15 @@ async fn connect_controller(
     platform: Platform,
     config: &SecureConnectionConfigOwned,
     callback: CallbackTarget,
-    material_publisher: Option<MaterialPublisher>,
 ) -> Result<ResolvedControllerConnection, ConnectFailure> {
+    if config
+        .expires_at_unix_s
+        .is_some_and(|expiry| now_unix_s() >= expiry)
+    {
+        return Err(ConnectFailure::permanent(
+            "saved temporary authorization expired".into(),
+        ));
+    }
     let relay_addr = resolve_relay(relay_url).map_err(ConnectFailure::permanent)?;
     let transport_config = QuicClientConfig::new(relay_addr, config.server_name.clone())
         .map_err(ConnectFailure::from_transport)?;
@@ -780,30 +806,23 @@ async fn connect_controller(
             .map_err(|_| ConnectFailure::retryable("relay directory lookup timed out".into()))?
             .map_err(ConnectFailure::from_transport)?;
             let result = PairingInvite::decode(&invitation, now_unix_s())
-                .map(|invite| {
-                    let session_id = *invite.session_id().as_bytes();
-                    let relay_authentication = *invite.relay_authentication();
-                    let host_verify_key = *invite.host_verify_key().as_bytes();
-                    if let Some(publish) = &material_publisher {
-                        publish(SavedHostMaterialOwned {
-                            session_id,
-                            relay_authentication: Zeroizing::new(relay_authentication),
-                            host_verify_key,
-                            server_name: config.server_name.clone(),
-                        });
-                    }
-                    (
-                        session_id,
-                        relay_authentication,
-                        host_verify_key,
-                        Some(invite.expires_at_unix_s()).filter(|expires| *expires != 0),
-                    )
-                })
                 .map_err(|_| {
                     ConnectFailure::permanent(
                         "the device returned an invalid or expired connection invitation"
                             .to_owned(),
                     )
+                })
+                .and_then(|invite| {
+                    let session_id = *invite.session_id().as_bytes();
+                    let relay_authentication = *invite.relay_authentication();
+                    let host_verify_key = *invite.host_verify_key().as_bytes();
+                    validate_expected_host(config.host_verify_key, host_verify_key)?;
+                    Ok((
+                        session_id,
+                        relay_authentication,
+                        host_verify_key,
+                        Some(invite.expires_at_unix_s()).filter(|expires| *expires != 0),
+                    ))
                 });
             invitation.zeroize();
             result?
@@ -840,6 +859,15 @@ async fn connect_controller(
         .map(|controller| ResolvedControllerConnection {
             controller,
             expires_at_unix_s,
+            material: SavedHostMaterialOwned {
+                session_id,
+                relay_authentication: Zeroizing::new(relay_authentication),
+                host_verify_key,
+                server_name: config.server_name.clone(),
+                expires_at_unix_s: expires_at_unix_s.unwrap_or(0),
+                authorization_type: if expires_at_unix_s.is_some() { 1 } else { 2 },
+                directory: config.directory.clone(),
+            },
         })
         .map_err(ConnectFailure::from_controller)
 }
@@ -859,6 +887,16 @@ async fn join_relay(client: &QuicClient, join: RelayJoin) -> Result<(), Transpor
 struct ResolvedControllerConnection {
     controller: ControllerRuntime,
     expires_at_unix_s: Option<u64>,
+    material: SavedHostMaterialOwned,
+}
+
+fn validate_expected_host(expected: [u8; 32], actual: [u8; 32]) -> Result<(), ConnectFailure> {
+    if expected != [0; 32] && expected != actual {
+        return Err(ConnectFailure::permanent(
+            "approved host identity changed; pair again".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn enqueue_release_all(
@@ -988,6 +1026,56 @@ fn resolve_relay(relay_url: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_relookup_cannot_replace_an_approved_host_identity() {
+        assert!(validate_expected_host([0; 32], [1; 32]).is_ok());
+        assert!(validate_expected_host([1; 32], [1; 32]).is_ok());
+        let changed = validate_expected_host([1; 32], [2; 32]).unwrap_err();
+        assert!(!changed.retryable);
+        assert!(changed.message.contains("identity changed"));
+    }
+
+    #[tokio::test]
+    async fn persistent_host_keeps_waiting_after_budget_and_is_still_cancellable() {
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_secs(8), 1).unwrap();
+        let mut schedule = ReconnectSchedule::new(policy, None);
+        let _ = schedule.next(now_unix_s());
+        let (_sender, mut commands) = mpsc::channel(1);
+        let (sender, mut cancellation) = watch::channel(false);
+        let mut pending = None;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let release_pending = Arc::new(AtomicU8::new(0));
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            sender.send(true).unwrap();
+        };
+        let retry = schedule_retry(
+            ConnectFailure::retryable("offline".into()),
+            false,
+            RetryContext {
+                schedule: &mut schedule,
+                commands: &mut commands,
+                pending_release: &mut pending,
+                cancellation: &mut cancellation,
+                callback: CallbackTarget {
+                    callback: None,
+                    context: 0,
+                },
+                release_events: &events,
+                release_pending: &release_pending,
+                persistent: true,
+            },
+        );
+        let (result, ()) = tokio::join!(retry, cancel);
+        assert!(!result);
+        assert!(*cancellation.borrow());
+        assert!(matches!(
+            schedule.next(now_unix_s()),
+            ReconnectDecision::Exhausted
+        ));
+    }
 
     #[tokio::test]
     async fn full_connected_send_is_cancelled_even_with_queued_commands() {

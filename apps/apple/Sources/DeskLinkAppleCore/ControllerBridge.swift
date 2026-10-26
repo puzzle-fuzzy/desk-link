@@ -237,8 +237,8 @@ public final class ControllerBridge: ObservableObject {
     public func connect(savedHost: SavedHost) {
         state = .connecting
         lastError = nil
-        guard savedHost.isValid else {
-            publishErrorMessage("The saved host record is invalid.")
+        guard savedHost.canReconnect else {
+            publishErrorMessage("已保存的授权已过期或缺少有效期限，请重新配对。")
             return
         }
         savedHostForResume = savedHost
@@ -253,6 +253,12 @@ public final class ControllerBridge: ObservableObject {
             withUnsafeMutableBytes(of: &config.controller_device_id) { $0.copyBytes(from: identity.deviceID) }
             withUnsafeMutableBytes(of: &config.controller_secret_key) { $0.copyBytes(from: identity.secretKey) }
             withUnsafeMutableBytes(of: &config.host_verify_key) { $0.copyBytes(from: savedHost.hostVerifyKey) }
+            config.expires_at_unix_s = savedHost.expiresAtUnixS ?? 0
+            config.authorization_type = savedHost.authorizationType ?? 0
+            config.directory_device_id = savedHost.directoryDeviceID ?? 0
+            if let accessCode = savedHost.directoryAccessCode {
+                withUnsafeMutableBytes(of: &config.directory_access_code) { $0.copyBytes(from: accessCode) }
+            }
             let result = savedHost.serverName.withCString { serverName in
                 config.server_name = serverName
                 return desklink_connect_secure(handle, &config)
@@ -261,7 +267,7 @@ public final class ControllerBridge: ObservableObject {
                 publishResultError("The saved host could not be reached.", result: result)
                 return
             }
-            awaitingApprovedHostMaterial = false
+            awaitingApprovedHostMaterial = true
             state = .connecting
         } catch {
             publishError(error)
@@ -499,7 +505,9 @@ public final class ControllerBridge: ObservableObject {
         case Int(DESKLINK_IDLE.rawValue): state = .idle
         case Int(DESKLINK_DEGRADED.rawValue): state = .frozen
         case Int(DESKLINK_RECOVERING_VIDEO.rawValue): state = .recovering
-        case Int(DESKLINK_RECONNECTING.rawValue): state = .reconnecting
+        case Int(DESKLINK_RECONNECTING.rawValue):
+            if savedHostForResume != nil { awaitingApprovedHostMaterial = true }
+            state = .reconnecting
         case Int(DESKLINK_DISCONNECTING.rawValue): state = .reconnecting
         default: state = .connecting
         }
@@ -585,7 +593,12 @@ public final class ControllerBridge: ObservableObject {
             serverName: serverName,
             sessionID: withUnsafeBytes(of: material.session_id) { Array($0) },
             relayAuthentication: withUnsafeBytes(of: material.relay_authentication) { Array($0) },
-            hostVerifyKey: withUnsafeBytes(of: material.host_verify_key) { Array($0) }
+            hostVerifyKey: withUnsafeBytes(of: material.host_verify_key) { Array($0) },
+            expiresAtUnixS: material.expires_at_unix_s,
+            authorizationType: material.authorization_type,
+            directoryDeviceID: material.directory_device_id == 0 ? nil : material.directory_device_id,
+            directoryAccessCode: material.directory_device_id == 0 ? nil : withUnsafeBytes(of: material.directory_access_code) { Array($0) },
+            lastConnectedAt: Date()
         )
         do {
             try savedHostStore.save(host)

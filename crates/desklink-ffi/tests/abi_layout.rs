@@ -28,7 +28,7 @@ fn c_header_layout_matches_every_public_rust_struct() {
     }
     layout!(DesklinkConfig; relay_url, log_level);
     layout!(DesklinkHostConfig; relay_url, server_name, host_device_id, host_secret_key, log_level);
-    layout!(DesklinkSecureConnectionConfig; server_name, session_id, relay_authentication, controller_device_id, controller_secret_key, host_verify_key);
+    layout!(DesklinkSecureConnectionConfig; server_name, session_id, relay_authentication, controller_device_id, controller_secret_key, host_verify_key, expires_at_unix_s, authorization_type, directory_device_id, directory_access_code);
     layout!(DesklinkPairingInviteConnectionConfig; server_name, invite, invite_len, controller_device_id, controller_secret_key);
     layout!(DesklinkDirectoryConnectionConfig; server_name, device_id, access_code, controller_device_id, controller_secret_key);
     layout!(DesklinkPairingInfo; session_id, code, expires_at_unix_s);
@@ -37,7 +37,7 @@ fn c_header_layout_matches_every_public_rust_struct() {
     layout!(DesklinkHostInput; kind, x, y, wheel_x, wheel_y, button, key_code, character, pressed, modifiers);
     layout!(DesklinkHostMetrics; sent_video_configs, sent_video_packets, received_input_events, keyframe_requests);
     layout!(DesklinkHostEvent; kind, state, data, data_len, controller_device_id, controller_verify_key, fingerprint, fingerprint_len, input, metrics);
-    layout!(DesklinkSavedHostMaterial; session_id, relay_authentication, host_verify_key, server_name);
+    layout!(DesklinkSavedHostMaterial; session_id, relay_authentication, host_verify_key, server_name, expires_at_unix_s, authorization_type, directory_device_id, directory_access_code);
     let temp = std::env::temp_dir().join(format!("desklink-abi-{}", std::process::id()));
     fs::create_dir_all(&temp).unwrap();
     let source = temp.join("layout.c");

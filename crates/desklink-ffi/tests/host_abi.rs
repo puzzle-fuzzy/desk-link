@@ -154,6 +154,10 @@ fn controller_saved_material_is_not_exported_before_authenticated_connection() {
         relay_authentication: [0; 32],
         host_verify_key: [0; 32],
         server_name: [0; 256],
+        expires_at_unix_s: 0,
+        authorization_type: 0,
+        directory_device_id: 0,
+        directory_access_code: [0; 8],
     };
     assert_eq!(
         unsafe {

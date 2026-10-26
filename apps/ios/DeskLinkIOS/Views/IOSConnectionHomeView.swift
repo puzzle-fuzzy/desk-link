@@ -52,16 +52,16 @@ struct IOSConnectionHomeView: View {
                                     controller.connect(savedHost: host)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 3) {
-                                        Text(host.serverName)
+                                        Text(host.displayName)
                                             .foregroundStyle(.primary)
-                                        Text("已保存的安全连接")
+                                        Text(host.canReconnect ? "已保存的安全连接" : "连接授权需更新，请重新配对")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
                                 }
                                 .buttonStyle(.borderless)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .disabled(isBusy)
+                                .disabled(isBusy || !host.canReconnect)
 
                                 Button(role: .destructive) {
                                     removeSavedHost(host)
@@ -69,7 +69,7 @@ struct IOSConnectionHomeView: View {
                                     Image(systemName: "trash")
                                 }
                                 .buttonStyle(.borderless)
-                                .accessibilityLabel("删除 \(host.serverName)")
+                                .accessibilityLabel("删除 \(host.displayName)")
                             }
                         }
                     }

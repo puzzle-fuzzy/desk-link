@@ -185,6 +185,11 @@ pub struct DesklinkSecureConnectionConfig {
     pub controller_device_id: [u8; 16],
     pub controller_secret_key: [u8; 32],
     pub host_verify_key: [u8; 32],
+    pub expires_at_unix_s: u64,
+    /// 0 unknown (requires re-pair), 1 temporary, 2 persistent.
+    pub authorization_type: u32,
+    pub directory_device_id: u64,
+    pub directory_access_code: [u8; 8],
 }
 
 #[repr(C)]
@@ -324,6 +329,10 @@ pub struct DesklinkSavedHostMaterial {
     pub relay_authentication: [u8; 32],
     pub host_verify_key: [u8; 32],
     pub server_name: [c_char; 256],
+    pub expires_at_unix_s: u64,
+    pub authorization_type: u32,
+    pub directory_device_id: u64,
+    pub directory_access_code: [u8; 8],
 }
 
 pub struct DesklinkHandle {
@@ -352,6 +361,9 @@ pub(crate) struct SavedHostMaterialOwned {
     pub(crate) relay_authentication: Zeroizing<[u8; 32]>,
     pub(crate) host_verify_key: [u8; 32],
     pub(crate) server_name: String,
+    pub(crate) expires_at_unix_s: u64,
+    pub(crate) authorization_type: u32,
+    pub(crate) directory: Option<DirectoryConnectionConfigOwned>,
 }
 
 struct HostCallbackState {
@@ -884,11 +896,37 @@ pub unsafe extern "C" fn desklink_connect_secure(
     if ed25519_dalek::VerifyingKey::from_bytes(&config.host_verify_key).is_err() {
         return DesklinkResult::InvalidArgument;
     }
+    if !saved_authorization_valid(
+        config.authorization_type,
+        config.expires_at_unix_s,
+        now_unix_s(),
+    ) {
+        return DesklinkResult::InvalidArgument;
+    }
+    let directory = if config.directory_device_id != 0 {
+        if desklink_transport::RelayDirectoryLookup::new(
+            config.directory_device_id,
+            config.directory_access_code,
+        )
+        .is_err()
+        {
+            return DesklinkResult::InvalidArgument;
+        }
+        Some(DirectoryConnectionConfigOwned {
+            device_id: config.directory_device_id,
+            access_code: config.directory_access_code,
+        })
+    } else {
+        None
+    };
     let saved = SavedHostMaterialOwned {
         session_id: config.session_id,
         relay_authentication: Zeroizing::new(config.relay_authentication),
         host_verify_key: config.host_verify_key,
         server_name: server_name.clone(),
+        expires_at_unix_s: config.expires_at_unix_s,
+        authorization_type: config.authorization_type,
+        directory: directory.clone(),
     };
     let Ok(mut material) = runtime.saved_host_material.lock() else {
         return DesklinkResult::InternalError;
@@ -904,8 +942,9 @@ pub unsafe extern "C" fn desklink_connect_secure(
             controller_device_id: config.controller_device_id,
             controller_secret_key: config.controller_secret_key,
             host_verify_key: config.host_verify_key,
-            expires_at_unix_s: None,
-            directory: None,
+            expires_at_unix_s: (config.authorization_type == 1).then_some(config.expires_at_unix_s),
+            authorization_type: config.authorization_type,
+            directory,
         },
     );
     if result != DesklinkResult::Ok {
@@ -969,6 +1008,9 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
         relay_authentication: Zeroizing::new(relay_authentication),
         host_verify_key,
         server_name: server_name.clone(),
+        expires_at_unix_s: invite.expires_at_unix_s(),
+        authorization_type: if invite.is_persistent() { 2 } else { 1 },
+        directory: None,
     };
     let Ok(mut material) = runtime.saved_host_material.lock() else {
         return DesklinkResult::InternalError;
@@ -984,7 +1026,8 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
             controller_device_id: config.controller_device_id,
             controller_secret_key: config.controller_secret_key,
             host_verify_key,
-            expires_at_unix_s: Some(invite.expires_at_unix_s()),
+            expires_at_unix_s: Some(invite.expires_at_unix_s()).filter(|expiry| *expiry != 0),
+            authorization_type: if invite.is_persistent() { 2 } else { 1 },
             directory: None,
         },
     );
@@ -1044,6 +1087,7 @@ pub unsafe extern "C" fn desklink_connect_directory(
             controller_secret_key: config.controller_secret_key,
             host_verify_key: [0; 32],
             expires_at_unix_s: None,
+            authorization_type: 0,
             directory: Some(DirectoryConnectionConfigOwned {
                 device_id: config.device_id,
                 access_code: config.access_code,
@@ -1365,6 +1409,16 @@ pub unsafe extern "C" fn desklink_controller_copy_saved_host_material(
         relay_authentication: *material.relay_authentication,
         host_verify_key: material.host_verify_key,
         server_name: [0; 256],
+        expires_at_unix_s: material.expires_at_unix_s,
+        authorization_type: material.authorization_type,
+        directory_device_id: material
+            .directory
+            .as_ref()
+            .map_or(0, |directory| directory.device_id),
+        directory_access_code: material
+            .directory
+            .as_ref()
+            .map_or([0; 8], |directory| directory.access_code),
     };
     for (destination, source) in output
         .server_name
@@ -1831,6 +1885,14 @@ fn clear_saved_material(material: &Arc<Mutex<Option<SavedHostMaterialOwned>>>) {
     }
 }
 
+fn saved_authorization_valid(kind: u32, expires_at: u64, now: u64) -> bool {
+    match kind {
+        1 => expires_at > now,
+        2 => expires_at == 0,
+        _ => false,
+    }
+}
+
 fn reserve_host_start(handle: &DesklinkHostHandle) -> Result<(), DesklinkResult> {
     let Ok(mut lifecycle) = handle.lifecycle.lock() else {
         return Err(DesklinkResult::InternalError);
@@ -2212,6 +2274,17 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_authorization_never_upgrades_unknown_or_expired_material() {
+        assert!(!saved_authorization_valid(0, 0, 100));
+        assert!(!saved_authorization_valid(1, 0, 100));
+        assert!(!saved_authorization_valid(1, 100, 100));
+        assert!(saved_authorization_valid(1, 101, 100));
+        assert!(saved_authorization_valid(2, 0, 100));
+        assert!(!saved_authorization_valid(2, 101, 100));
+        assert!(!saved_authorization_valid(3, 0, 100));
+    }
 
     #[test]
     fn controller_commands_validate_values_and_preserve_typed_intent() {

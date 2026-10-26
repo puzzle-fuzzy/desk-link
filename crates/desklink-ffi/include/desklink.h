@@ -157,6 +157,10 @@ typedef struct DesklinkSecureConnectionConfig {
     uint8_t controller_device_id[16];
     uint8_t controller_secret_key[32];
     uint8_t host_verify_key[32];
+    uint64_t expires_at_unix_s;
+    uint32_t authorization_type;
+    uint64_t directory_device_id;
+    uint8_t directory_access_code[8];
 } DesklinkSecureConnectionConfig;
 
 typedef struct DesklinkPairingInviteConnectionConfig {
@@ -246,6 +250,10 @@ typedef struct DesklinkSavedHostMaterial {
     uint8_t relay_authentication[32];
     uint8_t host_verify_key[32];
     char server_name[256];
+    uint64_t expires_at_unix_s;
+    uint32_t authorization_type;
+    uint64_t directory_device_id;
+    uint8_t directory_access_code[8];
 } DesklinkSavedHostMaterial;
 
 /* Event bytes are borrowed only for the callback duration.
