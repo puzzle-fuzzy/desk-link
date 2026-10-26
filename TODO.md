@@ -220,6 +220,15 @@
 - [x] **真实配置配对（`fix(DL2-013): pair input epoch publication with actual encoder versions`）：** Coordinator所有发布显式读取encoder.config_version；几何/有效性边界在分配epoch前验证真实新版本大于epoch出生版本，metadata保持anchor。HostPipeline拒绝倒退/同版本换epoch或尺寸，正确新版本仍需IDR。保留ControllerRuntime原有相同身份字段变更拒绝，不冒称已复现旧帧误激活。配置u32耗尽在各捕获重配入口退出peer，不做无穷重试/复用1。
 - **验证：** 174库通过/2忽略+11契约通过，lib+tests严格Clippy通过；同尺寸/同SPS选屏与虚拟原点、旧MFT输出回归均从实际SoftwareOnly编码器重配/getter取得版本并由真实pipeline发布token，非修改常量fixture求绿。
 
+### DL2-044 · P1 · 可选光标数据报降级与发送诊断
+
+- [ ] 完成可选光标降级及用户可见诊断接入验收。
+- **源码复核修正：** 锁定Quinn 0.11.11/proto 0.11.16的send_datagram在队列压力下逐出旧报文并返回Ok，不存在公开QueueFull；TransportError::Datagram只覆盖该发送API的UnsupportedByPeer/Disabled/TooLarge。不能用连续失败预算模拟队列压力，也不能把Ok或发送错误次数当作送达/丢包统计。
+- [x] **生产策略（`fix(DL2-044): disable unsupported cursor datagrams without ending peers`）：** 首个Datagram错误仅停用当前peer的可选光标，后续不采样、不加密、不重发，future保持pending等待主peer取消。连接/代数/身份/preflight错误仍立即传播。每个peer独立状态，一次固定capability_or_size原因；send_attempts/send_errors/disabled字段只表示本地操作。
+- [x] **有界诊断接线：** HostSupervisor/HostRuntime提供with_media_diagnostics_observer，构造时初始化进程唯一32槽队列/工作线程；热路径try_send、不做同步文件或HTTP，回调异常不杀接收器。DiagnosticEvent::HostMedia提供固定JSON字段映射；队列拒绝数与网络丢包明确分离。未绑定observer时仅后台stderr回退，不视为用户导出/服务端可见性已交付。接口见docs/windows-host-media-diagnostics.md。
+- **验证：** 光标10项（含真实生产循环停止采样但不完成peer future）+诊断分发2项通过；真实127.0.0.1传输20项通过，包括对端禁用、低于应用preflight上限的TooLarge、终态/代数检查及1字节Quinn发送缓冲下1000次Ok，之后同连接控制/输入可用。Windows+transport lib/tests严格Clippy通过。
+- [ ] 产品层绑定observer到实际诊断导出/服务端schema并验证最终可见性；真实网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
+
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 
 - [ ] 区分监听终态并使禁用原因可观测。

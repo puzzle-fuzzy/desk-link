@@ -1,3 +1,9 @@
+mod cursor_send;
+mod media_diagnostics;
+pub use cursor_send::CursorDisableReason;
+pub use media_diagnostics::{
+    HostMediaDiagnostic, HostMediaDiagnosticsObserver, rejected_host_media_diagnostics,
+};
 mod adaptive_bitrate;
 #[cfg(test)]
 mod direct_arbitration_tests;
@@ -475,6 +481,7 @@ pub struct HostSupervisor {
     expires_at_unix_s: Option<u64>,
     directory_registration: Option<RelayDirectoryRegistration>,
     observer: Option<Arc<dyn HostLifecycleObserver>>,
+    media_observer: Option<HostMediaDiagnosticsObserver>,
 }
 
 impl HostSupervisor {
@@ -503,6 +510,7 @@ impl HostSupervisor {
             expires_at_unix_s,
             directory_registration: None,
             observer: None,
+            media_observer: None,
         })
     }
 
@@ -513,6 +521,15 @@ impl HostSupervisor {
 
     pub fn with_observer(mut self, observer: Arc<dyn HostLifecycleObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Delivery is queued to one bounded worker, never inline on media/input.
+    pub fn with_media_diagnostics_observer(
+        mut self,
+        observer: HostMediaDiagnosticsObserver,
+    ) -> Self {
+        self.media_observer = Some(observer);
         self
     }
 
@@ -638,16 +655,18 @@ impl HostSupervisor {
         loop {
             let identity =
                 DeviceIdentity::from_secret_key(self.host_device_id, &self.host_secret_key);
-            let outcome = HostRuntime::with_shared_authorizer(
+            let mut runtime = HostRuntime::with_shared_authorizer(
                 client.clone(),
                 *stream_id,
                 identity,
                 self.authorizer.clone(),
-            )?
-            .run_tracking_stability(stable, |stream_id| {
-                self.publish(HostLifecycleEvent::Connected { stream_id });
-            })
-            .await;
+            )?;
+            runtime.media_observer = self.media_observer.clone();
+            let outcome = runtime
+                .run_tracking_stability(stable, |stream_id| {
+                    self.publish(HostLifecycleEvent::Connected { stream_id });
+                })
+                .await;
             match outcome {
                 Err(error)
                     if self.expires_at_unix_s.is_none()
@@ -1096,6 +1115,7 @@ pub struct HostRuntime {
     stream_id: u64,
     identity: DeviceIdentity,
     authorizer: Arc<dyn ControllerAuthorizer>,
+    media_observer: Option<HostMediaDiagnosticsObserver>,
 }
 
 impl HostRuntime {
@@ -1140,12 +1160,22 @@ impl HostRuntime {
         if stream_id == 0 {
             return Err(HostRuntimeError::InvalidControllerCapabilities);
         }
+        media_diagnostics::initialize();
         Ok(Self {
             client,
             stream_id,
             identity,
             authorizer,
+            media_observer: None,
         })
+    }
+
+    pub fn with_media_diagnostics_observer(
+        mut self,
+        observer: HostMediaDiagnosticsObserver,
+    ) -> Self {
+        self.media_observer = Some(observer);
+        self
     }
 
     pub async fn run(self) -> Result<(), HostRuntimeError> {
@@ -1163,6 +1193,7 @@ impl HostRuntime {
             stream_id,
             identity,
             authorizer,
+            media_observer,
         } = self;
         let (secure, peer_generation) =
             perform_noise_handshake(&client, identity, authorizer.as_ref()).await?;
@@ -1350,6 +1381,7 @@ impl HostRuntime {
             peer_generation,
             stream_id,
             selected_desktop,
+            media_observer,
         ));
         let mut transfer = Box::pin(receive_transfer_loop(
             client.clone(),
@@ -4175,24 +4207,70 @@ async fn send_cursor_loop(
     peer_generation: u64,
     stream_id: u64,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    observer: Option<HostMediaDiagnosticsObserver>,
 ) -> Result<(), HostRuntimeError> {
+    send_cursor_samples(stream_id, observer, |sequence| {
+        let desktop = lock_unpoisoned(&selected_desktop).desktop.rect;
+        let cursor = sample_cursor(desktop, stream_id, sequence);
+        let client = &client;
+        let secure = &secure;
+        async move {
+            let Some(cursor) = cursor else {
+                return Ok(None);
+            };
+            let plaintext = encode_cursor_update(&cursor)?;
+            let sent = client
+                .send_cursor_datagram_for_generation(
+                    peer_generation,
+                    seal(secure, SecureLane::CursorDatagram, &plaintext).await?,
+                )
+                .await;
+            Ok(Some(sent))
+        }
+    })
+    .await
+}
+
+async fn send_cursor_samples<F, Fut>(
+    stream_id: u64,
+    observer: Option<HostMediaDiagnosticsObserver>,
+    mut sample_and_send: F,
+) -> Result<(), HostRuntimeError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Result<(), TransportError>>, HostRuntimeError>>,
+{
     let mut interval = tokio::time::interval(CURSOR_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut sequence = 0_u64;
+    let mut state = cursor_send::CursorSendState::default();
     loop {
+        if state.is_disabled() {
+            // QUIC capability/size limits are fixed for this peer. Park this
+            // optional future; connection closure is consumed by inbound.
+            return std::future::pending().await;
+        }
         interval.tick().await;
         sequence = sequence.wrapping_add(1).max(1);
-        let desktop = lock_unpoisoned(&selected_desktop).desktop.rect;
-        let Some(cursor) = sample_cursor(desktop, stream_id, sequence) else {
+        let Some(sent) = sample_and_send(sequence).await? else {
             continue;
         };
-        let plaintext = encode_cursor_update(&cursor)?;
-        client
-            .send_cursor_datagram_for_generation(
-                peer_generation,
-                seal(&secure, SecureLane::CursorDatagram, &plaintext).await?,
-            )
-            .await?;
+        let outcome = state.record(sent)?;
+        if outcome.should_report()
+            && let cursor_send::CursorSendOutcome::OptionalDisabled { reason, .. } = outcome
+        {
+            let snapshot = outcome.snapshot();
+            media_diagnostics::emit(
+                &observer,
+                HostMediaDiagnostic::CursorSend {
+                    stream_id,
+                    send_attempts: snapshot.send_attempts,
+                    send_errors: snapshot.send_errors,
+                    disabled: snapshot.disabled,
+                    reason,
+                },
+            );
+        }
     }
 }
 
