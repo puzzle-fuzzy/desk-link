@@ -446,10 +446,22 @@
 
 - [x] **已实现并自动验证（`perf(DL2-015): reuse owned staging textures for desktop readback`）：** 捕获进程持有staging/context缓存，以D3D device身份和完整texture布局失效；Map/复制/Unmap在ReleaseFrame前完成，不保留失效桌面surface。
 - **验证：** `test -p desklink-windows --lib --locked capture::` 10通过、2忽略；3个WARP合成用例验证复用后新像素、尺寸/device失效、row pitch/padding；显式dev WARP基准1通过、staging创建60→1。命令与release复跑规范见 `docs/windows-capture-readback-benchmark.md`。上述是软件D3D工具/正确性验证，不代表真实GPU收益；CPU回读字节不变。
-- [ ] **仍待实现/硬件验收：** GPU缩放/转色/NV12 surface编码链、CPU捕获输出buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照。
+- [ ] **仍待整链/完整硬件验收：** GPU surface编码链、CPU捕获输出buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照；owned池/缩放转色进展见第二波完成项。
 
 - [x] **转换buffer切片（`perf(DL2-015): reuse encoder NV12 scratch buffers`）：** 生产编码器复用NV12 Vec，新增checked `convert_to_nv12_into`，保留原分配API；1:1转换不再为x/y索引建临时Vec。基线工具支持 `--reuse-buffer` 并记录增长次数，GPU与CPU输入复制未改变。
 - **验证：** 新buffer 3项、原encoder_contract 11项、backend 3项、percentile 1项通过，严格Clippy通过；显式release `--test encoder_buffers conversion_buffer_reuse_release_baseline -- --ignored --nocapture` 1通过。30样本/API、5次预热，同进程1080p分配/复用p50=4.8271/4.3698ms、p95=4.9710/4.4706ms、p99=5.0626/4.8022ms；1440p p50=8.6875/7.8823ms、p95=8.9543/8.0388ms、p99=9.0792/8.2324ms；预热后buffer增长0。仅为本机CPU转换API对照，非旧commit/真实GPU/端到端收益。
+
+- [x] **第二波owned GPU池与转色（`feat(DL2-015): add bounded owned GPU surfaces and NV12 processing`）：** GPU-only BGRA复制及VideoProcessor缩放/BT709 limited→NV12，普通路径无Map；Capture提供新CPU/GPU入口且保留旧CPU API。复制EVENT完成后才交付并ReleaseFrame；Clone共享lease，NV12独占lease供后续TrackedSample持有；超时/未完成fence隔离槽位。全进程64槽/512MiB逻辑图像字节预算跨pool换代计数，不能用丢旧pool逃逸预算。失败可对同一Acquire源完成CPU读回，新CPU帧清旧GPUcache；确认Idle后才允许缓存owned图像恢复IDR。
+- **验证：** 基于65c70fd归档加本切片4源码文件的独立快照（隔离并行016 WIP）原生GPU测试7通过：3个纯内存/状态用例+4个本机RTX4070TiSUPER合成纹理用例，覆盖source销毁、Clone占用/池满、709limited缩放色值、NV12跨pool存活、invalid/pending EVENT禁止复用、跨代64槽上限；独立快照完整lib 204通过/6忽略、lib/tests严格Clippy及定向格式检查通过。没有采集真实桌面、未推定MFT接受surface或实际编码成功。结构/命令/计量边界见docs/windows-gpu-media.md。
+- [x] **声明顺序格式跟进（`style(DL2-015): normalize GPU module declaration order`）：** 固定2d79f97补落盘日志时workspace fmt发现lib.rs仅gpu/identity声明排序差异，跟进只调整该顺序；原GPU7项、完整lib204项与Clippy均通过，原失败日志如实保留，不改GPU实现。
+- [ ] **后续完整验收仍待：** CPU输出buffer池、集显/独显/混合GPU及真实DXGI/双机/驱动恢复矩阵与性能；runtime GPU选路与MFT surface输入已在016完成项接通，单独owned池切片不作为生产整链或收益证明。
+
+- [x] **非热路径退役清理（`fix(DL2-015): trim retired GPU generations after safe ownership release`）：** Pool销毁先释放自身slots再按同一完成规则trim，捕获切软件时释放旧pool/cache，capture+encoder返回后worker再trim。只回收已无外部owner且EVENT完成的退役槽位；live lease、未完成/无效fence仍计全局预算。MF回调仍只原子归还lease，不做GPU查询/全局清理；late callback后的有界缓存可等后续trim，不冒称立即全部释放或把旧策略称泄漏。
+- **验证：** GPU模块8项（含本机合成live lease/incomplete query→End完成后的安全回收）及真实TrackedSample外部COM引用跨encoder/guard销毁仍占用的寿命回归通过，严格lib/tests Clippy通过。resident统计是逻辑槽/图像字节，不是实测VRAM。
+
+- [x] **可复跑GPU计量工具（`perf(DL2-015): add source-bound synthetic GPU stage probes`）：** 新gpu_media_probe及benchmark-windows-gpu.py，分capability/benchmark、显式adapter/input-path/experimental4k；CPU输入不假定软件backend。确定性desktop glyph-like/gradient/panels及滚动，tiles专用于两phase颜色/方向/UV参考；报告requested/actual尺寸/profile/bitrate、真实MFT/active状态、sample ID、pending未drain范围。区分GPU copy/VP输出、CPU读回、fixture上传/clone、texture/query/view创建；GPU时间/driver copy/heap分配未知为null。wrapper逐run及跨repeat绑定完整源码hash/HEAD/clean状态，fallback或不稳定源不作GPU比较依据。4项示例测试、严格example Clippy及Python编译通过。
+- [x] **正式本机阶段矩阵（`docs(DL2-015): record the frozen synthetic GPU stage matrix`）：** 固定6a60f45、clean、同一files_sha256，desktop-motion的1080p/1440p/显式4K两输入路径各3×30样本/3预热，18benchmark+1capability native进程全部exit0；实际尺寸、Main18M/4K High40.5M匹配。GPU均NVIDIA surface后端、fallback0、normalCPU读回/NV12 CPU写入/MF输入copy=0；CPU实际同NVIDIA system-memory后端。每run正常GPU query60/views各30，motion fixture另建纹理30，非零分配/零拷贝。数据表和原始JSON/hash路径见docs/windows-gpu-media.md；严格不将返回30输出/lastpending0当drained cohort或FPS。
+- [ ] **性能外推仍待：** GPU实际执行时间/driver内部copy/heap分配、质量等效、真实桌面/多GPU/双机/帧龄/功耗/长稳；本机CPU墙钟分阶段数据不外推端到端收益。
 
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
@@ -461,13 +473,20 @@
 
 - [x] **已实现并自动验证（`feat(DL2-016): select hardware MFTs with bounded software fallback`）：** 显式MFTEnumEx枚举NV12→H264硬件候选（最多尝试16），async unlock/事件credit授权/100ms进展预算；失败以相同帧在新config_version强制IDR重试软件，后续重配保持软件避免振荡。backend_info及基线报告记录实际后端/候选/稳定原因；见 `docs/windows-encoder-backends.md`。
 - **验证：** 2个新增credit/合成硬件故障用例通过，encoder_contract 11通过/1人工项忽略，基线percentile 1通过；lib+example严格Clippy通过。64×64合成软件及prefer-hardware各3帧烟测通过；后者真实枚举1候选、拒绝该配置后软件完成，报告source_unchanged=true。
-- [ ] **仍待硬件验收：** 本机未实际成功激活硬件异步编码；Intel/AMD/NVIDIA/混合GPU、真实device-loss与参数拒绝矩阵、CPU/GPU/帧龄恢复测量及GPU surface输入联合DL2-015验证。当前硬件输入仍为CPU NV12，不宣称零复制；进展预算不能中断驱动内部阻塞COM调用。
+- [ ] **仍待硬件验收：** 第一波仅验证CPU NV12输入和64²软件兜底，第二波surface实测见后续完成项；Intel/AMD/NVIDIA/混合GPU、真实device-loss与参数拒绝矩阵、CPU/GPU/帧龄恢复测量仍需联合DL2-015验收。进展预算不能中断驱动内部阻塞COM调用。
 
 - [x] **异步缓冲跟进（`fix(DL2-016): pump asynchronous MFT events across buffered inputs`）：** 合法NeedInput→输入1→NeedInput可返回等待下一输入，不再强求每输入100ms内必有输出；先排空旧输出、接收本次输入再交付旧帧，保留各时间戳/IDR元数据，不因INCOMPLETE把不同sample合为一帧。128 credit、16 pending、8MiB输出和100ms无事件/跨调用1秒无输出预算保持有界。
 - **验证：** encoder 14项通过（新增6个事件序列/容量/截止回归），lib严格Clippy通过；此为注入事件状态机验证，未代替真实硬件MFT事件执行与恢复矩阵。
 
 - [x] **输出时间戳跟进（`fix(DL2-016): reject unmatched encoder output timestamps`）：** 硬件缺失/未知输出时间戳在既有错误边界重试同一输入为软件IDR并锁定软件；软件未知明确时间戳产生可恢复错误，保留pending元数据，不再假装NeedMoreInput。软件未提供时间戳时保留FIFO契约。
 - **验证：** encoder 18项通过，新增当前/旧/未知/缺失时间戳矩阵及合成硬件损坏输出的同帧软件恢复；lib严格Clippy通过。真实厂商时间戳差异继续保留矩阵验收。
+
+- [x] **第二波真实surface编码（`feat(DL2-016): encode owned D3D11 surfaces with tracked sample leases`）：** runtime实际选择CaptureMediaFrame并进入GPU编码；按输入device LUID枚举硬件MFT，只读检查非零D3D11_AWARE，在async unlock后/格式协商前绑定DXGI device manager，包装NV12 subresource为MF DXGI buffer。TrackedSample回调持有独占lease直到最后外部sample引用释放，output/flush不提前归还。沿用原有async credit/pending/output/watchdog预算，真实backend替换先checked预留config后继；CPU/GPU切换、尺寸/设备重绑清旧pending但保持几何epoch。GPU错误从同一owned BGRA明确读回，切软件新config+IDR，当前peer关闭GPU重试；ConfigVersionExhausted仍typed退出、不wrap。
+- **本机验证：** NVIDIA720p实际8个surface输入/8输出，强制IDR1/3、709 matrix/limited metadata和CPU NV12/MF显式输入copy=0；6个GPU编码回归全部通过，含真正延迟交付输出的原ID/timestamp/config、故障同帧软件IDR/sticky关闭、版本耗尽，以及已有output后仍持额外sample COM引用→flush/drop encoder与原MFStartup guard→pool仍Busy→最后sample引用释放才精确归还同纹理。不是用“有输出”等价sample已释放。
+- **内容/R2联合验证：** GPU AnnexB→强制软件CMSH264DecoderMFT实际解码128帧，Main/High各512²及640×384重配、两phase更新；颜色/方向/UV/严格timestamp与SPS profile77/100、resize新SPS/首IDR通过，左右/上下/UV交换及旧phase反证也通过。真实runtime编码入口→submission归属→HostPipeline→VideoConfig token回归通过：GPU→CPU→GPU与纯codec重配保持epoch，同尺寸原点变化分配新epoch，旧实际GPU输出/旧release不能进入新映射。没有调用真实SendInput或采集桌面。相关库/tests严格Clippy通过。
+- [ ] **完整硬件/性能仍待：** Intel/AMD/混合GPU、实际driver/device loss、真实DXGI Acquire/Release、双机/长稳与帧龄/功耗；1080p/1440p/显式4K合成矩阵和可复跑阶段计量由后续015工具切片提供。首批64²软件兜底证据保留为历史，不再代表本机未成功GPU编码；本切片不把CopyResource+VP称零拷贝。
+
+- [x] **代表尺寸内容验证（`test(DL2-016): decode representative GPU frame sizes and display apertures`）：** 在原128帧回归外新增1080p/1440p Main18M及显式4K High40.5M，两phase各4帧共24帧真实GPU编码→软件MFT解码；decoded timestamp/实际SPS profile/首IDR/可见尺寸与tile内容更新均通过、CPU fallback与原GPU读回均0。1080实测coded1920×1088/visible1920×1080，仅依解码器MFVideoArea显示孔径裁padding，检查偶数offset/边界并正确裁Y/UV，不按expected尺寸盲裁。验证模块4项（含裁剪与错轴/UV/旧phase反证）及严格lib/tests Clippy通过。仍不代表复杂桌面视觉质量、真实DXGI或端到端性能通过。
 
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
