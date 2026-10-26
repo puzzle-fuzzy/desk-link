@@ -123,9 +123,9 @@ mod tests {
         use std::time::Duration;
 
         media_diagnostics::initialize();
-        let (reported, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (reported, mut received) = tokio::sync::mpsc::channel(1);
         let observer: HostMediaDiagnosticsObserver = Arc::new(move |event| {
-            reported.send(event).unwrap();
+            reported.try_send(event).unwrap();
         });
         let samples = Arc::new(AtomicU64::new(0));
         let count = samples.clone();

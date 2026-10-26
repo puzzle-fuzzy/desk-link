@@ -344,9 +344,9 @@ async fn terminal_listener_cleanup_reports_once_and_late_real_probe_cannot_reins
         .unwrap(),
     ));
     media_diagnostics::initialize();
-    let (reported, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (reported, mut received) = tokio::sync::mpsc::channel(1);
     let observer: Option<HostMediaDiagnosticsObserver> = Some(Arc::new(move |event| {
-        reported.send(event).unwrap();
+        reported.try_send(event).unwrap();
     }));
 
     // A genuine authenticated connection has finished probing before shutdown,
