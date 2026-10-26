@@ -14,6 +14,8 @@ input context 合同 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` → `5501aad9f7d
 
 该桥接的 controller.rs/test 两文件 hunk 与完整Apple `9ad7154b365de875d725188cfa091f5c21da0b5a` 等价，稳定patch-id为 `2f004b5c19baaa5f3df4360b605818df1f40f9b4`；后续按等价patch去重，不能重复覆盖。完整9ad的C头、lib.rs、worker、ledger与其003/004/025前置没有被本工程引入，C/Swift接线仍以Apple源分支为准。
 
+后续独立Sender来源 `3ea72dc7f5a66d4cd96c197c0aadb7603cee2436` → 本工程 `d6f153ed59c6d91b7cfa7337dd1b1a9fbeae9cf6`，只依赖bc6+b473。Runtime与可clone的ControllerInputSender共用单一发送实现/序号；输入专用序号锁持到完整写入，加密锁不跨网络等待。该切片继续扩展上述桥接，后续整合须保留Sender与测试，不用完整Apple文件覆盖；未引入C/Swift/worker祖先，七处生产旧调用仍未迁移。
+
 版本从 manifest/配置读取，命令只读，不构建、不访问设备或网络：
 
 ```sh
@@ -59,6 +61,8 @@ Windows 0.1.93 是公开测试构建，测试更新清单有独立签名；尚�
 最新合同过渡报告 `dist/verify/input-context-transition.json` 记录源码 `5501aad`、dirty=true：workspace 全target/feature编译、protocol **47项**、crypto/transport79项通过；host runtime 9通过/1失败，生产 `HostVideoPipeline::prepare` 的零epoch被拒绝为 `Protocol(InvalidVideoConfig)`，报告整体 failed / passed=false。来源分支报告49项，本工程实际执行47项，计数不能照搬。它是待owner接线的业务失败，没有 skip、填默认值或改断言标绿。此前 `probe-integration.json` / `probe-clippy.json` 的源码是 `4c3648a`，仅证明此前 probe 接入，不能证明新过渡源码可运行。
 
 API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `56f53b4`、dirty=false：编译、protocol47项及 controller加密loopback5项通过（0忽略）；host runtime仍9通过/1失败，整体failed / passed=false。这是新API原语通过，不是七处生产调用、完整C/Swift/FFI、host epoch或实际呈现已接通；DL2-013严格绑定继续未完成。
+
+有序Sender后的 `dist/verify/ordered-input-sender.json` 记录干净源码 `d6f153e`、dirty=false：fmt、编译、protocol47、独立controller-loopback6通过；完整ffi-runtime内lib12、ABI7、platform1、controller6、directory4通过，但Host8通过/2失败（旧配置epoch0），所以完整FFI失败；Windows host仍9通过/1失败。加密回归实际覆盖32并发clone和Runtime共36帧连续序号、原context保留、零context不发包/不消耗序号，仍不证明生产迁移、新Noise随机epoch或IPC大整数已完成。整体报告failed / passed=false，不以选中项通过替代完整结果。
 
 ## 独立分支的已提交证据快照
 
