@@ -46,7 +46,7 @@ use apps_windows::{
     cloud_diagnostics::{DiagnosticUploadSummary, start_background_uploader, upload_all_once},
     configuration::{HostConnectionSettings, WindowsConnectionSettingsStore},
     diagnostic_sharing::WindowsDiagnosticSharing,
-    diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation},
+    diagnostics::{DiagnosticEvent, DiagnosticLog, DiagnosticOperation, diagnostic_u64},
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
     startup::WindowsStartupSettings,
@@ -1443,8 +1443,17 @@ fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
     };
     let transport = latest_metric_event(recent_events, "controller_video_metrics")
         .filter(|(timestamp, value)| {
-            let render_stream_id = render.get("stream_id").and_then(serde_json::Value::as_u64);
-            let transport_stream_id = value.get("stream_id").and_then(serde_json::Value::as_u64);
+            // Missing legacy identity may use the time window. An explicit
+            // malformed/zero identity must not be reinterpreted as missing.
+            if [render.get("stream_id"), value.get("stream_id")]
+                .into_iter()
+                .flatten()
+                .any(|identity| diagnostic_u64(identity).is_none_or(|id| id == 0))
+            {
+                return false;
+            }
+            let render_stream_id = render.get("stream_id").and_then(diagnostic_u64);
+            let transport_stream_id = value.get("stream_id").and_then(diagnostic_u64);
             match (render_stream_id, transport_stream_id) {
                 (Some(render_stream_id), Some(transport_stream_id)) => {
                     render_stream_id == transport_stream_id
@@ -1463,24 +1472,21 @@ fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
     } else {
         findings.push("本地显示帧率: 尚未形成有效采样".to_owned());
     }
-    if let Some(gap_ms) = render
-        .get("max_frame_gap_ms")
-        .and_then(serde_json::Value::as_u64)
-    {
+    if let Some(gap_ms) = render.get("max_frame_gap_ms").and_then(diagnostic_u64) {
         findings.push(format!("本地最大帧间隔: {gap_ms} 毫秒"));
     }
 
     let received = render
         .get("received_frames")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(diagnostic_u64)
         .unwrap_or_default();
     let submitted = render
         .get("submitted_frames")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(diagnostic_u64)
         .unwrap_or_default();
     let displayed = render
         .get("displayed_frames")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(diagnostic_u64)
         .unwrap_or_default();
     let pull_failures = render
         .get("video_pull_failures")
@@ -1493,22 +1499,20 @@ fn build_video_performance_summary(recent_events: &[String]) -> Vec<String> {
     let completed = transport
         .as_ref()
         .and_then(|value| value.get("completed_frames"))
-        .and_then(serde_json::Value::as_u64)
+        .and_then(diagnostic_u64)
         .unwrap_or_default();
     let delivered = transport
         .as_ref()
         .and_then(|value| value.get("delivered_video_frames"))
-        .and_then(serde_json::Value::as_u64)
+        .and_then(diagnostic_u64)
         .unwrap_or_default();
     let fps_x100 = render
         .get("displayed_fps_x100")
         .and_then(serde_json::Value::as_u64);
-    let gap_ms = render
-        .get("max_frame_gap_ms")
-        .and_then(serde_json::Value::as_u64);
+    let gap_ms = render.get("max_frame_gap_ms").and_then(diagnostic_u64);
     let coalesced_frame_drops = render
         .get("coalesced_frame_drops")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(diagnostic_u64)
         .unwrap_or_default();
     findings.push(format!("本地显示合并帧: {coalesced_frame_drops}"));
 
@@ -2110,6 +2114,71 @@ mod tests {
 
         assert!(summary.contains("指标不足以定位单一层级"));
         assert!(!summary.contains("未显示明显的显示层卡顿"));
+    }
+
+    #[test]
+    fn video_performance_summary_keeps_adjacent_large_streams_separate() {
+        let events = vec![
+            r#"[控制端] {"timestamp_unix_ms":200000,"event":"controller_video_metrics","stream_id":"9007199254740992","completed_frames":"120","delivered_video_frames":"118"}"#.to_owned(),
+            r#"[控制端] {"timestamp_unix_ms":200100,"event":"controller_render_metrics","stream_id":"9007199254740993","received_frames":"116","submitted_frames":"114","displayed_frames":"110","video_pull_failures":0,"displayed_fps_x100":3000,"max_frame_gap_ms":"33"}"#.to_owned(),
+        ];
+        let summary = build_video_performance_summary(&events).join("\n");
+        assert!(summary.contains("指标不足以定位单一层级"));
+        assert!(!summary.contains("未显示明显的显示层卡顿"));
+    }
+
+    #[test]
+    fn video_performance_summary_reads_full_u64_counters_and_old_safe_number_ids() {
+        for stream in ["7", "18446744073709551615"] {
+            let transport_identity = if stream == "7" {
+                serde_json::json!(7)
+            } else {
+                serde_json::json!(stream)
+            };
+            let events = vec![
+                format!(
+                    "[控制端] {}",
+                    serde_json::json!({
+                        "timestamp_unix_ms": 200000, "event": "controller_video_metrics",
+                        "stream_id": transport_identity, "completed_frames": "18446744073709551615",
+                        "delivered_video_frames": "18446744073709551615"
+                    })
+                ),
+                format!(
+                    "[控制端] {}",
+                    serde_json::json!({
+                        "timestamp_unix_ms": 200100, "event": "controller_render_metrics",
+                        "stream_id": stream, "received_frames": "18446744073709551615",
+                        "submitted_frames": "18446744073709551615", "displayed_frames": "18446744073709551615",
+                        "video_pull_failures": 0, "displayed_fps_x100": 3000,
+                        "max_frame_gap_ms": "33", "coalesced_frame_drops": "0"
+                    })
+                ),
+            ];
+            let summary = build_video_performance_summary(&events).join("\n");
+            assert!(summary.contains("收到 18446744073709551615"));
+            assert!(summary.contains("提交解码 18446744073709551615"));
+            assert!(summary.contains("最近一段视频链路未显示明显的显示层卡顿"));
+        }
+    }
+
+    #[test]
+    fn malformed_explicit_diagnostic_stream_does_not_fall_back_to_time_matching() {
+        for invalid in ["07", "+7", " 7", "7e0", "18446744073709551616", "0"] {
+            let events = vec![
+                r#"[控制端] {"timestamp_unix_ms":200000,"event":"controller_video_metrics","stream_id":7,"completed_frames":120,"delivered_video_frames":118}"#.to_owned(),
+                format!("[控制端] {}", serde_json::json!({
+                    "timestamp_unix_ms": 200100, "event": "controller_render_metrics",
+                    "stream_id": invalid, "received_frames": "116", "submitted_frames": "114",
+                    "displayed_frames": "110", "displayed_fps_x100": 3000, "max_frame_gap_ms": "33"
+                })),
+            ];
+            let summary = build_video_performance_summary(&events).join("\n");
+            assert!(
+                summary.contains("指标不足以定位单一层级"),
+                "{invalid}: {summary}"
+            );
+        }
     }
 
     #[test]
