@@ -2351,7 +2351,17 @@ fn capture_encode_loop(
                 encoded_any_frame = true;
                 encoded
             }
-            Err(EncoderError::NeedMoreInput) => continue,
+            Err(EncoderError::NeedMoreInput) => {
+                // Some MFTs need another submission before returning output.
+                // Preserve recovery intent so an idle DXGI desktop can supply
+                // another bounded snapshot instead of losing the request.
+                static_recovery.encoder_buffered_output(
+                    &force_keyframe,
+                    request_keyframe,
+                    encoded_any_frame,
+                );
+                continue;
+            }
             Err(error)
                 if encoder_error_is_recoverable(&error)
                     && encoder_recovery_attempts < MAX_ENCODER_RECOVERY_ATTEMPTS =>
@@ -2384,6 +2394,12 @@ struct StaticKeyframeRecovery {
 }
 
 impl StaticKeyframeRecovery {
+    fn encoder_buffered_output(&self, requested: &AtomicBool, keyframe: bool, encoded_any: bool) {
+        if keyframe || !encoded_any {
+            requested.store(true, Ordering::Release);
+        }
+    }
+
     fn snapshot_due(&mut self, requested: bool, now: Instant) -> bool {
         if !requested
             || self
@@ -4070,6 +4086,22 @@ mod retry_policy_tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[test]
+    fn buffered_keyframe_recovery_can_submit_again_on_an_idle_desktop() {
+        let now = Instant::now();
+        let requested = std::sync::atomic::AtomicBool::new(true);
+        let mut recovery = super::StaticKeyframeRecovery::default();
+        assert!(recovery.snapshot_due(requested.load(std::sync::atomic::Ordering::Acquire), now));
+        let request_keyframe = requested.swap(false, std::sync::atomic::Ordering::AcqRel);
+        assert!(request_keyframe);
+        recovery.encoder_buffered_output(&requested, request_keyframe, true);
+        assert!(!recovery.snapshot_due(requested.load(std::sync::atomic::Ordering::Acquire), now));
+        assert!(recovery.snapshot_due(
+            requested.load(std::sync::atomic::Ordering::Acquire),
+            now + super::STATIC_KEYFRAME_INTERVAL
+        ));
     }
 
     #[test]

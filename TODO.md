@@ -158,6 +158,8 @@
 - **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib static_keyframe --locked`，1通过；覆盖无请求零快照、连续请求限频及间隔后可重试；Windows原生库编译通过。
 - [ ] **仍待真机：** 静态桌面重置解码器、DirectLan丢关键帧及DL2-002组合的请求至显示≤1秒验收；本次未建立真实远控会话。
 
+- [x] **缓冲编码器跟进（`fix(DL2-010): retain idle recovery through buffered encoder output`）：** NeedMoreInput时保留关键帧/首输出恢复意图，使静态DXGI在250ms预算后再次提交快照；`--lib keyframe_recovery --locked` 2通过，覆盖缓冲结果后仍能触发下一次限频快照。
+
 ### DL2-011 · P1 · DirectLan 探测不能长期占用会话加密锁
 
 - [ ] 将探测网络等待移出共享加密锁的临界区。
