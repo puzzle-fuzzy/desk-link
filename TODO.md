@@ -284,6 +284,11 @@
 - **方案：** 同一已认证路径承载独立优先级的输入、控制、音频和文件，并支持逐通道切换、回退和去重；完善局域网发现/本地配对与 relay 不可达时的行为。公网打洞作为独立实验，不把“换 WebRTC”本身当性能结论。
 - **验收：** 同网输入延迟符合实际 LAN 路径；断开公网后按定义保持本地连接；切换不重放按键、不串会话、不中断授权。公网方案另测不同 NAT/IPv6/UDP 限制与回退时间。
 
+### DL2-049 · P3 · QuicClient 按 relay 地址族绑定本地 socket
+
+- [x] `QuicClient::connect` 对 IPv4 relay 绑定 `0.0.0.0:0`，对 IPv6 relay 绑定 `[::]:0`；绑定失败仍通过带具体地址的 InvalidConfig 返回，不改协议/输入格式。修复前本地 `::1` 实证失败 `invalid remote address`，修复后真实 RelayServer 的 v4/v6 连接、join、目录发布/查询、可靠 VideoConfig/Input 与视频/音频 datagram 回环及容量回收均通过。
+- **验证：** 2 项地址族回归及 transport 43 单元 +16 localhost 测试通过，相关 Clippy、rustfmt、diff 检查通过；仅 loopback 合成传输，未声称公网 IPv6 路由、NAT、双栈 socket 混用或真实输入注入。主题 `fix(DL2-049): bind relay clients to the matching address family`。
+
 ## 5. 功能完备与用户流程
 
 ### DL2-025 · P1 · 统一 Rust、C 头文件和 Swift 的能力契约
