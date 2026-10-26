@@ -19,6 +19,7 @@ struct MetalVideoView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
+        guard context.coordinator.pixelBuffer !== pixelBuffer else { return }
         context.coordinator.pixelBuffer = pixelBuffer
         view.setNeedsDisplay(view.bounds)
     }
@@ -84,6 +85,8 @@ struct MetalVideoView: NSViewRepresentable {
             commandBuffer.commit()
         }
 
-        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+            view.setNeedsDisplay(view.bounds)
+        }
     }
 }

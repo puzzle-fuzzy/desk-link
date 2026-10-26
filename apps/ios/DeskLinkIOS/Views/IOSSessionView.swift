@@ -221,6 +221,12 @@ struct IOSSessionView: View {
                 )
                 .allowsHitTesting(isInputEnabled)
 
+                RemoteCursorPositionLayer(
+                    overlay: controller.cursorOverlay,
+                    activeStreamID: cursorStreamID,
+                    videoRect: visibleVideoRect
+                )
+
                 if !hasVideoFrame {
                     VStack(spacing: 10) {
                         Image(systemName: "rectangle.inset.filled")
@@ -264,6 +270,14 @@ struct IOSSessionView: View {
     private var isInputEnabled: Bool {
         if case .connected = controller.state { return true }
         return false
+    }
+
+    private var cursorStreamID: UInt64? {
+        if case let .connected(streamID) = controller.state { return streamID }
+        if controller.state == .frozen || controller.state == .recovering {
+            return controller.cursorOverlay?.streamID
+        }
+        return nil
     }
 
     private var hasVideoFrame: Bool {

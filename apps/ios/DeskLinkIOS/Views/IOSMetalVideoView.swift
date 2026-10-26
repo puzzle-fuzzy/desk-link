@@ -49,6 +49,7 @@ final class IOSMetalVideoSurface: MTKView {
     private var zoomScale: CGFloat = 1
     private var panOffset: CGSize = .zero
     private var lastPublishedRect: CGRect = .null
+    private var lastLayoutBounds: CGRect = .null
 
     override init(frame frameRect: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
@@ -72,6 +73,9 @@ final class IOSMetalVideoSurface: MTKView {
         zoomScale: CGFloat,
         panOffset: CGSize
     ) {
+        guard self.pixelBuffer !== pixelBuffer || self.videoSize != videoSize
+                || self.zoomScale != zoomScale || self.panOffset != panOffset
+        else { return }
         self.pixelBuffer = pixelBuffer
         self.videoSize = videoSize
         self.zoomScale = zoomScale
@@ -83,7 +87,10 @@ final class IOSMetalVideoSurface: MTKView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        guard bounds != lastLayoutBounds else { return }
+        lastLayoutBounds = bounds
         publishVisibleVideoRect()
+        setNeedsDisplay()
     }
 
     override func draw(_ rect: CGRect) {

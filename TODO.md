@@ -296,6 +296,8 @@
 ### DL2-027 · P1 · 在 Apple 会话呈现远端独立光标
 
 - [ ] 解码并绘制形状、热点、位置和可见性，不依赖视频中烘焙光标。
+- [x] 位置切片：严格解码真实 postcard CursorUpdate，按 stream/sequence 隔离迟到与乱序；Mac/iOS 在实际视频几何（含 iOS zoom/pan）上独立绘制中性位置圆环并响应隐藏。连接恢复/关闭隔离旧位置，视频冻结或关键帧恢复期间仍消费当前会话位置。Metal 仅帧身份、几何或布局尺寸变化时请求重绘。`python -m unittest discover -s scripts/tests -p test_dl2_apple_cursor_contract.py -v`：6 项通过；`python scripts/run-windows-cargo.py test -p desklink-protocol --test apple_cursor_contract --locked`：1 项通过，生产 Rust codec 校验 Swift 的可见/隐藏/边界字节 fixture。提交主题：`fix(DL2-027): render isolated Apple cursor position updates`。
+- [ ] 完整形状/hotspot/cache 尚缺上游数据：协议 v12 仅发送 opaque shape_id，Windows 当前值来自 hCursor，未传 BGRA、尺寸或热点，不把该句柄推断为远端形状。需扩展上游生产契约；本切片圆环只表达位置。Swift/Xcode、真实 I-beam/resize/忙碌/隐藏及不同 DPI/缩放四角验收仍待运行，尚无性能实测。
 - **证据 / 类型：能力缺口。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:346-348` 已写 cursorOverlay；`apps/apple/Sources/DeskLinkAppleCore/DeskLinkEvents.swift:202-209` 保存 encodedUpdate；macOS `apps/macos/Sources/DeskLinkApp/Views/SessionView.swift:18-22` 只有视频和输入层，Apple 展示路径没有消费此 overlay。
 - **方案：** 独立低延迟光标层、shape cache、统一视频几何与 DPI 映射；处理隐藏、切屏和缩放后的热点。
 - **验收：** 文本 I-beam、resize、忙碌、隐藏光标与四角热点在不同 DPI/缩放模式正确；仅光标变化不强制整帧重绘。

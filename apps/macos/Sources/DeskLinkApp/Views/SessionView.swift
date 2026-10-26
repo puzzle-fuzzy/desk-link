@@ -20,6 +20,17 @@ struct SessionView: View {
                     .background(Color.black)
                 SessionInputView(bridge: bridge, videoSize: videoSize)
                     .background(Color.clear)
+                GeometryReader { proxy in
+                    RemoteCursorPositionLayer(
+                        overlay: bridge.cursorOverlay,
+                        activeStreamID: cursorStreamID,
+                        videoRect: VideoGeometry.aspectFit(
+                            source: videoSize ?? .zero,
+                            in: CGRect(origin: .zero, size: proxy.size)
+                        )
+                    )
+                }
+                .allowsHitTesting(false)
                 if bridge.latestPixelBuffer == nil {
                     VStack(spacing: 10) {
                         ProgressView()
@@ -91,6 +102,14 @@ struct SessionView: View {
     private var videoSize: CGSize? {
         guard let pixelBuffer = bridge.latestPixelBuffer else { return nil }
         return CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+    }
+
+    private var cursorStreamID: UInt64? {
+        if case let .connected(streamID) = bridge.state { return streamID }
+        if bridge.state == .frozen || bridge.state == .recovering {
+            return bridge.cursorOverlay?.streamID
+        }
+        return nil
     }
 
     private var statusText: String {
