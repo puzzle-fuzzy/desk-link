@@ -77,6 +77,12 @@ RNG失败、零值和checked推进溢出必须有明确失败或上下文重建�
 
 Windows的context与VideoConfig身份IPC使用规范十进制字符串与BigInt，保存完整u64；C/Swift继续使用uint64_t/UInt64。需覆盖超过2^53的真实JSON/IPC往返、非规范文本/number/溢出拒绝与原context入队保持，不能用Number、round或clamp“修复”精度。这些是待owner接线规则，当前sender原语通过不表示随机起点、host映射、IPC或实际呈现已实现。
 
+### epoch与真实帧配置的配对
+
+源码中的 `VideoFrameHeader` 与 Windows `VideoMailboxKey` 只有stream_id/config_version，没有独立frame epoch。当前 `ControllerRuntime::next_event` 已拒绝同stream+同config_version却改变VideoConfig任一字段的配置，返回InconsistentVideoConfig；VideoConfig的Eq包含input_epoch。必须保留这道保护。“同version换epoch使旧帧误激活”是放宽/绕过该拒绝后的设计风险，不能写成当前已复现故障。
+
+Host在同一活动会话内每次input_epoch变化时，必须推进**真实**config_version并发布对应配置/恢复关键帧，即使同尺寸换屏、仅虚拟原点/输入映射或有效性边界变化，SPS/尺寸未变也如此。纯编码/画质可以只推进config_version，保持epoch，不无谓清键。确认token必须来自该帧真实配置；旧buffered编码/解码输出不能在发布时重贴新config_version/epoch。验收同时覆盖旧version变字段明确拒绝，以及正确新version配置和对应帧实际呈现后才启用epoch，不能只测最终尺寸变化。
+
 DL2-011 的独立 lane 已有提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`，经源码核对仅追加 `SecureLane::DirectProbe = 8` 并同步 COUNT/ALL，所有 Exclusive/Shared probe 的 seal/open 迁移；现有 lane 0～7、JOIN 版本与 QUIC 事件槽数量保持原义。慢 probe 必须不被视频重放窗推进挤出，同时继续拒绝重放和跨 lane 解密；复用该独立提交及所需 shared-probe 前置，不另造探测加密路径。分支提交和其报告的 79 项测试不是本工程接入或 main 整合证明，接入验证须另记源码身份；双机/候选黑洞性能条件继续未完成。
 
 合并后用[统一入口](local-verification.md)验证共享 unit/contract、transport/FFI localhost、媒体恢复和平台 native；特别补背压中停止、迟到回调/代数、持续输入受限与恢复、普通 shell 更新存活、慢盘/网络黑洞。Apple Swift/Xcode、真实权限和设备缺条件时明确 skipped；代码移动或模块行数下降不能作为性能收益。
