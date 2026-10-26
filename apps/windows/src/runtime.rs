@@ -65,6 +65,7 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 // The authenticated handshake includes the native local-approval dialog. Give
 // the person at the host enough time to inspect and approve the controller.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
+const PROTOCOL_REJECTION_TIMEOUT: Duration = Duration::from_millis(500);
 const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const END_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1577,6 +1578,22 @@ async fn next_initiator_hello(
             Ok((peer_generation, payload)) => match decode_noise_handshake(&payload) {
                 Ok(handshake) if handshake.step == NoiseHandshakeStep::InitiatorHello => {
                     return Ok((peer_generation, handshake));
+                }
+                Err(error @ ProtocolError::UnsupportedVersion(_)) => {
+                    // Version is public pre-authentication metadata. A legacy
+                    // controller rejects this envelope's current version before
+                    // touching the placeholder Noise payload, instead of waiting
+                    // for silence and repeatedly retrying its stale invitation.
+                    let rejection = encode_noise_handshake(&NoiseHandshake {
+                        protocol_version: PROTOCOL_VERSION,
+                        step: NoiseHandshakeStep::ResponderHello,
+                        payload: vec![0],
+                    })?;
+                    let _ = tokio::time::timeout(
+                        PROTOCOL_REJECTION_TIMEOUT,
+                        client.send_control_for_generation(peer_generation, rejection),
+                    ).await;
+                    return Err(HostRuntimeError::Protocol(error));
                 }
                 Ok(_) | Err(_) => {
                     // Messages queued by an already disconnected controller
@@ -4083,3 +4100,7 @@ mod direct_video_tests {
 #[cfg(test)]
 #[path = "session_control_tests.rs"]
 mod session_control_tests;
+
+#[cfg(test)]
+#[path = "protocol_rejection_tests.rs"]
+mod protocol_rejection_tests;
