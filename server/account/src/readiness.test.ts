@@ -24,7 +24,7 @@ test("incomplete migration and damaged schema are not ready", async () => {
   try {
     store.database.exec("PRAGMA user_version = 1");
     expect((await ready(store)).status).toBe(503);
-    store.database.exec("PRAGMA user_version = 2; DROP TABLE audit_events");
+    store.database.exec("PRAGMA user_version = 3; DROP TABLE audit_events");
     expect((await ready(store)).status).toBe(503);
   } finally { store.close(); }
 });
@@ -56,7 +56,7 @@ test("locked and truly read-only file databases fail with bounded lock waiting",
     Object.defineProperty(store, "database", { value: readonly });
     expect((await ready(store)).status).toBe(503);
   } finally {
-    competitor.close(); store.close(); rmSync(directory, { recursive: true, force: true });
+    competitor.close(); store.close(); rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 });
 
@@ -66,11 +66,11 @@ test("mail retry failures are visible as recoverable degradation without failing
     const user = store.createUser({ email: "synthetic@example.com", passwordHash: "synthetic", now: 1 });
     const token = store.createActionToken({ userId: user.id, purpose: "verify_email", tokenHash: "synthetic", now: 1, expiresAt: 100 });
     const email = store.enqueueEmail({ userId: user.id, recipient: user.email, template: "verify_email", actionTokenId: token.id, now: 1 });
-    store.markEmailFailed(email, 1, "sensitive synthetic path or provider error");
+    store.failClaimedEmail(store.claimEmail(1)!, 1, "mail_delivery_failed");
     const response = await ready(store);
     expect(response.status).toBe(200);
     expect((await response.json()).dependencies).toEqual({ database: "ready", mail: "degraded" });
-    store.markEmailSent(email.id, 2);
+    store.completeClaimedEmail(store.claimEmail(11)!, 11);
     expect((await (await ready(store)).json()).dependencies.mail).toBe("ready");
   } finally { store.close(); }
 });

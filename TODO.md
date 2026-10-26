@@ -364,11 +364,12 @@
 
 ### DL2-038 · P2 · 邮件任务与账号历史记录具有完整生命周期
 
-- [ ] 将邮件投递从用户请求等待中解耦，并补齐失败终态、回收与恢复。
+- [x] 将邮件投递从用户请求等待中解耦，并补齐失败终态、回收与恢复。
 - **证据 / 类型：能力缺口、性能结构。** `server/account/src/services/account-service.ts:158-178` 注册/找回直接 await 投递，`server/account/src/providers/http-mailer.ts:15` 可等待 10 秒；`server/account/src/db/store.ts:302-316` 在 attempts 达 10 后不再查询，但没有明确终态接口；schema 中 session/action token/outbox/audit 没有保留期回收入口。
 - **现有保护：** 已有持久 outbox、进程内 single-flight、最多 10 次重试与退避，不能报告成没有重试或无限重试。
 - **方案：** 请求原子入队后返回；独立 worker 认领/恢复/去重，暴露 pending/delivered/failed；按用途保留最小审计与刷新令牌重放检测窗口后分批回收；进程关闭时停止定时器并完成资源释放。
 - **验收：** 邮件服务慢/宕机时注册响应不等待投递 timeout；第 10 次失败可诊断/受控重投；重启不丢任务；回收不破坏有效令牌和重放检测，长期数据库增长可解释。
+- **完成 / 验证（2026-10-26，`fix(DL2-038)`）：** 请求仅事务入队；独立 worker 按条认领 30s 租约、持久计数和所有权校验，保留 single-flight / 10 次 / 退避，补 delivered/failed 终态、崩溃恢复与本地审计重投接口。schema v3 迁移旧终态，provider 错误仅保存固定类别；关闭先停止接收/计时/新认领，再等当前邮件并释放全部固定 SQL statement。每表每分钟最多回收 500 条，outbox 终态 30 天、过期 action token 7 天、审计 90 天；整个 refresh family 最后到期后再保留 30 天，保留所有邮件引用 token。Bun 1.3.14：46 测试 / 368 断言及 typecheck 通过，含慢投递期间 register/resend/forgot 已返回、文件库重启/迁移、双连接租约去重/迟到 ack 拒绝、第 10 次失败或崩溃终态、显式重投、有效 token 与旧 rotated token 重放、清理边界/限量/计划和关闭文件释放。保留期、吞吐/页复用、至少一次投递与部署长稳边界见 `server/account/README.md`；未连接真实 provider 或线上库。
 
 ### DL2-039 · P2 · 诊断保留期清理不扫描并锁住全部历史
 

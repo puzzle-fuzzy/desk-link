@@ -38,6 +38,7 @@ describe("account lifecycle", () => {
       deviceName: "我的 iPhone",
     }));
     expect(registration.status).toBe(202);
+    await app.flushOutbox();
     expect(mailer.messages).toHaveLength(1);
     expect((await registration.json()).verificationRequired).toBe(true);
 
@@ -51,6 +52,7 @@ describe("account lifecycle", () => {
     expect(beforeVerification.status).toBe(403);
     expect((await beforeVerification.json()).message).toContain("邮箱");
 
+    await app.flushOutbox();
     const verificationToken = new URL(mailer.messages[0].text.match(/https?:\/\/\S+/)![0]).searchParams.get("token");
     const verification = await app.fetch(post("/v1/account/verify-email", { token: verificationToken }));
     expect(verification.status).toBe(200);
@@ -97,6 +99,7 @@ describe("account lifecycle", () => {
       platform: "macos",
       deviceName: "Mac",
     }));
+    await app.flushOutbox();
     const token = new URL(mailer.messages[0].text.match(/https?:\/\/\S+/)![0]).searchParams.get("token");
     await app.fetch(post("/v1/account/verify-email", { token }));
     const login = await app.fetch(post("/v1/account/login", {
@@ -133,6 +136,7 @@ describe("account lifecycle", () => {
       platform: "ios",
       deviceName: "测试 iPhone",
     }));
+    await app.flushOutbox();
     const verificationToken = new URL(mailer.messages[0].text.match(/https?:\/\/\S+/)![0]).searchParams.get("token");
     await app.fetch(post("/v1/account/verify-email", { token: verificationToken }));
     const forgot = await app.fetch(post("/v1/account/password/forgot", { email: "reset@example.com" }));
@@ -140,6 +144,7 @@ describe("account lifecycle", () => {
     expect(forgot.status).toBe(202);
     expect(unknownForgot.status).toBe(202);
     expect(await forgot.json()).toEqual(await unknownForgot.json());
+    await app.flushOutbox();
     const resetToken = new URL(mailer.messages[1].text.match(/https?:\/\/\S+/)![0]).searchParams.get("token");
     const reset = await app.fetch(post("/v1/account/password/reset", {
       token: resetToken,
@@ -187,6 +192,7 @@ describe("account lifecycle", () => {
       platform: "ios",
       deviceName: "iPhone",
     }));
+    await app.flushOutbox();
     const verificationToken = new URL(mailer.messages[0].text.match(/https?:\/\/\S+/)![0]).searchParams.get("token");
     await app.fetch(post("/v1/account/verify-email", { token: verificationToken }));
     const first = await app.fetch(post("/v1/account/login", {

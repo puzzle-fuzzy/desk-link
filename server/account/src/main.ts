@@ -1,5 +1,6 @@
 import { createAccountApp } from "./app";
 import { loadAccountConfig } from "./config";
+import { AccountWorker } from "./worker";
 
 const config = loadAccountConfig();
 const app = createAccountApp({ config });
@@ -16,7 +17,14 @@ export const server = Bun.serve({
 });
 
 console.log(`DeskLink account listening on http://${server.hostname}:${server.port}`);
-void app.flushOutbox();
-setInterval(() => {
-  void app.flushOutbox().catch((error) => console.error("account outbox flush failed", error));
-}, 30_000);
+const worker = new AccountWorker(app);
+worker.start();
+let stopping = false;
+async function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  await server.stop();
+  await worker.stop();
+}
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);

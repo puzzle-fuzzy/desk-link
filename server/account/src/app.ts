@@ -1,4 +1,5 @@
 import { AccountStore } from "./db/store";
+import { cleanupAccountHistory } from "./db/retention";
 import type { AccountConfig } from "./config";
 import { loadAccountConfig } from "./config";
 import { AccountError } from "./domain/errors";
@@ -21,6 +22,8 @@ export interface AccountAppDependencies {
 export interface AccountApp {
   fetch(request: Request): Promise<Response>;
   flushOutbox(): Promise<number>;
+  cleanupHistory(): ReturnType<typeof cleanupAccountHistory>;
+  close(): Promise<void>;
 }
 
 export function createAccountApp(dependencies: AccountAppDependencies = {}): AccountApp {
@@ -156,6 +159,11 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
       }
     },
     flushOutbox: () => accounts.flushOutbox(),
+    cleanupHistory: () => cleanupAccountHistory(store.database, now()),
+    async close() {
+      await accounts.stopOutbox();
+      store.close();
+    },
   };
 }
 

@@ -20,6 +20,7 @@ export interface LoginInput extends RegisterInput {}
 
 export class AccountService {
   private outboxFlushInFlight?: Promise<number>;
+  private outboxStopped = false;
 
   constructor(
     private readonly store: AccountStore,
@@ -40,14 +41,13 @@ export class AccountService {
     // Hashing stays outside the synchronous transaction; independent registrations
     // can hash concurrently, while only the winner of the email insert has effects.
     const passwordHash = await hashPassword(input.password);
-    const queued = this.store.database.transaction(() => {
+    this.store.database.transaction(() => {
       const user = this.store.createUserIfAbsent({ email, passwordHash, now });
       if (!user) return undefined;
       this.store.upsertDevice({ ...device, userId: user.id, now });
       this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
       return this.enqueueActionEmail(user, "verify_email");
     })();
-    if (queued) await this.deliverQueuedEmail(queued);
     return { verificationRequired: true };
   }
 
@@ -55,8 +55,10 @@ export class AccountService {
     const email = normalizeEmail(emailInput);
     const user = this.store.findUserByEmail(email);
     if (!user || user.emailVerifiedAt !== null || user.status !== "active") return;
-    this.store.recordAuditEvent({ userId: user.id, action: "account.verification_resent", now: this.now() });
-    await this.sendVerification(user);
+    this.store.database.transaction(() => {
+      this.store.recordAuditEvent({ userId: user.id, action: "account.verification_resent", now: this.now() });
+      this.enqueueActionEmail(user, "verify_email");
+    })();
   }
 
   async verifyEmail(tokenInput: unknown): Promise<PublicUser> {
@@ -94,8 +96,10 @@ export class AccountService {
     const email = normalizeEmail(emailInput);
     const user = this.store.findUserByEmail(email);
     if (!user || user.status !== "active") return;
-    this.store.recordAuditEvent({ userId: user.id, action: "account.password_reset_requested", now: this.now() });
-    await this.sendActionEmail(user, "reset_password");
+    this.store.database.transaction(() => {
+      this.store.recordAuditEvent({ userId: user.id, action: "account.password_reset_requested", now: this.now() });
+      this.enqueueActionEmail(user, "reset_password");
+    })();
   }
 
   async resetPassword(tokenInput: unknown, passwordInput: unknown): Promise<void> {
@@ -111,80 +115,53 @@ export class AccountService {
 
   flushOutbox(limit = 20): Promise<number> {
     if (this.outboxFlushInFlight) return this.outboxFlushInFlight;
+    if (this.outboxStopped) return Promise.resolve(0);
     this.outboxFlushInFlight = this.flushOutboxInternal(limit).finally(() => {
       this.outboxFlushInFlight = undefined;
     });
     return this.outboxFlushInFlight;
   }
 
+  async stopOutbox(): Promise<void> {
+    this.outboxStopped = true;
+    await this.outboxFlushInFlight;
+  }
+
   private async flushOutboxInternal(limit: number): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new RangeError("invalid outbox batch size");
     let delivered = 0;
-    for (const record of this.store.listPendingEmails(this.now(), limit)) {
+    for (let index = 0; index < limit && !this.outboxStopped; index++) {
+      // Claim only the next send, so queued messages cannot expire behind a slow send.
+      const record = this.store.claimEmail(this.now());
+      if (!record) break;
       const user = this.store.findUserById(record.userId);
       if (!user || user.status !== "active") {
-        this.store.markEmailFailed(record, this.now(), "account user is unavailable");
+        this.store.failClaimedEmail(record, this.now(), "account_unavailable");
         continue;
       }
-      this.store.invalidateActionToken(record.actionTokenId, this.now());
-      const token = createOpaqueToken();
-      const actionToken = this.store.createActionToken({
-        userId: user.id,
-        purpose: record.template,
-        tokenHash: token.hash,
-        now: this.now(),
-        expiresAt: this.now() + (record.template === "verify_email" ? 24 * 60 * 60 : 30 * 60),
-      });
-      this.store.replaceEmailActionToken(record.id, actionToken.id);
       try {
+        const token = createOpaqueToken();
+        if (!this.store.prepareClaimedEmailToken(record, token.hash, this.now())) continue;
         await this.mailer.send(this.actionEmailMessage(user, record.template, token.value));
-        this.store.markEmailSent(record.id, this.now());
-        delivered += 1;
-      } catch (error) {
-        this.store.markEmailFailed(record, this.now(), error instanceof Error ? error.message : "mail delivery failed");
+        if (this.store.completeClaimedEmail(record, this.now())) delivered++;
+      } catch {
+        // Provider errors may contain URLs/credentials; persist a fixed category.
+        this.store.failClaimedEmail(record, this.now(), "mail_delivery_failed");
       }
     }
     return delivered;
   }
 
-  private async sendVerification(user: UserRecord): Promise<void> {
-    await this.sendActionEmail(user, "verify_email");
-  }
-
-  private async sendActionEmail(user: UserRecord, purpose: ActionTokenPurpose): Promise<void> {
-    const queued = this.store.database.transaction(() => this.enqueueActionEmail(user, purpose))();
-    await this.deliverQueuedEmail(queued);
-  }
-
-  private enqueueActionEmail(user: UserRecord, purpose: ActionTokenPurpose): {
-    message: MailMessage;
-    outbox: EmailOutboxRecord;
-  } {
+  private enqueueActionEmail(user: UserRecord, purpose: ActionTokenPurpose): EmailOutboxRecord {
     const token = createOpaqueToken();
     const actionToken = this.store.createActionToken({
-      userId: user.id,
-      purpose,
-      tokenHash: token.hash,
-      now: this.now(),
-      expiresAt: this.now() + (purpose === "verify_email" ? 24 * 60 * 60 : 30 * 60),
+      userId: user.id, purpose, tokenHash: token.hash, now: this.now(),
+      expiresAt: this.now() + (purpose === "verify_email" ? 86_400 : 1_800),
     });
-    const message = this.actionEmailMessage(user, purpose, token.value);
-    const outbox = this.store.enqueueEmail({
-      userId: user.id,
-      recipient: user.email,
-      template: purpose,
-      actionTokenId: actionToken.id,
-      now: this.now(),
+    return this.store.enqueueEmail({
+      userId: user.id, recipient: user.email, template: purpose,
+      actionTokenId: actionToken.id, now: this.now(),
     });
-    return { message, outbox };
-  }
-
-  private async deliverQueuedEmail({ message, outbox }: { message: MailMessage; outbox: EmailOutboxRecord }): Promise<void> {
-    try {
-      await this.mailer.send(message);
-      this.store.markEmailSent(outbox.id, this.now());
-    } catch (error) {
-      this.store.markEmailFailed(outbox, this.now(), error instanceof Error ? error.message : "mail delivery failed");
-    }
   }
 
   private actionEmailMessage(user: UserRecord, purpose: ActionTokenPurpose, token: string): MailMessage {

@@ -28,6 +28,8 @@ test("same-email concurrent registration across connections has exactly one set 
     for (const table of ["users", "account_devices", "audit_events", "action_tokens", "email_outbox"]) {
       expect(count(stores[0], table)).toBe(1);
     }
+    expect(mailer.messages).toHaveLength(0);
+    await services[0].flushOutbox();
     expect(mailer.messages).toHaveLength(1);
     const original = stores[0].findUserByEmail("race@example.com")!;
     await services[1].register({ ...input(100), password: "a different synthetic password" });
@@ -36,7 +38,7 @@ test("same-email concurrent registration across connections has exactly one set 
     expect(mailer.messages).toHaveLength(1);
   } finally {
     stores.forEach(store => store.close());
-    rmSync(directory, { recursive: true, force: true });
+    rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 }, 30_000);
 
@@ -63,7 +65,7 @@ test("registration rolls back all effects when queueing fails", async () => {
   } finally { store.close(); }
 });
 
-test("a different email can complete while another registration waits for mail", async () => {
+test("a different email can enqueue while the worker waits for mail", async () => {
   const store = new AccountStore();
   let release!: () => void;
   let entered!: () => void;
@@ -73,7 +75,8 @@ test("a different email can complete while another registration waits for mail",
     async send(message) { if (message.to === "slow@example.com") { entered(); await gate; } },
   }, new SessionService(store, config, () => 100), () => 100);
   try {
-    const first = service.register(input(1, "slow@example.com"));
+    await service.register(input(1, "slow@example.com"));
+    const first = service.flushOutbox();
     await started;
     expect(await service.register(input(2, "independent@example.com"))).toEqual({ verificationRequired: true });
     expect(count(store, "users")).toBe(2);
