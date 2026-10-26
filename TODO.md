@@ -446,6 +446,8 @@
 
 - **joint初始化保留缺陷与日志归因（`docs(DL2-042): record the joint partial-retention blocker and review limits`）：** 只读固定媒体89bd1e5确认021 create/open后ready发送失败直接return，绕过正常preserve并由remove_on_drop=true删除已有resume partial；确定源码链路不是已运行回归。媒体owner独立修复与确定性回归待joint复用，未改其WIP或021状态。协调方报告joint未提交/UU/测试未跟踪，不当stable；shared174通过1忽略为其日志更正，274笔误撤回，不冒充本工程测试或joint最终验收，其余review未见问题也不等于测试通过。
 
+- **来源更新与MacHost归因（`docs(DL2-042): scope source reports and refresh joint parent provenance`）：** 只读Git核对产品27fec756的parent16594c4与唯一InputSendFuture类型别名变更；其135通过/1签名资产忽略和本包--no-deps Clippy为来源报告，未冒充工程或跨包实跑。协调方报告Apple完整FFI71/Python186/双头通过、013 worker owned future仍在做，测试完整SHA待交付；旧工程d6/旧joint的MacHost失败因缺完整Apple链，不能外推Apple当前分支失败。最终joint第一parent更新为27fec，另一parent待媒体021修复后的稳定SHA，10份resolution/测试备份及SHA256清单为协调方报告；待完整Apple依赖/稳定SHA一起合并、去重既有桥接，禁止单独flat-pick9ad，最终跨包严格检查及适用测试仍待实际报告。
+
 ## 8. 扩展角色
 
 ### DL2-043 · P3 · 被控 Mac 的能力协商与实际编码一致

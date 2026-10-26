@@ -62,7 +62,7 @@ Windows 0.1.93 是公开测试构建，测试更新清单有独立签名；尚�
 
 API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `56f53b4`、dirty=false：编译、protocol47项及 controller加密loopback5项通过（0忽略）；host runtime仍9通过/1失败，整体failed / passed=false。这是新API原语通过，不是七处生产调用、完整C/Swift/FFI、host epoch或实际呈现已接通；DL2-013严格绑定继续未完成。
 
-有序Sender后的 `dist/verify/ordered-input-sender.json` 记录干净源码 `d6f153e`、dirty=false：fmt、编译、protocol47、独立controller-loopback6通过；完整ffi-runtime内lib12、ABI7、platform1、controller6、directory4通过，但Host8通过/2失败（旧配置epoch0），所以完整FFI失败；Windows host仍9通过/1失败。加密回归实际覆盖32并发clone和Runtime共36帧连续序号、原context保留、零context不发包/不消耗序号，仍不证明生产迁移、新Noise随机epoch或IPC大整数已完成。整体报告failed / passed=false，不以选中项通过替代完整结果。
+有序Sender后的 `dist/verify/ordered-input-sender.json` 记录干净源码 `d6f153e`、dirty=false：fmt、编译、protocol47、独立controller-loopback6通过；完整ffi-runtime内lib12、ABI7、platform1、controller6、directory4通过，但Host8通过/2失败（旧配置epoch0），所以完整FFI失败；Windows host仍9通过/1失败。此失败仅属于尚未整合完整Apple ABI/Host依赖的本工程旧源码，不能外推为Apple当前源分支失败。加密回归实际覆盖32并发clone和Runtime共36帧连续序号、原context保留、零context不发包/不消耗序号，仍不证明生产迁移、新Noise随机epoch或IPC大整数已完成。整体报告failed / passed=false，不以选中项通过替代完整结果。
 
 ## 独立分支的已提交证据快照
 
@@ -95,4 +95,14 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 
 协调方joint只读审查与本工程固定媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a` 源码核对确认DL2-021初始化缺口：打开已有resume partial后，ready发送失败直接return，未走preserve，IncomingFile的remove_on_drop=true导致partial被删。正常handle-drop的preserve分支不覆盖这个窗口。媒体owner负责独立021修复，joint最终提交前须复用并补确定性回归；本工程这里只做源码复核，未运行新回归，详细链路见[证据记录](second-stage-review-evidence.md)。
 
-协调方报告joint仍未提交/索引UU/测试未跟踪，因此未形成可整合的stable revision。其日志计数已更正为shared174通过/1忽略（原274笔误撤回），不是本工程实际测试，也不能替代最终jointSHA/报告。除此项之外“暂未见新确定缺陷”的只读review表述不等于测试通过。FFI Mac Host/Swift、实际WebView和双机仍独立；本工程原始失败报告继续按各自源码身份保留。
+此前协调方报告的joint未提交/索引UU/测试未跟踪，是当时的审查快照；本工程未检查其WIP，不能将该快照当作当前状态。其日志计数已更正为shared174通过/1忽略（原274笔误撤回），不是本工程实际测试，也不能替代最终jointSHA/报告。除此项之外“暂未见新确定缺陷”的只读review表述不等于测试通过。FFI Mac Host/Swift、实际WebView和双机仍独立；本工程原始失败报告继续按各自源码身份保留。
+
+## 联合收口来源更新（2026-10-26）
+
+| 来源 | 已核对或收到的证据 | 当前边界 |
+| --- | --- | --- |
+| 产品 `27fec756ba97ee6f67228dc9530c7b0578a49ff3` | 本工程只读Git对象确认其parent为 `16594c4f8780cd565afd57695f88e29277ec5939`；代码仅将既有owned future提取为 `InputSendFuture<Writer>` 类型别名，发送语义不变。提交TODO报告UI库135通过/1项签名资产忽略、本包 `--lib --tests --no-deps` Clippy通过 | 本工程未复跑、未复用整包；本包Clippy不代表跨包严格检查。最终joint第一parent采用27fec，保留既有历史 |
+| Apple最新源分支 | 协调方报告完整FFI71项、Python186项、双头检查实际通过；013 worker owned future仍在进行 | 本次报告未附对应完整测试SHA，不把所见branch head擅自绑定到该结果；等待最终稳定SHA与完整依赖一起合并，不能单独flat-pick9ad。旧joint两个MacHost失败来自尚缺完整Apple ABI/Host链，不能写成Apple当前分支失败；源分支通过不等于最终joint或Swift/真机呈现通过 |
+| 媒体021修复及最终joint | 媒体初始化取消修复后的稳定SHA将作为另一parent；协调方报告10份人工resolution/新增联合测试已备份并有SHA256清单 | 修复后稳定SHA与最终jointSHA/完整报告仍待交付。本工程未读取备份清单或joint WIP；备份不等于文件已纳入最终提交，合并后须重跑跨包严格检查及所有适用测试 |
+
+原产品16594与媒体89bd的合并安排、旧joint审查和工程d6f153e失败报告均保留其历史身份。上述来源进展不关闭021初始化回归、041联合验收、013完整生产接线或真实设备门禁。

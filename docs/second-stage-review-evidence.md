@@ -35,6 +35,14 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 
 该项分类为**源码确定的初始化保留缺口，修复/确定性回归待媒体owner交付**，不是已经跑失败的本工程测试。须用真实临时partial和可控初始化barrier覆盖“文件已打开、ready未交付→drop create future→释放磁盘线程”；断言原prefix内容/长度/hash与后续resume仍可用。正常handle-drop保留和显式cancel清理分别回归，不把两种语义合并。媒体独立021修复及结果必须先复用到joint，再取得最终revision与报告；不靠一次旧suite通过代替这个未覆盖窗口。
 
-协调方另报告joint仍未提交、索引有UU、测试文件未跟踪，不能当stable；本工程未自行检查该WIP。其shared日志汇总更正为174通过/1忽略，先前274是撤回的笔误；这些都是协调方日志信息，尚未绑定最终joint提交，不是本工程复跑结果，也不是联合验收已完成。
+此前协调方另报告joint未提交、索引有UU、测试文件未跟踪，这是当时的审查快照，不能当stable或直接当作后续当前状态；本工程未自行检查该WIP。其shared日志汇总更正为174通过/1忽略，先前274是撤回的笔误；这些都是协调方日志信息，尚未绑定最终joint提交，不是本工程复跑结果，也不是联合验收已完成。
 
 052/053由网络组优先复核，054～058由服务组复核，其他项由媒体/产品/Apple按各自范围核验。未完成归属与成立性确认的项不加入本工程最终能力矩阵；主目录“新增全部确认”的总括应由原编辑者逐项更正，工程组不整份覆盖或stage该草稿。
+
+## 收口来源与旧MacHost失败归因更新
+
+本工程只读核对产品 `27fec756ba97ee6f67228dc9530c7b0578a49ff3` 的parent确为 `16594c4f8780cd565afd57695f88e29277ec5939`。代码唯一变化是提取 `InputSendFuture<Writer>` 类型别名并用于PendingInputSend.future，未改变发送、锁、取消或队列语义。提交TODO声明UI库135通过/1项签名资产忽略，本包 `--lib --tests --no-deps` Clippy通过；这是产品来源报告，本工程未复跑，不代表workspace严格检查或最终joint通过。
+
+协调方报告Apple最新源分支完整FFI71项、Python186项与双头检查实跑通过，013 worker owned future仍在进行；本次未给该报告的完整源码SHA，本工程不擅自绑定所见动态branch head。工程 `d6f153e` 的旧FFI Host8通过/2失败、旧joint的两个MacHost失败均属于未整合完整Apple ABI/Host链的快照，不能外推到Apple当前源分支。等待Apple最终稳定SHA和完整依赖一起整合，保留已有等价API/Sender扩展并去重，不单独flat-pick9ad；来源通过仍不能替代joint实际复跑、Swift/Xcode或真实Mac presented。
+
+最终joint计划以27fec为第一parent，以媒体021初始化取消修复后的稳定SHA为另一parent；旧89bd仍是已核对缺陷来源，不是修复完成证据。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验这些备份，也未操作joint WIP。最终revision须实际包含所需resolution/测试，重跑跨包严格检查与所有适用测试，并交付源码身份和原始报告，才能更新联合验收状态。
