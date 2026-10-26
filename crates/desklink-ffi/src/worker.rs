@@ -10,8 +10,8 @@ use std::{
 
 use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
 use desklink_protocol::{
-    ControlMessage, InputEvent, Platform, TransferMessage, encode_audio_packet, encode_control,
-    encode_cursor_update, encode_transfer,
+    ControlMessage, InputContext, InputEvent, Platform, TransferMessage, encode_audio_packet,
+    encode_control, encode_cursor_update, encode_transfer,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -36,6 +36,12 @@ const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CapturedInput {
+    pub context: InputContext,
+    pub event: InputEvent,
+}
 
 pub(crate) struct SecureConnectionConfigOwned {
     pub server_name: String,
@@ -71,7 +77,7 @@ impl Drop for DirectoryConnectionConfigOwned {
 
 #[derive(Debug)]
 pub(crate) enum ControllerCommand {
-    SendInput(InputEvent),
+    SendInput(CapturedInput),
     ReleaseAll,
     RequestKeyframe,
     Control(ControlMessage),
@@ -106,6 +112,7 @@ impl CallbackTarget {
             state,
             error_code: error_metadata(kind, state).0,
             recoverable: error_metadata(kind, state).1,
+            input_epoch: meta.input_epoch,
         };
         callback(self.context as *mut std::ffi::c_void, &event);
     }
@@ -148,7 +155,7 @@ fn error_metadata(kind: DesklinkEventKind, state: DesklinkState) -> (u32, u8) {
 pub(crate) struct ControllerWorker {
     commands: mpsc::Sender<ControllerCommand>,
     cancellation: watch::Sender<bool>,
-    release_events: Arc<Mutex<Vec<InputEvent>>>,
+    release_events: Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: Arc<AtomicU8>,
     phase: Arc<AtomicU8>,
     thread: Option<thread::JoinHandle<()>>,
@@ -222,7 +229,7 @@ impl ControllerWorker {
         self.commands.try_send(command).map_err(|_| ())
     }
 
-    pub(crate) fn release_all(&self, events: Vec<InputEvent>) -> Result<(), ()> {
+    pub(crate) fn release_all(&self, events: Vec<CapturedInput>) -> Result<(), ()> {
         enqueue_release_all(
             &self.commands,
             &self.release_events,
@@ -264,7 +271,7 @@ struct WorkerContext {
     callback: CallbackTarget,
     material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     material_publisher: Option<MaterialPublisher>,
-    release_events: Arc<Mutex<Vec<InputEvent>>>,
+    release_events: Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: Arc<AtomicU8>,
 }
 
@@ -286,7 +293,7 @@ async fn run_worker(
     } = context;
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
-    let mut pending_release: Option<Vec<InputEvent>> = None;
+    let mut pending_release: Option<Vec<CapturedInput>> = None;
     loop {
         if !first_attempt && let Some(invalidate) = &material_invalidator {
             invalidate();
@@ -469,16 +476,21 @@ enum ConnectedOutcome {
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &mut Option<Vec<InputEvent>>,
+    pending_release: &mut Option<Vec<CapturedInput>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
-    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_events: &Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &Arc<AtomicU8>,
 ) -> ConnectedOutcome {
     let mut stable = false;
     if let Some(events) = pending_release.take() {
         for event in events {
-            if let Err(error) = send_cancellable(cancellation, controller.send_input(event)).await {
+            if let Err(error) = send_cancellable(
+                cancellation,
+                controller.send_input_with_context(event.context, event.event),
+            )
+            .await
+            {
                 return ConnectedOutcome::Failed {
                     failure: ConnectFailure::from_controller(error),
                     stream_id: controller.active_stream_id().unwrap_or(0),
@@ -495,7 +507,7 @@ async fn run_connected(
                     release_pending.store(0, Ordering::Release);
                     let events = take_release_events(release_events);
                     for event in events {
-                        if let Err(error) = send_cancellable(cancellation, controller.send_input(event)).await {
+                        if let Err(error) = send_cancellable(cancellation, controller.send_input_with_context(event.context, event.event)).await {
                             return ConnectedOutcome::Failed {
                                 failure: ConnectFailure::from_controller(error),
                                 stream_id: controller.active_stream_id().unwrap_or(0),
@@ -505,7 +517,7 @@ async fn run_connected(
                     }
                 }
                 Some(ControllerCommand::SendInput(event)) => {
-                    if let Err(error) = send_cancellable(cancellation, controller.send_input(event)).await {
+                    if let Err(error) = send_cancellable(cancellation, controller.send_input_with_context(event.context, event.event)).await {
                         return ConnectedOutcome::Failed {
                             failure: ConnectFailure::from_controller(error),
                             stream_id: controller.active_stream_id().unwrap_or(0),
@@ -599,10 +611,10 @@ async fn send_cancellable<T>(
 struct RetryContext<'a> {
     schedule: &'a mut ReconnectSchedule,
     commands: &'a mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &'a mut Option<Vec<InputEvent>>,
+    pending_release: &'a mut Option<Vec<CapturedInput>>,
     cancellation: &'a mut watch::Receiver<bool>,
     callback: CallbackTarget,
-    release_events: &'a Arc<Mutex<Vec<InputEvent>>>,
+    release_events: &'a Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &'a Arc<AtomicU8>,
     persistent: bool,
 }
@@ -689,9 +701,9 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
 async fn wait_for_retry(
     delay: Duration,
     commands: &mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &mut Option<Vec<InputEvent>>,
+    pending_release: &mut Option<Vec<CapturedInput>>,
     cancellation: &mut watch::Receiver<bool>,
-    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_events: &Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &Arc<AtomicU8>,
 ) -> bool {
     if *cancellation.borrow() {
@@ -901,9 +913,9 @@ fn validate_expected_host(expected: [u8; 32], actual: [u8; 32]) -> Result<(), Co
 
 fn enqueue_release_all(
     commands: &mpsc::Sender<ControllerCommand>,
-    release_events: &Mutex<Vec<InputEvent>>,
+    release_events: &Mutex<Vec<CapturedInput>>,
     release_pending: &AtomicU8,
-    events: Vec<InputEvent>,
+    events: Vec<CapturedInput>,
 ) -> Result<(), ()> {
     if !events.is_empty() {
         let mut pending = release_events
@@ -925,7 +937,7 @@ fn enqueue_release_all(
     Ok(())
 }
 
-fn take_release_events(release_events: &Mutex<Vec<InputEvent>>) -> Vec<InputEvent> {
+fn take_release_events(release_events: &Mutex<Vec<CapturedInput>>) -> Vec<CapturedInput> {
     let mut pending = release_events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -951,6 +963,7 @@ fn emit_controller_event(callback: CallbackTarget, event: ControllerEvent) -> bo
                 config_version: config.config_version,
                 width: config.width,
                 height: config.height,
+                input_epoch: config.input_epoch,
             };
             callback.emit_state(DesklinkState::Connected, config.stream_id);
             callback.emit(
@@ -970,6 +983,7 @@ fn emit_controller_event(callback: CallbackTarget, event: ControllerEvent) -> bo
                     config_version: frame.config_version,
                     width: frame.width,
                     height: frame.height,
+                    input_epoch: 0,
                 },
                 DesklinkState::Connected,
             );
@@ -1205,8 +1219,20 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let release_events = Mutex::new(Vec::new());
         let release_pending = AtomicU8::new(0);
-        let first_event = InputEvent::MouseMove { x: 1, y: 2 };
-        let second_event = InputEvent::MouseMove { x: 3, y: 4 };
+        let first_event = CapturedInput {
+            context: InputContext {
+                stream_id: 1,
+                input_epoch: 11,
+            },
+            event: InputEvent::MouseMove { x: 1, y: 2 },
+        };
+        let second_event = CapturedInput {
+            context: InputContext {
+                stream_id: 2,
+                input_epoch: 22,
+            },
+            event: InputEvent::MouseMove { x: 3, y: 4 },
+        };
 
         assert!(
             enqueue_release_all(

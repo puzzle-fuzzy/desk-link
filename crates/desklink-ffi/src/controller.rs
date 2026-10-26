@@ -12,12 +12,12 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioPacket, Codec, ControlMessage, CursorUpdate, DeviceCapabilities,
-    DeviceRole, DirectLanCandidate, H264Profile, InputEnvelope, InputEvent, NoiseHandshake,
-    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage, VideoConfig,
-    VideoPacket, VideoQualityPreference, decode_audio_packet, decode_control, decode_cursor_update,
-    decode_noise_handshake, decode_transfer, decode_video_config, decode_video_packet,
-    decode_video_reliable_batch, encode_control, encode_input, encode_noise_handshake,
-    encode_transfer,
+    DeviceRole, DirectLanCandidate, H264Profile, InputContext, InputEnvelope, InputEvent,
+    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage,
+    VideoConfig, VideoPacket, VideoQualityPreference, decode_audio_packet, decode_control,
+    decode_cursor_update, decode_noise_handshake, decode_transfer, decode_video_config,
+    decode_video_packet, decode_video_reliable_batch, encode_control, encode_input,
+    encode_noise_handshake, encode_transfer,
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{
@@ -322,13 +322,30 @@ impl ControllerRuntime {
     }
 
     pub async fn send_input(&self, event: InputEvent) -> Result<(), ControllerError> {
+        // Legacy callers are deliberately fail-closed until they capture a
+        // presentation context. No network command acquires a current epoch.
+        self.send_input_with_context(
+            InputContext {
+                stream_id: 0,
+                input_epoch: 0,
+            },
+            event,
+        )
+        .await
+    }
+
+    pub async fn send_input_with_context(
+        &self,
+        context: InputContext,
+        event: InputEvent,
+    ) -> Result<(), ControllerError> {
+        context.validate()?;
         let sequence = self.input_sequence.lock().await.next_sequence();
         let plaintext = encode_input(&InputEnvelope {
             sequence,
             timestamp_us: now_micros(),
-            // Fail closed until callers supply the captured presentation context.
-            stream_id: 0,
-            input_epoch: 0,
+            stream_id: context.stream_id,
+            input_epoch: context.input_epoch,
             event,
         })?;
         let ciphertext = seal(&self.secure, SecureLane::Input, &plaintext).await?;

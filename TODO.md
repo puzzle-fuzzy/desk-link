@@ -206,6 +206,8 @@
 - [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
 - [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
 
+- [x] Controller/FFI 输入切片：`ControllerRuntime::send_input_with_context(context: InputContext, event: InputEvent)` 严格校验并序列化原 context；旧无上下文方法保持拒绝。FFI DesklinkInput/Event 贯通 epoch，有界队列、合成 release 按 context 保存；新增 `desklink_release_all_for_context`，旧 epoch 的同名键释放不会清掉新 epoch ledger，空 ledger 回收且最多跟踪 8 个 context。生成 C 头与实际 C/Rust 布局一致。Rust 20 单元+7 ABI+2布局+5 Controller loopback共34项通过。主题 `feat(DL2-013): preserve captured input context across FFI queues and releases`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

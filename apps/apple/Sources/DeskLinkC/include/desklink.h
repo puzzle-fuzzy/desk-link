@@ -198,6 +198,8 @@ typedef struct DesklinkInput {
     uint32_t character;
     uint8_t pressed;
     uint8_t modifiers;
+    uint64_t stream_id;
+    uint64_t input_epoch;
 } DesklinkInput;
 
 typedef struct DesklinkEvent {
@@ -212,6 +214,7 @@ typedef struct DesklinkEvent {
     DesklinkState state;
     uint32_t error_code;
     uint8_t recoverable;
+    uint64_t input_epoch;
 } DesklinkEvent;
 
 typedef struct DesklinkHostInput {
@@ -290,6 +293,8 @@ DesklinkResult desklink_send_input(DesklinkHandle * handle, const DesklinkInput 
 DesklinkResult desklink_request_keyframe(DesklinkHandle * handle);
 
 DesklinkResult desklink_release_all(DesklinkHandle * handle);
+
+DesklinkResult desklink_release_all_for_context(DesklinkHandle * handle, uint64_t stream_id, uint64_t input_epoch);
 
 DesklinkResult desklink_controller_command(DesklinkHandle * handle, uint32_t command, uint32_t value);
 

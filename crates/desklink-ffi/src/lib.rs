@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::{CStr, c_char, c_void},
     net::{SocketAddr, ToSocketAddrs},
     ptr::{null, null_mut},
@@ -11,10 +12,10 @@ use desklink_crypto::{
     DeviceIdentity, MAX_PAIRING_TTL_S, PAIRING_INVITE_BYTES, PairingInvite, PairingOffer, SessionId,
 };
 use desklink_protocol::{
-    ControlMessage, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES, MAX_MVP_HEIGHT,
-    MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_PAYLOAD_BYTES,
-    MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, encode_control, encode_input,
-    encode_transfer,
+    ControlMessage, InputContext, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES,
+    MAX_MVP_HEIGHT, MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES,
+    MAX_VIDEO_PACKET_PAYLOAD_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform,
+    encode_control, encode_input, encode_transfer,
 };
 use desklink_session::{
     InputSequencer, PressedInputState, SessionEvent, SessionMachine, SessionState,
@@ -35,7 +36,7 @@ pub use host::{
     HostCommand, HostError, HostEvent, HostIdentity, HostMetrics, HostRuntime, HostState,
 };
 use worker::{
-    ControllerCommand, ControllerWorker, DirectoryConnectionConfigOwned,
+    CapturedInput, ControllerCommand, ControllerWorker, DirectoryConnectionConfigOwned,
     SecureConnectionConfigOwned,
 };
 
@@ -243,6 +244,8 @@ pub struct DesklinkInput {
     pub character: u32,
     pub pressed: u8,
     pub modifiers: u8,
+    pub stream_id: u64,
+    pub input_epoch: u64,
 }
 
 #[repr(C)]
@@ -260,6 +263,7 @@ pub struct DesklinkEvent {
     /// Stable classification; message bytes are diagnostic text only.
     pub error_code: u32,
     pub recoverable: u8,
+    pub input_epoch: u64,
 }
 
 pub type DesklinkEventCallback = extern "C" fn(*mut c_void, *const DesklinkEvent);
@@ -475,6 +479,7 @@ pub(crate) struct EventMeta {
     config_version: u32,
     width: u16,
     height: u16,
+    input_epoch: u64,
 }
 
 impl EventMeta {
@@ -485,6 +490,7 @@ impl EventMeta {
             config_version: 0,
             width: 0,
             height: 0,
+            input_epoch: 0,
         }
     }
 }
@@ -497,7 +503,7 @@ struct DesklinkRuntime {
     callback_context: *mut c_void,
     session: SessionMachine,
     pairing: Option<PairingOffer>,
-    pressed: PressedInputState,
+    pressed: HashMap<InputContext, PressedInputState>,
     input_sequence: InputSequencer,
     stream_id: u64,
     closed: bool,
@@ -534,6 +540,7 @@ impl DesklinkRuntime {
                 0
             },
             recoverable: 0,
+            input_epoch: meta.input_epoch,
         };
         callback(self.callback_context, &event);
     }
@@ -548,6 +555,7 @@ impl DesklinkRuntime {
                 config_version: 0,
                 width: 0,
                 height: 0,
+                input_epoch: 0,
             },
         );
     }
@@ -562,6 +570,7 @@ impl DesklinkRuntime {
                 config_version: 0,
                 width: 0,
                 height: 0,
+                input_epoch: 0,
             },
         );
     }
@@ -589,64 +598,77 @@ impl DesklinkRuntime {
     }
 
     fn release_all(&mut self) -> DesklinkResult {
-        let events = self.pressed.release_events();
+        self.release_context(None)
+    }
+
+    fn release_context(&mut self, only: Option<InputContext>) -> DesklinkResult {
+        let mut releases = Vec::new();
+        for (&context, pressed) in &self.pressed {
+            if only.is_none_or(|expected| expected == context) {
+                releases.extend(
+                    pressed
+                        .release_events()
+                        .into_iter()
+                        .map(|event| CapturedInput { context, event }),
+                );
+            }
+        }
         if let Some(worker) = &self.worker {
-            if worker.release_all(events).is_err() {
+            if worker.release_all(releases).is_err() {
                 return DesklinkResult::InternalError;
             }
         } else {
-            for event in events {
-                if let Err(error) = self.dispatch_input(event) {
+            for input in releases {
+                if let Err(error) = self.dispatch_input(input) {
                     return error;
                 }
             }
         }
-        self.pressed.release_all();
+        self.pressed
+            .retain(|context, _| only.is_some_and(|expected| expected != *context));
         self.emit(
             DesklinkEventKind::ReleaseAll,
             &[],
+            EventMeta::for_stream(only.map_or(0, |context| context.stream_id)),
+        );
+        DesklinkResult::Ok
+    }
+
+    fn emit_input(&mut self, input: CapturedInput) -> Result<(), DesklinkResult> {
+        let envelope = InputEnvelope {
+            sequence: self.input_sequence.next_sequence(),
+            timestamp_us: now_micros(),
+            stream_id: input.context.stream_id,
+            input_epoch: input.context.input_epoch,
+            event: input.event,
+        };
+        let bytes = encode_input(&envelope).map_err(|_| DesklinkResult::InvalidArgument)?;
+        self.emit(
+            DesklinkEventKind::Input,
+            &bytes,
             EventMeta {
-                stream_id: self.stream_id,
+                stream_id: input.context.stream_id,
+                input_epoch: input.context.input_epoch,
                 frame_id: 0,
                 config_version: 0,
                 width: 0,
                 height: 0,
             },
         );
-        DesklinkResult::Ok
+        Ok(())
     }
 
-    fn emit_input(&mut self, event: InputEvent) {
-        let envelope = InputEnvelope {
-            sequence: self.input_sequence.next_sequence(),
-            timestamp_us: now_micros(),
-            stream_id: 0,
-            input_epoch: 0,
-            event,
-        };
-        if let Ok(bytes) = encode_input(&envelope) {
-            self.emit(
-                DesklinkEventKind::Input,
-                &bytes,
-                EventMeta {
-                    stream_id: self.stream_id,
-                    frame_id: 0,
-                    config_version: 0,
-                    width: 0,
-                    height: 0,
-                },
-            );
-        }
-    }
-
-    fn dispatch_input(&mut self, event: InputEvent) -> Result<(), DesklinkResult> {
+    fn dispatch_input(&mut self, input: CapturedInput) -> Result<(), DesklinkResult> {
+        input
+            .context
+            .validate()
+            .map_err(|_| DesklinkResult::InvalidArgument)?;
         if let Some(worker) = &self.worker {
             worker
-                .send(ControllerCommand::SendInput(event))
+                .send(ControllerCommand::SendInput(input))
                 .map_err(|_| DesklinkResult::InternalError)
         } else {
-            self.emit_input(event);
-            Ok(())
+            self.emit_input(input)
         }
     }
 
@@ -726,7 +748,7 @@ pub unsafe extern "C" fn desklink_create_for_platform(
         callback_context,
         session: SessionMachine::new(desklink_protocol::DeviceRole::Controller),
         pairing: None,
-        pressed: PressedInputState::default(),
+        pressed: HashMap::new(),
         input_sequence: InputSequencer::new(),
         stream_id: 0,
         closed: false,
@@ -811,6 +833,7 @@ pub unsafe extern "C" fn desklink_start_pairing(
             config_version: 0,
             width: 0,
             height: 0,
+            input_epoch: 0,
         },
     );
     DesklinkResult::Ok
@@ -1189,19 +1212,41 @@ pub unsafe extern "C" fn desklink_send_input(
         return error;
     }
     let input = unsafe { &*input };
+    let context = InputContext {
+        stream_id: input.stream_id,
+        input_epoch: input.input_epoch,
+    };
+    if context.validate().is_err() {
+        return DesklinkResult::InvalidArgument;
+    }
     let event = match convert_input(input) {
         Ok(event) => event,
         Err(error) => return error,
     };
-    let result = runtime.dispatch_input(event.clone());
+    let is_press = matches!(
+        &event,
+        InputEvent::MouseButton { pressed: true, .. } | InputEvent::Key { pressed: true, .. }
+    );
+    if is_press && !runtime.pressed.contains_key(&context) && runtime.pressed.len() >= 8 {
+        return DesklinkResult::InvalidState;
+    }
+    let result = runtime.dispatch_input(CapturedInput {
+        context,
+        event: event.clone(),
+    });
     if result.is_ok() {
         if matches!(
             &event,
             InputEvent::MouseButton { pressed: false, .. } | InputEvent::Key { pressed: false, .. }
         ) {
-            runtime.pressed.release(&event);
-        } else {
-            runtime.pressed.press(&event);
+            if let Some(pressed) = runtime.pressed.get_mut(&context) {
+                pressed.release(&event);
+                if pressed.release_events().is_empty() {
+                    runtime.pressed.remove(&context);
+                }
+            }
+        } else if is_press {
+            runtime.pressed.entry(context).or_default().press(&event);
         }
     }
     result.map_or_else(|error| error, |_| DesklinkResult::Ok)
@@ -1242,6 +1287,7 @@ pub unsafe extern "C" fn desklink_request_keyframe(handle: *mut DesklinkHandle) 
             config_version: 0,
             width: 0,
             height: 0,
+            input_epoch: 0,
         },
     );
     DesklinkResult::Ok
@@ -1260,6 +1306,32 @@ pub unsafe extern "C" fn desklink_release_all(handle: *mut DesklinkHandle) -> De
         return error;
     }
     runtime.release_all()
+}
+
+/// Releases only keys/buttons captured on this surface; it never substitutes a
+/// newer context or releases a successor epoch's identical keys.
+/// # Safety
+/// `handle` must be a live, exclusively accessed handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_release_all_for_context(
+    handle: *mut DesklinkHandle,
+    stream_id: u64,
+    input_epoch: u64,
+) -> DesklinkResult {
+    let context = InputContext {
+        stream_id,
+        input_epoch,
+    };
+    if context.validate().is_err() {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if let Err(error) = runtime.ensure_active() {
+        return error;
+    }
+    runtime.release_context(Some(context))
 }
 
 /// Queues a bounded controller command. command/value are validated before enqueue.
@@ -2278,6 +2350,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_specific_release_cannot_clear_a_successor_epochs_identical_key() {
+        let relay = std::ffi::CString::new("quic://127.0.0.1:9").unwrap();
+        let config = DesklinkConfig {
+            relay_url: relay.as_ptr(),
+            log_level: 0,
+        };
+        let mut handle = null_mut();
+        unsafe {
+            assert_eq!(
+                desklink_create(&config, None, null_mut(), &mut handle),
+                DesklinkResult::Ok
+            );
+            let mut key = input(DesklinkInputKind::Key);
+            key.key_code = 1;
+            key.pressed = 1;
+            key.input_epoch = 0;
+            assert_eq!(
+                desklink_send_input(handle, &key),
+                DesklinkResult::InvalidArgument
+            );
+            key.input_epoch = 10;
+            assert_eq!(desklink_send_input(handle, &key), DesklinkResult::Ok);
+            key.input_epoch = 20;
+            assert_eq!(desklink_send_input(handle, &key), DesklinkResult::Ok);
+            assert_eq!((*handle).runtime.pressed.len(), 2);
+            assert_eq!(
+                desklink_release_all_for_context(handle, 1, 10),
+                DesklinkResult::Ok
+            );
+            let next = InputContext {
+                stream_id: 1,
+                input_epoch: 20,
+            };
+            assert_eq!(
+                (*handle)
+                    .runtime
+                    .pressed
+                    .get(&next)
+                    .unwrap()
+                    .release_events()
+                    .len(),
+                1
+            );
+            key.input_epoch = 10;
+            key.pressed = 0;
+            assert_eq!(desklink_send_input(handle, &key), DesklinkResult::Ok);
+            assert_eq!((*handle).runtime.pressed.len(), 1);
+            assert_eq!(desklink_release_all(handle), DesklinkResult::Ok);
+            assert!((*handle).runtime.pressed.is_empty());
+            desklink_destroy(handle);
+        }
+    }
+
+    #[test]
     fn saved_authorization_never_upgrades_unknown_or_expired_material() {
         assert!(!saved_authorization_valid(0, 0, 100));
         assert!(!saved_authorization_valid(1, 0, 100));
@@ -2328,6 +2454,8 @@ mod tests {
 
     fn input(kind: DesklinkInputKind) -> DesklinkInput {
         DesklinkInput {
+            stream_id: 1,
+            input_epoch: 1,
             kind,
             x: 0.0,
             y: 0.0,
