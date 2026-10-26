@@ -42,6 +42,31 @@ pub enum DirectLanProbeError {
     Crypto(String),
 }
 
+// Shared callers borrow the session only for authenticated packet transforms.
+// The connection, stream and response waits never retain a crypto guard.
+enum ProbeCrypto<'a> {
+    Exclusive(&'a mut SecureSession),
+    Shared(&'a tokio::sync::Mutex<SecureSession>),
+}
+
+impl ProbeCrypto<'_> {
+    async fn seal(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DirectLanProbeError> {
+        match self {
+            Self::Exclusive(secure) => secure.seal(SecureLane::VideoDatagram, bytes),
+            Self::Shared(secure) => secure.lock().await.seal(SecureLane::VideoDatagram, bytes),
+        }
+        .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))
+    }
+
+    async fn open(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DirectLanProbeError> {
+        match self {
+            Self::Exclusive(secure) => secure.open(SecureLane::VideoDatagram, bytes),
+            Self::Shared(secure) => secure.lock().await.open(SecureLane::VideoDatagram, bytes),
+        }
+        .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProbeKind {
     Request,
@@ -397,14 +422,45 @@ impl DirectLanEndpoint {
         secure: &mut SecureSession,
         now_unix_s: u64,
     ) -> Result<(DirectLanConnection, DirectLanProbeResult), DirectLanProbeError> {
+        self.connect_with_crypto(
+            candidate,
+            expected_binding,
+            ProbeCrypto::Exclusive(secure),
+            now_unix_s,
+        )
+        .await
+    }
+
+    /// Probe without holding the shared media/control crypto lock over I/O.
+    pub async fn connect_shared(
+        &self,
+        candidate: &DirectLanCandidate,
+        expected_binding: &[u8; 16],
+        secure: &tokio::sync::Mutex<SecureSession>,
+        now_unix_s: u64,
+    ) -> Result<(DirectLanConnection, DirectLanProbeResult), DirectLanProbeError> {
+        self.connect_with_crypto(
+            candidate,
+            expected_binding,
+            ProbeCrypto::Shared(secure),
+            now_unix_s,
+        )
+        .await
+    }
+
+    async fn connect_with_crypto(
+        &self,
+        candidate: &DirectLanCandidate,
+        expected_binding: &[u8; 16],
+        mut secure: ProbeCrypto<'_>,
+        now_unix_s: u64,
+    ) -> Result<(DirectLanConnection, DirectLanProbeResult), DirectLanProbeError> {
         candidate
             .validate(now_unix_s, expected_binding)
             .map_err(|error| DirectLanProbeError::InvalidCandidate(error.to_string()))?;
         let request =
             DirectLanProbe::request(candidate.candidate_id(), *expected_binding, now_unix_s);
-        let ciphertext = secure
-            .seal(SecureLane::VideoDatagram, &request.encode())
-            .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))?;
+        let ciphertext = secure.seal(&request.encode()).await?;
         let started = std::time::Instant::now();
         let connection = tokio::time::timeout(
             PROBE_TIMEOUT,
@@ -425,11 +481,7 @@ impl DirectLanEndpoint {
             .map_err(|error| DirectLanProbeError::Stream(error.to_string()))?;
         write_probe(&mut send, &ciphertext).await?;
         let response_ciphertext = read_probe(&mut receive).await?;
-        let response = DirectLanProbe::decode(
-            &secure
-                .open(SecureLane::VideoDatagram, &response_ciphertext)
-                .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))?,
-        )?;
+        let response = DirectLanProbe::decode(&secure.open(&response_ciphertext).await?)?;
         response.validate(
             ProbeKind::Response,
             candidate.candidate_id(),
@@ -482,16 +534,49 @@ impl DirectLanEndpoint {
         secure: &mut SecureSession,
         now_unix_s: u64,
     ) -> Result<(DirectLanConnection, DirectLanProbeResult), DirectLanProbeError> {
+        self.accept_probe_with_crypto(
+            connection,
+            expected_candidate_id,
+            expected_binding,
+            ProbeCrypto::Exclusive(secure),
+            now_unix_s,
+        )
+        .await
+    }
+
+    /// Accept a probe with short per-packet access to the shared session.
+    pub async fn accept_probe_connection_shared(
+        &self,
+        connection: quinn::Connection,
+        expected_candidate_id: u64,
+        expected_binding: &[u8; 16],
+        secure: &tokio::sync::Mutex<SecureSession>,
+        now_unix_s: u64,
+    ) -> Result<(DirectLanConnection, DirectLanProbeResult), DirectLanProbeError> {
+        self.accept_probe_with_crypto(
+            connection,
+            expected_candidate_id,
+            expected_binding,
+            ProbeCrypto::Shared(secure),
+            now_unix_s,
+        )
+        .await
+    }
+
+    async fn accept_probe_with_crypto(
+        &self,
+        connection: quinn::Connection,
+        expected_candidate_id: u64,
+        expected_binding: &[u8; 16],
+        mut secure: ProbeCrypto<'_>,
+        now_unix_s: u64,
+    ) -> Result<(DirectLanConnection, DirectLanProbeResult), DirectLanProbeError> {
         let (mut send, mut receive) = tokio::time::timeout(PROBE_TIMEOUT, connection.accept_bi())
             .await
             .map_err(|_| DirectLanProbeError::Timeout)?
             .map_err(|error| DirectLanProbeError::Stream(error.to_string()))?;
         let request_ciphertext = read_probe(&mut receive).await?;
-        let request = DirectLanProbe::decode(
-            &secure
-                .open(SecureLane::VideoDatagram, &request_ciphertext)
-                .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))?,
-        )?;
+        let request = DirectLanProbe::decode(&secure.open(&request_ciphertext).await?)?;
         request.validate(
             ProbeKind::Request,
             expected_candidate_id,
@@ -499,9 +584,7 @@ impl DirectLanEndpoint {
             now_unix_s,
         )?;
         let response = DirectLanProbe::response(request, now_unix_s);
-        let ciphertext = secure
-            .seal(SecureLane::VideoDatagram, &response.encode())
-            .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))?;
+        let ciphertext = secure.seal(&response.encode()).await?;
         write_probe(&mut send, &ciphertext).await?;
         Ok((
             DirectLanConnection::new(connection, request.candidate_id),
@@ -632,6 +715,81 @@ mod tests {
             .expect("responder must observe an active direct-path close");
         assert!(initiator_connection.is_closed());
         assert!(responder_connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn shared_probe_network_wait_does_not_hold_media_crypto_lock() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let responder = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let initiator = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let binding = [9; 16];
+        let candidate =
+            DirectLanCandidate::new(77, responder.local_addr().unwrap(), 110, binding, 100)
+                .unwrap();
+        let (initiator_secure, responder_secure) = connected_secure_sessions();
+        let initiator_secure = Arc::new(tokio::sync::Mutex::new(initiator_secure));
+        let responder_secure = tokio::sync::Mutex::new(responder_secure);
+        let initiator_for_task = initiator.clone();
+        let secure_for_task = initiator_secure.clone();
+        let task = tokio::spawn(async move {
+            initiator_for_task
+                .connect_shared(&candidate, &binding, &secure_for_task, 100)
+                .await
+        });
+        let connection = responder.accept().await.unwrap().unwrap();
+        // The peer has completed TLS but has deliberately not read/responded
+        // to the encrypted probe. Normal reliable lanes must still encrypt.
+        let mut secure = tokio::time::timeout(Duration::from_millis(100), initiator_secure.lock())
+            .await
+            .expect("network wait retained shared crypto lock");
+        let packet = secure
+            .seal(SecureLane::Control, b"input remains live")
+            .unwrap();
+        drop(secure);
+        assert_eq!(
+            responder_secure
+                .lock()
+                .await
+                .open(SecureLane::Control, &packet)
+                .unwrap(),
+            b"input remains live"
+        );
+        let (responder_path, _) = responder
+            .accept_probe_connection_shared(connection, 77, &binding, &responder_secure, 100)
+            .await
+            .unwrap();
+        let (initiator_path, _) = task.await.unwrap().unwrap();
+        initiator_path.close(b"test complete");
+        responder_path.close(b"test complete");
+    }
+
+    #[tokio::test]
+    async fn shared_inbound_probe_wait_is_cancellable_without_crypto_guard() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let responder = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let initiator = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connecting = initiator
+            .endpoint
+            .connect_with(
+                initiator.client_config.clone(),
+                responder.local_addr().unwrap(),
+                "desklink-lan",
+            )
+            .unwrap();
+        let (accepted, connected) = tokio::join!(responder.accept(), connecting);
+        let connection = accepted.unwrap().unwrap();
+        let peer = connected.unwrap();
+        let (_, secure) = connected_secure_sessions();
+        let secure = tokio::sync::Mutex::new(secure);
+        // Peer sends no probe stream. Timeout cancels the inbound select future.
+        let wait = responder.accept_probe_connection_shared(connection, 1, &[9; 16], &secure, 100);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), wait)
+                .await
+                .is_err()
+        );
+        assert!(secure.try_lock().is_ok());
+        peer.close(0_u32.into(), b"cancelled");
     }
 
     #[tokio::test]
