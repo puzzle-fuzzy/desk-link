@@ -789,6 +789,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_lane_rejection_before_video_advances_does_not_consume_either_packet() {
+        use desklink_crypto::CryptoError;
+
+        let (mut initiator, mut responder) = connected_secure_sessions();
+        let request = DirectLanProbe::request(7, [9; 16], 100);
+        let encrypted_probe = ProbeCrypto::Exclusive(&mut initiator)
+            .seal(&request.encode())
+            .await
+            .unwrap();
+        // Both lane replay windows are pristine. This must exercise actual
+        // authentication failure, not an earlier stale-sequence rejection.
+        assert_eq!(
+            responder.open(SecureLane::VideoDatagram, &encrypted_probe),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        let opened_probe = ProbeCrypto::Exclusive(&mut responder)
+            .open(&encrypted_probe)
+            .await
+            .unwrap();
+        assert_eq!(DirectLanProbe::decode(&opened_probe).unwrap(), request);
+
+        // The failed open must also leave the first genuine video sequence
+        // available. Its counter starts at one independently of DirectProbe.
+        let first_video = initiator
+            .seal(SecureLane::VideoDatagram, b"first genuine video")
+            .unwrap();
+        assert_eq!(
+            responder
+                .open(SecureLane::VideoDatagram, &first_video)
+                .unwrap(),
+            b"first genuine video"
+        );
+        assert_eq!(
+            responder.open(SecureLane::DirectProbe, &encrypted_probe),
+            Err(CryptoError::ReplayRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn reflected_outbound_probe_is_rejected_without_consuming_a_genuine_reply() {
+        use desklink_crypto::CryptoError;
+
+        let (mut initiator, mut responder) = connected_secure_sessions();
+        let request = DirectLanProbe::request(7, [9; 16], 100);
+        let outbound_probe = ProbeCrypto::Exclusive(&mut initiator)
+            .seal(&request.encode())
+            .await
+            .unwrap();
+        // Same lane and sequence, opposite direction: reflection must fail
+        // authentication while the initiator's receive window is still empty.
+        assert_eq!(
+            initiator.open(SecureLane::DirectProbe, &outbound_probe),
+            Err(CryptoError::AuthenticationFailed)
+        );
+        let genuine_request = ProbeCrypto::Exclusive(&mut responder)
+            .open(&outbound_probe)
+            .await
+            .unwrap();
+        assert_eq!(DirectLanProbe::decode(&genuine_request).unwrap(), request);
+        let response = DirectLanProbe::response(request, 100);
+        let inbound_probe = ProbeCrypto::Exclusive(&mut responder)
+            .seal(&response.encode())
+            .await
+            .unwrap();
+        let genuine_reply = ProbeCrypto::Exclusive(&mut initiator)
+            .open(&inbound_probe)
+            .await
+            .unwrap();
+        assert_eq!(DirectLanProbe::decode(&genuine_reply).unwrap(), response);
+        assert_eq!(
+            initiator.open(SecureLane::DirectProbe, &inbound_probe),
+            Err(CryptoError::ReplayRejected)
+        );
+        // Rejection and replay checks do not poison the next genuine packet
+        // in either direction.
+        let next_request = initiator
+            .seal(SecureLane::DirectProbe, b"next request")
+            .unwrap();
+        let next_response = responder
+            .seal(SecureLane::DirectProbe, b"next response")
+            .unwrap();
+        assert_eq!(
+            responder
+                .open(SecureLane::DirectProbe, &next_request)
+                .unwrap(),
+            b"next request"
+        );
+        assert_eq!(
+            initiator
+                .open(SecureLane::DirectProbe, &next_response)
+                .unwrap(),
+            b"next response"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_response_wait_survives_reverse_video_traffic_without_crypto_guards() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let responder = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let initiator = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let binding = [9; 16];
+        let candidate =
+            DirectLanCandidate::new(88, responder.local_addr().unwrap(), 110, binding, 100)
+                .unwrap();
+        let (initiator_secure, responder_secure) = connected_secure_sessions();
+        let initiator_secure = Arc::new(tokio::sync::Mutex::new(initiator_secure));
+        let responder_secure = Arc::new(tokio::sync::Mutex::new(responder_secure));
+        let (response_ready, wait_ready) = tokio::sync::oneshot::channel();
+        let (release_response, wait_release) = tokio::sync::oneshot::channel();
+        let responder_task = tokio::spawn({
+            let endpoint = responder.clone();
+            let secure = responder_secure.clone();
+            async move {
+                let connection = endpoint.accept().await.unwrap().unwrap();
+                let (mut send, mut receive) =
+                    tokio::time::timeout(PROBE_TIMEOUT, connection.accept_bi())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let encrypted_request = read_probe(&mut receive).await.unwrap();
+                let mut crypto = ProbeCrypto::Shared(&secure);
+                let request =
+                    DirectLanProbe::decode(&crypto.open(&encrypted_request).await.unwrap())
+                        .unwrap();
+                request
+                    .validate(ProbeKind::Request, 88, &binding, 100)
+                    .unwrap();
+                let response = DirectLanProbe::response(request, 100);
+                let encrypted_response = crypto.seal(&response.encode()).await.unwrap();
+                response_ready.send(()).unwrap();
+                // The response is sealed before media advances the reverse
+                // video replay window, but is deliberately not written yet.
+                wait_release.await.unwrap();
+                write_probe(&mut send, &encrypted_response).await.unwrap();
+                DirectLanConnection::new(connection, 88)
+            }
+        });
+        let initiator_task = tokio::spawn({
+            let endpoint = initiator.clone();
+            let secure = initiator_secure.clone();
+            async move {
+                endpoint
+                    .connect_shared(&candidate, &binding, &secure, 100)
+                    .await
+            }
+        });
+        tokio::time::timeout(PROBE_TIMEOUT, wait_ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !initiator_task.is_finished(),
+            "probe completed before response release"
+        );
+        let mut initiator_guard =
+            tokio::time::timeout(Duration::from_millis(100), initiator_secure.lock())
+                .await
+                .expect("response read wait retained initiator crypto guard");
+        let control = initiator_guard
+            .seal(SecureLane::Control, b"control during response wait")
+            .unwrap();
+        drop(initiator_guard);
+        let mut responder_guard =
+            tokio::time::timeout(Duration::from_millis(100), responder_secure.lock())
+                .await
+                .expect("delayed response write retained responder crypto guard");
+        assert_eq!(
+            responder_guard.open(SecureLane::Control, &control).unwrap(),
+            b"control during response wait"
+        );
+        drop(responder_guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for sequence in 0_u16..256 {
+                let payload = sequence.to_be_bytes();
+                let video = responder_secure
+                    .lock()
+                    .await
+                    .seal(SecureLane::VideoDatagram, &payload)
+                    .unwrap();
+                assert_eq!(
+                    initiator_secure
+                        .lock()
+                        .await
+                        .open(SecureLane::VideoDatagram, &video)
+                        .unwrap(),
+                    payload
+                );
+            }
+        })
+        .await
+        .expect("reverse video crypto stalled while the probe awaited its response");
+        assert!(
+            !initiator_task.is_finished(),
+            "probe must still await the delayed response"
+        );
+        release_response.send(()).unwrap();
+        let (initiator_path, result) = tokio::time::timeout(PROBE_TIMEOUT, initiator_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let responder_path = tokio::time::timeout(PROBE_TIMEOUT, responder_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.candidate_id, 88);
+        initiator_path.close(b"response wait test complete");
+        responder_path.close(b"response wait test complete");
+    }
+
+    #[tokio::test]
     async fn shared_probe_network_wait_does_not_hold_media_crypto_lock() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let responder = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
