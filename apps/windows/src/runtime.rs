@@ -49,9 +49,9 @@ use crate::{
     input::{InputInjectionError, InputInjector, VirtualDesktop},
     input_restriction::{InputRestrictionTracker, forward_latest_input_state},
     transfer::{
-        IncomingFileWorker, OutgoingFile, chunk_after_resume, confirm_file_offer, notify_file_received,
-        pick_outgoing_file, prepare_outgoing_file, read_clipboard_text, verify_resume_prefix,
-        write_clipboard_text,
+        IncomingFileWorker, OutgoingFile, chunk_after_resume, confirm_file_offer,
+        notify_file_received, pick_outgoing_file, prepare_outgoing_file, read_clipboard_text,
+        verify_resume_prefix, write_clipboard_text,
     },
     window::ApprovalState,
 };
@@ -2581,17 +2581,111 @@ async fn apply_video_profile(
         .unwrap_or(H264Profile::Main))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_input_and_control(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
     peer_generation: u64,
     stream_id: u64,
-    mut input: InputInjector,
+    input: InputInjector,
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
 ) -> Result<(), HostRuntimeError> {
+    let release_input = Arc::new(Notify::new());
+    let input_suspended = Arc::new(AtomicBool::new(false));
+    run_inbound_lanes(
+        receive_host_input(
+            client.clone(),
+            secure.clone(),
+            peer_generation,
+            stream_id,
+            input,
+            context.selected_desktop.clone(),
+            context.input_state_updates.clone(),
+            release_input.clone(),
+            input_suspended.clone(),
+        ),
+        receive_host_control(
+            client,
+            secure,
+            peer_generation,
+            stream_id,
+            force_keyframe,
+            context,
+            release_input,
+            input_suspended,
+        ),
+    )
+    .await
+}
+
+async fn run_inbound_lanes<I, C>(input: I, control: C) -> Result<(), HostRuntimeError>
+where
+    I: std::future::Future<Output = Result<(), HostRuntimeError>>,
+    C: std::future::Future<Output = Result<(), HostRuntimeError>>,
+{
+    // Dropping either lane also drops the other: no detached injector, stale
+    // configuration completion or direct probe survives the peer generation.
+    tokio::select! {
+        biased;
+        result = input => result,
+        result = control => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_host_input(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+    stream_id: u64,
+    mut input: InputInjector,
+    selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    input_state_updates: watch::Sender<Option<InputRestrictionReason>>,
+    release_input: Arc<Notify>,
+    input_suspended: Arc<AtomicBool>,
+) -> Result<(), HostRuntimeError> {
+    let mut policy = HostInboundPolicy::new(stream_id);
+    let mut input_restriction = InputRestrictionTracker::default();
+    loop {
+        tokio::select! {
+            biased;
+            _ = release_input.notified() => { let _ = input.release_all(); }
+            reason = client.next_closed_reason() => {
+                return Err(HostRuntimeError::TransportClosed(reason));
+            }
+            result = client.next_input_for_generation(peer_generation) => {
+                let bytes = result?;
+                let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
+                if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
+                    // Consume and discard coordinates produced during a monitor
+                    // transition. ReleaseAll remains safe and must still run.
+                    if !input_suspended.load(Ordering::Acquire) || matches!(event, InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }) {
+                        input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
+                        let failure = apply_input_event(&mut input, event.clone());
+                        if let Some(reason) = input_restriction.observe(&event, failure) {
+                            input_state_updates.send_replace(reason);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_host_control(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+    stream_id: u64,
+    force_keyframe: Arc<AtomicBool>,
+    context: HostInboundContext,
+    release_input: Arc<Notify>,
+    input_suspended: Arc<AtomicBool>,
+) -> Result<(), HostRuntimeError> {
     let HostInboundContext {
-        input_state_updates,
+        input_state_updates: _,
         capture_commands,
         selected_desktop,
         displays,
@@ -2602,8 +2696,7 @@ async fn receive_input_and_control(
         mut direct_session,
         direct_connection,
     } = context;
-    let mut policy = HostInboundPolicy::new(stream_id);
-    let mut input_restriction = InputRestrictionTracker::default();
+    let policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
     loop {
@@ -2629,7 +2722,8 @@ async fn receive_input_and_control(
                             // monitors must not close the video and control lanes.
                             // Retained pressed-state entries are retried by later
                             // release events and once more when the injector drops.
-                            let _ = input.release_all();
+                            input_suspended.store(true, Ordering::Release);
+                            release_input.notify_one();
                             let (reply, switched) = oneshot::channel();
                             capture_commands
                                 .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
@@ -2640,8 +2734,9 @@ async fn receive_input_and_control(
                                 .and_then(Result::ok)
                                 .unwrap_or(false)
                             {
-                                input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
+                                release_input.notify_one();
                             }
+                            input_suspended.store(false, Ordering::Release);
                         }
                         let active_display_id = lock_unpoisoned(&selected_desktop).display_id;
                         send_display_list(
@@ -2773,17 +2868,6 @@ async fn receive_input_and_control(
                     _ => {}
                 }
             }
-            result = client.next_input_for_generation(peer_generation) => {
-                let bytes = result?;
-                let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
-                if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
-                    input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
-                    let failure = apply_input_event(&mut input, event.clone());
-                    if let Some(reason) = input_restriction.observe(&event, failure) {
-                        input_state_updates.send_replace(reason);
-                    }
-                }
-            }
             reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
@@ -2869,8 +2953,7 @@ async fn receive_transfer_loop(
     peer_generation: u64,
 ) -> Result<(), HostRuntimeError> {
     let mut incoming = None;
-    let result =
-        receive_transfer_loop_inner(client, secure, peer_generation, &mut incoming).await;
+    let result = receive_transfer_loop_inner(client, secure, peer_generation, &mut incoming).await;
     if let Some(file) = incoming.take() {
         let _ = file.preserve().await;
     }
@@ -3128,12 +3211,17 @@ async fn receive_transfer_loop_inner(
                 offset,
                 bytes,
             } => {
-                let result = match incoming.as_mut().filter(|file| file.transfer_id() == transfer_id) {
+                let result = match incoming
+                    .as_mut()
+                    .filter(|file| file.transfer_id() == transfer_id)
+                {
                     Some(file) => file.write_chunk(offset, bytes).await,
                     None => Err(TransferResult::InvalidData),
                 };
                 if let Err(result) = result {
-                    if let Some(file) = incoming.take() { file.cancel(); }
+                    if let Some(file) = incoming.take() {
+                        file.cancel();
+                    }
                     send_transfer_response(
                         &client,
                         &secure,
@@ -3179,7 +3267,9 @@ async fn receive_transfer_loop_inner(
                     .as_ref()
                     .is_some_and(|file| file.transfer_id() == transfer_id)
                 {
-                    if let Some(file) = incoming.take() { file.cancel(); }
+                    if let Some(file) = incoming.take() {
+                        file.cancel();
+                    }
                 }
                 if outgoing
                     .as_ref()
@@ -3481,6 +3571,40 @@ mod retry_policy_tests {
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn slow_configuration_does_not_stop_input_and_release_consumption() {
+        let (sent, mut received) = tokio::sync::mpsc::channel(4);
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let input = async move {
+            wait_started.await.unwrap();
+            for expected in [1, 2, 3] {
+                let next =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), received.recv())
+                        .await
+                        .unwrap();
+                assert_eq!(next, Some(expected));
+            }
+            Ok(())
+        };
+        let control = async move {
+            started.send(()).unwrap();
+            for value in [1, 2, 3] {
+                sent.send(value).await.unwrap();
+            }
+            // Simulate a worker stalled for the full production reconfigure
+            // deadline. The input future must finish first without waiting.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            panic!("slow control completed before input was consumed");
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            super::run_inbound_lanes(input, control),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     #[test]

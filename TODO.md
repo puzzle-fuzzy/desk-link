@@ -147,6 +147,7 @@
 - [ ] 将持续输入受限转为独立会话状态，并补齐权限场景指引。
 - [x] 共享契约切片 `feat(DL2-009): add protocol 13 input restriction state`：唯一业务协议升至 13，末尾追加 InputState，三个稳定原因及 None 恢复；保留 relay JOIN 信封版本。协议/FFI 77 项、目录 6 项、Windows 原生升级提示 1 项测试通过，覆盖非法原因/截断、旧 tag、目录 12↔13 与密码先验、收到旧版 Noise/媒体拒绝。当前仅契约，未宣称输入反馈已接通。
 - [x] 输入反馈切片 `feat(DL2-009): report sustained input restrictions without disconnecting`：当前认证会话内按输入类别累计三次同因失败，去重发送有界最新状态；释放/零输入和其他类别成功不误清警，真实同类恢复后自动清除。发送等待独立于输入处理；控制端仅更新提示，不改连接状态，断开/新 stream 清旧提示。Windows 库 102 通过、1 交互桌面测试忽略；管理库 113 通过、1 签名资产忽略（含稳定 signal 回归）；前端 312 项全过，构建通过。权限边界见 `docs/windows-input-restriction-protocol13.md`，均未冒称真实 UAC/锁屏可控。
+- [x] 复用媒体组 `4dabcde` 的输入快路径切片，将输入限制 tracker 迁入 receive_host_input，保留独立有界反馈发送 future，慢配置不阻塞输入。整合后 Windows 库 107 通过、1 桌面忽略，管理库 123 通过、1 签名资产忽略；包含慢配置、输入反馈取消及结束控制回归。
 - [ ] 新旧直接/保存连接静默握手的有界退出与提示、持续输入失败汇总/恢复、前端提示及真实权限场景验收。
 - **证据 / 类型：源码缺陷、能力边界。** `apps/windows/src/input.rs:306-326` 返回 Blocked；`apps/windows/src/runtime.rs:2714-2723` 把 Blocked / UnsupportedKey / InvalidInput 都转为 Ok。`apps/windows/assets/desklink.manifest:8` 为 asInvoker、uiAccess=false。
 - **用户影响：** 输入持续失败时，控制端仍只看到已连接；无法区分权限限制、不支持的键或远端没有响应。
@@ -176,6 +177,10 @@
 - **用户影响：** 编码器繁忙或重建变慢时，切画质和自动调节会让键鼠等待同一循环返回。
 - **方案：** 带代数的异步配置请求与完成事件；合并过时请求，单独消费输入；ReleaseAll、取消和断开优先，配置完成不回写旧 stream。
 - **验收：** 注入 2～5 秒重配置延迟，键鼠和释放事件仍满足预算；无积压输入突然回放，无旧配置覆盖新选择。
+
+- [x] **已实现并自动验证（`fix(DL2-012): consume input independently from slow host controls`）：** peer内输入与控制改为两个并行且共同取消的future；重配5秒等待不再阻止输入解密/消费。显示切换独立通知释放，过渡期间丢弃坐标/按下事件而允许按键/鼠标释放；断开取消两条路径，不派生迟到输入任务。
+- **验证：** `test -p desklink-windows --lib slow_configuration --locked` 1通过，合成5秒控制等待期间输入/释放队列在250ms预算内完成；`clippy -p desklink-windows --lib --locked -- -D warnings`通过（均经scripts/run-windows-cargo.py）。
+- [ ] **仍待后续切片/实机：** 配置请求的独立代数/过时请求合并与原生延迟重配下键鼠p95/p99及旧配置覆盖回归；本提交关闭输入快路径隔离，不冒称完整控制编排已完成。
 
 ### DL2-013 · P1 · 连接中刷新显示拓扑并稳定识别屏幕
 
