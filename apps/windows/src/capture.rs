@@ -20,6 +20,25 @@ pub struct CapturedFrame {
     pub pixels: Vec<u8>,
 }
 
+/// CPU fallback and an owned GPU texture share capture timing and geometry;
+/// neither variant changes the session's input epoch or wire contracts.
+#[derive(Clone, Debug)]
+pub enum CaptureMediaFrame {
+    Cpu(CapturedFrame),
+    #[cfg(windows)]
+    Gpu(crate::gpu::GpuBgraFrame),
+}
+
+impl CaptureMediaFrame {
+    pub fn timestamp_us(&self) -> u64 {
+        match self {
+            Self::Cpu(frame) => frame.timestamp_us,
+            #[cfg(windows)]
+            Self::Gpu(frame) => frame.timestamp_us(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CaptureError {
     NoDisplay,
@@ -46,6 +65,8 @@ pub struct DxgiDesktopCapturer {
     initial_snapshot_pending: bool,
     dxgi_recovery: DxgiRecoverySchedule,
     readback: TextureReadback,
+    gpu_capture: Option<Result<crate::gpu::GpuBgraPool, ()>>,
+    last_gpu_frame: Option<crate::gpu::GpuBgraFrame>,
 }
 
 #[cfg(windows)]
@@ -289,41 +310,189 @@ impl DxgiDesktopCapturer {
         }
     }
 
+    pub fn next_media_frame(
+        &mut self,
+        timeout: Duration,
+        prefer_gpu: bool,
+    ) -> Result<CaptureMediaFrame, CaptureError> {
+        #[cfg(windows)]
+        {
+            self.next_frame_surface(timeout, prefer_gpu)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = prefer_gpu;
+            self.next_frame(timeout).map(CaptureMediaFrame::Cpu)
+        }
+    }
+
+    /// Called only after DXGI returned Idle. A cached owned image is current
+    /// while duplication reports no new desktop pixels. New capturers and
+    /// newer CPU frames invalidate it, preserving topology/epoch boundaries.
+    pub fn snapshot_media_frame(
+        &mut self,
+        prefer_gpu: bool,
+    ) -> Result<CaptureMediaFrame, CaptureError> {
+        #[cfg(windows)]
+        if prefer_gpu && let Some(frame) = &self.last_gpu_frame {
+            return Ok(CaptureMediaFrame::Gpu(frame.with_timestamp(now_micros())));
+        }
+        #[cfg(not(windows))]
+        let _ = prefer_gpu;
+        self.snapshot_frame().map(CaptureMediaFrame::Cpu)
+    }
+
+    #[cfg(windows)]
+    fn next_frame_surface(
+        &mut self,
+        timeout: Duration,
+        prefer_gpu: bool,
+    ) -> Result<CaptureMediaFrame, CaptureError> {
+        use windows::Win32::Graphics::{
+            Direct3D11::ID3D11Texture2D,
+            Dxgi::{DXGI_OUTDUPL_FRAME_INFO, IDXGIResource},
+        };
+        use windows::core::Interface;
+
+        if timeout.is_zero() {
+            return Err(CaptureError::Timeout);
+        }
+        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        if matches!(&self.backend, WindowsCaptureBackend::Gdi) {
+            if let Some(frame) = self.try_restore_dxgi() {
+                return Ok(CaptureMediaFrame::Cpu(frame));
+            }
+            std::thread::sleep(timeout.min(Duration::from_millis(33)));
+            return capture_gdi_frame(self.desktop_rect).map(CaptureMediaFrame::Cpu);
+        }
+        let WindowsCaptureBackend::Dxgi(duplication) = &self.backend else {
+            unreachable!()
+        };
+        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut resource: Option<IDXGIResource> = None;
+        let acquired =
+            unsafe { duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource) };
+        if let Err(error) = acquired {
+            if error.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT
+                && self.initial_snapshot_pending
+            {
+                // DXGI emits no frame until the desktop changes. Take a
+                // single GDI snapshot for the initial keyframe, then
+                // return to the low-overhead duplication path.
+                self.initial_snapshot_pending = false;
+                return capture_gdi_frame(self.desktop_rect).map(CaptureMediaFrame::Cpu);
+            }
+            return Err(map_dxgi_error(error));
+        }
+        self.initial_snapshot_pending = false;
+
+        // Only a process-owned destination whose copy fence completed may
+        // escape Acquire/Release. GPU failure reads the same source on the CPU
+        // before ReleaseFrame, and never publishes a quarantined GPU slot.
+        let captured = resource
+            .ok_or_else(|| CaptureError::Native("DXGI returned no desktop resource".into()))
+            .and_then(|resource| resource.cast::<ID3D11Texture2D>().map_err(native_error))
+            .and_then(|texture| {
+                let timestamp_us = now_micros();
+                if prefer_gpu {
+                    let pool = self.gpu_capture.get_or_insert_with(|| {
+                        let device = unsafe { texture.GetDevice() }.map_err(|_| ())?;
+                        crate::gpu::GpuBgraPool::from_device(
+                            device,
+                            self.dimensions.0,
+                            self.dimensions.1,
+                            4,
+                        )
+                        .map_err(|_| ())
+                    });
+                    if let Ok(pool) = pool
+                        && let Ok(frame) = pool.copy_from(&texture, timestamp_us)
+                    {
+                        self.last_gpu_frame = Some(frame.clone());
+                        return Ok(CaptureMediaFrame::Gpu(frame));
+                    }
+                }
+                // A newer CPU image supersedes the cache as well. An idle IDR
+                // must never reuse an older GPU image after a failed copy.
+                self.last_gpu_frame = None;
+                self.readback
+                    .copy_pixels(&texture, self.dimensions.0, self.dimensions.1)
+                    .map(|pixels| {
+                        CaptureMediaFrame::Cpu(CapturedFrame {
+                            width: self.dimensions.0,
+                            height: self.dimensions.1,
+                            timestamp_us,
+                            pixels,
+                        })
+                    })
+            });
+        let release_result = unsafe { duplication.ReleaseFrame() };
+        let captured = captured?;
+        release_result.map_err(map_dxgi_error)?;
+        Ok(captured)
+    }
+
+    #[cfg(windows)]
+    fn create_dxgi_device(
+        adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Device, CaptureError> {
+        use windows::{
+            Win32::{
+                Foundation::HMODULE,
+                Graphics::{
+                    Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL},
+                    Direct3D11::{
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                        D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
+                    },
+                },
+            },
+            core::Interface,
+        };
+        // Older/virtual adapters may support duplication without video APIs.
+        // Preserve that CPU path if VIDEO_SUPPORT device creation is rejected.
+        for flags in [
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        ] {
+            let mut device: Option<ID3D11Device> = None;
+            if unsafe {
+                D3D11CreateDevice(
+                    adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    flags,
+                    None::<&[D3D_FEATURE_LEVEL]>,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    None,
+                )
+            }
+            .is_ok()
+            {
+                let device = device
+                    .ok_or_else(|| CaptureError::Native("D3D11 device was not created".into()))?;
+                if let Ok(context) = unsafe { device.GetImmediateContext() }
+                    && let Ok(multithread) = context.cast::<ID3D11Multithread>()
+                {
+                    let _ = unsafe { multithread.SetMultithreadProtected(true) };
+                }
+                return Ok(device);
+            }
+        }
+        Err(CaptureError::Native(
+            "D3D11 capture device creation failed".into(),
+        ))
+    }
+
     #[cfg(windows)]
     fn new_dxgi_primary() -> Result<Self, CaptureError> {
-        use windows::Win32::Foundation::HMODULE;
-        use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL};
-        use windows::Win32::Graphics::Direct3D11::{
-            D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
-        };
         use windows::Win32::Graphics::Dxgi::IDXGIOutput1;
         use windows::core::Interface;
 
-        let (display_id, adapter, output, description, device) = unsafe {
-            let (display_id, adapter, output, description) = find_primary_output()?;
-            let mut device: Option<ID3D11Device> = None;
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_FLAG(0),
-                None::<&[D3D_FEATURE_LEVEL]>,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )
-            .map_err(native_error)?;
-            (
-                display_id,
-                adapter,
-                output,
-                description,
-                device
-                    .ok_or_else(|| CaptureError::Native("D3D11 device was not created".into()))?,
-            )
-        };
-        let _ = adapter;
+        let (display_id, adapter, output, description) = unsafe { find_primary_output()? };
+        let device = Self::create_dxgi_device(&adapter)?;
         let output1: IDXGIOutput1 = output.cast().map_err(native_error)?;
         let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(native_error)?;
         let width =
@@ -346,37 +515,18 @@ impl DxgiDesktopCapturer {
             initial_snapshot_pending: true,
             dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
             readback: TextureReadback::default(),
+            gpu_capture: None,
+            last_gpu_frame: None,
         })
     }
 
     #[cfg(windows)]
     fn new_dxgi_display(display_id: u32) -> Result<Self, CaptureError> {
-        use windows::Win32::Foundation::HMODULE;
-        use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL};
-        use windows::Win32::Graphics::Direct3D11::{
-            D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
-        };
         use windows::Win32::Graphics::Dxgi::IDXGIOutput1;
         use windows::core::Interface;
 
         let (adapter, output, description) = unsafe { find_display_output(display_id)? };
-        let mut device: Option<ID3D11Device> = None;
-        unsafe {
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_FLAG(0),
-                None::<&[D3D_FEATURE_LEVEL]>,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )
-        }
-        .map_err(native_error)?;
-        let device =
-            device.ok_or_else(|| CaptureError::Native("D3D11 device was not created".into()))?;
+        let device = Self::create_dxgi_device(&adapter)?;
         let output1: IDXGIOutput1 = output.cast().map_err(native_error)?;
         let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(native_error)?;
         let width =
@@ -399,6 +549,8 @@ impl DxgiDesktopCapturer {
             initial_snapshot_pending: true,
             dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
             readback: TextureReadback::default(),
+            gpu_capture: None,
+            last_gpu_frame: None,
         })
     }
 
@@ -427,6 +579,8 @@ impl DxgiDesktopCapturer {
             initial_snapshot_pending: false,
             dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
             readback: TextureReadback::default(),
+            gpu_capture: None,
+            last_gpu_frame: None,
         })
     }
 
@@ -690,63 +844,12 @@ impl DesktopCapturer for DxgiDesktopCapturer {
     fn next_frame(&mut self, timeout: Duration) -> Result<CapturedFrame, CaptureError> {
         #[cfg(windows)]
         {
-            use windows::Win32::Graphics::{
-                Direct3D11::ID3D11Texture2D,
-                Dxgi::{DXGI_OUTDUPL_FRAME_INFO, IDXGIResource},
-            };
-            use windows::core::Interface;
-
-            if timeout.is_zero() {
-                return Err(CaptureError::Timeout);
-            }
-            let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-            if matches!(&self.backend, WindowsCaptureBackend::Gdi) {
-                if let Some(frame) = self.try_restore_dxgi() {
-                    return Ok(frame);
+            match self.next_frame_surface(timeout, false)? {
+                CaptureMediaFrame::Cpu(frame) => Ok(frame),
+                CaptureMediaFrame::Gpu(_) => {
+                    unreachable!("CPU capture cannot return a GPU surface")
                 }
-                std::thread::sleep(timeout.min(Duration::from_millis(33)));
-                return capture_gdi_frame(self.desktop_rect);
             }
-            let WindowsCaptureBackend::Dxgi(duplication) = &self.backend else {
-                unreachable!()
-            };
-            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource: Option<IDXGIResource> = None;
-            let acquired =
-                unsafe { duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource) };
-            if let Err(error) = acquired {
-                if error.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT
-                    && self.initial_snapshot_pending
-                {
-                    // DXGI emits no frame until the desktop changes. Take a
-                    // single GDI snapshot for the initial keyframe, then
-                    // return to the low-overhead duplication path.
-                    self.initial_snapshot_pending = false;
-                    return capture_gdi_frame(self.desktop_rect);
-                }
-                return Err(map_dxgi_error(error));
-            }
-            self.initial_snapshot_pending = false;
-
-            // The desktop-duplication surface is only valid until ReleaseFrame. Copy it to
-            // process-owned memory before releasing it; retaining the COM texture and reading it
-            // later works on some drivers but produces invalid frames or device errors on others.
-            let pixels = resource
-                .ok_or_else(|| CaptureError::Native("DXGI returned no desktop resource".into()))
-                .and_then(|resource| resource.cast::<ID3D11Texture2D>().map_err(native_error))
-                .and_then(|texture| {
-                    self.readback
-                        .copy_pixels(&texture, self.dimensions.0, self.dimensions.1)
-                });
-            let release_result = unsafe { duplication.ReleaseFrame() };
-            let pixels = pixels?;
-            release_result.map_err(map_dxgi_error)?;
-            Ok(CapturedFrame {
-                width: self.dimensions.0,
-                height: self.dimensions.1,
-                timestamp_us: now_micros(),
-                pixels,
-            })
         }
 
         #[cfg(not(windows))]

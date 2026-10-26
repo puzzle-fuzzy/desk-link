@@ -20,6 +20,8 @@ pub mod encoder;
 pub mod fixed_access;
 #[cfg(windows)]
 pub mod identity;
+#[cfg(windows)]
+pub mod gpu;
 pub mod input;
 #[cfg(windows)]
 pub mod recent_access;

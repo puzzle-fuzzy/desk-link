@@ -271,10 +271,14 @@
 
 - [x] **已实现并自动验证（`perf(DL2-015): reuse owned staging textures for desktop readback`）：** 捕获进程持有staging/context缓存，以D3D device身份和完整texture布局失效；Map/复制/Unmap在ReleaseFrame前完成，不保留失效桌面surface。
 - **验证：** `test -p desklink-windows --lib --locked capture::` 10通过、2忽略；3个WARP合成用例验证复用后新像素、尺寸/device失效、row pitch/padding；显式dev WARP基准1通过、staging创建60→1。命令与release复跑规范见 `docs/windows-capture-readback-benchmark.md`。上述是软件D3D工具/正确性验证，不代表真实GPU收益；CPU回读字节不变。
-- [ ] **仍待实现/硬件验收：** GPU缩放/转色/NV12 surface编码链、CPU捕获输出buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照。
+- [ ] **仍待整链/完整硬件验收：** GPU surface编码链、CPU捕获输出buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照；owned池/缩放转色进展见第二波完成项。
 
 - [x] **转换buffer切片（`perf(DL2-015): reuse encoder NV12 scratch buffers`）：** 生产编码器复用NV12 Vec，新增checked `convert_to_nv12_into`，保留原分配API；1:1转换不再为x/y索引建临时Vec。基线工具支持 `--reuse-buffer` 并记录增长次数，GPU与CPU输入复制未改变。
 - **验证：** 新buffer 3项、原encoder_contract 11项、backend 3项、percentile 1项通过，严格Clippy通过；显式release `--test encoder_buffers conversion_buffer_reuse_release_baseline -- --ignored --nocapture` 1通过。30样本/API、5次预热，同进程1080p分配/复用p50=4.8271/4.3698ms、p95=4.9710/4.4706ms、p99=5.0626/4.8022ms；1440p p50=8.6875/7.8823ms、p95=8.9543/8.0388ms、p99=9.0792/8.2324ms；预热后buffer增长0。仅为本机CPU转换API对照，非旧commit/真实GPU/端到端收益。
+
+- [x] **第二波owned GPU池与转色（`feat(DL2-015): add bounded owned GPU surfaces and NV12 processing`）：** GPU-only BGRA复制及VideoProcessor缩放/BT709 limited→NV12，普通路径无Map；Capture提供新CPU/GPU入口且保留旧CPU API。复制EVENT完成后才交付并ReleaseFrame；Clone共享lease，NV12独占lease供后续TrackedSample持有；超时/未完成fence隔离槽位。全进程64槽/512MiB逻辑图像字节预算跨pool换代计数，不能用丢旧pool逃逸预算。失败可对同一Acquire源完成CPU读回，新CPU帧清旧GPUcache；确认Idle后才允许缓存owned图像恢复IDR。
+- **验证：** 基于65c70fd归档加本切片4源码文件的独立快照（隔离并行016 WIP）原生GPU测试7通过：3个纯内存/状态用例+4个本机RTX4070TiSUPER合成纹理用例，覆盖source销毁、Clone占用/池满、709limited缩放色值、NV12跨pool存活、invalid/pending EVENT禁止复用、跨代64槽上限；独立快照完整lib 204通过/6忽略、lib/tests严格Clippy及定向格式检查通过。没有采集真实桌面、未推定MFT接受surface或实际编码成功。结构/命令/计量边界见docs/windows-gpu-media.md。
+- [ ] **后续仍待：** runtime GPU选路和D3D11-aware MFT surface输入见016后续切片；CPU输出buffer池、1080p/1440p集显/独显/混合GPU及真实DXGI/双机/驱动恢复矩阵与性能仍未完成。本切片不单独宣称生产GPU常驻或性能收益。
 
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
