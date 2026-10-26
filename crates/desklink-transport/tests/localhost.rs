@@ -853,6 +853,85 @@ async fn input_flood_does_not_starve_control_delivery() {
 }
 
 #[tokio::test]
+async fn pausing_transfer_ingress_keeps_media_and_control_live_then_restores_transfer_order() {
+    let relay = spawn_mock_relay(false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    client.send_transfer(vec![0xa1]).await.unwrap();
+    // Exercise the awaiting receive path as well as the already-buffered scan:
+    // an arriving transfer must remain unread while that lane is paused.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            client.next_event_with_transfer(false)
+        )
+        .await
+        .is_err()
+    );
+    client.send_transfer(vec![0xa2]).await.unwrap();
+    client.send_control(vec![0xc1]).await.unwrap();
+    client.send_input(vec![0x11]).await.unwrap();
+    client.send_video_datagram(vec![0x71]).await.unwrap();
+    client.send_audio_datagram(vec![0x81]).await.unwrap();
+    let mut control = false;
+    let mut input = false;
+    let mut video = false;
+    let mut audio = false;
+    for _ in 0..12 {
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_event_with_transfer(false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match event {
+            TransportEvent::Control(bytes) => {
+                assert_eq!(bytes, [0xc1]);
+                control = true;
+            }
+            TransportEvent::Input(bytes) => {
+                assert_eq!(bytes, [0x11]);
+                input = true;
+            }
+            TransportEvent::VideoDatagram(bytes) => {
+                assert_eq!(bytes, [0x71]);
+                video = true;
+            }
+            TransportEvent::AudioDatagram(bytes) => {
+                assert_eq!(bytes, [0x81]);
+                audio = true;
+            }
+            TransportEvent::PeerDisconnected { .. } => {} // This echo fixture finishes each message stream.
+            other => panic!("paused transfer displaced a live media/control lane: {other:?}"),
+        }
+        if control && input && video && audio {
+            break;
+        }
+    }
+    assert!(control && input && video && audio);
+    let mut transfers = Vec::new();
+    for _ in 0..12 {
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_event_with_transfer(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match event {
+            TransportEvent::Transfer(bytes) => transfers.push(bytes),
+            TransportEvent::PeerDisconnected { .. } => {}
+            other => panic!("unexpected event while resuming transfer: {other:?}"),
+        }
+        if transfers.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(transfers, [vec![0xa1], vec![0xa2]]);
+}
+
+#[tokio::test]
 async fn empty_reliable_stream_emits_a_closed_event() {
     let relay = spawn_peer_relay_with_reliable_prefix(Vec::new()).await;
     let client = QuicClient::connect(config(&relay)).await.unwrap();

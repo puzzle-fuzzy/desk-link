@@ -22,8 +22,8 @@ use apps_windows::{
     identity::WindowsIdentityStore,
     recent_access::{RecentAccessEntry, WindowsRecentAccessError, WindowsRecentAccessStore},
     transfer::{
-        IncomingFile, OutgoingFile, chunk_after_resume, discard_incoming_resume,
-        prepare_outgoing_file, verify_resume_prefix,
+        OutgoingFile, chunk_after_resume, discard_incoming_resume, prepare_outgoing_file,
+        verify_resume_prefix,
     },
     transfer_recovery::{
         MAX_FILE_QUEUE_RECOVERY_ITEMS, TransferQueueRecovery, TransferRecoveryAction,
@@ -57,6 +57,12 @@ use zeroize::Zeroize;
 use crate::video_mailbox::{
     ControllerVideoMailbox, VideoDeliveryFrame, VideoMailboxKey, VideoMailboxMetrics,
     VideoMailboxOffer,
+};
+
+#[path = "controller-incoming-file.rs"]
+mod incoming_file;
+use incoming_file::{
+    INCOMING_EVENT_CAPACITY, IncomingFileEvent, IncomingFileEventKind, IncomingFilePipeline,
 };
 
 const COMMAND_CAPACITY: usize = 512;
@@ -719,36 +725,16 @@ struct OutgoingTransfer {
 }
 
 struct IncomingTransfer {
-    file: IncomingFile,
+    file: IncomingFilePipeline,
+    ticket: u64,
+    opened: bool,
+    finishing: bool,
+    received_offset: u64,
+    pending_writes: usize,
     name: String,
     size: u64,
     transferred: u64,
     last_activity: Instant,
-}
-
-#[derive(Default)]
-struct ResumableIncomingTransfer(Option<IncomingTransfer>);
-
-impl std::ops::Deref for ResumableIncomingTransfer {
-    type Target = Option<IncomingTransfer>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ResumableIncomingTransfer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for ResumableIncomingTransfer {
-    fn drop(&mut self) {
-        if let Some(transfer) = self.0.take() {
-            let _ = transfer.file.preserve();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2578,7 +2564,10 @@ async fn run_controller(
             .unwrap_or_else(Instant::now);
         let mut next_transfer_request_id = 1_u64;
         let mut outgoing: Option<OutgoingTransfer> = None;
-        let mut incoming = ResumableIncomingTransfer::default();
+        let mut incoming: Option<IncomingTransfer> = None;
+        let mut next_incoming_ticket = 1_u64;
+        let (incoming_file_events, mut pending_incoming_file_events) =
+            mpsc::channel::<IncomingFileEvent>(INCOMING_EVENT_CAPACITY);
         let mut pending_remote_file_request: Option<PendingRemoteFileRequest> = None;
         let mut pending_clipboard: Option<PendingClipboardOperation> = None;
         let mut audio_decoder = ControllerAudioDecoder::new();
@@ -3019,8 +3008,10 @@ async fn run_controller(
                                 );
                             }
                         } else if let Some(transfer) = incoming.take() {
+                            let transfer_id = transfer.file.transfer_id();
+                            transfer.file.cancel();
                             let _ = runtime.send_transfer(TransferMessage::Cancel {
-                                transfer_id: transfer.file.transfer_id(),
+                                transfer_id,
                             }).await;
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "cancelled",
@@ -3028,7 +3019,7 @@ async fn run_controller(
                                 name: transfer.name,
                                 transferred: transfer.transferred,
                                 total: transfer.size,
-                                message: "文件接收已取消，未完成的临时文件已删除。".to_owned(),
+                                message: "文件接收已取消；进行中的磁盘操作返回后会清理临时文件。".to_owned(),
                             });
                         } else if let Some(request) = pending_remote_file_request.take() {
                             let _ = runtime.send_transfer(
@@ -3058,7 +3049,76 @@ async fn run_controller(
                         return;
                     }
                 },
-                event = runtime.next_event() => match event {
+                Some(event) = pending_incoming_file_events.recv() => {
+                    if !manager.is_current(generation) || !incoming.as_ref().is_some_and(|transfer| transfer.ticket == event.ticket) {
+                        continue;
+                    }
+                    match event.kind {
+                        IncomingFileEventKind::Opened { offset, prefix_hash } => {
+                            let transfer = incoming.as_mut().expect("matched incoming ticket");
+                            transfer.opened = true;
+                            transfer.received_offset = offset;
+                            transfer.transferred = offset;
+                            transfer.last_activity = Instant::now();
+                            let transfer_id = transfer.file.transfer_id();
+                            if let Err(error) = runtime.send_transfer(TransferMessage::FileDecision {
+                                transfer_id, result: TransferResult::Completed,
+                                resume_offset: offset, resume_prefix_hash: prefix_hash,
+                            }).await { break ConnectFailure::from_controller(error); }
+                            let _ = manager.remember_last_file_action(LastFileAction::download(host_device_id, Some(FileResumeHint {
+                                transfer_id, name: transfer.name.clone(), size: transfer.size,
+                            })));
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "receiving", direction: "download", name: transfer.name.clone(),
+                                transferred: offset, total: transfer.size,
+                                message: format!("正在接收远端文件… {}%", transfer_percent(offset, transfer.size)),
+                            });
+                        }
+                        IncomingFileEventKind::Written { transferred } => {
+                            let transfer = incoming.as_mut().expect("matched incoming ticket");
+                            transfer.transferred = transferred;
+                            transfer.pending_writes = transfer.pending_writes.saturating_sub(1);
+                            transfer.last_activity = Instant::now();
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: if transfer.finishing { "verifying" } else { "receiving" }, direction: "download", name: transfer.name.clone(),
+                                transferred, total: transfer.size,
+                                message: if transfer.finishing { "正在写入并校验文件…".to_owned() }
+                                    else { format!("正在接收… {}%", transfer_percent(transferred, transfer.size)) },
+                            });
+                        }
+                        IncomingFileEventKind::Finished { path } => {
+                            let transfer = incoming.take().expect("matched incoming ticket");
+                            let transfer_id = transfer.file.transfer_id();
+                            tauri::async_runtime::spawn_blocking(move || apps_windows::transfer::notify_file_received(&path));
+                            if let Err(error) = runtime.send_transfer(TransferMessage::FileResult {
+                                transfer_id, result: TransferResult::Completed,
+                            }).await { break ConnectFailure::from_controller(error); }
+                            manager.clear_last_file_action();
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "completed", direction: "download", name: transfer.name,
+                                transferred: transfer.size, total: transfer.size,
+                                message: "文件已校验并保存到本机的“下载”文件夹。".to_owned(),
+                            });
+                        }
+                        IncomingFileEventKind::Failed(result) => {
+                            let transfer = incoming.take().expect("matched incoming ticket");
+                            let transfer_id = transfer.file.transfer_id();
+                            let response = if transfer.opened {
+                                TransferMessage::FileResult { transfer_id, result }
+                            } else {
+                                TransferMessage::FileDecision { transfer_id, result, resume_offset: 0, resume_prefix_hash: None }
+                            };
+                            transfer.file.cancel();
+                            if let Err(error) = runtime.send_transfer(response).await { break ConnectFailure::from_controller(error); }
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed", direction: "download", name: transfer.name,
+                                transferred: transfer.transferred, total: transfer.size,
+                                message: transfer_result_message(result).to_owned(),
+                            });
+                        }
+                    }
+                }
+                event = runtime.next_event_with_transfer(incoming.as_ref().is_none_or(|transfer| transfer.file.can_receive())) => match event {
                     Ok(ControllerEvent::VideoConfig(config)) => {
                         if !stable {
                             record_controller_diagnostic(
@@ -3305,176 +3365,71 @@ async fn run_controller(
                                 }
                                 continue;
                             }
-                            let incoming_file = tauri::async_runtime::spawn_blocking({
-                                let name = name.clone();
-                                move || IncomingFile::create(transfer_id, name, size)
-                            }).await.unwrap_or(Err(TransferResult::IoFailed));
-                            let (result, resume_offset, resume_prefix_hash, mut staged) =
-                                match incoming_file {
-                                Ok(file) => {
-                                    let resume_offset = file.resume_offset();
-                                    let resume_prefix_hash = file.resume_prefix_hash();
-                                    (
-                                        TransferResult::Completed,
-                                        resume_offset,
-                                        resume_prefix_hash,
-                                        ResumableIncomingTransfer(Some(IncomingTransfer {
-                                            file,
-                                            name: name.clone(),
-                                            size,
-                                            transferred: resume_offset,
-                                            last_activity: Instant::now(),
-                                        })),
-                                    )
-                                }
-                                Err(result) => {
-                                    (result, 0, None, ResumableIncomingTransfer::default())
-                                }
-                            };
-                            if let Err(error) = runtime.send_transfer(
-                                TransferMessage::FileDecision {
-                                    transfer_id,
-                                    result,
-                                    resume_offset,
-                                    resume_prefix_hash,
-                                },
-                            ).await {
-                                break ConnectFailure::from_controller(error);
-                            }
-                            match staged.take() {
-                                Some(transfer) => {
-                                    let _ = manager.remember_last_file_action(
-                                        LastFileAction::download(host_device_id, Some(FileResumeHint {
-                                            transfer_id,
-                                            name: name.clone(),
-                                            size,
-                                        })),
-                                    );
-                                    let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "receiving",
-                                        direction: "download",
-                                        name: name.clone(),
-                                        transferred: resume_offset,
-                                        total: size,
-                                        message: if resume_offset == 0 {
-                                            "正在接收远端文件… 0%".to_owned()
-                                        } else {
-                                            format!(
-                                                "从 {}% 继续接收远端文件…",
-                                                transfer_percent(resume_offset, size)
-                                            )
-                                        },
-                                    });
-                                    *incoming = Some(transfer);
-                                }
-                                None => {
-                                    let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "failed",
-                                        direction: "download",
-                                        name,
-                                        transferred: 0,
-                                        total: size,
-                                        message: transfer_result_message(result).to_owned(),
-                                    });
-                                }
-                            }
+                            let ticket = next_incoming_ticket;
+                            next_incoming_ticket = next_incoming_ticket.wrapping_add(1).max(1);
+                            incoming = Some(IncomingTransfer {
+                                file: IncomingFilePipeline::start(transfer_id, ticket, name.clone(), size, incoming_file_events.clone()),
+                                ticket, opened: false, finishing: false, received_offset: 0, pending_writes: 0,
+                                name, size, transferred: 0, last_activity: Instant::now(),
+                            });
                         }
                         TransferMessage::FileChunk { transfer_id, offset, bytes } => {
-                            let result = incoming
-                                .as_mut()
-                                .filter(|transfer| transfer.file.transfer_id() == transfer_id)
+                            let result = incoming.as_mut()
+                                .filter(|transfer| transfer.file.transfer_id() == transfer_id && transfer.opened && !transfer.finishing)
                                 .ok_or(TransferResult::InvalidData)
                                 .and_then(|transfer| {
-                                    transfer.file.write_chunk(offset, &bytes)?;
-                                    transfer.transferred = offset.saturating_add(bytes.len() as u64);
+                                    let end = offset.checked_add(bytes.len() as u64).ok_or(TransferResult::InvalidData)?;
+                                    if offset != transfer.received_offset || end > transfer.size { return Err(TransferResult::InvalidData); }
+                                    transfer.file.write_chunk(offset, bytes)?;
+                                    transfer.received_offset = end;
+                                    transfer.pending_writes += 1;
                                     transfer.last_activity = Instant::now();
-                                    Ok((
-                                        transfer.name.clone(),
-                                        transfer.transferred,
-                                        transfer.size,
-                                    ))
+                                    Ok(())
                                 });
-                            match result {
-                                Ok((name, transferred, total)) => {
+                            if let Err(result) = result {
+                                let failed = if incoming.as_ref().is_some_and(|transfer| transfer.file.transfer_id() == transfer_id) { incoming.take() } else { None };
+                                if let Some(transfer) = failed.as_ref() {
                                     let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "receiving",
-                                        direction: "download",
-                                        name,
-                                        transferred,
-                                        total,
-                                        message: format!(
-                                            "正在接收… {}%",
-                                            transfer_percent(transferred, total)
-                                        ),
-                                    });
-                                }
-                                Err(result) => {
-                                    let failed = incoming.take();
-                                    if let Err(error) = runtime.send_transfer(
-                                        TransferMessage::FileResult { transfer_id, result },
-                                    ).await {
-                                        break ConnectFailure::from_controller(error);
-                                    }
-                                    let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "failed",
-                                        direction: "download",
-                                        name: failed.as_ref().map(|item| item.name.clone())
-                                            .unwrap_or_else(|| "远端文件".to_owned()),
-                                        transferred: failed.as_ref().map_or(0, |item| item.transferred),
-                                        total: failed.as_ref().map_or(0, |item| item.size),
+                                        state: "failed", direction: "download", name: transfer.name.clone(),
+                                        transferred: transfer.transferred, total: transfer.size,
                                         message: transfer_result_message(result).to_owned(),
                                     });
+                                }
+                                if let Some(transfer) = failed { transfer.file.cancel(); }
+                                if let Err(error) = runtime.send_transfer(TransferMessage::FileResult { transfer_id, result }).await {
+                                    break ConnectFailure::from_controller(error);
                                 }
                             }
                         }
                         TransferMessage::FileComplete { transfer_id, content_hash } => {
-                            let transfer = incoming.take();
-                            let (name, size, result) = match transfer {
-                                Some(transfer) if transfer.file.transfer_id() == transfer_id => {
-                                    let name = transfer.name;
-                                    let size = transfer.size;
-                                    let result = tauri::async_runtime::spawn_blocking(move || {
-                                        transfer.file.finish(content_hash)
-                                    }).await.unwrap_or(Err(TransferResult::IoFailed));
-                                    (name, size, result)
-                                }
-                                Some(transfer) => {
-                                    *incoming = Some(transfer);
-                                    ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData))
-                                }
-                                None => ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData)),
-                            };
-                            let transfer_result = match result {
-                                Ok(path) => {
-                                    tauri::async_runtime::spawn_blocking(move || {
-                                        apps_windows::transfer::notify_file_received(&path)
+                            let result = incoming.as_mut()
+                                .filter(|transfer| transfer.file.transfer_id() == transfer_id && transfer.opened && !transfer.finishing)
+                                .ok_or(TransferResult::InvalidData)
+                                .and_then(|transfer| {
+                                    if transfer.received_offset != transfer.size { return Err(TransferResult::InvalidData); }
+                                    transfer.file.finish(content_hash)?;
+                                    transfer.finishing = true;
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "verifying", direction: "download", name: transfer.name.clone(),
+                                        transferred: transfer.transferred, total: transfer.size,
+                                        message: "正在写入并校验文件…".to_owned(),
                                     });
-                                    TransferResult::Completed
+                                    Ok(())
+                                });
+                            if let Err(result) = result {
+                                if incoming.as_ref().is_some_and(|transfer| transfer.file.transfer_id() == transfer_id)
+                                    && let Some(transfer) = incoming.take() {
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "failed", direction: "download", name: transfer.name,
+                                        transferred: transfer.transferred, total: transfer.size,
+                                        message: transfer_result_message(result).to_owned(),
+                                    });
+                                    transfer.file.cancel();
                                 }
-                                Err(result) => result,
-                            };
-                            if let Err(error) = runtime.send_transfer(TransferMessage::FileResult {
-                                transfer_id,
-                                result: transfer_result,
-                            }).await {
-                                break ConnectFailure::from_controller(error);
+                                if let Err(error) = runtime.send_transfer(TransferMessage::FileResult { transfer_id, result }).await {
+                                    break ConnectFailure::from_controller(error);
+                                }
                             }
-                            let completed = transfer_result == TransferResult::Completed;
-                            if completed {
-                                manager.clear_last_file_action();
-                            }
-                            let _ = signals.send(ControllerSignal::FileTransfer {
-                                state: if completed { "completed" } else { "failed" },
-                                direction: "download",
-                                name,
-                                transferred: if completed { size } else { 0 },
-                                total: size,
-                                message: if completed {
-                                    "文件已保存到本机的“下载”文件夹。"
-                                } else {
-                                    transfer_result_message(transfer_result)
-                                }.to_owned(),
-                            });
                         }
                         TransferMessage::FileDecision {
                             transfer_id,
@@ -3582,6 +3537,7 @@ async fn run_controller(
                                 transfer.file.transfer_id() == transfer_id
                             }) {
                                 let transfer = incoming.take().expect("checked incoming transfer");
+                                transfer.file.cancel();
                                 let _ = signals.send(ControllerSignal::FileTransfer {
                                     state: "failed",
                                     direction: "download",
@@ -3620,6 +3576,7 @@ async fn run_controller(
                                 transfer.file.transfer_id() == transfer_id
                             }) {
                                 let transfer = incoming.take().expect("checked incoming transfer");
+                                transfer.file.cancel();
                                 let _ = signals.send(ControllerSignal::FileTransfer {
                                     state: "cancelled",
                                     direction: "download",
@@ -3715,11 +3672,14 @@ async fn run_controller(
                         });
                     }
                     if incoming.as_ref().is_some_and(|transfer| {
-                        now.duration_since(transfer.last_activity) >= FILE_RECEIVE_IDLE_TIMEOUT
+                        transfer.pending_writes == 0 && !transfer.finishing
+                            && now.duration_since(transfer.last_activity) >= FILE_RECEIVE_IDLE_TIMEOUT
                     }) {
                         let transfer = incoming.take().expect("checked incoming file deadline");
+                        let transfer_id = transfer.file.transfer_id();
+                        transfer.file.cancel();
                         let _ = runtime.send_transfer(TransferMessage::Cancel {
-                            transfer_id: transfer.file.transfer_id(),
+                            transfer_id,
                         }).await;
                         let _ = signals.send(ControllerSignal::FileTransfer {
                             state: "failed",
@@ -3727,7 +3687,7 @@ async fn run_controller(
                             name: transfer.name,
                             transferred: transfer.transferred,
                             total: transfer.size,
-                            message: "连续 60 秒未收到新的文件数据，已取消接收并删除临时文件。".to_owned(),
+                            message: "连续 60 秒未收到新的文件数据，已取消接收；临时文件会在后台清理。".to_owned(),
                         });
                     }
                     if outgoing.as_ref().is_some_and(|transfer| {
@@ -3872,21 +3832,14 @@ async fn run_controller(
             let name = transfer.name;
             let transferred = transfer.transferred;
             let total = transfer.size;
-            let preserved = tauri::async_runtime::spawn_blocking(move || transfer.file.preserve())
-                .await
-                .is_ok_and(|result| result.is_ok());
+            drop(transfer.file);
             let _ = signals.send(ControllerSignal::FileTransfer {
                 state: "failed",
                 direction: "download",
                 name,
                 transferred,
                 total,
-                message: if preserved {
-                    "连接中断，已保留接收进度；连接恢复后点击重试即可继续。"
-                } else {
-                    "连接中断，且无法安全保留接收进度；请重新获取文件。"
-                }
-                .to_owned(),
+                message: "连接中断，正在后台保留接收进度；连接恢复后可重试。".to_owned(),
             });
         } else if pending_remote_file_request.take().is_some() {
             let _ = signals.send(ControllerSignal::FileTransfer {
@@ -4960,6 +4913,7 @@ mod tests {
     use desklink_transport::{JoinRejectCode, TransportError};
 
     use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
+
 
     fn file_target_fixture() -> (
         ControllerManager,
@@ -6239,4 +6193,5 @@ mod tests {
             );
         }
     }
+
 }

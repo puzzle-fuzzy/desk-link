@@ -388,6 +388,13 @@ impl ControllerRuntime {
     }
 
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
+        self.next_event_with_transfer(true).await
+    }
+
+    pub async fn next_event_with_transfer(
+        &mut self,
+        include_transfer: bool,
+    ) -> Result<ControllerEvent, ControllerError> {
         loop {
             if self.video_config.is_some()
                 && let Some(ciphertext) = self.pending_video_reliable.pop_front()
@@ -408,7 +415,7 @@ impl ControllerRuntime {
             let transport_event = if let Some(deadline) = self.keyframe_fallback_deadline {
                 match tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
-                    self.next_transport_event(),
+                    self.next_transport_event(include_transfer),
                 )
                 .await
                 {
@@ -427,7 +434,7 @@ impl ControllerRuntime {
                     }
                 }
             } else {
-                self.next_transport_event().await?
+                self.next_transport_event(include_transfer).await?
             };
             match transport_event {
                 TransportEvent::Control(ciphertext) => {
@@ -755,13 +762,16 @@ impl ControllerRuntime {
         }
     }
 
-    async fn next_transport_event(&mut self) -> Result<TransportEvent, ControllerError> {
+    async fn next_transport_event(
+        &mut self,
+        include_transfer: bool,
+    ) -> Result<TransportEvent, ControllerError> {
         loop {
             if let Some(connection) = self.direct_connection.clone() {
                 let silence_timeout = tokio::time::sleep(DIRECT_VIDEO_SILENCE_TIMEOUT);
                 tokio::pin!(silence_timeout);
                 tokio::select! {
-                    relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                    relay = self.client.next_event_with_transfer(include_transfer) => return relay.map_err(ControllerError::from),
                         direct = connection.recv_datagram() => match direct {
                             Ok(bytes) => return Ok(TransportEvent::VideoDatagram(bytes)),
                             Err(_) => {
@@ -783,7 +793,7 @@ impl ControllerRuntime {
             let Some(session) = self.direct_session.as_ref() else {
                 return self
                     .client
-                    .next_event()
+                    .next_event_with_transfer(include_transfer)
                     .await
                     .map_err(ControllerError::from);
             };
@@ -791,7 +801,7 @@ impl ControllerRuntime {
             let expected_candidate_id = session.candidate().candidate_id();
             let expected_binding = *session.session_binding();
             tokio::select! {
-                relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                relay = self.client.next_event_with_transfer(include_transfer) => return relay.map_err(ControllerError::from),
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else {
                         self.direct_session = None;

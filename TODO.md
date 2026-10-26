@@ -246,6 +246,8 @@
 ### DL2-021 · P1 · 慢磁盘写入与远控 async 调度隔离
 
 - [ ] 为文件读写提供带字节预算、取消和完成语义的专用 worker。
+- [x] 控制端接收切片 `perf(DL2-021): isolate controller file receive completion from media ingress`：复用媒体组 `c2ec149`（本分支来源提交 `eb6616d`）的 IncomingFileWorker；每接收文件单个有界 coordinator，2×48KiB 排队和当前块，主循环只提交命令并独立消费磁盘完成。队列满时 next_event_with_transfer(false) 仅暂停文件 lane，继续消费视频/音频/控制和本地取消；写入 ACK 后进度、hash/flush/rename 后完成。创建/写入/完成立即取消与迟到成功共 6 项受控慢盘测试通过；transport 24 单元+17 localhost、FFI 12 单元+5 controller_runtime 集成通过；管理库完整 113 通过、1 签名包忽略（后续新增两个取消边界聚焦通过）。
+- [ ] 真机慢盘/空间耗尽/杀毒扫描与性能验收；控制端出站 pre-offer metadata、队列保护存储仍有同步路径。远端取消受同一可靠文件 lane 回压约束，不声称可越过已满通道；本地取消不等待磁盘 gate。
 - **证据 / 类型：性能结构。** `apps/windows/src/runtime.rs:3035-3044` 直接调用 `apps/windows/src/transfer.rs:360-373` 的同步 write_all 与 hash。初始化及完成已有 spawn_blocking，不能写成全部 I/O 都未隔离。
 - **方案：** 长驻磁盘 worker 或有界异步管线，网络回压跟随落盘速度；不要每个 48 KiB chunk 新建 blocking task。两个传输方向一起核对；校验/flush 成功后才发布完成。
 - **验收：** 慢盘、云盘、杀毒扫描、空间耗尽、取消同时发生时，媒体/输入仍满足预算、内存有界、残留可清理；不能显示尚未落盘的虚假完成。
