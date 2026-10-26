@@ -6,9 +6,11 @@ use configuration_queue::{
 };
 
 use std::{
+    collections::VecDeque,
+    num::NonZeroU64,
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,13 +21,13 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, Codec, ControlMessage, CursorUpdate,
-    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, MAX_INPUT_AGE_US,
-    MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform,
-    ProtocolError, RemoteDisplay, TransferId, TransferMessage, TransferResult, VideoConfig,
-    VideoQualityPreference, VideoQualityPreset, VideoReliableBatchBuilder, decode_control,
-    decode_noise_handshake, decode_session_input, decode_transfer, encode_audio_packet,
-    encode_control, encode_cursor_update, encode_noise_handshake, encode_transfer,
-    encode_video_config,
+    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputContext, InputEnvelope,
+    InputEvent, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep,
+    PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId, TransferMessage,
+    TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset,
+    VideoReliableBatchBuilder, decode_control, decode_noise_handshake, decode_session_input,
+    decode_transfer, encode_audio_packet, encode_control, encode_cursor_update,
+    encode_noise_handshake, encode_transfer, encode_video_config,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -376,6 +378,12 @@ pub enum HostRuntimeError {
     Encoder(EncoderError),
     #[error("input injection error: {0:?}")]
     Input(InputInjectionError),
+    #[error("the process input epoch allocator is exhausted")]
+    InputEpochExhausted,
+    #[error("secure randomness for the process input epoch is unavailable")]
+    InputEpochRandomUnavailable,
+    #[error("secure randomness produced an invalid zero input epoch")]
+    InputEpochZeroSeed,
     #[error("controller capabilities are invalid or incompatible")]
     InvalidControllerCapabilities,
     #[error("controller capability negotiation timed out")]
@@ -691,6 +699,9 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         HostRuntimeError::ApprovalRequired
         | HostRuntimeError::PairingRejected
         | HostRuntimeError::PairingExpired
+        | HostRuntimeError::InputEpochExhausted
+        | HostRuntimeError::InputEpochRandomUnavailable
+        | HostRuntimeError::InputEpochZeroSeed
         | HostRuntimeError::AuthorizationBackend(_) => false,
     }
 }
@@ -792,7 +803,7 @@ impl ControllerAuthorizer for PinnedControllerAuthorizer {
 
 pub struct HostVideoPipeline {
     stream_id: u64,
-    sent_config: Option<(u32, u16, u16)>,
+    sent_config: Option<(u32, u16, u16, u64)>,
 }
 
 impl HostVideoPipeline {
@@ -808,7 +819,13 @@ impl HostVideoPipeline {
         frame: EncodedFrame,
         width: u32,
         height: u32,
+        input_epoch: u64,
     ) -> Result<PrepareVideo, HostRuntimeError> {
+        InputContext {
+            stream_id: self.stream_id,
+            input_epoch,
+        }
+        .validate()?;
         let width = u16::try_from(width).map_err(|_| HostRuntimeError::InvalidDimensions)?;
         let height = u16::try_from(height).map_err(|_| HostRuntimeError::InvalidDimensions)?;
         if width == 0 || height == 0 {
@@ -816,16 +833,16 @@ impl HostVideoPipeline {
         }
         if self
             .sent_config
-            .is_some_and(|(version, sent_width, sent_height)| {
+            .is_some_and(|(version, sent_width, sent_height, _)| {
                 version == frame.config_version && (sent_width, sent_height) != (width, height)
             })
         {
             return Err(HostRuntimeError::InconsistentVideoConfig);
         }
 
-        let needs_config = self
-            .sent_config
-            .is_none_or(|(version, _, _)| version != frame.config_version);
+        let needs_config = self.sent_config.is_none_or(|(version, _, _, sent_epoch)| {
+            version != frame.config_version || sent_epoch != input_epoch
+        });
         if needs_config && (!frame.keyframe || frame.sequence_header.is_none()) {
             return Ok(PrepareVideo::NeedKeyframe);
         }
@@ -833,7 +850,7 @@ impl HostVideoPipeline {
             Some(encode_video_config(&VideoConfig {
                 protocol_version: PROTOCOL_VERSION,
                 stream_id: self.stream_id,
-                input_epoch: 0,
+                input_epoch,
                 config_version: frame.config_version,
                 codec: desklink_protocol::Codec::H264,
                 width,
@@ -863,7 +880,7 @@ impl HostVideoPipeline {
         };
         let datagrams = encode_video_frame(&wire_frame)?;
         if needs_config {
-            self.sent_config = Some((frame.config_version, width, height));
+            self.sent_config = Some((frame.config_version, width, height, input_epoch));
         }
         Ok(PrepareVideo::Ready(PreparedVideo {
             video_config,
@@ -907,8 +924,35 @@ impl HostInboundPolicy {
         now_us: u64,
     ) -> Result<Option<InputEvent>, HostRuntimeError> {
         let envelope = decode_session_input(bytes)?;
+        let context = envelope.context();
+        Ok(self
+            .admit_input_envelope(envelope, now_us, context)
+            .map(|envelope| envelope.event))
+    }
+
+    /// Keep the admitted wire identity intact until the selected-desktop lock
+    /// validates and injects it. Rejected identities cannot advance ordering.
+    pub fn decode_input_envelope(
+        &mut self,
+        bytes: &[u8],
+        now_us: u64,
+        expected_context: InputContext,
+    ) -> Result<Option<InputEnvelope>, HostRuntimeError> {
+        expected_context.validate()?;
+        Ok(self.admit_input_envelope(decode_session_input(bytes)?, now_us, expected_context))
+    }
+
+    fn admit_input_envelope(
+        &mut self,
+        envelope: InputEnvelope,
+        now_us: u64,
+        expected_context: InputContext,
+    ) -> Option<InputEnvelope> {
+        if envelope.stream_id != self.stream_id || envelope.context() != expected_context {
+            return None;
+        }
         if !sequence_is_newer(envelope.sequence, self.last_input_sequence) {
-            return Ok(None);
+            return None;
         }
         if !self.input_timestamp_is_fresh(envelope.timestamp_us, now_us) {
             // A Windows time synchronization, resume from sleep, or manual clock
@@ -921,7 +965,7 @@ impl HostInboundPolicy {
             });
         }
         self.last_input_sequence = envelope.sequence;
-        Ok(Some(envelope.event))
+        Some(envelope)
     }
 
     fn input_timestamp_is_fresh(&mut self, remote_us: u64, local_us: u64) -> bool {
@@ -992,6 +1036,53 @@ struct EncodedDesktopFrame {
     frame: EncodedFrame,
     width: u32,
     height: u32,
+    input_epoch: u64,
+}
+
+#[derive(Default)]
+struct FrameInputContexts {
+    configuration: Option<(u32, InputContext)>,
+    pending: VecDeque<(u64, u32, InputContext)>,
+}
+
+impl FrameInputContexts {
+    // Independent of the native encoder's smaller pending-input budget. Never
+    // let a stalled backend accumulate input authorization metadata unboundedly.
+    const CAPACITY: usize = 32;
+
+    fn record_submission(
+        &mut self,
+        sample: crate::encoder::EncoderPerformanceSample,
+        context: InputContext,
+    ) -> bool {
+        if !context.is_valid() || sample.frame_id == 0 || sample.config_version == 0 {
+            return false;
+        }
+        let configuration = (sample.config_version, context);
+        if self.configuration != Some(configuration) {
+            self.pending.clear();
+            self.configuration = Some(configuration);
+        }
+        if self.pending.len() == Self::CAPACITY
+            || self
+                .pending
+                .iter()
+                .any(|(id, version, _)| *id == sample.frame_id && *version == sample.config_version)
+        {
+            self.pending.clear();
+            return false;
+        }
+        self.pending
+            .push_back((sample.frame_id, sample.config_version, context));
+        true
+    }
+
+    fn take_output(&mut self, frame: &EncodedFrame) -> Option<InputContext> {
+        let index = self.pending.iter().position(|(id, version, _)| {
+            *id == frame.frame_id && *version == frame.config_version
+        })?;
+        self.pending.remove(index).map(|(_, _, context)| context)
+    }
 }
 
 pub struct HostRuntime {
@@ -1103,14 +1194,12 @@ impl HostRuntime {
         let (start_sender, start_receiver) = std::sync::mpsc::sync_channel(0);
         let (capture_command_sender, capture_command_receiver) =
             std::sync::mpsc::sync_channel(CAPTURE_COMMAND_QUEUE_CAPACITY);
-        let selected_desktop = Arc::new(Mutex::new(SelectedDesktop {
-            display_id: 0,
-            desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
-            topology: None,
-            selection_pending: false,
-        }));
-        let release_input = Arc::new(Notify::new());
+        let selected_desktop = Arc::new(Mutex::new(SelectedDesktop::unconfigured(stream_id)?));
+        let input = Arc::new(Mutex::new(InputInjector::new(VirtualDesktop::single(
+            DesktopRect::new(0, 0, 1, 1),
+        ))));
         let input_suspended = Arc::new(AtomicBool::new(false));
+        let input_epochs = process_input_epochs()?;
         let (topology_updates, mut topology_receiver) = watch::channel(0_u64);
         let capture_context = CaptureWorkerContext {
             commands: capture_command_receiver,
@@ -1119,7 +1208,8 @@ impl HostRuntime {
             force_keyframe: force_keyframe.clone(),
             shutdown: shutdown.clone(),
             selected_desktop: selected_desktop.clone(),
-            release_input: release_input.clone(),
+            input: input.clone(),
+            input_epochs,
             input_suspended: input_suspended.clone(),
             topology_updates,
             profile: negotiated_profile,
@@ -1214,7 +1304,6 @@ impl HostRuntime {
                 None
             }
         };
-        let input = InputInjector::new(VirtualDesktop::new(ready.desktop, ready.coordinate_space));
         stable.store(true, Ordering::Release);
         on_connected(stream_id);
 
@@ -1233,12 +1322,12 @@ impl HostRuntime {
             secure.clone(),
             peer_generation,
             stream_id,
-            input,
+            input.clone(),
             force_keyframe,
             HostInboundContext {
                 capture_commands: capture_command_sender,
                 selected_desktop: selected_desktop.clone(),
-                release_input,
+                input,
                 input_suspended,
                 topology_updates: topology_receiver,
                 audio_enabled: audio_enabled.clone(),
@@ -1407,8 +1496,6 @@ impl Drop for AudioWorkerGuard {
 
 #[derive(Clone)]
 struct CaptureWorkerReady {
-    desktop: DesktopRect,
-    coordinate_space: DesktopRect,
     width: u32,
     height: u32,
     displays: Vec<RemoteDisplay>,
@@ -1418,15 +1505,93 @@ struct CaptureWorkerReady {
 
 #[derive(Clone)]
 struct SelectedDesktop {
+    stream_id: NonZeroU64,
+    input_epoch: Option<NonZeroU64>,
     display_id: u32,
     desktop: VirtualDesktop,
     topology: Option<DisplayTopologySnapshot>,
     selection_pending: bool,
+    input_invalidated: bool,
+    input_closed: bool,
+}
+
+struct InputEpochAllocator(AtomicU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputEpochSeedError {
+    RandomUnavailable,
+    Zero,
+}
+
+impl InputEpochAllocator {
+    #[cfg(test)]
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    fn from_seed(first: u64) -> Result<Self, InputEpochSeedError> {
+        let before_first = first.checked_sub(1).ok_or(InputEpochSeedError::Zero)?;
+        Ok(Self(AtomicU64::new(before_first)))
+    }
+
+    fn from_rng(random: &mut impl RngCore) -> Result<Self, InputEpochSeedError> {
+        let mut bytes = [0_u8; 8];
+        random
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| InputEpochSeedError::RandomUnavailable)?;
+        Self::from_seed(u64::from_be_bytes(bytes))
+    }
+
+    fn allocate(&self) -> Result<NonZeroU64, HostRuntimeError> {
+        let previous = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| HostRuntimeError::InputEpochExhausted)?;
+        NonZeroU64::new(previous + 1).ok_or(HostRuntimeError::InputEpochExhausted)
+    }
+}
+
+static INPUT_EPOCHS: OnceLock<Result<InputEpochAllocator, InputEpochSeedError>> = OnceLock::new();
+
+fn process_input_epochs() -> Result<&'static InputEpochAllocator, HostRuntimeError> {
+    // Stream IDs persist across restarts, and old plaintext can be encrypted
+    // again by a new transport. Draw one full-width nonzero process seed, then
+    // issue checked monotonic epochs from it. Restart separation is random,
+    // not a persistence guarantee. Zero/RNG failure and exhaustion fail closed;
+    // never mask, clamp, wrap, redraw, or fall back to a fixed active epoch.
+    match INPUT_EPOCHS.get_or_init(|| InputEpochAllocator::from_rng(&mut OsRng)) {
+        Ok(epochs) => Ok(epochs),
+        Err(InputEpochSeedError::RandomUnavailable) => {
+            Err(HostRuntimeError::InputEpochRandomUnavailable)
+        }
+        Err(InputEpochSeedError::Zero) => Err(HostRuntimeError::InputEpochZeroSeed),
+    }
 }
 
 impl SelectedDesktop {
-    fn from_snapshot(topology: DisplayTopologySnapshot) -> Self {
+    fn unconfigured(stream_id: u64) -> Result<Self, HostRuntimeError> {
+        Ok(Self {
+            stream_id: NonZeroU64::new(stream_id).ok_or(ProtocolError::InvalidInput)?,
+            input_epoch: None,
+            display_id: 0,
+            desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
+            topology: None,
+            selection_pending: false,
+            input_invalidated: true,
+            input_closed: false,
+        })
+    }
+
+    fn from_snapshot(
+        topology: DisplayTopologySnapshot,
+        stream_id: NonZeroU64,
+        input_epoch: NonZeroU64,
+    ) -> Self {
         Self {
+            stream_id,
+            input_epoch: Some(input_epoch),
             display_id: topology.active_display_id(),
             desktop: VirtualDesktop::new(
                 topology.active_display().rect,
@@ -1434,13 +1599,16 @@ impl SelectedDesktop {
             ),
             topology: Some(topology),
             selection_pending: false,
+            input_invalidated: false,
+            input_closed: false,
         }
     }
 
-    fn topology_generation(&self) -> u64 {
-        self.topology
-            .as_ref()
-            .map_or(0, DisplayTopologySnapshot::generation)
+    fn input_context(&self) -> Option<InputContext> {
+        self.input_epoch.map(|input_epoch| InputContext {
+            stream_id: self.stream_id.get(),
+            input_epoch: input_epoch.get(),
+        })
     }
 }
 
@@ -1470,7 +1638,8 @@ struct CaptureWorkerContext {
     force_keyframe: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
-    release_input: Arc<Notify>,
+    input: Arc<Mutex<InputInjector>>,
+    input_epochs: &'static InputEpochAllocator,
     input_suspended: Arc<AtomicBool>,
     topology_updates: watch::Sender<u64>,
     profile: H264Profile,
@@ -1479,7 +1648,7 @@ struct CaptureWorkerContext {
 struct HostInboundContext {
     capture_commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
-    release_input: Arc<Notify>,
+    input: Arc<Mutex<InputInjector>>,
     input_suspended: Arc<AtomicBool>,
     topology_updates: watch::Receiver<u64>,
     audio_enabled: Arc<AtomicBool>,
@@ -1490,14 +1659,18 @@ struct HostInboundContext {
     direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
 }
 
-struct CaptureDesktopCoordinator<'a> {
+struct CaptureDesktopCoordinator<
+    'a,
+    B: crate::input::InputBackend = crate::input::NativeInputBackend,
+> {
     selected: &'a Mutex<SelectedDesktop>,
-    release_input: &'a Notify,
+    input: &'a Mutex<InputInjector<B>>,
+    epochs: &'a InputEpochAllocator,
     input_suspended: &'a AtomicBool,
     updates: &'a watch::Sender<u64>,
 }
 
-impl CaptureDesktopCoordinator<'_> {
+impl<B: crate::input::InputBackend> CaptureDesktopCoordinator<'_, B> {
     fn current(&self) -> Result<DisplayTopologySnapshot, HostRuntimeError> {
         lock_unpoisoned(self.selected)
             .topology
@@ -1505,23 +1678,48 @@ impl CaptureDesktopCoordinator<'_> {
             .ok_or(HostRuntimeError::CaptureWorkerStopped)
     }
 
-    fn suspend(&self) {
-        suspend_desktop_input(self.selected, self.input_suspended, self.release_input);
+    fn suspend(&self) -> bool {
+        let mut selected = lock_unpoisoned(self.selected);
+        self.input_suspended.store(true, Ordering::Release);
+        selected.input_invalidated = true;
+        lock_unpoisoned(self.input).release_all().is_ok()
     }
 
-    fn resume(&self) {
-        resume_desktop_input(self.selected, self.input_suspended, self.release_input);
-    }
-
-    fn publish(&self, topology: DisplayTopologySnapshot) {
+    fn publish(&self, topology: DisplayTopologySnapshot) -> Result<bool, HostRuntimeError> {
         let generation = topology.generation();
         let mut selected = lock_unpoisoned(self.selected);
+        if selected.input_closed {
+            return Ok(false);
+        }
         let selection_pending = selected.selection_pending;
-        *selected = SelectedDesktop::from_snapshot(topology);
+        let boundary = selected.input_invalidated
+            || selected
+                .topology
+                .as_ref()
+                .is_none_or(|previous| topology.requires_capture_reconfigure(previous));
+        let mut input = lock_unpoisoned(self.input);
+        let input_epoch = if boundary {
+            self.input_suspended.store(true, Ordering::Release);
+            selected.input_invalidated = true;
+            if input.release_all().is_err() {
+                return Ok(false);
+            }
+            self.epochs.allocate()?
+        } else {
+            selected
+                .input_epoch
+                .ok_or(HostRuntimeError::CaptureWorkerStopped)?
+        };
+        let stream_id = selected.stream_id;
+        input.set_desktop(VirtualDesktop::new(
+            topology.active_display().rect,
+            topology.virtual_desktop(),
+        ));
+        *selected = SelectedDesktop::from_snapshot(topology, stream_id, input_epoch);
         selected.selection_pending = selection_pending;
-        self.release_input.notify_one();
         self.input_suspended.store(false, Ordering::Release);
         self.updates.send_replace(generation);
+        Ok(true)
     }
 }
 
@@ -1789,27 +1987,6 @@ fn selected_display_list(
     Ok((remote_displays(topology.displays())?, selected.display_id))
 }
 
-fn suspend_desktop_input(
-    selected_desktop: &Mutex<SelectedDesktop>,
-    input_suspended: &AtomicBool,
-    release_input: &Notify,
-) {
-    // Serialize the gate with the synchronous injection/coordinate lookup.
-    let _selected = lock_unpoisoned(selected_desktop);
-    input_suspended.store(true, Ordering::Release);
-    release_input.notify_one();
-}
-
-fn resume_desktop_input(
-    selected_desktop: &Mutex<SelectedDesktop>,
-    input_suspended: &AtomicBool,
-    release_input: &Notify,
-) {
-    let _selected = lock_unpoisoned(selected_desktop);
-    release_input.notify_one();
-    input_suspended.store(false, Ordering::Release);
-}
-
 fn capture_worker_entry(
     ready: oneshot::Sender<Result<CaptureWorkerReady, HostRuntimeError>>,
     start: std::sync::mpsc::Receiver<()>,
@@ -1873,11 +2050,25 @@ fn capture_worker_entry(
             return Ok(());
         }
     };
-    context.topology_updates.send_replace(topology.generation());
-    *lock_unpoisoned(&context.selected_desktop) = SelectedDesktop::from_snapshot(topology);
+    let coordinator = CaptureDesktopCoordinator {
+        selected: &context.selected_desktop,
+        input: &context.input,
+        epochs: context.input_epochs,
+        input_suspended: &context.input_suspended,
+        updates: &context.topology_updates,
+    };
+    match coordinator.publish(topology) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = ready.send(Err(HostRuntimeError::CaptureWorkerStopped));
+            return Ok(());
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return Ok(());
+        }
+    }
     let worker_ready = CaptureWorkerReady {
-        desktop: capture.desktop_rect(),
-        coordinate_space,
         width,
         height,
         displays,
@@ -2086,20 +2277,23 @@ fn capture_encode_loop(
         force_keyframe,
         shutdown,
         selected_desktop,
-        release_input,
+        input,
+        input_epochs,
         input_suspended,
         topology_updates,
         profile: _,
     } = context;
     let desktop_state = CaptureDesktopCoordinator {
         selected: &selected_desktop,
-        release_input: &release_input,
+        input: &input,
+        epochs: input_epochs,
         input_suspended: &input_suspended,
         updates: &topology_updates,
     };
     let mut next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
     let mut topology_recovery_pending = false;
     let mut encoder_recovery_attempts = 0_u8;
+    let mut frame_input_contexts = FrameInputContexts::default();
     let mut video_quality = DEFAULT_VIDEO_QUALITY;
     let mut video_profile = encoder.profile();
     let mut reported_first_encoded_frame = false;
@@ -2111,6 +2305,13 @@ fn capture_encode_loop(
     let mut first_encoded_frame_deadline = None;
     let mut encoded_any_frame = false;
     while !shutdown.load(Ordering::Acquire) {
+        {
+            let selected = lock_unpoisoned(&selected_desktop);
+            if selected.input_closed {
+                break;
+            }
+            topology_recovery_pending |= selected.input_invalidated;
+        }
         if Instant::now() >= next_topology_poll {
             next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
             let current = desktop_state.current()?;
@@ -2155,14 +2356,17 @@ fn capture_encode_loop(
                         if !encoded_any_frame {
                             first_encoded_frame_deadline = None;
                         }
-                        desktop_state.publish(next);
-                        notify.notify_one();
-                        topology_recovery_pending = false;
+                        if desktop_state.publish(next)? {
+                            notify.notify_one();
+                            topology_recovery_pending = false;
+                        }
                     }
                 } else {
                     // Hotplug of an unused output or a primary/name change may
                     // update the list without rebuilding unchanged media.
-                    desktop_state.publish(next);
+                    if !desktop_state.publish(next)? {
+                        topology_recovery_pending = true;
+                    }
                 }
             }
         }
@@ -2203,15 +2407,15 @@ fn capture_encode_loop(
                                 if !encoded_any_frame {
                                     first_encoded_frame_deadline = None;
                                 }
-                                desktop_state.publish(next);
-                                notify.notify_one();
-                                true
-                            } else {
-                                if matches!(prepared, Err(HostRuntimeError::Capture(_))) {
-                                    topology_recovery_pending = true;
+                                if desktop_state.publish(next)? {
+                                    notify.notify_one();
+                                    true
                                 } else {
-                                    desktop_state.resume();
+                                    topology_recovery_pending = true;
+                                    false
                                 }
+                            } else {
+                                topology_recovery_pending = true;
                                 next_topology_poll = Instant::now();
                                 false
                             }
@@ -2294,6 +2498,9 @@ fn capture_encode_loop(
             std::thread::sleep(CAPTURE_TIMEOUT);
             continue;
         }
+        let captured_context = lock_unpoisoned(&selected_desktop)
+            .input_context()
+            .ok_or(HostRuntimeError::CaptureWorkerStopped)?;
         let outcome = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2379,9 +2586,10 @@ fn capture_encode_loop(
                     .reset(video_quality_settings_with_profile(video_quality, video_profile).fps);
                 lock_queue(&queue).clear();
                 force_keyframe.store(true, Ordering::Release);
-                desktop_state.publish(next);
-                notify.notify_one();
-                topology_recovery_pending = false;
+                if desktop_state.publish(next)? {
+                    notify.notify_one();
+                    topology_recovery_pending = false;
+                }
                 continue;
             }
         };
@@ -2402,8 +2610,24 @@ fn capture_encode_loop(
         if !frame_pacer.should_encode(frame.timestamp_us, request_keyframe) {
             continue;
         }
-        let encoded = match encoder.encode(frame, request_keyframe) {
+        let result = encoder.encode(frame, request_keyframe);
+        if !encoder
+            .last_performance_sample()
+            .is_some_and(|sample| frame_input_contexts.record_submission(sample, captured_context))
+        {
+            force_keyframe.store(true, Ordering::Release);
+        }
+        let (encoded, encoded_context) = match result {
             Ok(encoded) => {
+                let Some(output_context) = frame_input_contexts
+                    .take_output(&encoded)
+                    .filter(|context| *context == captured_context)
+                else {
+                    // An asynchronous MFT may return an older buffered frame.
+                    // Never relabel it with the current geometry's input epoch.
+                    force_keyframe.store(true, Ordering::Release);
+                    continue;
+                };
                 encoder_recovery_attempts = 0;
                 if !reported_first_encoded_frame {
                     eprintln!(
@@ -2415,7 +2639,7 @@ fn capture_encode_loop(
                     reported_first_encoded_frame = true;
                 }
                 encoded_any_frame = true;
-                encoded
+                (encoded, output_context)
             }
             Err(EncoderError::NeedMoreInput) => {
                 // Some MFTs need another submission before returning output.
@@ -2448,6 +2672,7 @@ fn capture_encode_loop(
             frame: encoded,
             width,
             height,
+            input_epoch: encoded_context.input_epoch,
         });
         notify.notify_one();
     }
@@ -2518,7 +2743,7 @@ async fn send_video_loop(
         let Some(next) = next else {
             continue;
         };
-        match pipeline.prepare(next.frame, next.width, next.height)? {
+        match pipeline.prepare(next.frame, next.width, next.height, next.input_epoch)? {
             PrepareVideo::NeedKeyframe => {
                 if !reported_need_keyframe {
                     eprintln!(
@@ -2998,11 +3223,10 @@ async fn receive_input_and_control(
     secure: SharedSecureSession,
     peer_generation: u64,
     stream_id: u64,
-    input: InputInjector,
+    input: Arc<Mutex<InputInjector>>,
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
 ) -> Result<(), HostRuntimeError> {
-    let release_input = context.release_input.clone();
     let input_suspended = context.input_suspended.clone();
     run_inbound_lanes(
         receive_host_input(
@@ -3012,7 +3236,6 @@ async fn receive_input_and_control(
             stream_id,
             input,
             context.selected_desktop.clone(),
-            release_input.clone(),
             input_suspended.clone(),
         ),
         receive_host_control(
@@ -3041,75 +3264,102 @@ where
     }
 }
 
+struct HostInputExitGuard<B: crate::input::InputBackend = crate::input::NativeInputBackend> {
+    selected: Arc<Mutex<SelectedDesktop>>,
+    input: Arc<Mutex<InputInjector<B>>>,
+    input_suspended: Arc<AtomicBool>,
+}
+
+impl<B: crate::input::InputBackend> Drop for HostInputExitGuard<B> {
+    fn drop(&mut self) {
+        let mut selected = lock_unpoisoned(&self.selected);
+        selected.input_closed = true;
+        selected.input_invalidated = true;
+        self.input_suspended.store(true, Ordering::Release);
+        // Intentional host teardown, not a remotely supplied release command.
+        // The capture worker may still own an Arc, so injector Drop is too late.
+        let _ = lock_unpoisoned(&self.input).release_all();
+    }
+}
+
+fn begin_desktop_selection<B: crate::input::InputBackend>(
+    selected: &Mutex<SelectedDesktop>,
+    input: &Mutex<InputInjector<B>>,
+    input_suspended: &AtomicBool,
+) {
+    let mut selected = lock_unpoisoned(selected);
+    selected.selection_pending = true;
+    if lock_unpoisoned(input).release_all().is_err() {
+        selected.input_invalidated = true;
+        input_suspended.store(true, Ordering::Release);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_host_input(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
     peer_generation: u64,
     stream_id: u64,
-    mut input: InputInjector,
+    input: Arc<Mutex<InputInjector>>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
-    release_input: Arc<Notify>,
     input_suspended: Arc<AtomicBool>,
 ) -> Result<(), HostRuntimeError> {
+    let _exit = HostInputExitGuard {
+        selected: selected_desktop.clone(),
+        input: input.clone(),
+        input_suspended: input_suspended.clone(),
+    };
     let mut policy = HostInboundPolicy::new(stream_id);
-    let mut input_generation = lock_unpoisoned(&selected_desktop).topology_generation();
     loop {
-        let wait_generation = lock_unpoisoned(&selected_desktop).topology_generation();
         tokio::select! {
             biased;
-            _ = release_input.notified() => {
-                let selected = lock_unpoisoned(&selected_desktop);
-                input.set_desktop(selected.desktop);
-                let _ = input.release_all();
-                input_generation = selected.topology_generation();
-            }
             reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
             result = client.next_input_for_generation(peer_generation) => {
                 let bytes = result?;
                 let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
-                if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
-                    inject_desktop_input(
-                        &mut input, event, &selected_desktop, &input_suspended,
-                        wait_generation, &mut input_generation,
-                    )?;
-                }
+                inject_desktop_input(
+                    &mut policy, &input, &plaintext, now_micros(),
+                    &selected_desktop, &input_suspended,
+                )?;
             }
         }
     }
 }
 
 fn inject_desktop_input<B: crate::input::InputBackend>(
-    input: &mut InputInjector<B>,
-    event: InputEvent,
+    policy: &mut HostInboundPolicy,
+    input: &Mutex<InputInjector<B>>,
+    plaintext: &[u8],
+    now_us: u64,
     selected_desktop: &Mutex<SelectedDesktop>,
     input_suspended: &AtomicBool,
-    wait_generation: u64,
-    input_generation: &mut u64,
 ) -> Result<bool, HostRuntimeError> {
-    // Hold the same lock through synchronous injection, not just coordinate
-    // lookup. Publication cannot replace the mapping halfway through a sample.
+    // Context is checked before ordering state, release handling, or touching
+    // the injector. A delayed release from A cannot release a key pressed in B.
     let selected = lock_unpoisoned(selected_desktop);
-    let generation = selected.topology_generation();
-    if *input_generation != generation {
-        let _ = input.release_all();
-        *input_generation = generation;
-    }
-    let release = matches!(
-        event,
-        InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }
-    );
-    if !release
-        && (input_suspended.load(Ordering::Acquire)
-            || selected.selection_pending
-            || wait_generation != generation)
-    {
+    let Some(context) = selected.input_context() else {
+        return Ok(false);
+    };
+    if selected.input_closed {
         return Ok(false);
     }
+    let Some(envelope) = policy.decode_input_envelope(plaintext, now_us, context)? else {
+        return Ok(false);
+    };
+    let release = matches!(
+        envelope.event,
+        InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }
+    );
+    if !release && (input_suspended.load(Ordering::Acquire) || selected.selection_pending) {
+        return Ok(false);
+    }
+    // Maintain one lock order everywhere: selected mapping, then injector.
+    let mut input = lock_unpoisoned(input);
     input.set_desktop(selected.desktop);
-    apply_input_event(input, event)?;
+    apply_input_event(&mut input, envelope.event)?;
     Ok(true)
 }
 
@@ -3125,8 +3375,8 @@ async fn receive_host_control(
     let HostInboundContext {
         capture_commands,
         selected_desktop,
-        release_input,
-        input_suspended: _,
+        input,
+        input_suspended,
         mut topology_updates,
         audio_enabled,
         audio_enabled_updates,
@@ -3157,7 +3407,6 @@ async fn receive_host_control(
                         ConfigurationApplied::Display => {
                             if !configurations.has_pending_display() {
                                 lock_unpoisoned(&selected_desktop).selection_pending = false;
-                                release_input.notify_one();
                             }
                             let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
                             send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
@@ -3205,8 +3454,7 @@ async fn receive_host_control(
                                 topology.displays().iter().any(|display| display.id == display_id)
                             });
                         if known_display {
-                            lock_unpoisoned(&selected_desktop).selection_pending = true;
-                            release_input.notify_one();
+                            begin_desktop_selection(&selected_desktop, &input, &input_suspended);
                             configurations.request(ConfigurationAction::SelectDisplay(display_id));
                         } else {
                             let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
@@ -3964,18 +4212,37 @@ mod retry_policy_tests {
 
     struct RejectingInputBackend(InputInjectionError);
 
+    use desklink_protocol::{
+        InputContext, InputEnvelope, InputEvent, decode_video_config, encode_input,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    type RecordedTopologyInputs = Arc<Mutex<Vec<(InputEvent, VirtualDesktop)>>>;
+
     #[derive(Clone)]
     struct RecordingTopologyInputBackend {
-        sent:
-            std::sync::Arc<std::sync::Mutex<Vec<(desklink_protocol::InputEvent, VirtualDesktop)>>>,
+        sent: RecordedTopologyInputs,
+        block_releases: Arc<AtomicBool>,
     }
 
     impl InputBackend for RecordingTopologyInputBackend {
         fn send(
             &mut self,
-            event: &desklink_protocol::InputEvent,
+            event: &InputEvent,
             desktop: VirtualDesktop,
         ) -> Result<(), InputInjectionError> {
+            if self.block_releases.load(Ordering::Acquire)
+                && matches!(
+                    event,
+                    InputEvent::Key { pressed: false, .. }
+                        | InputEvent::MouseButton { pressed: false, .. }
+                )
+            {
+                return Err(InputInjectionError::Blocked);
+            }
             self.sent.lock().unwrap().push((event.clone(), desktop));
             Ok(())
         }
@@ -4003,9 +4270,137 @@ mod retry_policy_tests {
         .unwrap()
     }
 
+    fn key_event(pressed: bool) -> InputEvent {
+        InputEvent::Key {
+            code: KeyCode::Character('a'),
+            pressed,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn test_encoded_frame(
+        frame_id: u64,
+        config_version: u32,
+        keyframe: bool,
+    ) -> crate::encoder::EncodedFrame {
+        crate::encoder::EncodedFrame {
+            frame_id,
+            config_version,
+            keyframe,
+            timestamp_us: frame_id * 1_000,
+            access_unit: vec![frame_id as u8; 2_500],
+            sequence_header: Some(vec![0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2]),
+        }
+    }
+
+    struct EpochFixture<'a> {
+        epochs: &'a super::InputEpochAllocator,
+        selected: Arc<Mutex<super::SelectedDesktop>>,
+        input: Arc<Mutex<InputInjector<RecordingTopologyInputBackend>>>,
+        suspended: Arc<AtomicBool>,
+        updates: tokio::sync::watch::Sender<u64>,
+        sent: RecordedTopologyInputs,
+        block_releases: Arc<AtomicBool>,
+        pipeline: super::HostVideoPipeline,
+        policy: super::HostInboundPolicy,
+        next_frame_id: u64,
+    }
+
+    impl EpochFixture<'static> {
+        fn new() -> Self {
+            Self::with_epochs(super::process_input_epochs().unwrap())
+        }
+    }
+
+    impl<'a> EpochFixture<'a> {
+        fn with_epochs(epochs: &'a super::InputEpochAllocator) -> Self {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let block_releases = Arc::new(AtomicBool::new(false));
+            let (updates, _) = tokio::sync::watch::channel(0);
+            let fixture = Self {
+                epochs,
+                selected: Arc::new(Mutex::new(super::SelectedDesktop::unconfigured(9).unwrap())),
+                input: Arc::new(Mutex::new(InputInjector::with_backend(
+                    VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
+                    RecordingTopologyInputBackend {
+                        sent: sent.clone(),
+                        block_releases: block_releases.clone(),
+                    },
+                ))),
+                suspended: Arc::new(AtomicBool::new(false)),
+                updates,
+                sent,
+                block_releases,
+                pipeline: super::HostVideoPipeline::new(9),
+                policy: super::HostInboundPolicy::new(9),
+                next_frame_id: 1,
+            };
+            assert!(fixture.coordinator().publish(topology_pair()).unwrap());
+            fixture
+        }
+
+        fn coordinator(
+            &self,
+        ) -> super::CaptureDesktopCoordinator<'_, RecordingTopologyInputBackend> {
+            super::CaptureDesktopCoordinator {
+                selected: &self.selected,
+                input: &self.input,
+                epochs: self.epochs,
+                input_suspended: &self.suspended,
+                updates: &self.updates,
+            }
+        }
+
+        fn wire_context(&mut self, config_version: u32) -> InputContext {
+            let selected = self.selected.lock().unwrap();
+            let context = selected.input_context().unwrap();
+            let rect = selected.desktop.rect;
+            drop(selected);
+            let frame = test_encoded_frame(self.next_frame_id, config_version, true);
+            self.next_frame_id += 1;
+            let super::PrepareVideo::Ready(prepared) = self
+                .pipeline
+                .prepare(frame, rect.width, rect.height, context.input_epoch)
+                .unwrap()
+            else {
+                panic!("expected host video configuration");
+            };
+            let configuration =
+                decode_video_config(prepared.video_config.as_deref().expect("new configuration"))
+                    .unwrap();
+            // All strict-input tests take their identity from the real host
+            // pipeline's encoded/decoded VideoConfig, never a default epoch.
+            InputContext {
+                stream_id: configuration.stream_id,
+                input_epoch: configuration.input_epoch,
+            }
+        }
+
+        fn inject(&mut self, context: InputContext, sequence: u64, event: InputEvent) -> bool {
+            let envelope = InputEnvelope {
+                stream_id: context.stream_id,
+                input_epoch: context.input_epoch,
+                sequence,
+                timestamp_us: 1_000_000 + sequence,
+                event,
+            };
+            super::inject_desktop_input(
+                &mut self.policy,
+                &self.input,
+                &encode_input(&envelope).unwrap(),
+                1_000_000 + sequence,
+                &self.selected,
+                &self.suspended,
+            )
+            .unwrap()
+        }
+    }
+
     #[test]
-    fn topology_publication_keeps_list_active_output_and_input_geometry_together() {
-        let current = topology_pair();
+    fn topology_publication_keeps_list_active_output_and_input_context_together() {
+        let mut fixture = EpochFixture::new();
+        let before = fixture.wire_context(1);
+        let current = fixture.coordinator().current().unwrap();
         let surviving = current
             .displays()
             .iter()
@@ -4016,162 +4411,421 @@ mod retry_policy_tests {
             .refreshed(vec![surviving.clone()], surviving.rect)
             .unwrap()
             .unwrap();
-        let selected = std::sync::Mutex::new(super::SelectedDesktop::from_snapshot(current));
-        let release = tokio::sync::Notify::new();
-        let suspended = std::sync::atomic::AtomicBool::new(false);
-        let (updates, mut received) = tokio::sync::watch::channel(1_u64);
-        let coordinator = super::CaptureDesktopCoordinator {
-            selected: &selected,
-            release_input: &release,
-            input_suspended: &suspended,
-            updates: &updates,
-        };
-        coordinator.suspend();
-        assert!(suspended.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(selected.lock().unwrap().display_id, 7);
-        // Preparation above did not publish its fallback until the commit.
-        coordinator.publish(next);
-        let published = selected.lock().unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(fixture.coordinator().publish(next).unwrap());
+        let after = fixture.wire_context(2);
+        assert_ne!(before.input_epoch, after.input_epoch);
+        let published = fixture.selected.lock().unwrap();
         assert_eq!(published.display_id, 19);
         assert_eq!(published.desktop, VirtualDesktop::single(surviving.rect));
-        assert_eq!(published.topology_generation(), 2);
+        assert_eq!(published.input_context(), Some(after));
         drop(published);
-        let (list, active) = super::selected_display_list(&selected).unwrap();
+        let (list, active) = super::selected_display_list(&fixture.selected).unwrap();
         assert_eq!(active, 19);
-        assert_eq!(list.len(), 1);
         assert_eq!(
-            (list[0].id, list[0].width, list[0].height),
-            (19, 1920, 1080)
+            (list.len(), list[0].id, list[0].width, list[0].height),
+            (1, 19, 1920, 1080)
         );
-        assert_eq!(*received.borrow_and_update(), 2);
-        assert!(!suspended.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!fixture.suspended.load(Ordering::Acquire));
     }
 
     #[test]
-    fn input_wait_crossing_topology_change_is_discarded_and_held_keys_are_released() {
-        use desklink_protocol::InputEvent;
-        let topology = topology_pair();
-        let old_desktop =
-            VirtualDesktop::new(topology.active_display().rect, topology.virtual_desktop());
-        let next = topology.select(19).unwrap().unwrap();
-        let selected = std::sync::Mutex::new(super::SelectedDesktop::from_snapshot(topology));
-        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut input = InputInjector::with_backend(
-            old_desktop,
-            RecordingTopologyInputBackend { sent: sent.clone() },
-        );
-        let suspended = std::sync::atomic::AtomicBool::new(false);
-        let mut input_generation = 1;
-        let key = |pressed| InputEvent::Key {
-            code: KeyCode::Character('a'),
-            pressed,
-            modifiers: Modifiers::default(),
-        };
-        assert!(
-            super::inject_desktop_input(
-                &mut input,
-                key(true),
-                &selected,
-                &suspended,
-                1,
-                &mut input_generation
-            )
+    fn old_wire_releases_and_pending_samples_cannot_touch_new_epoch_or_reused_display() {
+        let mut fixture = EpochFixture::new();
+        let first_a = fixture.wire_context(1);
+        assert!(fixture.inject(first_a, 1, key_event(true)));
+        let b = fixture
+            .coordinator()
+            .current()
             .unwrap()
-        );
-        *selected.lock().unwrap() = super::SelectedDesktop::from_snapshot(next);
-        assert!(
-            !super::inject_desktop_input(
-                &mut input,
-                InputEvent::MouseMove {
-                    x: 500_000,
-                    y: 500_000
-                },
-                &selected,
-                &suspended,
-                1,
-                &mut input_generation
-            )
+            .select(19)
             .unwrap()
-        );
-        let events = sent.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0, key(true));
-        assert_eq!(events[1].0, key(false));
-        drop(events);
-        assert!(
-            super::inject_desktop_input(
-                &mut input,
-                InputEvent::MouseMove {
-                    x: 500_000,
-                    y: 500_000
-                },
-                &selected,
-                &suspended,
-                2,
-                &mut input_generation
-            )
-            .unwrap()
-        );
-        let events = sent.lock().unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[2].1.rect, DesktopRect::new(0, 0, 1920, 1080));
-    }
-
-    #[test]
-    fn topology_gate_discards_presses_and_coordinates_but_keeps_release_events() {
-        use desklink_protocol::InputEvent;
-        let topology = topology_pair();
-        let desktop =
-            VirtualDesktop::new(topology.active_display().rect, topology.virtual_desktop());
-        let selected = std::sync::Mutex::new(super::SelectedDesktop::from_snapshot(topology));
-        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut input = InputInjector::with_backend(
-            desktop,
-            RecordingTopologyInputBackend { sent: sent.clone() },
-        );
-        let suspended = std::sync::atomic::AtomicBool::new(true);
-        let mut input_generation = 1;
-        for event in [
-            InputEvent::MouseMove { x: 1, y: 1 },
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.coordinator().publish(b).unwrap());
+        let context_b = fixture.wire_context(2);
+        assert!(fixture.inject(context_b, 2, key_event(true)));
+        let before = fixture.sent.lock().unwrap().len();
+        let old_events = [
+            InputEvent::MouseMove {
+                x: 500_000,
+                y: 500_000,
+            },
+            key_event(true),
+            key_event(false),
+            InputEvent::Key {
+                code: KeyCode::Character('中'),
+                pressed: true,
+                modifiers: Modifiers::default(),
+            },
+            InputEvent::Key {
+                code: KeyCode::Character('中'),
+                pressed: false,
+                modifiers: Modifiers::default(),
+            },
             InputEvent::MouseButton {
                 button: desklink_protocol::MouseButton::Left,
                 pressed: true,
             },
-        ] {
-            assert!(
-                !super::inject_desktop_input(
-                    &mut input,
-                    event,
-                    &selected,
-                    &suspended,
-                    1,
-                    &mut input_generation
-                )
-                .unwrap()
-            );
+            InputEvent::MouseButton {
+                button: desklink_protocol::MouseButton::Left,
+                pressed: false,
+            },
+            InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 120,
+            },
+        ];
+        // Includes the key/button-up expansion used by a queued ReleaseAll.
+        for (index, event) in old_events.into_iter().enumerate() {
+            assert!(!fixture.inject(first_a, 1_000 + index as u64, event));
         }
-        let release = InputEvent::MouseButton {
-            button: desklink_protocol::MouseButton::Left,
-            pressed: false,
-        };
-        assert!(
-            super::inject_desktop_input(
-                &mut input,
-                release.clone(),
-                &selected,
-                &suspended,
-                0,
-                &mut input_generation
-            )
+        assert_eq!(fixture.sent.lock().unwrap().len(), before);
+        assert!(!fixture.inject(
+            InputContext {
+                stream_id: 8,
+                ..context_b
+            },
+            9_000,
+            key_event(false)
+        ));
+        // Rejected old high sequences must not poison current ordering either.
+        assert!(fixture.inject(context_b, 3, InputEvent::MouseMove { x: 100, y: 100 }));
+        let second_a = fixture
+            .coordinator()
+            .current()
             .unwrap()
-        );
-        let events = sent.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].0, release);
+            .select(7)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.coordinator().publish(second_a).unwrap());
+        let second_a = fixture.wire_context(3);
+        assert_ne!(second_a, first_a);
+        assert_ne!(second_a, context_b);
+        assert!(fixture.inject(second_a, 4, key_event(true)));
+        let before = fixture.sent.lock().unwrap().len();
+        assert!(!fixture.inject(first_a, 2_000, key_event(false)));
+        assert!(!fixture.inject(context_b, 2_001, key_event(false)));
+        assert_eq!(fixture.sent.lock().unwrap().len(), before);
+        assert!(fixture.inject(second_a, 5, key_event(false)));
     }
 
     #[test]
-    fn topology_publication_lock_remains_held_through_synchronous_injection() {
+    fn metadata_and_media_configuration_versions_preserve_epoch_and_held_keys() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context(1);
+        assert!(fixture.inject(context, 1, key_event(true)));
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays[0].name = "updated source label".into();
+        displays[0].primary = true;
+        displays[1].primary = false;
+        let next = current
+            .refreshed(displays, current.virtual_desktop())
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().publish(next).unwrap());
+        assert_eq!(
+            fixture.sent.lock().unwrap().len(),
+            1,
+            "metadata must not release a held key"
+        );
+        // Quality/profile changes advance codec config versions, not geometry
+        // epochs. Both identities come back from actual host VideoConfig bytes.
+        assert_eq!(fixture.wire_context(2), context);
+        assert_eq!(fixture.wire_context(3), context);
+        assert_eq!(fixture.sent.lock().unwrap().len(), 1);
+        assert!(fixture.inject(context, 2, key_event(false)));
+    }
+
+    #[test]
+    fn invalidity_renewal_rotates_epoch_and_blocked_releases_keep_old_mapping_gated() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context(1);
+        assert!(fixture.inject(context, 1, key_event(true)));
+        fixture.block_releases.store(true, Ordering::Release);
+        let current = fixture.coordinator().current().unwrap();
+        let next = current.select(19).unwrap().unwrap();
+        assert!(!fixture.coordinator().suspend());
+        assert!(!fixture.coordinator().publish(next).unwrap());
+        assert_eq!(
+            fixture.selected.lock().unwrap().input_context(),
+            Some(context)
+        );
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(fixture.suspended.load(Ordering::Acquire));
+        assert!(!fixture.inject(context, 2, key_event(true)));
+        fixture.block_releases.store(false, Ordering::Release);
+        // Restore the same physical display after an invalid interval. Identity
+        // still advances even though active ID and all geometry are unchanged.
+        assert!(
+            fixture
+                .coordinator()
+                .publish(current.renewed().unwrap())
+                .unwrap()
+        );
+        let restored = fixture.wire_context(2);
+        assert_ne!(restored, context);
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(!fixture.inject(context, 1_000, key_event(false)));
+        assert!(fixture.inject(restored, 3, key_event(true)));
+    }
+
+    #[test]
+    fn input_epoch_allocator_never_wraps_or_reuses_an_exhausted_counter() {
+        let allocator = super::InputEpochAllocator::new();
+        assert_eq!(allocator.allocate().unwrap().get(), 1);
+        assert_eq!(allocator.allocate().unwrap().get(), 2);
+        allocator.0.store(u64::MAX - 1, Ordering::Release);
+        assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
+        assert_eq!(
+            allocator.allocate(),
+            Err(HostRuntimeError::InputEpochExhausted)
+        );
+        assert_eq!(
+            allocator.allocate(),
+            Err(HostRuntimeError::InputEpochExhausted)
+        );
+        assert_eq!(allocator.0.load(Ordering::Acquire), u64::MAX);
+        assert!(!super::host_error_is_retryable(
+            &HostRuntimeError::InputEpochExhausted
+        ));
+    }
+
+    #[test]
+    fn process_epoch_seed_is_full_width_fallible_and_never_redrawn_or_clamped() {
+        struct FixedRandom {
+            seed: u64,
+            fail: bool,
+            calls: usize,
+        }
+        impl rand_core::RngCore for FixedRandom {
+            fn next_u32(&mut self) -> u32 {
+                panic!("use fallible entropy only")
+            }
+            fn next_u64(&mut self) -> u64 {
+                panic!("use fallible entropy only")
+            }
+            fn fill_bytes(&mut self, _: &mut [u8]) {
+                panic!("use fallible entropy only")
+            }
+            fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand_core::Error> {
+                self.calls += 1;
+                if self.fail {
+                    return Err(rand_core::Error::from(
+                        std::num::NonZeroU32::new(rand_core::Error::CUSTOM_START).unwrap(),
+                    ));
+                }
+                destination.copy_from_slice(&self.seed.to_be_bytes());
+                Ok(())
+            }
+        }
+        let mut full_width = FixedRandom {
+            seed: u64::MAX,
+            fail: false,
+            calls: 0,
+        };
+        let allocator = super::InputEpochAllocator::from_rng(&mut full_width).unwrap();
+        assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
+        assert_eq!(
+            allocator.allocate(),
+            Err(HostRuntimeError::InputEpochExhausted)
+        );
+        assert_eq!(full_width.calls, 1);
+        let mut zero = FixedRandom {
+            seed: 0,
+            fail: false,
+            calls: 0,
+        };
+        assert!(matches!(
+            super::InputEpochAllocator::from_rng(&mut zero),
+            Err(super::InputEpochSeedError::Zero)
+        ));
+        assert_eq!(zero.calls, 1);
+        let mut failed = FixedRandom {
+            seed: 123,
+            fail: true,
+            calls: 0,
+        };
+        assert!(matches!(
+            super::InputEpochAllocator::from_rng(&mut failed),
+            Err(super::InputEpochSeedError::RandomUnavailable)
+        ));
+        assert_eq!(failed.calls, 1);
+        assert!(!super::host_error_is_retryable(
+            &HostRuntimeError::InputEpochZeroSeed
+        ));
+        assert!(!super::host_error_is_retryable(
+            &HostRuntimeError::InputEpochRandomUnavailable
+        ));
+    }
+
+    #[test]
+    fn new_process_seed_and_new_authenticated_attempt_reject_old_plaintext_with_same_stream_id() {
+        let old_process = super::InputEpochAllocator::from_seed(9_007_199_254_740_993).unwrap();
+        let new_process = super::InputEpochAllocator::from_seed(18_014_398_509_481_987).unwrap();
+        let mut old = EpochFixture::with_epochs(&old_process);
+        let old_context = old.wire_context(1);
+        assert_eq!(old_context.input_epoch, 9_007_199_254_740_993);
+        let mut restarted = EpochFixture::with_epochs(&new_process);
+        let new_context = restarted.wire_context(1);
+        assert_eq!(new_context.input_epoch, 18_014_398_509_481_987);
+        assert_eq!(old_context.stream_id, new_context.stream_id);
+        assert!(!restarted.inject(old_context, 100, key_event(true)));
+        assert!(restarted.inject(new_context, 1, key_event(true)));
+        let mut new_attempt = EpochFixture::with_epochs(&new_process);
+        let next_context = new_attempt.wire_context(1);
+        assert_eq!(next_context.input_epoch, new_context.input_epoch + 1);
+        assert!(!new_attempt.inject(old_context, 100, key_event(true)));
+        assert!(!new_attempt.inject(new_context, 101, key_event(false)));
+        assert!(new_attempt.inject(next_context, 1, key_event(true)));
+    }
+
+    #[test]
+    fn buffered_old_encoder_output_cannot_be_relabelled_with_new_geometry_epoch() {
+        let mut fixture = EpochFixture::new();
+        let old_context = fixture.wire_context(1);
+        let mut bindings = super::FrameInputContexts::default();
+        assert!(bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 41,
+                config_version: 1,
+                ..Default::default()
+            },
+            old_context
+        ));
+        // The native MFT buffers frame 41. Switch geometry before it returns.
+        let next = fixture
+            .coordinator()
+            .current()
+            .unwrap()
+            .select(19)
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.coordinator().publish(next).unwrap());
+        let captured_new_context = fixture.selected.lock().unwrap().input_context().unwrap();
+        assert!(bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 42,
+                config_version: 2,
+                ..Default::default()
+            },
+            captured_new_context
+        ));
+        assert_eq!(bindings.take_output(&test_encoded_frame(41, 1, true)), None);
+        // Even a buggy old output with a current config number cannot inherit
+        // the new sample's identity just because encode() returned it now.
+        assert_eq!(bindings.take_output(&test_encoded_frame(41, 2, true)), None);
+        let output = test_encoded_frame(42, 2, true);
+        let encoded_context = bindings.take_output(&output).unwrap();
+        let super::PrepareVideo::Ready(prepared) = fixture
+            .pipeline
+            .prepare(output, 1920, 1080, encoded_context.input_epoch)
+            .unwrap()
+        else {
+            panic!("new frame must produce configuration");
+        };
+        let configuration = decode_video_config(prepared.video_config.as_deref().unwrap()).unwrap();
+        let actual_wire_context = InputContext {
+            stream_id: configuration.stream_id,
+            input_epoch: configuration.input_epoch,
+        };
+        assert_eq!(actual_wire_context, captured_new_context);
+        assert_ne!(actual_wire_context, old_context);
+        assert!(!fixture.inject(old_context, 100, key_event(true)));
+        assert!(fixture.inject(actual_wire_context, 1, key_event(true)));
+        assert_eq!(bindings.take_output(&test_encoded_frame(42, 2, true)), None);
+    }
+
+    #[test]
+    fn buffered_outputs_keep_submission_identity_and_context_storage_is_bounded() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context(1);
+        let mut bindings = super::FrameInputContexts::default();
+        for frame_id in [41, 42] {
+            assert!(bindings.record_submission(
+                crate::encoder::EncoderPerformanceSample {
+                    frame_id,
+                    config_version: 1,
+                    ..Default::default()
+                },
+                context
+            ));
+        }
+        // A normal delayed output remains legal within the same epoch.
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(41, 1, true)),
+            Some(context)
+        );
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(42, 1, false)),
+            Some(context)
+        );
+        for frame_id in 1..=super::FrameInputContexts::CAPACITY as u64 {
+            assert!(bindings.record_submission(
+                crate::encoder::EncoderPerformanceSample {
+                    frame_id,
+                    config_version: 1,
+                    ..Default::default()
+                },
+                context
+            ));
+        }
+        assert!(!bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 100,
+                config_version: 1,
+                ..Default::default()
+            },
+            context
+        ));
+        assert!(bindings.pending.is_empty());
+        assert!(bindings.record_submission(
+            crate::encoder::EncoderPerformanceSample {
+                frame_id: 101,
+                config_version: 1,
+                ..Default::default()
+            },
+            context
+        ));
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(101, 1, true)),
+            Some(context)
+        );
+    }
+
+    #[test]
+    fn input_exit_releases_pressed_state_while_capture_retains_its_injector_arc() {
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context(1);
+        assert!(fixture.inject(context, 1, key_event(true)));
+        let capture_input = fixture.input.clone();
+        let exit = super::HostInputExitGuard {
+            selected: fixture.selected.clone(),
+            input: fixture.input.clone(),
+            input_suspended: fixture.suspended.clone(),
+        };
+        drop(exit);
+        assert_eq!(Arc::strong_count(&capture_input), 2);
+        assert_eq!(
+            fixture.sent.lock().unwrap().last().unwrap().0,
+            key_event(false)
+        );
+        assert!(!fixture.inject(context, 2, key_event(true)));
+        assert!(
+            !fixture
+                .coordinator()
+                .publish(fixture.coordinator().current().unwrap().renewed().unwrap())
+                .unwrap()
+        );
+        assert!(fixture.suspended.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn topology_publication_lock_remains_held_through_context_check_and_injection() {
         struct BlockingBackend {
             entered: std::sync::mpsc::SyncSender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -4179,7 +4833,7 @@ mod retry_policy_tests {
         impl InputBackend for BlockingBackend {
             fn send(
                 &mut self,
-                _: &desklink_protocol::InputEvent,
+                _: &InputEvent,
                 _: VirtualDesktop,
             ) -> Result<(), InputInjectionError> {
                 self.entered.send(()).unwrap();
@@ -4189,33 +4843,38 @@ mod retry_policy_tests {
                 Ok(())
             }
         }
-        let topology = topology_pair();
-        let desktop =
-            VirtualDesktop::new(topology.active_display().rect, topology.virtual_desktop());
-        let selected = std::sync::Arc::new(std::sync::Mutex::new(
-            super::SelectedDesktop::from_snapshot(topology),
-        ));
+        let mut fixture = EpochFixture::new();
+        let context = fixture.wire_context(1);
+        let selected = fixture.selected.clone();
+        let desktop = selected.lock().unwrap().desktop;
         let (entered, wait_entered) = std::sync::mpsc::sync_channel(0);
         let (release, wait_release) = std::sync::mpsc::sync_channel(0);
         let inject = std::thread::spawn({
             let selected = selected.clone();
             move || {
-                let mut input = InputInjector::with_backend(
+                let input = Mutex::new(InputInjector::with_backend(
                     desktop,
                     BlockingBackend {
                         entered,
                         release: wait_release,
                     },
-                );
-                let suspended = std::sync::atomic::AtomicBool::new(false);
-                let mut generation = 1;
+                ));
+                let suspended = AtomicBool::new(false);
+                let mut policy = super::HostInboundPolicy::new(context.stream_id);
+                let envelope = InputEnvelope {
+                    stream_id: context.stream_id,
+                    input_epoch: context.input_epoch,
+                    sequence: 1,
+                    timestamp_us: 1_000,
+                    event: InputEvent::MouseMove { x: 100, y: 100 },
+                };
                 super::inject_desktop_input(
-                    &mut input,
-                    desklink_protocol::InputEvent::MouseMove { x: 100, y: 100 },
+                    &mut policy,
+                    &input,
+                    &encode_input(&envelope).unwrap(),
+                    1_000,
                     &selected,
                     &suspended,
-                    1,
-                    &mut generation,
                 )
                 .unwrap()
             }
@@ -4225,7 +4884,7 @@ mod retry_policy_tests {
             .unwrap();
         assert!(
             selected.try_lock().is_err(),
-            "publication must wait for an in-progress sample"
+            "publication must wait for the complete sample"
         );
         release.send(()).unwrap();
         assert!(inject.join().unwrap());

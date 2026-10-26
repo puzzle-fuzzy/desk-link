@@ -202,15 +202,18 @@
 
 - [x] **已实现并自动验证（`fix(DL2-013): preserve stable monitor identities across enumeration`）：** 使用EnumDisplayDevicesW监视器接口路径稳定映射，进程内最多1024身份且不复用ID；枚举重排/主屏变化不再使旧ID指向另一输出。GDI主屏保留实际descriptor ID；身份不可用/歧义时安全失败。
 - **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked capture::identity_tests` 3通过，覆盖重排、拔插重现、大小写归一和注册表耗尽；原生API编译通过。
-- [ ] **仍待实现/真机：** runtime连接中拓扑刷新、视频/输入的拓扑代数绑定，以及插拔/旋转/负坐标/100%～200%DPI/睡眠矩阵；本提交只关闭稳定身份切片。
+- [ ] **真机仍待：** 插拔/旋转/负坐标/100%～200%DPI/睡眠矩阵；连接内刷新与Host严格输入绑定见后续已验证切片。
 
 - [x] **连接内拓扑切片（`fix(DL2-013): publish live display topology with coordinated input mapping`）：** 每秒元数据枚举，稳定ID排序下相同拓扑不重建；活动输出移除明确回退主屏/首屏。准备捕获/编码器并复核OS快照后，以同一锁发布列表/活动屏/坐标/代数，清空旧编码队列并请求IDR；watch推送列表。枚举/驱动失败保留旧发布状态、暂停输入并有界重试。注入持映射锁，跨发布等待的非释放事件丢弃。
 - **验证：** Windows lib 128通过/2忽略，含7拓扑和4注入/发布帮助器回归；严格lib+tests Clippy通过；补充编码器准备后OS快照复核后再跑 `--lib topology --locked` 11通过。所有输入用记录/阻塞合成后端，无真实注入或远控。
-- [ ] **严格上下文/真机仍待：** 目前wire无拓扑标记，发布后才迟到的旧包（含release）不能严格识别；等待统一input_epoch契约，不以本机seq/timestamp代替。热插拔/旋转/DPI/睡眠及资源/帧龄实测继续未完成。
+- [ ] **跨组/真机仍待：** 控制端实际呈现后放行及各生产者、FFI被控端接线；热插拔/旋转/DPI/睡眠及资源/帧龄实测继续未完成。Host严格上下文已在后续切片接通，不以seq/timestamp代替。
 
 - [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
 - [x] Windows 共享 Rust API 来源切片 `feat(DL2-013): expose the captured-context runtime input bridge`：准确提取 Apple 已提交 `9ad7154b365de875d725188cfa091f5c21da0b5a` 的 ControllerRuntime::send_input_with_context(&self, InputContext, InputEvent)、必要 import、旧 send_input 明确拒绝及 encrypted controller_runtime 回归；未引入 C/Swift/worker 队列依赖。唯一必要前置为 `bc6c0a62` 的共享合同。`python scripts/run-windows-cargo.py test -p desklink-ffi --test controller_runtime --locked` 5 通过，包含真实加密输入传输；不表示主机/呈现/生产者整链已接通。
-- [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
+- [ ] 各生产者事件捕获与实际首帧呈现放行、FFI被控端接线尚在跨组推进；Host分配/锁/匹配校验见后续完成项。合同阶段其他未接入路径的无效零context/epoch仍由codec拒绝；不能把本Host完成等同整包可交付，不得整体关闭013。
+
+- [x] **Host严格绑定（`fix(DL2-013): authorize host input with published geometry epochs`）：** 全宽非零随机起点+checked进程共享分配，真实VideoConfig发布；映射锁内先匹配完整context再处理所有事件，旧release不能清除新按键。共享injector统一锁顺序完成旧状态释放/epoch/映射协调，受阻保持暂停重试；纯编码与列表元数据不换epoch。固定32项frame/config→采集context绑定拒绝异步旧输出被贴新epoch，peer退出主动清理。
+- **验证：** `test -p desklink-windows --lib --test runtime_contract --locked` 170库通过/2忽略+11契约通过，lib+tests严格Clippy通过。真实生产pipeline配置编码/解码后取token，记录后端覆盖旧移动/Unicode/release、A→B→A、新Noise/进程相同stream、纯编码保持、旧MFT输出、RNG失败/零值/u64耗尽。规则/复跑见 `docs/windows-host-input-epochs.md`；无真实注入/共享。
 
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 
