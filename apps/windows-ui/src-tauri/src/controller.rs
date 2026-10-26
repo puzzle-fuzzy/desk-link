@@ -763,9 +763,12 @@ struct ControllerInputWriter {
     context: Arc<Mutex<Option<InputContext>>>,
 }
 
+type InputSendFuture<Writer> =
+    Pin<Box<dyn Future<Output = (Writer, Result<bool, ControllerError>)> + Send>>;
+
 struct PendingInputSend<Writer> {
     kind: InputSendKind,
-    future: Pin<Box<dyn Future<Output = (Writer, Result<bool, ControllerError>)> + Send>>,
+    future: InputSendFuture<Writer>,
 }
 
 impl<Writer> PendingInputSend<Writer> {

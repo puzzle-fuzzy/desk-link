@@ -201,6 +201,9 @@
 
 ## 4. 性能与数据通道
 
+- [x] **输入发送类型静态检查跟进（`refactor(DL2-013): name the owned input send future type`）：** 为既有 owned future 提取等价类型别名，消除 `clippy::type_complexity`，不改变发送、锁、取消或队列语义。管理库 `test -p desklink-windows-ui --lib --locked` 135通过/1签名资产忽略；本包 `clippy -p desklink-windows-ui --lib --tests --no-deps --locked -- -D warnings` 通过。基线依赖的021 cancellation lint已由媒体来源提交修复，跨包严格检查由联合门禁复跑。
+
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。
