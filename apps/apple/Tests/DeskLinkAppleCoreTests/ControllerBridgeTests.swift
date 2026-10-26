@@ -5,6 +5,22 @@ import XCTest
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
+    func testDecodedConfigurationArrivingBeforeConnectedIsReplayed() {
+        let bridge = ControllerBridge.testing()
+        bridge.stageDecodedMetadataForTesting(streamID: 4, version: 1)
+        XCTAssertNil(bridge.videoSize)
+        bridge.acceptStateForTesting(streamID: 4)
+        XCTAssertEqual(bridge.videoSize, CGSize(width: 1920, height: 1080))
+    }
+
+    func testDisconnectDiscardsDecodedConfigurationWaitingForState() {
+        let bridge = ControllerBridge.testing()
+        bridge.stageDecodedMetadataForTesting(streamID: 4, version: 1)
+        bridge.disconnect()
+        bridge.acceptStateForTesting(streamID: 4)
+        XCTAssertNil(bridge.videoSize)
+    }
+
     func testMultilineCommittedTextMapsCRLFAndTabToBalancedSpecialKeys() {
         let bridge = ControllerBridge.testing()
         bridge.recordInputsForTesting = true

@@ -227,6 +227,11 @@
 ### DL2-018 · P1 · 为 Apple 编码帧输入增加有界解码调度
 
 - [ ] 将逐帧转换/解码提交移出主线程，并约束解码前的积压。
+  - [x] 源码实施：FFI callback 复制前限制 header 64 KiB / frame 8 MiB，直接送专用串行解码调度，不再逐帧排 main closure；默认待解码队列最多 6 帧 / 8 MiB / 250 ms，另允许 1 帧原生在途。拥塞/过期清除完整待解码依赖链并等待 IDR，按 generation / stream / config 隔离迟到输出。
+  - [x] 输出与转换：UI mailbox 合并最新 pixelBuffer / 配置 / 关键帧请求，主线程再次校验代数和配置；早于 Connected 通知到达的配置、帧和恢复请求各保留最新 1 项并在状态建立后重放，不依赖两种调度机制的 FIFO；Annex B 用原 Data range 扫描，AVCC 一次构建。仍保留 FFI 所有权复制和 CMBlockBuffer 拷贝，未宣称零拷贝或实测性能收益。
+  - [x] 自动验证：`python -m unittest discover -s scripts/tests -p test_dl2_apple_media_contract.py -v` 共 9 项静态合同通过（本项 7、043 2）；生产 callback 入口、复制前上限、队列预算、IDR 恢复、串行原生提交和迟到输出保护均入检查；新增 Swift 真实调度器的拥塞/字节/年龄/代数/重配用例及 Annex B 边界用例。
+  - [ ] Windows 无 Swift/Xcode，Swift 编译及 XCTest 未执行；仍需 Mac/iOS 阻塞主线程、VideoToolbox/GPU 解码、长稳和 CPU/GPU/内存/分配/copy bytes/解码渲染耗时实测，主项保持未完成。
+  - 提交主题：`perf(DL2-018): bound Apple encoded ingress before main actor decoding`。
 - **证据 / 类型：性能结构。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:569-589` 每个 FFI 事件复制 Data 并 DispatchQueue.main.async，`442-450` 在主线程提交解码；`apps/apple/Sources/DeskLinkAppleCore/H264AnnexB.swift:26-45,80-81` 多次数组/Data 构建，`apps/apple/Sources/DeskLinkAppleCore/H264Decoder.swift:214-220` 再复制到 CMBlockBuffer。
 - **现有保护：** `apps/apple/Sources/DeskLinkAppleCore/H264Decoder.swift:17-57` 已合并解码后的输出；本项针对它之前的队列和转换，不能重复报告输出无限缓存。
 - **方案：** 专用串行解码队列、按字节/数量/年龄限制输入；保持配置、关键帧和 delta 依赖，必要时请求关键帧；NAL 用 range/slice 一次构建，UI 只发布最新 pixelBuffer 和低频指标。
