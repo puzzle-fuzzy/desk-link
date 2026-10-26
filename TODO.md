@@ -185,6 +185,8 @@
 - [x] **并发加密跟进（`fix(DL2-011): isolate delayed probes from video replay windows`）：** 短锁后探测不得与视频共用128包重放窗；追加DirectProbe=8独立密钥/计数/窗口，现有lane 0～7不变，所有probe入口统一使用。未另升业务协议版本。
 - **验证：** crypto+transport `--lib --tests --locked` 79通过；真实共享endpoint探测等待期间推进256视频包仍完成认证；双向迟到probe、重放与跨lane拒绝均覆盖。修复前共享视频lane的窗口会把这类迟到密文误拒，不能仅把seal移到connect后缩短概率。
 
+- [x] **加密边界补充（`test(DL2-011): cover delayed responses and probe lane authentication`）：** probe测试12通过、transport lib+tests严格Clippy通过；新增干净窗口错lane认证失败后正确打开仍成功、反射包拒绝不污染双向真实包、真实QUIC响应已seal后等待期间共享锁100ms可取得且256个反向视频密文不挤出probe。视频密文在真实共享session上处理；不把这项fixture描述为已认证前QUIC视频数据面测试。DirectProbe自身仍是128包窗口，不保证无限乱序，新旧probe实现需同批构建或失败回落。
+
 ### DL2-012 · P1 · 编码器重配与显示切换不能阻塞输入消费
 
 - [ ] 将慢控制编排与输入快路径分开。
