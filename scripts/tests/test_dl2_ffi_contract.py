@@ -33,6 +33,18 @@ class FFIContractTests(unittest.TestCase):
         self.assertIn("SessionCapabilities(encoded: data)", source)
         self.assertIn("remotePlatform = .unknown", source)
 
+    def test_protocol_version_is_generated_for_swift_and_c(self):
+        version = header.PROTOCOL_VERSION
+        self.assertIn(f"deskLinkWireProtocolVersion: UInt16 = {version}", header.SWIFT_VERSION.read_text(encoding="utf-8"))
+        self.assertIn(f"#define DESKLINK_PROTOCOL_VERSION {version}", header.HEADERS[0].read_text(encoding="utf-8"))
+        events = (ROOT / "apps/apple/Sources/DeskLinkAppleCore/DeskLinkEvents.swift").read_text(encoding="utf-8")
+        self.assertIn("var cValue: UInt32", events)
+
+    def test_known_host_transfer_cannot_be_classified_as_fatal_error(self):
+        host = (ROOT / "apps/macos/Sources/DeskLinkApp/Bridge/HostBridge.swift").read_text(encoding="utf-8")
+        self.assertIn("case DESKLINK_HOST_EVENT_TRANSFER: .transfer", host)
+        self.assertIn("default: .unknown", host)
+
 
 if __name__ == "__main__":
     unittest.main()

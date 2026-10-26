@@ -5,9 +5,9 @@ import XCTest
 
 final class RemoteCursorPositionTests: XCTestCase {
     // Rust's production cursor codec verifies these exact Swift fixtures.
-    private let visibleFixture: [UInt8] = [12, 7, 11, 42, 160, 194, 30, 224, 198, 91, 1, 99]
-    private let hiddenFixture: [UInt8] = [12, 7, 12, 43, 0, 128, 137, 122, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1]
-    private let cornerFixture: [UInt8] = [12, 8, 1, 0, 128, 137, 122, 0, 1, 0]
+    private let visibleFixture: [UInt8] = [13, 7, 11, 42, 160, 194, 30, 224, 198, 91, 1, 99]
+    private let hiddenFixture: [UInt8] = [13, 7, 12, 43, 0, 128, 137, 122, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1]
+    private let cornerFixture: [UInt8] = [13, 8, 1, 0, 128, 137, 122, 0, 1, 0]
 
     func testProductionPostcardCursorFixture() throws {
         let position = try XCTUnwrap(RemoteCursorPosition.decode(Data(visibleFixture)))
@@ -35,7 +35,7 @@ final class RemoteCursorPositionTests: XCTestCase {
         XCTAssertNil(RemoteCursorPosition.decode(Data(visibleFixture + [0])))
         XCTAssertNil(RemoteCursorPosition.decode(Data(repeating: 0, count: 257)))
         var wrongVersion = visibleFixture
-        wrongVersion[0] = 11
+        wrongVersion[0] = 12
         XCTAssertNil(RemoteCursorPosition.decode(Data(wrongVersion)))
         var invalidBool = visibleFixture
         invalidBool[10] = 2

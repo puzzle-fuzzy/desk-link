@@ -295,6 +295,8 @@
 - [x] ABI 基础切片：Rust 公开枚举/struct/extern 签名生成两份字节一致 C 头；新增有界显示器/音频/画质/profile 命令及 transfer 消息入口，统一取消截止；认证能力事件含远端平台/尺寸/profile，Swift 显式接收 Control/Transfer/Audio/Capabilities。Rust 16 单元 + 2 ABI 布局回归通过（MSVC 实际编译所有公开 struct 的 sizeof/align/offset，与 Rust 对照）；Python 4 合同、生成检查通过。主题 `feat(DL2-025): generate ABI headers and expose bounded session commands`。
 - [ ] 其余 typed Swift 事件/能力消费及每种命令端到端回执；当前最新消息暂存不等于音频播放或文件工作流，事件所有权由生成头明确为仅回调期间借用。Swift/Xcode 目标布局与端到端调用尚待 Apple 环境。
 
+- [x] 契约同步补充：复用产品组协议 13 独立提交 `9979c6424cf99f704feb212c7700833fce466dae`（本分支 cherry-pick `da44ff2`），生成 C/Swift 版本常量并对齐光标 fixture；修正生成 C uint32_t 的 Swift 参数类型、显式测试 C 模块依赖；已知 Host Transfer 不再落入终态错误。Python FFI 6 + 光标 6 合同、Rust 光标 fixture/InputState/版本边界 5 项通过。主题 `fix(DL2-025): align generated Swift and protocol 13 contracts`。
+
 ### DL2-026 · P1 · 补齐 macOS → Windows 的会话功能闭环
 
 - [ ] 将已有底层功能真正接到 AppleCore 与 macOS 会话界面。

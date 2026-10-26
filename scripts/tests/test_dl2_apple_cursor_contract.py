@@ -19,6 +19,16 @@ def fixture(name: str) -> bytes:
     return bytes(int(value.strip()) for value in text.split(","))
 
 
+def wire_version() -> int:
+    protocol = read(ROOT / "crates/desklink-protocol/src/lib.rs")
+    rust_version = int(re.search(r"PROTOCOL_VERSION: u16 = (\d+)", protocol).group(1))
+    generated = read(CORE / "WireProtocolVersion.swift")
+    swift_version = int(re.search(r"deskLinkWireProtocolVersion: UInt16 = (\d+)", generated).group(1))
+    if swift_version != rust_version:
+        raise AssertionError("generated Swift wire version does not match Rust")
+    return rust_version
+
+
 def reference_decode(data: bytes) -> tuple:
     """Independent postcard wire oracle for the checked Rust/Swift fixtures."""
     if not 0 < len(data) <= 256:
@@ -46,7 +56,7 @@ def reference_decode(data: bytes) -> tuple:
     x, y = unsigned(32), unsigned(32)
     x, y = (x >> 1) ^ -(x & 1), (y >> 1) ^ -(y & 1)
     visible, shape = unsigned(1), unsigned(64)
-    if version != 12 or not stream or not sequence or not 0 <= x <= 1_000_000 or not 0 <= y <= 1_000_000 or offset != len(data):
+    if version != wire_version() or not stream or not sequence or not 0 <= x <= 1_000_000 or not 0 <= y <= 1_000_000 or offset != len(data):
         raise ValueError("invalid")
     return stream, sequence, timestamp, x, y, bool(visible), shape
 
@@ -62,15 +72,14 @@ class AppleCursorContractTests(unittest.TestCase):
         self.assertIn("encode_cursor_update(&update)", rust)
         self.assertIn("decode_cursor_update(&fixture)", rust)
         self.assertIn("RemoteCursorPositionTests.swift", rust)
-        protocol = read(ROOT / "crates/desklink-protocol/src/lib.rs")
         swift = read(CORE / "RemoteCursorPosition.swift")
-        version = re.search(r"PROTOCOL_VERSION: u16 = (\d+)", protocol).group(1)
-        self.assertIn(f"wireProtocolVersion: UInt16 = {version}", swift)
+        self.assertIn("wireProtocolVersion: UInt16 = deskLinkWireProtocolVersion", swift)
+        self.assertEqual(fixture("visibleFixture")[0], wire_version())
 
     def test_bad_size_truncated_overflow_and_trailing_data_are_rejected(self):
         valid = fixture("visibleFixture")
         invalid = [valid[:length] for length in range(len(valid))]
-        invalid.extend([valid + b"\0", bytes(257), b"\x0b" + valid[1:]])
+        invalid.extend([valid + b"\0", bytes(257), bytes([wire_version() - 1]) + valid[1:]])
         invalid.extend([valid[:10] + b"\x02" + valid[11:], fixture("hiddenFixture")[:-1] + b"\x02"])
         for encoded in invalid:
             with self.subTest(encoded=encoded), self.assertRaises(ValueError):

@@ -30,7 +30,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DeskLinkAppleCoreTests",
-            dependencies: ["DeskLinkAppleCore"],
+            dependencies: ["DeskLinkAppleCore", "DeskLinkC"],
             path: "Tests/DeskLinkAppleCoreTests",
             linkerSettings: [
                 .unsafeFlags([

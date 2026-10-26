@@ -352,6 +352,10 @@ final class HostBridge: ObservableObject {
             releaseAllLocalInput()
         case .metrics:
             if let metrics = event.metrics { self.metrics = metrics }
+        case .transfer:
+            lastError = "当前 Mac 共享尚不支持文件和剪贴板传输。"
+        case .unknown:
+            break
         }
     }
 
@@ -534,6 +538,8 @@ private enum HostCallbackKind {
     case keyframeRequested
     case releaseAll
     case metrics
+    case transfer
+    case unknown
 }
 
 private struct HostCallbackEvent {
@@ -589,7 +595,8 @@ private func hostCallbackKind(_ kind: DesklinkHostEventKind) -> HostCallbackKind
     case DESKLINK_HOST_EVENT_KEYFRAME_REQUESTED: .keyframeRequested
     case DESKLINK_HOST_EVENT_RELEASE_ALL: .releaseAll
     case DESKLINK_HOST_EVENT_METRICS: .metrics
-    default: .error
+    case DESKLINK_HOST_EVENT_TRANSFER: .transfer
+    default: .unknown
     }
 }
 

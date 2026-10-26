@@ -9,6 +9,8 @@
 #define DESKLINK_PAIRING_INVITE_BYTES 181
 #define DESKLINK_DIRECTORY_ACCESS_CODE_BYTES 8
 
+#define DESKLINK_PROTOCOL_VERSION 13
+
 #ifdef __cplusplus
 extern "C" {
 #endif

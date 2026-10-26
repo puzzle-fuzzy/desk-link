@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// A neutral position marker, not a reconstruction of the host cursor shape.
-/// v12 only transmits an opaque shape handle, so no hotspot can be inferred.
+/// v13 only transmits an opaque shape handle, so no hotspot can be inferred.
 public struct RemoteCursorPositionLayer: View {
     public let overlay: CursorOverlay?
     public let activeStreamID: UInt64?

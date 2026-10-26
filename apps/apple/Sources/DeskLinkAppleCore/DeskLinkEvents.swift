@@ -5,10 +5,10 @@ public enum DeskLinkPlatform: Equatable, Sendable {
     case macos
     case ios
 
-    var cValue: DesklinkPlatform {
+    var cValue: UInt32 {
         switch self {
-        case .macos: DESKLINK_PLATFORM_MACOS
-        case .ios: DESKLINK_PLATFORM_IOS
+        case .macos: UInt32(DESKLINK_PLATFORM_MACOS.rawValue)
+        case .ios: UInt32(DESKLINK_PLATFORM_IOS.rawValue)
         }
     }
 }
