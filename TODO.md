@@ -400,7 +400,8 @@
 - **本切片验证：** 文档本地链接、10 处相关源码路径和 12 个完整提交身份可解析，独立只读复核无阻塞事实错误，`git diff --check` 通过；未修改 crates/apps/server 业务源码。既有 Windows 全栈验证保留原始源码身份，不冒称各组集成验证或新增性能结果。
 - [ ] **仍依赖集成：** 009 协议13、Apple 003/004/025、网络024、媒体011/012/021与产品002等提交须在统一 revision 收口，再逐切片消除重复 owner；DL2-014 同硬件前后比较、Swift/Xcode、真实资源/取消/权限场景仍缺。当前只完成整理，主项继续未完成，不在本分支提前重写 controller/runtime/FFI。
 - [x] **追加协调合同（`docs(DL2-040): record input epoch ownership and probe lane gates`）：** 明确 Apple/FFI 单一 owner 发布 `VideoConfig.input_epoch` / `InputEnvelope{stream_id,input_epoch}`，媒体 host 原子清键/推进/映射锁校验，产品实际首帧呈现后启用并在入队固定 context；旧输入/旧 release 必须隔离，取消与本机收回独立有效，不以 seq/wallclock/config_version 替代。013 严格绑定仍未完成。已核对媒体独立 probe lane 提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`；合同、调用方及接入验证须分别交付。文档链接、固定提交身份与 diff 检查通过，未改活跃模块。
-- **待交付字段补充（`docs(DL2-040): clarify pending framed input context contract`）：** 记录 owner 明确的字段顺序、非零 stream/epoch、显式 InputContext 和 `[0, PROTOCOL_VERSION:u16 little-endian]` 前缀，由 encode_input/decode_session_input 唯一处理；禁止旧合法 Function(1) 的布局歧义、无context fallback和发送时补当前值。字段/前缀仍未落本分支源码，不冒称合同已提交；首帧门禁适用于该context远端输入，取消/本机收回独立。
+- **合同导入前的字段记录（`docs(DL2-040): clarify pending framed input context contract`）：** 记录 owner 明确的字段顺序、非零 stream/epoch、显式 InputContext 和 `[0, PROTOCOL_VERSION:u16 little-endian]` 前缀，由 encode_input/decode_session_input 唯一处理；禁止旧合法 Function(1) 的布局歧义、无context fallback和发送时补当前值。当时字段/前缀尚未落本分支；首帧门禁适用于该context远端输入，取消/本机收回独立。
+- **合同导入后的实际边界（`docs(DL2-040): separate landed wire contract from zero-context producers`）：** 来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`，只有wire/codec合同落地。HostVideoPipeline、FFI host配置以及两处controller输入生产者仍显式零；显式发送API/host映射/两平台生产者待接线。真实host runtime在prepare生成配置处被拒绝InvalidVideoConfig，非夹具缺字段；当前不可交付，不默认1、不在发送时取当前epoch、不跳过业务失败。
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 
