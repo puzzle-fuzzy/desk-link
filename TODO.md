@@ -208,6 +208,9 @@
 
 - [x] Controller/FFI 输入切片：`ControllerRuntime::send_input_with_context(context: InputContext, event: InputEvent)` 严格校验并序列化原 context；旧无上下文方法保持拒绝。FFI DesklinkInput/Event 贯通 epoch，有界队列、合成 release 按 context 保存；新增 `desklink_release_all_for_context`，旧 epoch 的同名键释放不会清掉新 epoch ledger，空 ledger 回收且最多跟踪 8 个 context。生成 C 头与实际 C/Rust 布局一致。Rust 20 单元+7 ABI+2布局+5 Controller loopback共34项通过。主题 `feat(DL2-013): preserve captured input context across FFI queues and releases`。
 
+- [x] FFI Mac Host 切片：随机种子进程共享非零 epoch 分配器，溢出失败；同 stream/尺寸编码重配保留 epoch，换流/尺寸发布前可靠清键，输入仅匹配已发布 context。旧 context 在时钟/过期检查前丢弃；满队列保留终态清理容量，清键/keyup 无法可靠入队则安全终止。Rust 23 单元 + 14 真实本地 Host loopback 共37项通过，覆盖配置前不注入、旧keyup/过期旧keyup/鼠标丢弃、换几何、饱和与取消。主题 `fix(DL2-013): enforce published input epochs on the FFI host`。
+- [ ] FFI Mac Host 当前只可绑定 stream 与编码尺寸；完整源显示器/捕获拓扑身份和真实 Mac 注入验收仍缺，不能据此整体关闭 013。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

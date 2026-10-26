@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,15 +11,17 @@ use desklink_crypto::{
     DeviceIdentity, NoiseResponder, SecureLane, SecureRole, SecureSession, SessionId,
 };
 use desklink_protocol::{
-    Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, NoiseHandshake,
-    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, VideoConfig, decode_control,
-    decode_cursor_update, decode_input, decode_noise_handshake, decode_transfer, encode_control,
+    Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputContext,
+    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep,
+    PROTOCOL_VERSION, Platform, ProtocolError, VideoConfig, decode_control, decode_cursor_update,
+    decode_noise_handshake, decode_session_input, decode_transfer, encode_control,
     encode_noise_handshake, encode_transfer, encode_video_config,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin, TransportError, TransportEvent};
 use desklink_video::{EncodedFrame, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
+use rand_core::{OsRng, RngCore};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroize;
 
@@ -35,6 +37,30 @@ const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // Nonterminal events may be dropped when this reserve would be consumed. That keeps the
 // bounded event path nonblocking while guaranteeing room for ReleaseAll, Error, and Closed.
 const TERMINAL_EVENT_RESERVE: usize = 3;
+
+static INPUT_EPOCH_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+
+fn allocate_input_epoch() -> Result<u64, HostError> {
+    let counter = INPUT_EPOCH_COUNTER.get_or_init(|| {
+        let seed = loop {
+            let seed = OsRng.next_u64();
+            if seed != 0 && seed != u64::MAX {
+                break seed;
+            }
+        };
+        AtomicU64::new(seed)
+    });
+    advance_input_epoch(counter)
+}
+
+fn advance_input_epoch(counter: &AtomicU64) -> Result<u64, HostError> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+            epoch.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| HostError::Protocol("host input epoch exhausted".into()))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -324,7 +350,7 @@ impl Drop for HostWorker {
 }
 
 fn emit_nonterminal(events: &mpsc::Sender<HostEvent>, event: HostEvent) {
-    // Never await application event capacity on the worker. Input, keyframe, metrics, and
+    // Never await application event capacity on the worker. Keyframe, metrics, and
     // approval notifications are best-effort under backpressure; terminal notifications below
     // retain their reserved slots and are never displaced by this path.
     if events.capacity() > TERMINAL_EVENT_RESERVE {
@@ -332,8 +358,18 @@ fn emit_nonterminal(events: &mpsc::Sender<HostEvent>, event: HostEvent) {
     }
 }
 
+fn emit_required(events: &mpsc::Sender<HostEvent>, event: HostEvent) -> Result<(), HostError> {
+    // Stateful input and release barriers may never be silently dropped. If the
+    // application is stalled, fail closed while the three terminal slots still
+    // guarantee ReleaseAll/Error/Closed without waiting on event capacity.
+    if events.capacity() <= TERMINAL_EVENT_RESERVE {
+        return Err(HostError::CommandQueueFull);
+    }
+    events.try_send(event).map_err(|_| HostError::WorkerStopped)
+}
+
 fn emit_terminal(events: &mpsc::Sender<HostEvent>, error: Option<HostError>) {
-    // Every worker producer uses emit_nonterminal, so the three slots reserved above make this
+    // Every nonterminal producer preserves the three slots above, making this
     // nonblocking sequence deliver ReleaseAll before its optional Error and final Closed state.
     let _ = events.try_send(HostEvent::ReleaseAll);
     if let Some(error) = error {
@@ -395,7 +431,10 @@ async fn run_worker(
                     && !*cancellation.borrow() =>
             {
                 let _ = try_advance_worker_phase(&phase, &phase_gate, WorkerPhase::Connecting);
-                emit_nonterminal(&events, HostEvent::ReleaseAll);
+                if let Err(error) = emit_required(&events, HostEvent::ReleaseAll) {
+                    terminal_error = Some(error);
+                    break;
+                }
                 emit_nonterminal(&events, HostEvent::State(HostState::Connecting));
                 match reconnect_host(
                     reconnect_config.as_ref().expect("checked above"),
@@ -713,7 +752,7 @@ async fn wait_for_approval_command(
                 }
                 Some(HostCommand::Reject | HostCommand::Stop) | None => return Ok(false),
                 Some(HostCommand::ReleaseAll) => {
-                    emit_nonterminal(events, HostEvent::ReleaseAll);
+                    emit_required(events, HostEvent::ReleaseAll)?;
                 }
                 Some(_) => return Err(HostError::InvalidState),
             },
@@ -838,9 +877,20 @@ async fn run_connected(
                     }
                     TransportEvent::Input(ciphertext) => {
                         let plaintext = secure.open(SecureLane::Input, &ciphertext).map_err(crypto_error)?;
-                        let input = decode_input(&plaintext, now_micros()).map_err(protocol_error)?;
+                        let input = decode_session_input(&plaintext).map_err(protocol_error)?;
+                        if video.input_context() != Some(input.context()) {
+                            continue;
+                        }
+                        // Discard retired contexts before checking freshness, so
+                        // a delayed old key-up cannot terminate its successor.
+                        let now = now_micros();
+                        if input.timestamp_us < now.saturating_sub(MAX_INPUT_AGE_US)
+                            || input.timestamp_us > now.saturating_add(MAX_INPUT_FUTURE_SKEW_US)
+                        {
+                            return Err(protocol_error(ProtocolError::TimestampOutsideWindow));
+                        }
+                        emit_required(events, HostEvent::Input(input.event))?;
                         metrics.received_input_events = metrics.received_input_events.saturating_add(1);
-                        emit_nonterminal(events, HostEvent::Input(input.event));
                     }
                     TransportEvent::Transfer(ciphertext) => {
                         let plaintext = secure.open(SecureLane::Transfer, &ciphertext).map_err(crypto_error)?;
@@ -868,8 +918,43 @@ async fn run_connected(
 
 #[derive(Default)]
 struct VideoState {
-    config: Option<(u64, u32, u16, u16)>,
+    config: Option<PublishedVideoConfig>,
     next_access_unit_is_keyframe: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PublishedVideoConfig {
+    context: InputContext,
+    version: u32,
+    width: u16,
+    height: u16,
+}
+
+impl VideoState {
+    fn input_context(&self) -> Option<InputContext> {
+        self.config.map(|config| config.context)
+    }
+
+    fn context_for_geometry(
+        &self,
+        stream_id: u64,
+        width: u16,
+        height: u16,
+    ) -> Result<InputContext, HostError> {
+        if let Some(current) = self.config
+            && (current.context.stream_id, current.width, current.height)
+                == (stream_id, width, height)
+        {
+            return Ok(current.context);
+        }
+        // The current FFI host only exposes encoded dimensions and stream ID.
+        // A display ID/capture-topology generation must be added before these
+        // checks can claim to bind inputs to arbitrary source-monitor changes.
+        Ok(InputContext {
+            stream_id,
+            input_epoch: allocate_input_epoch()?,
+        })
+    }
 }
 
 async fn handle_command(
@@ -890,10 +975,11 @@ async fn handle_command(
             height,
             bytes,
         } => {
+            let context = video.context_for_geometry(stream_id, width, height)?;
             let config = VideoConfig {
                 protocol_version: PROTOCOL_VERSION,
                 stream_id,
-                input_epoch: 0,
+                input_epoch: context.input_epoch,
                 config_version: version,
                 codec: Codec::H264,
                 width,
@@ -901,6 +987,13 @@ async fn handle_command(
                 sequence_header: bytes,
             };
             let plaintext = encode_video_config(&config).map_err(protocol_error)?;
+            if video
+                .input_context()
+                .is_some_and(|previous| previous != context)
+            {
+                emit_required(events, HostEvent::ReleaseAll)?;
+                video.config = None;
+            }
             let ciphertext = secure
                 .seal(SecureLane::VideoConfig, &plaintext)
                 .map_err(crypto_error)?;
@@ -908,7 +1001,12 @@ async fn handle_command(
                 .send_video_config(ciphertext)
                 .await
                 .map_err(transport_error)?;
-            video.config = Some((stream_id, version, width, height));
+            video.config = Some(PublishedVideoConfig {
+                context,
+                version,
+                width,
+                height,
+            });
             video.next_access_unit_is_keyframe = true;
             metrics.sent_video_configs = metrics.sent_video_configs.saturating_add(1);
             Ok(true)
@@ -919,10 +1017,10 @@ async fn handle_command(
             config_version,
             bytes,
         } => {
-            let Some((configured_stream, configured_version, width, height)) = video.config else {
+            let Some(config) = video.config else {
                 return Err(HostError::InvalidState);
             };
-            if (stream_id, config_version) != (configured_stream, configured_version) {
+            if (stream_id, config_version) != (config.context.stream_id, config.version) {
                 return Err(HostError::InvalidState);
             }
             let config_flag = video.next_access_unit_is_keyframe;
@@ -940,8 +1038,8 @@ async fn handle_command(
                 frame_id,
                 config_version,
                 capture_timestamp_us: now_micros(),
-                width,
-                height,
+                width: config.width,
+                height: config.height,
                 flags,
                 data: bytes,
             };
@@ -988,7 +1086,7 @@ async fn handle_command(
             Ok(true)
         }
         HostCommand::ReleaseAll => {
-            emit_nonterminal(events, HostEvent::ReleaseAll);
+            emit_required(events, HostEvent::ReleaseAll)?;
             Ok(true)
         }
     }
@@ -1063,15 +1161,86 @@ fn crypto_error(error: desklink_crypto::CryptoError) -> HostError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, atomic::AtomicU8};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    };
 
     use super::{
-        HostCommand, HostError, WorkerPhase, command_is_admissible, contains_idr,
-        is_retryable_host_error, record_terminal_admission, try_advance_worker_phase,
-        wait_for_approval_with_timeout,
+        HostCommand, HostError, HostEvent, HostState, PublishedVideoConfig, VideoState,
+        WorkerPhase, advance_input_epoch, command_is_admissible, contains_idr, emit_nonterminal,
+        emit_required, emit_terminal, is_retryable_host_error, record_terminal_admission,
+        try_advance_worker_phase, wait_for_approval_with_timeout,
     };
     use ed25519_dalek::SigningKey;
     use tokio::sync::{mpsc, watch};
+
+    #[test]
+    fn epoch_allocator_is_shared_across_video_state_and_refuses_to_wrap() {
+        let first = VideoState::default()
+            .context_for_geometry(7, 640, 360)
+            .unwrap();
+        let second = VideoState::default()
+            .context_for_geometry(7, 640, 360)
+            .unwrap();
+        assert!(first.is_valid());
+        assert!(second.input_epoch > first.input_epoch);
+
+        let last = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(advance_input_epoch(&last), Ok(u64::MAX));
+        assert!(matches!(
+            advance_input_epoch(&last),
+            Err(HostError::Protocol(_))
+        ));
+        assert_eq!(last.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn encoded_geometry_reconfiguration_preserves_only_the_matching_input_context() {
+        let mut state = VideoState::default();
+        assert_eq!(state.input_context(), None);
+        let context = state.context_for_geometry(7, 640, 360).unwrap();
+        // Planning a configuration does not grant it before publication.
+        assert_eq!(state.input_context(), None);
+        state.config = Some(PublishedVideoConfig {
+            context,
+            version: 1,
+            width: 640,
+            height: 360,
+        });
+        assert_eq!(state.context_for_geometry(7, 640, 360).unwrap(), context);
+        state.config.as_mut().unwrap().version = 2;
+        assert_eq!(state.context_for_geometry(7, 640, 360).unwrap(), context);
+        assert_ne!(state.context_for_geometry(7, 800, 600).unwrap(), context);
+        assert_ne!(state.context_for_geometry(8, 640, 360).unwrap(), context);
+    }
+
+    #[test]
+    fn required_release_fails_closed_without_consuming_terminal_capacity() {
+        let (events, mut receiver) = mpsc::channel(5);
+        emit_nonterminal(&events, HostEvent::KeyframeRequested);
+        emit_nonterminal(&events, HostEvent::KeyframeRequested);
+        assert_eq!(events.capacity(), 3);
+        assert_eq!(
+            emit_required(&events, HostEvent::ReleaseAll),
+            Err(HostError::CommandQueueFull)
+        );
+        emit_terminal(&events, Some(HostError::CommandQueueFull));
+        let mut delivered = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(
+            delivered,
+            vec![
+                HostEvent::KeyframeRequested,
+                HostEvent::KeyframeRequested,
+                HostEvent::ReleaseAll,
+                HostEvent::Error(HostError::CommandQueueFull),
+                HostEvent::State(HostState::Closed),
+            ]
+        );
+    }
 
     #[test]
     fn terminal_admission_blocks_late_worker_completion_transitions() {

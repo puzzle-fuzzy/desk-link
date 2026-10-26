@@ -156,6 +156,9 @@ pub struct HostRuntime {
 }
 
 impl HostRuntime {
+    /// Bounded application event capacity, including reserved shutdown events.
+    pub const EVENT_CAPACITY: usize = HOST_EVENT_CAPACITY;
+
     pub fn start(
         client: QuicClient,
         identity: HostIdentity,
