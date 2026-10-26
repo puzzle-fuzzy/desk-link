@@ -80,7 +80,9 @@ pub struct EncodedFrame {
 /// are not allocator telemetry or a count of driver/GPU transfers.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct EncoderPerformanceSample {
+    /// Input submitted during this call; output may belong to an older input.
     pub frame_id: u64,
+    pub output_frame_id: Option<u64>,
     pub config_version: u32,
     pub convert_us: u64,
     pub mft_us: u64,
@@ -95,9 +97,67 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(any(windows, test))]
+fn record_output_performance(sample: &mut EncoderPerformanceSample, output: PendingFrame) {
+    sample.output_frame_id = Some(output.frame_id);
+    sample.output_residence_us = Some(elapsed_us(output.submitted_at));
+}
+
+#[cfg(any(windows, test))]
+fn match_pending_output(
+    pending: &mut std::collections::VecDeque<PendingFrame>,
+    timestamp_us: Option<u64>,
+) -> Option<PendingFrame> {
+    if let Some(timestamp_us) = timestamp_us {
+        pending
+            .iter()
+            .position(|frame| frame.timestamp_us == timestamp_us)
+            .and_then(|index| pending.remove(index))
+    } else {
+        pending.pop_front()
+    }
+}
+
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn buffered_output_performance_keeps_distinct_input_and_output_ids() {
+        let mut pending = std::collections::VecDeque::from([
+            PendingFrame {
+                frame_id: 11,
+                config_version: 7,
+                timestamp_us: 11_000,
+                submitted_at: std::time::Instant::now(),
+            },
+            PendingFrame {
+                frame_id: 12,
+                config_version: 7,
+                timestamp_us: 12_000,
+                submitted_at: std::time::Instant::now(),
+            },
+        ]);
+        let mut sample = EncoderPerformanceSample {
+            frame_id: 12,
+            config_version: 7,
+            ..EncoderPerformanceSample::default()
+        };
+        let old_output = match_pending_output(&mut pending, Some(11_000)).unwrap();
+        record_output_performance(&mut sample, old_output);
+        assert_eq!(sample.frame_id, 12);
+        assert_eq!(sample.output_frame_id, Some(11));
+        assert_eq!(sample.config_version, 7);
+        assert!(sample.output_residence_us.is_some());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.front().unwrap().frame_id, 12);
+        assert!(match_pending_output(&mut pending, Some(99_000)).is_none());
+        assert_eq!(
+            pending.len(),
+            1,
+            "an unknown timestamp cannot consume another frame's attribution"
+        );
+    }
 
     #[test]
     fn asynchronous_calls_require_matching_bounded_event_credits() {
@@ -187,13 +247,26 @@ mod backend_tests {
             timestamp_us: index * 33_333,
             pixels: vec![index as u8; 64 * 64 * 4],
         };
-        encoder.encode(frame(1), true).unwrap();
+        let first = encoder.encode(frame(1), true).unwrap();
         assert!(encoder.last_performance_sample().unwrap().nv12_buffer_grew);
+        assert_eq!(
+            encoder.last_performance_sample().unwrap().frame_id,
+            first.frame_id
+        );
+        assert_eq!(
+            encoder.last_performance_sample().unwrap().output_frame_id,
+            Some(first.frame_id)
+        );
         let pointer = encoder.nv12_buffer.as_ptr();
         let capacity = encoder.nv12_buffer.capacity();
         for index in 2..=4 {
-            encoder.encode(frame(index), false).unwrap();
+            let output = encoder.encode(frame(index), false).unwrap();
             assert!(!encoder.last_performance_sample().unwrap().nv12_buffer_grew);
+            assert_eq!(encoder.last_performance_sample().unwrap().frame_id, index);
+            assert_eq!(
+                encoder.last_performance_sample().unwrap().output_frame_id,
+                Some(output.frame_id)
+            );
             assert_eq!(encoder.nv12_buffer.as_ptr(), pointer);
             assert_eq!(encoder.nv12_buffer.capacity(), capacity);
         }
@@ -657,7 +730,7 @@ pub struct H264Encoder {
     backend: native::MediaFoundationEncoder,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug)]
 struct PendingFrame {
     frame_id: u64,
@@ -826,6 +899,7 @@ impl H264Encoder {
             };
             self.last_performance_sample = Some(EncoderPerformanceSample {
                 frame_id: next_frame_id,
+                output_frame_id: None,
                 config_version: self.config_version,
                 convert_us,
                 mft_us: elapsed_us(mft_started),
@@ -855,20 +929,13 @@ impl H264Encoder {
                 }
                 return Err(EncoderError::NeedMoreInput);
             };
-            let pending = if let Some(timestamp_us) = output.timestamp_us {
-                self.pending_frames
-                    .iter()
-                    .position(|pending| pending.timestamp_us == timestamp_us)
-                    .and_then(|index| self.pending_frames.remove(index))
-            } else {
-                self.pending_frames.pop_front()
-            };
+            let pending = match_pending_output(&mut self.pending_frames, output.timestamp_us);
             let Some(pending) = pending else {
                 return Err(EncoderError::NeedMoreInput);
             };
             if let Some(sample) = &mut self.last_performance_sample {
                 sample.pending_frames = self.pending_frames.len();
-                sample.output_residence_us = Some(elapsed_us(pending.submitted_at));
+                record_output_performance(sample, pending);
             }
             Ok(EncodedFrame {
                 frame_id: pending.frame_id,

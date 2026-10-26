@@ -2,6 +2,8 @@
 
 DL2-014 的首个可复跑切片只测本机合成输入，不打开远控连接、不捕获桌面、不注入输入。生产 `H264Encoder` 为最近一次提交保存单个固定尺寸样本，计时使用本机 `Instant`；配置切换清空样本。`convert_us` 包括 CPU 转色及其分配，`mft_us` 包括同步 MF 提交和可用输出的读取；输出驻留时间从对应输入的本机提交开始计算。它不是跨机帧龄、GPU 时间或输入到显示延迟。
 
+原始样本的 `frame_id` 始终指本次提交的输入，`convert_us`/`mft_us` 属于这次调用；异步 MFT 可能在输入12时返回输入11的结果，因此新增 `output_frame_id` 单独关联输出及 `output_residence_us`。仅有提交、尚无输出时这两项为 null。逐帧归因必须用 `(config_version, output_frame_id)` 找到对应历史输入，不能默认本次调用的输入 ID 就是输出 ID，也不能把两者的阶段耗时直接拼在一起。当前汇总百分位不声称提供整条链路逐帧时序。
+
 ```powershell
 $env:CARGO_TARGET_DIR = 'E:\desk-link\.worktrees\dl2-targets\windows-media'
 python scripts/benchmark-windows-media.py --width 1920 --height 1080 --frames 120 --warmup 10 --label 'same-machine-static' --output dist/windows/media-1080p-before.json

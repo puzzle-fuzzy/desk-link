@@ -225,6 +225,8 @@
 - **验证：** 经 `scripts/run-windows-cargo.py` 执行 `test -p desklink-windows --test encoder_contract --example media_baseline --locked`（11+1通过，1个既有人工基准忽略）；`clippy -p desklink-windows --lib --example media_baseline --locked -- -D warnings`通过；Python编译与64×64/3帧工具烟测通过。并行编辑期间报告正确标记源码变化，烟测不是稳定性能结论。
 - [ ] **仍待完整基线：** GPU/双机、队列及端到端、分配/功耗/温度/长稳矩阵与同条件前后实测；本切片不宣称性能收益。
 
+- [x] **缓冲输出归因（`fix(DL2-014): distinguish submitted and buffered output frame timings`）：** 固定样本新增output_frame_id，frame_id仍表示当前输入；输出驻留使用实际匹配的旧PendingFrame，避免异步缓冲时把上一帧时间归到本帧。encoder 15项通过，含input12/output11事件fixture及实际软件64×64编码输出ID核对；lib严格Clippy通过。
+
 ### DL2-015 · P1 · 将 Windows 捕获与颜色转换尽量留在 GPU
 
 - [ ] 重构 texture 生命周期，减少每帧 CPU 回读、逐像素转换与临时分配。
