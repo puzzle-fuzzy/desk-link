@@ -1,4 +1,5 @@
 import { AccountStore } from "./db/store";
+import { clientAddress } from "./client-address";
 import { cleanupAccountHistory } from "./db/retention";
 import type { AccountConfig } from "./config";
 import { loadAccountConfig } from "./config";
@@ -20,7 +21,7 @@ export interface AccountAppDependencies {
 }
 
 export interface AccountApp {
-  fetch(request: Request): Promise<Response>;
+  fetch(request: Request, context?: { remoteAddress?: string }): Promise<Response>;
   flushOutbox(): Promise<number>;
   cleanupHistory(): ReturnType<typeof cleanupAccountHistory>;
   close(): Promise<void>;
@@ -37,7 +38,8 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
   const allowedOrigins = config.corsOrigins;
 
   return {
-    async fetch(request: Request): Promise<Response> {
+    async fetch(request: Request, context = {}): Promise<Response> {
+      const ip = clientAddress(request, context.remoteAddress, config.trustedProxyAddresses);
       const id = requestId(request);
       const origin = request.headers.get("origin");
       const cors = corsHeaders(origin, allowedOrigins);
@@ -67,7 +69,7 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
 
         if (request.method === "POST" && url.pathname === "/v1/account/register") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "register", body, now());
+          enforceRateLimit(rateLimiter, ip, "register", body, now());
           return jsonResponse(await accounts.register({
             email: body.email,
             password: body.password,
@@ -78,7 +80,7 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
         }
         if (request.method === "POST" && url.pathname === "/v1/account/verify-email") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "verify-email", body, now());
+          enforceRateLimit(rateLimiter, ip, "verify-email", body, now());
           return jsonResponse({ user: await accounts.verifyEmail(body.token) }, 200, id, cors);
         }
         if (request.method === "GET" && url.pathname === "/v1/account/verify-email") {
@@ -90,13 +92,13 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
         }
         if (request.method === "POST" && url.pathname === "/v1/account/verify-email/resend") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "resend-verification", body, now());
+          enforceRateLimit(rateLimiter, ip, "resend-verification", body, now());
           await accounts.resendVerification(body.email);
           return jsonResponse({ ok: true }, 202, id, cors);
         }
         if (request.method === "POST" && url.pathname === "/v1/account/login") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "login", body, now());
+          enforceRateLimit(rateLimiter, ip, "login", body, now());
           return jsonResponse(await accounts.login({
             email: body.email,
             password: body.password,
@@ -115,13 +117,13 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
         }
         if (request.method === "POST" && url.pathname === "/v1/account/password/forgot") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "forgot-password", body, now());
+          enforceRateLimit(rateLimiter, ip, "forgot-password", body, now());
           await accounts.requestPasswordReset(body.email);
           return jsonResponse({ ok: true, message: "如果邮箱已注册，重置密码邮件会很快送达。" }, 202, id, cors);
         }
         if (request.method === "POST" && url.pathname === "/v1/account/password/reset") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "reset-password", body, now());
+          enforceRateLimit(rateLimiter, ip, "reset-password", body, now());
           await accounts.resetPassword(body.token, body.password);
           return noContent(id);
         }
@@ -169,14 +171,11 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
 
 function enforceRateLimit(
   limiter: RateLimiter,
-  request: Request,
+  ip: string,
   scope: string,
   body: Record<string, unknown>,
   now: number,
 ): void {
-  const ip = request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim()
-    || request.headers.get("cf-connecting-ip")?.trim()
-    || "unknown";
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase().slice(0, 320) : "missing";
   const limits: Record<string, [number, number]> = {
     register: [5, 3_600],

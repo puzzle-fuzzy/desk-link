@@ -13,7 +13,9 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) {
 export const server = Bun.serve({
   hostname: process.env.DESKLINK_ACCOUNT_ADDR ?? "127.0.0.1",
   port,
-  fetch: app.fetch,
+  fetch(request, server) {
+    return app.fetch(request, { remoteAddress: server.requestIP(request)?.address });
+  },
 });
 
 console.log(`DeskLink account listening on http://${server.hostname}:${server.port}`);

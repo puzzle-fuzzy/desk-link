@@ -27,6 +27,7 @@ DESKLINK_ACCOUNT_PORT=3412 bun run start
 | `DESKLINK_ACCOUNT_MAIL_URL` | 生产邮件 provider 的 HTTPS API 地址 |
 | `DESKLINK_ACCOUNT_MAIL_TOKEN` | provider bearer token；只存在服务端环境变量，不写入数据库 |
 | `DESKLINK_ACCOUNT_MAIL_FROM` | 发件人地址 |
+| `DESKLINK_ACCOUNT_TRUSTED_PROXIES` | 默认空；逗号分隔的直属可信代理精确 IP。只有这些 socket peer 可提供代理覆盖的单值 `X-Real-IP`，不读取 XFF / CF 头作为身份。反代应覆盖该头且阻断外部直连；直连部署保持为空。 |
 
 邮件 provider 接收的请求格式为：
 
@@ -58,7 +59,7 @@ bun run src/outbox-admin.ts /absolute/path/account.sqlite retry <outbox-id>
 - `GET /health`：进程存活检查，返回 `status: ok`。
 - `GET /ready`：校验 schema 版本和请求所需列，并通过回滚的短写事务验证数据库可写；SQLite 锁等待预算为 25ms，失败返回 503 / `not_ready`。输出仅含固定依赖状态，不返回路径、SQL、凭据或堆栈。`dependencies.mail: degraded` 表示存在邮件失败待处理，数据库仍健康时保持 200；探测不访问邮件 provider。
 
-生产环境只应通过反向代理暴露 HTTPS。反向代理需要正确传递 `X-Forwarded-For`，并且只能由可信代理写入该头；服务端会使用它进行账号接口限流。
+生产环境只应通过反向代理暴露 HTTPS。Bun 将 socket peer 交给 app；直连按 peer 限流。显式配置可信代理时，代理必须使用 `proxy_set_header X-Real-IP $remote_addr` 覆盖客户端头。缺失/非法单值头回退为代理 peer，没有 socket context 的测试/嵌入调用共享 `unknown` 桶。限流最多保存 16,384 个键，每次固定最多检查 16 个过期键；容量用尽拒绝新键，避免淘汰仍有效的耗尽桶后重置其额度。
 
 ## 数据和安全边界
 
