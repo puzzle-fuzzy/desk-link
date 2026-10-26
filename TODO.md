@@ -377,6 +377,9 @@
 - **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 20通过；新增中块续传/最终hash、源变化先拒绝、取消/未读完不允许完成、Windows源写入删除排斥4项。此切片消除单次重试的重复扫描，仍有每次重试O(prefix)校验。
 - [ ] **仍待功能/真机：** >256MiB与>4GiB全链边界、目录manifest/冲突/符号链接、持久分块证明及空间预估、控制端复用reader、深目录/稀疏/慢盘实测；未仅调大上限或新增不兼容wire字段。
 
+- [x] **会话退出切片（`fix(DL2-030): cancel file producers when host peers disconnect`）：** 出站任务由HostOutgoingTransfer RAII持有，peer退出/错误/取消均置取消并abort异步sender，释放receiver唤醒堵在有界队列的磁盘producer；已取消reader在打开源/取得Windows共享锁前退出。取消仍不声称能中断已进入OS的read。
+- **验证：** `--lib outgoing_peer_drop --locked` 1通过，确认满队列producer原先受背压、peer Drop后250ms内退出；transfer 24通过，新增取消不打开不存在源文件回归；lib+tests严格Clippy通过。
+
 ### DL2-031 · P2 · 让等待队列中所有文件都能管理
 
 - [ ] 保留紧凑摘要，并允许展开完整队列、逐项移除。

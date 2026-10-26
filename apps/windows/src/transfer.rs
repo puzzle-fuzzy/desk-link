@@ -325,6 +325,9 @@ impl OutgoingFileReader {
         expected_prefix_hash: Option<[u8; 32]>,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Self, TransferResult> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(TransferResult::Cancelled);
+        }
         if resume_offset > source.size || (resume_offset == 0) != expected_prefix_hash.is_none() {
             return Err(TransferResult::InvalidData);
         }
@@ -1215,6 +1218,22 @@ mod tests {
         let staging = root.join("staging");
         let downloads = root.join("downloads");
         (root, staging, downloads)
+    }
+
+    #[test]
+    fn cancelled_source_reader_does_not_open_a_source_or_take_a_share_lock() {
+        let source = super::OutgoingFile {
+            transfer_id: [39; 16],
+            path: "must-not-be-opened.bin".into(),
+            name: "must-not-be-opened.bin".into(),
+            size: 1,
+            modified_at_unix_ns: 0,
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(matches!(
+            super::OutgoingFileReader::open(&source, 0, None, cancelled),
+            Err(desklink_protocol::TransferResult::Cancelled)
+        ));
     }
 
     #[test]

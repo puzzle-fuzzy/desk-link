@@ -3393,6 +3393,7 @@ async fn receive_transfer_loop_inner(
                     file,
                     cancellation: Arc::new(AtomicBool::new(false)),
                     phase: HostOutgoingPhase::AwaitingDecision,
+                    sender_task: None,
                 });
             }
             TransferMessage::FileSelectionCancel { request_id } => {
@@ -3485,7 +3486,7 @@ async fn receive_transfer_loop_inner(
                 let client = client.clone();
                 let secure = secure.clone();
                 let outgoing_events = outgoing_events.clone();
-                tokio::spawn(async move {
+                transfer.sender_task = Some(tokio::spawn(async move {
                     let result = stream_host_outgoing_file(
                         client,
                         secure,
@@ -3502,7 +3503,7 @@ async fn receive_transfer_loop_inner(
                             result,
                         })
                         .await;
-                });
+                }));
             }
             TransferMessage::FileChunk {
                 transfer_id,
@@ -3619,6 +3620,18 @@ struct HostOutgoingTransfer {
     file: OutgoingFile,
     cancellation: Arc<AtomicBool>,
     phase: HostOutgoingPhase,
+    sender_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HostOutgoingTransfer {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+        // Dropping the async receiver also wakes a disk producer blocked on
+        // the bounded chunk queue. Prefix scans observe cancellation per chunk.
+        if let Some(task) = self.sender_task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct HostOutgoingEvent {
@@ -4112,6 +4125,52 @@ mod retry_policy_tests {
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn outgoing_peer_drop_cancels_source_and_wakes_blocked_disk_producer() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (chunks, receiver) = tokio::sync::mpsc::channel(2);
+        chunks.try_send(1).unwrap();
+        chunks.try_send(2).unwrap();
+        let sender_task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(receiver);
+        });
+        // Ensure the sender owns the receiver before cancelling the peer.
+        tokio::task::yield_now().await;
+        let (started, reached) = tokio::sync::oneshot::channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            chunks.blocking_send(3)
+        });
+        reached.await.unwrap();
+        assert!(
+            !producer.is_finished(),
+            "full live queue must backpressure the producer"
+        );
+        let outgoing = super::HostOutgoingTransfer {
+            request_id: 1,
+            file: crate::transfer::OutgoingFile {
+                transfer_id: [1; 16],
+                path: "synthetic.bin".into(),
+                name: "synthetic.bin".into(),
+                size: 1,
+                modified_at_unix_ns: 0,
+            },
+            cancellation: cancelled.clone(),
+            phase: super::HostOutgoingPhase::Sending,
+            sender_task: Some(sender_task),
+        };
+        drop(outgoing);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), producer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[tokio::test]
