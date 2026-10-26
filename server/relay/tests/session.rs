@@ -1,5 +1,9 @@
 use std::{
-    sync::Arc,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -110,10 +114,18 @@ async fn next_event(client: &QuicClient) -> TransportEvent {
 }
 
 async fn raw_join(relay: &TestRelay, join: RelayJoin) -> (Endpoint, quinn::Connection) {
+    raw_join_at(relay, relay.address, join).await
+}
+
+async fn raw_join_at(
+    relay: &TestRelay,
+    address: SocketAddr,
+    join: RelayJoin,
+) -> (Endpoint, quinn::Connection) {
     let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(relay.client_config.clone());
     let connection = endpoint
-        .connect(relay.address, "localhost")
+        .connect(address, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -128,6 +140,191 @@ async fn raw_join(relay: &TestRelay, join: RelayJoin) -> (Endpoint, quinn::Conne
     receive.read_exact(&mut response).await.unwrap();
     assert_eq!(response, [0]);
     (endpoint, connection)
+}
+
+/// The client QUIC driver still acknowledges datagrams when its application
+/// stops reading. Drop the client's UDP packets *after* joining instead, so the
+/// relay's congestion window and outgoing datagram buffer actually fill.
+struct UdpAckBlackhole {
+    address: SocketAddr,
+    drop_client_packets: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UdpAckBlackhole {
+    async fn new(relay_address: SocketAddr) -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let drop_client_packets = Arc::new(AtomicBool::new(false));
+        let packet_gate = drop_client_packets.clone();
+        let task = tokio::spawn(async move {
+            let mut client_address = None;
+            let mut packet = vec![0; 65_536];
+            loop {
+                let Ok((length, source)) = socket.recv_from(&mut packet).await else {
+                    break;
+                };
+                let destination = if source == relay_address {
+                    let Some(client_address) = client_address else {
+                        continue;
+                    };
+                    client_address
+                } else {
+                    client_address = Some(source);
+                    if packet_gate.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    relay_address
+                };
+                if socket
+                    .send_to(&packet[..length], destination)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            address,
+            drop_client_packets,
+            task,
+        }
+    }
+}
+
+impl Drop for UdpAckBlackhole {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn congested_media_keeps_audio_admission_new_streams_and_other_sessions_live() {
+    let relay = spawn_test_relay().await;
+    let blackhole = UdpAckBlackhole::new(relay.address).await;
+    let (_source_endpoint, source) = raw_join(&relay, host(session(90), [90; 32])).await;
+    let (_slow_endpoint, slow) =
+        raw_join_at(&relay, blackhole.address, controller(session(90), [90; 32])).await;
+    blackhole.drop_client_packets.store(true, Ordering::Release);
+
+    let healthy_host = QuicClient::connect(config(&relay)).await.unwrap();
+    let healthy_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    healthy_host
+        .join(host(session(91), [91; 32]))
+        .await
+        .unwrap();
+    healthy_controller
+        .join(controller(session(91), [91; 32]))
+        .await
+        .unwrap();
+
+    let mut flood = tokio::task::JoinSet::new();
+    let flood_source = source.clone();
+    flood.spawn(async move {
+        let mut video = vec![0; 1_009];
+        video[0] = 4; // VideoDatagram, generation zero addresses the current peer.
+        let video = bytes::Bytes::from(video);
+        for packet_index in 0..100_000 {
+            if flood_source
+                .send_datagram_wait(video.clone())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if packet_index % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    let congestion_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let media = relay.server.media_snapshot();
+        if media.video.send_timeouts > 0 {
+            // A queue-full counter alone could describe a transient producer
+            // burst. This timeout proves actual QUIC send-capacity backpressure.
+            assert_eq!(media.active_workers, 12);
+            break;
+        }
+        assert!(
+            Instant::now() < congestion_deadline,
+            "the UDP ACK blackhole did not congest relay egress: {media:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let audio_before = relay.server.media_snapshot().audio.enqueued;
+    source
+        .send_datagram_wait(bytes::Bytes::from_static(&[7, 0, 0, 0, 0, 0, 0, 0, 0, 42]))
+        .await
+        .unwrap();
+    let audio_deadline = Instant::now() + Duration::from_secs(2);
+    while relay.server.media_snapshot().audio.enqueued == audio_before {
+        assert!(
+            Instant::now() < audio_deadline,
+            "congested video prevented independent audio admission"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    healthy_controller.send_input(vec![1, 2, 3]).await.unwrap();
+    assert_eq!(
+        next_event(&healthy_host).await,
+        TransportEvent::Input(vec![1, 2, 3])
+    );
+    healthy_host.send_control(vec![4, 5, 6]).await.unwrap();
+    assert_eq!(
+        next_event(&healthy_controller).await,
+        TransportEvent::Control(vec![4, 5, 6])
+    );
+
+    // The source's connection reader must continue accepting new streams even
+    // while its media sender is blocked on the slow destination. The malformed
+    // channel makes acceptance externally observable without requiring delivery
+    // through the deliberately blackholed path.
+    let (mut send, _receive) = source.open_bi().await.unwrap();
+    send.write_all(&[99, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    send.finish().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), source.closed())
+        .await
+        .expect("media congestion prevented accepting the new reliable stream");
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let media = relay.server.media_snapshot();
+        let capacity = relay.server.capacity_snapshot();
+        if media.active_workers == 9 && capacity.accepted_connections == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "closed source retained its three sender workers: {media:?}, {capacity:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    flood.abort_all();
+
+    blackhole
+        .drop_client_packets
+        .store(false, Ordering::Release);
+    slow.close(0u32.into(), b"media scheduling regression complete");
+    healthy_host.close(b"media scheduling regression complete");
+    healthy_controller.close(b"media scheduling regression complete");
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let media = relay.server.media_snapshot();
+        let capacity = relay.server.capacity_snapshot();
+        if media.active_workers == 0 && capacity.accepted_connections == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "closed sessions retained sender workers: {media:?}, {capacity:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]

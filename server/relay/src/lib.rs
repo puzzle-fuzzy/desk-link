@@ -23,6 +23,11 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+mod media_scheduler;
+
+use media_scheduler::{MediaIngress, media_queues};
+pub use media_scheduler::{RelayMediaLaneSnapshot, RelayMediaSnapshot};
+
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub session_ttl: Duration,
@@ -84,17 +89,7 @@ const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
 const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
-// Video keyframes are packetized into many QUIC datagrams. Forward each
-// packet independently so one paced `send_datagram_wait` cannot serialize a
-// whole keyframe behind the relay's read loop. The bound keeps a peer from
-// creating an unbounded task backlog while still covering the largest normal
-// keyframe burst (MAX_VIDEO_CHUNKS is currently below this limit).
-const MAX_DATAGRAM_FORWARD_TASKS_PER_CONNECTION: usize = 256;
 const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
-// A relay must not silently evict older video datagrams while a keyframe is
-// being forwarded. Wait briefly for QUIC send capacity, but keep a bounded
-// timeout so a dead/blocked peer cannot pin the participant read loop forever.
-const DATAGRAM_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 static DATAGRAM_FORWARD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static DATAGRAM_FORWARD_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 
@@ -466,6 +461,7 @@ struct Participant {
 }
 
 struct RelayState {
+    media_statistics: Arc<media_scheduler::MediaStatistics>,
     sessions: RelaySessionTable,
     membership: Mutex<()>,
     participants: Mutex<HashMap<u64, Participant>>,
@@ -873,6 +869,7 @@ impl RelayServer {
         let endpoint = quinn::Endpoint::server(server_config, bind_addr)
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         let state = Arc::new(RelayState {
+            media_statistics: Arc::default(),
             sessions: RelaySessionTable::new(config.clone()),
             membership: Mutex::new(()),
             participants: Mutex::new(HashMap::new()),
@@ -905,6 +902,10 @@ impl RelayServer {
                 .active_connections
                 .load(std::sync::atomic::Ordering::Acquire),
         )
+    }
+
+    pub fn media_snapshot(&self) -> RelayMediaSnapshot {
+        self.state.media_statistics.snapshot()
     }
 
     pub fn close(&self) {
@@ -1074,8 +1075,41 @@ async fn handle_connection(
     }
     let reliable_forward_slots =
         Arc::new(Semaphore::new(MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION));
-    let datagram_forward_slots =
-        Arc::new(Semaphore::new(MAX_DATAGRAM_FORWARD_TASKS_PER_CONNECTION));
+    let (media_ingress, media_receivers) = media_queues();
+    // Fixed workers, independent queues and age budgets. JoinSet aborts all
+    // workers on every exit path, including cancellation of this connection task.
+    let mut media_workers = tokio::task::JoinSet::new();
+    for (budget, mut receiver) in media_scheduler::MEDIA_BUDGETS
+        .into_iter()
+        .zip(media_receivers)
+    {
+        let state = state.clone();
+        let source = connection.clone();
+        let worker = state.media_statistics.worker();
+        media_workers.spawn(async move {
+            let _worker = worker;
+            loop {
+                let queued = tokio::select! {
+                    biased;
+                    _ = source.closed() => break,
+                    queued = receiver.recv() => {
+                        let Some(queued) = queued else { break; };
+                        queued
+                    }
+                };
+                forward_queued_datagram(
+                    &state,
+                    &source,
+                    connection_id,
+                    session_id,
+                    role,
+                    budget.channel,
+                    queued,
+                )
+                .await;
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -1111,47 +1145,14 @@ async fn handle_connection(
             }
             datagram = connection.read_datagram() => {
                 let Ok(datagram) = datagram else { break; };
-                let Ok(permit) = datagram_forward_slots.clone().try_acquire_owned() else {
-                    // Bounded backpressure: once the in-flight forwarding
-                    // window is full, wait for one permit instead of dropping
-                    // a video chunk or spawning unbounded tasks.
-                    let Ok(permit) = datagram_forward_slots.clone().acquire_owned().await else {
-                        break;
-                    };
-                    let state = state.clone();
-                    let source = connection.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let _ = forward_datagram(
-                            &state,
-                            &source,
-                            connection_id,
-                            session_id,
-                            role,
-                            datagram,
-                        )
-                        .await;
-                    });
-                    continue;
-                };
-                let state = state.clone();
-                let source = connection.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = forward_datagram(
-                        &state,
-                        &source,
-                        connection_id,
-                        session_id,
-                        role,
-                        datagram,
-                    )
-                    .await;
-                });
+                if !enqueue_datagram(
+                    &state, &connection, connection_id, session_id, role, datagram, &media_ingress,
+                ) { break; }
             }
             _ = connection.closed() => break,
         }
     }
+    media_workers.abort_all();
     log_session_event(
         "participant_disconnected",
         connection_id,
@@ -1373,13 +1374,20 @@ async fn forward_reliable_message(
     }
 }
 
-async fn forward_datagram(
+struct PendingDatagram {
+    peer_id: u64,
+    peer: quinn::Connection,
+    bytes: bytes::Bytes,
+}
+
+fn enqueue_datagram(
     state: &RelayState,
     source: &quinn::Connection,
     connection_id: u64,
     session_id: SessionId,
     role: DeviceRole,
     datagram: bytes::Bytes,
+    ingress: &MediaIngress<PendingDatagram>,
 ) -> bool {
     if datagram.len() < 9 || datagram.len() - 9 > MAX_DATAGRAM_BYTES {
         close_connection(source, b"datagram too large");
@@ -1401,58 +1409,98 @@ async fn forward_datagram(
             .try_into()
             .expect("datagram target generation header has a fixed length"),
     );
-    if let Some((peer_id, peer)) = state.peer_with_id(session_id, role, connection_id) {
-        if target_generation != 0 && target_generation != peer_id {
-            return true;
-        }
-        let mut forwarded = Vec::with_capacity(datagram.len());
-        forwarded.push(channel as u8);
-        forwarded.extend_from_slice(&connection_id.to_be_bytes());
-        forwarded.extend_from_slice(&datagram[9..]);
-        match tokio::time::timeout(
-            DATAGRAM_FORWARD_TIMEOUT,
-            peer.send_datagram_wait(forwarded.into()),
-        )
-        .await
-        {
-            Ok(Ok(())) => log_datagram_forward_success(
-                connection_id,
-                session_id,
-                role,
-                peer_id,
-                channel,
-                datagram.len(),
-                peer.max_datagram_size(),
-            ),
-            Ok(Err(_)) => {
-                log_datagram_forward_failure(
-                    connection_id,
-                    session_id,
-                    role,
-                    peer_id,
-                    channel,
-                    datagram.len(),
-                    peer.max_datagram_size(),
-                    "peer_send_failed",
-                );
-            }
-            Err(_) => {
-                log_datagram_forward_failure(
-                    connection_id,
-                    session_id,
-                    role,
-                    peer_id,
-                    channel,
-                    datagram.len(),
-                    peer.max_datagram_size(),
-                    "peer_send_timeout",
-                );
-            }
-        }
+    let Some((peer_id, peer)) = state.peer_with_id(session_id, role, connection_id) else {
+        return true;
+    };
+    if target_generation != 0 && target_generation != peer_id {
+        return true;
+    }
+    // Bind generation-zero packets at ingress too: queued ciphertext must
+    // never be re-addressed to a replacement controller or host.
+    let mut forwarded = datagram
+        .try_into_mut()
+        .unwrap_or_else(|bytes| bytes::BytesMut::from(bytes.as_ref()));
+    forwarded[1..9].copy_from_slice(&connection_id.to_be_bytes());
+    if let Err(packet) = ingress.enqueue(
+        channel,
+        PendingDatagram {
+            peer_id,
+            peer,
+            bytes: forwarded.freeze(),
+        },
+    ) {
+        state.media_statistics.record(channel, "queue_full");
+        log_datagram_forward_failure(
+            connection_id,
+            session_id,
+            role,
+            peer_id,
+            channel,
+            packet.bytes.len(),
+            packet.peer.max_datagram_size(),
+            "queue_full",
+        );
+    } else {
+        state.media_statistics.record(channel, "enqueued");
     }
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn forward_queued_datagram(
+    state: &RelayState,
+    source: &quinn::Connection,
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    channel: ChannelKind,
+    queued: media_scheduler::QueuedMedia<PendingDatagram>,
+) {
+    state
+        .media_statistics
+        .record_queue_age(channel, queued.enqueued_at.elapsed());
+    let packet = queued.value;
+    let outcome = if tokio::time::Instant::now() >= queued.deadline {
+        "queue_expired"
+    } else if state
+        .peer_with_id(session_id, role, connection_id)
+        .is_none_or(|(peer_id, _)| peer_id != packet.peer_id)
+    {
+        "peer_replaced"
+    } else {
+        let send = tokio::time::timeout_at(
+            queued.deadline,
+            packet.peer.send_datagram_wait(packet.bytes.clone()),
+        );
+        tokio::select! {
+            biased;
+            _ = source.closed() => "source_closed",
+            result = send => match result {
+                Ok(Ok(())) => {
+                    state.media_statistics.record(channel, "forwarded");
+                    log_datagram_forward_success(
+                        connection_id, session_id, role, packet.peer_id, channel,
+                        packet.bytes.len(), packet.peer.max_datagram_size(),
+                    );
+                    return;
+                }
+                Ok(Err(_)) => "peer_send_failed",
+                Err(_) => "peer_send_timeout",
+            }
+        }
+    };
+    state.media_statistics.record(channel, outcome);
+    log_datagram_forward_failure(
+        connection_id,
+        session_id,
+        role,
+        packet.peer_id,
+        channel,
+        packet.bytes.len(),
+        packet.peer.max_datagram_size(),
+        outcome,
+    );
+}
 #[allow(clippy::too_many_arguments)]
 fn log_datagram_forward_success(
     connection_id: u64,
