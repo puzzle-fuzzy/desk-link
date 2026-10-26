@@ -177,6 +177,47 @@ fn check_configuration() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+struct ShutdownSignals {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    interrupt: tokio::signal::windows::CtrlC,
+}
+
+impl ShutdownSignals {
+    fn new() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                terminate: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                interrupt: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+    }
+
+    async fn wait(&mut self) -> io::Result<&'static str> {
+        #[cfg(unix)]
+        let (received, kind) = tokio::select! {
+            received = self.terminate.recv() => (received, "sigterm"),
+            received = self.interrupt.recv() => (received, "sigint"),
+        };
+        #[cfg(windows)]
+        let (received, kind) = (self.interrupt.recv().await, "ctrl_c");
+        received
+            .map(|()| kind)
+            .ok_or_else(|| io::Error::other("shutdown signal listener closed"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("--resource-observation")) {
@@ -186,12 +227,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("--check-config")) {
         return check_configuration();
     }
+    // CLI-only health/observation commands never install process handlers.
+    // Register before announcing readiness so TERM/INT cannot race startup.
+    let mut signals = ShutdownSignals::new()?;
     let address = relay_address()?;
     let relay = Arc::new(RelayServer::bind(address, server_config()?, relay_config()?).await?);
     eprintln!("DeskLink relay listening on {}", relay.local_addr()?);
     eprintln!("relay_resource_budget {:?}", relay.resource_budget());
     let metrics_relay = relay.clone();
-    tokio::spawn(async move {
+    let metrics = tokio::spawn(async move {
         let mut interval = tokio::time::interval(CAPACITY_LOG_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -208,7 +252,31 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("relay_memory {}", RelayMemoryObservation::read());
         }
     });
-    relay.run().await?;
+    let serving = relay.run();
+    tokio::pin!(serving);
+    let mut signal_error = None;
+    let result = tokio::select! {
+        result = &mut serving => result,
+        signal = signals.wait() => {
+            match signal {
+                Ok(kind) => eprintln!("relay_stop_requested signal={kind}"),
+                Err(error) => {
+                    eprintln!("relay_stop_requested signal=listener_error");
+                    signal_error = Some(error);
+                }
+            }
+            relay.close();
+            // Keep driving QUIC and await bounded cleanup; dropping this
+            // future here could discard CONNECTION_CLOSE before it is sent.
+            serving.await
+        }
+    };
+    metrics.abort();
+    let _ = metrics.await;
+    result?;
+    if let Some(error) = signal_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 

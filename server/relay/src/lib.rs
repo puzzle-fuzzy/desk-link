@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +45,8 @@ pub struct RelayConfig {
     pub join_timeout: Duration,
     /// Completion budget once a reliable header/frame has actually started.
     pub partial_frame_timeout: Duration,
+    /// Total graceful and forced cleanup budget after stop is requested.
+    pub shutdown_timeout: Duration,
     pub max_connections: usize,
     pub max_sessions: usize,
     pub buffer_budget_bytes: u64,
@@ -59,6 +61,7 @@ impl Default for RelayConfig {
             dead_timeout: DEAD_TIMEOUT,
             join_timeout: Duration::from_secs(8),
             partial_frame_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(7),
             max_connections: DEFAULT_RELAY_MAX_CONNECTIONS,
             max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
             buffer_budget_bytes: DEFAULT_RELAY_BUFFER_BUDGET_BYTES,
@@ -104,6 +107,8 @@ pub enum RelayError {
     SessionLimitReached,
     #[error("device directory ID is already registered by another host")]
     DirectoryConflict,
+    #[error("relay shutdown did not finish gracefully within its budget")]
+    ShutdownTimeout,
 }
 
 const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
@@ -127,6 +132,16 @@ pub struct RelayCapacitySnapshot {
     pub accepted_connections: usize,
     pub max_sessions: usize,
     pub max_connections: usize,
+}
+
+/// Resource counts only; useful after awaiting `run()` during shutdown.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RelayShutdownSnapshot {
+    pub accepted_connections: usize,
+    pub attached_participants: usize,
+    pub media_workers: usize,
+    pub reliable_workers: usize,
+    pub rejection_tasks: usize,
 }
 
 struct SessionRecord {
@@ -491,6 +506,7 @@ struct RelayState {
     admission_rejection_slots: Arc<Semaphore>,
     next_connection_id: AtomicU64,
     active_connections: std::sync::atomic::AtomicUsize,
+    active_reliable_workers: AtomicUsize,
 }
 
 struct DirectoryRecord {
@@ -857,6 +873,7 @@ pub struct RelayServer {
     endpoint: quinn::Endpoint,
     state: Arc<RelayState>,
     config: RelayConfig,
+    stopping: AtomicBool,
 }
 
 impl RelayServer {
@@ -878,6 +895,7 @@ impl RelayServer {
         for (name, timeout) in [
             ("join timeout", config.join_timeout),
             ("partial frame timeout", config.partial_frame_timeout),
+            ("shutdown timeout", config.shutdown_timeout),
         ] {
             if timeout.is_zero() || tokio::time::Instant::now().checked_add(timeout).is_none() {
                 return Err(RelayError::InvalidConfig(format!(
@@ -914,11 +932,13 @@ impl RelayServer {
             admission_rejection_slots: Arc::new(Semaphore::new(MAX_ADMISSION_REJECTION_TASKS)),
             next_connection_id: AtomicU64::new(1),
             active_connections: std::sync::atomic::AtomicUsize::new(0),
+            active_reliable_workers: AtomicUsize::new(0),
         });
         Ok(Self {
             endpoint,
             state,
             config,
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -950,12 +970,29 @@ impl RelayServer {
             .expect("validated relay resource budget")
     }
 
+    pub fn shutdown_snapshot(&self) -> RelayShutdownSnapshot {
+        let capacity = self.capacity_snapshot();
+        RelayShutdownSnapshot {
+            accepted_connections: capacity.accepted_connections,
+            attached_participants: capacity.attached_participants,
+            media_workers: self.media_snapshot().active_workers,
+            reliable_workers: self.state.active_reliable_workers.load(Ordering::Acquire),
+            rejection_tasks: MAX_ADMISSION_REJECTION_TASKS
+                - self.state.admission_rejection_slots.available_permits(),
+        }
+    }
+
     pub fn close(&self) {
+        self.stopping.store(true, Ordering::Release);
         self.endpoint
             .close(quinn::VarInt::from_u32(0), b"relay shutdown");
     }
 
     pub async fn run(&self) -> Result<(), RelayError> {
+        // If the owner cancels run(), still close the endpoint and cancel every
+        // tracked child. Awaiting run() is required for a completed drain.
+        let _close_on_drop = RunGuard(self);
+        let mut connections = tokio::task::JoinSet::new();
         let sweep_period = if self.config.sweep_interval.is_zero() {
             Duration::from_millis(1)
         } else {
@@ -963,10 +1000,16 @@ impl RelayServer {
         };
         let mut sweep = tokio::time::interval(sweep_period);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
+        while !self.stopping.load(Ordering::Acquire) {
             tokio::select! {
                 incoming = self.endpoint.accept() => {
-                    let Some(incoming) = incoming else { return Ok(()); };
+                    let Some(incoming) = incoming else { break; };
+                    // Quinn may return queued incoming before reporting that
+                    // endpoint.close() stopped acceptance. Never admit it.
+                    if self.stopping.load(Ordering::Acquire) {
+                        incoming.refuse();
+                        break;
+                    }
                     // One absolute application budget starts at admission,
                     // not again after TLS or each subsequent partial read.
                     let join_deadline = tokio::time::Instant::now() + self.config.join_timeout;
@@ -977,7 +1020,7 @@ impl RelayServer {
                         // is waiting for its QUIC handshake. Excess peers are refused directly.
                         if let Ok(permit) = state.admission_rejection_slots.clone().try_acquire_owned()
                         {
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 let _permit = permit;
                                 if let Ok(Ok(connection)) = tokio::time::timeout_at(
                                     join_deadline, async { incoming.await },
@@ -998,7 +1041,7 @@ impl RelayServer {
                     // Capture the reservation before spawning, so dropping an
                     // unpolled future also releases admission during shutdown.
                     let admission = AdmissionGuard(state.clone());
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _admission = admission;
                         match tokio::time::timeout_at(join_deadline, async { incoming.await }).await {
                             Ok(Ok(connection)) => handle_connection(
@@ -1014,8 +1057,84 @@ impl RelayServer {
                 _ = sweep.tick() => {
                     self.state.sweep_expired(Instant::now());
                 }
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if completed.is_some_and(|result| result.is_err()) {
+                        eprintln!("relay_task_failed category=connection_task");
+                    }
+                }
             }
         }
+        self.finish_shutdown(&mut connections).await
+    }
+
+    async fn finish_shutdown(
+        &self,
+        connections: &mut tokio::task::JoinSet<()>,
+    ) -> Result<(), RelayError> {
+        self.close();
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.config.shutdown_timeout;
+        // Keep at most the last second for forced cancellation and guard
+        // cleanup. Both phases and QUIC draining share this total budget.
+        let forced_reserve = (self.config.shutdown_timeout / 4).min(Duration::from_secs(1));
+        let graceful_deadline = deadline - forced_reserve;
+        let graceful = tokio::time::timeout_at(graceful_deadline, async {
+            // close() rejects newly arriving Initial packets. Explicitly
+            // refuse the finite queue that was already pending beforehand.
+            while let Some(incoming) = self.endpoint.accept().await {
+                incoming.refuse();
+            }
+            while connections.join_next().await.is_some() {}
+            self.endpoint.wait_idle().await;
+        })
+        .await
+        .is_ok();
+        let forced_tasks = if graceful { 0 } else { connections.len() };
+        let completed = if graceful {
+            true
+        } else {
+            connections.abort_all();
+            tokio::time::timeout_at(deadline, async {
+                while connections.join_next().await.is_some() {}
+                self.endpoint.wait_idle().await;
+            })
+            .await
+            .is_ok()
+        };
+        let snapshot = self.shutdown_snapshot();
+        let drained = snapshot == RelayShutdownSnapshot::default();
+        let outcome = if completed && drained && forced_tasks == 0 {
+            "graceful"
+        } else if completed && drained {
+            "forced"
+        } else {
+            "timed_out"
+        };
+        eprintln!(
+            "relay_shutdown outcome={outcome} accepted_connections={} attached_participants={} \
+             media_workers={} reliable_workers={} rejection_tasks={} forced_tasks={} endpoint_idle_confirmed={} elapsed_ms={}",
+            snapshot.accepted_connections,
+            snapshot.attached_participants,
+            snapshot.media_workers,
+            snapshot.reliable_workers,
+            snapshot.rejection_tasks,
+            forced_tasks,
+            completed,
+            started.elapsed().as_millis(),
+        );
+        if outcome == "graceful" {
+            Ok(())
+        } else {
+            Err(RelayError::ShutdownTimeout)
+        }
+    }
+}
+
+struct RunGuard<'a>(&'a RelayServer);
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -1037,6 +1156,23 @@ impl Drop for ParticipantGuard {
     fn drop(&mut self) {
         self.state
             .remove_connection(self.session_id, self.connection_id);
+    }
+}
+
+struct ReliableWorkerGuard(Arc<RelayState>);
+
+impl ReliableWorkerGuard {
+    fn new(state: Arc<RelayState>) -> Self {
+        state.active_reliable_workers.fetch_add(1, Ordering::AcqRel);
+        Self(state)
+    }
+}
+
+impl Drop for ReliableWorkerGuard {
+    fn drop(&mut self) {
+        self.0
+            .active_reliable_workers
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1185,6 +1321,7 @@ async fn handle_connection(
     // Fixed workers, independent queues and age budgets. JoinSet aborts all
     // workers on every exit path, including cancellation of this connection task.
     let mut media_workers = tokio::task::JoinSet::new();
+    let mut reliable_workers = tokio::task::JoinSet::new();
     for (budget, mut receiver) in media_scheduler::MEDIA_BUDGETS
         .into_iter()
         .zip(media_receivers)
@@ -1238,8 +1375,10 @@ async fn handle_connection(
                 let source = connection.clone();
                 let header_deadline = tokio::time::Instant::now()
                     + state.sessions.config.partial_frame_timeout;
-                tokio::spawn(async move {
+                let worker = ReliableWorkerGuard::new(state.clone());
+                reliable_workers.spawn(async move {
                     let _permit = permit;
+                    let _worker = worker;
                     forward_reliable(
                         state,
                         source,
@@ -1259,9 +1398,13 @@ async fn handle_connection(
                 ) { break; }
             }
             _ = connection.closed() => break,
+            _ = reliable_workers.join_next(), if !reliable_workers.is_empty() => {},
         }
     }
-    media_workers.abort_all();
+    // The participant/admission owner does not complete while nested senders
+    // still hold source streams, peer connections or resource guards.
+    reliable_workers.shutdown().await;
+    media_workers.shutdown().await;
     log_session_event(
         "participant_disconnected",
         connection_id,
@@ -1822,6 +1965,7 @@ const fn relay_error_label(error: &RelayError) -> &'static str {
         RelayError::ConnectionLimitReached => "connection_limit",
         RelayError::SessionLimitReached => "session_limit",
         RelayError::DirectoryConflict => "directory_conflict",
+        RelayError::ShutdownTimeout => "shutdown_timeout",
     }
 }
 

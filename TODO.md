@@ -416,6 +416,14 @@
 - [x] 新增 6 个 helper 单元及 7 组真实 QUIC deadline 回归；relay lib/bin/deadline/resource/session 共 51 项常规测试、对应 Clippy `--locked -- -D warnings`、fmt/diff 检查通过。512 静默连接本机 probe 已运行，全部有 keepalive PING、最终 admission/worker 为 0；client-connect→应用关闭 p95/p99 为 8020.018/8024.498ms，整个批次至清零 8577.337ms。512 夹具显式声明 2GiB 缓冲预算，未修改生产 64 连接默认或容器配置。
 - **修复主题：** `fix(DL2-053): expire incomplete relay joins and reliable frames`。本机合成验证范围与测量口径见 [relay 读取截止时间](docs/relay-read-deadlines.md)；未做公网探针、部署或真实输入注入。
 
+### DL2-057 · P2 · relay 受控停机与任务收尾（Rust 切片）
+
+- [ ] 汇总 Bun 服务关闭、Unix/候选容器实际 SIGTERM 和 Windows Ctrl+C 验收后，再关闭整个 057；本提交只处理 Rust relay。
+- [x] relay 注册 Unix TERM/INT 或 Windows Ctrl+C，close 停止新 admission 并主动关闭 QUIC；JoinSet 管理连接、拒绝、可靠子任务与媒体，总收尾预算默认 7 秒并等待 endpoint idle，超时明确报告 forced/timed_out，metrics task 取消等待。两个 CLI 检查在注册信号前直接返回。
+- [x] 真实 loopback 覆盖两条可靠流背压时只关闭源、目标仍活/健康会话继续、混合认证/未 join/媒体/TLS 拒绝任务、重复 close、ApplicationClosed、新 admission 不可用和超时分类；58 项常规回归、对应 Clippy `--locked -- -D warnings`、fmt/diff 检查通过。Tokio 只启 signal，锁文件只补已有包依赖边，无版本升级。
+- [ ] 已准备 Unix 真实 child SIGTERM → peer ApplicationClosed → binary exit 0 夹具，当前 Windows 未运行；不以旧 052 镜像或本地 close() 调用冒充信号实测。
+- **修复主题：** `fix(DL2-057): drain relay tasks and notify peers on shutdown`。任务生命周期与 052 缓冲预算的关系、实际验证和 Linux 执行命令见 [relay 受控停机](docs/relay-graceful-shutdown.md)。未部署。
+
 ## 7. 代码整理与验证体系
 
 ### DL2-040 · P1 · 按实际所有权拆分巨型控制模块
