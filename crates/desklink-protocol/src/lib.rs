@@ -15,7 +15,8 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
-/// Protocol 13 adds explicit input restriction / recovery feedback. The project has not shipped to
+/// Protocol 13 adds input restriction / recovery feedback and binds input to an
+/// explicit stream/epoch context using a tagged input wire format. The project has not shipped to
 /// end users, so development binaries move together instead of carrying a
 /// legacy protocol compatibility layer.
 pub const PROTOCOL_VERSION: u16 = 13;
@@ -282,6 +283,8 @@ pub struct VideoPacket {
 pub struct VideoConfig {
     pub protocol_version: u16,
     pub stream_id: u64,
+    /// Host-issued input authorization epoch for this stream configuration.
+    pub input_epoch: u64,
     pub config_version: u32,
     pub codec: Codec,
     pub width: u16,
@@ -731,9 +734,42 @@ pub enum InputEvent {
         delta_y: i32,
     },
 }
+/// Identity captured when an input is admitted, before any asynchronous queue.
+/// A queued command retains this value even when the active session changes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct InputContext {
+    pub stream_id: u64,
+    pub input_epoch: u64,
+}
+
+impl InputContext {
+    pub const fn is_valid(self) -> bool {
+        self.stream_id != 0 && self.input_epoch != 0
+    }
+
+    pub fn validate(self) -> Result<(), codec::ProtocolError> {
+        if self.is_valid() {
+            Ok(())
+        } else {
+            Err(codec::ProtocolError::InvalidInput)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InputEnvelope {
     pub sequence: u64,
     pub timestamp_us: u64,
+    pub stream_id: u64,
+    pub input_epoch: u64,
     pub event: InputEvent,
+}
+
+impl InputEnvelope {
+    pub const fn context(&self) -> InputContext {
+        InputContext {
+            stream_id: self.stream_id,
+            input_epoch: self.input_epoch,
+        }
+    }
 }

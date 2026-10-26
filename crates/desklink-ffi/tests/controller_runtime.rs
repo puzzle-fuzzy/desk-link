@@ -715,6 +715,7 @@ async fn run_fake_host(
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,
         stream_id: 9,
+        input_epoch: 1,
         config_version: 3,
         codec: Codec::H264,
         width: 1280,
@@ -893,6 +894,7 @@ async fn run_reference_gap_host(
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,
         stream_id: 9,
+        input_epoch: 1,
         config_version: 3,
         codec: Codec::H264,
         width: 1280,
@@ -1014,6 +1016,7 @@ async fn send_reconnect_config(host: &QuicClient, secure: &mut SecureSession, st
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,
         stream_id,
+        input_epoch: 1,
         config_version: 1,
         codec: Codec::H264,
         width: 1280,

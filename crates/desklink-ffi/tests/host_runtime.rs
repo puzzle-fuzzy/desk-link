@@ -322,6 +322,8 @@ impl RawController {
         let plaintext = encode_input(&InputEnvelope {
             sequence: self.input_sequence,
             timestamp_us: now_micros(),
+            stream_id: 1,
+            input_epoch: 1,
             event: InputEvent::MouseWheel {
                 delta_x: 1,
                 delta_y: -1,

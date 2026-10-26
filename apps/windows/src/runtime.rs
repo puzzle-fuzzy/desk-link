@@ -833,6 +833,7 @@ impl HostVideoPipeline {
             Some(encode_video_config(&VideoConfig {
                 protocol_version: PROTOCOL_VERSION,
                 stream_id: self.stream_id,
+                input_epoch: 0,
                 config_version: frame.config_version,
                 codec: desklink_protocol::Codec::H264,
                 width,
