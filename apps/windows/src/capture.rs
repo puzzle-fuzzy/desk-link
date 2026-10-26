@@ -59,6 +59,98 @@ pub struct DisplayDescriptor {
     pub primary: bool,
 }
 
+/// A display ID belongs to a monitor interface for the lifetime of this process,
+/// including periods when that monitor is unplugged. Never recycle an ID for a
+/// different monitor: a delayed SelectDisplay must fail rather than select a
+/// newly attached output which inherited an enumeration position.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct DisplayIdentityRegistry {
+    identities: Vec<Vec<u16>>,
+}
+
+#[cfg(any(windows, test))]
+impl DisplayIdentityRegistry {
+    const CAPACITY: usize = 1024;
+
+    fn id_for(&mut self, identity: &[u16]) -> Result<u32, CaptureError> {
+        let end = identity
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(identity.len());
+        if end == 0 {
+            return Err(CaptureError::Native(
+                "monitor interface identity is empty".into(),
+            ));
+        }
+        let identity = identity[..end]
+            .iter()
+            .map(|unit| {
+                if (u16::from(b'a')..=u16::from(b'z')).contains(unit) {
+                    *unit - u16::from(b'a' - b'A')
+                } else {
+                    *unit
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = self.identities.iter().position(|known| *known == identity) {
+            return Ok(index as u32 + 1);
+        }
+        if self.identities.len() == Self::CAPACITY {
+            return Err(CaptureError::Native(
+                "monitor interface identity capacity exhausted".into(),
+            ));
+        }
+        self.identities.push(identity);
+        Ok(self.identities.len() as u32)
+    }
+}
+
+#[cfg(windows)]
+fn display_id_for_output(
+    description: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+) -> Result<u32, CaptureError> {
+    use std::{
+        mem::size_of,
+        sync::{Mutex, OnceLock},
+    };
+    use windows::{
+        Win32::{
+            Graphics::Gdi::{DISPLAY_DEVICEW, EnumDisplayDevicesW},
+            UI::WindowsAndMessaging::EDD_GET_DEVICE_INTERFACE_NAME,
+        },
+        core::PCWSTR,
+    };
+
+    static IDENTITIES: OnceLock<Mutex<DisplayIdentityRegistry>> = OnceLock::new();
+    let mut monitor = DISPLAY_DEVICEW {
+        cb: size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    // EDD_GET_DEVICE_INTERFACE_NAME gives the per-monitor OS interface path;
+    // DeviceName by itself is a temporary desktop source such as DISPLAY1.
+    // https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-enumdisplaydevicesw
+    if !unsafe {
+        EnumDisplayDevicesW(
+            PCWSTR(description.DeviceName.as_ptr()),
+            0,
+            &mut monitor,
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+    }
+    .as_bool()
+    {
+        return Err(CaptureError::Native(
+            "monitor interface identity is unavailable".into(),
+        ));
+    }
+    IDENTITIES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .id_for(&monitor.DeviceID)
+}
+
 impl DxgiDesktopCapturer {
     pub fn new_primary() -> Result<Self, CaptureError> {
         #[cfg(windows)]
@@ -239,14 +331,13 @@ impl DxgiDesktopCapturer {
 
     #[cfg(windows)]
     fn new_gdi_primary() -> Result<Self, CaptureError> {
-        let topology = display_topology()?;
-        Ok(Self {
-            backend: WindowsCaptureBackend::Gdi,
-            dimensions: (topology.primary.width, topology.primary.height),
-            desktop_rect: topology.primary,
-            display_id: 0,
-            initial_snapshot_pending: false,
-        })
+        let displays = available_displays()?;
+        let primary = displays
+            .iter()
+            .find(|display| display.primary)
+            .or_else(|| displays.first())
+            .ok_or(CaptureError::NoDisplay)?;
+        Self::new_gdi_display(primary.id)
     }
 
     #[cfg(windows)]
@@ -286,7 +377,6 @@ unsafe fn find_primary_output() -> Result<
 
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(native_error)?;
     let mut fallback: Option<(u32, IDXGIAdapter1, IDXGIOutput, _)> = None;
-    let mut display_id = 0;
     let mut adapter_index = 0;
     loop {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
@@ -303,6 +393,7 @@ unsafe fn find_primary_output() -> Result<
             };
             let description = unsafe { output.GetDesc() }.map_err(native_error)?;
             if description.AttachedToDesktop.as_bool() {
+                let display_id = display_id_for_output(&description)?;
                 let coordinates = description.DesktopCoordinates;
                 let contains_primary_origin = coordinates.left <= 0
                     && coordinates.top <= 0
@@ -314,7 +405,6 @@ unsafe fn find_primary_output() -> Result<
                 if fallback.is_none() {
                     fallback = Some((display_id, adapter.clone(), output, description));
                 }
-                display_id = display_id.saturating_add(1);
             }
             output_index += 1;
         }
@@ -337,7 +427,6 @@ unsafe fn find_display_output(
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1};
 
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(native_error)?;
-    let mut display_id = 0;
     let mut adapter_index = 0;
     loop {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
@@ -354,10 +443,10 @@ unsafe fn find_display_output(
             };
             let description = unsafe { output.GetDesc() }.map_err(native_error)?;
             if description.AttachedToDesktop.as_bool() {
+                let display_id = display_id_for_output(&description)?;
                 if display_id == requested_id {
                     return Ok((adapter, output, description));
                 }
-                display_id = display_id.saturating_add(1);
             }
             output_index += 1;
         }
@@ -392,13 +481,22 @@ pub fn available_displays() -> Result<Vec<DisplayDescriptor>, CaptureError> {
                 let width = (coordinates.right - coordinates.left) as u32;
                 let height = (coordinates.bottom - coordinates.top) as u32;
                 if width > 0 && height > 0 {
+                    let display_id = display_id_for_output(&description)?;
+                    if displays
+                        .iter()
+                        .any(|display: &DisplayDescriptor| display.id == display_id)
+                    {
+                        return Err(CaptureError::Native(
+                            "multiple outputs share a monitor interface identity".into(),
+                        ));
+                    }
                     let end = description
                         .DeviceName
                         .iter()
                         .position(|character| *character == 0)
                         .unwrap_or(description.DeviceName.len());
                     displays.push(DisplayDescriptor {
-                        id: displays.len() as u32,
+                        id: display_id,
                         name: String::from_utf16_lossy(&description.DeviceName[..end]),
                         rect: DesktopRect::new(coordinates.left, coordinates.top, width, height),
                         primary: coordinates.left <= 0
@@ -808,6 +906,55 @@ fn now_micros() -> u64 {
                 .saturating_mul(1_000_000)
                 .saturating_add(u64::from(duration.subsec_micros()))
         })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn identity(name: &str) -> Vec<u16> {
+        name.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[test]
+    fn output_ids_survive_enumeration_reordering_and_primary_changes() {
+        let mut registry = DisplayIdentityRegistry::default();
+        let a = identity("monitor-interface-a");
+        let b = identity("monitor-interface-b");
+        let initial = [registry.id_for(&a).unwrap(), registry.id_for(&b).unwrap()];
+        let reordered = [registry.id_for(&b).unwrap(), registry.id_for(&a).unwrap()];
+        assert_eq!(reordered, [initial[1], initial[0]]);
+        assert_ne!(initial[0], initial[1]);
+        assert_ne!(initial[0], 0);
+    }
+
+    #[test]
+    fn detached_output_id_is_not_reused_and_reinsert_keeps_its_identity() {
+        let mut registry = DisplayIdentityRegistry::default();
+        let a = registry.id_for(&identity("monitor-a")).unwrap();
+        // A disappears while B is enumerated on its former source/position.
+        let b = registry.id_for(&identity("monitor-b")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(registry.id_for(&identity("MONITOR-A")).unwrap(), a);
+        assert_eq!(registry.identities.len(), 2);
+    }
+
+    #[test]
+    fn identity_exhaustion_rejects_new_outputs_without_reassigning_known_ones() {
+        let mut registry = DisplayIdentityRegistry::default();
+        assert!(registry.id_for(&[0]).is_err());
+        for index in 0..DisplayIdentityRegistry::CAPACITY {
+            assert_eq!(
+                registry
+                    .id_for(&identity(&format!("monitor-{index}")))
+                    .unwrap(),
+                index as u32 + 1
+            );
+        }
+        assert!(registry.id_for(&identity("another-monitor")).is_err());
+        assert_eq!(registry.id_for(&identity("monitor-0")).unwrap(), 1);
+        assert_eq!(registry.identities.len(), DisplayIdentityRegistry::CAPACITY);
+    }
 }
 
 #[cfg(all(test, windows))]

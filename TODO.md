@@ -184,6 +184,10 @@
 - **方案：** 监听/检测拓扑变化，用稳定输出身份而非临时索引；活动屏移除时明确回退；旧拓扑下的输入不落入新输出。
 - **验收：** 插拔、旋转、主屏切换、100%～200% DPI、负坐标屏幕和睡眠恢复，列表、画面、坐标同步且错误选择可解释。
 
+- [x] **已实现并自动验证（`fix(DL2-013): preserve stable monitor identities across enumeration`）：** 使用EnumDisplayDevicesW监视器接口路径稳定映射，进程内最多1024身份且不复用ID；枚举重排/主屏变化不再使旧ID指向另一输出。GDI主屏保留实际descriptor ID；身份不可用/歧义时安全失败。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked capture::identity_tests` 3通过，覆盖重排、拔插重现、大小写归一和注册表耗尽；原生API编译通过。
+- [ ] **仍待实现/真机：** runtime连接中拓扑刷新、视频/输入的拓扑代数绑定，以及插拔/旋转/负坐标/100%～200%DPI/睡眠矩阵；本提交只关闭稳定身份切片。
+
 ## 4. 性能与数据通道
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
