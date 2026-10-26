@@ -4,7 +4,7 @@ import { AccountError } from "../domain/errors";
 import { hashPassword, validatePassword, verifyPassword } from "../domain/password";
 import { createOpaqueToken, hashOpaqueToken } from "../domain/tokens";
 import type { AccountStore } from "../db/store";
-import type { AccountPlatform, ActionTokenPurpose, UserRecord } from "../db/types";
+import type { AccountPlatform, ActionTokenPurpose, EmailOutboxRecord, UserRecord } from "../db/types";
 import type { MailMessage, Mailer } from "../providers/mailer";
 import type { SessionService, SessionTokenPair } from "./session-service";
 
@@ -37,10 +37,17 @@ export class AccountService {
       return { verificationRequired: true };
     }
     const now = this.now();
-    const user = this.store.createUser({ email, passwordHash: await hashPassword(input.password), now });
-    this.store.upsertDevice({ ...device, userId: user.id, now });
-    this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
-    await this.sendVerification(user);
+    // Hashing stays outside the synchronous transaction; independent registrations
+    // can hash concurrently, while only the winner of the email insert has effects.
+    const passwordHash = await hashPassword(input.password);
+    const queued = this.store.database.transaction(() => {
+      const user = this.store.createUserIfAbsent({ email, passwordHash, now });
+      if (!user) return undefined;
+      this.store.upsertDevice({ ...device, userId: user.id, now });
+      this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
+      return this.enqueueActionEmail(user, "verify_email");
+    })();
+    if (queued) await this.deliverQueuedEmail(queued);
     return { verificationRequired: true };
   }
 
@@ -144,6 +151,14 @@ export class AccountService {
   }
 
   private async sendActionEmail(user: UserRecord, purpose: ActionTokenPurpose): Promise<void> {
+    const queued = this.store.database.transaction(() => this.enqueueActionEmail(user, purpose))();
+    await this.deliverQueuedEmail(queued);
+  }
+
+  private enqueueActionEmail(user: UserRecord, purpose: ActionTokenPurpose): {
+    message: MailMessage;
+    outbox: EmailOutboxRecord;
+  } {
     const token = createOpaqueToken();
     const actionToken = this.store.createActionToken({
       userId: user.id,
@@ -152,23 +167,18 @@ export class AccountService {
       now: this.now(),
       expiresAt: this.now() + (purpose === "verify_email" ? 24 * 60 * 60 : 30 * 60),
     });
-    await this.queueEmail(user, purpose, actionToken.id, token.value);
-  }
-
-  private async queueEmail(
-    user: UserRecord,
-    purpose: ActionTokenPurpose,
-    actionTokenId: string,
-    token: string,
-  ): Promise<void> {
-    const message = this.actionEmailMessage(user, purpose, token);
+    const message = this.actionEmailMessage(user, purpose, token.value);
     const outbox = this.store.enqueueEmail({
       userId: user.id,
       recipient: user.email,
       template: purpose,
-      actionTokenId,
+      actionTokenId: actionToken.id,
       now: this.now(),
     });
+    return { message, outbox };
+  }
+
+  private async deliverQueuedEmail({ message, outbox }: { message: MailMessage; outbox: EmailOutboxRecord }): Promise<void> {
     try {
       await this.mailer.send(message);
       this.store.markEmailSent(outbox.id, this.now());

@@ -144,6 +144,17 @@ export class AccountStore {
     return this.findUserById(id)!;
   }
 
+  createUserIfAbsent(input: CreateUserInput): UserRecord | undefined {
+    const row = this.database.query(`
+      INSERT INTO users (
+        id, email, password_hash, email_verified_at, status,
+        created_at, updated_at, password_changed_at
+      ) VALUES (?, ?, ?, NULL, 'active', ?, ?, ?)
+      ON CONFLICT(email) DO NOTHING RETURNING *
+    `).get(randomUUID(), input.email, input.passwordHash, input.now, input.now, input.now) as UserRow | null;
+    return row ? mapUser(row) : undefined;
+  }
+
   findUserById(id: string): UserRecord | undefined {
     const row = this.database.query("SELECT * FROM users WHERE id = ?").get(id) as UserRow | null;
     return row ? mapUser(row) : undefined;
