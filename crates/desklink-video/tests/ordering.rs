@@ -219,6 +219,76 @@ fn duplicate_chunk_and_mismatched_metadata_are_dropped() {
 }
 
 #[test]
+fn different_payload_duplicate_keeps_first_content_when_remaining_chunks_arrive_out_of_order() {
+    let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
+    let mut first = packet(50, 1, 3);
+    first.payload[0] = 0x11;
+    let mut duplicate = first.clone();
+    duplicate.payload[0] = 0x99;
+    assert_eq!(assembler.push(instant(0), first), AssembleResult::Pending);
+    assert_eq!(
+        assembler.push(instant(1), duplicate),
+        AssembleResult::Dropped(DropReason::DuplicateChunk)
+    );
+    assert_eq!(assembler.take_dropped_chunks(), 1);
+    assert_eq!(assembler.take_dropped_chunks(), 0);
+    assert_eq!(
+        assembler.push(instant(2), packet(50, 2, 3)),
+        AssembleResult::Pending
+    );
+    let mut expected = frame(50);
+    expected.data = vec![50, 0x11, 50];
+    assert_eq!(
+        assembler.push(instant(3), packet(50, 0, 3)),
+        AssembleResult::Complete(expected)
+    );
+    assert_eq!(assembler.take_dropped_chunks(), 0);
+}
+
+#[test]
+fn identical_payload_duplicate_is_counted_once_without_preventing_completion() {
+    let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
+    let first = packet(51, 0, 2);
+    assert_eq!(
+        assembler.push(instant(0), first.clone()),
+        AssembleResult::Pending
+    );
+    assert_eq!(
+        assembler.push(instant(1), first),
+        AssembleResult::Dropped(DropReason::DuplicateChunk)
+    );
+    let mut expected = frame(51);
+    expected.data = vec![51; 2];
+    assert_eq!(
+        assembler.push(instant(2), packet(51, 1, 2)),
+        AssembleResult::Complete(expected)
+    );
+    assert_eq!(assembler.take_dropped_chunks(), 1);
+}
+
+#[test]
+fn duplicate_flood_keeps_one_pending_frame_and_does_not_extend_its_lifetime() {
+    let mut assembler = FrameAssembler::new(1, Duration::from_millis(120));
+    assert_eq!(
+        assembler.push(instant(0), packet(52, 0, 2)),
+        AssembleResult::Pending
+    );
+    let mut duplicate = packet(52, 0, 2);
+    duplicate.payload = vec![0x99; MAX_VIDEO_PACKET_PAYLOAD_BYTES];
+    duplicate.header.payload_length = duplicate.payload.len() as u32;
+    for _ in 0..1000 {
+        assert_eq!(
+            assembler.push(instant(119), duplicate.clone()),
+            AssembleResult::Dropped(DropReason::DuplicateChunk)
+        );
+    }
+    assert_eq!(assembler.take_dropped_chunks(), 1000);
+    assert_eq!(assembler.expire(instant(120)), 1);
+    assert_eq!(assembler.take_dropped_chunks(), 1);
+    assert_eq!(assembler.expire(instant(120)), 0);
+}
+
+#[test]
 fn assembler_evicts_oldest_incomplete_frame_at_capacity() {
     let mut assembler = FrameAssembler::new(2, Duration::from_millis(120));
     assert_eq!(

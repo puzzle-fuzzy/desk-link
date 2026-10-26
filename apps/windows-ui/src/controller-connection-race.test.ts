@@ -23,7 +23,7 @@ async function flushPromises(): Promise<void> {
 
 function snapshot(state: ControllerSnapshot["runtime"]["state"]): ControllerSnapshot {
   return {
-    runtime: { state, title: state, detail: state, streamId: state === "connected" ? 9 : null },
+    runtime: { state, title: state, detail: state, streamId: state === "connected" ? "9" : null },
     savedConnection: null, connectionError: null, savedDevices: [], savedDevicesError: null,
     fileRecovery: null, fileRecoveryError: null, fileQueueRecovery: null, fileQueueRecoveryError: null,
   };
@@ -90,7 +90,7 @@ describe("controller connection and cancellation ordering", () => {
     host.recovery.resolve(snapshot("stopped"));
     await pending;
     expect(host.state().snapshot.runtime.state).toBe("connected");
-    expect(host.state().snapshot.runtime.streamId).toBe(9);
+    expect(host.state().snapshot.runtime.streamId).toBe("9");
   });
 
   test("cancel is serialized and retains the typed credentials for retry", async () => {

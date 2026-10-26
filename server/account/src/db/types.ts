@@ -60,4 +60,8 @@ export interface EmailOutboxRecord {
   attempts: number;
   sentAt: number | null;
   lastError: string | null;
+  status: "pending" | "delivering" | "delivered" | "failed";
+  leaseToken: string | null;
+  leaseUntil: number | null;
+  finishedAt: number | null;
 }

@@ -59,7 +59,7 @@ export class SessionService {
     const session = this.store.findSessionByAccessHash(hashOpaqueToken(token), now);
     if (!session) throw new AccountError("token_invalid", 401, "登录状态已失效，请重新登录。 ");
     const user = this.store.findUserById(session.userId);
-    const device = this.store.findDevice(session.deviceId);
+    const device = this.store.findDevice(session.userId, session.deviceId);
     if (!user || user.status !== "active" || !device || device.revokedAt !== null) {
       throw new AccountError("token_invalid", 401, "登录状态已失效，请重新登录。 ");
     }
@@ -82,7 +82,7 @@ export class SessionService {
       throw new AccountError("token_invalid", 401, "刷新令牌已失效，请重新登录。 ");
     }
     const user = this.store.findUserById(existing.userId);
-    const device = this.store.findDevice(existing.deviceId);
+    const device = this.store.findDevice(existing.userId, existing.deviceId);
     if (!user || user.status !== "active" || !device || device.revokedAt !== null) {
       throw new AccountError("token_invalid", 401, "登录状态已失效，请重新登录。 ");
     }

@@ -26,6 +26,7 @@ describe("account app boundary", () => {
       schema: 1,
       status: "ready",
       service: "desklink-account",
+      dependencies: { database: "ready", mail: "ready" },
     });
   });
 

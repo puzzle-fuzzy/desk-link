@@ -1,0 +1,62 @@
+{
+  "date": "2026-10-26T06:46:23.761Z",
+  "bun": "1.3.14",
+  "platform": "win32",
+  "note": "Synthetic in-process service measurements; excludes HTTP/network and production load. Finite distributions cannot prove timing indistinguishability.",
+  "output": [
+    {
+      "route": "login",
+      "samplesPerBranch": 100,
+      "knownMs": {
+        "p50": 117.0054999999993,
+        "p95": 134.04479999999967,
+        "min": 101.89580000000205,
+        "max": 135.39670000000115
+      },
+      "absentMs": {
+        "p50": 117.21909999999843,
+        "p95": 133.71609999999782,
+        "min": 100.64120000000003,
+        "max": 135.4404999999988
+      },
+      "knownGreaterAuc": 0.4836,
+      "orientationIndependentAuc": 0.5164
+    },
+    {
+      "route": "register",
+      "samplesPerBranch": 100,
+      "knownMs": {
+        "p50": 117.06240000000253,
+        "p95": 132.68469999999797,
+        "min": 100.05249999999796,
+        "max": 134.7025999999969
+      },
+      "absentMs": {
+        "p50": 118.16330000000016,
+        "p95": 133.71830000000045,
+        "min": 103.08359999999811,
+        "max": 138.9577999999965
+      },
+      "knownGreaterAuc": 0.4206,
+      "orientationIndependentAuc": 0.5794
+    },
+    {
+      "route": "forgot",
+      "samplesPerBranch": 100,
+      "knownMs": {
+        "p50": 118.32640000000538,
+        "p95": 135.24549999999,
+        "min": 101.02079999999842,
+        "max": 138.88360000000102
+      },
+      "absentMs": {
+        "p50": 117.81040000000212,
+        "p95": 133.02880000000005,
+        "min": 100.15019999998913,
+        "max": 135.14929999999003
+      },
+      "knownGreaterAuc": 0.5664,
+      "orientationIndependentAuc": 0.5664
+    }
+  ]
+}

@@ -1,25 +1,46 @@
+import CryptoKit
 import Foundation
 import Security
 
-public struct SavedHost: Codable, Equatable, Identifiable, Sendable {
+public struct SavedHost: Codable, Equatable, Identifiable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    private static let directoryAlphabet = Set("23456789ABCDEFGHJKLMNPQRSTUVWXYZ".utf8)
     public let id: UUID
     public let serverName: String
     public let sessionID: [UInt8]
     public let relayAuthentication: [UInt8]
     public let hostVerifyKey: [UInt8]
+    public let expiresAtUnixS: UInt64?
+    /// nil/0 is unknown legacy material, 1 temporary, 2 explicitly persistent.
+    public let authorizationType: UInt32?
+    public let directoryDeviceID: UInt64?
+    public let directoryAccessCode: [UInt8]?
+    public let alias: String?
+    public let lastConnectedAt: Date?
 
     public init(
         id: UUID,
         serverName: String,
         sessionID: [UInt8],
         relayAuthentication: [UInt8],
-        hostVerifyKey: [UInt8]
+        hostVerifyKey: [UInt8],
+        expiresAtUnixS: UInt64? = nil,
+        authorizationType: UInt32? = nil,
+        directoryDeviceID: UInt64? = nil,
+        directoryAccessCode: [UInt8]? = nil,
+        alias: String? = nil,
+        lastConnectedAt: Date? = nil
     ) {
         self.id = id
         self.serverName = serverName
         self.sessionID = sessionID
         self.relayAuthentication = relayAuthentication
         self.hostVerifyKey = hostVerifyKey
+        self.expiresAtUnixS = expiresAtUnixS
+        self.authorizationType = authorizationType
+        self.directoryDeviceID = directoryDeviceID
+        self.directoryAccessCode = directoryAccessCode
+        self.alias = Self.normalizedAlias(alias)
+        self.lastConnectedAt = lastConnectedAt
     }
 
     public var isValid: Bool {
@@ -27,6 +48,71 @@ public struct SavedHost: Codable, Equatable, Identifiable, Sendable {
             && sessionID.count == 16
             && relayAuthentication.count == 32
             && hostVerifyKey.count == 32
+            && (authorizationType.map { $0 <= 2 } ?? true)
+            && directoryIsStructurallyValid
+            && Self.aliasIsValid(alias)
+            && (lastConnectedAt?.timeIntervalSince1970.isFinite ?? true)
+    }
+
+    public var canReconnect: Bool { canReconnect(at: Date()) }
+
+    public func canReconnect(at date: Date) -> Bool {
+        guard isValid, date.timeIntervalSince1970.isFinite,
+              date.timeIntervalSince1970 >= 0 else { return false }
+        switch authorizationType {
+        case 1:
+            guard let expiresAtUnixS, expiresAtUnixS > 0 else { return false }
+            return date.timeIntervalSince1970 < TimeInterval(expiresAtUnixS)
+        case 2:
+            return expiresAtUnixS == 0
+        default:
+            // Missing expiry/authorization in old records is never upgraded
+            // into permanent access. The record stays available for re-pairing.
+            return false
+        }
+    }
+
+    public var displayName: String {
+        if let alias = Self.normalizedAlias(alias), Self.aliasIsValid(alias) { return alias }
+        if let directoryDeviceID, directoryDeviceID > 0 { return "设备 \(directoryDeviceID)" }
+        let fingerprint = SHA256.hash(data: Data(hostVerifyKey))
+            .prefix(6).map { String(format: "%02x", $0) }.joined()
+        return "设备 \(fingerprint)"
+    }
+
+    public var description: String { "SavedHost([REDACTED])" }
+    public var debugDescription: String { description }
+
+    private var directoryIsStructurallyValid: Bool {
+        switch (directoryDeviceID, directoryAccessCode) {
+        case (nil, nil): true
+        case let (.some(deviceID), .some(code)):
+            deviceID > 0 && code.count == 8
+                && code.allSatisfy { Self.directoryAlphabet.contains($0) }
+        default: false
+        }
+    }
+
+    fileprivate static func normalizedAlias(_ alias: String?) -> String? {
+        guard let value = alias?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
+    fileprivate static func aliasIsValid(_ alias: String?) -> Bool {
+        guard let alias else { return true }
+        return alias.count <= 80
+            && !alias.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+    }
+
+    fileprivate func withLocalMetadata(id: UUID, alias: String?, lastConnectedAt: Date?) -> Self {
+        Self(
+            id: id, serverName: serverName, sessionID: sessionID,
+            relayAuthentication: relayAuthentication, hostVerifyKey: hostVerifyKey,
+            expiresAtUnixS: expiresAtUnixS, authorizationType: authorizationType,
+            directoryDeviceID: directoryDeviceID, directoryAccessCode: directoryAccessCode,
+            alias: alias, lastConnectedAt: lastConnectedAt
+        )
     }
 }
 
@@ -54,6 +140,14 @@ public struct SavedHostStore: Sendable {
     public func save(_ host: SavedHost) throws {
         guard host.isValid else { throw SavedHostStoreError.invalidRecord }
         var hosts = try loadAll()
+        guard !hosts.contains(where: { $0.id == host.id && !Self.sameRemoteHost($0, host) })
+        else { throw SavedHostStoreError.invalidRecord }
+        let previous = hosts.first { Self.sameRemoteHost($0, host) }
+        let saved = host.withLocalMetadata(
+            id: previous?.id ?? host.id,
+            alias: previous?.alias ?? host.alias,
+            lastConnectedAt: host.lastConnectedAt ?? previous?.lastConnectedAt
+        )
         // The UUID identifies a local record, not the remote host. Directory
         // lookup and fresh pairing can produce a new local UUID for the same
         // host, so de-duplicate by authenticated host identity and move the
@@ -61,7 +155,19 @@ public struct SavedHostStore: Sendable {
         hosts.removeAll { existing in
             existing.id == host.id || Self.sameRemoteHost(existing, host)
         }
-        hosts.insert(host, at: 0)
+        hosts.insert(saved, at: 0)
+        try write(try Self.encode(hosts))
+    }
+
+    public func rename(id: UUID, alias: String?) throws {
+        let normalized = SavedHost.normalizedAlias(alias)
+        guard SavedHost.aliasIsValid(normalized) else { throw SavedHostStoreError.invalidRecord }
+        var hosts = try loadAll()
+        guard let index = hosts.firstIndex(where: { $0.id == id }) else {
+            throw SavedHostStoreError.invalidRecord
+        }
+        let host = hosts[index]
+        hosts[index] = host.withLocalMetadata(id: id, alias: normalized, lastConnectedAt: host.lastConnectedAt)
         try write(try Self.encode(hosts))
     }
 

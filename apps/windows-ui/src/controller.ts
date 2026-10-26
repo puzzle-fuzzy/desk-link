@@ -62,6 +62,7 @@ import type {
   ControllerSignal,
   ControllerSnapshot,
   ControllerVideoConfigSignal,
+  RemoteInputContext,
   H264ProfileFallbackReason,
   H264ProfileProbe,
   RemoteDisplaySummary,
@@ -116,6 +117,13 @@ import {
   recoveredFileTransfer,
 } from "./file-transfer-recovery";
 import { fileQueueProtectionPresentation } from "./file-queue-protection";
+import { FileQueueView } from "./file-queue-view";
+import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
+import { REMOTE_SHORTCUTS, remoteShortcutInput } from "./remote-shortcuts";
+import { RemoteInputPresentation, sameInputContext, type PaintedInputFrame } from "./remote-input-context";
+import { remoteAudioControl } from "./remote-audio-control";
+import { inputRestrictionPresentation, restrictionAfterRuntime } from "./input-restriction";
+import type { InputRestrictionReason } from "./types";
 import {
   FileQueueActionGate,
   type FileQueueActionKind,
@@ -250,11 +258,14 @@ let transferActivity: TransferActivityState = { unreadResults: 0, tone: null };
 let transferPanelUpdateTimer: number | null = null;
 let lastTransferProgressPaintAtMs: number | null = null;
 let smartPasteBusy = false;
+let remoteShortcutBusy = false;
 let smartPastePending = false;
 let filePickerBusy = false;
 let discardFileRecoveryBusy = false;
 let discardFileQueueRecoveryBusy = false;
 const fileQueueActions = new FileQueueActionGate();
+const fileQueueView = new FileQueueView();
+const fileDropTargetGate = new FileDropTargetGate();
 let downloadsFolderBusy = false;
 let downloadsFolderMessage = "";
 let fileDropInitialized = false;
@@ -272,14 +283,25 @@ let h264ProfileProbe: H264ProfileProbe = "notChecked";
 let h264ProfileProbeMs: number | null = null;
 let h264ProfileFallbackReason: H264ProfileFallbackReason | null = null;
 let remoteSurfaceState: ControllerRemoteSurfaceState = "empty";
+const inputPresentation = new RemoteInputPresentation();
+let inputActivationFrame: number | null = null;
+let inputSurfaceConfirmedVisible = false;
+let heldKeyboardContext: RemoteInputContext | null = null;
+let heldButtonContext: RemoteInputContext | null = null;
+let inputRestrictionReason: InputRestrictionReason | null = null;
 const inputDispatcher = new RemoteInputDispatcher(
-  (input, streamId) => sendControllerInput({ ...input, streamId }),
+  (input, context) => sendControllerInput({ ...input, streamId: context.streamId, inputEpoch: context.inputEpoch }),
   undefined,
-  (text, streamId) => snapshot?.runtime.state === "connected" && snapshot.runtime.streamId === streamId
-    ? sendControllerText(text, streamId)
-    : Promise.reject(new Error("Remote session changed")),
+  (text, context) => sendControllerText(text, context),
 );
 const remoteAudio = new RemoteAudioPlayer();
+let audioPlaybackPresentation = "";
+remoteAudio.subscribe((playback) => {
+  const next = `${playback.state}:${playback.message}`;
+  if (next === audioPlaybackPresentation) return;
+  audioPlaybackPresentation = next;
+  updateAudioControl();
+});
 const videoPlaybackPressure = new VideoPlaybackPressure();
 const videoPull = new SerialVideoPull<ControllerVideoPayload>();
 const videoRenderTiming = new VideoRenderTiming();
@@ -327,9 +349,15 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
   void initializeNativeFileDrop();
   if (!fullscreenListenerInitialized) {
     window.addEventListener("resize", scheduleRemoteFullscreenSync);
+    window.addEventListener("resize", () => { suspendPresentedInput(); schedulePresentedInputActivation(); });
     window.addEventListener("blur", resetRemoteInputState);
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) resetRemoteInputState();
+      if (document.hidden) {
+        suspendPresentedInput();
+        resetRemoteInputState();
+      } else {
+        schedulePresentedInputActivation();
+      }
     });
     document.addEventListener("keydown", handleRemoteFullscreenEscape, true);
     document.addEventListener("pointermove", handleRemoteToolbarPointerMove, { passive: true });
@@ -370,7 +398,14 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
 }
 
 export function prepareControllerRender(): void {
+  fileDropTargetGate.clear();
+  setFileDragActive(false);
+  const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
+  if (queue) fileQueueView.capture(queue);
   resetRemoteInputState();
+  inputPresentation.clear();
+  inputSurfaceConfirmedVisible = false;
+  if (inputActivationFrame !== null) { window.cancelAnimationFrame(inputActivationFrame); inputActivationFrame = null; }
   remoteTextInput = null;
   inputDispatcher.discardPendingMoves();
   if (pointerFrame !== null) {
@@ -415,7 +450,7 @@ export function renderControllerView(): string {
   const remoteSurfaceVisible = connected || remoteSurfaceState === "retaining";
   return `
     <div class="controller-stack${remoteSurfaceVisible ? " controller-stack--remote" : ""}">
-      ${feedback ? renderFeedback(feedback) : ""}
+      <div data-controller-feedback>${feedback ? renderFeedback(feedback) : ""}</div>
       <div class="controller-heading${remoteSurfaceVisible ? " sr-only" : ""}">
         <div class="controller-heading-copy">
           <h1>连接设备</h1>
@@ -425,6 +460,27 @@ export function renderControllerView(): string {
       ${remoteSurfaceVisible ? renderRemoteDesktop() : renderConnectionPanel()}
     </div>
   `;
+}
+
+export function controllerSurfaceIdentity(): string | null {
+  if (loading || (snapshot?.runtime.state !== "connected" && remoteSurfaceState !== "retaining")) return null;
+  const key = videoConfig ? `${videoConfig.streamId}:canvas` : `${snapshot?.runtime.streamId}:waiting`;
+  return `${key}:${failedVideoConfig ?? "ready"}`;
+}
+
+export function updatePersistentControllerRegions(): void {
+  const region = document.querySelector<HTMLElement>("[data-controller-feedback]");
+  if (region) {
+    region.innerHTML = feedback ? renderFeedback(feedback) : "";
+    region.querySelector<HTMLButtonElement>("[data-controller-dismiss]")?.addEventListener("click", () => {
+      feedback = null;
+      requestRender();
+    });
+  }
+  updateRemoteSessionStatus();
+  updateInputRestriction();
+  updateAudioControl();
+  updateTransferPanel();
 }
 
 export function bindControllerInteractions(): void {
@@ -590,8 +646,12 @@ export function bindControllerInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-controller-pan]")?.addEventListener("click", () => {
     setRemotePanMode(!remotePanMode);
   });
-  document.querySelector<HTMLButtonElement>("[data-controller-windows-key]")?.addEventListener("click", () => {
-    sendRemoteKeyTap("meta");
+  document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]").forEach((button) => {
+    button.addEventListener("click", () => { void sendRemoteShortcut(button.dataset.controllerShortcut ?? ""); });
+  });
+  const shortcuts = document.querySelector<HTMLDetailsElement>("[data-controller-shortcuts]");
+  shortcuts?.addEventListener("focusout", (event) => {
+    if (!shortcuts.contains(event.relatedTarget as Node | null)) shortcuts.open = false;
   });
   document.querySelector<HTMLButtonElement>("[data-controller-text]")?.addEventListener("click", () => {
     const panel = document.querySelector<HTMLElement>("[data-controller-text-panel]");
@@ -981,7 +1041,13 @@ function renderRemoteDesktop(): string {
             </select>
           </label>
           <button class="toolbar-button${remotePanMode ? " toolbar-button--active" : ""}" type="button" data-controller-pan aria-pressed="${remotePanMode}" ${remoteScaleMode === "actual" ? "" : "disabled"} title="${remoteScaleMode === "actual" ? (remotePanMode ? "恢复向远程电脑发送鼠标和键盘输入" : "只在本地拖动或滚动画面，不会操作远程电脑") : "切换到 1:1 后可以浏览超出窗口的画面"}">${icon("hand")}${remotePanMode ? "继续控制" : "浏览画面"}</button>
-          <button class="toolbar-button" type="button" data-controller-windows-key title="在远程电脑打开或关闭开始菜单，不会打开本机开始菜单">${icon("panels-top-left")}Windows 键</button>
+          <details class="remote-shortcuts" data-controller-shortcuts>
+            <summary class="toolbar-button" title="发送远端 Esc、Windows 键和系统组合键">${icon("keyboard")}快捷键</summary>
+            <div class="remote-shortcuts-panel" aria-label="发送快捷键到远端">
+              ${REMOTE_SHORTCUTS.map((shortcut) => `<button type="button" data-controller-shortcut="${shortcut.id}" ${remoteShortcutBusy ? "disabled" : ""}><strong>${shortcut.label}</strong><small>${shortcut.description}</small></button>`).join("")}
+              <p>本机 Esc：退出全屏。<br>Ctrl + Alt + Delete：请在被控电脑本机操作。</p>
+            </div>
+          </details>
           <button class="toolbar-button" type="button" data-controller-text title="发送中文、符号或一段文字">${icon("keyboard")}发送文字</button>
           ${renderTransferToolbarButton()}
           <button class="toolbar-button" type="button" data-controller-keyframe title="刷新远程画面">${icon("refresh-cw")}刷新画面</button>
@@ -989,7 +1055,8 @@ function renderRemoteDesktop(): string {
           <button class="toolbar-button toolbar-button--danger" type="button" data-controller-disconnect>${icon("log-out")}断开连接</button>
         </div>
       </div>
-      <div class="remote-fullscreen-guide" aria-hidden="true">鼠标移到顶部显示工具栏 · Esc 退出全屏</div>
+      <div class="remote-fullscreen-guide" aria-hidden="true">鼠标移到顶部显示工具栏 · Esc 退出全屏 · 快捷键菜单可发送远端 Esc</div>
+      ${renderInputRestriction()}
       ${renderTransferPanel()}
       <form class="remote-text-entry" data-controller-text-form data-controller-text-panel hidden>
         <label for="remote-text-input">发送文字到远程电脑</label>
@@ -1011,7 +1078,7 @@ function renderRemoteDesktop(): string {
           </div>
         <div class="remote-focus-hint" data-remote-focus-hint>${remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑" : "点击画面开始控制 · Ctrl+V 粘贴本机短文本 · Ctrl+Alt+Delete 必须在主机本地操作"}</div>
         <div class="remote-file-drop-overlay" data-controller-file-drop-overlay ${fileDragActive ? "" : "hidden"} aria-hidden="true">
-          ${icon("file-up")}<strong>松开鼠标，将文件加入发送队列</strong><span>文件会按顺序发送，不会打断画面和输入。</span>
+          ${icon("file-up")}<strong>松开鼠标，发送到设备 ${escapeHtml(attemptTarget || deviceIdDraft)}</strong><span>文件会加入等待队列，按顺序发送。</span>
         </div>
       </div>
     </section>
@@ -1019,20 +1086,11 @@ function renderRemoteDesktop(): string {
 }
 
 function renderAudioControl(): string {
-  const unavailable = audioStatus === "starting" || audioStatus === "unavailable";
-  const muted = audioStatus === "muted" || !audioEnabled;
-  const iconName = unavailable ? "volume-off" : muted ? "volume-x" : "volume-2";
-  const label = audioStatus === "starting"
-    ? "声音准备中"
-    : audioStatus === "unavailable"
-      ? "无声音"
-      : muted
-        ? "打开声音"
-        : "静音";
+  const { unavailable, muted, iconName, label, message } = remoteAudioControl(audioStatus, audioEnabled, audioMessage, remoteAudio.getSnapshot());
   return '<button class="toolbar-button" type="button" data-controller-audio aria-pressed="'
     + String(muted)
     + '" title="'
-    + escapeHtml(audioMessage)
+    + escapeHtml(message)
     + '"'
     + (unavailable || audioToggleBusy ? " disabled" : "")
     + ">"
@@ -1040,6 +1098,22 @@ function renderAudioControl(): string {
     + '<span data-controller-audio-label>'
     + label
     + "</span></button>";
+}
+
+function renderInputRestriction(): string {
+  const state = inputRestrictionPresentation(inputRestrictionReason);
+  return `<aside class="feedback feedback--info" data-controller-input-restriction role="status" aria-live="polite" ${state ? "" : "hidden"}><strong>${escapeHtml(state?.title ?? "")}</strong><span>${escapeHtml(state?.detail ?? "")}</span></aside>`;
+}
+
+function updateInputRestriction(): void {
+  const region = document.querySelector<HTMLElement>("[data-controller-input-restriction]");
+  if (!region) return;
+  const state = inputRestrictionPresentation(inputRestrictionReason);
+  region.hidden = state === null;
+  const title = region.querySelector<HTMLElement>("strong");
+  const detail = region.querySelector<HTMLElement>("span");
+  if (title) title.textContent = state?.title ?? "";
+  if (detail) detail.textContent = state?.detail ?? "";
 }
 
 function renderTransferPanel(): string {
@@ -1128,7 +1202,6 @@ function renderFileQueueRecovery(): string {
 }
 
 function renderFileQueue(): string {
-  const visible = fileQueue.queued.slice(0, 4);
   const summary = queuedFilesSummary(fileQueue.queued);
   const queueActionsDisabled = fileQueueActions.busy || filePickerBusy || discardFileQueueRecoveryBusy;
   const resuming = fileQueueActions.matches("resume");
@@ -1136,10 +1209,12 @@ function renderFileQueue(): string {
   return `
     <div class="remote-transfer-list-heading"><strong>${fileQueue.paused ? "队列已暂停" : "等待发送"} · ${summary}</strong><span>${fileQueue.paused ? `<button type="button" data-controller-file-queue-resume ${queueActionsDisabled ? "disabled" : ""}>${resuming ? `${icon("loader-circle", "button-spinner")}正在继续…` : "继续队列"}</button>` : ""}<button type="button" data-controller-file-queue-clear ${queueActionsDisabled ? "disabled" : ""}>${clearing ? `${icon("loader-circle", "button-spinner")}正在清空…` : "清空等待"}</button></span></div>
     ${renderFileQueueProtection()}
-    <ul>${visible.map((file) => `
-      <li><span>${icon("file-up")}<span><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></span><button type="button" data-controller-file-queue-remove="${file.id}" aria-label="${fileQueueActions.matches("remove", file.id) ? "正在从队列移除" : "从队列移除"} ${escapeHtml(file.name)}" title="${fileQueueActions.matches("remove", file.id) ? "正在移除" : "从队列移除"}" ${queueActionsDisabled ? "disabled" : ""}>${fileQueueActions.matches("remove", file.id) ? icon("loader-circle", "button-spinner") : icon("x")}</button></li>
-    `).join("")}</ul>
-    ${fileQueue.queued.length > visible.length ? `<small class="remote-transfer-more">还有 ${fileQueue.queued.length - visible.length} 个文件正在等待</small>` : ""}
+    ${fileQueueView.render(fileQueue.queued, {
+      disabled: queueActionsDisabled,
+      removingId: fileQueueActions.active?.kind === "remove" ? fileQueueActions.active.transferId : null,
+      formatBytes,
+      icon,
+    })}
   `;
 }
 
@@ -1466,9 +1541,15 @@ async function clearStoredDevices(): Promise<void> {
 
 function handleSignal(signal: ControllerSignal): void {
   switch (signal.kind) {
+    case "inputRestriction":
+      inputRestrictionReason = signal.reason;
+      updateInputRestriction();
+      break;
     case "status": {
       runtimeSignalRevision += 1;
       const previousRuntime = snapshot?.runtime;
+      inputRestrictionReason = restrictionAfterRuntime(inputRestrictionReason, previousRuntime, signal.runtime);
+      updateInputRestriction();
       const previousSurfaceState = remoteSurfaceState;
       const nextSurfaceState = advanceControllerRemoteSurfaceState(
         previousSurfaceState,
@@ -1499,6 +1580,9 @@ function handleSignal(signal: ControllerSignal): void {
       }
       remoteSurfaceState = nextSurfaceState;
       if (signal.runtime.state !== "connected") {
+        inputPresentation.clear();
+        inputSurfaceConfirmedVisible = false;
+        fileDropTargetGate.clear();
         if (remoteFullscreenActive || remoteFullscreenDesired) {
           void setRemoteFullscreen(false, false);
         }
@@ -1559,6 +1643,17 @@ function handleSignal(signal: ControllerSignal): void {
       break;
     }
     case "videoConfig": {
+      const inputChange = inputPresentation.announce(signal, channelGeneration);
+      if (inputChange.changed) {
+        inputSurfaceConfirmedVisible = false;
+        inputDispatcher.discardPendingMoves();
+        if (pointerFrame !== null) { window.cancelAnimationFrame(pointerFrame); pointerFrame = null; }
+        if (inputActivationFrame !== null) { window.cancelAnimationFrame(inputActivationFrame); inputActivationFrame = null; }
+      }
+      if (inputChange.contextChanged) {
+        inputDispatcher.discardAll();
+        resetRemoteInputState();
+      }
       const changed = !videoConfig || videoConfigKey(videoConfig) !== videoConfigKey(signal);
       if (changed) {
         videoSequenceHeader = Uint8Array.from(signal.sequenceHeader);
@@ -1570,9 +1665,13 @@ function handleSignal(signal: ControllerSignal): void {
         h264ProfileFallbackReason = null;
       }
       videoConfig = signal;
-      if (changed || !document.querySelector("[data-remote-canvas]")) {
+      const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
+      if (changed && canvas) {
+        setupRemoteDesktop(false);
+      } else if (!canvas) {
         requestRender();
       }
+      updateInputContextPresentation();
       break;
     }
     case "cursor":
@@ -1694,6 +1793,11 @@ async function toggleRemoteAudio(): Promise<void> {
   ) {
     return;
   }
+  if (remoteAudioControl(audioStatus, audioEnabled, audioMessage, remoteAudio.getSnapshot()).retry) {
+    remoteAudio.prepare();
+    updateAudioControl();
+    return;
+  }
   const previousEnabled = audioEnabled;
   const previousStatus = audioStatus;
   const previousMessage = audioMessage;
@@ -1722,18 +1826,9 @@ async function toggleRemoteAudio(): Promise<void> {
 function updateAudioControl(): void {
   const button = document.querySelector<HTMLButtonElement>("[data-controller-audio]");
   if (!button) return;
-  const unavailable = audioStatus === "starting" || audioStatus === "unavailable";
-  const muted = audioStatus === "muted" || !audioEnabled;
-  const iconName = unavailable ? "volume-off" : muted ? "volume-x" : "volume-2";
-  const label = audioStatus === "starting"
-    ? "声音准备中"
-    : audioStatus === "unavailable"
-      ? "无声音"
-      : muted
-        ? "打开声音"
-        : "静音";
+  const { unavailable, muted, iconName, label, message } = remoteAudioControl(audioStatus, audioEnabled, audioMessage, remoteAudio.getSnapshot());
   button.disabled = unavailable || audioToggleBusy;
-  button.title = audioMessage;
+  button.title = message;
   button.setAttribute("aria-pressed", String(muted));
   button.innerHTML = icon(iconName) + '<span data-controller-audio-label>' + label + "</span>";
   renderLucideIcons(button);
@@ -1817,6 +1912,7 @@ function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void
     }
     const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
     if (queue) {
+      fileQueueView.capture(queue);
       queue.hidden = fileQueue.queued.length === 0;
       queue.innerHTML = renderFileQueue();
       renderLucideIcons(queue);
@@ -1963,6 +2059,8 @@ async function openDownloadsFolder(): Promise<void> {
 }
 
 function bindTransferLedgerActions(): void {
+  const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
+  if (queue) fileQueueView.restore(queue);
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-recovery-discard]")
     ?.addEventListener("click", () => void discardFileQueueRecovery());
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-clear]")
@@ -2054,14 +2152,16 @@ async function chooseFileForTransfer(): Promise<void> {
   }
 }
 
-async function enqueueDroppedFiles(paths: string[]): Promise<void> {
+async function enqueueDroppedFiles(paths: string[], target: FileDropTarget): Promise<void> {
   if (paths.length === 0 || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
   openTransferPanel();
   updateTransferPanel();
   try {
-    await queueControllerFiles(paths);
+    await queueControllerFiles(paths, target.streamId, target.deviceId);
   } catch (error) {
-    showFileQueueError(error);
+    if (channelGeneration === target.generation && snapshot?.runtime.streamId === target.streamId) {
+      showFileQueueError(error);
+    }
   }
 }
 
@@ -2149,18 +2249,25 @@ async function initializeNativeFileDrop(): Promise<void> {
   fileDropInitialized = true;
   try {
     await getCurrentWebview().onDragDropEvent((event) => {
-      const connected = snapshot?.runtime.state === "connected";
-      if (!connected) {
+      const payload = event.payload;
+      if (payload.type === "leave") {
+        fileDropTargetGate.clear();
         setFileDragActive(false);
         return;
       }
-      if (event.payload.type === "enter" || event.payload.type === "over") {
-        setFileDragActive(true);
-      } else if (event.payload.type === "leave") {
+      const runtime = snapshot?.runtime;
+      const target = runtime?.state === "connected" && runtime.streamId !== null
+        ? { streamId: runtime.streamId, deviceId: attemptTarget || deviceIdDraft, generation: channelGeneration }
+        : null;
+      if (payload.type === "enter") fileDropTargetGate.enter(target);
+      const accepted = fileDropTargetGate.accept(target,
+        nativeFileDropHitsSurface(payload.position, window.devicePixelRatio, document));
+      if (payload.type === "drop") {
+        fileDropTargetGate.clear();
         setFileDragActive(false);
-      } else if (event.payload.type === "drop") {
-        setFileDragActive(false);
-        void enqueueDroppedFiles(event.payload.paths);
+        if (accepted) void enqueueDroppedFiles(payload.paths, accepted);
+      } else {
+        setFileDragActive(accepted !== null);
       }
     });
   } catch {
@@ -2345,7 +2452,7 @@ function updateConnectionProgressClock(): void {
   guidance.classList.toggle("connection-progress-guidance--delayed", presentation.delayed);
 }
 
-function setupRemoteDesktop(): void {
+function setupRemoteDesktop(bindInputs = true): void {
   const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
   const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
   if (!viewport || !canvas || !videoConfig) {
@@ -2369,7 +2476,8 @@ function setupRemoteDesktop(): void {
     queueMicrotask(requestRender);
     return;
   }
-  setupRemoteGeometry(viewport, canvas);
+  inputPresentation.announce(config, channelGeneration);
+  if (bindInputs) setupRemoteGeometry(viewport, canvas);
   scheduleRemoteScaleLayout(viewport, canvas, remoteScaleMode === "actual");
   void startVideoDecoder(canvas, context, configKey, "hardware");
   videoPull.start(
@@ -2382,8 +2490,10 @@ function setupRemoteDesktop(): void {
     },
   );
   armVideoPlaybackPressureReporter(config.streamId);
-  bindRemoteInput(viewport, canvas);
-  focusRemoteKeyboard(viewport);
+  if (bindInputs) {
+    bindRemoteInput(viewport, canvas);
+    focusRemoteKeyboard(viewport);
+  }
 }
 
 function handleVideo(payload: ControllerVideoPayload): void {
@@ -2456,7 +2566,7 @@ function restartVideoDecoderForFreshness(
   void startVideoDecoder(canvas, context, configKey, preference);
 }
 
-function armVideoPlaybackPressureReporter(streamId: number): void {
+function armVideoPlaybackPressureReporter(streamId: string): void {
   if (videoPlaybackPressureTimer !== null) {
     return;
   }
@@ -2520,12 +2630,99 @@ function updateVideoStartingMessage(): void {
   }
 }
 
+function inputSurfaceVisible(canvas = remoteCanvasElement): boolean {
+  if (document.hidden || canvas === null || !canvas.isConnected) return false;
+  const bounds = canvas.getClientRects();
+  for (let index = 0; index < bounds.length; index += 1) {
+    if (bounds[index]!.width > 0 && bounds[index]!.height > 0) return true;
+  }
+  return false;
+}
+
+function suspendPresentedInput(): void {
+  inputSurfaceConfirmedVisible = false;
+  inputPresentation.suspend();
+}
+
+function currentInputContext(): RemoteInputContext | null {
+  if (snapshot?.runtime.state !== "connected" || document.hidden || !remoteCanvasElement?.isConnected || !inputSurfaceConfirmedVisible) {
+    suspendPresentedInput();
+    return null;
+  }
+  const context = inputPresentation.context;
+  return context?.streamId === snapshot.runtime.streamId ? context : null;
+}
+
+function updateInputContextPresentation(): void {
+  const viewport = remoteViewportElement;
+  if (!viewport) return;
+  const ready = currentInputContext() !== null;
+  viewport.dataset.inputReady = String(ready);
+  const hint = viewport.querySelector<HTMLElement>("[data-remote-focus-hint]");
+  if (hint) hint.textContent = !ready
+    ? "正在等待新画面显示，输入暂时暂停。"
+    : remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑"
+      : "点击画面开始控制 · Ctrl+V 粘贴本机短文本 · Ctrl+Alt+Delete 必须在主机本地操作";
+}
+
+function schedulePresentedInputActivation(frame: PaintedInputFrame | null = inputPresentation.painted): void {
+  if (!frame) return;
+  if (inputActivationFrame !== null) window.cancelAnimationFrame(inputActivationFrame);
+  inputActivationFrame = window.requestAnimationFrame(() => {
+    inputActivationFrame = null;
+    inputSurfaceConfirmedVisible = inputSurfaceVisible();
+    inputPresentation.activate(frame, channelGeneration,
+      snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null, inputSurfaceConfirmedVisible);
+    updateInputContextPresentation();
+  });
+}
+
+function paintRemoteVideoFrame(
+  frame: VideoFrame, canvas: HTMLCanvasElement, context: CanvasRenderingContext2D,
+  configuration: ControllerVideoConfigSignal, connectionGeneration: number, generation: number,
+  configKey: string, preference: "hardware" | "software",
+): void {
+  try {
+    if (generation !== decoderGeneration || connectionGeneration !== channelGeneration || !canvas.isConnected
+      || !videoConfig || videoConfigKey(videoConfig) !== configKey || videoConfig.inputEpoch !== configuration.inputEpoch) return;
+    if (canvas.width !== configuration.width || canvas.height !== configuration.height) {
+      canvas.width = configuration.width;
+      canvas.height = configuration.height;
+      remoteCanvasBounds = null;
+      remoteViewportBounds = null;
+      syncRemoteCanvasPixelSize(canvas);
+      if (remoteViewportElement) scheduleRemoteScaleLayout(remoteViewportElement, canvas, false);
+    }
+    if (frame.displayWidth === canvas.width && frame.displayHeight === canvas.height) context.drawImage(frame, 0, 0);
+    else context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    const painted = inputPresentation.drew(configuration, connectionGeneration, frame);
+    schedulePresentedInputActivation(painted);
+    if (decodedFrames === 0 && videoConfigReceivedAtMs !== null) firstFrameMs = Math.max(0, Date.now() - videoConfigReceivedAtMs);
+    decodedFrames += 1;
+    consecutiveDecoderStalls = 0;
+    if (decodedFrames === 1) {
+      const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
+      if (waiting) waiting.hidden = true;
+    }
+    videoRenderTiming.observe(performance.now());
+    if (decodedFrames === 1) reportRenderMetrics(true);
+  } catch {
+    suspendPresentedInput();
+    fallbackOrFailVideo(configKey, preference, "decoderError");
+  } finally {
+    frame.close();
+  }
+}
+
 async function startVideoDecoder(
   canvas: HTMLCanvasElement,
   context: CanvasRenderingContext2D,
   configKey: string,
   preference: "hardware" | "software",
 ): Promise<void> {
+  const configuration = videoConfig ? { ...videoConfig } : null;
+  if (!configuration || videoConfigKey(configuration) !== configKey) return;
+  const connectionGeneration = channelGeneration;
   releaseVideoDecoder();
   const generation = decoderGeneration;
   decoderPreference = preference;
@@ -2555,35 +2752,7 @@ async function startVideoDecoder(
               nextFrame?.close();
               return;
             }
-            try {
-              if (
-                nextFrame.displayWidth === canvas.width
-                && nextFrame.displayHeight === canvas.height
-              ) {
-                context.drawImage(nextFrame, 0, 0);
-              } else {
-                context.drawImage(nextFrame, 0, 0, canvas.width, canvas.height);
-              }
-              if (decodedFrames === 0 && videoConfigReceivedAtMs !== null) {
-                firstFrameMs = Math.max(0, Date.now() - videoConfigReceivedAtMs);
-              }
-              decodedFrames += 1;
-              consecutiveDecoderStalls = 0;
-              if (decodedFrames === 1) {
-                const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
-                if (waiting) {
-                  waiting.hidden = true;
-                }
-              }
-              videoRenderTiming.observe(performance.now());
-              if (decodedFrames === 1) {
-                reportRenderMetrics(true);
-              }
-            } catch {
-              fallbackOrFailVideo(configKey, preference, "decoderError");
-            } finally {
-              nextFrame.close();
-            }
+            paintRemoteVideoFrame(nextFrame, canvas, context, configuration, connectionGeneration, generation, configKey, preference);
           });
         }
       },
@@ -2598,8 +2767,8 @@ async function startVideoDecoder(
     const h264Profile = h264ProfileFromCodec(codec);
     const decoderConfig = {
       codec,
-      codedWidth: videoConfig?.width ?? canvas.width,
-      codedHeight: videoConfig?.height ?? canvas.height,
+      codedWidth: configuration.width,
+      codedHeight: configuration.height,
       hardwareAcceleration: preference === "hardware" ? "prefer-hardware" : "prefer-software",
       optimizeForLatency: true,
     } as const;
@@ -3080,6 +3249,7 @@ function syncRemoteInteractionControls(): void {
       ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑"
       : "点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作";
   }
+  updateInputContextPresentation();
 }
 
 function scheduleRemoteScaleLayout(
@@ -3192,6 +3362,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     });
   }
   const pendingPoint = { x: 0, y: 0 };
+  let pendingPointContext: RemoteInputContext | null = null;
   let hasPendingPoint = false;
   let panDrag: (RemotePanOrigin & { pointerId: number }) | null = null;
   const sendPendingPoint = () => {
@@ -3200,8 +3371,11 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     }
     pointerFrame = null;
     if (hasPendingPoint) {
-      fireMouseMove(pendingPoint.x, pendingPoint.y);
+      if (pendingPointContext !== null && currentInputContext() === pendingPointContext) {
+        fireMouseMove(pendingPoint.x, pendingPoint.y, pendingPointContext);
+      }
       hasPendingPoint = false;
+      pendingPointContext = null;
     }
   };
   const discardPendingPoint = () => {
@@ -3210,6 +3384,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       pointerFrame = null;
     }
     hasPendingPoint = false;
+    pendingPointContext = null;
   };
   const finishPanDrag = () => {
     if (panDrag && viewport.hasPointerCapture(panDrag.pointerId)) {
@@ -3241,9 +3416,11 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       }
       return;
     }
-    if (!writePointerPosition(event, canvas, pendingPoint)) {
+    const inputContext = currentInputContext();
+    if (!inputContext || !writePointerPosition(event, canvas, pendingPoint)) {
       return;
     }
+    pendingPointContext = inputContext;
     hasPendingPoint = true;
     if (pointerFrame === null) {
       pointerFrame = window.requestAnimationFrame(sendPendingPoint);
@@ -3284,9 +3461,11 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     }
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
-    if (!writePointerPosition(event, canvas, pendingPoint)) {
+    const inputContext = currentInputContext();
+    if (!inputContext || !writePointerPosition(event, canvas, pendingPoint)) {
       return;
     }
+    pendingPointContext = inputContext;
     event.preventDefault();
     if (carrier) {
       const bounds = viewport.getBoundingClientRect();
@@ -3298,7 +3477,8 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     hasPendingPoint = true;
     sendPendingPoint();
     pressedButtons.add(button);
-    fireInput({ kind: "mouseButton", button, pressed: true });
+    heldButtonContext = inputContext;
+    fireInput({ kind: "mouseButton", button, pressed: true }, inputContext);
   });
   viewport.addEventListener("pointerup", (event) => {
     if (panDrag?.pointerId === event.pointerId) {
@@ -3314,12 +3494,16 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       return;
     }
     event.preventDefault();
-    if (writePointerPosition(event, canvas, pendingPoint)) {
+    const inputContext = currentInputContext();
+    if (inputContext && writePointerPosition(event, canvas, pendingPoint)) {
       hasPendingPoint = true;
+      pendingPointContext = inputContext;
       sendPendingPoint();
     }
+    const releaseContext = pressedButtons.has(button) ? heldButtonContext : null;
     pressedButtons.delete(button);
-    fireInput({ kind: "mouseButton", button, pressed: false });
+    if (releaseContext) fireInput({ kind: "mouseButton", button, pressed: false }, releaseContext);
+    if (pressedButtons.size === 0) heldButtonContext = null;
   });
   const releaseCapturedInput = () => {
     finishPanDrag();
@@ -3335,11 +3519,13 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       return;
     }
     event.preventDefault();
+    const inputContext = currentInputContext();
+    if (!inputContext) { discardPendingPoint(); return; }
     sendPendingPoint();
     const deltaX = clampWheel(Math.round(event.deltaX));
     const deltaY = clampWheel(-Math.round(event.deltaY));
     if (deltaX !== 0 || deltaY !== 0) {
-      fireInput({ kind: "wheel", deltaX, deltaY });
+      fireInput({ kind: "wheel", deltaX, deltaY }, inputContext);
     }
   }, { passive: false });
   viewport.addEventListener("keydown", (event) => {
@@ -3388,8 +3574,8 @@ function focusRemoteKeyboard(viewport = remoteTextInput?.viewport): void {
 }
 
 function fireRemoteText(text: string): void {
-  const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
-  if (streamId !== null) void inputDispatcher.enqueueText(text, streamId).catch(() => {});
+  const inputContext = currentInputContext();
+  if (inputContext) void inputDispatcher.enqueueText(text, inputContext).catch(() => {});
 }
 
 function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
@@ -3403,6 +3589,8 @@ function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
   event.preventDefault();
   const physicalCode = event.code || key.key;
   if (pressed) {
+    const inputContext = currentInputContext();
+    if (!inputContext) return;
     const ownModifier = keyboardModifierMask(key.key);
     const input: ControllerKeyInput = {
       kind: "key",
@@ -3411,20 +3599,23 @@ function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
       pressed: true,
       modifiers: keyboardModifiers(event, pressedKeys.modifierMask() | ownModifier),
     };
+    heldKeyboardContext = inputContext;
     for (const next of pressedKeys.press(physicalCode, input)) {
-      fireInput(next);
+      fireInput(next, inputContext);
     }
   } else {
     for (const next of pressedKeys.release(physicalCode)) {
-      fireInput(next);
+      if (heldKeyboardContext) fireInput(next, heldKeyboardContext);
     }
   }
 }
 
 function releaseKeyboardState(): void {
+  const inputContext = heldKeyboardContext;
   for (const input of pressedKeys.releaseAll()) {
-    fireInput(input);
+    if (inputContext) fireInput(input, inputContext);
   }
+  heldKeyboardContext = null;
 }
 
 function resetRemoteTextInput(): void {
@@ -3433,6 +3624,7 @@ function resetRemoteTextInput(): void {
 }
 
 function resetRemoteInputState(): void {
+  inputDispatcher.cancelShortcuts();
   resetRemoteTextInput();
   releaseInputState();
 }
@@ -3440,15 +3632,18 @@ function resetRemoteInputState(): void {
 function releaseInputState(): void {
   releaseKeyboardState();
   for (const button of pressedButtons) {
-    fireInput({ kind: "mouseButton", button, pressed: false });
+    if (heldButtonContext) fireInput({ kind: "mouseButton", button, pressed: false }, heldButtonContext);
   }
   pressedButtons.clear();
+  heldButtonContext = null;
 }
 
 async function pasteLocalClipboardText(): Promise<void> {
-  if (smartPasteBusy || snapshot?.runtime.state !== "connected") {
+  const inputContext = currentInputContext();
+  if (smartPasteBusy || !inputContext) {
     return;
   }
+  const generation = channelGeneration;
   smartPasteBusy = true;
   smartPastePending = true;
   clipboardTransfer = {
@@ -3462,8 +3657,10 @@ async function pasteLocalClipboardText(): Promise<void> {
   resetRemoteInputState();
   try {
     await inputDispatcher.drain();
-    await pasteControllerClipboardText();
+    if (!sameInputContext(currentInputContext(), inputContext)) throw new Error("画面已切换，请重新粘贴文字。");
+    await pasteControllerClipboardText(inputContext);
   } catch (error) {
+    if (generation !== channelGeneration) return;
     smartPasteBusy = false;
     smartPastePending = false;
     openTransferPanel();
@@ -3474,33 +3671,41 @@ async function pasteLocalClipboardText(): Promise<void> {
       message: normalizeError(error),
     };
   } finally {
-    updateTransferPanel({ ledger: false });
-    focusRemoteKeyboard();
+    if (generation === channelGeneration) {
+      updateTransferPanel({ ledger: false });
+      if (sameInputContext(currentInputContext(), inputContext)) focusRemoteKeyboard();
+    }
   }
 }
 
-function fireInput(input: ControllerInput): void {
-  const streamId = snapshot?.runtime.state === "connected"
-    ? snapshot.runtime.streamId
-    : null;
-  if (streamId !== null) {
-    inputDispatcher.enqueue(input, streamId);
-  }
+function fireInput(input: ControllerInput, inputContext: RemoteInputContext): void {
+  inputDispatcher.enqueue(input, inputContext);
 }
 
-function fireMouseMove(x: number, y: number): void {
-  const streamId = snapshot?.runtime.state === "connected"
-    ? snapshot.runtime.streamId
-    : null;
-  if (streamId !== null) {
-    inputDispatcher.enqueueMouseMove(x, y, streamId);
-  }
+function fireMouseMove(x: number, y: number, inputContext: RemoteInputContext): void {
+  inputDispatcher.enqueueMouseMove(x, y, inputContext);
 }
 
-function sendRemoteKeyTap(key: string): void {
-  fireInput({ kind: "key", key, pressed: true, modifiers: 0 });
-  fireInput({ kind: "key", key, pressed: false, modifiers: 0 });
-  focusRemoteKeyboard();
+async function sendRemoteShortcut(id: string): Promise<void> {
+  const input = remoteShortcutInput(id);
+  const inputContext = currentInputContext();
+  if (!input || !inputContext || remoteShortcutBusy || remoteTextInput?.state.isComposing) return;
+  const generation = channelGeneration;
+  resetRemoteInputState();
+  remoteShortcutBusy = true;
+  const menu = document.querySelector<HTMLDetailsElement>("[data-controller-shortcuts]");
+  if (menu) menu.open = false;
+  const buttons = document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]");
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await inputDispatcher.enqueueShortcut(input, inputContext);
+  } catch (error) {
+    if (channelGeneration === generation && sameInputContext(currentInputContext(), inputContext)) showOperationError(error);
+  } finally {
+    remoteShortcutBusy = false;
+    document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]").forEach((button) => { button.disabled = false; });
+    if (channelGeneration === generation && sameInputContext(currentInputContext(), inputContext)) focusRemoteKeyboard();
+  }
 }
 
 async function submitTextInput(event: SubmitEvent): Promise<void> {
@@ -3523,10 +3728,10 @@ async function submitTextInput(event: SubmitEvent): Promise<void> {
     submit.setAttribute("aria-busy", "true");
   }
   try {
-    const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
-    if (streamId === null) return;
+    const inputContext = currentInputContext();
+    if (!inputContext) return;
     releaseKeyboardState();
-    await inputDispatcher.enqueueText(text, streamId);
+    await inputDispatcher.enqueueText(text, inputContext);
     input.value = "";
     closeTextInput();
   } catch (error) {
@@ -3601,12 +3806,14 @@ function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): 
   remoteCanvasElement = canvas;
   remoteCursorElement = document.querySelector<HTMLElement>("[data-remote-cursor]");
   const refresh = () => {
+    suspendPresentedInput();
     syncRemoteCanvasPixelSize(canvas);
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
     remoteViewportScrollLeft = viewport.scrollLeft;
     remoteViewportScrollTop = viewport.scrollTop;
     syncRemoteCanvasFitState(viewport, canvas);
+    schedulePresentedInputActivation();
   };
   const handleScroll = () => {
     const nextScrollLeft = viewport.scrollLeft;

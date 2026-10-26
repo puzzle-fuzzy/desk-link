@@ -20,8 +20,8 @@ describe("H.264 decoder configuration", () => {
   });
 
   test("distinguishes stream restarts from configuration revisions", () => {
-    expect(videoConfigKey({ streamId: 8, configVersion: 2 })).toBe("8:2");
-    expect(videoConfigKey({ streamId: 9, configVersion: 2 })).not.toBe("8:2");
+    expect(videoConfigKey({ streamId: "8", configVersion: 2 })).toBe("8:2");
+    expect(videoConfigKey({ streamId: "9", configVersion: 2 })).not.toBe("8:2");
   });
 
   test("classifies High SPS codecs for capability diagnostics", () => {

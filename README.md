@@ -27,11 +27,12 @@ DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正�
 
 当前明确不支持：麦克风/语音对讲、整块虚拟桌面合成、未经用户点击即自动安装更新，以及 Windows UAC 安全桌面和 `Ctrl+Alt+Delete` 注入。多显示器通过会话内切换当前屏幕实现；剪贴板采用用户主动触发的纯文本传输，不在后台自动监听。更新检查失败或发布清单不完整时只在设置页提示，不会影响远程控制。
 
-### Apple 开发面（2026-07-26）
+### Apple 与第二阶段能力（2026-10-26）
 
 - `apps/macos`：Apple Silicon macOS 13+ controller/host，使用 ScreenCaptureKit、VideoToolbox、CGEvent 和 Keychain；自动门禁见 [`docs/apple/macos-apple-silicon-acceptance.md`](docs/apple/macos-apple-silicon-acceptance.md)。
 - `apps/ios`：iOS 16+ controller-only 客户端，支持安全配对、保存设备、H.264/Metal 画面、直接触控、轨迹板、键盘输入和前后台恢复；不会伪装成 iOS host，也不会控制其他 iOS App。
-- Apple 端当前已完成 Rust/Swift/模拟器构建门禁；物理 iPhone、系统权限、签名/公证和跨设备链路仍须人工验收，未完成项记录在 [`docs/apple/2026-07-26-apple-platform-acceptance.md`](docs/apple/2026-07-26-apple-platform-acceptance.md)。
+- 用户已确认 Windows→Windows 和 macOS→Windows 的基础远控良好。Mac 控制侧的 IME、音频、剪贴板、文件、多屏与特殊恢复仍分别核验；被控 Mac 和 iOS 单列，不能因 Rust 方法存在就视为平台 UI 已接通。方向/功能矩阵、源码版本与独立分支证据见[当前能力与阶段证据](docs/current-capabilities.md)。
+- Apple 历史 Rust/Swift/模拟器构建记录保留于 [`2026-07-26 验收记录`](docs/apple/2026-07-26-apple-platform-acceptance.md)；本次 Windows 本地检查没有运行 Swift/Xcode、物理 iPhone、权限或签名/公证验收。
 - `server/account`：独立的可选邮箱账号服务；登录用于账号状态和设备管理，不参与远程配对、主机审批或 relay。未登录也可直接使用本机远程控制。多设备语义、退出清理和生产发布限制见 [`docs/account-login.md`](docs/account-login.md) 与 [`docs/account-release-runbook.md`](docs/account-release-runbook.md)。
 
 ## 架构
@@ -52,13 +53,15 @@ DeskLink 是面向个人设备的端到端加密远程桌面工具。当前正�
 
 Windows 详细审计见 [`docs/windows-architecture-review.md`](docs/windows-architecture-review.md)。跨平台研究代码与研究记录保留在 `docs/superpowers/`，不代表当前发布承诺。
 
-## 共享 Rust 验证
+## 统一分层本地验证
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+python scripts/verify.py fast integration
+python scripts/verify.py all --list
+python scripts/verify-windows-release.py --versions-only
 ```
+
+入口覆盖 Rust、三个 Bun 项目与 Python；Bun 固定 1.3.14，Rust 使用仓库 toolchain。macOS 使用 `python3`；系统默认 Bun 不同可用 `--bun` 指定固定版本路径。任务、隔离 target、native/perf 与 skipped 语义见[分层本地验证](docs/local-verification.md)。缺少设备条件不会记为 pass。
 
 ## Windows 开发与发布验证
 
@@ -92,7 +95,11 @@ python scripts/verify-managed-relay.py
 
 完整步骤、输入范围与故障处理见 [`docs/windows-two-pc-setup.md`](docs/windows-two-pc-setup.md)。
 
-当前候选的协议、功能和发布边界以本节、[CHANGELOG.md](CHANGELOG.md) 与 [docs/current-architecture-contract.md](docs/current-architecture-contract.md) 为准；更早的开发记录只保留在 Git 历史中，不构成当前客户端或中继的兼容承诺。
+当前候选的协议、功能和发布边界以本节、[CHANGELOG.md](CHANGELOG.md)、[当前架构契约](docs/current-architecture-contract.md) 与[能力矩阵](docs/current-capabilities.md)为准。第一波协议 13 软件候选的已测试源码为 `a4c5b404d43794d646394923a481f23c9298c3ed`，完整合入 Windows joint、Apple/FFI 及其输入 admission 后继、网络、工程、GUI、诊断 producer 与 services 历史，v3 的 25 个软件门禁全部通过。它尚未合入 main，不代表 Swift/Xcode、实际 WebView、真实输入/双机/拓扑或正式发布验收通过；main 基线仍为协议 12。GPU 后续候选、文件协议 14 与 LAN024 后续生产接线不在本轮。
+
+第二波GPU候选已在独立分支从第一波冻结提交 `c3fa4df987fb88be08eb5aeea9c7983b556e87d3` 合入GPU235完整历史，干净测试源 `97ff7c08199cdad4511b0044ddf783d79e2295b1` 重新通过25项软件检查、24项选定合成GPU用例及19项签名/HTTP/SQLite案例。平台报告仍2通过/7跳过、incomplete；第一波冻结源不变。见[第二波GPU集成报告](docs/wave2-gpu-integration.md)。
+
+工程来源 `5501aad`、`56f53b4`、`d6f153e` 的零 producer、七处旧输入调用及失败报告保留为各自历史快照，不再描述当前已整合候选。下面的 0.1.91/0.1.92 段落也是历史协议说明；当前 checkout 的应用、协议和工具链用 `python scripts/verify-windows-release.py --versions-only` 读取。
 
 0.1.91 将开发协议统一升级到 12，加入 H.264 Main/High Profile 能力协商、按 Noise 会话派生的候选绑定和视频直连 Offer/Answer 状态机。Windows 控制端会先探测 High Profile，WebView2 不支持时自动请求主机切回 Main；主机编码器创建 High MFT 失败也会自动回退。同一局域网会阶段性尝试经过认证的 DirectLan 视频数据面，探测失败自动回落公网中继；跨网络仍使用中继，4K 仍未作为用户能力开放。项目尚未正式发布；0.1.92 保持协议 12，可与 0.1.91 互连。
 

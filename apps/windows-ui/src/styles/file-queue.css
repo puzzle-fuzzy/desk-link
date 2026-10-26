@@ -1,0 +1,21 @@
+.remote-file-queue-details > summary {
+  cursor: pointer;
+  padding: 5px 3px;
+}
+
+.remote-file-queue-details > summary:focus-visible,
+.remote-file-queue-items button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.remote-file-queue-details[open] > .remote-file-queue-items {
+  max-height: min(280px, 35vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.remote-file-queue-items button {
+  flex: none;
+}

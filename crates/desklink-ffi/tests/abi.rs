@@ -109,6 +109,10 @@ fn ffi_derives_identity_verify_key_and_cancels_connecting_worker_on_destroy() {
         controller_device_id: [94; 16],
         controller_secret_key: secret,
         host_verify_key: *identity.verify_key().as_bytes(),
+        expires_at_unix_s: 0,
+        authorization_type: 2,
+        directory_device_id: 0,
+        directory_access_code: [0; 8],
     };
     assert_eq!(
         unsafe { desklink_connect_secure(handle, &secure) },
@@ -221,6 +225,8 @@ fn ffi_dispatches_pairing_control_and_release_events() {
         DesklinkResult::Ok
     );
     let input = DesklinkInput {
+        stream_id: 1,
+        input_epoch: 1,
         kind: DesklinkInputKind::MouseMove,
         x: 0.5,
         y: 0.25,
@@ -237,6 +243,8 @@ fn ffi_dispatches_pairing_control_and_release_events() {
         DesklinkResult::Ok
     );
     let wheel = DesklinkInput {
+        stream_id: 1,
+        input_epoch: 1,
         kind: DesklinkInputKind::MouseWheel,
         x: 0.0,
         y: 0.0,

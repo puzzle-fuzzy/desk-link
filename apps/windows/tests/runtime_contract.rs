@@ -31,15 +31,20 @@ fn video_pipeline_sends_config_before_first_idr_and_only_once_per_version() {
     let mut pipeline = HostVideoPipeline::new(9);
 
     assert_eq!(
-        pipeline.prepare(encoded(1, 1, false), 1280, 720).unwrap(),
+        pipeline
+            .prepare(encoded(1, 1, false), 1280, 720, 41)
+            .unwrap(),
         PrepareVideo::NeedKeyframe
     );
-    let PrepareVideo::Ready(first) = pipeline.prepare(encoded(2, 1, true), 1280, 720).unwrap()
+    let PrepareVideo::Ready(first) = pipeline
+        .prepare(encoded(2, 1, true), 1280, 720, 41)
+        .unwrap()
     else {
         panic!("expected first IDR to be ready");
     };
     let config = decode_video_config(first.video_config.as_deref().unwrap()).unwrap();
     assert_eq!(config.stream_id, 9);
+    assert_eq!(config.input_epoch, 41);
     assert_eq!(config.config_version, 1);
     assert_eq!((config.width, config.height), (1280, 720));
     assert!(!first.datagrams.is_empty());
@@ -52,19 +57,77 @@ fn video_pipeline_sends_config_before_first_idr_and_only_once_per_version() {
     );
     assert!(first.keyframe);
 
-    let PrepareVideo::Ready(next) = pipeline.prepare(encoded(3, 1, false), 1280, 720).unwrap()
+    let PrepareVideo::Ready(next) = pipeline
+        .prepare(encoded(3, 1, false), 1280, 720, 41)
+        .unwrap()
     else {
         panic!("expected delta frame");
     };
     assert!(next.video_config.is_none());
 
-    let PrepareVideo::Ready(recovery_keyframe) =
-        pipeline.prepare(encoded(4, 1, true), 1280, 720).unwrap()
+    let PrepareVideo::Ready(recovery_keyframe) = pipeline
+        .prepare(encoded(4, 1, true), 1280, 720, 41)
+        .unwrap()
     else {
         panic!("expected recovery keyframe to be ready");
     };
     assert!(recovery_keyframe.video_config.is_none());
     assert!(recovery_keyframe.keyframe);
+}
+
+#[test]
+fn input_authorization_epoch_requires_an_idr_but_codec_reconfiguration_preserves_it() {
+    let mut pipeline = HostVideoPipeline::new(9);
+    assert!(matches!(
+        pipeline.prepare(encoded(1, 1, true), 1280, 720, 0),
+        Err(HostRuntimeError::Protocol(_))
+    ));
+    let PrepareVideo::Ready(first) = pipeline
+        .prepare(encoded(2, 1, true), 1280, 720, 41)
+        .unwrap()
+    else {
+        panic!("initial configuration");
+    };
+    let first = decode_video_config(first.video_config.as_deref().unwrap()).unwrap();
+    assert_eq!(first.input_epoch, 41);
+    let PrepareVideo::Ready(quality) = pipeline
+        .prepare(encoded(3, 2, true), 1280, 720, 41)
+        .unwrap()
+    else {
+        panic!("quality/profile configuration");
+    };
+    let quality = decode_video_config(quality.video_config.as_deref().unwrap()).unwrap();
+    assert_eq!(quality.input_epoch, first.input_epoch);
+    for keyframe in [false, true] {
+        assert_eq!(
+            pipeline.prepare(encoded(4, 2, keyframe), 1280, 720, 42),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+    }
+    assert_eq!(
+        pipeline
+            .prepare(encoded(5, 3, false), 1280, 720, 42)
+            .unwrap(),
+        PrepareVideo::NeedKeyframe
+    );
+    let PrepareVideo::Ready(changed) = pipeline
+        .prepare(encoded(6, 3, true), 1280, 720, 42)
+        .unwrap()
+    else {
+        panic!("changed input authorization requires an IDR and configuration");
+    };
+    let changed = decode_video_config(changed.video_config.as_deref().unwrap()).unwrap();
+    assert_eq!(changed.input_epoch, 42);
+    assert!(changed.config_version > quality.config_version);
+    assert_eq!(changed.sequence_header, quality.sequence_header);
+    assert_eq!(
+        (changed.width, changed.height),
+        (quality.width, quality.height)
+    );
+    assert_eq!(
+        pipeline.prepare(encoded(7, 2, true), 1280, 720, 41),
+        Err(HostRuntimeError::InconsistentVideoConfig)
+    );
 }
 
 #[test]
@@ -78,6 +141,8 @@ fn inbound_policy_filters_wrong_stream_requests_and_replayed_input() {
     let envelope = InputEnvelope {
         sequence: 7,
         timestamp_us: 1_000,
+        stream_id: 9,
+        input_epoch: 41,
         event: InputEvent::Key {
             code: KeyCode::Enter,
             pressed: true,
@@ -98,11 +163,15 @@ fn inbound_policy_calibrates_different_computer_clocks_without_dropping_input() 
     let first = InputEnvelope {
         sequence: 1,
         timestamp_us: 10_000,
+        stream_id: 9,
+        input_epoch: 41,
         event: InputEvent::MouseMove { x: 100, y: 200 },
     };
     let second = InputEnvelope {
         sequence: 2,
         timestamp_us: 26_000,
+        stream_id: 9,
+        input_epoch: 41,
         event: InputEvent::MouseMove { x: 300, y: 400 },
     };
 
@@ -126,11 +195,15 @@ fn inbound_policy_reanchors_after_a_wall_clock_jump_instead_of_ending_the_sessio
     let first = InputEnvelope {
         sequence: 1,
         timestamp_us: 1_000_000,
+        stream_id: 9,
+        input_epoch: 41,
         event: InputEvent::MouseMove { x: 10, y: 20 },
     };
     let after_clock_jump = InputEnvelope {
         sequence: 2,
         timestamp_us: 101_000_000,
+        stream_id: 9,
+        input_epoch: 41,
         event: InputEvent::MouseMove { x: 30, y: 40 },
     };
 

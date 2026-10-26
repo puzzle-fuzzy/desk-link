@@ -1,10 +1,11 @@
+import { randomInt } from "node:crypto";
 import type { AccountConfig } from "../config";
 import { normalizeEmail } from "../domain/email";
 import { AccountError } from "../domain/errors";
-import { hashPassword, validatePassword, verifyPassword } from "../domain/password";
+import { DUMMY_PASSWORD_HASH, protectedPasswordOperations, validatePassword, type PasswordOperations } from "../domain/password";
 import { createOpaqueToken, hashOpaqueToken } from "../domain/tokens";
 import type { AccountStore } from "../db/store";
-import type { AccountPlatform, ActionTokenPurpose, UserRecord } from "../db/types";
+import type { AccountPlatform, ActionTokenPurpose, EmailOutboxRecord, UserRecord } from "../db/types";
 import type { MailMessage, Mailer } from "../providers/mailer";
 import type { SessionService, SessionTokenPair } from "./session-service";
 
@@ -20,6 +21,7 @@ export interface LoginInput extends RegisterInput {}
 
 export class AccountService {
   private outboxFlushInFlight?: Promise<number>;
+  private outboxStopped = false;
 
   constructor(
     private readonly store: AccountStore,
@@ -27,29 +29,40 @@ export class AccountService {
     private readonly mailer: Mailer,
     private readonly sessions: SessionService,
     private readonly now: () => number,
+    private readonly passwords: PasswordOperations = protectedPasswordOperations,
   ) {}
 
   async register(input: RegisterInput): Promise<{ verificationRequired: true }> {
-    const email = normalizeEmail(input.email);
-    validatePassword(input.password);
-    const device = readDeviceInput(input);
-    if (this.store.findUserByEmail(email)) {
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(input.email);
+      validatePassword(input.password);
+      const device = readDeviceInput(input);
+      const now = this.now();
+      // Hashing stays outside the synchronous transaction; independent registrations
+      // can hash concurrently, while only the winner of the email insert has effects.
+      const passwordHash = await this.passwords.hash(input.password);
+      this.store.database.transaction(() => {
+        const user = this.store.createUserIfAbsent({ email, passwordHash, now });
+        if (!user) return undefined;
+        this.store.upsertDevice({ ...device, userId: user.id, now });
+        this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
+        return this.enqueueActionEmail(user, "verify_email");
+      })();
       return { verificationRequired: true };
-    }
-    const now = this.now();
-    const user = this.store.createUser({ email, passwordHash: await hashPassword(input.password), now });
-    this.store.upsertDevice({ ...device, userId: user.id, now });
-    this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
-    await this.sendVerification(user);
-    return { verificationRequired: true };
+    });
   }
 
   async resendVerification(emailInput: unknown): Promise<void> {
-    const email = normalizeEmail(emailInput);
-    const user = this.store.findUserByEmail(email);
-    if (!user || user.emailVerifiedAt !== null || user.status !== "active") return;
-    this.store.recordAuditEvent({ userId: user.id, action: "account.verification_resent", now: this.now() });
-    await this.sendVerification(user);
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(emailInput);
+      await this.passwords.verify("desklink-public-action-check", DUMMY_PASSWORD_HASH);
+      const user = this.store.findUserByEmail(email);
+      if (!user || user.emailVerifiedAt !== null || user.status !== "active") return;
+      this.store.database.transaction(() => {
+        this.store.recordAuditEvent({ userId: user.id, action: "account.verification_resent", now: this.now() });
+        this.enqueueActionEmail(user, "verify_email");
+      })();
+    });
   }
 
   async verifyEmail(tokenInput: unknown): Promise<PublicUser> {
@@ -64,117 +77,120 @@ export class AccountService {
   }
 
   async login(input: LoginInput): Promise<{ user: PublicUser; tokens: SessionTokenPair }> {
-    const email = normalizeEmail(input.email);
-    const password = input.password;
-    if (typeof password !== "string") {
-      throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
-    }
-    const user = this.store.findUserByEmail(email);
-    if (!user || user.status !== "active" || !(await verifyPassword(password, user.passwordHash))) {
-      throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
-    }
-    if (user.emailVerifiedAt === null) {
-      throw new AccountError("email_not_verified", 403, "请先完成邮箱验证。 ");
-    }
-    const device = readDeviceInput(input);
-    const accountDevice = this.store.upsertDevice({ ...device, userId: user.id, now: this.now() });
-    const tokens = this.sessions.create(user, accountDevice);
-    this.store.recordAuditEvent({ userId: user.id, deviceId: accountDevice.id, action: "account.logged_in", now: this.now() });
-    return { user: publicUser(user), tokens };
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(input.email);
+      const password = input.password;
+      if (typeof password !== "string" || password.length > 128) {
+        throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
+      }
+      const user = this.store.findUserByEmail(email);
+      const matches = await this.passwords.verify(password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
+      if (!user || user.status !== "active" || !matches) {
+        throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
+      }
+      if (user.emailVerifiedAt === null) {
+        throw new AccountError("email_not_verified", 403, "请先完成邮箱验证。 ");
+      }
+      const device = readDeviceInput(input);
+      const accountDevice = this.store.upsertDevice({ ...device, userId: user.id, now: this.now() });
+      const tokens = this.sessions.create(user, accountDevice);
+      this.store.recordAuditEvent({ userId: user.id, deviceId: accountDevice.id, action: "account.logged_in", now: this.now() });
+      return { user: publicUser(user), tokens };
+    });
   }
 
   async requestPasswordReset(emailInput: unknown): Promise<void> {
-    const email = normalizeEmail(emailInput);
-    const user = this.store.findUserByEmail(email);
-    if (!user || user.status !== "active") return;
-    this.store.recordAuditEvent({ userId: user.id, action: "account.password_reset_requested", now: this.now() });
-    await this.sendActionEmail(user, "reset_password");
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(emailInput);
+      await this.passwords.verify("desklink-public-action-check", DUMMY_PASSWORD_HASH);
+      const user = this.store.findUserByEmail(email);
+      if (!user || user.status !== "active") return;
+      this.store.database.transaction(() => {
+        this.store.recordAuditEvent({ userId: user.id, action: "account.password_reset_requested", now: this.now() });
+        this.enqueueActionEmail(user, "reset_password");
+      })();
+    });
   }
 
   async resetPassword(tokenInput: unknown, passwordInput: unknown): Promise<void> {
     const token = readToken(tokenInput, "密码重置令牌");
     validatePassword(passwordInput);
-    const record = this.store.consumeActionToken(hashOpaqueToken(token), "reset_password", this.now());
-    if (!record) throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
-    const passwordHash = await hashPassword(passwordInput);
-    this.store.updatePassword(record.userId, passwordHash, this.now());
-    this.store.revokeUserSessions(record.userId, this.now());
-    this.store.recordAuditEvent({ userId: record.userId, action: "account.password_reset", now: this.now() });
+    const tokenHash = hashOpaqueToken(token);
+    // A read-only precheck avoids spending the bounded hash budget on invalid
+    // bearer tokens. It is not the final authorization to change the password.
+    if (!this.store.findValidActionToken(tokenHash, "reset_password", this.now())) {
+      throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
+    }
+    const passwordHash = await this.passwords.hash(passwordInput);
+    this.store.database.transaction(() => {
+      // Capture fresh time after acquiring the write lock: hashing, queueing or
+      // lock contention may have outlived the token's expiry or revocation.
+      const now = this.now();
+      const record = this.store.consumeActionToken(tokenHash, "reset_password", now);
+      if (!record) throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
+      this.store.updatePassword(record.userId, passwordHash, now);
+      this.store.revokeUserSessions(record.userId, now);
+      this.store.recordAuditEvent({ userId: record.userId, action: "account.password_reset", now });
+    }).immediate();
+  }
+
+  private async privacyResponse<T>(operation: () => Promise<T>): Promise<T> {
+    // Choose the deadline before consulting account state. Jitter is independent
+    // of the branch; waiting does not occupy an Argon2 work slot.
+    const deadline = performance.now() + 100 + randomInt(0, 25);
+    try { return await operation(); }
+    finally { await Bun.sleep(Math.max(0, deadline - performance.now())); }
   }
 
   flushOutbox(limit = 20): Promise<number> {
     if (this.outboxFlushInFlight) return this.outboxFlushInFlight;
+    if (this.outboxStopped) return Promise.resolve(0);
     this.outboxFlushInFlight = this.flushOutboxInternal(limit).finally(() => {
       this.outboxFlushInFlight = undefined;
     });
     return this.outboxFlushInFlight;
   }
 
+  async stopOutbox(): Promise<void> {
+    this.outboxStopped = true;
+    await this.outboxFlushInFlight;
+  }
+
   private async flushOutboxInternal(limit: number): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new RangeError("invalid outbox batch size");
     let delivered = 0;
-    for (const record of this.store.listPendingEmails(this.now(), limit)) {
+    for (let index = 0; index < limit && !this.outboxStopped; index++) {
+      // Claim only the next send, so queued messages cannot expire behind a slow send.
+      const record = this.store.claimEmail(this.now());
+      if (!record) break;
       const user = this.store.findUserById(record.userId);
       if (!user || user.status !== "active") {
-        this.store.markEmailFailed(record, this.now(), "account user is unavailable");
+        this.store.failClaimedEmail(record, this.now(), "account_unavailable");
         continue;
       }
-      this.store.invalidateActionToken(record.actionTokenId, this.now());
-      const token = createOpaqueToken();
-      const actionToken = this.store.createActionToken({
-        userId: user.id,
-        purpose: record.template,
-        tokenHash: token.hash,
-        now: this.now(),
-        expiresAt: this.now() + (record.template === "verify_email" ? 24 * 60 * 60 : 30 * 60),
-      });
-      this.store.replaceEmailActionToken(record.id, actionToken.id);
       try {
+        const token = createOpaqueToken();
+        if (!this.store.prepareClaimedEmailToken(record, token.hash, this.now())) continue;
         await this.mailer.send(this.actionEmailMessage(user, record.template, token.value));
-        this.store.markEmailSent(record.id, this.now());
-        delivered += 1;
-      } catch (error) {
-        this.store.markEmailFailed(record, this.now(), error instanceof Error ? error.message : "mail delivery failed");
+        if (this.store.completeClaimedEmail(record, this.now())) delivered++;
+      } catch {
+        // Provider errors may contain URLs/credentials; persist a fixed category.
+        this.store.failClaimedEmail(record, this.now(), "mail_delivery_failed");
       }
     }
     return delivered;
   }
 
-  private async sendVerification(user: UserRecord): Promise<void> {
-    await this.sendActionEmail(user, "verify_email");
-  }
-
-  private async sendActionEmail(user: UserRecord, purpose: ActionTokenPurpose): Promise<void> {
+  private enqueueActionEmail(user: UserRecord, purpose: ActionTokenPurpose): EmailOutboxRecord {
     const token = createOpaqueToken();
     const actionToken = this.store.createActionToken({
-      userId: user.id,
-      purpose,
-      tokenHash: token.hash,
-      now: this.now(),
-      expiresAt: this.now() + (purpose === "verify_email" ? 24 * 60 * 60 : 30 * 60),
+      userId: user.id, purpose, tokenHash: token.hash, now: this.now(),
+      expiresAt: this.now() + (purpose === "verify_email" ? 86_400 : 1_800),
     });
-    await this.queueEmail(user, purpose, actionToken.id, token.value);
-  }
-
-  private async queueEmail(
-    user: UserRecord,
-    purpose: ActionTokenPurpose,
-    actionTokenId: string,
-    token: string,
-  ): Promise<void> {
-    const message = this.actionEmailMessage(user, purpose, token);
-    const outbox = this.store.enqueueEmail({
-      userId: user.id,
-      recipient: user.email,
-      template: purpose,
-      actionTokenId,
-      now: this.now(),
+    return this.store.enqueueEmail({
+      userId: user.id, recipient: user.email, template: purpose,
+      actionTokenId: actionToken.id, now: this.now(),
     });
-    try {
-      await this.mailer.send(message);
-      this.store.markEmailSent(outbox.id, this.now());
-    } catch (error) {
-      this.store.markEmailFailed(outbox, this.now(), error instanceof Error ? error.message : "mail delivery failed");
-    }
   }
 
   private actionEmailMessage(user: UserRecord, purpose: ActionTokenPurpose, token: string): MailMessage {

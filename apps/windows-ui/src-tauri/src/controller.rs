@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io::Read,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -22,8 +23,8 @@ use apps_windows::{
     identity::WindowsIdentityStore,
     recent_access::{RecentAccessEntry, WindowsRecentAccessError, WindowsRecentAccessStore},
     transfer::{
-        IncomingFile, OutgoingFile, chunk_after_resume, discard_incoming_resume,
-        prepare_outgoing_file, verify_resume_prefix,
+        OutgoingFile, chunk_after_resume, discard_incoming_resume, prepare_outgoing_file,
+        verify_resume_prefix,
     },
     transfer_recovery::{
         MAX_FILE_QUEUE_RECOVERY_ITEMS, TransferQueueRecovery, TransferRecoveryAction,
@@ -33,15 +34,16 @@ use apps_windows::{
 use blake2::{Blake2s256, Digest};
 use desklink_crypto::{PairingCode, PairingInvite};
 use desklink_ffi::{
-    ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime,
+    ControllerError, ControllerEvent, ControllerInputSender, ControllerMetrics, ControllerRuntime,
     ControllerTransferSender,
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FileResumeHint, FrameFlags,
-    H264Profile, InputEvent, KeyCode, MAX_CLIPBOARD_TEXT_BYTES, MAX_EXPERIMENTAL_4K_HEIGHT,
-    MAX_EXPERIMENTAL_4K_WIDTH, MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA,
-    Modifiers, MouseButton, Platform, ProtocolError, TransferId, TransferMessage, TransferResult,
-    VideoQualityPreference, VideoQualityPreset,
+    H264Profile, InputContext, InputEvent, InputRestrictionReason, KeyCode,
+    MAX_CLIPBOARD_TEXT_BYTES, MAX_EXPERIMENTAL_4K_HEIGHT, MAX_EXPERIMENTAL_4K_WIDTH,
+    MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton,
+    Platform, ProtocolError, TransferId, TransferMessage, TransferResult, VideoQualityPreference,
+    VideoQualityPreset,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -58,6 +60,15 @@ use crate::video_mailbox::{
     ControllerVideoMailbox, VideoDeliveryFrame, VideoMailboxKey, VideoMailboxMetrics,
     VideoMailboxOffer,
 };
+
+#[path = "controller-incoming-file.rs"]
+mod incoming_file;
+use incoming_file::{
+    INCOMING_EVENT_CAPACITY, IncomingFileEvent, IncomingFileEventKind, IncomingFilePipeline,
+};
+#[path = "controller-handshake-budget.rs"]
+mod handshake_budget;
+use handshake_budget::HandshakeResponseBudget;
 
 const COMMAND_CAPACITY: usize = 512;
 const MAX_BUFFERED_POINTER_MOVES: usize = 8;
@@ -211,6 +222,7 @@ pub struct ControllerRuntimeSummary {
     pub state: &'static str,
     pub title: String,
     pub detail: String,
+    #[serde(serialize_with = "crate::ipc_identity::serialize_optional")]
     pub stream_id: Option<u64>,
 }
 
@@ -459,7 +471,10 @@ impl DeviceCredentialSource {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerInput {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
+    input_epoch: u64,
     kind: String,
     x: Option<i32>,
     y: Option<i32>,
@@ -483,13 +498,17 @@ pub enum ControllerSignal {
         runtime: ControllerRuntimeSummary,
     },
     VideoConfig {
+        #[serde(serialize_with = "crate::ipc_identity::serialize")]
         stream_id: u64,
+        #[serde(serialize_with = "crate::ipc_identity::serialize")]
+        input_epoch: u64,
         config_version: u32,
         width: u16,
         height: u16,
         sequence_header: Vec<u8>,
     },
     Cursor {
+        #[serde(serialize_with = "crate::ipc_identity::serialize")]
         stream_id: u64,
         sequence: u64,
         x_millionths: i32,
@@ -530,6 +549,9 @@ pub enum ControllerSignal {
         enabled: bool,
         message: String,
     },
+    InputRestriction {
+        reason: Option<InputRestrictionReason>,
+    },
     VideoQuality {
         preference: VideoQualityPreference,
         preset: VideoQualityPreset,
@@ -556,6 +578,7 @@ pub struct QueuedFileSummary {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerRenderMetrics {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
     video_width: u16,
     video_height: u16,
@@ -579,6 +602,7 @@ pub struct ControllerRenderMetrics {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerPlaybackPressure {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
     peak_decode_queue_size: u16,
     freshness_recoveries: u16,
@@ -587,6 +611,7 @@ pub struct ControllerPlaybackPressure {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerVideoPullInput {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
     config_version: u32,
 }
@@ -597,13 +622,28 @@ struct PlaybackPressureSample {
     freshness_recoveries: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerFileTarget {
+    generation: u64,
+    stream_id: u64,
+    host_device_id: [u8; 16],
+}
+
+impl ControllerFileTarget {
+    fn matches(self, generation: u64, stream_id: Option<u64>, host_device_id: [u8; 16]) -> bool {
+        self.generation == generation
+            && Some(self.stream_id) == stream_id
+            && self.host_device_id == host_device_id
+    }
+}
+
 enum ControllerCommand {
     Input {
-        stream_id: u64,
+        context: InputContext,
         event: InputEvent,
     },
     Text {
-        stream_id: u64,
+        context: InputContext,
         text: String,
     },
     RequestKeyframe,
@@ -612,9 +652,15 @@ enum ControllerCommand {
     SetVideoQuality(VideoQualityPreference),
     SetVideoProfile(H264Profile),
     SendClipboard(String),
-    PasteClipboard(String),
+    PasteClipboard {
+        context: InputContext,
+        text: String,
+    },
     RequestClipboard,
-    SendFiles(Vec<OutgoingFile>),
+    SendFiles {
+        target: ControllerFileTarget,
+        files: Vec<OutgoingFile>,
+    },
     RetryFile(OutgoingFile),
     RemoveQueuedFile {
         transfer_id: TransferId,
@@ -666,6 +712,8 @@ impl ClipboardOperation {
 struct PendingClipboardOperation {
     request_id: u64,
     operation: ClipboardOperation,
+    input_context: Option<InputContext>,
+    shortcut_pending: bool,
     deadline: Instant,
 }
 
@@ -674,13 +722,116 @@ impl PendingClipboardOperation {
         Self {
             request_id,
             operation,
+            input_context: None,
+            shortcut_pending: false,
             deadline: now + CLIPBOARD_RESPONSE_TIMEOUT,
         }
+    }
+
+    fn paste(request_id: u64, context: InputContext, now: Instant) -> Self {
+        Self {
+            input_context: Some(context),
+            ..Self::new(request_id, ClipboardOperation::Paste, now)
+        }
+    }
+
+    fn paste_context(self, active: Option<InputContext>) -> Option<InputContext> {
+        self.input_context
+            .filter(|context| context.is_valid() && Some(*context) == active)
     }
 
     fn matches(self, request_id: u64, operation: ClipboardOperation) -> bool {
         self.request_id == request_id && self.operation == operation
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputSendKind {
+    Input,
+    Text,
+    Paste { request_id: u64 },
+}
+
+enum InputSendWork {
+    Input(InputEvent),
+    Text(String),
+    Paste { request_id: u64 },
+}
+
+struct ControllerInputWriter {
+    sender: ControllerInputSender,
+    context: Arc<Mutex<Option<InputContext>>>,
+}
+
+type InputSendFuture<Writer> =
+    Pin<Box<dyn Future<Output = (Writer, Result<bool, ControllerError>)> + Send>>;
+
+struct PendingInputSend<Writer> {
+    kind: InputSendKind,
+    future: InputSendFuture<Writer>,
+}
+
+impl<Writer> PendingInputSend<Writer> {
+    fn new<F>(kind: InputSendKind, future: F) -> Self
+    where
+        F: Future<Output = (Writer, Result<bool, ControllerError>)> + Send + 'static,
+    {
+        Self {
+            kind,
+            future: Box::pin(future),
+        }
+    }
+}
+
+async fn next_input_completion<Writer>(
+    active: &mut Option<PendingInputSend<Writer>>,
+) -> (Writer, Result<bool, ControllerError>) {
+    match active.as_mut() {
+        Some(active) => active.future.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn begin_input_send(
+    writer: ControllerInputWriter,
+    context: InputContext,
+    work: InputSendWork,
+) -> PendingInputSend<ControllerInputWriter> {
+    let kind = match &work {
+        InputSendWork::Input(_) => InputSendKind::Input,
+        InputSendWork::Text(_) => InputSendKind::Text,
+        InputSendWork::Paste { request_id } => InputSendKind::Paste {
+            request_id: *request_id,
+        },
+    };
+    PendingInputSend::new(kind, async move {
+        let result = match work {
+            InputSendWork::Input(event) => {
+                send_captured_input_events(
+                    context,
+                    std::iter::once(event),
+                    |context| input_context_is_current(&writer.context, context),
+                    |context, event| writer.sender.send_input_with_context(context, event),
+                )
+                .await
+            }
+            InputSendWork::Text(text) => {
+                send_text_input(&writer.sender, &writer.context, context, &text).await
+            }
+            InputSendWork::Paste { .. } => {
+                send_remote_paste_shortcut(&writer.sender, &writer.context, context).await
+            }
+        };
+        (writer, result)
+    })
+}
+
+fn input_context_is_current(active: &Mutex<Option<InputContext>>, context: InputContext) -> bool {
+    context.is_valid()
+        && active
+            .lock()
+            .ok()
+            .is_some_and(|active| *active == Some(context))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,36 +849,16 @@ struct OutgoingTransfer {
 }
 
 struct IncomingTransfer {
-    file: IncomingFile,
+    file: IncomingFilePipeline,
+    ticket: u64,
+    opened: bool,
+    finishing: bool,
+    received_offset: u64,
+    pending_writes: usize,
     name: String,
     size: u64,
     transferred: u64,
     last_activity: Instant,
-}
-
-#[derive(Default)]
-struct ResumableIncomingTransfer(Option<IncomingTransfer>);
-
-impl std::ops::Deref for ResumableIncomingTransfer {
-    type Target = Option<IncomingTransfer>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ResumableIncomingTransfer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for ResumableIncomingTransfer {
-    fn drop(&mut self) {
-        if let Some(transfer) = self.0.take() {
-            let _ = transfer.file.preserve();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -878,6 +1009,7 @@ enum OutgoingFileEvent {
 }
 
 struct ControllerWorker {
+    generation: u64,
     host_device_id: [u8; 16],
     commands: mpsc::Sender<ControllerCommand>,
     cancellation: watch::Sender<bool>,
@@ -892,6 +1024,7 @@ struct ControllerOutputChannels {
 #[derive(Clone)]
 pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
+    input_context: Arc<Mutex<Option<InputContext>>>,
     worker: Arc<Mutex<Option<ControllerWorker>>>,
     last_file_action: Arc<Mutex<Option<LastFileAction>>>,
     file_recovery_store: Option<WindowsTransferRecoveryStore>,
@@ -916,6 +1049,7 @@ impl Default for ControllerManager {
     fn default() -> Self {
         Self {
             status: Arc::new(Mutex::new(ControllerRuntimeSummary::idle())),
+            input_context: Arc::new(Mutex::new(None)),
             worker: Arc::new(Mutex::new(None)),
             last_file_action: Arc::new(Mutex::new(None)),
             file_recovery_store: None,
@@ -1630,6 +1764,7 @@ impl ControllerManager {
             .lock()
             .map_err(|_| "DeskLink 无法启动控制端任务。".to_owned())?;
         *worker = Some(ControllerWorker {
+            generation,
             host_device_id,
             commands,
             cancellation,
@@ -1639,31 +1774,25 @@ impl ControllerManager {
     }
 
     pub async fn send_input(&self, input: ControllerInput) -> Result<(), String> {
-        if input.stream_id == 0 {
-            return Err("远程输入缺少有效的视频流标识。".to_owned());
-        }
-        let stream_id = input.stream_id;
+        let context = InputContext {
+            stream_id: input.stream_id,
+            input_epoch: input.input_epoch,
+        };
+        validate_input_context(context)?;
         let event = parse_input(input)?;
-        if self.active_stream_id() != Some(stream_id) {
+        if !self.accepts_input_context(context) {
             return Ok(());
         }
-        self.send(ControllerCommand::Input { stream_id, event })
-            .await
+        self.send(ControllerCommand::Input { context, event }).await
     }
 
-    pub async fn send_text(&self, text: String, stream_id: Option<u64>) -> Result<(), String> {
+    pub async fn send_text(&self, text: String, context: InputContext) -> Result<(), String> {
         validate_text_input(&text)?;
-        let stream_id = match stream_id {
-            Some(0) => return Err("文字输入缺少有效的视频流标识。".to_owned()),
-            Some(stream_id) => stream_id,
-            None => self
-                .active_stream_id()
-                .ok_or_else(|| "当前没有正在运行的远程控制会话。".to_owned())?,
-        };
-        if self.active_stream_id() != Some(stream_id) {
+        validate_input_context(context)?;
+        if !self.accepts_input_context(context) {
             return Ok(());
         }
-        self.send(ControllerCommand::Text { stream_id, text }).await
+        self.send(ControllerCommand::Text { context, text }).await
     }
 
     pub async fn request_keyframe(&self) -> Result<(), String> {
@@ -1698,38 +1827,111 @@ impl ControllerManager {
         self.send(ControllerCommand::SendClipboard(text)).await
     }
 
-    pub async fn paste_clipboard(&self, text: String) -> Result<(), String> {
+    pub async fn paste_clipboard(&self, text: String, context: InputContext) -> Result<(), String> {
+        validate_input_context(context)?;
+        if !self.accepts_input_context(context) {
+            return Ok(());
+        }
         if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
             return Err("剪贴板文本超过 48 KB，无法粘贴。".to_owned());
         }
-        self.send(ControllerCommand::PasteClipboard(text)).await
+        self.send(ControllerCommand::PasteClipboard { context, text })
+            .await
     }
 
     pub async fn request_clipboard(&self) -> Result<(), String> {
         self.send(ControllerCommand::RequestClipboard).await
     }
 
-    pub async fn send_files(&self, paths: Vec<PathBuf>) -> Result<(), String> {
+    pub fn capture_file_target(&self) -> Result<ControllerFileTarget, String> {
+        let _operation = self
+            .operation_guard
+            .lock()
+            .map_err(|_| "DeskLink 无法读取当前文件接收设备。".to_owned())?;
+        let runtime = self.snapshot();
+        let stream_id = runtime
+            .stream_id
+            .filter(|stream_id| *stream_id != 0)
+            .filter(|_| runtime.state == "connected")
+            .ok_or_else(|| "请先连接文件接收设备。".to_owned())?;
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| "DeskLink 无法读取当前文件接收设备。".to_owned())?;
+        let worker = worker
+            .as_ref()
+            .filter(|worker| self.is_current(worker.generation))
+            .ok_or_else(|| "当前远程控制会话已经结束。".to_owned())?;
+        Ok(ControllerFileTarget {
+            generation: worker.generation,
+            stream_id,
+            host_device_id: worker.host_device_id,
+        })
+    }
+
+    pub fn file_drop_target(
+        &self,
+        stream_id: u64,
+        device_id: &str,
+    ) -> Result<ControllerFileTarget, String> {
+        let target = self.capture_file_target()?;
+        let device_id =
+            crate::device_directory::parse_device_id(device_id).map_err(str::to_owned)?;
+        if target.stream_id != stream_id
+            || crate::device_directory::public_device_id(target.host_device_id) != device_id
+        {
+            return Err("文件接收会话已变化，请重新拖入文件。".to_owned());
+        }
+        Ok(target)
+    }
+
+    fn ensure_file_target(&self, target: ControllerFileTarget) -> Result<(), String> {
+        if self.capture_file_target()? == target {
+            Ok(())
+        } else {
+            Err("文件接收会话已变化，请重新选择或拖入文件。".to_owned())
+        }
+    }
+
+    pub async fn send_files(
+        &self,
+        paths: Vec<PathBuf>,
+        target: ControllerFileTarget,
+    ) -> Result<(), String> {
         if paths.is_empty() {
             return Ok(());
         }
         if paths.len() > MAX_FILE_QUEUE_ITEMS {
             return Err(format!("一次最多添加 {MAX_FILE_QUEUE_ITEMS} 个文件。"));
         }
-        let prepared = tauri::async_runtime::spawn_blocking(move || {
-            let mut files = Vec::with_capacity(paths.len());
-            for path in paths {
-                if files.iter().any(|file: &OutgoingFile| file.path == path) {
-                    continue;
+        let preparation = async {
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut files = Vec::with_capacity(paths.len());
+                for path in paths {
+                    if files.iter().any(|file: &OutgoingFile| file.path == path) {
+                        continue;
+                    }
+                    files.push(prepare_outgoing_file(path)?);
                 }
-                files.push(prepare_outgoing_file(path)?);
-            }
-            Ok::<_, TransferResult>(files)
-        })
-        .await
-        .map_err(|_| "DeskLink 无法读取所选文件。".to_owned())?
-        .map_err(|result| prepare_file_error_message(result).to_owned())?;
-        self.send(ControllerCommand::SendFiles(prepared)).await
+                Ok::<_, TransferResult>(files)
+            })
+            .await
+            .map_err(|_| "DeskLink 无法读取所选文件。".to_owned())?
+            .map_err(|result| prepare_file_error_message(result).to_owned())
+        };
+        self.send_files_after_preparation(target, preparation).await
+    }
+
+    async fn send_files_after_preparation(
+        &self,
+        target: ControllerFileTarget,
+        preparation: impl std::future::Future<Output = Result<Vec<OutgoingFile>, String>>,
+    ) -> Result<(), String> {
+        self.ensure_file_target(target)?;
+        let files = preparation.await?;
+        self.ensure_file_target(target)?;
+        self.send(ControllerCommand::SendFiles { target, files })
+            .await
     }
 
     pub async fn request_remote_file(&self) -> Result<(), String> {
@@ -1855,6 +2057,48 @@ impl ControllerManager {
             .send(command)
             .await
             .map_err(|_| "远程控制会话已结束，无法继续执行操作。".to_owned())
+    }
+
+    fn accepts_input_context(&self, context: InputContext) -> bool {
+        input_context_is_current(&self.input_context, context)
+    }
+
+    fn active_input_context(&self) -> Option<InputContext> {
+        self.input_context.lock().ok().and_then(|active| *active)
+    }
+
+    fn clear_input_context(&self) {
+        if let Ok(mut context) = self.input_context.lock() {
+            *context = None;
+        }
+    }
+
+    fn set_video_input_context_if_current(
+        &self,
+        generation: u64,
+        config: &desklink_protocol::VideoConfig,
+    ) -> bool {
+        self.set_input_context_if_current(
+            generation,
+            InputContext {
+                stream_id: config.stream_id,
+                input_epoch: config.input_epoch,
+            },
+        )
+    }
+
+    fn set_input_context_if_current(&self, generation: u64, context: InputContext) -> bool {
+        let _guard = self
+            .operation_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current(generation) {
+            return false;
+        }
+        if let Ok(mut active) = self.input_context.lock() {
+            *active = context.is_valid().then_some(context);
+        }
+        true
     }
 
     fn active_stream_id(&self) -> Option<u64> {
@@ -2067,6 +2311,7 @@ impl ControllerManager {
     }
 
     async fn stop_current(&self) {
+        self.clear_input_context();
         self.video_mailbox.close();
         let worker = self.worker.lock().ok().and_then(|mut worker| worker.take());
         let Some(mut worker) = worker else {
@@ -2088,6 +2333,13 @@ impl ControllerManager {
     }
 
     fn set_status(&self, status: ControllerRuntimeSummary) {
+        if status.state != "connected"
+            || self.input_context.lock().ok().is_some_and(|context| {
+                context.is_some_and(|context| Some(context.stream_id) != status.stream_id)
+            })
+        {
+            self.clear_input_context();
+        }
         if let Ok(mut current) = self.status.lock() {
             *current = status;
         }
@@ -2098,6 +2350,7 @@ impl ControllerManager {
             .operation_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.clear_input_context();
         self.operation_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -2106,6 +2359,7 @@ impl ControllerManager {
             .operation_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.clear_input_context();
         self.operation_generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -2330,6 +2584,7 @@ async fn run_controller(
         set_session_correlation(DiagnosticSource::Controller, settings.session_id()).ok();
     let host_device_id = settings.host_device_id();
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+    let mut handshake_budget = HandshakeResponseBudget::default();
     let mut attempt = 0_u32;
     let mut audio_enabled = true;
     let mut video_quality = VideoQualityPreference::Sharp;
@@ -2397,9 +2652,9 @@ async fn run_controller(
                     | Some(ControllerCommand::RequestKeyframe)
                     | Some(ControllerCommand::SelectDisplay(_))
                     | Some(ControllerCommand::SendClipboard(_))
-                    | Some(ControllerCommand::PasteClipboard(_))
+                    | Some(ControllerCommand::PasteClipboard { .. })
                     | Some(ControllerCommand::RequestClipboard)
-                    | Some(ControllerCommand::SendFiles(_))
+                    | Some(ControllerCommand::SendFiles { .. })
                     | Some(ControllerCommand::RetryFile(_))
                     | Some(ControllerCommand::RemoveQueuedFile { .. })
                     | Some(ControllerCommand::ClearFileQueue { .. })
@@ -2409,8 +2664,12 @@ async fn run_controller(
                     | Some(ControllerCommand::CancelFile) => {}
                 },
                 result = &mut connection => match result {
-                    Ok(runtime) => break runtime,
+                    Ok(runtime) => {
+                        handshake_budget.authenticated();
+                        break runtime;
+                    }
                     Err(failure) => {
+                        let failure = failure.limit_unanswered_handshake(&mut handshake_budget);
                         if !schedule_failure(
                             &manager,
                             &signals,
@@ -2487,9 +2746,21 @@ async fn run_controller(
             .unwrap_or_else(Instant::now);
         let mut next_transfer_request_id = 1_u64;
         let mut outgoing: Option<OutgoingTransfer> = None;
-        let mut incoming = ResumableIncomingTransfer::default();
+        let mut incoming: Option<IncomingTransfer> = None;
+        let mut next_incoming_ticket = 1_u64;
+        let (incoming_file_events, mut pending_incoming_file_events) =
+            mpsc::channel::<IncomingFileEvent>(INCOMING_EVENT_CAPACITY);
         let mut pending_remote_file_request: Option<PendingRemoteFileRequest> = None;
         let mut pending_clipboard: Option<PendingClipboardOperation> = None;
+        // The writer is moved into one owned future and returned on completion.
+        // The existing bounded command queue supplies backpressure; no second
+        // queue or per-event sender/manager Arc clone is needed.
+        let mut input_writer = Some(ControllerInputWriter {
+            sender: runtime.input_sender(),
+            context: manager.input_context.clone(),
+        });
+        let mut active_input: Option<PendingInputSend<ControllerInputWriter>> = None;
+        let mut pending_paste: Option<(u64, InputContext)> = None;
         let mut audio_decoder = ControllerAudioDecoder::new();
         // There can be at most one file sender for the active transfer. Keep
         // completion notifications bounded so a late task from a disconnected
@@ -2506,6 +2777,15 @@ async fn run_controller(
             file_queue_paused,
         );
         let failure = loop {
+            if active_input.is_none()
+                && let Some((request_id, context)) = pending_paste.take()
+            {
+                active_input = Some(begin_input_send(
+                    input_writer.take().expect("idle input writer"),
+                    context,
+                    InputSendWork::Paste { request_id },
+                ));
+            }
             if outgoing.is_none()
                 && incoming.is_none()
                 && pending_remote_file_request.is_none()
@@ -2586,27 +2866,42 @@ async fn run_controller(
                         return;
                     }
                 }
-                command = commands.recv() => match command {
-                    Some(ControllerCommand::Input { stream_id, event }) => {
-                        if manager.active_stream_id() != Some(stream_id) {
+                input_result = next_input_completion(&mut active_input), if active_input.is_some() => {
+                    let kind = active_input.take().expect("completed input work").kind;
+                    let (writer, result) = input_result;
+                    input_writer = Some(writer);
+                    if let InputSendKind::Paste { request_id } = kind {
+                        if pending_clipboard.is_some_and(|pending| pending.request_id == request_id && pending.shortcut_pending) {
+                            pending_clipboard = None;
+                            match result {
+                                Ok(completed) => { let _ = signals.send(ControllerSignal::Clipboard {
+                                    state: if completed { "completed" } else { "failed" }, operation: "paste",
+                                    message: if completed { "已将本机剪贴板粘贴到远程电脑。" } else { "远程画面已经切换，已停止本次粘贴；请确认当前画面后重试。" }.to_owned(),
+                                }); },
+                                Err(error) => break ConnectFailure::from_controller(error),
+                            }
+                        }
+                    } else if let Err(error) = result {
+                        break ConnectFailure::from_controller(error);
+                    }
+                }
+                command = commands.recv(), if active_input.is_none() => match command {
+                    Some(ControllerCommand::Input { context, event }) => {
+                        if !manager.accepts_input_context(context) {
                             continue;
                         }
-                        if let Err(error) = runtime.send_input(event).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        active_input = Some(begin_input_send(input_writer.take().expect("idle input writer"), context, InputSendWork::Input(event)));
                     }
                     Some(ControllerCommand::SetVideoProfile(profile)) => {
                         if let Err(error) = runtime.set_video_profile(profile).await {
                             break ConnectFailure::from_controller(error);
                         }
                     }
-                    Some(ControllerCommand::Text { stream_id, text }) => {
-                        if manager.active_stream_id() != Some(stream_id) {
+                    Some(ControllerCommand::Text { context, text }) => {
+                        if !manager.accepts_input_context(context) {
                             continue;
                         }
-                        if let Err(error) = send_text_input(&runtime, &text).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        active_input = Some(begin_input_send(input_writer.take().expect("idle input writer"), context, InputSendWork::Text(text)));
                     }
                     Some(ControllerCommand::RequestKeyframe) => {
                         if let Err(error) = runtime.request_keyframe().await
@@ -2661,7 +2956,8 @@ async fn run_controller(
                             Instant::now(),
                         ));
                     }
-                    Some(ControllerCommand::PasteClipboard(text)) => {
+                    Some(ControllerCommand::PasteClipboard { context, text }) => {
+                        if !manager.accepts_input_context(context) { continue; }
                         if pending_clipboard.is_some() {
                             let _ = signals.send(ControllerSignal::Clipboard {
                                 state: "failed",
@@ -2683,11 +2979,7 @@ async fn run_controller(
                         }).await {
                             break ConnectFailure::from_controller(error);
                         }
-                        pending_clipboard = Some(PendingClipboardOperation::new(
-                            request_id,
-                            ClipboardOperation::Paste,
-                            Instant::now(),
-                        ));
+                        pending_clipboard = Some(PendingClipboardOperation::paste(request_id, context, Instant::now()));
                     }
                     Some(ControllerCommand::RequestClipboard) => {
                         if pending_clipboard.is_some() {
@@ -2716,7 +3008,14 @@ async fn run_controller(
                             Instant::now(),
                         ));
                     }
-                    Some(ControllerCommand::SendFiles(files)) => {
+                    Some(ControllerCommand::SendFiles { target, files }) => {
+                        // Preparation and IPC can outlive both a session switch and
+                        // an in-place reconnect. Never attach old files to either.
+                        if !manager.is_current(generation)
+                            || !target.matches(generation, manager.active_stream_id(), host_device_id)
+                        {
+                            continue;
+                        }
                         let occupied = queued_files.len() + usize::from(outgoing.is_some());
                         if files.is_empty() {
                             continue;
@@ -2921,8 +3220,10 @@ async fn run_controller(
                                 );
                             }
                         } else if let Some(transfer) = incoming.take() {
+                            let transfer_id = transfer.file.transfer_id();
+                            transfer.file.cancel();
                             let _ = runtime.send_transfer(TransferMessage::Cancel {
-                                transfer_id: transfer.file.transfer_id(),
+                                transfer_id,
                             }).await;
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "cancelled",
@@ -2930,7 +3231,7 @@ async fn run_controller(
                                 name: transfer.name,
                                 transferred: transfer.transferred,
                                 total: transfer.size,
-                                message: "文件接收已取消，未完成的临时文件已删除。".to_owned(),
+                                message: "文件接收已取消；进行中的磁盘操作返回后会清理临时文件。".to_owned(),
                             });
                         } else if let Some(request) = pending_remote_file_request.take() {
                             let _ = runtime.send_transfer(
@@ -2960,8 +3261,78 @@ async fn run_controller(
                         return;
                     }
                 },
-                event = runtime.next_event() => match event {
+                Some(event) = pending_incoming_file_events.recv() => {
+                    if !manager.is_current(generation) || !incoming.as_ref().is_some_and(|transfer| transfer.ticket == event.ticket) {
+                        continue;
+                    }
+                    match event.kind {
+                        IncomingFileEventKind::Opened { offset, prefix_hash } => {
+                            let transfer = incoming.as_mut().expect("matched incoming ticket");
+                            transfer.opened = true;
+                            transfer.received_offset = offset;
+                            transfer.transferred = offset;
+                            transfer.last_activity = Instant::now();
+                            let transfer_id = transfer.file.transfer_id();
+                            if let Err(error) = runtime.send_transfer(TransferMessage::FileDecision {
+                                transfer_id, result: TransferResult::Completed,
+                                resume_offset: offset, resume_prefix_hash: prefix_hash,
+                            }).await { break ConnectFailure::from_controller(error); }
+                            let _ = manager.remember_last_file_action(LastFileAction::download(host_device_id, Some(FileResumeHint {
+                                transfer_id, name: transfer.name.clone(), size: transfer.size,
+                            })));
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "receiving", direction: "download", name: transfer.name.clone(),
+                                transferred: offset, total: transfer.size,
+                                message: format!("正在接收远端文件… {}%", transfer_percent(offset, transfer.size)),
+                            });
+                        }
+                        IncomingFileEventKind::Written { transferred } => {
+                            let transfer = incoming.as_mut().expect("matched incoming ticket");
+                            transfer.transferred = transferred;
+                            transfer.pending_writes = transfer.pending_writes.saturating_sub(1);
+                            transfer.last_activity = Instant::now();
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: if transfer.finishing { "verifying" } else { "receiving" }, direction: "download", name: transfer.name.clone(),
+                                transferred, total: transfer.size,
+                                message: if transfer.finishing { "正在写入并校验文件…".to_owned() }
+                                    else { format!("正在接收… {}%", transfer_percent(transferred, transfer.size)) },
+                            });
+                        }
+                        IncomingFileEventKind::Finished { path } => {
+                            let transfer = incoming.take().expect("matched incoming ticket");
+                            let transfer_id = transfer.file.transfer_id();
+                            tauri::async_runtime::spawn_blocking(move || apps_windows::transfer::notify_file_received(&path));
+                            if let Err(error) = runtime.send_transfer(TransferMessage::FileResult {
+                                transfer_id, result: TransferResult::Completed,
+                            }).await { break ConnectFailure::from_controller(error); }
+                            manager.clear_last_file_action();
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "completed", direction: "download", name: transfer.name,
+                                transferred: transfer.size, total: transfer.size,
+                                message: "文件已校验并保存到本机的“下载”文件夹。".to_owned(),
+                            });
+                        }
+                        IncomingFileEventKind::Failed(result) => {
+                            let transfer = incoming.take().expect("matched incoming ticket");
+                            let transfer_id = transfer.file.transfer_id();
+                            let response = if transfer.opened {
+                                TransferMessage::FileResult { transfer_id, result }
+                            } else {
+                                TransferMessage::FileDecision { transfer_id, result, resume_offset: 0, resume_prefix_hash: None }
+                            };
+                            transfer.file.cancel();
+                            if let Err(error) = runtime.send_transfer(response).await { break ConnectFailure::from_controller(error); }
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed", direction: "download", name: transfer.name,
+                                transferred: transfer.transferred, total: transfer.size,
+                                message: transfer_result_message(result).to_owned(),
+                            });
+                        }
+                    }
+                }
+                event = runtime.next_event_with_transfer(incoming.as_ref().is_none_or(|transfer| transfer.file.can_receive())) => match event {
                     Ok(ControllerEvent::VideoConfig(config)) => {
+                        if !manager.set_video_input_context_if_current(generation, &config) { continue; }
                         if !stable {
                             record_controller_diagnostic(
                                 diagnostics.as_ref(),
@@ -3001,6 +3372,7 @@ async fn run_controller(
                         );
                         let _ = signals.send(ControllerSignal::VideoConfig {
                             stream_id: config.stream_id,
+                            input_epoch: config.input_epoch,
                             config_version: config.config_version,
                             width: config.width,
                             height: config.height,
@@ -3069,6 +3441,9 @@ async fn run_controller(
                             active_display_id,
                         });
                     }
+                    Ok(ControllerEvent::Control(ControlMessage::InputState { reason })) => {
+                        let _ = signals.send(ControllerSignal::InputRestriction { reason });
+                    }
                     Ok(ControllerEvent::Control(ControlMessage::AudioState {
                         available,
                         enabled,
@@ -3132,13 +3507,21 @@ async fn run_controller(
                             }) else {
                                 continue;
                             };
+                            if pending.shortcut_pending { continue; }
                             pending_clipboard = None;
                             let completed = result == TransferResult::Completed
                                 && pending.operation != ClipboardOperation::Receive;
-                            if pending.operation == ClipboardOperation::Paste && completed
-                                && let Err(error) = send_remote_paste_shortcut(&runtime).await
-                            {
-                                break ConnectFailure::from_controller(error);
+                            if pending.operation == ClipboardOperation::Paste && completed {
+                                let Some(context) = pending.paste_context(manager.active_input_context()) else {
+                                    let _ = signals.send(ControllerSignal::Clipboard {
+                                        state: "failed", operation: "paste",
+                                        message: "远程画面已经切换；文本已写入剪贴板，请确认当前画面后重新粘贴。".to_owned(),
+                                    });
+                                    continue;
+                                };
+                                pending_clipboard = Some(PendingClipboardOperation { shortcut_pending: true, ..pending });
+                                pending_paste = Some((request_id, context));
+                                continue;
                             }
                             let _ = signals.send(ControllerSignal::Clipboard {
                                 state: if completed { "completed" } else { "failed" },
@@ -3204,176 +3587,71 @@ async fn run_controller(
                                 }
                                 continue;
                             }
-                            let incoming_file = tauri::async_runtime::spawn_blocking({
-                                let name = name.clone();
-                                move || IncomingFile::create(transfer_id, name, size)
-                            }).await.unwrap_or(Err(TransferResult::IoFailed));
-                            let (result, resume_offset, resume_prefix_hash, mut staged) =
-                                match incoming_file {
-                                Ok(file) => {
-                                    let resume_offset = file.resume_offset();
-                                    let resume_prefix_hash = file.resume_prefix_hash();
-                                    (
-                                        TransferResult::Completed,
-                                        resume_offset,
-                                        resume_prefix_hash,
-                                        ResumableIncomingTransfer(Some(IncomingTransfer {
-                                            file,
-                                            name: name.clone(),
-                                            size,
-                                            transferred: resume_offset,
-                                            last_activity: Instant::now(),
-                                        })),
-                                    )
-                                }
-                                Err(result) => {
-                                    (result, 0, None, ResumableIncomingTransfer::default())
-                                }
-                            };
-                            if let Err(error) = runtime.send_transfer(
-                                TransferMessage::FileDecision {
-                                    transfer_id,
-                                    result,
-                                    resume_offset,
-                                    resume_prefix_hash,
-                                },
-                            ).await {
-                                break ConnectFailure::from_controller(error);
-                            }
-                            match staged.take() {
-                                Some(transfer) => {
-                                    let _ = manager.remember_last_file_action(
-                                        LastFileAction::download(host_device_id, Some(FileResumeHint {
-                                            transfer_id,
-                                            name: name.clone(),
-                                            size,
-                                        })),
-                                    );
-                                    let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "receiving",
-                                        direction: "download",
-                                        name: name.clone(),
-                                        transferred: resume_offset,
-                                        total: size,
-                                        message: if resume_offset == 0 {
-                                            "正在接收远端文件… 0%".to_owned()
-                                        } else {
-                                            format!(
-                                                "从 {}% 继续接收远端文件…",
-                                                transfer_percent(resume_offset, size)
-                                            )
-                                        },
-                                    });
-                                    *incoming = Some(transfer);
-                                }
-                                None => {
-                                    let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "failed",
-                                        direction: "download",
-                                        name,
-                                        transferred: 0,
-                                        total: size,
-                                        message: transfer_result_message(result).to_owned(),
-                                    });
-                                }
-                            }
+                            let ticket = next_incoming_ticket;
+                            next_incoming_ticket = next_incoming_ticket.wrapping_add(1).max(1);
+                            incoming = Some(IncomingTransfer {
+                                file: IncomingFilePipeline::start(transfer_id, ticket, name.clone(), size, incoming_file_events.clone()),
+                                ticket, opened: false, finishing: false, received_offset: 0, pending_writes: 0,
+                                name, size, transferred: 0, last_activity: Instant::now(),
+                            });
                         }
                         TransferMessage::FileChunk { transfer_id, offset, bytes } => {
-                            let result = incoming
-                                .as_mut()
-                                .filter(|transfer| transfer.file.transfer_id() == transfer_id)
+                            let result = incoming.as_mut()
+                                .filter(|transfer| transfer.file.transfer_id() == transfer_id && transfer.opened && !transfer.finishing)
                                 .ok_or(TransferResult::InvalidData)
                                 .and_then(|transfer| {
-                                    transfer.file.write_chunk(offset, &bytes)?;
-                                    transfer.transferred = offset.saturating_add(bytes.len() as u64);
+                                    let end = offset.checked_add(bytes.len() as u64).ok_or(TransferResult::InvalidData)?;
+                                    if offset != transfer.received_offset || end > transfer.size { return Err(TransferResult::InvalidData); }
+                                    transfer.file.write_chunk(offset, bytes)?;
+                                    transfer.received_offset = end;
+                                    transfer.pending_writes += 1;
                                     transfer.last_activity = Instant::now();
-                                    Ok((
-                                        transfer.name.clone(),
-                                        transfer.transferred,
-                                        transfer.size,
-                                    ))
+                                    Ok(())
                                 });
-                            match result {
-                                Ok((name, transferred, total)) => {
+                            if let Err(result) = result {
+                                let failed = if incoming.as_ref().is_some_and(|transfer| transfer.file.transfer_id() == transfer_id) { incoming.take() } else { None };
+                                if let Some(transfer) = failed.as_ref() {
                                     let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "receiving",
-                                        direction: "download",
-                                        name,
-                                        transferred,
-                                        total,
-                                        message: format!(
-                                            "正在接收… {}%",
-                                            transfer_percent(transferred, total)
-                                        ),
-                                    });
-                                }
-                                Err(result) => {
-                                    let failed = incoming.take();
-                                    if let Err(error) = runtime.send_transfer(
-                                        TransferMessage::FileResult { transfer_id, result },
-                                    ).await {
-                                        break ConnectFailure::from_controller(error);
-                                    }
-                                    let _ = signals.send(ControllerSignal::FileTransfer {
-                                        state: "failed",
-                                        direction: "download",
-                                        name: failed.as_ref().map(|item| item.name.clone())
-                                            .unwrap_or_else(|| "远端文件".to_owned()),
-                                        transferred: failed.as_ref().map_or(0, |item| item.transferred),
-                                        total: failed.as_ref().map_or(0, |item| item.size),
+                                        state: "failed", direction: "download", name: transfer.name.clone(),
+                                        transferred: transfer.transferred, total: transfer.size,
                                         message: transfer_result_message(result).to_owned(),
                                     });
+                                }
+                                if let Some(transfer) = failed { transfer.file.cancel(); }
+                                if let Err(error) = runtime.send_transfer(TransferMessage::FileResult { transfer_id, result }).await {
+                                    break ConnectFailure::from_controller(error);
                                 }
                             }
                         }
                         TransferMessage::FileComplete { transfer_id, content_hash } => {
-                            let transfer = incoming.take();
-                            let (name, size, result) = match transfer {
-                                Some(transfer) if transfer.file.transfer_id() == transfer_id => {
-                                    let name = transfer.name;
-                                    let size = transfer.size;
-                                    let result = tauri::async_runtime::spawn_blocking(move || {
-                                        transfer.file.finish(content_hash)
-                                    }).await.unwrap_or(Err(TransferResult::IoFailed));
-                                    (name, size, result)
-                                }
-                                Some(transfer) => {
-                                    *incoming = Some(transfer);
-                                    ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData))
-                                }
-                                None => ("远端文件".to_owned(), 0, Err(TransferResult::InvalidData)),
-                            };
-                            let transfer_result = match result {
-                                Ok(path) => {
-                                    tauri::async_runtime::spawn_blocking(move || {
-                                        apps_windows::transfer::notify_file_received(&path)
+                            let result = incoming.as_mut()
+                                .filter(|transfer| transfer.file.transfer_id() == transfer_id && transfer.opened && !transfer.finishing)
+                                .ok_or(TransferResult::InvalidData)
+                                .and_then(|transfer| {
+                                    if transfer.received_offset != transfer.size { return Err(TransferResult::InvalidData); }
+                                    transfer.file.finish(content_hash)?;
+                                    transfer.finishing = true;
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "verifying", direction: "download", name: transfer.name.clone(),
+                                        transferred: transfer.transferred, total: transfer.size,
+                                        message: "正在写入并校验文件…".to_owned(),
                                     });
-                                    TransferResult::Completed
+                                    Ok(())
+                                });
+                            if let Err(result) = result {
+                                if incoming.as_ref().is_some_and(|transfer| transfer.file.transfer_id() == transfer_id)
+                                    && let Some(transfer) = incoming.take() {
+                                    let _ = signals.send(ControllerSignal::FileTransfer {
+                                        state: "failed", direction: "download", name: transfer.name,
+                                        transferred: transfer.transferred, total: transfer.size,
+                                        message: transfer_result_message(result).to_owned(),
+                                    });
+                                    transfer.file.cancel();
                                 }
-                                Err(result) => result,
-                            };
-                            if let Err(error) = runtime.send_transfer(TransferMessage::FileResult {
-                                transfer_id,
-                                result: transfer_result,
-                            }).await {
-                                break ConnectFailure::from_controller(error);
+                                if let Err(error) = runtime.send_transfer(TransferMessage::FileResult { transfer_id, result }).await {
+                                    break ConnectFailure::from_controller(error);
+                                }
                             }
-                            let completed = transfer_result == TransferResult::Completed;
-                            if completed {
-                                manager.clear_last_file_action();
-                            }
-                            let _ = signals.send(ControllerSignal::FileTransfer {
-                                state: if completed { "completed" } else { "failed" },
-                                direction: "download",
-                                name,
-                                transferred: if completed { size } else { 0 },
-                                total: size,
-                                message: if completed {
-                                    "文件已保存到本机的“下载”文件夹。"
-                                } else {
-                                    transfer_result_message(transfer_result)
-                                }.to_owned(),
-                            });
                         }
                         TransferMessage::FileDecision {
                             transfer_id,
@@ -3481,6 +3759,7 @@ async fn run_controller(
                                 transfer.file.transfer_id() == transfer_id
                             }) {
                                 let transfer = incoming.take().expect("checked incoming transfer");
+                                transfer.file.cancel();
                                 let _ = signals.send(ControllerSignal::FileTransfer {
                                     state: "failed",
                                     direction: "download",
@@ -3519,6 +3798,7 @@ async fn run_controller(
                                 transfer.file.transfer_id() == transfer_id
                             }) {
                                 let transfer = incoming.take().expect("checked incoming transfer");
+                                transfer.file.cancel();
                                 let _ = signals.send(ControllerSignal::FileTransfer {
                                     state: "cancelled",
                                     direction: "download",
@@ -3586,7 +3866,7 @@ async fn run_controller(
                 _ = transfer_watchdog.tick() => {
                     let now = Instant::now();
                     if pending_clipboard
-                        .is_some_and(|pending| deadline_expired(pending.deadline, now))
+                        .is_some_and(|pending| !pending.shortcut_pending && deadline_expired(pending.deadline, now))
                     {
                         let pending = pending_clipboard.take().expect("checked clipboard deadline");
                         let _ = signals.send(ControllerSignal::Clipboard {
@@ -3614,11 +3894,14 @@ async fn run_controller(
                         });
                     }
                     if incoming.as_ref().is_some_and(|transfer| {
-                        now.duration_since(transfer.last_activity) >= FILE_RECEIVE_IDLE_TIMEOUT
+                        transfer.pending_writes == 0 && !transfer.finishing
+                            && now.duration_since(transfer.last_activity) >= FILE_RECEIVE_IDLE_TIMEOUT
                     }) {
                         let transfer = incoming.take().expect("checked incoming file deadline");
+                        let transfer_id = transfer.file.transfer_id();
+                        transfer.file.cancel();
                         let _ = runtime.send_transfer(TransferMessage::Cancel {
-                            transfer_id: transfer.file.transfer_id(),
+                            transfer_id,
                         }).await;
                         let _ = signals.send(ControllerSignal::FileTransfer {
                             state: "failed",
@@ -3626,7 +3909,7 @@ async fn run_controller(
                             name: transfer.name,
                             transferred: transfer.transferred,
                             total: transfer.size,
-                            message: "连续 60 秒未收到新的文件数据，已取消接收并删除临时文件。".to_owned(),
+                            message: "连续 60 秒未收到新的文件数据，已取消接收；临时文件会在后台清理。".to_owned(),
                         });
                     }
                     if outgoing.as_ref().is_some_and(|transfer| {
@@ -3725,6 +4008,7 @@ async fn run_controller(
                 last_metrics = Instant::now();
             }
         };
+        drop(active_input.take());
         record_controller_video_metrics(
             diagnostics.as_ref(),
             attempt,
@@ -3771,21 +4055,14 @@ async fn run_controller(
             let name = transfer.name;
             let transferred = transfer.transferred;
             let total = transfer.size;
-            let preserved = tauri::async_runtime::spawn_blocking(move || transfer.file.preserve())
-                .await
-                .is_ok_and(|result| result.is_ok());
+            drop(transfer.file);
             let _ = signals.send(ControllerSignal::FileTransfer {
                 state: "failed",
                 direction: "download",
                 name,
                 transferred,
                 total,
-                message: if preserved {
-                    "连接中断，已保留接收进度；连接恢复后点击重试即可继续。"
-                } else {
-                    "连接中断，且无法安全保留接收进度；请重新获取文件。"
-                }
-                .to_owned(),
+                message: "连接中断，正在后台保留接收进度；连接恢复后可重试。".to_owned(),
             });
         } else if pending_remote_file_request.take().is_some() {
             let _ = signals.send(ControllerSignal::FileTransfer {
@@ -4150,6 +4427,19 @@ struct ConnectFailure {
 }
 
 impl ConnectFailure {
+    fn limit_unanswered_handshake(self, budget: &mut HandshakeResponseBudget) -> Self {
+        if self.kind == "handshake_no_response" && !budget.record_no_response() {
+            Self::with_reason(
+                false,
+                "主机的安全握手多次未响应。请确认目标电脑在线、网络可达，并在两台电脑上安装同一个最新版本后重试。",
+                "handshake_no_response",
+                self.technical_reason,
+            )
+        } else {
+            self
+        }
+    }
+
     fn with_reason(
         retryable: bool,
         detail: &'static str,
@@ -4243,6 +4533,14 @@ impl ConnectFailure {
 
     fn from_controller(error: ControllerError) -> Self {
         let technical_reason = error.to_string();
+        if matches!(&error, ControllerError::HandshakeTimeout) {
+            return Self::with_reason(
+                true,
+                "主机的安全握手未响应，DeskLink 将在有限次数内重试。",
+                "handshake_no_response",
+                technical_reason,
+            );
+        }
         if let ControllerError::Protocol(ProtocolError::UnsupportedVersion(_)) = &error {
             return Self::with_reason(
                 false,
@@ -4287,7 +4585,7 @@ impl ConnectFailure {
                 ),
                 AccessDenialReason::HostUnavailable => Self::with_reason(
                     false,
-                    "主机已批准连接，但当前无法启动屏幕采集。请解锁主机屏幕、退出远程桌面或兼容模式后重试。",
+                    "主机已结束本次控制，或暂时无法提供共享。请在主机上确认共享状态后重新连接。",
                     "host_unavailable",
                     technical_reason,
                 ),
@@ -4313,8 +4611,7 @@ impl ConnectFailure {
         }
         let retryable = matches!(
             error,
-            ControllerError::HandshakeTimeout
-                | ControllerError::NegotiationTimeout
+            ControllerError::NegotiationTimeout
                 | ControllerError::Transport(
                     TransportError::Connection(_)
                         | TransportError::ConnectionLimit
@@ -4572,29 +4869,63 @@ fn record_controller_video_metrics(
     });
 }
 
-async fn send_text_input(runtime: &ControllerRuntime, text: &str) -> Result<(), ControllerError> {
-    for character in text.chars() {
+async fn send_captured_input_events<Events, IsCurrent, Send, SendFuture>(
+    context: InputContext,
+    events: Events,
+    mut is_current: IsCurrent,
+    mut send: Send,
+) -> Result<bool, ControllerError>
+where
+    Events: IntoIterator<Item = InputEvent>,
+    IsCurrent: FnMut(InputContext) -> bool,
+    Send: FnMut(InputContext, InputEvent) -> SendFuture,
+    SendFuture: Future<Output = Result<(), ControllerError>>,
+{
+    context.validate()?;
+    for event in events {
+        if !is_current(context) {
+            return Ok(false);
+        }
+        send(context, event).await?;
+    }
+    Ok(true)
+}
+
+fn text_input_events(text: &str) -> impl Iterator<Item = InputEvent> + '_ {
+    text.chars().flat_map(|character| {
         let code = match character {
             '\n' => KeyCode::Enter,
             '\t' => KeyCode::Tab,
             character => KeyCode::Character(character),
         };
-        runtime
-            .send_input(InputEvent::Key {
+        [
+            InputEvent::Key {
                 code,
                 pressed: true,
                 modifiers: Modifiers(0),
-            })
-            .await?;
-        runtime
-            .send_input(InputEvent::Key {
+            },
+            InputEvent::Key {
                 code,
                 pressed: false,
                 modifiers: Modifiers(0),
-            })
-            .await?;
-    }
-    Ok(())
+            },
+        ]
+    })
+}
+
+async fn send_text_input(
+    sender: &ControllerInputSender,
+    active: &Mutex<Option<InputContext>>,
+    context: InputContext,
+    text: &str,
+) -> Result<bool, ControllerError> {
+    send_captured_input_events(
+        context,
+        text_input_events(text),
+        |context| input_context_is_current(active, context),
+        |context, event| sender.send_input_with_context(context, event),
+    )
+    .await
 }
 
 fn remote_paste_shortcut_events() -> [InputEvent; 2] {
@@ -4612,11 +4943,24 @@ fn remote_paste_shortcut_events() -> [InputEvent; 2] {
     ]
 }
 
-async fn send_remote_paste_shortcut(runtime: &ControllerRuntime) -> Result<(), ControllerError> {
-    for event in remote_paste_shortcut_events() {
-        runtime.send_input(event).await?;
-    }
-    Ok(())
+async fn send_remote_paste_shortcut(
+    sender: &ControllerInputSender,
+    active: &Mutex<Option<InputContext>>,
+    context: InputContext,
+) -> Result<bool, ControllerError> {
+    send_captured_input_events(
+        context,
+        remote_paste_shortcut_events(),
+        |context| input_context_is_current(active, context),
+        |context, event| sender.send_input_with_context(context, event),
+    )
+    .await
+}
+
+fn validate_input_context(context: InputContext) -> Result<(), String> {
+    context
+        .validate()
+        .map_err(|_| "远程输入缺少有效的画面上下文，请等待当前画面显示后重试。".to_owned())
 }
 
 fn validate_text_input(text: &str) -> Result<(), String> {
@@ -4834,16 +5178,16 @@ mod tests {
 
     use super::{
         COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
-        ControllerCommand, ControllerInput, ControllerManager, ControllerPlaybackPressure,
-        ControllerRenderMetrics, ControllerRuntimeSummary, ControllerVideoPullInput,
-        CurrentTransportWait, H264ProfileProbe, LastFileAction, MAX_BUFFERED_POINTER_MOVES,
-        PendingClipboardOperation, PendingRemoteFileRequest, PlaybackPressureSample,
-        RetryWaitOutcome, deadline_expired, directory_transport_error_is_retryable,
-        directory_transport_error_message, file_offer_matches_request, parse_input,
-        parse_transfer_id, remote_paste_shortcut_events, revalidate_queued_file,
-        session_earned_fresh_retry_budget, should_drop_buffered_pointer_move,
-        transfer_result_message, transfer_result_state, validate_text_input,
-        wait_for_file_queue_command, wait_for_retry_deadline,
+        ControllerCommand, ControllerFileTarget, ControllerInput, ControllerManager,
+        ControllerPlaybackPressure, ControllerRenderMetrics, ControllerRuntimeSummary,
+        ControllerVideoPullInput, ControllerWorker, CurrentTransportWait, H264ProfileProbe,
+        LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
+        PendingRemoteFileRequest, PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
+        directory_transport_error_is_retryable, directory_transport_error_message,
+        file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
+        revalidate_queued_file, session_earned_fresh_retry_budget,
+        should_drop_buffered_pointer_move, transfer_result_message, transfer_result_state,
+        validate_text_input, wait_for_file_queue_command, wait_for_retry_deadline,
     };
     use apps_windows::{
         audio::RemoteAudioEncoder, transfer::OutgoingFile,
@@ -4852,13 +5196,101 @@ mod tests {
     use desklink_ffi::ControllerError;
     use desklink_protocol::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket,
-        H264Profile, InputEvent, KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton,
-        PROTOCOL_VERSION, ProtocolError, TransferResult,
+        H264Profile, InputContext, InputEvent, KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers,
+        MouseButton, PROTOCOL_VERSION, ProtocolError, TransferResult,
     };
     use desklink_session::{ReconnectPolicy, ReconnectSchedule};
     use desklink_transport::{JoinRejectCode, TransportError};
 
     use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
+
+    fn file_target_fixture() -> (
+        ControllerManager,
+        tokio::sync::mpsc::Receiver<ControllerCommand>,
+    ) {
+        let manager = ControllerManager::default();
+        manager
+            .operation_generation
+            .store(4, std::sync::atomic::Ordering::Release);
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+        let (commands, receiver) = tokio::sync::mpsc::channel(4);
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        *manager.worker.lock().unwrap() = Some(ControllerWorker {
+            generation: 4,
+            host_device_id: [7; 16],
+            commands,
+            cancellation,
+            task: tauri::async_runtime::spawn(async {}),
+        });
+        (manager, receiver)
+    }
+
+    #[tokio::test]
+    async fn file_drop_requires_the_current_stream_and_device() {
+        let (manager, _) = file_target_fixture();
+        let device_id = crate::device_directory::format_device_id(
+            crate::device_directory::public_device_id([7; 16]),
+        );
+        assert!(manager.file_drop_target(9, &device_id).is_ok());
+        assert!(manager.file_drop_target(10, &device_id).is_err());
+        assert!(manager.file_drop_target(9, "123 456 789").is_err());
+        manager
+            .operation_generation
+            .store(5, std::sync::atomic::Ordering::Release);
+        assert!(manager.capture_file_target().is_err());
+    }
+
+    #[tokio::test]
+    async fn file_preparation_cannot_cross_a_stream_or_operation_change() {
+        for change_generation in [false, true] {
+            let (manager, mut receiver) = file_target_fixture();
+            let target = manager.capture_file_target().unwrap();
+            let result = manager
+                .send_files_after_preparation(target, async {
+                    // Model the session changing while blocking file hashing or a
+                    // native picker is in flight, without reading any user files.
+                    tokio::task::yield_now().await;
+                    if change_generation {
+                        manager
+                            .operation_generation
+                            .store(5, std::sync::atomic::Ordering::Release);
+                    } else {
+                        manager.set_status(ControllerRuntimeSummary::connected(10));
+                    }
+                    Ok(Vec::new())
+                })
+                .await;
+            assert!(result.is_err());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_files_keep_the_captured_target_in_the_native_command() {
+        let (manager, mut receiver) = file_target_fixture();
+        let target = manager.capture_file_target().unwrap();
+        manager
+            .send_files_after_preparation(target, std::future::ready(Ok(Vec::new())))
+            .await
+            .unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap(), ControllerCommand::SendFiles { target: actual, .. } if actual == target)
+        );
+    }
+
+    #[test]
+    fn queued_file_target_rejects_stale_commands_at_consumption() {
+        let target = ControllerFileTarget {
+            generation: 4,
+            stream_id: 9,
+            host_device_id: [7; 16],
+        };
+        assert!(target.matches(4, Some(9), [7; 16]));
+        assert!(!target.matches(5, Some(9), [7; 16]));
+        assert!(!target.matches(4, Some(10), [7; 16]));
+        assert!(!target.matches(4, None, [7; 16]));
+        assert!(!target.matches(4, Some(9), [8; 16]));
+    }
 
     #[tokio::test]
     async fn controller_video_mailbox_returns_only_the_exact_stream_configuration() {
@@ -5372,6 +5804,7 @@ mod tests {
     fn empty_input(kind: &str) -> ControllerInput {
         ControllerInput {
             stream_id: 1,
+            input_epoch: 100,
             kind: kind.to_owned(),
             x: None,
             y: None,
@@ -5388,11 +5821,17 @@ mod tests {
     #[test]
     fn pointer_backlog_is_bounded_without_dropping_discrete_input() {
         let pointer = ControllerCommand::Input {
-            stream_id: 1,
+            context: InputContext {
+                stream_id: 1,
+                input_epoch: 100,
+            },
             event: InputEvent::MouseMove { x: 1, y: 1 },
         };
         let release = ControllerCommand::Input {
-            stream_id: 1,
+            context: InputContext {
+                stream_id: 1,
+                input_epoch: 100,
+            },
             event: InputEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: false,
@@ -5414,62 +5853,462 @@ mod tests {
     async fn stale_or_missing_stream_ids_never_enter_the_active_command_queue() {
         let manager = ControllerManager::default();
         manager.set_status(ControllerRuntimeSummary::connected(42));
-
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 100,
+            },
+        );
         let mut stale = empty_input("mouseMove");
         stale.stream_id = 41;
         stale.x = Some(1);
         stale.y = Some(1);
         assert!(manager.send_input(stale).await.is_ok());
-
         let mut missing = empty_input("mouseMove");
         missing.stream_id = 0;
         missing.x = Some(1);
         missing.y = Some(1);
         assert!(manager.send_input(missing).await.is_err());
+        let mut zero_epoch = empty_input("mouseMove");
+        zero_epoch.stream_id = 42;
+        zero_epoch.input_epoch = 0;
+        zero_epoch.x = Some(1);
+        zero_epoch.y = Some(1);
+        assert!(manager.send_input(zero_epoch).await.is_err());
+        let mut old_epoch = empty_input("mouseMove");
+        old_epoch.stream_id = 42;
+        old_epoch.input_epoch = 99;
+        old_epoch.x = Some(1);
+        old_epoch.y = Some(1);
+        assert!(manager.send_input(old_epoch).await.is_ok());
     }
 
     #[tokio::test]
     async fn stale_composed_text_is_discarded_without_entering_a_new_session_queue() {
         let manager = ControllerManager::default();
         manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 100,
+            },
+        );
         // No worker is registered: reaching the command queue would fail.
-        assert!(manager.send_text("中文".to_owned(), Some(41)).await.is_ok());
-        assert!(manager.send_text("中文".to_owned(), Some(0)).await.is_err());
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 41,
+                        input_epoch: 100
+                    }
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 42,
+                        input_epoch: 99
+                    }
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 42,
+                        input_epoch: 0
+                    }
+                )
+                .await
+                .is_err()
+        );
         manager.set_status(ControllerRuntimeSummary::idle());
-        assert!(manager.send_text("中文".to_owned(), Some(42)).await.is_ok());
-        assert!(manager.send_text("中文".to_owned(), None).await.is_err());
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 42,
+                        input_epoch: 100
+                    }
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
-    async fn composed_and_explicit_text_commands_keep_their_submission_stream() {
+    async fn composed_text_input_and_paste_keep_their_captured_context_in_the_queue() {
         let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
         manager.set_status(ControllerRuntimeSummary::connected(42));
-        let (commands, mut receiver) = mpsc::channel(2);
+        manager.set_input_context_if_current(0, context);
+        let (commands, mut receiver) = mpsc::channel(4);
         let (cancellation, _cancellation_receiver) = watch::channel(false);
         *manager.worker.lock().unwrap() = Some(super::ControllerWorker {
+            generation: 0,
             host_device_id: [1; 16],
             commands,
             cancellation,
             task: tauri::async_runtime::spawn(async {}),
         });
+        manager.send_text("中文".to_owned(), context).await.unwrap();
+        let mut input = empty_input("key");
+        input.stream_id = context.stream_id;
+        input.input_epoch = context.input_epoch;
+        input.key = Some("character".to_owned());
+        input.character = Some("x".to_owned());
+        input.pressed = Some(false);
+        manager.send_input(input).await.unwrap();
         manager
-            .send_text("中文".to_owned(), Some(42))
+            .paste_clipboard("粘贴".to_owned(), context)
             .await
             .unwrap();
-        manager
-            .send_text("文字面板".to_owned(), None)
-            .await
-            .unwrap();
-        manager.set_status(ControllerRuntimeSummary::connected(43));
-        for expected in ["中文", "文字面板"] {
-            let ControllerCommand::Text { stream_id, text } = receiver.recv().await.unwrap() else {
-                panic!("expected queued text command");
-            };
-            assert_eq!(stream_id, 42);
-            assert_eq!(text, expected);
-            assert_ne!(manager.active_stream_id(), Some(stream_id));
-        }
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 101,
+            },
+        );
+        assert!(!manager.accepts_input_context(context));
+        let ControllerCommand::Text {
+            context: text_context,
+            text,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(text_context, context);
+        assert_eq!(text, "中文");
+        let ControllerCommand::Input {
+            context: input_context,
+            event,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected release");
+        };
+        assert_eq!(input_context, context);
+        assert!(matches!(event, InputEvent::Key { pressed: false, .. }));
+        let ControllerCommand::PasteClipboard {
+            context: paste_context,
+            text,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected paste");
+        };
+        assert_eq!(paste_context, context);
+        assert_eq!(text, "粘贴");
         manager.stop_current().await;
+    }
+
+    #[test]
+    fn missing_input_context_is_a_deserialization_error_instead_of_a_default() {
+        assert!(
+            serde_json::from_value::<ControllerInput>(serde_json::json!({
+                "streamId":"42","kind":"mouseMove","x":1,"y":1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ControllerInput>(serde_json::json!({
+                "inputEpoch":"100","kind":"mouseMove","x":1,"y":1
+            }))
+            .is_err()
+        );
+        let input = serde_json::from_value::<ControllerInput>(serde_json::json!({
+            "streamId":"42","inputEpoch":"100","kind":"mouseMove","x":1,"y":1
+        }))
+        .unwrap();
+        assert_eq!(input.stream_id, 42);
+        assert_eq!(input.input_epoch, 100);
+    }
+
+    #[test]
+    fn native_video_and_input_ipc_keep_full_u64_identities_as_canonical_strings() {
+        for value in [(1_u64 << 53) - 1, 1_u64 << 53, (1_u64 << 53) + 1, u64::MAX] {
+            let text = value.to_string();
+            let input = serde_json::from_value::<ControllerInput>(serde_json::json!({
+                "streamId":text,"inputEpoch":text,"kind":"mouseMove","x":1,"y":1
+            }))
+            .unwrap();
+            assert_eq!(input.stream_id, value);
+            assert_eq!(input.input_epoch, value);
+            let pull =
+                serde_json::from_value::<super::ControllerVideoPullInput>(serde_json::json!({
+                    "streamId":text,"configVersion":1
+                }))
+                .unwrap();
+            assert_eq!(pull.stream_id, value);
+            let signal = super::ControllerSignal::VideoConfig {
+                stream_id: value,
+                input_epoch: value,
+                config_version: 1,
+                width: 16,
+                height: 16,
+                sequence_header: vec![],
+            };
+            let signal = serde_json::to_value(signal).unwrap();
+            assert_eq!(signal["streamId"], text);
+            assert_eq!(signal["inputEpoch"], text);
+            let status = serde_json::to_value(ControllerRuntimeSummary::connected(value)).unwrap();
+            assert_eq!(status["streamId"], text);
+        }
+        for value in [
+            serde_json::json!(42),
+            serde_json::json!("0"),
+            serde_json::json!("01"),
+            serde_json::json!("-1"),
+            serde_json::json!("1.2"),
+            serde_json::json!("18446744073709551616"),
+        ] {
+            assert!(
+                serde_json::from_value::<ControllerInput>(serde_json::json!({
+                    "streamId":value,"inputEpoch":"100","kind":"mouseMove","x":1,"y":1
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<ControllerInput>(serde_json::json!({
+                    "streamId":"42","inputEpoch":value,"kind":"mouseMove","x":1,"y":1
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn paste_ack_only_admits_the_original_context_and_quality_changes_keep_it_valid() {
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(0, context);
+        let paste = PendingClipboardOperation::paste(7, context, Instant::now());
+        assert_eq!(
+            paste.paste_context(manager.active_input_context()),
+            Some(context)
+        );
+        // A pure quality config may retain the epoch.
+        manager.set_input_context_if_current(0, context);
+        assert_eq!(
+            paste.paste_context(manager.active_input_context()),
+            Some(context)
+        );
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 101,
+            },
+        );
+        assert!(
+            paste
+                .paste_context(manager.active_input_context())
+                .is_none()
+        );
+        assert_eq!(paste.input_context, Some(context));
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 43,
+                input_epoch: 100,
+            },
+        );
+        assert!(
+            paste
+                .paste_context(manager.active_input_context())
+                .is_none()
+        );
+        manager.cancel_operations();
+        assert!(manager.active_input_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn connected_select_consumes_new_video_config_before_a_blocked_input_send_finishes() {
+        use std::sync::{Arc, Mutex};
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(0, context);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let captured = sent.clone();
+        let current = manager.clone();
+        let event_manager = manager.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (configs, mut config_events) = tokio::sync::mpsc::channel(1);
+        let (consumed, config_consumed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut entered = Some(entered);
+            let mut released = Some(released);
+            let mut active = Some(super::PendingInputSend::new(
+                super::InputSendKind::Text,
+                async move {
+                    let result = super::send_captured_input_events(
+                        context,
+                        super::text_input_events("中文"),
+                        |context| current.accepts_input_context(context),
+                        move |context, event| {
+                            captured.lock().unwrap().push((context, event));
+                            if let Some(entered) = entered.take() {
+                                let _ = entered.send(());
+                            }
+                            let released = released.take();
+                            async move {
+                                if let Some(released) = released {
+                                    let _ = released.await;
+                                }
+                                Ok::<(), ControllerError>(())
+                            }
+                        },
+                    )
+                    .await;
+                    ((), result)
+                },
+            ));
+            // This is the production connected-loop structure: input owns its
+            // future while protocol events keep being polled by the same loop.
+            tokio::select! {
+                _ = super::next_input_completion(&mut active) => panic!("send gate was not released"),
+                config = config_events.recv() => {
+                    let config = config.unwrap();
+                    assert!(event_manager.set_video_input_context_if_current(0, &config));
+                    consumed.send(()).unwrap();
+                },
+            }
+            let (_, result) = super::next_input_completion(&mut active).await;
+            result
+        });
+        started.await.unwrap();
+        configs
+            .send(desklink_protocol::VideoConfig {
+                protocol_version: PROTOCOL_VERSION,
+                stream_id: 42,
+                input_epoch: 101,
+                config_version: 2,
+                codec: desklink_protocol::Codec::H264,
+                width: 16,
+                height: 16,
+                sequence_header: vec![0, 0, 1],
+            })
+            .await
+            .unwrap();
+        config_consumed.await.unwrap();
+        assert_eq!(
+            manager.active_input_context(),
+            Some(InputContext {
+                stream_id: 42,
+                input_epoch: 101
+            })
+        );
+        // A successful send proves the in-flight reliable-write future was
+        // retained across the config event instead of being dropped mid-frame.
+        release.send(()).unwrap();
+        assert!(!task.await.unwrap().unwrap());
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, context);
+        assert!(matches!(sent[0].1, InputEvent::Key { pressed: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn text_and_shortcut_sender_keep_the_original_pair_and_balance_normal_keys() {
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(0, context);
+        let mut sent = Vec::new();
+        assert!(
+            super::send_captured_input_events(
+                context,
+                super::text_input_events("中\n"),
+                |context| manager.accepts_input_context(context),
+                |captured, event| {
+                    // Quality-only updates retain the input authorization epoch.
+                    manager.set_input_context_if_current(0, context);
+                    sent.push((captured, event));
+                    std::future::ready(Ok::<(), ControllerError>(()))
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(sent.len(), 4);
+        assert!(sent.iter().all(|(actual, _)| *actual == context));
+        for pair in sent.chunks_exact(2) {
+            assert!(matches!(pair[0].1, InputEvent::Key { pressed: true, .. }));
+            assert!(matches!(pair[1].1, InputEvent::Key { pressed: false, .. }));
+        }
+        let mut paste = Vec::new();
+        assert!(
+            !super::send_captured_input_events(
+                context,
+                remote_paste_shortcut_events(),
+                |context| manager.accepts_input_context(context),
+                |captured, event| {
+                    paste.push((captured, event));
+                    manager.set_input_context_if_current(
+                        0,
+                        InputContext {
+                            stream_id: 42,
+                            input_epoch: 101,
+                        },
+                    );
+                    std::future::ready(Ok::<(), ControllerError>(()))
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(paste.len(), 1);
+        assert_eq!(paste[0].0, context);
+    }
+
+    #[tokio::test]
+    async fn connection_status_never_supplies_an_input_epoch_and_old_generations_cannot_rearm_it() {
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        assert!(manager.active_input_context().is_none());
+        // No worker exists, so an accidental admission would produce an error.
+        assert!(
+            manager
+                .send_text("unchanged".to_owned(), context)
+                .await
+                .is_ok()
+        );
+        let generation = manager.begin_operation();
+        assert!(!manager.set_input_context_if_current(generation - 1, context));
+        assert!(manager.active_input_context().is_none());
+        assert!(manager.set_input_context_if_current(generation, context));
+        manager.cancel_operations();
+        assert!(manager.active_input_context().is_none());
+        assert!(!manager.set_input_context_if_current(generation, context));
     }
 
     #[test]
@@ -5583,8 +6422,8 @@ mod tests {
         ));
 
         assert!(!failure.retryable);
-        assert!(failure.detail.contains("屏幕采集"));
-        assert!(failure.detail.contains("解锁"));
+        assert!(failure.detail.contains("结束本次控制"));
+        assert!(failure.detail.contains("共享状态"));
     }
 
     #[test]
@@ -5636,6 +6475,137 @@ mod tests {
         assert!(!failure.retryable);
         assert_eq!(failure.kind, "protocol_version_mismatch");
         assert!(failure.detail.contains("同一个最新版本"));
+    }
+
+    #[test]
+    fn three_unanswered_noise_handshakes_stop_with_an_accurate_terminal_reason() {
+        let mut budget = super::HandshakeResponseBudget::default();
+        for _ in 0..2 {
+            let failure = ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget);
+            assert!(failure.retryable);
+            assert_eq!(failure.kind, "handshake_no_response");
+        }
+        let failure = ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget);
+        assert!(!failure.retryable);
+        assert_eq!(failure.kind, "handshake_no_response");
+        assert!(failure.detail.contains("安全握手多次未响应"));
+        assert!(failure.detail.contains("确认目标电脑在线"));
+        assert!(!failure.detail.contains("不兼容"));
+    }
+
+    #[test]
+    fn fixed_host_offline_and_transport_waits_never_consume_handshake_response_budget() {
+        let mut budget = super::HandshakeResponseBudget::default();
+        for index in 0..100 {
+            let error = if index % 2 == 0 {
+                TransportError::JoinRejected(JoinRejectCode::SessionNotFound)
+            } else {
+                TransportError::Connection("synthetic temporary relay outage".into())
+            };
+            assert!(
+                ConnectFailure::from_transport(error, true)
+                    .limit_unanswered_handshake(&mut budget)
+                    .retryable
+            );
+        }
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        // Intervening offline periods preserve, but never consume or reset, the
+        // count of actual unanswered handshakes after the peer has joined.
+        for _ in 0..100 {
+            assert!(
+                ConnectFailure::from_transport(
+                    TransportError::JoinRejected(JoinRejectCode::SessionNotFound),
+                    true,
+                )
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+            );
+        }
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        assert!(
+            !ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+    }
+
+    #[test]
+    fn completed_authenticated_connection_resets_only_the_no_response_budget() {
+        let mut budget = super::HandshakeResponseBudget::default();
+        for _ in 0..2 {
+            assert!(
+                ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                    .limit_unanswered_handshake(&mut budget)
+                    .retryable
+            );
+        }
+        budget.authenticated();
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        assert!(
+            !ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_no_response_budget_stops_persistent_recovery_before_another_wait() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let signals = tauri::ipc::Channel::new(|_| Ok(()));
+        let mut budget = super::HandshakeResponseBudget::default();
+        for _ in 0..2 {
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget);
+        }
+        let failure = ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget);
+        let expected_detail = failure.detail;
+        let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+        let (_commands, mut receiver) = mpsc::channel(1);
+        let (_cancellation, mut cancellation_receiver) = watch::channel(false);
+        let retry = tokio::time::timeout(
+            Duration::from_millis(200),
+            super::schedule_failure(
+                &manager,
+                &signals,
+                &mut schedule,
+                failure,
+                super::ControllerWaitChannels {
+                    generation,
+                    persistent: true,
+                    commands: &mut receiver,
+                    cancellation: &mut cancellation_receiver,
+                },
+                None,
+                3,
+            ),
+        )
+        .await
+        .expect("silent handshakes must stop before another persistent retry wait");
+        assert!(!retry);
+        assert_eq!(manager.snapshot().state, "stopped");
+        assert_eq!(manager.snapshot().detail, expected_detail);
+        assert_eq!(schedule.retries_used(), 0);
     }
 
     #[test]
@@ -6024,5 +6994,29 @@ mod tests {
         );
 
         assert!(decoder.decode(packets[2].clone()).is_empty());
+    }
+    #[test]
+    fn input_restriction_signal_uses_stable_categories_and_explicit_recovery() {
+        use desklink_protocol::InputRestrictionReason;
+        for (reason, expected) in [
+            (
+                Some(InputRestrictionReason::Blocked),
+                serde_json::json!("blocked"),
+            ),
+            (
+                Some(InputRestrictionReason::UnsupportedKey),
+                serde_json::json!("unsupportedKey"),
+            ),
+            (
+                Some(InputRestrictionReason::InvalidInput),
+                serde_json::json!("invalidInput"),
+            ),
+            (None, serde_json::Value::Null),
+        ] {
+            assert_eq!(
+                serde_json::to_value(super::ControllerSignal::InputRestriction { reason }).unwrap(),
+                serde_json::json!({ "kind": "inputRestriction", "reason": expected }),
+            );
+        }
     }
 }

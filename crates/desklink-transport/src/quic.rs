@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -284,16 +284,23 @@ impl QuicClient {
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
         let mut transport = quinn::TransportConfig::default();
+        if let Some(limits) = config.flow_control_limits {
+            limits.apply_to(&mut transport);
+        }
         transport
             .keep_alive_interval(Some(config.keep_alive))
             .max_idle_timeout(Some(idle_timeout));
         let mut client_config = config.client_config.clone();
         client_config.transport_config(Arc::new(transport));
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(|error| {
-            TransportError::InvalidConfig(format!("client bind address: {error}"))
-        })?)
-        .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
+        let bind_address = if config.relay_addr.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_address).map_err(|error| {
+            TransportError::InvalidConfig(format!("client bind address {bind_address}: {error}"))
+        })?;
         endpoint.set_default_client_config(client_config);
         let connection = endpoint
             .connect(config.relay_addr, &config.server_name)
@@ -565,11 +572,20 @@ impl QuicClient {
     }
 
     pub async fn next_event(&self) -> Result<TransportEvent, TransportError> {
+        self.next_event_with_transfer(true).await
+    }
+
+    /// Pause only reliable file/clipboard ingress while its consumer is full.
+    /// Other lanes keep their independent queues and round-robin scheduling.
+    pub async fn next_event_with_transfer(
+        &self,
+        include_transfer: bool,
+    ) -> Result<TransportEvent, TransportError> {
         loop {
             let start = self.inner.events.next_lane.load(Ordering::Acquire);
             for offset in 0..INBOUND_LANE_COUNT {
                 let lane = (start + offset) % INBOUND_LANE_COUNT;
-                if !self.inner.events.lane_open(lane) {
+                if (!include_transfer && lane == 6) || !self.inner.events.lane_open(lane) {
                     continue;
                 }
                 match self.inner.events.try_recv_lane(lane) {
@@ -583,7 +599,11 @@ impl QuicClient {
                     LanePoll::Empty | LanePoll::Locked => {}
                 }
             }
-            if !self.inner.events.has_open_lane() {
+            if !self.inner.events.has_open_lane()
+                || (!include_transfer
+                    && (0..INBOUND_LANE_COUNT)
+                        .all(|lane| lane == 6 || !self.inner.events.lane_open(lane)))
+            {
                 return Err(TransportError::Closed);
             }
 
@@ -651,7 +671,7 @@ impl QuicClient {
                     }
                     self.inner.events.close_lane(5);
                 }
-                event = receive_current_inbound(&self.inner.events.transfer, &self.inner.events.active_peer_generation), if self.inner.events.transfer_open.load(Ordering::Acquire) => {
+                event = receive_current_inbound(&self.inner.events.transfer, &self.inner.events.active_peer_generation), if include_transfer && self.inner.events.transfer_open.load(Ordering::Acquire) => {
                     if let Some(event) = event {
                         self.inner.events.set_next_lane(6);
                         if let Some(event) = self.settle_peer_event(event).await {

@@ -60,6 +60,7 @@ struct IOSSessionView: View {
             .padding(.trailing, 18)
 
             IOSKeyboardInputView(input: keyboard)
+                .id(controller.presentedInputContext?.targetIdentity)
                 .frame(width: 1, height: 1)
                 .opacity(0.01)
                 .allowsHitTesting(false)
@@ -68,8 +69,9 @@ struct IOSSessionView: View {
         .toolbar(.hidden, for: .tabBar)
         .onDisappear {
             keyboard.resign()
-            controller.releaseAll()
         }
+        .onChange(of: controller.presentedInputContext) { keyboard.synchronizeInputContext($0) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in keyboard.resign() }
         .onChange(of: controller.state) { state in
             guard !IOSSessionPresentation.isActive(state) else { return }
             viewport.reset()
@@ -185,8 +187,8 @@ struct IOSSessionView: View {
             ZStack {
                 Color.black
                 IOSMetalVideoView(
-                    pixelBuffer: controller.latestPixelBuffer,
-                    videoSize: controller.videoSize,
+                    frame: controller.videoFrame,
+                    onFramePresented: { [controller] token, _ in controller.confirmVideoFramePresentation(token) },
                     zoomScale: viewport.zoomScale,
                     panOffset: viewport.panOffset,
                     visibleVideoRect: $visibleVideoRect
@@ -220,6 +222,12 @@ struct IOSSessionView: View {
                     }
                 )
                 .allowsHitTesting(isInputEnabled)
+
+                RemoteCursorPositionLayer(
+                    overlay: controller.cursorOverlay,
+                    activeStreamID: cursorStreamID,
+                    videoRect: visibleVideoRect
+                )
 
                 if !hasVideoFrame {
                     VStack(spacing: 10) {
@@ -264,6 +272,14 @@ struct IOSSessionView: View {
     private var isInputEnabled: Bool {
         if case .connected = controller.state { return true }
         return false
+    }
+
+    private var cursorStreamID: UInt64? {
+        if case let .connected(streamID) = controller.state { return streamID }
+        if controller.state == .frozen || controller.state == .recovering {
+            return controller.cursorOverlay?.streamID
+        }
+        return nil
     }
 
     private var hasVideoFrame: Bool {

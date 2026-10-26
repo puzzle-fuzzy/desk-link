@@ -5,6 +5,8 @@ struct ControllerHomeView: View {
     @ObservedObject var bridge: ControllerBridge
     @State private var savedHosts: [SavedHost] = []
     @State private var storeError: String?
+    @State private var renamingHost: SavedHost?
+    @State private var aliasDraft = ""
     private let savedHostStore = SavedHostStore()
 
     init(bridge: ControllerBridge) {
@@ -42,6 +44,13 @@ struct ControllerHomeView: View {
             if case .connected = state {
                 loadSavedHosts()
             }
+        }
+        .alert("重命名设备", isPresented: isRenaming) {
+            TextField("设备名称", text: $aliasDraft)
+            Button("保存") { saveAlias() }
+            Button("取消", role: .cancel) { renamingHost = nil }
+        } message: {
+            Text("名称只保存在这台 Mac 上。留空可恢复默认名称。")
         }
     }
 
@@ -94,11 +103,11 @@ struct ControllerHomeView: View {
                 .frame(width: 24)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(host.serverName)
+                Text(host.displayName)
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(DeskLinkPalette.ink)
                     .lineLimit(1)
-                Text("已保存到本机")
+                Text(host.canReconnect ? "已保存到本机" : "连接授权需更新，请重新配对")
                     .font(.system(size: 11))
                     .foregroundStyle(DeskLinkPalette.mutedInk)
             }
@@ -109,6 +118,14 @@ struct ControllerHomeView: View {
                 bridge.connect(savedHost: host)
             }
             .buttonStyle(DeskLinkSecondaryButtonStyle())
+            .disabled(isBusy || !host.canReconnect)
+
+            Button("重命名") {
+                renamingHost = host
+                aliasDraft = host.alias ?? ""
+            }
+            .buttonStyle(.borderless)
+            .font(.system(size: 12, weight: .medium))
             .disabled(isBusy)
 
             Button("移除", role: .destructive) {
@@ -122,9 +139,21 @@ struct ControllerHomeView: View {
     }
 
     private var isBusy: Bool {
-        switch bridge.state {
-        case .pairing, .connecting, .reconnecting, .recovering: true
-        default: false
+        deskLinkConnectionIsWaiting(bridge.state)
+    }
+
+    private var isRenaming: Binding<Bool> {
+        Binding(get: { renamingHost != nil }, set: { if !$0 { renamingHost = nil } })
+    }
+
+    private func saveAlias() {
+        guard let host = renamingHost else { return }
+        do {
+            try savedHostStore.rename(id: host.id, alias: aliasDraft)
+            renamingHost = nil
+            loadSavedHosts()
+        } catch {
+            storeError = "无法更新设备名称，请使用 80 字以内的名称。"
         }
     }
 

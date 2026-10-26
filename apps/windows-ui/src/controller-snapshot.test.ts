@@ -8,7 +8,7 @@ function snapshot(state: ControllerSnapshot["runtime"]["state"], deviceId: strin
       state,
       title: state,
       detail: `${state} detail`,
-      streamId: state === "connected" ? 9 : null,
+      streamId: state === "connected" ? "9" : null,
     },
     savedConnection: null,
     connectionError: null,
@@ -48,7 +48,7 @@ describe("controller operation snapshot merge", () => {
     );
 
     expect(result.runtime.state).toBe("connected");
-    expect(result.runtime.streamId).toBe(9);
+    expect(result.runtime.streamId).toBe("9");
     expect(result.savedDevices[0]?.deviceId).toBe("new-device");
   });
 
