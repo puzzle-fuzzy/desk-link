@@ -255,6 +255,8 @@ impl Harness {
         let envelope = InputEnvelope {
             sequence: self.metrics.input_sequence,
             timestamp_us: now_micros(),
+            stream_id: 1,
+            input_epoch: 1,
             event,
         };
         self.controller

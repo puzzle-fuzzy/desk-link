@@ -44,6 +44,18 @@ pub enum ProtocolError {
     InvalidDirectVideoMessage,
 }
 
+/// Protocol lanes carry one complete value. Postcard's `from_bytes` silently
+/// permits a remainder, which would allow input bytes to alias a short control
+/// message and would hide missing or extra wire fields during schema changes.
+fn decode_exact<'de, T: serde::Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, ProtocolError> {
+    let (value, remainder) =
+        postcard::take_from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    if !remainder.is_empty() {
+        return Err(ProtocolError::Malformed);
+    }
+    Ok(value)
+}
+
 pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError> {
     if let ControlMessage::Capabilities(capabilities) = message {
         capabilities.validate()?;
@@ -61,7 +73,7 @@ pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError
 }
 pub fn decode_control(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
     ensure(bytes, MAX_CONTROL_MESSAGE_BYTES)?;
-    let message = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let message = decode_exact(bytes)?;
     if let ControlMessage::Capabilities(capabilities) = &message {
         capabilities.validate()?;
     }
@@ -121,7 +133,7 @@ pub fn encode_transfer(message: &TransferMessage) -> Result<Vec<u8>, ProtocolErr
 
 pub fn decode_transfer(bytes: &[u8]) -> Result<TransferMessage, ProtocolError> {
     ensure(bytes, crate::MAX_TRANSFER_MESSAGE_BYTES)?;
-    let message = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let message = decode_exact(bytes)?;
     validate_transfer(&message)?;
     Ok(message)
 }
@@ -227,7 +239,7 @@ pub fn encode_noise_handshake(handshake: &NoiseHandshake) -> Result<Vec<u8>, Pro
 }
 pub fn decode_noise_handshake(bytes: &[u8]) -> Result<NoiseHandshake, ProtocolError> {
     ensure(bytes, MAX_CONTROL_MESSAGE_BYTES)?;
-    let handshake = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let handshake = decode_exact(bytes)?;
     validate_noise_handshake(&handshake)?;
     Ok(handshake)
 }
@@ -238,7 +250,7 @@ pub fn encode_video_config(config: &VideoConfig) -> Result<Vec<u8>, ProtocolErro
 }
 pub fn decode_video_config(bytes: &[u8]) -> Result<VideoConfig, ProtocolError> {
     ensure(bytes, MAX_VIDEO_CONFIG_BYTES)?;
-    let config = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let config = decode_exact(bytes)?;
     validate_video_config(&config)?;
     Ok(config)
 }
@@ -249,7 +261,7 @@ pub fn encode_cursor_update(cursor: &CursorUpdate) -> Result<Vec<u8>, ProtocolEr
 }
 pub fn decode_cursor_update(bytes: &[u8]) -> Result<CursorUpdate, ProtocolError> {
     ensure(bytes, MAX_CURSOR_MESSAGE_BYTES)?;
-    let cursor = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let cursor = decode_exact(bytes)?;
     validate_cursor_update(&cursor)?;
     Ok(cursor)
 }
@@ -262,7 +274,7 @@ pub fn encode_audio_packet(packet: &AudioPacket) -> Result<Vec<u8>, ProtocolErro
 }
 pub fn decode_audio_packet(bytes: &[u8]) -> Result<AudioPacket, ProtocolError> {
     ensure(bytes, MAX_AUDIO_PACKET_BYTES)?;
-    let packet = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let packet = decode_exact(bytes)?;
     validate_audio_packet(&packet)?;
     Ok(packet)
 }
@@ -272,17 +284,19 @@ pub fn encode_video_header(header: &VideoFrameHeader) -> Result<Vec<u8>, Protoco
 }
 pub fn decode_video_header(bytes: &[u8]) -> Result<VideoFrameHeader, ProtocolError> {
     ensure(bytes, 128)?;
-    let header: VideoFrameHeader =
-        postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let header: VideoFrameHeader = decode_exact(bytes)?;
     validate_video_header(&header)?;
     Ok(header)
 }
 pub fn encode_input(input: &InputEnvelope) -> Result<Vec<u8>, ProtocolError> {
     validate_input(input)?;
-    bounded(
-        postcard::to_allocvec(input).map_err(|_| ProtocolError::Malformed)?,
-        MAX_CONTROL_MESSAGE_BYTES,
-    )
+    // A legal legacy envelope starts with a nonzero postcard sequence. Reserve
+    // zero as a discriminator so old fields cannot alias a new input context.
+    let version = PROTOCOL_VERSION.to_le_bytes();
+    let mut wire = Vec::with_capacity(64);
+    wire.extend_from_slice(&[0, version[0], version[1]]);
+    let wire = postcard::to_extend(input, wire).map_err(|_| ProtocolError::Malformed)?;
+    bounded(wire, MAX_CONTROL_MESSAGE_BYTES)
 }
 /// Decodes and structurally validates an input envelope without comparing its
 /// wall-clock timestamp to the local machine. Authenticated sessions use this
@@ -291,7 +305,14 @@ pub fn encode_input(input: &InputEnvelope) -> Result<Vec<u8>, ProtocolError> {
 /// synchronized to within a second.
 pub fn decode_session_input(bytes: &[u8]) -> Result<InputEnvelope, ProtocolError> {
     ensure(bytes, MAX_CONTROL_MESSAGE_BYTES)?;
-    let input: InputEnvelope = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    if bytes.len() < 3 || bytes[0] != 0 {
+        return Err(ProtocolError::Malformed);
+    }
+    let version = u16::from_le_bytes([bytes[1], bytes[2]]);
+    if version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(version));
+    }
+    let input: InputEnvelope = decode_exact(&bytes[3..])?;
     validate_input(&input)?;
     Ok(input)
 }
@@ -307,6 +328,7 @@ pub fn decode_input(bytes: &[u8], now_us: u64) -> Result<InputEnvelope, Protocol
 }
 
 fn validate_input(input: &InputEnvelope) -> Result<(), ProtocolError> {
+    input.context().validate()?;
     let valid = input.sequence != 0
         && match &input.event {
             InputEvent::MouseMove { x, y } => {
@@ -378,7 +400,7 @@ pub fn encode_video_packet_parts(
 
 pub fn decode_video_packet(bytes: &[u8]) -> Result<VideoPacket, ProtocolError> {
     ensure(bytes, MAX_VIDEO_PACKET_BYTES)?;
-    let packet: VideoPacket = postcard::from_bytes(bytes).map_err(|_| ProtocolError::Malformed)?;
+    let packet: VideoPacket = decode_exact(bytes)?;
     VideoPacket::new(packet.header, packet.payload)
 }
 
@@ -499,6 +521,7 @@ fn validate_video_config(config: &VideoConfig) -> Result<(), ProtocolError> {
         return Err(ProtocolError::UnsupportedVersion(config.protocol_version));
     }
     if config.stream_id == 0
+        || config.input_epoch == 0
         || config.config_version == 0
         || config.width == 0
         || config.height == 0

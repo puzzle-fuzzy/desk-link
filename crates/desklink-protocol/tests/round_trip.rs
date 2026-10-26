@@ -273,6 +273,7 @@ fn video_config_round_trips_and_rejects_invalid_decoder_state() {
     let config = VideoConfig {
         protocol_version: PROTOCOL_VERSION,
         stream_id: 7,
+        input_epoch: 4,
         config_version: 3,
         codec: Codec::H264,
         width: 1920,
@@ -490,6 +491,8 @@ fn input_timestamp_window_rejects_stale_and_future_values() {
     let envelope = InputEnvelope {
         sequence: 1,
         timestamp_us: 10,
+        stream_id: 7,
+        input_epoch: 4,
         event: InputEvent::MouseMove { x: 1, y: 1 },
     };
     let stale_bytes = encode_input(&envelope).expect("encode");
@@ -507,6 +510,8 @@ fn input_wire_decode_rejects_stale_and_future_values() {
     let stale = InputEnvelope {
         sequence: 1,
         timestamp_us: 10,
+        stream_id: 7,
+        input_epoch: 4,
         event: InputEvent::MouseMove { x: 1, y: 1 },
     };
     let bytes = encode_input(&stale).expect("encode");
@@ -557,6 +562,8 @@ fn input_round_trips_wheel_and_explicit_modifiers() {
         let envelope = InputEnvelope {
             sequence: index as u64 + 1,
             timestamp_us: 1_000,
+            stream_id: 7,
+            input_epoch: 4,
             event,
         };
         let bytes = encode_input(&envelope).expect("encode valid input");
@@ -602,13 +609,16 @@ fn input_rejects_out_of_bounds_pointer_wheel_and_modifier_values() {
         let envelope = InputEnvelope {
             sequence: index as u64 + 1,
             timestamp_us: 1_000,
+            stream_id: 7,
+            input_epoch: 4,
             event,
         };
         assert!(matches!(
             encode_input(&envelope),
             Err(ProtocolError::InvalidInput)
         ));
-        let bytes = postcard::to_allocvec(&envelope).unwrap();
+        let version = PROTOCOL_VERSION.to_le_bytes();
+        let bytes = postcard::to_extend(&envelope, vec![0, version[0], version[1]]).unwrap();
         assert!(matches!(
             decode_input(&bytes, 1_000),
             Err(ProtocolError::InvalidInput)
@@ -621,6 +631,8 @@ fn control_channel_has_no_input_bypass() {
     let input = InputEnvelope {
         sequence: 1,
         timestamp_us: 10,
+        stream_id: 7,
+        input_epoch: 4,
         event: InputEvent::MouseMove { x: 1, y: 1 },
     };
     let bytes = encode_input(&input).expect("encode input");

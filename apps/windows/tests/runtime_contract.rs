@@ -78,6 +78,8 @@ fn inbound_policy_filters_wrong_stream_requests_and_replayed_input() {
     let envelope = InputEnvelope {
         sequence: 7,
         timestamp_us: 1_000,
+        stream_id: 1,
+        input_epoch: 1,
         event: InputEvent::Key {
             code: KeyCode::Enter,
             pressed: true,
@@ -98,11 +100,15 @@ fn inbound_policy_calibrates_different_computer_clocks_without_dropping_input() 
     let first = InputEnvelope {
         sequence: 1,
         timestamp_us: 10_000,
+        stream_id: 1,
+        input_epoch: 1,
         event: InputEvent::MouseMove { x: 100, y: 200 },
     };
     let second = InputEnvelope {
         sequence: 2,
         timestamp_us: 26_000,
+        stream_id: 1,
+        input_epoch: 1,
         event: InputEvent::MouseMove { x: 300, y: 400 },
     };
 
@@ -126,11 +132,15 @@ fn inbound_policy_reanchors_after_a_wall_clock_jump_instead_of_ending_the_sessio
     let first = InputEnvelope {
         sequence: 1,
         timestamp_us: 1_000_000,
+        stream_id: 1,
+        input_epoch: 1,
         event: InputEvent::MouseMove { x: 10, y: 20 },
     };
     let after_clock_jump = InputEnvelope {
         sequence: 2,
         timestamp_us: 101_000_000,
+        stream_id: 1,
+        input_epoch: 1,
         event: InputEvent::MouseMove { x: 30, y: 40 },
     };
 

@@ -313,6 +313,9 @@ impl ControllerRuntime {
         let plaintext = encode_input(&InputEnvelope {
             sequence,
             timestamp_us: now_micros(),
+            // Fail closed until callers supply the captured presentation context.
+            stream_id: 0,
+            input_epoch: 0,
             event,
         })?;
         let ciphertext = seal(&self.secure, SecureLane::Input, &plaintext).await?;

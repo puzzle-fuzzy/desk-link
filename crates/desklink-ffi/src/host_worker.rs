@@ -893,6 +893,7 @@ async fn handle_command(
             let config = VideoConfig {
                 protocol_version: PROTOCOL_VERSION,
                 stream_id,
+                input_epoch: 0,
                 config_version: version,
                 codec: Codec::H264,
                 width,
