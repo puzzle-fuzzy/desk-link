@@ -7,7 +7,7 @@ use configuration_queue::{
 
 use std::{
     collections::VecDeque,
-    num::NonZeroU64,
+    num::{NonZeroU32, NonZeroU64},
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -833,8 +833,11 @@ impl HostVideoPipeline {
         }
         if self
             .sent_config
-            .is_some_and(|(version, sent_width, sent_height, _)| {
-                version == frame.config_version && (sent_width, sent_height) != (width, height)
+            .is_some_and(|(version, sent_width, sent_height, sent_epoch)| {
+                frame.config_version < version
+                    || (version == frame.config_version
+                        && ((sent_width, sent_height) != (width, height)
+                            || sent_epoch != input_epoch))
             })
         {
             return Err(HostRuntimeError::InconsistentVideoConfig);
@@ -1507,6 +1510,7 @@ struct CaptureWorkerReady {
 struct SelectedDesktop {
     stream_id: NonZeroU64,
     input_epoch: Option<NonZeroU64>,
+    input_config_anchor: Option<NonZeroU32>,
     display_id: u32,
     desktop: VirtualDesktop,
     topology: Option<DisplayTopologySnapshot>,
@@ -1575,6 +1579,7 @@ impl SelectedDesktop {
         Ok(Self {
             stream_id: NonZeroU64::new(stream_id).ok_or(ProtocolError::InvalidInput)?,
             input_epoch: None,
+            input_config_anchor: None,
             display_id: 0,
             desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
             topology: None,
@@ -1588,10 +1593,12 @@ impl SelectedDesktop {
         topology: DisplayTopologySnapshot,
         stream_id: NonZeroU64,
         input_epoch: NonZeroU64,
+        input_config_anchor: NonZeroU32,
     ) -> Self {
         Self {
             stream_id,
             input_epoch: Some(input_epoch),
+            input_config_anchor: Some(input_config_anchor),
             display_id: topology.active_display_id(),
             desktop: VirtualDesktop::new(
                 topology.active_display().rect,
@@ -1685,7 +1692,11 @@ impl<B: crate::input::InputBackend> CaptureDesktopCoordinator<'_, B> {
         lock_unpoisoned(self.input).release_all().is_ok()
     }
 
-    fn publish(&self, topology: DisplayTopologySnapshot) -> Result<bool, HostRuntimeError> {
+    fn publish(
+        &self,
+        topology: DisplayTopologySnapshot,
+        encoder_config_version: u32,
+    ) -> Result<bool, HostRuntimeError> {
         let generation = topology.generation();
         let mut selected = lock_unpoisoned(self.selected);
         if selected.input_closed {
@@ -1697,6 +1708,14 @@ impl<B: crate::input::InputBackend> CaptureDesktopCoordinator<'_, B> {
                 .topology
                 .as_ref()
                 .is_none_or(|previous| topology.requires_capture_reconfigure(previous));
+        let encoder_config_version = NonZeroU32::new(encoder_config_version)
+            .ok_or(HostRuntimeError::InconsistentVideoConfig)?;
+        let previous_anchor = selected.input_config_anchor;
+        if let Some(anchor) = previous_anchor
+            && (encoder_config_version < anchor || (boundary && encoder_config_version <= anchor))
+        {
+            return Err(HostRuntimeError::InconsistentVideoConfig);
+        }
         let mut input = lock_unpoisoned(self.input);
         let input_epoch = if boundary {
             self.input_suspended.store(true, Ordering::Release);
@@ -1711,11 +1730,17 @@ impl<B: crate::input::InputBackend> CaptureDesktopCoordinator<'_, B> {
                 .ok_or(HostRuntimeError::CaptureWorkerStopped)?
         };
         let stream_id = selected.stream_id;
+        let input_config_anchor = if boundary {
+            encoder_config_version
+        } else {
+            previous_anchor.ok_or(HostRuntimeError::InconsistentVideoConfig)?
+        };
         input.set_desktop(VirtualDesktop::new(
             topology.active_display().rect,
             topology.virtual_desktop(),
         ));
-        *selected = SelectedDesktop::from_snapshot(topology, stream_id, input_epoch);
+        *selected =
+            SelectedDesktop::from_snapshot(topology, stream_id, input_epoch, input_config_anchor);
         selected.selection_pending = selection_pending;
         self.input_suspended.store(false, Ordering::Release);
         self.updates.send_replace(generation);
@@ -2057,7 +2082,7 @@ fn capture_worker_entry(
         input_suspended: &context.input_suspended,
         updates: &context.topology_updates,
     };
-    match coordinator.publish(topology) {
+    match coordinator.publish(topology, encoder.config_version()) {
         Ok(true) => {}
         Ok(false) => {
             let _ = ready.send(Err(HostRuntimeError::CaptureWorkerStopped));
@@ -2265,6 +2290,16 @@ fn encoder_error_is_recoverable(error: &EncoderError) -> bool {
     )
 }
 
+fn recoverable_configuration<T>(
+    result: Result<T, HostRuntimeError>,
+) -> Result<Option<T>, HostRuntimeError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error @ HostRuntimeError::Encoder(EncoderError::ConfigVersionExhausted)) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
 fn capture_encode_loop(
     mut capture: DxgiDesktopCapturer,
     mut encoder: H264Encoder,
@@ -2335,14 +2370,14 @@ fn capture_encode_loop(
                 if reset_media {
                     desktop_state.suspend();
                     topology_recovery_pending = true;
-                    if prepare_capture_topology(
+                    if recoverable_configuration(prepare_capture_topology(
                         &mut capture,
                         &mut encoder,
                         &next,
                         video_quality_settings_with_profile(video_quality, video_profile),
                         false,
-                    )
-                    .is_ok()
+                    ))?
+                    .is_some()
                     {
                         video_profile = encoder.profile();
                         frame_pacer.reset(
@@ -2356,7 +2391,7 @@ fn capture_encode_loop(
                         if !encoded_any_frame {
                             first_encoded_frame_deadline = None;
                         }
-                        if desktop_state.publish(next)? {
+                        if desktop_state.publish(next, encoder.config_version())? {
                             notify.notify_one();
                             topology_recovery_pending = false;
                         }
@@ -2364,7 +2399,7 @@ fn capture_encode_loop(
                 } else {
                     // Hotplug of an unused output or a primary/name change may
                     // update the list without rebuilding unchanged media.
-                    if !desktop_state.publish(next)? {
+                    if !desktop_state.publish(next, encoder.config_version())? {
                         topology_recovery_pending = true;
                     }
                 }
@@ -2383,14 +2418,14 @@ fn capture_encode_loop(
                         Ok(None) => true,
                         Ok(Some(next)) => {
                             desktop_state.suspend();
-                            let prepared = prepare_capture_topology(
+                            let prepared = recoverable_configuration(prepare_capture_topology(
                                 &mut capture,
                                 &mut encoder,
                                 &next,
                                 video_quality_settings_with_profile(video_quality, video_profile),
                                 false,
-                            );
-                            if prepared.is_ok() {
+                            ))?;
+                            if prepared.is_some() {
                                 video_profile = encoder.profile();
                                 frame_pacer.reset(
                                     video_quality_settings_with_profile(
@@ -2407,7 +2442,7 @@ fn capture_encode_loop(
                                 if !encoded_any_frame {
                                     first_encoded_frame_deadline = None;
                                 }
-                                if desktop_state.publish(next)? {
+                                if desktop_state.publish(next, encoder.config_version())? {
                                     notify.notify_one();
                                     true
                                 } else {
@@ -2429,13 +2464,16 @@ fn capture_encode_loop(
                         || encoder.bitrate() != video_quality_settings(preset).bitrate
                     {
                         let (source_width, source_height) = capture.dimensions();
-                        if encoder
-                            .reconfigure_for_source(
-                                source_width,
-                                source_height,
-                                video_quality_settings_with_profile(preset, video_profile),
-                            )
-                            .is_ok()
+                        if recoverable_configuration(
+                            encoder
+                                .reconfigure_for_source(
+                                    source_width,
+                                    source_height,
+                                    video_quality_settings_with_profile(preset, video_profile),
+                                )
+                                .map_err(HostRuntimeError::Encoder),
+                        )?
+                        .is_some()
                         {
                             video_quality = preset;
                             video_profile = encoder.profile();
@@ -2453,16 +2491,22 @@ fn capture_encode_loop(
                 CaptureWorkerCommand::SetVideoProfile { profile, reply } => {
                     if profile != video_profile {
                         let (source_width, source_height) = capture.dimensions();
-                        if encoder
-                            .reconfigure_for_source(
-                                source_width,
-                                source_height,
-                                H264EncoderSettings {
-                                    bitrate: encoder.bitrate(),
-                                    ..video_quality_settings_with_profile(video_quality, profile)
-                                },
-                            )
-                            .is_ok()
+                        if recoverable_configuration(
+                            encoder
+                                .reconfigure_for_source(
+                                    source_width,
+                                    source_height,
+                                    H264EncoderSettings {
+                                        bitrate: encoder.bitrate(),
+                                        ..video_quality_settings_with_profile(
+                                            video_quality,
+                                            profile,
+                                        )
+                                    },
+                                )
+                                .map_err(HostRuntimeError::Encoder),
+                        )?
+                        .is_some()
                         {
                             video_profile = encoder.profile();
                             lock_queue(&queue).clear();
@@ -2563,14 +2607,14 @@ fn capture_encode_loop(
                         continue;
                     }
                 };
-                if prepare_capture_topology(
+                if recoverable_configuration(prepare_capture_topology(
                     &mut capture,
                     &mut encoder,
                     &next,
                     video_quality_settings_with_profile(video_quality, video_profile),
                     true,
-                )
-                .is_err()
+                ))?
+                .is_none()
                 {
                     next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
                     continue;
@@ -2586,7 +2630,7 @@ fn capture_encode_loop(
                     .reset(video_quality_settings_with_profile(video_quality, video_profile).fps);
                 lock_queue(&queue).clear();
                 force_keyframe.store(true, Ordering::Release);
-                if desktop_state.publish(next)? {
+                if desktop_state.publish(next, encoder.config_version())? {
                     notify.notify_one();
                     topology_recovery_pending = false;
                 }
@@ -4304,6 +4348,10 @@ mod retry_policy_tests {
         pipeline: super::HostVideoPipeline,
         policy: super::HostInboundPolicy,
         next_frame_id: u64,
+        #[cfg(windows)]
+        encoder: crate::encoder::H264Encoder,
+        #[cfg(not(windows))]
+        model_config_version: u32,
     }
 
     impl EpochFixture<'static> {
@@ -4334,8 +4382,23 @@ mod retry_policy_tests {
                 pipeline: super::HostVideoPipeline::new(9),
                 policy: super::HostInboundPolicy::new(9),
                 next_frame_id: 1,
+                #[cfg(windows)]
+                encoder: crate::encoder::H264Encoder::new_with_settings_and_backend(
+                    1280,
+                    720,
+                    crate::encoder::H264EncoderSettings::default(),
+                    crate::encoder::EncoderBackendPreference::SoftwareOnly,
+                )
+                .unwrap(),
+                #[cfg(not(windows))]
+                model_config_version: 1,
             };
-            assert!(fixture.coordinator().publish(topology_pair()).unwrap());
+            assert!(
+                fixture
+                    .coordinator()
+                    .publish(topology_pair(), fixture.encoder_version())
+                    .unwrap()
+            );
             fixture
         }
 
@@ -4351,12 +4414,54 @@ mod retry_policy_tests {
             }
         }
 
-        fn wire_context(&mut self, config_version: u32) -> InputContext {
+        fn encoder_version(&self) -> u32 {
+            #[cfg(windows)]
+            {
+                self.encoder.config_version()
+            }
+            #[cfg(not(windows))]
+            {
+                self.model_config_version
+            }
+        }
+
+        fn reconfigure_encoder(&mut self, rect: DesktopRect) {
+            #[cfg(windows)]
+            self.encoder
+                .reconfigure_for_source(
+                    rect.width,
+                    rect.height,
+                    crate::encoder::H264EncoderSettings::default(),
+                )
+                .unwrap();
+            #[cfg(not(windows))]
+            {
+                // Portable policy tests have no Media Foundation backend. The
+                // native Windows fixture above uses the real encoder getter.
+                let _ = rect;
+                self.model_config_version = self.model_config_version.checked_add(1).unwrap();
+            }
+        }
+
+        fn publish_prepared(
+            &mut self,
+            topology: crate::capture::DisplayTopologySnapshot,
+        ) -> Result<bool, HostRuntimeError> {
+            self.reconfigure_encoder(topology.active_display().rect);
+            self.coordinator().publish(topology, self.encoder_version())
+        }
+
+        fn advance_codec_only(&mut self) {
+            let rect = self.selected.lock().unwrap().desktop.rect;
+            self.reconfigure_encoder(rect);
+        }
+
+        fn wire_context(&mut self) -> InputContext {
             let selected = self.selected.lock().unwrap();
             let context = selected.input_context().unwrap();
             let rect = selected.desktop.rect;
             drop(selected);
-            let frame = test_encoded_frame(self.next_frame_id, config_version, true);
+            let frame = test_encoded_frame(self.next_frame_id, self.encoder_version(), true);
             self.next_frame_id += 1;
             let super::PrepareVideo::Ready(prepared) = self
                 .pipeline
@@ -4399,7 +4504,7 @@ mod retry_policy_tests {
     #[test]
     fn topology_publication_keeps_list_active_output_and_input_context_together() {
         let mut fixture = EpochFixture::new();
-        let before = fixture.wire_context(1);
+        let before = fixture.wire_context();
         let current = fixture.coordinator().current().unwrap();
         let surviving = current
             .displays()
@@ -4413,8 +4518,8 @@ mod retry_policy_tests {
             .unwrap();
         assert!(fixture.coordinator().suspend());
         assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
-        assert!(fixture.coordinator().publish(next).unwrap());
-        let after = fixture.wire_context(2);
+        assert!(fixture.publish_prepared(next).unwrap());
+        let after = fixture.wire_context();
         assert_ne!(before.input_epoch, after.input_epoch);
         let published = fixture.selected.lock().unwrap();
         assert_eq!(published.display_id, 19);
@@ -4433,7 +4538,7 @@ mod retry_policy_tests {
     #[test]
     fn old_wire_releases_and_pending_samples_cannot_touch_new_epoch_or_reused_display() {
         let mut fixture = EpochFixture::new();
-        let first_a = fixture.wire_context(1);
+        let first_a = fixture.wire_context();
         assert!(fixture.inject(first_a, 1, key_event(true)));
         let b = fixture
             .coordinator()
@@ -4443,8 +4548,8 @@ mod retry_policy_tests {
             .unwrap()
             .unwrap();
         assert!(fixture.coordinator().suspend());
-        assert!(fixture.coordinator().publish(b).unwrap());
-        let context_b = fixture.wire_context(2);
+        assert!(fixture.publish_prepared(b).unwrap());
+        let context_b = fixture.wire_context();
         assert!(fixture.inject(context_b, 2, key_event(true)));
         let before = fixture.sent.lock().unwrap().len();
         let old_events = [
@@ -4500,8 +4605,8 @@ mod retry_policy_tests {
             .unwrap()
             .unwrap();
         assert!(fixture.coordinator().suspend());
-        assert!(fixture.coordinator().publish(second_a).unwrap());
-        let second_a = fixture.wire_context(3);
+        assert!(fixture.publish_prepared(second_a).unwrap());
+        let second_a = fixture.wire_context();
         assert_ne!(second_a, first_a);
         assert_ne!(second_a, context_b);
         assert!(fixture.inject(second_a, 4, key_event(true)));
@@ -4515,7 +4620,8 @@ mod retry_policy_tests {
     #[test]
     fn metadata_and_media_configuration_versions_preserve_epoch_and_held_keys() {
         let mut fixture = EpochFixture::new();
-        let context = fixture.wire_context(1);
+        let context = fixture.wire_context();
+        let initial_anchor = fixture.selected.lock().unwrap().input_config_anchor;
         assert!(fixture.inject(context, 1, key_event(true)));
         let current = fixture.coordinator().current().unwrap();
         let mut displays = current.displays().to_vec();
@@ -4526,7 +4632,12 @@ mod retry_policy_tests {
             .refreshed(displays, current.virtual_desktop())
             .unwrap()
             .unwrap();
-        assert!(fixture.coordinator().publish(next).unwrap());
+        assert!(
+            fixture
+                .coordinator()
+                .publish(next, fixture.encoder_version())
+                .unwrap()
+        );
         assert_eq!(
             fixture.sent.lock().unwrap().len(),
             1,
@@ -4534,22 +4645,119 @@ mod retry_policy_tests {
         );
         // Quality/profile changes advance codec config versions, not geometry
         // epochs. Both identities come back from actual host VideoConfig bytes.
-        assert_eq!(fixture.wire_context(2), context);
-        assert_eq!(fixture.wire_context(3), context);
+        fixture.advance_codec_only();
+        assert_eq!(fixture.wire_context(), context);
+        assert_eq!(
+            fixture.selected.lock().unwrap().input_config_anchor,
+            initial_anchor
+        );
+        fixture.advance_codec_only();
+        assert_eq!(fixture.wire_context(), context);
         assert_eq!(fixture.sent.lock().unwrap().len(), 1);
         assert!(fixture.inject(context, 2, key_event(false)));
     }
 
     #[test]
+    fn same_dimensions_selection_and_virtual_origin_require_prepared_encoder_version() {
+        let mut fixture = EpochFixture::new();
+        let first = fixture.wire_context();
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays[1].rect = DesktopRect::new(0, 0, 1280, 720);
+        let same_size = current
+            .refreshed(displays, DesktopRect::new(-1280, 0, 2560, 720))
+            .unwrap()
+            .unwrap();
+        assert!(fixture.coordinator().suspend());
+        assert!(fixture.publish_prepared(same_size).unwrap());
+        let normalized = fixture.wire_context();
+        assert_ne!(normalized, first);
+        let current = fixture.coordinator().current().unwrap();
+        let selected = current.select(19).unwrap().unwrap();
+        assert_eq!(
+            current.active_display().rect.width,
+            selected.active_display().rect.width
+        );
+        assert_eq!(
+            current.active_display().rect.height,
+            selected.active_display().rect.height
+        );
+        let old_version = fixture.encoder_version();
+        assert!(fixture.coordinator().suspend());
+        assert_eq!(
+            fixture.coordinator().publish(selected.clone(), old_version),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+        assert_eq!(
+            fixture.selected.lock().unwrap().input_context(),
+            Some(normalized)
+        );
+        assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
+        assert!(fixture.publish_prepared(selected).unwrap());
+        assert!(fixture.encoder_version() > old_version);
+        let selected_context = fixture.wire_context();
+        assert_ne!(selected_context, normalized);
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays[0].rect.left = -1400;
+        let origin_changed = current
+            .refreshed(displays, DesktopRect::new(-1400, 0, 2680, 720))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            origin_changed.active_display().rect,
+            current.active_display().rect
+        );
+        assert!(fixture.coordinator().suspend());
+        assert_eq!(
+            fixture
+                .coordinator()
+                .publish(origin_changed.clone(), fixture.encoder_version()),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+        assert!(fixture.publish_prepared(origin_changed).unwrap());
+        let shifted_context = fixture.wire_context();
+        assert_ne!(shifted_context, selected_context);
+        assert_eq!(
+            fixture
+                .coordinator()
+                .publish(fixture.coordinator().current().unwrap(), 0),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+        assert!(!fixture.inject(selected_context, 100, key_event(true)));
+        assert!(fixture.inject(shifted_context, 1, key_event(true)));
+    }
+
+    #[test]
+    fn encoder_version_exhaustion_ends_configuration_instead_of_retrying_or_wrapping() {
+        let failure = HostRuntimeError::Encoder(EncoderError::ConfigVersionExhausted);
+        assert!(!super::encoder_error_is_recoverable(
+            &EncoderError::ConfigVersionExhausted
+        ));
+        assert_eq!(
+            super::recoverable_configuration::<()>(Err(failure)),
+            Err(HostRuntimeError::Encoder(
+                EncoderError::ConfigVersionExhausted
+            ))
+        );
+        assert_eq!(
+            super::recoverable_configuration::<()>(Err(HostRuntimeError::Encoder(
+                EncoderError::Native("transient".into())
+            ))),
+            Ok(None)
+        );
+    }
+
+    #[test]
     fn invalidity_renewal_rotates_epoch_and_blocked_releases_keep_old_mapping_gated() {
         let mut fixture = EpochFixture::new();
-        let context = fixture.wire_context(1);
+        let context = fixture.wire_context();
         assert!(fixture.inject(context, 1, key_event(true)));
         fixture.block_releases.store(true, Ordering::Release);
         let current = fixture.coordinator().current().unwrap();
         let next = current.select(19).unwrap().unwrap();
         assert!(!fixture.coordinator().suspend());
-        assert!(!fixture.coordinator().publish(next).unwrap());
+        assert!(!fixture.publish_prepared(next).unwrap());
         assert_eq!(
             fixture.selected.lock().unwrap().input_context(),
             Some(context)
@@ -4562,11 +4770,10 @@ mod retry_policy_tests {
         // still advances even though active ID and all geometry are unchanged.
         assert!(
             fixture
-                .coordinator()
-                .publish(current.renewed().unwrap())
+                .publish_prepared(current.renewed().unwrap())
                 .unwrap()
         );
-        let restored = fixture.wire_context(2);
+        let restored = fixture.wire_context();
         assert_ne!(restored, context);
         assert_eq!(fixture.selected.lock().unwrap().display_id, 7);
         assert!(!fixture.inject(context, 1_000, key_event(false)));
@@ -4667,16 +4874,16 @@ mod retry_policy_tests {
         let old_process = super::InputEpochAllocator::from_seed(9_007_199_254_740_993).unwrap();
         let new_process = super::InputEpochAllocator::from_seed(18_014_398_509_481_987).unwrap();
         let mut old = EpochFixture::with_epochs(&old_process);
-        let old_context = old.wire_context(1);
+        let old_context = old.wire_context();
         assert_eq!(old_context.input_epoch, 9_007_199_254_740_993);
         let mut restarted = EpochFixture::with_epochs(&new_process);
-        let new_context = restarted.wire_context(1);
+        let new_context = restarted.wire_context();
         assert_eq!(new_context.input_epoch, 18_014_398_509_481_987);
         assert_eq!(old_context.stream_id, new_context.stream_id);
         assert!(!restarted.inject(old_context, 100, key_event(true)));
         assert!(restarted.inject(new_context, 1, key_event(true)));
         let mut new_attempt = EpochFixture::with_epochs(&new_process);
-        let next_context = new_attempt.wire_context(1);
+        let next_context = new_attempt.wire_context();
         assert_eq!(next_context.input_epoch, new_context.input_epoch + 1);
         assert!(!new_attempt.inject(old_context, 100, key_event(true)));
         assert!(!new_attempt.inject(new_context, 101, key_event(false)));
@@ -4686,12 +4893,13 @@ mod retry_policy_tests {
     #[test]
     fn buffered_old_encoder_output_cannot_be_relabelled_with_new_geometry_epoch() {
         let mut fixture = EpochFixture::new();
-        let old_context = fixture.wire_context(1);
+        let old_context = fixture.wire_context();
+        let old_version = fixture.encoder_version();
         let mut bindings = super::FrameInputContexts::default();
         assert!(bindings.record_submission(
             crate::encoder::EncoderPerformanceSample {
                 frame_id: 41,
-                config_version: 1,
+                config_version: old_version,
                 ..Default::default()
             },
             old_context
@@ -4705,21 +4913,29 @@ mod retry_policy_tests {
             .unwrap()
             .unwrap();
         assert!(fixture.coordinator().suspend());
-        assert!(fixture.coordinator().publish(next).unwrap());
+        assert!(fixture.publish_prepared(next).unwrap());
+        let new_version = fixture.encoder_version();
+        assert!(new_version > old_version);
         let captured_new_context = fixture.selected.lock().unwrap().input_context().unwrap();
         assert!(bindings.record_submission(
             crate::encoder::EncoderPerformanceSample {
                 frame_id: 42,
-                config_version: 2,
+                config_version: new_version,
                 ..Default::default()
             },
             captured_new_context
         ));
-        assert_eq!(bindings.take_output(&test_encoded_frame(41, 1, true)), None);
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(41, old_version, true)),
+            None
+        );
         // Even a buggy old output with a current config number cannot inherit
         // the new sample's identity just because encode() returned it now.
-        assert_eq!(bindings.take_output(&test_encoded_frame(41, 2, true)), None);
-        let output = test_encoded_frame(42, 2, true);
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(41, new_version, true)),
+            None
+        );
+        let output = test_encoded_frame(42, new_version, true);
         let encoded_context = bindings.take_output(&output).unwrap();
         let super::PrepareVideo::Ready(prepared) = fixture
             .pipeline
@@ -4729,6 +4945,7 @@ mod retry_policy_tests {
             panic!("new frame must produce configuration");
         };
         let configuration = decode_video_config(prepared.video_config.as_deref().unwrap()).unwrap();
+        assert_eq!(configuration.config_version, new_version);
         let actual_wire_context = InputContext {
             stream_id: configuration.stream_id,
             input_epoch: configuration.input_epoch,
@@ -4737,13 +4954,16 @@ mod retry_policy_tests {
         assert_ne!(actual_wire_context, old_context);
         assert!(!fixture.inject(old_context, 100, key_event(true)));
         assert!(fixture.inject(actual_wire_context, 1, key_event(true)));
-        assert_eq!(bindings.take_output(&test_encoded_frame(42, 2, true)), None);
+        assert_eq!(
+            bindings.take_output(&test_encoded_frame(42, new_version, true)),
+            None
+        );
     }
 
     #[test]
     fn buffered_outputs_keep_submission_identity_and_context_storage_is_bounded() {
         let mut fixture = EpochFixture::new();
-        let context = fixture.wire_context(1);
+        let context = fixture.wire_context();
         let mut bindings = super::FrameInputContexts::default();
         for frame_id in [41, 42] {
             assert!(bindings.record_submission(
@@ -4800,7 +5020,7 @@ mod retry_policy_tests {
     #[test]
     fn input_exit_releases_pressed_state_while_capture_retains_its_injector_arc() {
         let mut fixture = EpochFixture::new();
-        let context = fixture.wire_context(1);
+        let context = fixture.wire_context();
         assert!(fixture.inject(context, 1, key_event(true)));
         let capture_input = fixture.input.clone();
         let exit = super::HostInputExitGuard {
@@ -4818,7 +5038,10 @@ mod retry_policy_tests {
         assert!(
             !fixture
                 .coordinator()
-                .publish(fixture.coordinator().current().unwrap().renewed().unwrap())
+                .publish(
+                    fixture.coordinator().current().unwrap().renewed().unwrap(),
+                    fixture.encoder_version()
+                )
                 .unwrap()
         );
         assert!(fixture.suspended.load(Ordering::Acquire));
@@ -4844,7 +5067,7 @@ mod retry_policy_tests {
             }
         }
         let mut fixture = EpochFixture::new();
-        let context = fixture.wire_context(1);
+        let context = fixture.wire_context();
         let selected = fixture.selected.clone();
         let desktop = selected.lock().unwrap().desktop;
         let (entered, wait_entered) = std::sync::mpsc::sync_channel(0);

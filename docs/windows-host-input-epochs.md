@@ -19,3 +19,7 @@ python scripts/run-windows-cargo.py clippy -p desklink-windows --lib --tests --l
 ```
 
 仍需各控制端首帧实际呈现后放行的完整跨组回归、FFI被控Mac配置接线，以及真实热插拔、旋转、DPI、睡眠和双机验收；本Host切片不能单独当作当前整包可交付证据。
+
+每个输入epoch的发布还绑定实际编码器配置版本。Coordinator仅接受 `publish(snapshot, encoder.config_version())`；同一活动上下文几何/有效性边界必须使用大于epoch出生版本的真实配置版本，随后发布配置及IDR。纯编码调整可以推进config_version而不推进epoch。HostPipeline拒绝版本倒退、同版本换epoch/尺寸；ControllerRuntime本来已拒绝同stream+同configVersion但配置字段改变，此约束保留，没有绕过它使旧帧误激活。u32版本耗尽明确退出当前peer，新stream再建上下文，不wrap复用。
+
+同尺寸/同SPS选屏、虚拟原点变化回归使用实际SoftwareOnly H264Encoder重配/getter取得版本，配置由实际HostPipeline编码/解码取token；不通过给fixture填常量把不一致掩盖成通过。

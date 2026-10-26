@@ -217,6 +217,9 @@
 
 - [x] **配置版本边界（`fix(DL2-013): prevent encoder configuration version reuse`）：** 编码器三个配置推进点均在替换后端/设置前checked预留非零后继，u32耗尽返回ConfigVersionExhausted，不wrap或重置1；提供实际config_version读取供Host原子配对校验。encoder 20项通过，边界失败后COM后端/设置/帧计数/pending引用不变，lib严格Clippy通过。
 
+- [x] **真实配置配对（`fix(DL2-013): pair input epoch publication with actual encoder versions`）：** Coordinator所有发布显式读取encoder.config_version；几何/有效性边界在分配epoch前验证真实新版本大于epoch出生版本，metadata保持anchor。HostPipeline拒绝倒退/同版本换epoch或尺寸，正确新版本仍需IDR。保留ControllerRuntime原有相同身份字段变更拒绝，不冒称已复现旧帧误激活。配置u32耗尽在各捕获重配入口退出peer，不做无穷重试/复用1。
+- **验证：** 174库通过/2忽略+11契约通过，lib+tests严格Clippy通过；同尺寸/同SPS选屏与虚拟原点、旧MFT输出回归均从实际SoftwareOnly编码器重配/getter取得版本并由真实pipeline发布token，非修改常量fixture求绿。
+
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 
 - [ ] 区分监听终态并使禁用原因可观测。

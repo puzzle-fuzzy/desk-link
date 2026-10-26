@@ -98,21 +98,36 @@ fn input_authorization_epoch_requires_an_idr_but_codec_reconfiguration_preserves
     };
     let quality = decode_video_config(quality.video_config.as_deref().unwrap()).unwrap();
     assert_eq!(quality.input_epoch, first.input_epoch);
+    for keyframe in [false, true] {
+        assert_eq!(
+            pipeline.prepare(encoded(4, 2, keyframe), 1280, 720, 42),
+            Err(HostRuntimeError::InconsistentVideoConfig)
+        );
+    }
     assert_eq!(
         pipeline
-            .prepare(encoded(4, 2, false), 1280, 720, 42)
+            .prepare(encoded(5, 3, false), 1280, 720, 42)
             .unwrap(),
         PrepareVideo::NeedKeyframe
     );
     let PrepareVideo::Ready(changed) = pipeline
-        .prepare(encoded(5, 2, true), 1280, 720, 42)
+        .prepare(encoded(6, 3, true), 1280, 720, 42)
         .unwrap()
     else {
         panic!("changed input authorization requires an IDR and configuration");
     };
     let changed = decode_video_config(changed.video_config.as_deref().unwrap()).unwrap();
     assert_eq!(changed.input_epoch, 42);
-    assert_eq!(changed.config_version, quality.config_version);
+    assert!(changed.config_version > quality.config_version);
+    assert_eq!(changed.sequence_header, quality.sequence_header);
+    assert_eq!(
+        (changed.width, changed.height),
+        (quality.width, quality.height)
+    );
+    assert_eq!(
+        pipeline.prepare(encoded(7, 2, true), 1280, 720, 41),
+        Err(HostRuntimeError::InconsistentVideoConfig)
+    );
 }
 
 #[test]
