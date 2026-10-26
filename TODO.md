@@ -5,6 +5,7 @@
 > 本阶段目标：补齐远控工作流、消除真实缺陷、重整模块职责，并以可重复测量推进低延迟、低资源占用和稳定吞吐。允许调整协议、ABI、模块边界及实现，不以开发成本或现有部署兼容性限制方案。
 > 用户已确认 Windows → Windows、macOS → Windows 可以正常连接并良好控制，这两条路径是已成立的产品基础。本文件不把旧文档中“尚未验收”的历史表述当作当前不可用证据。
 > 本清单已进入并行实施阶段。各项按下述会话分工推进，完成一个问题并通过对应验证后立即独立 commit，同时更新该项完成标记。第一阶段记录保留在文末，不能用其旧日期、版本或勾选状态代替本阶段验收。
+> 2026-10-26 复核：草稿引用的 30 处 file:line 证据已逐条读源码重验，全部成立；另经两个独立专项审查（服务端、共享 crates）新增 DL2-044～061 共 18 项经源码逐条抽查确认的问题，其中 DL2-052 判定为 P0。所有新条目证据均已在主 checkout 上以源码核实。
 
 ## 1. 如何使用这份清单
 
@@ -15,18 +16,18 @@
 - **能力缺口**：代码明确没有接通或存在硬性限制；属于需要补齐的功能，不代表基础远控不可用。
 - **性能结构**：源码证明存在复制、分配、锁等待或调度开销；收益幅度、当前 CPU 占用及用户感知延迟必须实测。
 
-优先级：**P1** 为影响输入、恢复、控制权或核心性能的优先工作；**P2** 为完整体验、持续性能及工程收口；**P3** 为扩展角色。未发现足以在本次证据范围内直接判定为 P0 的事项。
+优先级：**P0** 为公网可达、利用成本低且影响全部会话的缺陷（当前仅 DL2-052，2026-10-26 复核新增）；**P1** 为影响输入、恢复、控制权、机密性或核心性能的优先工作；**P2** 为完整体验、持续性能及工程收口；**P3** 为扩展角色。首轮审查未判定 P0。
 
 每项关闭时必须补充修复提交、相关测试与真实设备结果。涉及硬件、权限、网络、音频和安装的条目，单元测试或构建通过只关闭对应自动验证部分。实测目标是未来验收标准，不是当前产品测量结果。
 
 | 工作面 | 任务 | 主要结果 |
 | --- | --- | --- |
-| 核心正确性、输入与恢复 | DL2-001～013 | 输入完整、取消有界、重连不中断、主机可立即收回控制 |
-| 性能与数据通道 | DL2-014～024 | 可测量的媒体链路、减少复制、隔离慢路径、低延迟调度 |
-| 功能完备与用户流程 | DL2-025～035 | Mac 功能接通、设备可辨识、文件与账号操作闭环 |
-| 服务端与长期运行 | DL2-036～039 | 并发注册正确、健康状态可信、存储与邮件可持续运行 |
+| 核心正确性、输入与恢复 | DL2-001～013、044～048 | 输入完整、取消有界、重连不中断、主机可立即收回控制、会话密钥双方贡献 |
+| 性能与数据通道 | DL2-014～024、049～050 | 可测量的媒体链路、减少复制、隔离慢路径、低延迟调度、传输栈收口 |
+| 功能完备与用户流程 | DL2-025～035、051 | Mac 功能接通、设备可辨识、文件与账号操作闭环 |
+| 服务端与长期运行 | DL2-036～039、052～058 | 并发注册正确、健康状态可信、存储与邮件可持续运行、公网资源上界与停机语义 |
 | 代码整理与验证 | DL2-040～042 | 统一契约、拆解职责、自动验证覆盖真实边界 |
-| 扩展角色 | DL2-043 | 被控 Mac 的能力协商与编码配置一致 |
+| 扩展角色 | DL2-043、059～061 | 被控 Mac 的能力协商、事件契约、输入新鲜度与直连超时一致 |
 
 ### 并行分工与提交规则（2026-10-26）
 
@@ -46,6 +47,8 @@
 - 先做现有接口内的修复；DL2-004/011 涉及 transport，DL2-009 涉及 Windows runtime，DL2-024/025/030 涉及协议/ABI，变更前检查其他分支已提交的相关修改。先完成接口边界，再开展依赖功能；不并行实施相互替代的协议方案。
 - 各会话只维护自己编号的 TODO 条目及必要证据，不改其他任务状态。DL2-040 不提前跨组重写，集成时逐问题保留提交；不把仅在分支完成当成已经合入 main。
 - 仅处理本地代码、测试及提交；线上部署、发布和真实远控/输入注入不作为本次安排的自动动作。
+
+**复核新增条目的分工建议（2026-10-26）：** DL2-044～046 归 Windows 媒体与文件；047 归 Windows 产品与交互；048 涉及 Noise 握手协议，须与 DL2-024/025 的协议变更统筹后由单一会话实施；049、052～053 归中继与直连；050 归 Windows 媒体与文件（desklink-video）；051、059～061 归 Apple 与 FFI；054～058 归账号与诊断服务。其中 DL2-052 为 P0 配置级加固，任一会话可立即优先处理，不与客户端分支冲突。
 
 ## 2. 本次验证基线
 
@@ -68,6 +71,8 @@
 2. 同一个内存账号库并发提交两次相同邮箱注册，返回 **202 与 500**，后者为 `users.email` 唯一键冲突。见 DL2-036。
 3. 关闭账号数据库后调用同一 app 的 `/ready`，仍返回 **200 / ready**。见 DL2-037。
 4. 在真实 `DiagnosticStore` 的内存库执行保留期删除的 `EXPLAIN QUERY PLAN`，得到 **SCAN events**。见 DL2-039。
+
+2026-10-26 复核补充：重跑 Windows 前端 `bun test` 为 246 通过、0 失败；草稿引用的 30 处 file:line 证据逐条读源码重验，全部成立（DL2-008 的 stop 位置为 `apps/windows-ui/src-tauri/src/host.rs:502`，DL2-010 的 Idle 分支实际含首帧 10 秒 deadline 检查，DL2-017 的常量在 14-15 行）。新增 DL2-044～061 的证据均经源码逐条抽查核实；服务端与共享 crate 条目由独立专项审查发现，关键项（relay 流控、握手密钥、时序枚举、HostBridge 默认分支、AccountClient 恢复路径、smartPasteBusy、光标致命错误、direct accept 折叠）另由主会话二次确认。
 
 本次没有运行 Swift/Xcode、双机远控、GPU/CPU 性能采样、长稳、真实 UAC/锁屏或公网故障注入。CodeGraph 用于定位符号、依赖与影响范围，结论均再以源码确认。三个专项审查覆盖 Windows 产品流程、原生媒体/传输、Apple/FFI；重连错误与加密锁问题另作交叉复核。
 
@@ -100,7 +105,7 @@
 ### DL2-004 · P1 · 已连接发送背压时仍能及时取消和退出
 
 - [ ] 为发送、关闭及 FFI teardown 建立可取消、有截止时间的异步生命周期。
-- **证据 / 类型：源码缺陷。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:33,299-305` 在 MainActor 同步 reject；`crates/desklink-ffi/src/lib.rs:620-622,1099-1100` 最终调用 `crates/desklink-ffi/src/worker.rs:223-227` 的 thread.join。`crates/desklink-ffi/src/worker.rs:449-502` 外层 select 有取消，但分支内 send_input / request_keyframe 的 await 没有同等取消保护；`crates/desklink-transport/src/quic.rs:963-1002` 写流仍可能等待。
+- **证据 / 类型：源码缺陷。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:33,299-305` 在 MainActor 同步 reject；`crates/desklink-ffi/src/lib.rs:620-622,1099-1100` 最终调用 `crates/desklink-ffi/src/worker.rs:223-227` 的 thread.join。`crates/desklink-ffi/src/worker.rs:449-502` 外层 select 有取消，但分支内 send_input / request_keyframe 的 await 没有同等取消保护；`crates/desklink-transport/src/quic.rs:963-1002` 写流仍可能等待。复核补充：`crates/desklink-ffi/src/lib.rs:1656-1671` 在回调线程内调用 host destroy 时，detached 线程只 join 事件线程、从不清除回调（`handle.callback.clear()` 仅在非回调线程路径执行），destroy 返回后残余事件仍可能以悬空 context 回调 C 侧，对调用方构成 use-after-free 式回调。
 - **用户影响：** 对端停止读取或可靠流背压时，断开、退出或场景切换可能阻塞 Apple 主线程。
 - **方案：** 发送本身参与 cancellation/deadline；关闭 transport 唤醒等待者；将阻塞 join 移出 UI 线程，以停止完成事件管理 callback context 的释放，避免为了快速返回制造回调悬空。
 - **验收：** 本地 peer 建连后停止读流、队列满时取消，UI 仍响应；建议关闭完成预算 ≤2 秒，超时有明确清理结果；随后能重新连接。连接阶段超时用例不能替代此项。
@@ -147,7 +152,7 @@
 ### DL2-010 · P1 · 静态桌面也能响应后续关键帧请求
 
 - [ ] 为恢复请求增加复用最近有效帧或强制快照的产帧路径。
-- **证据 / 类型：源码缺陷，已交叉复核。** `apps/windows/src/runtime.rs:1965-1990` 遇到 CaptureOutcome::Idle 直接 continue，`2033-2037` 才处理 force_keyframe；`2537-2542` 请求只设标志。`apps/windows/src/capture.rs:491-499` 的 GDI 兜底只保证首次快照。
+- **证据 / 类型：源码缺陷，已交叉复核。** `apps/windows/src/runtime.rs:1965-1990` 遇到 CaptureOutcome::Idle 在首帧 10 秒 deadline 检查后 continue（已产出过帧的静态桌面直接跳过），`2033-2037` 才处理 force_keyframe；`2537-2542` 请求只设标志。`apps/windows/src/capture.rs:491-499` 的 GDI 兜底只保证首次快照。
 - **触发条件：** DXGI 已产生首帧后桌面完全静止，控制端因解码器重建或丢失关键帧要求恢复。周期 GDI 不受同一问题影响；relay 已有可靠关键帧发送，但不能替主机生成新帧。
 - **方案：** 请求独立唤醒媒体生产者；以配置版本绑定最近合法帧，限频重编码或强制捕获；不把静态桌面改为常态高频全屏轮询。
 - **验收：** 静态桌面主动重置解码器/丢弃 DirectLan 关键帧后，无需移动鼠标或窗口即可恢复；建议请求至显示 ≤1 秒；覆盖与 DL2-002 的组合场景。
@@ -156,9 +161,9 @@
 
 - [ ] 将探测网络等待移出共享加密锁的临界区。
 - **证据 / 类型：源码缺陷、性能结构，已交叉复核。** `apps/windows/src/runtime.rs:2652-2661` 出站探测持 secure guard 等待 endpoint.connect；`1575-1588` 的各通道 seal/open 共用此锁。`crates/desklink-transport/src/direct_probe.rs:393-431` 内有连接、开流及响应等 await。
-- **边界：** 已有并发槽位和逐阶段 3 秒超时，问题不是无限死锁。入站 `apps/windows/src/runtime.rs:2741-2751` 也持锁，但外层 select 可在输入/控制就绪时取消该 future；不能写成入站必然阻塞输入 3 秒。
+- **边界：** 已有并发槽位和逐阶段 3 秒超时，问题不是无限死锁。入站 `apps/windows/src/runtime.rs:2741-2751` 也持锁，但外层 select 可在输入/控制就绪时取消该 future；不能写成入站必然阻塞输入 3 秒。复核补充：FFI 控制端存在同类模式——`crates/desklink-ffi/src/controller.rs:803-814` 入站探测持 secure 锁跨 `accept_probe_connection` 的多个 3 秒阶段（最坏约 9 秒），期间 `send_input` 的 seal（`controller.rs:311-318`）与控制消息加密全部排队。
 - **方案：** 短锁生成/验证探测消息，网络 I/O 在锁外执行；必要时派生专用探测上下文，仍绑定已认证会话；停止时取消任务并释放连接。
-- **验收：** relay 正常而候选黑洞、慢响应、半包时，测锁持有时间、输入及画面 p95/p99；不能出现由探测锁造成的秒级停顿，探测失败正常回退。
+- **验收：** relay 正常而候选黑洞、慢响应、半包时，测锁持有时间、输入及画面 p95/p99；不能出现由探测锁造成的秒级停顿，探测失败正常回退。Windows 原生与 FFI 两条路径分别覆盖。
 
 ### DL2-012 · P1 · 编码器重配与显示切换不能阻塞输入消费
 
@@ -175,6 +180,45 @@
 - **用户影响：** 扩展屏热插拔、主屏变化后，新屏不可选，序号变更还可能选择到不同输出。
 - **方案：** 监听/检测拓扑变化，用稳定输出身份而非临时索引；活动屏移除时明确回退；旧拓扑下的输入不落入新输出。
 - **验收：** 插拔、旋转、主屏切换、100%～200% DPI、负坐标屏幕和睡眠恢复，列表、画面、坐标同步且错误选择可解释。
+
+### DL2-044 · P1 · 光标数据报一次发送失败即终止已认证会话
+
+- [ ] 将光标通道发送失败降级为容忍丢弃并计数，与音频、视频的既有策略对齐。
+- **证据 / 类型：源码缺陷。** `apps/windows/src/runtime.rs:3287-3292` 光标循环对 `send_cursor_datagram_for_generation(...).await?` 直接传播错误。对照：音频对 `TransportError::Datagram` 容忍丢弃（`runtime.rs:2435` 附近），视频容忍至 3 次连续失败（`runtime.rs:2233-2250`），唯独光标一次失败即致命。
+- **触发条件：** quinn `send_datagram` 在队列满时立即返回 QueueFull，经 `crates/desklink-transport/src/quic.rs:1157-1161` 归为 `TransportError::Datagram`；16ms 周期的光标包遇到一次拥塞即可终止整个已认证 Host 会话。
+- **方案：** 光标是纯时效性数据，按音频相同的丢弃策略处理并记录诊断计数，连续失败达到阈值才进入既有恢复路径。
+- **验收：** 注入 datagram 队列满后会话不中断、画面与输入继续；诊断可见丢弃计数；真实拥塞下光标最多延迟到下一包更新。
+
+### DL2-045 · P1 · DirectLan 入站 accept 瞬时错误永久禁用直连且无降级信号
+
+- [ ] 区分 accept 瞬时错误与监听终态失效；禁用直连时暴露原因。
+- **证据 / 类型：源码缺陷。** `apps/windows/src/runtime.rs:2737` `endpoint.accept().await?` 把任何 accept 错误折叠为返回 None；主循环 `2533-2535` 收到 None 即 `direct_session = None`，此后该分支变为 `std::future::pending`（`2730-2732`），本会话视频永久走 relay，控制端与诊断均无降级信号。
+- **方案：** accept 错误分类：瞬时错误继续 loop 等待，监听对象失效才退出并清理；直连禁用写入既有路径诊断字段（与 `datagramSilence` 同类）。
+- **验收：** 注入一次 accept Err 后直连仍可建立；真实失效场景在诊断与连接状态中可见原因；不因重试风暴影响 relay 路径。
+
+### DL2-046 · P1 · 出站直连探测任务脱离会话生命周期且可覆盖活动直连
+
+- [ ] 探测任务纳入会话取消树；替换活动直连前按候选与路径状态仲裁。
+- **证据 / 类型：源码缺陷。** `apps/windows/src/runtime.rs:2650-2666` `tokio::spawn` 的 JoinHandle 未保存，会话关闭不 abort；任务持 `secure_for_probe` 锁跨越 `endpoint.connect` 的多个 await（叠加 DL2-011 的锁问题，会话结束后仍可占用加密锁）；成功后无条件 `*direct_connection_for_probe.lock().await = Some(...)`，可与 `2532` 行入站已接受的连接竞争，丢弃正在发送视频的旧连接并重置路由状态。
+- **用户影响：** 会话关闭后探测仍在后台运行；两条直连竞争时表现为瞬时黑屏或意外回退。
+- **方案：** JoinHandle 挂到会话取消令牌；切换活动连接前校验候选一致性与当前路径代数；旧连接排空后再释放。
+- **验收：** 会话关闭后探测任务全部退出、锁等待归零；入站直连已激活时出站探测结果不抢占；与 DL2-011 联合验证锁持有时间。
+
+### DL2-047 · P1 · 智能粘贴 busy 状态在成功路径不复位，远端键盘被静默吞掉
+
+- [ ] 为 smartPasteBusy 提供与完成信号解耦的复位保证。
+- **证据 / 类型：源码缺陷。** `apps/windows-ui/src/controller.ts:3452-3468` 仅 catch 分支复位 busy；成功路径依赖 `clipboard` 完成信号（`1637-1638`），而该信号经 `1263-1276` 的 `generation === channelGeneration` 守卫——粘贴 invoke 成功后若通道代数推进（取消、重连），旧信号被丢弃且新连接不再触发 `1506` 行的复位；此后 `3355-3357` 的 `if (smartPasteBusy) { event.preventDefault(); return; }` 静默吞掉全部远端 keydown，直到下次断连。
+- **用户影响：** 一次粘贴叠加代数切换后远端键盘"失灵"，界面无任何提示。
+- **方案：** try/finally 复位加有界超时兜底；代数切换时主动清 busy；粘贴状态与发起时的通道代数绑定。
+- **验收：** 粘贴进行中取消/重连后键盘立即可用；completed/failed 正常复位；不产生重复粘贴。
+
+### DL2-048 · P1 · 会话密钥由发起方单方选定且未纳入握手签名
+
+- [ ] 会话密钥改为双方贡献派生，并把密钥材料纳入签名 transcript。
+- **证据 / 类型：源码缺陷（加密设计）。** `crates/desklink-crypto/src/noise.rs:288-302` responder 将 initiator 载荷尾部的 32 字节原样作为 session_key，不做任何校验；`708-721` 的 Ed25519 签名只覆盖 `encode_auth_payload`（device_id、verify_key、transcript），不含 key 字节。
+- **影响：** 会话密钥的机密性完全取决于发起方（控制端）的随机数质量与善意：被篡改或恶意的控制端可以把密钥固定为与第三方共享的值，而 `PacketCipher::new`（`noise.rs:461-477`）用 `BLAKE2s(domain‖key‖dir‖lane)` 确定性派生全部 lane 密钥，路径上的窃听者一旦得知该值即可被动解密主机发出的视频、音频与输入密文——把机密性从"连接双方"扩大到"任何拿到该值的人"。退化取值（如全零）也不会被拒绝。
+- **方案：** 双方各贡献随机数，经 HKDF(Noise handshake secret, c1‖c2) 派生会话密钥，任一方都无法单方决定；至少应将 key 字节纳入签名并拒绝退化取值。随本阶段协议版本一并升级，与 DL2-024/025 的协议变更统筹。
+- **验收：** 任一方无法单方决定会话密钥；篡改密钥材料导致握手失败；新增恶意发起方/密钥固定用例的回归测试与协议兼容矩阵。
 
 ## 4. 性能与数据通道
 
@@ -205,7 +249,7 @@
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
 - [ ] 用 AudioWorklet 或经测量更合适的原生播放路径，替代逐包节点创建。
-- **证据 / 类型：性能结构。** `apps/windows-ui/src/remote-audio.ts:42,115-126` 每包建立 Float32Array、AudioBuffer、AudioBufferSourceNode 并复制；480 样本 / 48kHz 对应约每秒 100 个包时，节点创建也达到同等频率。`14-16` 已有 40ms 提前量和 250ms 调度上限，不能称为无界队列。
+- **证据 / 类型：性能结构。** `apps/windows-ui/src/remote-audio.ts:42,115-126` 每包建立 Float32Array、AudioBuffer、AudioBufferSourceNode 并复制；480 样本 / 48kHz 对应约每秒 100 个包时，节点创建也达到同等频率。`14-15` 已有 40ms 提前量和 250ms 调度上限，不能称为无界队列。
 - **方案：** 有界环形缓冲、复用内存、抖动/欠载指标和可调目标缓冲；按真实 AudioContext 状态反馈静音、恢复与播放失败。[AudioWorklet](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet)可在独立音频线程处理数据。
 - **验收：** UI 主线程忙时仍保持音频连续且不过期堆积；比较分配率、长任务、欠载及实测音频延迟，保留明确缓冲上限，不预先承诺改善百分比。
 
@@ -260,6 +304,20 @@
 - **证据 / 类型：架构能力限制。** `crates/desklink-transport/src/video_egress.rs:5-8` 明确只优化视频；`apps/windows/src/runtime.rs:2424-2428` 音频仍通过 relay QuicClient；可靠通道位于 `crates/desklink-transport/src/quic.rs:925-930`。因此同网视频直连不代表键鼠/文件也在 LAN 内传输。
 - **方案：** 同一已认证路径承载独立优先级的输入、控制、音频和文件，并支持逐通道切换、回退和去重；完善局域网发现/本地配对与 relay 不可达时的行为。公网打洞作为独立实验，不把“换 WebRTC”本身当性能结论。
 - **验收：** 同网输入延迟符合实际 LAN 路径；断开公网后按定义保持本地连接；切换不重放按键、不串会话、不中断授权。公网方案另测不同 NAT/IPv6/UDP 限制与回退时间。
+
+### DL2-049 · P3 · QuicClient 恒定绑定 IPv4，IPv6 relay 无法连接
+
+- [ ] 按 relay 地址族选择本地 bind 地址。
+- **证据 / 类型：能力缺口。** `crates/desklink-transport/src/quic.rs:293-296` 恒定 `Endpoint::client("0.0.0.0:0")`；relay 地址为 IPv6（自建中继的高级设置场景）时 connect 直接失败。direct 路径的 `DirectLanSession::bind` 已按地址族选择，客户端路径未跟上。
+- **方案：** IPv6 relay 使用 `[::]:0`（dual-stack）bind；配置校验同步提示不支持的形态。
+- **验收：** v4/v6 relay 下的连接、目录查询与媒体回环测试。
+
+### DL2-050 · P3 · FrameAssembler 重复分片先覆盖后判重
+
+- [ ] 重复分片保留首次内容并丢弃后续。
+- **证据 / 类型：源码缺陷。** `crates/desklink-video/src/packet.rs:182-188` `chunks.insert(...)` 先替换旧值再返回 DuplicateChunk——同 frame_id 重传分片与原始分片不一致时，组帧取到的是后一份，掩盖上游不一致。
+- **方案：** 改为 entry 语义：分片已存在即丢弃新包；可选记录不一致计数供诊断。
+- **验收：** 不同 payload 的重传分片被丢弃且计数；正常乱序补片组帧行为不变。
 
 ## 5. 功能完备与用户流程
 
@@ -344,6 +402,13 @@
 - **方案：** 请求捕获不可变的动作/邮箱/代数；切换使旧结果失效，必要时取消底层请求；原生持久化和重启 Host 前同样复核操作所有权。对已完成但用户已离开的登录明确处理本机会话，不直接使用会清空远控记录的 account_logout 作为补偿；不要求用户留在等待页，也不重复订阅 workspace。
 - **验收：** 可控 Promise 覆盖注册中切找回、登录中进入本机模式、连续重试；旧结果不能覆盖新选择或重启后台共享。
 
+### DL2-051 · P2 · Mac 账号 restore 遇瞬时网络故障即删除钥匙串会话
+
+- [ ] 区分令牌失效与网络/服务不可达，只有前者清除本地会话。
+- **证据 / 类型：源码缺陷。** `apps/apple/Sources/DeskLinkAppleCore/AccountClient.swift:127-132` restore 中 me 请求失败后尝试 refresh，refresh 再失败落入外层 catch 执行 `clearLocalSession()`（删除 Keychain token 并置 signedOut）。启动时无网或账号服务瞬时不可达即被永久登出。Windows 侧 `apps/windows-ui/src-tauri/src/account.rs:80-127` 失败仅返回 Err 并保留存储会话，两端行为不一致。
+- **方案：** 网络类错误保留会话进入"离线、稍后重试"；仅明确的令牌无效/被撤销才清除；与 DL2-035 的迟到响应隔离一起设计。
+- **验收：** 断网启动、服务 5xx、refresh token 过期三种场景行为各自正确；恢复网络后自动或一键恢复登录。
+
 ## 6. 服务端与长期运行
 
 ### DL2-036 · P2 · 同邮箱并发注册保持幂等和稳定响应
@@ -374,6 +439,57 @@
 - **证据 / 类型：复现性能结构。** `server/diagnostics/src/store.ts:17-47` 的事件索引只有 correlation/installation；`103-111` 每次 insert 事务内按 received_at_unix_s 删除 events/batches。本次真实 schema 的 EXPLAIN 返回 SCAN events。
 - **方案：** 以 received_at 建索引，按时间/数量分批回收，独立低频维护；保留接收原子性和去重；监测 WAL、磁盘及清理耗时。SQLite 文件是否缩小需实际维护策略，删除行不等于空间立刻归还 OS。
 - **验收：** 用真实规模合成历史记录验证 query plan、接收 p95、清理锁时间和磁盘上界；14 天保留语义不变，不为性能丢失批次原子性。
+
+### DL2-052 · P0 · relay 未收紧 QUIC 单向流与流控窗口，少量未认证连接即可 OOM
+
+- [ ] 显式禁用未使用的 uni 流并收紧流控窗口，使对端可请求的缓冲上界与容器内存匹配。
+- **证据 / 类型：源码缺陷（公网可达）。** `server/relay/src/lib.rs:868-872` TransportConfig 只设置 keep_alive 与 max_idle_timeout；全仓无任何 `accept_uni()` 调用（业务只用 bidi 流与 datagram），而 quinn 默认值（已对照本机 quinn-proto 0.11.16：`max_concurrent_uni_streams=100`、`stream_receive_window≈1.25MB`、连接级 receive window 未收紧）会作为初始流控额度在握手时直接下发。
+- **影响：** 攻击者只需完成 QUIC 握手（无需通过 join 认证）并打开 uni 流写入数据，服务端将永久缓冲无人读取的内容；按默认窗口估算单连接可积累约 100MB 量级未读缓冲，而生产部署 `deploy/tencent-relay/compose.yml:35` 为 `mem_limit: 256m`、`:14` `DESKLINK_RELAY_MAX_CONNECTIONS: "512"`——少量连接即可 OOM-kill 公网 relay，影响全部会话。精确倍数在修复时以实测复核。
+- **方案：** `max_concurrent_uni_streams(0)`（协议不使用 uni 流，quinn 官方建议直接置零）；按可靠消息 64 KiB / datagram 1200 B 的实际上界收紧 stream 与 connection receive window；增加内存水位观测。
+- **验收：** 恶意客户端开满 uni 流灌数据时 relay 内存有界且连接被关闭；正常 bidi 业务不受影响；容器内实测峰值内存与配置有明确对应关系。
+
+### DL2-053 · P1 · relay join 与转发读取无应用层超时，静默连接长期占用 admission
+
+- [ ] 为 join 阶段与转发流读取增加空闲超时。
+- **证据 / 类型：源码缺陷。** `server/relay/src/lib.rs:970-973` `accept_bi().await` 与 `read_request` 无超时；`forward_reliable` 的 `read_exact`（`1176,1195`）同样无超时。传输层 keepalive 5s / idle 15s（`crates/desklink-transport/src/lib.rs:29-30`）会被客户端协议栈对 keepalive 的自动 ACK 重置——"已连接但应用层不发一字节"的连接永远不会被清理，`try_reserve_connection` 的 admission 名额（`lib.rs:928,949-955`）被无限期占用。第一阶段只给客户端加了 join 8 秒超时，服务端没有对应保护。
+- **方案：** join 的 accept_bi/read_request 包 8-10 秒超时；转发流读取空闲超时可放宽至 30-60 秒；超时释放名额并记录。
+- **验收：** 静默连接在超时后被清理、名额可用；慢速正常会话不被误伤；512 上限下的清理延迟有实测数据。
+
+### DL2-054 · P2 · diagnostics 限流可被自认证身份绕过，且限流发生在验签之后
+
+- [ ] 限流前移到读 body 之前并增加不可伪造维度；为存储增长设总量配额。
+- **证据 / 类型：源码缺陷。** `server/diagnostics/src/index.ts:62-64` 先执行 `arrayBuffer()`、blake2s、ed25519 验签与 JSON 解析，之后才按 `installation_id` 限流（12 次/60 秒，`index.ts:40`）；而 `installation_id` 由请求自带公钥哈希派生（`server/diagnostics/src/validation.ts:120-126`），签名校验只保证"签名与 ID 自洽"（`153-155`），没有准入名单——换一对密钥即获得全新身份，官方探针本身就每次生成新身份。nginx per-IP 30r/m（`server/diagnostics/deploy/nginx-location.conf:1`）是当前唯一有效约束，跨 IP 即失效。`SlidingWindowLimiter` 的清理（`index.ts:24-30`）在 size>10_000 时全表扫描。另外 `index.ts:67-68` 存库的 `remote_address` 在反代部署下恒为 127.0.0.1，取证字段失效。
+- **方案：** 读 body 前按受信代理头的真实 IP 限流；installation 维度增加事件/字节总量配额；限流键设上界与 O(1) 淘汰；remote_address 读取代理注入的真实 IP。
+- **验收：** 换密钥对洪泛不再无限写入 SQLite；单 IP 与全局配额生效；生产形态下 batches.remote_address 可用于溯源。
+
+### DL2-055 · P2 · account 限流 IP 取 XFF 最左值可伪造，限流桶无界增长
+
+- [ ] 改用不可伪造的 IP 来源，并给限流表设键数上界。
+- **证据 / 类型：源码缺陷。** `server/account/src/app.ts:163-165` 取 `x-forwarded-for` 的第一个元素——nginx `proxy_add_x_forwarded_for` 是追加语义，客户端自带的 XFF 排在最前、完全可控，`register 5/h、login 12/min、forgot-password 5/h` 等 IP 维度限流全部可绕过（结合 DL2-038 的同步投递可无限消耗外发邮件配额）。`server/account/src/domain/rate-limit.ts:8-27` 桶仅在"新建桶且 size≥256"时清理过期项，伪造随机 IP 可在窗口内造成 Map 无界增长。
+- **方案：** 仅信任代理覆盖的头（如 X-Real-IP）或 rightmost-untrusted 策略，按部署形态配置；限流表加最大键数与 LRU 淘汰。
+- **验收：** 自带 XFF 不再获得独立限流桶；伪造 IP 洪泛下内存有界；直连与反代两种部署限流均有效。
+
+### DL2-056 · P2 · account 登录、注册与找回存在时序型用户枚举
+
+- [ ] 统一各分支的计算成本与异步形状。
+- **证据 / 类型：源码缺陷。** `server/account/src/services/account-service.ts:72-75` `!user || ... || !(await verifyPassword(...))` 短路使"邮箱不存在"跳过 argon2id（几十至几百毫秒差异）；注册在 `36-38` 用户已存在时立即返回；找回在 `88-89` 用户不存在时立即返回，存在时却要等待最长 10 秒的邮件投递，差异更大。响应文案已统一，但远程计时可稳定区分邮箱注册状态。
+- **方案：** 邮箱不存在时对固定哑哈希执行一次 verify；找回统一走 outbox 异步路径（与 DL2-038 一并消除投递等待差异）。
+- **验收：** 大样本计时无法区分"不存在/存在密码错"分支；注册与找回接口同理；不泄露账号存在性。
+
+### DL2-057 · P2 · 三个服务无优雅关闭；outbox 启动 flush 是未处理拒绝
+
+- [ ] 增加信号处理与受控停机，修复未处理的 Promise 拒绝。
+- **证据 / 类型：源码缺陷。** `server/account/src/main.ts:19-21` 启动路径 `void app.flushOutbox()` 没有 `.catch`（紧邻的定时器路径有），SQLite 异常会成为未处理拒绝。三个 Bun 服务与 relay 均无 SIGTERM/SIGINT 处理：diagnostics/account 的 `store.close()` 永不被调用，relay 的 `RelayServer::close()`（`server/relay/src/lib.rs:910-913`）无任何调用方；`deploy/tencent-relay/compose.yml:46` `stop_grace_period: 10s` 之后直接 SIGKILL。
+- **影响：** 滚动重启时在途 SQLite 事务与 WAL 不落盘；relay 不发 QUIC CONNECTION_CLOSE，对端只能等自己的 15 秒 idle 超时——正是客户端 8 秒 join 超时要应对的黑洞窗口。
+- **方案：** Bun 侧 `server.stop(true)`、最终 flush 与 `store.close()`；relay 注册信号后调用 `relay.close()` 并等待在途任务收尾；文档化停机预算。
+- **验收：** SIGTERM 后新请求被拒、在途请求完成、数据库正常关闭；relay 主动关闭使对端立即进入重连而不是等超时。
+
+### DL2-058 · P3 · 已注销设备登记可被其他账号静默接管
+
+- [ ] 跨用户改绑需要额外验证或直接拒绝。
+- **证据 / 类型：源码缺陷（前提：deviceId 已泄露）。** `server/account/src/db/store.ts:170-177` 非 revoked 的他人设备返回 409，但 revoked（登出即标记，`server/account/src/services/session-service.ts:122`）的他人设备走 UPDATE 静默改绑并清空 revoked_at；随后原主人在本机登录反而命中 409，在其主动登出前无法使用。
+- **方案：** 设备行归属不可变，换号插入新行；或跨用户改绑要求邮箱确认；至少"revoked 且属他人"也返回 409 并引导重新注册设备。
+- **验收：** 持他人 deviceId 无法静默改绑；正常"退出后换账号"流程不受影响。
 
 ## 7. 代码整理与验证体系
 
@@ -411,13 +527,37 @@
 - **验收：** Main-only 控制端、High 支持端、编码器失败降级、切屏/分辨率变化分别验证；真实 Mac 系统权限、签名/公证和无人值守边界另记。此项不阻塞已经跑通的 Mac→Windows。
 - **iOS 关系：** AppleCore 共享修复需要回归 iOS；iOS 新功能和独立发布不自动进入本阶段关键路径。
 
+### DL2-059 · P2 · Mac Host 把未知事件当致命错误，Transfer 流量会拆掉主机会话
+
+- [ ] 未知事件 kind 显式忽略并计数，错误只能由显式 error 事件表达。
+- **证据 / 类型：源码缺陷（ABI 漂移的运行时后果）。** `apps/macos/Sources/DeskLinkApp/Bridge/HostBridge.swift:592` `hostCallbackKind` 的 `default: .error`；而 Rust 侧会发出两份手工头文件都没有的 kind：`crates/desklink-ffi/src/host_worker.rs:847` 收到控制器 Transfer 数据报时发出非终态 `HostEvent::Transfer`，`crates/desklink-ffi/src/lib.rs:416` 映射为 `DesklinkHostEventKind::Transfer`。HostBridge 把 error 转为 publishError（`332-333`），随后 `513-518` 置 `.failed` 并 stop()。
+- **用户影响：** Windows 控制端向 Mac 主机发送剪贴板/文件消息（SecureLane::Transfer）时，整个 macOS 主机会话被误判为错误并拆除。
+- **方案：** 依赖 DL2-025 的统一 ABI 契约：Swift 对未知 kind 记诊断并忽略；不得用 default 兜底成错误。
+- **验收：** 用超出当前头文件的 kind 注入事件，Mac 会话保持；Transfer 消息进入正常确认流程而不是 failed。
+
+### DL2-060 · P2 · FFI Host 输入新鲜度用本机墙钟，时钟偏差直接终态关闭
+
+- [ ] 建立会话级时钟偏移，或把超窗输入降级为丢弃并告警。
+- **证据 / 类型：源码缺陷。** `crates/desklink-ffi/src/host_worker.rs:840` 用 `decode_input(&plaintext, now_micros())` 做墙钟校验（5 秒 age / 1 秒 future skew），而 `crates/desklink-protocol/src/codec.rs:287-299` 专门提供了不做墙钟比较的 `decode_session_input`，注释明确说明两台机器的时钟不保证同步。控制端时间戳来自其自身 `now_micros()`（`crates/desklink-ffi/src/controller.rs:315`）。超窗时第一条输入即 `TimestampOutsideWindow` → `HostError::Protocol`，`is_retryable_host_error`（`host_worker.rs:517-519`）只放行 Transport 类错误，会话进入终态 Closed 且不重连。
+- **用户影响：** 控制端机器时钟偏差超出窗口（新装机、虚拟机、双系统切换后常见）时，连接成功但第一次键鼠操作就断线，且表现为不可重试的协议错误。
+- **方案：** 握手互换时间戳建立 per-session 偏移，用 `decode_session_input` 加偏移校验；或降级为丢弃单条输入并发可恢复告警。Windows 原生 host 侧一并核对是否存在同类用法。
+- **验收：** 人为偏移控制端时钟 ±10 分钟，会话保持且输入可用（或明确提示校时）；不出现终态协议错误。
+
+### DL2-061 · P3 · FFI 控制端直连静默超时被 relay 事件反复重置
+
+- [ ] 静默判定基于"上次 direct 数据报到达时间"，而不是每次轮询新建计时器。
+- **证据 / 类型：源码缺陷。** `crates/desklink-ffi/src/controller.rs:758-778` 每次进入 `next_transport_event` 都新建 5 秒 sleep；select 的 relay 分支返回任意事件（包括 host 持续经 relay 发送的光标数据报，`host_worker.rs:963-969`）后回到循环重建计时器——direct 路径被防火墙黑洞时（正是该超时要防的场景）静默判定可能永不触发，控制端停留在黑屏 direct 路径不回退。Windows 原生控制端的第一阶段实现按"5 秒静默回落并记录 datagramSilence"正确处理，本项仅涉及 FFI/Apple 路径。
+- **方案：** 记录 last_direct_datagram 时刻并在循环中比较 elapsed；relay 事件不重置该计时。
+- **验收：** 注入"direct 黑洞 + relay 光标持续到达"场景，5 秒内回退 relay；正常 direct 流量不误判。
+
 ## 9. 建议执行顺序与依赖
 
-1. **先固定合同和复现用例：** DL2-014、025、041 建立基线；并行修 001、003、034～037。补测试应直接针对上述可复现/可推导分支。
-2. **消除操作与恢复断点：** 002、004～013、027～029、032。优先证明正常控制不会因菜单、重试、输入法、静态桌面或取消而失效。
-3. **推进媒体性能：** 015/016 联合重构 Windows 捕获编码；018 优化 Apple 输入队列；017、019～022 分别优化音频、中继、文件和恢复。每项带同条件测量。
-4. **补齐完整工作流：** 026、030/031、033、038/039；再以 023/024 推进高分辨率/高帧率和完整直连能力。
-5. **同步收拢代码与文档：** 040 随纵向修复落地，042 随能力变化更新；043 作为扩展角色独立验收。
+1. **立即执行 P0 服务端加固：** DL2-052 是配置级修复，先于一切其他工作；DL2-053 紧随其后。两项均为服务端独立改动，不与客户端分支冲突。
+2. **先固定合同和复现用例：** DL2-014、025、041 建立基线；并行修 001、003、034～037、047、051、054～057。补测试应直接针对上述可复现/可推导分支。
+3. **消除操作与恢复断点：** 002、004～013、027～029、032、044～046、048。优先证明正常控制不会因菜单、重试、输入法、静态桌面、光标拥塞、直连竞争或取消而失效。
+4. **推进媒体性能：** 015/016 联合重构 Windows 捕获编码；018 优化 Apple 输入队列；017、019～022 分别优化音频、中继、文件和恢复。每项带同条件测量。
+5. **补齐完整工作流：** 026、030/031、033、038/039、049/050、058；再以 023/024 推进高分辨率/高帧率和完整直连能力。
+6. **同步收拢代码与文档：** 040 随纵向修复落地，042 随能力变化更新；043、059～061 作为扩展角色独立验收，其中 059、060 必须在开放 Windows → Mac 之前完成。
 
 不要求按模块全部修完后才集成。每个纵向切片交付一条真实用户路径，避免出现“后端 API 已有，但 UI/ABI 未接通”的新半成品。
 
