@@ -279,10 +279,13 @@
 - [x] **第二波owned GPU池与转色（`feat(DL2-015): add bounded owned GPU surfaces and NV12 processing`）：** GPU-only BGRA复制及VideoProcessor缩放/BT709 limited→NV12，普通路径无Map；Capture提供新CPU/GPU入口且保留旧CPU API。复制EVENT完成后才交付并ReleaseFrame；Clone共享lease，NV12独占lease供后续TrackedSample持有；超时/未完成fence隔离槽位。全进程64槽/512MiB逻辑图像字节预算跨pool换代计数，不能用丢旧pool逃逸预算。失败可对同一Acquire源完成CPU读回，新CPU帧清旧GPUcache；确认Idle后才允许缓存owned图像恢复IDR。
 - **验证：** 基于65c70fd归档加本切片4源码文件的独立快照（隔离并行016 WIP）原生GPU测试7通过：3个纯内存/状态用例+4个本机RTX4070TiSUPER合成纹理用例，覆盖source销毁、Clone占用/池满、709limited缩放色值、NV12跨pool存活、invalid/pending EVENT禁止复用、跨代64槽上限；独立快照完整lib 204通过/6忽略、lib/tests严格Clippy及定向格式检查通过。没有采集真实桌面、未推定MFT接受surface或实际编码成功。结构/命令/计量边界见docs/windows-gpu-media.md。
 - [x] **声明顺序格式跟进（`style(DL2-015): normalize GPU module declaration order`）：** 固定2d79f97补落盘日志时workspace fmt发现lib.rs仅gpu/identity声明排序差异，跟进只调整该顺序；原GPU7项、完整lib204项与Clippy均通过，原失败日志如实保留，不改GPU实现。
-- [ ] **后续仍待：** runtime GPU选路和D3D11-aware MFT surface输入见016后续切片；CPU输出buffer池、1080p/1440p集显/独显/混合GPU及真实DXGI/双机/驱动恢复矩阵与性能仍未完成。本切片不单独宣称生产GPU常驻或性能收益。
+- [ ] **后续完整验收仍待：** CPU输出buffer池、集显/独显/混合GPU及真实DXGI/双机/驱动恢复矩阵与性能；runtime GPU选路与MFT surface输入已在016完成项接通，单独owned池切片不作为生产整链或收益证明。
 
 - [x] **非热路径退役清理（`fix(DL2-015): trim retired GPU generations after safe ownership release`）：** Pool销毁先释放自身slots再按同一完成规则trim，捕获切软件时释放旧pool/cache，capture+encoder返回后worker再trim。只回收已无外部owner且EVENT完成的退役槽位；live lease、未完成/无效fence仍计全局预算。MF回调仍只原子归还lease，不做GPU查询/全局清理；late callback后的有界缓存可等后续trim，不冒称立即全部释放或把旧策略称泄漏。
 - **验证：** GPU模块8项（含本机合成live lease/incomplete query→End完成后的安全回收）及真实TrackedSample外部COM引用跨encoder/guard销毁仍占用的寿命回归通过，严格lib/tests Clippy通过。resident统计是逻辑槽/图像字节，不是实测VRAM。
+
+- [x] **可复跑GPU计量工具（`perf(DL2-015): add source-bound synthetic GPU stage probes`）：** 新gpu_media_probe及benchmark-windows-gpu.py，分capability/benchmark、显式adapter/input-path/experimental4k；CPU输入不假定软件backend。确定性desktop glyph-like/gradient/panels及滚动，tiles专用于两phase颜色/方向/UV参考；报告requested/actual尺寸/profile/bitrate、真实MFT/active状态、sample ID、pending未drain范围。区分GPU copy/VP输出、CPU读回、fixture上传/clone、texture/query/view创建；GPU时间/driver copy/heap分配未知为null。wrapper逐run及跨repeat绑定完整源码hash/HEAD/clean状态，fallback或不稳定源不作GPU比较依据。4项示例测试、严格example Clippy及Python编译通过。
+- [ ] **正式阶段矩阵：** 工具冻结后记录1080p/1440p/显式4K、desktop-motion、CPU/GPU输入路径各3×30样本；报告仅本机阶段数据，质量等效、真实桌面/多GPU/双机/长稳另验，不预先承诺收益。
 
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 

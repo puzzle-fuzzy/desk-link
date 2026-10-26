@@ -140,6 +140,38 @@ not driver VRAM measurements. The native cleanup regression checks both live
 leases and incomplete events survive trim, then confirms completed retired slots
 are reclaimed after the final ownership/completion boundary.
 
+## Reproducible synthetic stage probe
+
+`gpu_media_probe` and `scripts/benchmark-windows-gpu.py` provide capability and
+benchmark modes, explicit adapter selection and CPU/GPU input paths. CPU input
+feeds the existing owned-BGRA encoder API and does not imply a software backend.
+4K requires `--experimental-4k`, which requests High/40.5 Mbps and checks actual
+dimensions/profile/bitrate. Defaults retain the product's 2560×1440 maximum.
+
+The desktop workload is deterministic glyph-like strokes, panels and gradients;
+`--motion` scrolls content below fixed chrome. It is synthetic rather than a
+capture or a claim about typical desktop benefit. Independent two-phase color
+tiles check the VP path against existing CPU coefficients before measurement.
+
+Counters separate fixture CPU upload/clone from normal GPU CopyResource, VP
+output, explicit CPU readback and known texture/query/view creation. The current
+implementation still creates queries/views. Driver copies and COM/heap allocation
+totals remain null. CPU wall calls include completion waits; GPU execution time,
+decoded visual quality and end-to-end latency are not inferred from them.
+
+Output counts describe results returned during measurement calls, possibly from
+warmup inputs; they are not a drained input cohort or FPS. The final submission's
+pending count is reported explicitly. Raw per-submission/output IDs are retained.
+The wrapper binds each run and all repeats to the same clean HEAD/file hashes.
+Fallback, unstable/dirty source and mismatched repeated settings cannot establish
+a GPU stage comparison. Matching settings still do not prove quality equivalence.
+
+```powershell
+python scripts/benchmark-windows-gpu.py --mode capability --profile release --target-dir E:\desk-link\.worktrees\dl2-targets\windows-gpu --output dist/windows/gpu-capabilities.json
+python scripts/benchmark-windows-gpu.py --mode benchmark --encode --width 1920 --height 1080 --workload desktop --motion --input-path gpu --adapter-index 0 --frames 30 --warmup 3 --repeat 3 --profile release --target-dir E:\desk-link\.worktrees\dl2-targets\windows-gpu --output dist/windows/gpu-1080p.json
+# Repeat with --input-path cpu, 2560x1440, and 3840x2160 --experimental-4k.
+```
+
 ## Official API basis
 
 - [MF_SA_D3D11_AWARE](https://learn.microsoft.com/en-us/windows/win32/medfound/mf-sa-d3d11-aware): read-only capability before manager negotiation.
