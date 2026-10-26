@@ -116,6 +116,7 @@ import {
   recoveredFileTransfer,
 } from "./file-transfer-recovery";
 import { fileQueueProtectionPresentation } from "./file-queue-protection";
+import { FileQueueView } from "./file-queue-view";
 import {
   FileQueueActionGate,
   type FileQueueActionKind,
@@ -255,6 +256,7 @@ let filePickerBusy = false;
 let discardFileRecoveryBusy = false;
 let discardFileQueueRecoveryBusy = false;
 const fileQueueActions = new FileQueueActionGate();
+const fileQueueView = new FileQueueView();
 let downloadsFolderBusy = false;
 let downloadsFolderMessage = "";
 let fileDropInitialized = false;
@@ -370,6 +372,8 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
 }
 
 export function prepareControllerRender(): void {
+  const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
+  if (queue) fileQueueView.capture(queue);
   resetRemoteInputState();
   remoteTextInput = null;
   inputDispatcher.discardPendingMoves();
@@ -1128,7 +1132,6 @@ function renderFileQueueRecovery(): string {
 }
 
 function renderFileQueue(): string {
-  const visible = fileQueue.queued.slice(0, 4);
   const summary = queuedFilesSummary(fileQueue.queued);
   const queueActionsDisabled = fileQueueActions.busy || filePickerBusy || discardFileQueueRecoveryBusy;
   const resuming = fileQueueActions.matches("resume");
@@ -1136,10 +1139,12 @@ function renderFileQueue(): string {
   return `
     <div class="remote-transfer-list-heading"><strong>${fileQueue.paused ? "队列已暂停" : "等待发送"} · ${summary}</strong><span>${fileQueue.paused ? `<button type="button" data-controller-file-queue-resume ${queueActionsDisabled ? "disabled" : ""}>${resuming ? `${icon("loader-circle", "button-spinner")}正在继续…` : "继续队列"}</button>` : ""}<button type="button" data-controller-file-queue-clear ${queueActionsDisabled ? "disabled" : ""}>${clearing ? `${icon("loader-circle", "button-spinner")}正在清空…` : "清空等待"}</button></span></div>
     ${renderFileQueueProtection()}
-    <ul>${visible.map((file) => `
-      <li><span>${icon("file-up")}<span><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><small>${formatBytes(file.size)}</small></span></span><button type="button" data-controller-file-queue-remove="${file.id}" aria-label="${fileQueueActions.matches("remove", file.id) ? "正在从队列移除" : "从队列移除"} ${escapeHtml(file.name)}" title="${fileQueueActions.matches("remove", file.id) ? "正在移除" : "从队列移除"}" ${queueActionsDisabled ? "disabled" : ""}>${fileQueueActions.matches("remove", file.id) ? icon("loader-circle", "button-spinner") : icon("x")}</button></li>
-    `).join("")}</ul>
-    ${fileQueue.queued.length > visible.length ? `<small class="remote-transfer-more">还有 ${fileQueue.queued.length - visible.length} 个文件正在等待</small>` : ""}
+    ${fileQueueView.render(fileQueue.queued, {
+      disabled: queueActionsDisabled,
+      removingId: fileQueueActions.active?.kind === "remove" ? fileQueueActions.active.transferId : null,
+      formatBytes,
+      icon,
+    })}
   `;
 }
 
@@ -1817,6 +1822,7 @@ function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void
     }
     const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
     if (queue) {
+      fileQueueView.capture(queue);
       queue.hidden = fileQueue.queued.length === 0;
       queue.innerHTML = renderFileQueue();
       renderLucideIcons(queue);
@@ -1963,6 +1969,8 @@ async function openDownloadsFolder(): Promise<void> {
 }
 
 function bindTransferLedgerActions(): void {
+  const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
+  if (queue) fileQueueView.restore(queue);
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-recovery-discard]")
     ?.addEventListener("click", () => void discardFileQueueRecovery());
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-clear]")

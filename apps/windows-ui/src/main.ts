@@ -1,6 +1,7 @@
 import "./styles/layout.css";
 import "./styles/base.css";
 import "./styles/interaction.css";
+import "./styles/file-queue.css";
 
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
