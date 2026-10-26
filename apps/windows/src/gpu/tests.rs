@@ -180,3 +180,47 @@ fn retired_generations_and_live_leases_share_one_global_slot_cap() {
     frames.pop();
     assert!(pool.copy_from(&source, 3).is_ok());
 }
+
+#[test]
+#[ignore = "opt-in synthetic GPU retired-generation cleanup test; no desktop capture"]
+fn explicit_trim_preserves_live_or_uncompleted_leases_and_releases_retired_completed_slots() {
+    let _gate = lock(&GPU_TEST_GATE);
+    let device = hardware_device();
+    let source = create_synthetic_bgra(&device, 16, 16, &vec![42; 16 * 16 * 4]).unwrap();
+    let pool = GpuBgraPool::from_device(device.clone(), 16, 16, 1).unwrap();
+    let frame = pool.copy_from(&source, 1).unwrap();
+    let key = Arc::as_ptr(&frame.lease.0) as usize;
+    let contains = |key| {
+        lock(resident())
+            .iter()
+            .any(|slot| Arc::as_ptr(slot) as usize == key)
+    };
+    drop(pool);
+    trim_retired_gpu_surfaces();
+    assert!(contains(key), "an externally owned lease must survive trim");
+    assert_eq!(frame.readback_bgra().unwrap(), vec![42; 16 * 16 * 4]);
+    drop(frame);
+    trim_retired_gpu_surfaces();
+    assert!(
+        !contains(key),
+        "completed retired generation should be reclaimed"
+    );
+
+    let pool = GpuBgraPool::from_device(device, 16, 16, 1).unwrap();
+    let frame = pool.copy_from(&source, 2).unwrap();
+    let key = Arc::as_ptr(&frame.lease.0) as usize;
+    let device = pool.pool.device.clone();
+    let query = device.query().unwrap();
+    *lock(&frame.lease.0.fence) = Some(query.clone());
+    drop(frame);
+    drop(pool);
+    trim_retired_gpu_surfaces();
+    assert!(
+        contains(key),
+        "invalid/incomplete event on a live device cannot release accounting"
+    );
+    unsafe { device.context.End(&query) };
+    device.wait(&query).unwrap();
+    trim_retired_gpu_surfaces();
+    assert!(!contains(key));
+}

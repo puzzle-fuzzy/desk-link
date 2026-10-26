@@ -273,12 +273,14 @@ fn resident() -> &'static Mutex<Vec<Arc<Slot>>> {
     RESIDENT.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn allocate(
-    device: &Arc<Device>,
-    desc: &D3D11_TEXTURE2D_DESC,
-    bytes: u64,
-) -> Result<Arc<Slot>, GpuError> {
-    let mut registry = lock(resident());
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct GpuResidentStats {
+    pub slots: usize,
+    /// Logical image bytes only; excludes driver layout and other resources.
+    pub logical_image_bytes: u64,
+}
+
+fn prune_retired(registry: &mut Vec<Arc<Slot>>) {
     registry.retain(|slot| {
         if Arc::strong_count(slot) != 1 {
             return true;
@@ -289,6 +291,34 @@ fn allocate(
             Err(_) => unsafe { slot.device.device.GetDeviceRemovedReason() }.is_ok(),
         }
     });
+}
+
+pub fn gpu_resident_stats() -> GpuResidentStats {
+    let registry = lock(resident());
+    GpuResidentStats {
+        slots: registry.len(),
+        logical_image_bytes: registry.iter().map(|slot| slot.bytes).sum(),
+    }
+}
+
+/// Non-hot cleanup for a retired encoder/capture generation. It never forces
+/// release of a live lease or an incomplete fence, and is not an MF callback.
+pub fn trim_retired_gpu_surfaces() -> GpuResidentStats {
+    let mut registry = lock(resident());
+    prune_retired(&mut registry);
+    GpuResidentStats {
+        slots: registry.len(),
+        logical_image_bytes: registry.iter().map(|slot| slot.bytes).sum(),
+    }
+}
+
+fn allocate(
+    device: &Arc<Device>,
+    desc: &D3D11_TEXTURE2D_DESC,
+    bytes: u64,
+) -> Result<Arc<Slot>, GpuError> {
+    let mut registry = lock(resident());
+    prune_retired(&mut registry);
     let used: u64 = registry.iter().map(|slot| slot.bytes).sum();
     if registry.len() >= MAX_GPU_RESIDENT_SLOTS
         || bytes > MAX_GPU_RESIDENT_BYTES.saturating_sub(used)
@@ -360,6 +390,18 @@ impl Pool {
         let slot = allocate(&self.device, &self.desc, self.bytes)?;
         slots.push(slot.clone());
         Ok(Lease(slot))
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // A pool is an encoder/capture generation owner, never an MF callback
+        // owner. Clear its own references before trimming retired resources.
+        self.slots
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let _ = trim_retired_gpu_surfaces();
     }
 }
 
@@ -897,6 +939,6 @@ fn copy_mapped(
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod bitstream_validation;
+#[cfg(test)]
+mod tests;

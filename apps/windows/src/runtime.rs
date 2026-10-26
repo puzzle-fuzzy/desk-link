@@ -2181,7 +2181,10 @@ fn capture_worker_entry(
     if ready.send(Ok(worker_ready)).is_err() || start.recv().is_err() {
         return Ok(());
     }
-    capture_encode_loop(capture, encoder, context)
+    let outcome = capture_encode_loop(capture, encoder, context);
+    #[cfg(windows)]
+    let _ = crate::gpu::trim_retired_gpu_surfaces();
+    outcome
 }
 
 async fn receive_controller_capabilities(

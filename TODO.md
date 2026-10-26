@@ -281,6 +281,9 @@
 - [x] **声明顺序格式跟进（`style(DL2-015): normalize GPU module declaration order`）：** 固定2d79f97补落盘日志时workspace fmt发现lib.rs仅gpu/identity声明排序差异，跟进只调整该顺序；原GPU7项、完整lib204项与Clippy均通过，原失败日志如实保留，不改GPU实现。
 - [ ] **后续仍待：** runtime GPU选路和D3D11-aware MFT surface输入见016后续切片；CPU输出buffer池、1080p/1440p集显/独显/混合GPU及真实DXGI/双机/驱动恢复矩阵与性能仍未完成。本切片不单独宣称生产GPU常驻或性能收益。
 
+- [x] **非热路径退役清理（`fix(DL2-015): trim retired GPU generations after safe ownership release`）：** Pool销毁先释放自身slots再按同一完成规则trim，捕获切软件时释放旧pool/cache，capture+encoder返回后worker再trim。只回收已无外部owner且EVENT完成的退役槽位；live lease、未完成/无效fence仍计全局预算。MF回调仍只原子归还lease，不做GPU查询/全局清理；late callback后的有界缓存可等后续trim，不冒称立即全部释放或把旧策略称泄漏。
+- **验证：** GPU模块8项（含本机合成live lease/incomplete query→End完成后的安全回收）及真实TrackedSample外部COM引用跨encoder/guard销毁仍占用的寿命回归通过，严格lib/tests Clippy通过。resident统计是逻辑槽/图像字节，不是实测VRAM。
+
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
 - [ ] 建立编码后端能力探测、选择、诊断与恢复机制。

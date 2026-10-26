@@ -357,6 +357,11 @@ impl DxgiDesktopCapturer {
         if timeout.is_zero() {
             return Err(CaptureError::Timeout);
         }
+        if !prefer_gpu {
+            // A sticky software fallback no longer needs the old GPU pool/cache.
+            self.last_gpu_frame = None;
+            self.gpu_capture = None;
+        }
         let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
         if matches!(&self.backend, WindowsCaptureBackend::Gdi) {
             if let Some(frame) = self.try_restore_dxgi() {

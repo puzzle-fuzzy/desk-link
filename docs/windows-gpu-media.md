@@ -116,8 +116,20 @@ python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked gpu_
 
 Intel/AMD/hybrid adapters, physical device/driver loss, actual duplication,
 two-machine latency and sustained workload measurements remain separate gates.
-The registry currently reclaims completed, unowned retired generations on its
-next allocation; an idle process may retain this bounded cache meanwhile.
+The registry reclaims completed, unowned retired generations on allocation and
+through `trim_retired_gpu_surfaces`. Pool drop clears the generation's own
+references before a safe trim. A software capture policy releases its old GPU
+pool/cache; the worker also trims after capture and encoder have returned and
+dropped. These are generation/shutdown paths, not per-frame or allocator-callback
+work. A still-owned lease or incomplete/invalid fence on a live device remains
+accounted and retained. A late callback can leave bounded retired resources until
+the next trim/allocation; cleanup never promises to interrupt driver calls or
+force a sample's release.
+
+`gpu_resident_stats` reports registry slots and logical image bytes. These are
+not driver VRAM measurements. The native cleanup regression checks both live
+leases and incomplete events survive trim, then confirms completed retired slots
+are reclaimed after the final ownership/completion boundary.
 
 ## Official API basis
 
