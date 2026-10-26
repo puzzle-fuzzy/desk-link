@@ -224,6 +224,8 @@
 
 - [x] FFI Host 发布前也校验同 stream 的尺寸变化必须提高真实 config_version；不在 Rust 层重写 Swift 帧版本。无效旧版本几何配置明确终止并保留清键，Controller原有same-version变化拒绝保持。新增本地回环与几何policy回归各1项通过。主题 `fix(DL2-013): require new frame versions for changed host geometry`。
 
+- [x] 复用产品组有序 input sender：来源 `3ea72dc7f5a66d4cd96c197c0aadb7603cee2436`（其最小前置为bc合同+b473桥接，本分支已有等价9ad）；Runtime与clone共用序号并持input专用锁至可靠写完成，secure锁不跨网络await。此依赖的本分支接入回归将在后续worker切片记录，不能引用来源分支结果冒充当前证明。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

@@ -29,7 +29,7 @@ mod host_worker;
 mod worker;
 
 pub use controller::{
-    ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime,
+    ControllerError, ControllerEvent, ControllerInputSender, ControllerMetrics, ControllerRuntime,
     ControllerTransferSender,
 };
 pub use host::{
