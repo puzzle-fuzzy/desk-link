@@ -5,6 +5,7 @@ import type { AccountConfig } from "./config";
 import { loadAccountConfig } from "./config";
 import { AccountError } from "./domain/errors";
 import { RateLimiter } from "./domain/rate-limit";
+import type { PasswordOperations } from "./domain/password";
 import { errorResponse, corsHeaders, jsonResponse, noContent, readJson, requestId } from "./http";
 import { DevMailer } from "./providers/dev-mailer";
 import type { Mailer } from "./providers/mailer";
@@ -18,6 +19,7 @@ export interface AccountAppDependencies {
   mailer?: Mailer;
   now?: () => number;
   rateLimiter?: RateLimiter;
+  passwords?: PasswordOperations;
 }
 
 export interface AccountApp {
@@ -34,7 +36,8 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
   const now = dependencies.now ?? (() => Math.floor(Date.now() / 1000));
   const rateLimiter = dependencies.rateLimiter ?? new RateLimiter();
   const sessions = new SessionService(store, config, now);
-  const accounts = new AccountService(store, config, mailer, sessions, now);
+  const accounts = new AccountService(store, config, mailer, sessions, now, dependencies.passwords);
+  const requestBudget = new RateLimiter(1);
   const allowedOrigins = config.corsOrigins;
 
   return {
@@ -48,6 +51,10 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
           return new Response(null, { status: 204, headers: { ...cors, "x-request-id": id } });
         }
         const url = new URL(request.url);
+        if (request.method === "POST" && /^\/v1\/account\/(register|login|verify-email\/resend|password\/(forgot|reset))$/.test(url.pathname)
+          && !requestBudget.allow("unauthenticated", 120, 60, now())) {
+          throw new AccountError("rate_limited", 429, "请求过于频繁，请稍后再试。");
+        }
         if (request.method === "GET" && url.pathname === "/ready") {
           const dependencies = store.readiness();
           const ready = dependencies.database === "ready";

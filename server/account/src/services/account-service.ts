@@ -1,7 +1,8 @@
+import { randomInt } from "node:crypto";
 import type { AccountConfig } from "../config";
 import { normalizeEmail } from "../domain/email";
 import { AccountError } from "../domain/errors";
-import { hashPassword, validatePassword, verifyPassword } from "../domain/password";
+import { DUMMY_PASSWORD_HASH, protectedPasswordOperations, validatePassword, type PasswordOperations } from "../domain/password";
 import { createOpaqueToken, hashOpaqueToken } from "../domain/tokens";
 import type { AccountStore } from "../db/store";
 import type { AccountPlatform, ActionTokenPurpose, EmailOutboxRecord, UserRecord } from "../db/types";
@@ -28,37 +29,40 @@ export class AccountService {
     private readonly mailer: Mailer,
     private readonly sessions: SessionService,
     private readonly now: () => number,
+    private readonly passwords: PasswordOperations = protectedPasswordOperations,
   ) {}
 
   async register(input: RegisterInput): Promise<{ verificationRequired: true }> {
-    const email = normalizeEmail(input.email);
-    validatePassword(input.password);
-    const device = readDeviceInput(input);
-    if (this.store.findUserByEmail(email)) {
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(input.email);
+      validatePassword(input.password);
+      const device = readDeviceInput(input);
+      const now = this.now();
+      // Hashing stays outside the synchronous transaction; independent registrations
+      // can hash concurrently, while only the winner of the email insert has effects.
+      const passwordHash = await this.passwords.hash(input.password);
+      this.store.database.transaction(() => {
+        const user = this.store.createUserIfAbsent({ email, passwordHash, now });
+        if (!user) return undefined;
+        this.store.upsertDevice({ ...device, userId: user.id, now });
+        this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
+        return this.enqueueActionEmail(user, "verify_email");
+      })();
       return { verificationRequired: true };
-    }
-    const now = this.now();
-    // Hashing stays outside the synchronous transaction; independent registrations
-    // can hash concurrently, while only the winner of the email insert has effects.
-    const passwordHash = await hashPassword(input.password);
-    this.store.database.transaction(() => {
-      const user = this.store.createUserIfAbsent({ email, passwordHash, now });
-      if (!user) return undefined;
-      this.store.upsertDevice({ ...device, userId: user.id, now });
-      this.store.recordAuditEvent({ userId: user.id, deviceId: device.id, action: "account.registered", now });
-      return this.enqueueActionEmail(user, "verify_email");
-    })();
-    return { verificationRequired: true };
+    });
   }
 
   async resendVerification(emailInput: unknown): Promise<void> {
-    const email = normalizeEmail(emailInput);
-    const user = this.store.findUserByEmail(email);
-    if (!user || user.emailVerifiedAt !== null || user.status !== "active") return;
-    this.store.database.transaction(() => {
-      this.store.recordAuditEvent({ userId: user.id, action: "account.verification_resent", now: this.now() });
-      this.enqueueActionEmail(user, "verify_email");
-    })();
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(emailInput);
+      await this.passwords.verify("desklink-public-action-check", DUMMY_PASSWORD_HASH);
+      const user = this.store.findUserByEmail(email);
+      if (!user || user.emailVerifiedAt !== null || user.status !== "active") return;
+      this.store.database.transaction(() => {
+        this.store.recordAuditEvent({ userId: user.id, action: "account.verification_resent", now: this.now() });
+        this.enqueueActionEmail(user, "verify_email");
+      })();
+    });
   }
 
   async verifyEmail(tokenInput: unknown): Promise<PublicUser> {
@@ -73,33 +77,39 @@ export class AccountService {
   }
 
   async login(input: LoginInput): Promise<{ user: PublicUser; tokens: SessionTokenPair }> {
-    const email = normalizeEmail(input.email);
-    const password = input.password;
-    if (typeof password !== "string") {
-      throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
-    }
-    const user = this.store.findUserByEmail(email);
-    if (!user || user.status !== "active" || !(await verifyPassword(password, user.passwordHash))) {
-      throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
-    }
-    if (user.emailVerifiedAt === null) {
-      throw new AccountError("email_not_verified", 403, "请先完成邮箱验证。 ");
-    }
-    const device = readDeviceInput(input);
-    const accountDevice = this.store.upsertDevice({ ...device, userId: user.id, now: this.now() });
-    const tokens = this.sessions.create(user, accountDevice);
-    this.store.recordAuditEvent({ userId: user.id, deviceId: accountDevice.id, action: "account.logged_in", now: this.now() });
-    return { user: publicUser(user), tokens };
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(input.email);
+      const password = input.password;
+      if (typeof password !== "string" || password.length > 128) {
+        throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
+      }
+      const user = this.store.findUserByEmail(email);
+      const matches = await this.passwords.verify(password, user?.passwordHash ?? DUMMY_PASSWORD_HASH);
+      if (!user || user.status !== "active" || !matches) {
+        throw new AccountError("invalid_credentials", 401, "邮箱或密码不正确。 ");
+      }
+      if (user.emailVerifiedAt === null) {
+        throw new AccountError("email_not_verified", 403, "请先完成邮箱验证。 ");
+      }
+      const device = readDeviceInput(input);
+      const accountDevice = this.store.upsertDevice({ ...device, userId: user.id, now: this.now() });
+      const tokens = this.sessions.create(user, accountDevice);
+      this.store.recordAuditEvent({ userId: user.id, deviceId: accountDevice.id, action: "account.logged_in", now: this.now() });
+      return { user: publicUser(user), tokens };
+    });
   }
 
   async requestPasswordReset(emailInput: unknown): Promise<void> {
-    const email = normalizeEmail(emailInput);
-    const user = this.store.findUserByEmail(email);
-    if (!user || user.status !== "active") return;
-    this.store.database.transaction(() => {
-      this.store.recordAuditEvent({ userId: user.id, action: "account.password_reset_requested", now: this.now() });
-      this.enqueueActionEmail(user, "reset_password");
-    })();
+    return this.privacyResponse(async () => {
+      const email = normalizeEmail(emailInput);
+      await this.passwords.verify("desklink-public-action-check", DUMMY_PASSWORD_HASH);
+      const user = this.store.findUserByEmail(email);
+      if (!user || user.status !== "active") return;
+      this.store.database.transaction(() => {
+        this.store.recordAuditEvent({ userId: user.id, action: "account.password_reset_requested", now: this.now() });
+        this.enqueueActionEmail(user, "reset_password");
+      })();
+    });
   }
 
   async resetPassword(tokenInput: unknown, passwordInput: unknown): Promise<void> {
@@ -107,10 +117,18 @@ export class AccountService {
     validatePassword(passwordInput);
     const record = this.store.consumeActionToken(hashOpaqueToken(token), "reset_password", this.now());
     if (!record) throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
-    const passwordHash = await hashPassword(passwordInput);
+    const passwordHash = await this.passwords.hash(passwordInput);
     this.store.updatePassword(record.userId, passwordHash, this.now());
     this.store.revokeUserSessions(record.userId, this.now());
     this.store.recordAuditEvent({ userId: record.userId, action: "account.password_reset", now: this.now() });
+  }
+
+  private async privacyResponse<T>(operation: () => Promise<T>): Promise<T> {
+    // Choose the deadline before consulting account state. Jitter is independent
+    // of the branch; waiting does not occupy an Argon2 work slot.
+    const deadline = performance.now() + 100 + randomInt(0, 25);
+    try { return await operation(); }
+    finally { await Bun.sleep(Math.max(0, deadline - performance.now())); }
   }
 
   flushOutbox(limit = 20): Promise<number> {

@@ -1,6 +1,7 @@
 import { createAccountApp } from "./app";
 import { loadAccountConfig } from "./config";
 import { AccountWorker } from "./worker";
+import { MAX_ACCOUNT_BODY_BYTES } from "./http";
 
 const config = loadAccountConfig();
 const app = createAccountApp({ config });
@@ -13,6 +14,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) {
 export const server = Bun.serve({
   hostname: process.env.DESKLINK_ACCOUNT_ADDR ?? "127.0.0.1",
   port,
+  maxRequestBodySize: MAX_ACCOUNT_BODY_BYTES,
   fetch(request, server) {
     return app.fetch(request, { remoteAddress: server.requestIP(request)?.address });
   },

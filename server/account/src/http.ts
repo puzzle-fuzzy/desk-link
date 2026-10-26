@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { AccountError } from "./domain/errors";
+export const MAX_ACCOUNT_BODY_BYTES = 16 * 1_024;
 
 export function requestId(request: Request): string {
   return request.headers.get("x-request-id")?.trim().slice(0, 96) || randomUUID();
@@ -41,8 +42,38 @@ export async function readJson(request: Request): Promise<Record<string, unknown
   }
   let value: unknown;
   try {
-    value = await request.json();
-  } catch {
+    const reader = request.body?.getReader();
+    if (!reader) throw new AccountError("invalid_request", 400, "请求内容不是有效的 JSON。");
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new AccountError("invalid_request", 408, "请求内容读取超时。"));
+        void reader.cancel().catch(() => {});
+      }, 2_000);
+    });
+    try {
+      for (;;) {
+        const chunk = await Promise.race([reader.read(), timeout]);
+        if (chunk.done) break;
+        length += chunk.value.byteLength;
+        if (length > MAX_ACCOUNT_BODY_BYTES) {
+          void reader.cancel().catch(() => {});
+          throw new AccountError("invalid_request", 413, "请求内容过大。");
+        }
+        chunks.push(chunk.value);
+      }
+      const bytes = new Uint8Array(length);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      value = JSON.parse(new TextDecoder().decode(bytes));
+    } finally {
+      clearTimeout(timer);
+      reader.releaseLock();
+    }
+  } catch (error) {
+    if (error instanceof AccountError) throw error;
     throw new AccountError("invalid_request", 400, "请求内容不是有效的 JSON。");
   }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
