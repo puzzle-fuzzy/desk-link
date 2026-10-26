@@ -115,7 +115,7 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 
 同次完整 `ffi-runtime` 中lib12、ABI7、platform1、controller6、directory4通过，旧Host **8通过/2失败**；Windows host-runtime-contract **9通过/1失败**，仍为零epoch配置未接通。整体 **failed / passed=false**。这些是本工程旧源码d6f153e未整合完整Apple ABI/Host依赖时的实际结果，不能外推为Apple当前源分支失败。选择lib或loopback的通过不能改写这份完整FFI失败，不能跳过这两个Host测试后宣称该源码全通过；新鲜度、config配对、IPC、Text/粘贴/release生产路径与真实presented继续按上表验收。
 
-### Windows joint证据入口（尚待交付）
+### Windows joint固定证据与第一波候选
 
 产品组在独立 `codex/dl2-windows-joint` 的原始安排为产品 `16594c4f8780cd565afd57695f88e29277ec5939` 整合媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a`（媒体更早为 `fb9734499fc560af79b11709aae185eb4ddcc81a`）。最新第一parent改用产品 **`27fec756ba97ee6f67228dc9530c7b0578a49ff3`**，本工程只读Git确认它直接接续16594，代码仅提取InputSendFuture类型别名；另一parent已固定为媒体021初始化取消修复 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`**，直接parent为 `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`。协调方报告产品已开始按这两个parents真实remerge；保留已解冲突、审计resolution、联合测试与逐问题历史，不重置或覆盖原WIP。本工程未操作该joint worktree。
 
@@ -125,11 +125,15 @@ Apple最新来源由协调方报告完整FFI71项、Python186项、双头检查�
 
 媒体65c冻结交接已读取 `E:/desk-link/.worktrees/dl2-targets/windows-media/validation/final-validation.json` 与同目录 `windows-media-handoff.json`，本工程核对三组原日志合计448通过/0失败/18忽略、source前后均65c、空working_status及固定Git对象Cargo.lock哈希一致；37笔唯一提交/subject/ancestry与handoff吻合，已包含三条imported contract。另有来源workspace/all-targets check、限定包lib/tests严格Clippy及workspace fmt通过，均不是本工程复跑。主项仅020/046/050完成，015仍CPU读回且GPU surface链未实现，030仍256MiB/无目录、大文件与持久块证明；源冻结不能关闭041/013或把当前工程树标可交付。报告哈希和完整边界见[来源核对记录](second-stage-review-evidence.md)。
 
-收口须同时取得：joint最终完整SHA及dirty/parents/来源记录、所需resolution和新增联合测试已提交的证据、逐问题历史/等价patch去重说明、新parents整合后的实际跨包严格检查与所有适用测试命令和原始报告，以及上表各epoch/config/IPC/呈现/取消门禁对应的运行结果。当前尚未收到joint最终SHA/完整报告，不能据安排、merge完成或来源各自通过更新041/042为联合通过。失败、忽略与缺设备条件分别保留，不能把选中用例通过扩大成全部通过。FFI Mac Host、Swift/真实Mac presented、实际WebView与双机验收继续单列；Windows joint不能代替这些证据，也不会使本工程旧源码上的失败报告失效。
+Windows joint现已交付 `5782341e22ba55b2efe30a8eeaeafbebfe0daaba` / tree `59c7270aea76bc1d542ac49c625e308b42ef20f2`，parents27fec+65c；本工程核对27产品/37媒体历史、477源码blob、已跟踪联合测试及六份原日志哈希。原Rust结果634通过/2失败/19忽略，Cargo101（两项FFI Host仍零epoch、未合完整Apple）；八包lib/tests严格Clippy无no-deps及Bun1.3.14的474项/构建通过。完整范围见[固定证据核对](second-stage-review-evidence.md)。这是本工程只读核对来源，未自行复跑该joint，整体仍不能标全绿。
+
+第一波独立候选从J578合入完整Apple协议13冻结 `f954a68153168a1ded048ddf93eb9c565684d096`、网络冻结4b155615、服务token预算/分桶补修后的最终历史、GUI最终50691585及工程分支；保留J非零Windows producer，去重共享等价patch，不单挑9ad。当前已在独立 `codex/dl2-wave1-integration` 开始真实merge，冲突逐路径处理；最终revision、实际跨包/前端/脚本/ABI联合结果仍须交付。Apple f954的Swift旧input callback缺receipt已由协调方复核为P2，owner独立后继补丁待追加；不能将当前Mac输入退役隔离写已闭环。
+
+GUI044/045的最终producer与服务b111/bf5d固定schema一起进入候选后，必须运行真实client事件→签名验签/schema→store联合验证；不按旧joint schema永久过滤事件。GPU015/016、文件030/协议14与024新生产接线作为后续波次，不阻塞稳定13第一波。失败、忽略与缺设备条件分别保留；Swift/Xcode/Metal、真实WebView、权限/输入注入/双机/硬件测量继续单列。候选通过后由主会话决定合入main，root未知dirty不操作。
 
 ### joint新增前置：接收文件初始化时保留已有partial
 
-独立只读review及固定媒体89bd1e5源码核对发现的DL2-021缺口已由媒体 `65c70fd658d0526a8a27b75fdbf120ae065222bf` 修复：旧实现ready发送失败直接return会删除已有resume partial；新实现在同一磁盘线程先调用file.preserve再退出。本工程只读Git核对其直接parent6dbe53d及仅TODO+transfer变更，没有改runtime，也没有代修或复跑来源测试。当前状态为**源分支修复已验证、joint待复验**，旧89源码因果链保留为历史缺陷记录。
+独立只读review及固定媒体89bd1e5源码核对发现的DL2-021缺口已由媒体 `65c70fd658d0526a8a27b75fdbf120ae065222bf` 修复：旧实现ready发送失败直接return会删除已有resume partial；新实现在同一磁盘线程先调用file.preserve再退出。本工程只读核对源码及J最终原日志四项初始化回归ok，状态为**源修复/局部joint回归已记录、第一波完整聚合待验**；本工程未自行复跑J，旧89源码因果链保留历史身份。
 
 65c提交TODO及协调方报告transfer28通过、lib/tests严格Clippy与定向rustfmt/diff检查通过。新增源码回归通过真实spawn_with/create路径，在已取得独占句柄、读取/哈希前用barrier停住，poll Pending后drop创建future，再放行并等待磁盘线程退出；9次取消均断言原4字节prefix、offset/hash/元数据不变，最终续传通过完整哈希。还覆盖空part保留、显式cancel删除、初始化TooLarge不删旧prefix、Windows真实sync_data失败返回IoFailed且未发布；资源型测试串行化而未放大生产8线程上限。这些是已核对的回归源码与来源实跑报告，不等于本工程或joint已执行。
 
@@ -139,6 +143,6 @@ Apple最新来源由协调方报告完整FFI71项、Python186项、双头检查�
 | 正常handle-drop仍保留；明确cancel/校验失败仍按原政策清理，资源与并发permit收尾 | 把断连和显式cancel都改成永久保留，或只证明future返回 |
 | 独立修复来源/本地复用SHA、最终joint revision和该窗口对应测试/相关套件原始结果 | 两个源分支各自通过、旧suite通过、没有复现新缺陷的只读review结论 |
 
-上表来源层已有65c修复、对应回归源码和28项来源结果；剩余待交付的是实际最终joint复用与复跑证据。不能继续把65c描述为未修代码，也不能提前标joint已通过。
+上表来源层已有65c修复和28项来源结果，J578原日志亦有四项初始化回归通过；后续第一波候选仍按精确源码重复运行相关套件。局部成功不改写J634/2/19，也不关闭真实慢盘或整体021/041验收。
 
 此前协调方报告joint未提交、索引UU、测试未跟踪，是当时审查快照；本工程没有读取或操作这些WIP，不将其直接视为后续当前状态，在最终状态证据到达前继续待验。协调方的shared日志汇总是174通过/1忽略，原274为已撤回笔误；该计数尚不等于可整合revision，更不是本工程执行数。初始化缺口的源码确认、未来实际回归和最终联合验收保持三层记录。
