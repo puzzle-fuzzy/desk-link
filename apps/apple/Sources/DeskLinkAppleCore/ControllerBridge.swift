@@ -69,6 +69,14 @@ public final class ControllerBridge: ObservableObject {
     @Published public private(set) var latestControlMessage: Data?
     @Published public private(set) var latestTransferMessage: Data?
     @Published public private(set) var latestAudioPacket: Data?
+    @Published public private(set) var remoteDisplays: [SessionDisplay] = []
+    @Published public private(set) var activeDisplayID: UInt32?
+    @Published public private(set) var confirmedQuality: SessionVideoQuality?
+    @Published public private(set) var inputRestriction: SessionInputRestrictionReason?
+    @Published public private(set) var audioAvailable = false
+    @Published public private(set) var audioEnabled = false
+    @Published public private(set) var qualityStateRevision: UInt64 = 0
+    @Published public private(set) var displayStateRevision: UInt64 = 0
 
     public var userFacingError: String { lastError ?? "" }
 
@@ -420,13 +428,16 @@ public final class ControllerBridge: ObservableObject {
         case 8:
             guard streamID == activeStreamID, !data.isEmpty else { return }
             cursorOverlay = CursorOverlay(streamID: streamID, encodedUpdate: data)
-        case 4: latestControlMessage = data
+        case 4:
+            latestControlMessage = data
+            consumeControl(data)
         case 11: latestTransferMessage = data
         case 12:
             guard streamID == activeStreamID else { return }
             latestAudioPacket = data
         case 13:
             guard let value = SessionCapabilities(encoded: data) else { return }
+            resetControlState()
             capabilities = value
             remotePlatform = value.platform
         default:
@@ -506,11 +517,42 @@ public final class ControllerBridge: ObservableObject {
         case Int(DESKLINK_DEGRADED.rawValue): state = .frozen
         case Int(DESKLINK_RECOVERING_VIDEO.rawValue): state = .recovering
         case Int(DESKLINK_RECONNECTING.rawValue):
+            inputRestriction = nil
             if savedHostForResume != nil { awaitingApprovedHostMaterial = true }
             state = .reconnecting
         case Int(DESKLINK_DISCONNECTING.rawValue): state = .reconnecting
         default: state = .connecting
         }
+    }
+
+    private func consumeControl(_ data: Data) {
+        guard let control = SessionControlState(encoded: data) else { return }
+        switch control {
+        case let .displays(displays, activeID):
+            remoteDisplays = displays
+            activeDisplayID = activeID
+            displayStateRevision &+= 1
+        case let .audio(available, enabled):
+            audioAvailable = available
+            audioEnabled = enabled
+        case let .videoQuality(quality):
+            confirmedQuality = quality
+            qualityStateRevision &+= 1
+        case let .inputRestriction(reason):
+            // Input permission can recover independently of the media stream.
+            inputRestriction = reason
+        }
+    }
+
+    private func resetControlState() {
+        remoteDisplays = []
+        activeDisplayID = nil
+        confirmedQuality = nil
+        inputRestriction = nil
+        audioAvailable = false
+        audioEnabled = false
+        qualityStateRevision &+= 1
+        displayStateRevision &+= 1
     }
 
     private func consumeDecodedConfiguration(generation: UInt64, streamID: UInt64,
@@ -636,6 +678,7 @@ public final class ControllerBridge: ObservableObject {
     private func publishError(_ error: Error) { publishErrorMessage(error.localizedDescription) }
 
     private func resetDisplayedSessionState() {
+        resetControlState()
         capabilities = nil
         remotePlatform = .unknown
         latestControlMessage = nil
@@ -701,6 +744,8 @@ public final class ControllerBridge: ObservableObject {
     }
 
 #if DEBUG
+    public func acceptControlForTesting(_ data: Data) { consumeControl(data) }
+
     /// Exercises UI state ordering only; the invalid header cannot configure a
     /// native decoder and is not evidence of video or hardware acceptance.
     public func stageDecodedMetadataForTesting(streamID: UInt64, version: UInt32) {

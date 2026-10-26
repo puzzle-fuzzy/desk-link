@@ -5,6 +5,23 @@ import XCTest
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
+    func testInputRestrictionAndRecoveryKeepSessionAndRepeatedAcknowledgementsAdvance() {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
+        bridge.acceptControlForTesting(Data([14, 1, 0]))
+        XCTAssertEqual(bridge.inputRestriction, .blocked)
+        XCTAssertEqual(bridge.state, .connected(streamID: 4))
+        bridge.acceptControlForTesting(Data([14, 0]))
+        XCTAssertNil(bridge.inputRestriction)
+        bridge.acceptControlForTesting(Data([10, 0, 1]))
+        let first = bridge.qualityStateRevision
+        bridge.acceptControlForTesting(Data([10, 0, 1]))
+        XCTAssertEqual(bridge.qualityStateRevision, first + 1)
+        bridge.acceptControlForTesting(Data([14, 1, 0]))
+        bridge.disconnect()
+        XCTAssertNil(bridge.inputRestriction)
+        XCTAssertNil(bridge.confirmedQuality)
+    }
+
     func testDecodedConfigurationArrivingBeforeConnectedIsReplayed() {
         let bridge = ControllerBridge.testing()
         bridge.stageDecodedMetadataForTesting(streamID: 4, version: 1)

@@ -300,10 +300,15 @@
 ### DL2-026 · P1 · 补齐 macOS → Windows 的会话功能闭环
 
 - [ ] 将已有底层功能真正接到 AppleCore 与 macOS 会话界面。
+- [x] 首个代码切片：严格、有界的 Control 状态解析接入显示器 / 当前屏、画质偏好 / 实际 preset、音频可用状态及可恢复输入受限；Mac 会话菜单通过真实有界 FFI 命令发送切屏和画质请求，仅在 capabilities + connected 时启用。排队成功只显示等待，远端回执才确认；不匹配 / 5 秒无回执可重试，输入恢复后清除受限提示。主题 `feat(DL2-026): connect Mac display and quality controls to remote acknowledgements`。
+- [x] Windows 静态与 wire oracle：`python -m unittest scripts.tests.test_dl2_mac_session_contract -v` 6 项通过；新增 Swift 解码、回执 / 拒绝 / 超时状态回归及跨语言 Rust postcard fixture，Swift/AppKit 尚未运行，Rust fixture 由本组统一验证后记录。
+- [ ] 其余闭环与真机：适应 / 1:1 / 会话全屏的统一视频与输入几何、音频实际播放 / 静音 / 音量、双向剪贴板、双向文件流程及所有 Mac → Windows 交互 / 恢复仍待完成；typed 音频状态不是音频播放，菜单源码和合成回执不是双机结果。
 - **证据 / 类型：能力缺口。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:336-350` 只消费 state/error/video/cursor，Control/Audio/Transfer 落入 default；`apps/macos/Sources/DeskLinkApp/Views/SessionView.swift:56-84` 缺少相应会话操作。Rust 有方法不能代表 Mac 用户已可使用。
 - **分项交付：** 多屏列表/切换；会话内适应/1:1/全屏操作与清晰度；音频播放/静音/音量及失败恢复；纯文本剪贴板双向操作；文件双向选择、确认、进度、取消、重试与断点恢复。macOS 原生窗口全屏已有系统入口，本项不把它说成完全无法全屏。
 - **方案：** capability 驱动操作可用性；每项提供等待、成功、拒绝、失败和下一步，不支持时准确说明；布局沿用平台原生习惯，控件命名与 Windows 保持任务语义一致。
 - **验收：** Mac → Windows 每个分项都完成真实用户动作和错误恢复；接收文件仍经被控端授权，换设备不能恢复到错误目标；与 DL2-025、029～032 联合验证。
+
+- [x] Bridge 实际消费 DisplayList/VideoQualityState/AudioState/InputState，重复同值回执仍推进 revision；输入受限与恢复独立于会话终态，新能力/断开清空。Rust 真实 codec→Swift 六组 fixture 回归 1 项通过；Python 会话合同 6 项通过。主题 `feat(DL2-026): connect Mac display and quality controls to remote acknowledgements`。
 
 ### DL2-027 · P1 · 在 Apple 会话呈现远端独立光标
 
