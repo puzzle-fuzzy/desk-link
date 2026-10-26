@@ -2,6 +2,8 @@
 
 更新日期：2026-10-26。用户已确认 **Windows→Windows、macOS→Windows 的基础连接、画面与控制良好**。这条确认保留为产品事实；高级功能、特殊权限、故障恢复与性能仍分别核验。
 
+全分支已进入统一协议14整合线，具体合并范围与本次软件验证见 [全分支整合记录](all-branches-integration.md)。下文第一波、第二波及旧 main 的“尚未合入”表述均保留为对应来源冻结时的历史状态，不替代整合后的主分支身份。
+
 **第一波协议13候选已冻结并通过本地软件门禁。** 已完整合入Windows joint、Apple及输入退役补丁、网络、工程、GUI和producer/services历史，保留非零Windows producer；测试源为 `a4c5b404d43794d646394923a481f23c9298c3ed`。25项软件检查及新生成原生签名批次的19项HTTP/SQLite闭环通过，详细范围见[第一波报告](wave1-integration.md)。Swift/Xcode、真实WebView、权限/输入注入、双机与完整性能仍未验收，main尚未合入。下列旧零producer失败均按其历史源码保留。
 
 **当前第二波GPU候选亦已实际验证。** 独立分支从第一波冻结c3正常merge GPU235七笔历史；干净测试源 `97ff7c08199cdad4511b0044ddf783d79e2295b1` 的25软件检查、24选定合成GPU用例及19签名/HTTP/SQLite案例全部通过，native/perf仍2通过7跳过、incomplete。第一波a4/c3不变；真实捕获、设备恢复、同画质性能和原平台缺项保持未验。见[第二波报告](wave2-gpu-integration.md)。
@@ -31,7 +33,7 @@ python scripts/verify-windows-release.py --versions-only
 | 项目 | 核对值 | 权威来源 |
 | --- | --- | --- |
 | Windows 应用 | `0.1.93` | `apps/windows/Cargo.toml`、`apps/windows-ui/package.json`、`apps/windows-ui/src-tauri/Cargo.toml`、`tauri.conf.json`、`tools/windows-installer/Cargo.toml`，脚本要求五者一致 |
-| 业务协议 | `13` | 当前工程 checkout 的 `crates/desklink-protocol/src/lib.rs::PROTOCOL_VERSION`；未发布开发线，已复用 InputState 契约，不是应用版本或 relay JOIN 信封版本 |
+| 业务协议 | `14` | 当前整合 checkout 的 `crates/desklink-protocol/src/lib.rs::PROTOCOL_VERSION`；未发布开发线，已合入文件任务与 LAN 业务合同，不是应用版本或 relay JOIN 信封版本；历史协议13冻结证据仍按原源码保留 |
 | main 基线业务协议 | `12` | `main@a905b88`；不能把工程接入分支当作 main 已集成 |
 | Bun | `1.3.14` | 三个 Bun 项目的 `packageManager`；本地入口检查实际可执行版本 |
 | Rust toolchain | `1.97.1` | `rust-toolchain.toml`；workspace `rust-version=1.88` 是最低版本要求 |

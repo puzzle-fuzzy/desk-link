@@ -69,8 +69,10 @@ mod incoming_file;
 use file_task::FileTaskBinding;
 #[path = "controller-queue-worker.rs"]
 mod queue_worker;
-use apps_windows::transfer_task::{FileTaskHandle, FileTaskProgress};
-use desklink_protocol::{FileTaskAction, FileTaskMessage, FileTransferCapabilities};
+use apps_windows::transfer_task::{FileTaskHandle, FileTaskProgress, FileTaskService};
+use desklink_protocol::{
+    DeviceCapabilities, DeviceRole, FileTaskAction, FileTaskMessage, FileTransferCapabilities,
+};
 use queue_worker::{QueuePersistence, QueuePersistenceUpdate};
 
 use incoming_file::{
@@ -3022,15 +3024,14 @@ async fn run_controller(
             hex(&host_device_id),
             hex(settings.host_verify_key().as_bytes())
         );
-        let _ = signals.send(ControllerSignal::FileCapabilities {
-            peer_id: file_peer_id.clone(),
-            state: "pending",
-            large_files: false,
-            directories: false,
-            block_resume: false,
+        let file_service = start_file_task_service_for_host(runtime.host_capabilities(), || {
+            apps_windows::transfer_task_native::current_user_service(file_peer_id.clone())
         });
-        let file_service =
-            apps_windows::transfer_task_native::current_user_service(file_peer_id.clone()).ok();
+        let file_task_supported = file_service.is_some();
+        let _ = signals.send(initial_file_task_capabilities(
+            file_peer_id.clone(),
+            &file_service,
+        ));
         let mut file_task_handle: Option<FileTaskHandle> =
             file_service.as_ref().map(|s| s.handle.clone());
         let mut file_task_progress = file_service.as_ref().map(|s| s.progress.clone());
@@ -3090,7 +3091,7 @@ async fn run_controller(
         let mut queued_task_source: Option<OutgoingFile> = None;
         let mut queued_task_active: Option<TransferId> = None;
         let file_capability_deadline = Instant::now() + Duration::from_secs(5);
-        let mut file_capability_timeout_reported = false;
+        let mut file_capability_timeout_reported = !file_task_supported;
         let mut incoming: Option<IncomingTransfer> = None;
         let mut next_incoming_ticket = 1_u64;
         let (incoming_file_events, mut pending_incoming_file_events) =
@@ -4405,14 +4406,6 @@ async fn run_controller(
                                     message: "远端已取消文件发送。".to_owned(),
                                 });
                             }
-                        }
-                        TransferMessage::FileTask(_) => {
-                            break ConnectFailure::with_reason(
-                                false,
-                                "当前控制端尚未接入文件任务服务，此会话已停止。",
-                                "file_task_unsupported",
-                                "protocol-14 FileTask received without a connected file task service",
-                            );
                         }
                         TransferMessage::ClipboardSet { .. }
                         | TransferMessage::ClipboardRequest { .. }
@@ -7877,6 +7870,40 @@ mod tests {
         }
     }
 }
+
+// DeviceCapabilities comes from the authenticated host negotiation. Other host
+// implementations reject FileTask messages, including the capability packet
+// emitted as soon as this service starts; keep their base session usable.
+fn start_file_task_service_for_host(
+    capabilities: &DeviceCapabilities,
+    start: impl FnOnce() -> Result<FileTaskService, TransferResult>,
+) -> Option<FileTaskService> {
+    if capabilities.role != DeviceRole::Host || capabilities.platform != Platform::Windows {
+        return None;
+    }
+    start().ok()
+}
+
+fn initial_file_task_capabilities(
+    peer_id: String,
+    service: &Option<FileTaskService>,
+) -> ControllerSignal {
+    ControllerSignal::FileCapabilities {
+        peer_id,
+        state: if service.is_some() {
+            "pending"
+        } else {
+            "unsupported"
+        },
+        large_files: false,
+        directories: false,
+        block_resume: false,
+    }
+}
+
+#[cfg(test)]
+#[path = "controller-file-task-platform-tests.rs"]
+mod file_task_platform_tests;
 
 async fn next_file_task_progress(
     receiver: &mut Option<watch::Receiver<Option<FileTaskProgress>>>,
