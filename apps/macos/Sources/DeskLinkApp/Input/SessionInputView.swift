@@ -154,7 +154,7 @@ struct SessionInputView: NSViewRepresentable {
         }
         override func flagsChanged(with event: NSEvent) {
             guard !hasMarkedText() else { return }
-            for command in keyboard.flagsChanged(event.modifierFlags, policy: keyboardPolicy) { bridge?.send(input: command) }
+            for command in keyboard.flagsChanged(event.modifierFlags, keyCode: event.keyCode, policy: keyboardPolicy) { bridge?.send(input: command) }
         }
         override func mouseMoved(with event: NSEvent) { sendPointer(event) }
         override func mouseDragged(with event: NSEvent) { sendPointer(event) }

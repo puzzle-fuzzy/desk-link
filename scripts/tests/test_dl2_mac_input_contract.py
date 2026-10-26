@@ -28,10 +28,11 @@ class MacInputSourceContractTests(unittest.TestCase):
     def test_production_view_tracks_physical_keyup_repeat_flags_and_reset(self) -> None:
         view = source("apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift")
         mapper = source("apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift")
-        for token in ["keyboard.keyDown(", "keyboard.keyUp(keyCode: event.keyCode)", "keyboard.flagsChanged(event.modifierFlags, policy: keyboardPolicy)", "keyboard.reset()", "event.isARepeat", "event.charactersIgnoringModifiers"]:
+        for token in ["keyboard.keyDown(", "keyboard.keyUp(keyCode: event.keyCode)", "keyboard.flagsChanged(event.modifierFlags, keyCode: event.keyCode, policy: keyboardPolicy)", "keyboard.reset()", "event.isARepeat", "event.charactersIgnoringModifiers"]:
             self.assertIn(token, view)
         self.assertIn("pressedKeys.removeValue(forKey: keyCode)", mapper)
-        self.assertIn("return isRepeat ? held : []", mapper)
+        self.assertIn("guard isRepeat else { return [] }", mapper)
+        self.assertIn("guard commands != held else { return held }", mapper)
         self.assertIn("pressed: false, modifiers: modifiers", mapper)
 
     def test_mac_host_forwards_unicode_keyup_and_tracks_failed_releases(self) -> None:
@@ -100,6 +101,12 @@ class MacInputSourceContractTests(unittest.TestCase):
         self.assertIn("sendSystemKey(DeskLinkKeyCode.tab, modifiers: .option)", view)
         self.assertIn("sendSystemKey(DeskLinkKeyCode.meta)", view)
         self.assertIn(".character(114, pressed: true, modifiers: .meta)", view)
+
+    def test_repeat_transition_releases_previous_logical_key_and_caps_lock_is_physical(self) -> None:
+        mapper = source("apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift")
+        transition = mapper.split("guard commands != held", 1)[1].split("mutating func keyUp", 1)[0]
+        self.assertRegex(transition, r"(?s)keyUp\(keyCode: keyCode\).*pressedKeys\[keyCode\] = commands.*return releases \+ commands")
+        self.assertIn("if keyCode == 0x39, capsLockEnabled == nil || capsLock != capsLockEnabled", mapper)
 
 
 if __name__ == "__main__":

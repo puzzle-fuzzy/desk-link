@@ -26,7 +26,7 @@ enum KeyboardMapper {
 struct KeyboardInputState {
     private var pressedKeys: [UInt16: [RemoteInputCommand]] = [:]
     private var heldModifiers: Modifiers = []
-    private var capsLockEnabled = false
+    private var capsLockEnabled: Bool?
 
     mutating func keyDown(
         keyCode: UInt16,
@@ -35,10 +35,18 @@ struct KeyboardInputState {
         isRepeat: Bool,
         policy: KeyboardMappingPolicy = KeyboardMappingPolicy()
     ) -> [RemoteInputCommand] {
-        if let held = pressedKeys[keyCode] { return isRepeat ? held : [] }
         let commands = KeyboardMapper.map(
             keyCode: keyCode, characters: characters, modifiers: modifiers, isDown: true, policy: policy
         )
+        if let held = pressedKeys[keyCode] {
+            guard isRepeat else { return [] }
+            guard commands != held else { return held }
+            // A held physical key can change glyph or chord when Shift or the
+            // layout changes. Release its previous logical identity first.
+            let releases = keyUp(keyCode: keyCode)
+            if !commands.isEmpty { pressedKeys[keyCode] = commands }
+            return releases + commands
+        }
         if !commands.isEmpty { pressedKeys[keyCode] = commands }
         return commands
     }
@@ -63,26 +71,26 @@ struct KeyboardInputState {
         return releases + modifierCommands(chordModifiers.intersection(heldModifiers), pressed: true)
     }
 
-    mutating func flagsChanged(_ flags: NSEvent.ModifierFlags, policy: KeyboardMappingPolicy = KeyboardMappingPolicy()) -> [RemoteInputCommand] {
+    mutating func flagsChanged(_ flags: NSEvent.ModifierFlags, keyCode: UInt16? = nil, policy: KeyboardMappingPolicy = KeyboardMappingPolicy()) -> [RemoteInputCommand] {
         let next = policy.modifiers(for: flags)
         var commands = modifierCommands(heldModifiers.subtracting(next), pressed: false)
         commands += modifierCommands(next.subtracting(heldModifiers), pressed: true)
         heldModifiers = next
         let capsLock = flags.contains(.capsLock)
-        if capsLock != capsLockEnabled {
+        if keyCode == 0x39, capsLockEnabled == nil || capsLock != capsLockEnabled {
             commands += [
                 .key(code: DeskLinkKeyCode.capsLock, pressed: true, modifiers: []),
                 .key(code: DeskLinkKeyCode.capsLock, pressed: false, modifiers: []),
             ]
-            capsLockEnabled = capsLock
         }
+        capsLockEnabled = capsLock
         return commands
     }
 
     mutating func reset() {
         pressedKeys.removeAll()
         heldModifiers = []
-        capsLockEnabled = false
+        capsLockEnabled = nil
     }
 
     private func modifierCommands(_ flags: Modifiers, pressed: Bool) -> [RemoteInputCommand] {

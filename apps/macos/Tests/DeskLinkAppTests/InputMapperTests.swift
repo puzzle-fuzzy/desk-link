@@ -108,13 +108,36 @@ final class InputMapperTests: XCTestCase {
         XCTAssertTrue(keyboard.keyUp(keyCode: 0).isEmpty)
     }
 
-    func testRepeatsUseOriginalKeyAndHaveOneFinalRelease() {
+    func testRepeatGlyphChangeReleasesOldIdentityBeforePressingNewIdentity() {
         var keyboard = KeyboardInputState()
         let down: [RemoteInputCommand] = [.character(97, pressed: true, modifiers: [])]
         XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: false), down)
-        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true), down)
+        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: true), down)
+        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true), [
+            .character(97, pressed: false, modifiers: []),
+            .character(65, pressed: true, modifiers: .shift),
+        ])
         XCTAssertTrue(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: false).isEmpty)
-        XCTAssertEqual(keyboard.keyUp(keyCode: 0), [.character(97, pressed: false, modifiers: [])])
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0), [.character(65, pressed: false, modifiers: .shift)])
+    }
+
+    func testCapsLockOnlyTogglesForItsPhysicalFlagsEvent() {
+        var keyboard = KeyboardInputState()
+        // Local Caps Lock was already on before focus. Pressing Shift must not
+        // guess the host's lock state or toggle it as a side effect.
+        XCTAssertEqual(keyboard.flagsChanged([.capsLock, .shift], keyCode: 0x38), [
+            .key(code: 30, pressed: true, modifiers: []),
+        ])
+        XCTAssertEqual(keyboard.flagsChanged(.capsLock, keyCode: 0x38), [
+            .key(code: 30, pressed: false, modifiers: []),
+        ])
+        let toggle: [RemoteInputCommand] = [
+            .key(code: 15, pressed: true, modifiers: []), .key(code: 15, pressed: false, modifiers: []),
+        ]
+        XCTAssertEqual(keyboard.flagsChanged([], keyCode: 0x39), toggle)
+        XCTAssertTrue(keyboard.flagsChanged([], keyCode: 0x39).isEmpty)
+        keyboard.reset()
+        XCTAssertEqual(keyboard.flagsChanged([], keyCode: 0x39), toggle)
     }
 
     func testFlagsChangedEmitsOnlyModifierDifferencesAndKeepsDragModifier() {
