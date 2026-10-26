@@ -404,6 +404,13 @@
 - [x] 核实锁定 quinn-proto 0.11.16 的 uni=100、单流 1250000 字节、连接 VarInt::MAX 等默认；代码禁用 uni，显式限制 bidi/stream/connection/datagram/crypto/incoming 额度。默认连接/session 改为 64，声明 160MiB 缓冲预算，包含 accepted/rejection/incoming 的默认模型为 152MiB；超预算配置启动拒绝，候选 Compose/Dockerfile 与 256MiB 容器限制对应。未部署。
 - [x] 本地真实 QUIC 资源夹具、最大可靠帧、慢接收端隔离通过；relay 共 38 项常规测试，Clippy all-targets `--locked -- -D warnings`、fmt/diff 检查通过。Linux RSS/cgroup 只读观测和 CLI 已加入；容器实际测量仍待做。主题 `fix(DL2-052): bound relay QUIC buffers and validate admission budgets`，细节见 [relay 资源边界](docs/relay-resource-bounds.md)。
 
+### DL2-053 · P1 · 为 join 与已开始的可靠帧建立应用层截止时间
+
+- [x] 默认 8 秒绝对 join 预算覆盖 admission 后 TLS、accept、请求与回复；超时关闭并回收名额，已 attach 但回复被零窗口阻塞的 participant 也由 guard 清理。新增可配置、非零验证的 join/partial-frame deadline。
+- [x] 默认 30 秒限制不完整 routing header；后续每帧在首个 length 字节后才启动共享 length/body 的绝对截止时间，滴字节不续期、超长在分配前拒绝；认证可靠 lane 正常帧间空闲和完整帧后的 EOF 不断开连接。
+- [x] 新增 6 个 helper 单元及 7 组真实 QUIC deadline 回归；relay lib/bin/deadline/resource/session 共 51 项常规测试、对应 Clippy `--locked -- -D warnings`、fmt/diff 检查通过。512 静默连接本机 probe 已运行，全部有 keepalive PING、最终 admission/worker 为 0；client-connect→应用关闭 p95/p99 为 8020.018/8024.498ms，整个批次至清零 8577.337ms。512 夹具显式声明 2GiB 缓冲预算，未修改生产 64 连接默认或容器配置。
+- **修复主题：** `fix(DL2-053): expire incomplete relay joins and reliable frames`。本机合成验证范围与测量口径见 [relay 读取截止时间](docs/relay-read-deadlines.md)；未做公网探针、部署或真实输入注入。
+
 ## 7. 代码整理与验证体系
 
 ### DL2-040 · P1 · 按实际所有权拆分巨型控制模块

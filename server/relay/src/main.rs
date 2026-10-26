@@ -108,10 +108,25 @@ fn relay_config() -> Result<RelayConfig, Box<dyn Error + Send + Sync>> {
         env::var("DESKLINK_RELAY_BUFFER_BUDGET_MIB").ok().as_deref(),
         (DEFAULT_RELAY_BUFFER_BUDGET_BYTES / (1024 * 1024)) as usize,
     )?;
+    let defaults = RelayConfig::default();
+    let join_timeout_s = bounded_limit(
+        "DESKLINK_RELAY_JOIN_TIMEOUT_S",
+        env::var("DESKLINK_RELAY_JOIN_TIMEOUT_S").ok().as_deref(),
+        defaults.join_timeout.as_secs() as usize,
+    )?;
+    let partial_frame_timeout_s = bounded_limit(
+        "DESKLINK_RELAY_PARTIAL_FRAME_TIMEOUT_S",
+        env::var("DESKLINK_RELAY_PARTIAL_FRAME_TIMEOUT_S")
+            .ok()
+            .as_deref(),
+        defaults.partial_frame_timeout.as_secs() as usize,
+    )?;
     let config = RelayConfig {
         session_ttl: Duration::from_secs(session_ttl_s),
         max_connections,
         max_sessions,
+        join_timeout: Duration::from_secs(join_timeout_s as u64),
+        partial_frame_timeout: Duration::from_secs(partial_frame_timeout_s as u64),
         buffer_budget_bytes: u64::try_from(buffer_budget_mib)?
             .checked_mul(1024 * 1024)
             .ok_or_else(|| {
