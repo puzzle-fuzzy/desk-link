@@ -115,12 +115,23 @@ export class AccountService {
   async resetPassword(tokenInput: unknown, passwordInput: unknown): Promise<void> {
     const token = readToken(tokenInput, "密码重置令牌");
     validatePassword(passwordInput);
-    const record = this.store.consumeActionToken(hashOpaqueToken(token), "reset_password", this.now());
-    if (!record) throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
+    const tokenHash = hashOpaqueToken(token);
+    // A read-only precheck avoids spending the bounded hash budget on invalid
+    // bearer tokens. It is not the final authorization to change the password.
+    if (!this.store.findValidActionToken(tokenHash, "reset_password", this.now())) {
+      throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
+    }
     const passwordHash = await this.passwords.hash(passwordInput);
-    this.store.updatePassword(record.userId, passwordHash, this.now());
-    this.store.revokeUserSessions(record.userId, this.now());
-    this.store.recordAuditEvent({ userId: record.userId, action: "account.password_reset", now: this.now() });
+    this.store.database.transaction(() => {
+      // Capture fresh time after acquiring the write lock: hashing, queueing or
+      // lock contention may have outlived the token's expiry or revocation.
+      const now = this.now();
+      const record = this.store.consumeActionToken(tokenHash, "reset_password", now);
+      if (!record) throw new AccountError("invalid_request", 400, "密码重置链接无效或已过期。 ");
+      this.store.updatePassword(record.userId, passwordHash, now);
+      this.store.revokeUserSessions(record.userId, now);
+      this.store.recordAuditEvent({ userId: record.userId, action: "account.password_reset", now });
+    }).immediate();
   }
 
   private async privacyResponse<T>(operation: () => Promise<T>): Promise<T> {

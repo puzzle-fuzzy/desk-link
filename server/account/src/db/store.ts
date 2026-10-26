@@ -453,6 +453,12 @@ export class AccountStore {
     return row ? mapActionToken(row) : undefined;
   }
 
+  findValidActionToken(tokenHash: string, purpose: ActionTokenPurpose, now: number): ActionTokenRecord | undefined {
+    const row = this.database.query("SELECT * FROM action_tokens WHERE token_hash = ? AND purpose = ? AND consumed_at IS NULL AND expires_at > ?")
+      .get(tokenHash, purpose, now) as ActionTokenRow | null;
+    return row ? mapActionToken(row) : undefined;
+  }
+
   consumeActionToken(tokenHash: string, purpose: ActionTokenPurpose, now: number): ActionTokenRecord | undefined {
     const transaction = this.database.transaction(() => {
       const row = this.database.query("SELECT * FROM action_tokens WHERE token_hash = ? AND purpose = ? AND consumed_at IS NULL AND expires_at > ?")

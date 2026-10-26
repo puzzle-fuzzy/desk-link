@@ -56,3 +56,24 @@ load. It verifies removal of the large early-return/Argon2/provider timing gap;
 it does not establish universal timing indistinguishability. Production-like
 network measurements under idle and saturated budgets remain an explicit
 acceptance step, particularly when CPU pressure makes work exceed the deadline.
+
+## Password reset commit boundary
+
+Reset tokens are high-entropy bearer credentials. A read-only validity check
+rejects missing, expired, consumed and wrong-purpose tokens with the same generic
+400 before they spend Argon2 capacity. Password hashing and its bounded queue run
+outside a database transaction and do not consume the token.
+
+After hashing succeeds, an IMMEDIATE transaction obtains the writer lock and
+reads a fresh clock. It revalidates and consumes the token, updates the password,
+revokes user sessions and appends the reset audit as one commit. Hash failure or
+429 leaves the link reusable; any database failure rolls consumption and all
+account effects back. Expiry or revocation during hashing prevents the commit.
+Two requests for the same token may both finish hashing, but only one commits.
+This does not revoke other independently issued reset links or change account
+status policy.
+
+`src/password-reset-atomic.test.ts` covers the default two-running/sixteen-waiting
+budget saturation, draining and same-token retry, real Argon2 success, two file
+connections racing through a hash barrier, write/audit failures, hash rejection,
+exact expiry, concurrent revocation and post-hash writer-lock contention.
