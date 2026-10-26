@@ -87,7 +87,7 @@ test("retired_active remains listener-specific and malformed signed mixed batche
     { ...original, send_errors: 1 }, { ...original, event: "host_cursor_send" },
     { ...original, event: "host_direct_listener_stopped_v2" }, { ...original, reason: "capability_or_size" },
     { ...original, reason: "listener_closed: raw error" }, { ...original, level: "info" },
-    { ...original, stream_id: 0 }, { ...original, stream_id: -1 }, { ...original, stream_id: "7" },
+    { ...original, stream_id: 0 }, { ...original, stream_id: -1 }, { ...original, stream_id: "07" },
     { ...original, stream_id: 1.5 }, { ...original, stream_id: Number.MAX_SAFE_INTEGER + 1 },
     { ...original, retired_active: "true" }, { ...original, retired_active: 1 }, { ...original, retired_active: null },
     producerEvent("u64_overflow"),

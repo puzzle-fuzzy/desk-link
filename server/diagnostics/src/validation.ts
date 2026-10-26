@@ -1,4 +1,5 @@
 import { createHash, createPublicKey, verify } from "node:crypto";
+import { canonicalU64, parseU64 } from "./diagnostic-u64";
 
 export const MAX_BATCH_BYTES = 64 * 1_024;
 export const SIGNATURE_DOMAIN = Buffer.from("desklink-cloud-diagnostics-v1\0", "utf8");
@@ -60,6 +61,21 @@ const CURSOR_SEND_FIELDS = new Set([
 // DirectListenerStopped product encoding, pinned to 6dbe53d.
 const DIRECT_LISTENER_FIELDS = new Set([
   "schema", "timestamp_unix_ms", "level", "event", "stream_id", "retired_active", "reason",
+]);
+const STREAM_ID = new Set(["stream_id"]);
+const U64_EVENT_FIELDS = new Map<string, ReadonlySet<string>>([
+  ["host_connecting", STREAM_ID], ["host_available", STREAM_ID], ["host_connected", STREAM_ID],
+  ["host_cursor_send", new Set(["stream_id", "send_attempts", "send_errors"])],
+  ["host_direct_listener_stopped", STREAM_ID],
+  ["controller_video_metrics", new Set(["stream_id", "received_video_packets", "dropped_video_packets", "completed_frames",
+    "delivered_video_frames", "video_ipc_overflow_drops", "video_ipc_keyframe_replacements", "input_backpressure_count"])],
+  ["controller_render_metrics", new Set(["stream_id", "received_frames", "submitted_frames", "displayed_frames",
+    "malformed_frames", "coalesced_frame_drops", "first_frame_ms", "max_frame_gap_ms", "profile_probe_ms"])],
+]);
+const U64_FIELD_NAMES = new Set([...U64_EVENT_FIELDS.values()].flatMap(fields => [...fields]));
+const JSON_NUMBER_FIELDS = new Set([
+  "attempt", "retry", "maximum_retries", "delay_ms", "video_path_rtt_ms", "video_path_loss_basis_points",
+  "video_width", "video_height", "decoder_recoveries", "video_pull_failures", "displayed_fps_x100",
 ]);
 
 export interface DiagnosticEvent {
@@ -206,13 +222,14 @@ function validateEvent(value: unknown, nowUnixMs: number, source: DiagnosticBatc
   if (typeof value.event !== "string" || !EVENT_NAME.test(value.event)) {
     throw new BatchValidationError(400, "diagnostic event name is invalid");
   }
+  const stream = parseU64(value.stream_id);
+  const attempts = parseU64(value.send_attempts);
+  const errors = parseU64(value.send_errors);
   if (cursorSend && (
     Object.keys(value).length !== CURSOR_SEND_FIELDS.size
     || source !== "host" || value.level !== "warning"
-    || !Number.isSafeInteger(value.stream_id) || Number(value.stream_id) <= 0
-    || !Number.isSafeInteger(value.send_attempts) || Number(value.send_attempts) < 0
-    || !Number.isSafeInteger(value.send_errors) || Number(value.send_errors) < 0
-    || Number(value.send_errors) > Number(value.send_attempts)
+    || stream === null || stream === 0n
+    || attempts === null || errors === null || errors > attempts
     || typeof value.disabled !== "boolean" || value.reason !== "capability_or_size"
   )) {
     throw new BatchValidationError(400, "host cursor send fields are invalid");
@@ -220,12 +237,24 @@ function validateEvent(value: unknown, nowUnixMs: number, source: DiagnosticBatc
   if (directListenerStopped && (
     Object.keys(value).length !== DIRECT_LISTENER_FIELDS.size
     || source !== "host" || value.level !== "warning"
-    || !Number.isSafeInteger(value.stream_id) || Number(value.stream_id) <= 0
+    || stream === null || stream === 0n
     || typeof value.retired_active !== "boolean" || value.reason !== "listener_closed"
   )) {
     throw new BatchValidationError(400, "host direct listener fields are invalid");
   }
+  const nativeU64Fields = U64_EVENT_FIELDS.get(value.event);
   for (const [key, field] of Object.entries(value)) {
+    if (nativeU64Fields?.has(key)) {
+      const decimal = canonicalU64(field);
+      if (decimal === null || (key === "stream_id" && decimal === "0")) {
+        throw new BatchValidationError(400, `diagnostic u64 field ${key} is invalid`);
+      }
+      continue;
+    }
+    if ((U64_FIELD_NAMES.has(key) && typeof field === "string")
+      || (JSON_NUMBER_FIELDS.has(key) && typeof field !== "number")) {
+      throw new BatchValidationError(400, `diagnostic numeric field ${key} is invalid for event`);
+    }
     if (typeof field === "number" && (!Number.isSafeInteger(field) || field < 0)) {
       throw new BatchValidationError(400, `diagnostic numeric field ${key} is invalid`);
     }

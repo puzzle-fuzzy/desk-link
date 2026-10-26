@@ -306,7 +306,7 @@ describe("correlated diagnostic analysis", () => {
       { ...cursorEvent(), payload_json: "not JSON" },
       { ...cursorEvent(), payload_json: "[]" },
       ...["send_attempts", "send_errors", "stream_id"].flatMap(field => [
-        cursorEvent({ [field]: "1" }), cursorEvent({ [field]: true }), cursorEvent({ [field]: null }), cursorEvent({ [field]: undefined }),
+        cursorEvent({ [field]: "01" }), cursorEvent({ [field]: true }), cursorEvent({ [field]: null }), cursorEvent({ [field]: undefined }),
         cursorEvent({ [field]: -1 }), cursorEvent({ [field]: 1.5 }),
         cursorEvent({ [field]: Number.MAX_SAFE_INTEGER + 1 }), cursorEvent({ [field]: 0 }),
       ]),
@@ -371,7 +371,7 @@ describe("correlated diagnostic analysis", () => {
       { ...directListenerEvent(), event: "controller_video_metrics" },
       { ...directListenerEvent(), payload_json: "not JSON" },
       { ...directListenerEvent(), payload_json: "[]" },
-      ...["7", true, null, undefined, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1].map(stream_id => directListenerEvent({ stream_id })),
+      ...["07", true, null, undefined, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1].map(stream_id => directListenerEvent({ stream_id })),
     ];
     for (const row of invalidRows) {
       const session = analyzeDiagnosticRows([row], 24, NOW).sessions[0]!;
@@ -403,6 +403,147 @@ describe("correlated diagnostic analysis", () => {
     );
     expect(warningHealth.summary.warning).toBe(3);
     expect(warningHealth.requires_attention).toBeTrue();
+  });
+
+  test("canonical render keys merge legacy numeric IDs with decimal strings while adjacent large streams remain distinct", () => {
+    const rows = [
+      event("controller_render_metrics", 0, { stream_id: 7, received_frames: 10, submitted_frames: 10, displayed_frames: 9 }),
+      event("controller_render_metrics", 1, { stream_id: "7", received_frames: "15", submitted_frames: "15", displayed_frames: "14" }),
+      event("controller_render_metrics", 2, { stream_id: "9007199254740992", received_frames: "20", submitted_frames: "20", displayed_frames: "18" }),
+      event("controller_render_metrics", 3, { stream_id: "9007199254740993", received_frames: "30", submitted_frames: "30", displayed_frames: "29" }),
+      // Invalid historical IDs retain the explicit legacy bucket, without
+      // swallowing either of the valid large decimal stream identities.
+      event("controller_render_metrics", 4, { stream_id: "07", received_frames: 4 }),
+      event("controller_render_metrics", 5, { received_frames: 6 }),
+    ];
+    const session = analyzeDiagnosticRows(rows, 24, NOW).sessions[0]!;
+    expect(session.render.received_frames).toBe(71);
+    expect(session.render.submitted_frames).toBe(65);
+    expect(session.render.displayed_frames).toBe(61);
+  });
+
+  test("video u64 snapshots keep exact maxima and cross-attempt totals larger than u64 without exposing BigInt", () => {
+    const max = "18446744073709551615";
+    const snapshot = {
+      stream_id: max, received_video_packets: max, dropped_video_packets: max,
+      completed_frames: max, delivered_video_frames: max, video_ipc_overflow_drops: max,
+      video_ipc_keyframe_replacements: max, input_backpressure_count: max,
+    };
+    const rows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 1, { ...snapshot, attempt: 1, received_video_packets: "18446744073709551614" }),
+      event("controller_video_metrics", 2, { ...snapshot, attempt: 1 }),
+      event("controller_video_metrics", 3, { ...snapshot, attempt: 1 }),
+      event("controller_video_metrics", 4, { ...snapshot, attempt: 2 }),
+    ];
+    const report = analyzeDiagnosticRows(rows, 24, NOW);
+    const session = report.sessions[0]!;
+    const total = "36893488147419103230";
+    expect(session.video).toEqual({
+      received_packets: total, dropped_packets: total, completed_frames: total,
+      delivered_frames: total, video_ipc_overflow_drops: total,
+      video_ipc_keyframe_replacements: total, input_backpressure_count: total, loss_percent: 50,
+    });
+    expect(session.findings.map(finding => finding.code)).toEqual(["high_video_loss", "video_ipc_pressure", "input_backpressure"]);
+    expect(() => JSON.stringify(report)).not.toThrow();
+    expect(JSON.parse(JSON.stringify(report)).sessions[0].video.received_packets).toBe(total);
+    expect(() => JSON.stringify(buildDiagnosticHealthReport(report))).not.toThrow();
+  });
+
+  test("render u64 maxima, totals and first-frame duration stay exact while unchanged u32 counters accept only numbers", () => {
+    const max = "18446744073709551615";
+    const snapshot = {
+      received_frames: max, submitted_frames: max, displayed_frames: max, malformed_frames: max,
+      first_frame_ms: max, decoder_recoveries: 4_294_967_295, video_pull_failures: 4_294_967_295,
+      coalesced_frame_drops: max, max_frame_gap_ms: max,
+    };
+    const report = analyzeDiagnosticRows([
+      event("controller_render_metrics", 1, { ...snapshot, stream_id: "9007199254740992", received_frames: "18446744073709551614" }),
+      event("controller_render_metrics", 2, { ...snapshot, stream_id: "9007199254740992" }),
+      event("controller_render_metrics", 3, { ...snapshot, stream_id: "9007199254740993" }),
+    ], 24, NOW);
+    const session = report.sessions[0]!;
+    expect(session.render).toEqual({
+      received_frames: "36893488147419103230", submitted_frames: "36893488147419103230",
+      displayed_frames: "36893488147419103230", malformed_frames: "36893488147419103230",
+      first_frame_ms: max, decoder_recoveries: 8_589_934_590, video_pull_failures: 8_589_934_590,
+    });
+    expect(session.findings.map(finding => finding.code)).toEqual(["decoder_instability", "video_pull_instability", "slow_first_frame"]);
+    expect(session.render).not.toHaveProperty("coalesced_frame_drops");
+    expect(session.render).not.toHaveProperty("max_frame_gap_ms");
+    const health = JSON.parse(JSON.stringify(buildDiagnosticHealthReport(report)));
+    expect(health.alert_sessions[0].render.first_frame_ms).toBe(max);
+
+    const unchangedU32 = analyzeDiagnosticRows([event("controller_render_metrics", 1, {
+      stream_id: "7", decoder_recoveries: "3", video_pull_failures: "3",
+    })], 24, NOW).sessions[0]!;
+    expect(unchangedU32.render.decoder_recoveries).toBe(0);
+    expect(unchangedU32.render.video_pull_failures).toBe(0);
+    expect(unchangedU32.findings.map(finding => finding.code)).toEqual(["incomplete_evidence"]);
+  });
+
+  test("loss percentages use bounded exact rounding and high-loss thresholds compare the original integer ratio", () => {
+    const analyze = (received: string, dropped: string) => analyzeDiagnosticRows([
+      event("controller_connected", 0),
+      event("controller_video_metrics", 1, { attempt: 1, received_video_packets: received,
+        dropped_video_packets: dropped, completed_frames: "1", delivered_video_frames: "1" }),
+    ], 24, NOW).sessions[0]!;
+    const below = analyze("9000000000000000001", "1000000000000000000");
+    expect(below.video.loss_percent).toBe(10);
+    expect(below.findings.map(finding => finding.code)).toEqual(["healthy_video"]);
+    const exact = analyze("9000000000000000000", "1000000000000000000");
+    expect(exact.video.loss_percent).toBe(10);
+    expect(exact.findings.map(finding => finding.code)).toEqual(["high_video_loss"]);
+    const above = analyze("8999999999999999999", "1000000000000000000");
+    expect(above.findings.map(finding => finding.code)).toEqual(["high_video_loss"]);
+    expect(analyze("9300000000000000000", "300000000000000000").video.loss_percent).toBe(3.13);
+    expect(analyze("0", "18446744073709551615").video.loss_percent).toBe(100);
+    expect(analyze("18446744073709551615", "1").video.loss_percent).toBe(0);
+  });
+
+  test("decimal first-frame and backpressure thresholds retain their exact inclusive boundaries", () => {
+    const analyze = (firstFrame: string, pressure: string) => analyzeDiagnosticRows([
+      event("controller_connected", 0),
+      event("controller_video_metrics", 1, { attempt: 1, completed_frames: "1", input_backpressure_count: pressure }),
+      event("controller_render_metrics", 2, { stream_id: "7", received_frames: "1", displayed_frames: "1", first_frame_ms: firstFrame }),
+    ], 24, NOW).sessions[0]!;
+    expect(analyze("4999", "4").findings.map(finding => finding.code)).toEqual(["healthy_video"]);
+    const threshold = analyze("5000", "5");
+    expect(threshold.findings.map(finding => finding.code)).toEqual(["input_backpressure", "slow_first_frame"]);
+    expect(threshold.render.first_frame_ms).toBe(5000);
+    expect(threshold.video.input_backpressure_count).toBe(5);
+  });
+
+  test("full-u64 host-media fields compare exactly without inferring cursor delivery or network loss", () => {
+    const max = "18446744073709551615";
+    for (const [attempts, errors] of [[max, max], ["9007199254740993", "9007199254740992"]]) {
+      const session = analyzeDiagnosticRows([
+        cursorEvent({ stream_id: max, send_attempts: attempts, send_errors: errors }),
+        directListenerEvent({ stream_id: max, retired_active: false }),
+      ], 24, NOW).sessions[0]!;
+      expect(session.findings.map(finding => finding.code)).toEqual(["cursor_lane_disabled", "direct_listener_stopped"]);
+      expect(session.video.loss_percent).toBeNull();
+      expect(session.video.dropped_packets).toBe(0);
+      expect(session.stop_reason_kinds).toEqual([]);
+      expect(() => JSON.stringify(session)).not.toThrow();
+    }
+    for (const [attempts, errors] of [["18446744073709551614", max], ["9007199254740992", "9007199254740993"]]) {
+      const session = analyzeDiagnosticRows([cursorEvent({ stream_id: max, send_attempts: attempts, send_errors: errors })], 24, NOW).sessions[0]!;
+      expect(session.findings.map(finding => finding.code)).not.toContain("cursor_lane_disabled");
+    }
+  });
+
+  test("host-media analysis rejects noncanonical decimal strings rather than coercing them into u64 values", () => {
+    const malformed = ["", "01", "+1", "-1", "-0", "1.0", "1e3", " 1", "1 ", "0x1", "1_000", "１２",
+      "18446744073709551616", "100000000000000000000"];
+    for (const value of malformed) {
+      for (const field of ["stream_id", "send_attempts", "send_errors"]) {
+        const session = analyzeDiagnosticRows([cursorEvent({ [field]: value })], 24, NOW).sessions[0]!;
+        expect(session.findings.map(finding => finding.code)).not.toContain("cursor_lane_disabled");
+      }
+      const session = analyzeDiagnosticRows([directListenerEvent({ stream_id: value })], 24, NOW).sessions[0]!;
+      expect(session.findings.map(finding => finding.code)).not.toContain("direct_listener_stopped");
+    }
   });
 });
 

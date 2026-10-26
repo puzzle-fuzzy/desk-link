@@ -83,7 +83,7 @@ test("new cursor fields stay event-scoped, typed and bounded; malformed signed m
     { ...original, raw_error: "synthetic-private-error" }, { ...original, peer_id: "synthetic-private-identity" },
     { ...original, received_video_packets: 100 }, { ...original, event: "host_connected" },
     { ...original, event: "host_cursor_send_v2" }, { ...original, reason: "listener_closed" },
-    { ...original, level: "info" }, { ...original, stream_id: 0 }, { ...original, stream_id: "7" },
+    { ...original, level: "info" }, { ...original, stream_id: 0 }, { ...original, stream_id: "07" },
     { ...original, send_attempts: -1 }, { ...original, send_attempts: 2.5 }, { ...original, send_errors: true },
     { ...original, send_errors: 3 }, { ...original, disabled: "true" }, { ...original, disabled: 1 },
     { ...original, send_attempts: Number.MAX_SAFE_INTEGER + 1 }, producerEvent("u64_overflow"),

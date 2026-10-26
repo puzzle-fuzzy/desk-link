@@ -395,6 +395,13 @@
 - [ ] 产品 observer 接线 / 导出、真实 listener 生命周期与 relay 回退验收继续由媒体 / 产品工作面处理，不能据 server 契约测试关闭整个 045。未知未来 schema 仍需真实 producer SHA；永久 400 的桌面重试策略不在本服务验证内。
 - **契约 / 证据：** `server/diagnostics/HOST_MEDIA.md`、`fixtures/host-media-listener-producer.json`、`scripts/generate-host-media-contract.py --event direct-listener`。仅隔离编码 harness 和本地合成签名/SQLite，未连接线上。
 
+#### DL2-044 / DL2-045 · 共享完整 u64 诊断精度切片
+
+- [x] 对齐实际 producer `28c11ee05a08183f7636ede7946e93029c7bbb16`：仅已确认 7 事件 / 18 个 u64 键接受 canonical 十进制字符串（至 `18446744073709551615`），兼容历史 safe-integer 数字；stream 非零，counter / u64 duration 可零，cursor errors ≤ attempts 精确比较。timestamp / u16 / u32 / Duration 数字字段、HostMedia 精确键 / source / reason / boolean 边界不变；未知字段/字符串不扩散。
+- [x] payload 仍存 TEXT JSON，无 schema 迁移；分析用精确本地整数与 canonical stream key，保留相邻大 ID、max / sum / threshold 和超过单个 u64 的汇总；小报告值保持 number，大值输出精确十进制字符串，BigInt 不进入 JSON。
+- [x] 同路径原 Git blob 导入唯一 `apps/windows/tests/fixtures/diagnostic-u64-producer.json`（`58f386235e9dda4c5045b21af9a1a37a53cc39da` / SHA-256 `8d7d3124436b52906c63905340d7fa7a968017de40a639db37efe18489bb19bf`），8 份源指纹均匹配 producer；不改写、不重签。6 当前 + 6 历史升级原始 Rust body/hash/签名 → 真实 loopback HTTP → 验签/schema → 文件 SQLite/重启/去重全部通过；旧 unsafe numeric 原签名批次仍整批 400。原 cursor/listener fixture 字节未变。Bun 1.3.14：诊断 129 测试 / 6017 断言及 typecheck 通过；详见 `server/diagnostics/U64_CONTRACT.md`。
+- [ ] GUI observer / 导出、真实设备和媒体恢复及最终联合候选验收继续保留；null correlation 样本不伪造真实会话，单独合成分组只验证已落库数值分析。本切片不能关闭整个 044 / 045。
+
 ### DL2-054 · P2 · 诊断接收在验签前限额，持久配额限制留存增长
 
 - [x] 在读 body / 验签前按 socket / 显式可信代理 IP 和全局预算准入，有界键状态；为事件、批次、全部可变 TEXT 字节设事务持久配额。

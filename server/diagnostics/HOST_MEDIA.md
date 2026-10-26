@@ -6,21 +6,25 @@ The first accepted typed host-media event is pinned to producer commit
 `apps/windows/src/diagnostics.rs`. The serde `kind: cursor_send` fallback written
 to stderr is a different representation and is not the cloud event contract.
 
-The product encoder emits exactly these fields for `source: host`:
+This historical encoder emits exactly these fields for `source: host`:
 
 ```json
 {"schema":1,"timestamp_unix_ms":1,"level":"warning","event":"host_cursor_send","stream_id":7,"send_attempts":2,"send_errors":1,"disabled":true,"reason":"capability_or_size"}
 ```
 
 The timestamp above is illustrative. Validation uses the existing accepted time
-window. `stream_id` is a positive safe integer; both counters are nonnegative
-safe integers and errors cannot exceed attempts. `disabled` is a boolean,
+window. Historical numeric `stream_id` is a positive safe integer; both numeric
+counters are nonnegative safe integers and errors cannot exceed attempts. The
+current complete-u64 representation also accepts canonical decimal strings for
+these three fields, with exact comparison through UINT64_MAX; see
+[`U64_CONTRACT.md`](U64_CONTRACT.md). `disabled` is a boolean,
 including false for typed snapshots; the reason is the fixed
 `capability_or_size` enum. The three new fields are accepted only for this exact
 event. Extra legacy fields, raw error/identity fields, unknown reasons, a
 controller source and the stderr representation are rejected. Existing safe
-integer limits remain in force: Rust u64 values above 2^53−1 are not silently
-rounded into accepted data.
+integer limits remain in force for JSON numbers: values above 2^53−1 are not
+silently rounded into accepted data. The string representation carries those
+values without precision loss.
 
 The store needs no schema migration: it already retains the entire validated
 payload and deduplicates events/batches. A valid mixed batch containing legacy
@@ -48,11 +52,13 @@ emits exactly seven fields for `source: host`:
 {"schema":1,"timestamp_unix_ms":1,"level":"warning","event":"host_direct_listener_stopped","stream_id":7,"retired_active":true,"reason":"listener_closed"}
 ```
 
-The source, level, fixed reason, positive safe `stream_id` and strict boolean
+The source, level, fixed reason, positive `stream_id` and strict boolean
 `retired_active` are required. Both boolean values are valid; the field records
 whether a selected direct connection was taken out of its slot at shutdown,
 not whether that connection was still healthy. It is allowed only for this
 exact event, without cursor counter fields, endpoints or raw errors.
+As with cursor snapshots, stream IDs accept historical safe-integer numbers or
+canonical nonzero decimal u64 strings.
 
 Analysis emits one `direct_listener_stopped` warning while retaining independent
 video and cursor evidence. The producer retires the listener's direct paths
@@ -76,6 +82,9 @@ Ed25519 key, verifies them through the production validator, submits them throug
 the production app/store, checks exact stored payloads and duplicate receipts,
 then reads the actual analysis rows. Negative cases check event-scoped fields,
 bad types/reasons/source, missing keys, unsafe integers and signature tampering.
+The unsafe numeric u64 cases in these historical fixtures remain negative
+cases. The separate complete-u64 producer fixture supplies positive string
+cases and real Rust-signed batches, as described in `U64_CONTRACT.md`.
 
 Further host-media event shapes require their own reviewed producer SHA;
 neither fixed event opens arbitrary new keys or fallback stderr records.
