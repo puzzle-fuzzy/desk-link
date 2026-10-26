@@ -1,4 +1,5 @@
 import type { ControllerInput } from "./types";
+import { MAX_WHEEL_DELTA } from "./input-contract.generated";
 
 type InputSender = (input: ControllerInput, streamId: number) => Promise<void>;
 type TextSender = (text: string, streamId: number) => Promise<void>;
@@ -11,14 +12,8 @@ interface QueuedInput {
   reject?: (error: unknown) => void;
 }
 
-// Wheel events are discrete for ordering purposes, but a stalled IPC call can
-// otherwise let a high-resolution wheel generate an unbounded queue.  Keeping
-// a bounded accumulated delta preserves responsiveness without dropping key
-// or mouse-button transitions.
-const MAX_COALESCED_WHEEL_DELTA = 4_800;
-
-function clampCoalescedWheelDelta(value: number): number {
-  return Math.max(-MAX_COALESCED_WHEEL_DELTA, Math.min(MAX_COALESCED_WHEEL_DELTA, value));
+function sameDirection(left = 0, right = 0): boolean {
+  return left === 0 || right === 0 || Math.sign(left) === Math.sign(right);
 }
 
 /**
@@ -32,6 +27,7 @@ export class RemoteInputDispatcher {
   private pumping: Promise<void> | null = null;
   private readonly pendingMouseMove = { x: 0, y: 0, streamId: 0 };
   private hasPendingMouseMove = false;
+  private generation = 0;
 
   constructor(
     private readonly sender: InputSender,
@@ -40,6 +36,10 @@ export class RemoteInputDispatcher {
   ) {}
 
   enqueue(input: ControllerInput, streamId: number): void {
+    if (input.kind === "wheel" && (!Number.isSafeInteger(input.deltaX ?? 0) || !Number.isSafeInteger(input.deltaY ?? 0))) {
+      this.onError();
+      return;
+    }
     this.flushPendingMouseMove();
     const last = this.queue.length > this.queueHead
       ? this.queue[this.queue.length - 1]
@@ -49,13 +49,13 @@ export class RemoteInputDispatcher {
       input.kind === "wheel"
       && last?.input?.kind === "wheel"
       && last.streamId === streamId
+      && sameDirection(last.input.deltaX, input.deltaX)
+      && sameDirection(last.input.deltaY, input.deltaY)
+      && Number.isSafeInteger((last.input.deltaX ?? 0) + (input.deltaX ?? 0))
+      && Number.isSafeInteger((last.input.deltaY ?? 0) + (input.deltaY ?? 0))
     ) {
-      last.input.deltaX = clampCoalescedWheelDelta(
-        (last.input.deltaX ?? 0) + (input.deltaX ?? 0),
-      );
-      last.input.deltaY = clampCoalescedWheelDelta(
-        (last.input.deltaY ?? 0) + (input.deltaY ?? 0),
-      );
+      last.input.deltaX = (last.input.deltaX ?? 0) + (input.deltaX ?? 0);
+      last.input.deltaY = (last.input.deltaY ?? 0) + (input.deltaY ?? 0);
     } else if (
       input.kind === "mouseMove"
       && last?.input?.kind === "mouseMove"
@@ -119,6 +119,7 @@ export class RemoteInputDispatcher {
   }
 
   discardAll(): void {
+    this.generation += 1;
     for (let index = this.queueHead; index < this.queue.length; index += 1) {
       this.queue[index]?.reject?.(new Error("Remote input was cleared"));
     }
@@ -158,7 +159,20 @@ export class RemoteInputDispatcher {
             if (!this.textSender) throw new Error("Remote text sender is unavailable");
             await this.textSender(queued.text, queued.streamId);
           } else if (queued.input) {
-            await this.sender(queued.input, queued.streamId);
+            if (queued.input.kind === "wheel") {
+              const generation = this.generation;
+              let x = queued.input.deltaX ?? 0;
+              let y = queued.input.deltaY ?? 0;
+              while ((x !== 0 || y !== 0) && generation === this.generation) {
+                const deltaX = Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, x));
+                const deltaY = Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, y));
+                await this.sender({ kind: "wheel", deltaX, deltaY }, queued.streamId);
+                x -= deltaX;
+                y -= deltaY;
+              }
+            } else {
+              await this.sender(queued.input, queued.streamId);
+            }
           }
           queued.resolve?.();
         } catch (error) {

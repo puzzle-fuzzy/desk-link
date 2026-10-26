@@ -1,5 +1,5 @@
-export const MAX_POINTER_COORDINATE = 1_000_000;
-export const MAX_WHEEL_DELTA = 1_200;
+import { MAX_POINTER_COORDINATE, MAX_WHEEL_DELTA } from "./input-contract.generated";
+export { MAX_POINTER_COORDINATE, MAX_WHEEL_DELTA } from "./input-contract.generated";
 
 export type PointerBounds = Pick<DOMRectReadOnly, "left" | "top" | "width" | "height">;
 

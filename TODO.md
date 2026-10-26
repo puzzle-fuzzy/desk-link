@@ -75,7 +75,8 @@
 
 ### DL2-001 · P1 · 修复滚轮合并与 Rust 上限冲突
 
-- [ ] 统一跨层输入边界，发送时拆分合并滚轮事件。
+- [x] 统一跨层输入边界，发送时拆分合并滚轮事件。
+- **修复 / 自动验证：** `fix(DL2-001): preserve wheel distance within protocol event bounds`；前端常量由 Rust 协议生成，build 检查漂移；累计不截断，按 1200 拆分并保留反向、按钮顺序、stream 及取消边界。Bun 1.3.14 `bun test src/remote-input-dispatcher.test.ts src/remote-input.test.ts` 27 通过；`bun run build` 通过。5000/10000 单位合成背压、水平与负向、取消已覆盖；未做真实输入注入。
 - **证据 / 类型：复现缺陷。** `apps/windows-ui/src/remote-input-dispatcher.ts:18,49-57` 将滚轮合并至 4800；`crates/desklink-protocol/src/lib.rs:70` 上限 1200；`apps/windows-ui/src-tauri/src/controller.rs:4656-4663` 拒绝超限。现有 dispatcher 测试反而把 4800 当作正确输出。
 - **用户影响：** 快速滚动且 IPC 有背压时，整个合并事件被拒绝，滚动距离丢失；`apps/windows-ui/src/controller.ts:275-277` 的空错误处理令失败不可见。
 - **方案：** 由共享契约产生边界常量；累计量和单事件发送上限分离；按合法分片发送并保留方向、总量及按钮/按键顺序。不能用简单 clamp 丢弃剩余滚动量。

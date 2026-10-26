@@ -135,7 +135,7 @@ describe("remote input dispatcher", () => {
     ]);
   });
 
-  test("coalesces a stalled wheel burst into one bounded event", async () => {
+  test("splits a stalled wheel burst within the native bound without losing distance", async () => {
     const first = deferred();
     const sent: Array<{ input: ControllerInput; streamId: number }> = [];
     const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
@@ -152,11 +152,11 @@ describe("remote input dispatcher", () => {
     first.resolve();
     await dispatcher.drain();
 
-    expect(sent).toHaveLength(2);
-    expect(sent[1]).toEqual({
-      input: { kind: "wheel", deltaX: 4_800, deltaY: 4_800 },
-      streamId: 7,
-    });
+    expect(sent).toHaveLength(10);
+    const wheels = sent.slice(1).map(({ input }) => input);
+    expect(wheels.every(({ deltaX = 0, deltaY = 0 }) => Math.abs(deltaX) <= 1200 && Math.abs(deltaY) <= 1200)).toBe(true);
+    expect(wheels.reduce((sum, input) => sum + (input.deltaX ?? 0), 0)).toBe(10_000);
+    expect(wheels.reduce((sum, input) => sum + (input.deltaY ?? 0), 0)).toBe(10_000);
   });
 
   test("preserves button ordering around coalesced movement", async () => {
@@ -238,4 +238,52 @@ describe("remote input dispatcher", () => {
 
     expect(sent).toEqual([30]);
   });
+});
+
+test("5000 units preserve horizontal direction reversals and button ordering", async () => {
+  const first = deferred();
+  const sent: Array<{ input: ControllerInput; streamId: number }> = [];
+  const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
+    sent.push({ input, streamId });
+    if (sent.length === 1) await first.promise;
+  });
+  dispatcher.enqueue({ kind: "key", key: "a", pressed: true }, 1);
+  for (let n = 0; n < 50; n++) dispatcher.enqueue({ kind: "wheel", deltaX: 100, deltaY: -100 }, 1);
+  dispatcher.enqueue({ kind: "wheel", deltaX: -500, deltaY: 500 }, 1);
+  dispatcher.enqueue({ kind: "mouseButton", button: "left", pressed: true }, 1);
+  dispatcher.enqueue({ kind: "wheel", deltaX: 200, deltaY: 200 }, 2);
+  first.resolve();
+  await dispatcher.drain();
+  expect(sent.slice(1, 6).map(({input}) => input.deltaX)).toEqual([1200,1200,1200,1200,200]);
+  expect(sent.slice(1, 6).reduce((sum, {input}) => sum + (input.deltaY ?? 0), 0)).toBe(-5000);
+  expect(sent.slice(6)).toEqual([
+    { input: {kind: "wheel", deltaX: -500, deltaY: 500}, streamId: 1 },
+    { input: {kind: "mouseButton", button: "left", pressed: true}, streamId: 1 },
+    { input: {kind: "wheel", deltaX: 200, deltaY: 200}, streamId: 2 },
+  ]);
+});
+
+test("discard cancels remaining fragments of a wheel already being sent", async () => {
+  const first = deferred();
+  const sent: Array<{ input: ControllerInput; streamId: number }> = [];
+  const dispatcher = new RemoteInputDispatcher(async (input, streamId) => {
+    sent.push({ input, streamId });
+    if (sent.length === 1) await first.promise;
+  });
+  dispatcher.enqueue({kind: "wheel", deltaY: 5000}, 1);
+  dispatcher.discardAll();
+  dispatcher.enqueue({kind: "wheel", deltaY: -100}, 2);
+  first.resolve();
+  await dispatcher.drain();
+  expect(sent.map(({input,streamId}) => [input.deltaY, streamId])).toEqual([[1200,1],[-100,2]]);
+});
+
+test("invalid wheel values cannot create a non-terminating fragment loop", async () => {
+  let errors = 0;
+  const sent: ControllerInput[] = [];
+  const dispatcher = new RemoteInputDispatcher(async (input) => { sent.push(input); }, () => { errors++; });
+  for (const deltaY of [Infinity, NaN, 1.5]) dispatcher.enqueue({ kind: "wheel", deltaY }, 1);
+  await dispatcher.drain();
+  expect(errors).toBe(3);
+  expect(sent).toEqual([]);
 });
