@@ -48,7 +48,7 @@ use crate::{
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
     transfer::{
-        IncomingFile, OutgoingFile, chunk_after_resume, confirm_file_offer, notify_file_received,
+        IncomingFileWorker, OutgoingFile, chunk_after_resume, confirm_file_offer, notify_file_received,
         pick_outgoing_file, prepare_outgoing_file, read_clipboard_text, verify_resume_prefix,
         write_clipboard_text,
     },
@@ -2790,31 +2790,20 @@ async fn receive_transfer_loop(
     secure: SharedSecureSession,
     peer_generation: u64,
 ) -> Result<(), HostRuntimeError> {
-    let mut incoming = ResumableHostIncoming::default();
+    let mut incoming = None;
     let result =
-        receive_transfer_loop_inner(client, secure, peer_generation, &mut incoming.0).await;
-    if let Some(file) = incoming.0.take() {
-        let _ = tokio::task::spawn_blocking(move || file.preserve()).await;
+        receive_transfer_loop_inner(client, secure, peer_generation, &mut incoming).await;
+    if let Some(file) = incoming.take() {
+        let _ = file.preserve().await;
     }
     result
-}
-
-#[derive(Default)]
-struct ResumableHostIncoming(Option<IncomingFile>);
-
-impl Drop for ResumableHostIncoming {
-    fn drop(&mut self) {
-        if let Some(file) = self.0.take() {
-            let _ = file.preserve();
-        }
-    }
 }
 
 async fn receive_transfer_loop_inner(
     client: Arc<QuicClient>,
     secure: SharedSecureSession,
     peer_generation: u64,
-    incoming: &mut Option<IncomingFile>,
+    incoming: &mut Option<IncomingFileWorker>,
 ) -> Result<(), HostRuntimeError> {
     let mut outgoing: Option<HostOutgoingTransfer> = None;
     let (outgoing_events, mut pending_outgoing_events) =
@@ -2985,19 +2974,14 @@ async fn receive_transfer_loop_inner(
                     if !accepted {
                         (TransferResult::Rejected, 0, None)
                     } else {
-                        match tokio::task::spawn_blocking(move || {
-                            IncomingFile::create(transfer_id, name, size)
-                        })
-                        .await
-                        {
-                            Ok(Ok(file)) => {
+                        match IncomingFileWorker::create(transfer_id, name, size).await {
+                            Ok(file) => {
                                 let resume_offset = file.resume_offset();
                                 let resume_prefix_hash = file.resume_prefix_hash();
                                 *incoming = Some(file);
                                 (TransferResult::Completed, resume_offset, resume_prefix_hash)
                             }
-                            Ok(Err(result)) => (result, 0, None),
-                            Err(_) => (TransferResult::IoFailed, 0, None),
+                            Err(result) => (result, 0, None),
                         }
                     }
                 };
@@ -3066,13 +3050,12 @@ async fn receive_transfer_loop_inner(
                 offset,
                 bytes,
             } => {
-                let result = incoming
-                    .as_mut()
-                    .filter(|file| file.transfer_id() == transfer_id)
-                    .ok_or(TransferResult::InvalidData)
-                    .and_then(|file| file.write_chunk(offset, &bytes));
+                let result = match incoming.as_mut().filter(|file| file.transfer_id() == transfer_id) {
+                    Some(file) => file.write_chunk(offset, bytes).await,
+                    None => Err(TransferResult::InvalidData),
+                };
                 if let Err(result) = result {
-                    incoming.take();
+                    if let Some(file) = incoming.take() { file.cancel(); }
                     send_transfer_response(
                         &client,
                         &secure,
@@ -3091,9 +3074,7 @@ async fn receive_transfer_loop_inner(
             } => {
                 let result = match incoming.take() {
                     Some(file) if file.transfer_id() == transfer_id => {
-                        tokio::task::spawn_blocking(move || file.finish(content_hash))
-                            .await
-                            .unwrap_or(Err(TransferResult::IoFailed))
+                        file.finish(content_hash).await
                     }
                     _ => Err(TransferResult::InvalidData),
                 };
@@ -3120,7 +3101,7 @@ async fn receive_transfer_loop_inner(
                     .as_ref()
                     .is_some_and(|file| file.transfer_id() == transfer_id)
                 {
-                    incoming.take();
+                    if let Some(file) = incoming.take() { file.cancel(); }
                 }
                 if outgoing
                     .as_ref()
