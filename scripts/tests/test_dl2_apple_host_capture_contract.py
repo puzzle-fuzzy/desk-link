@@ -39,7 +39,9 @@ class HostCaptureContractTests(unittest.TestCase):
         cls.swift_tests = source("apps/macos/Tests/DeskLinkAppTests/HostBridgeTests.swift")
 
     def test_native_callback_retires_before_ui_dispatch_and_ui_checks_receipt(self):
-        callback = body(self.bridge, "private func desklinkHostEventCallback(")
+        native = body(self.bridge, "private func desklinkHostEventCallback(")
+        self.assertIn("scheduleHostCallbackEvent(callbackContext, event.pointee)", native)
+        callback = body(self.bridge, "private func scheduleHostCallbackEvent(")
         self.assertLess(callback.index("captureAdmission.observe("), callback.index("DispatchQueue.main.async"))
         self.assertLess(callback.index("captureAdmission.matches(receipt)"), callback.index("bridge.consume(mapped)"))
         self.assertIn("mediaGeneration: value.media_generation", callback)

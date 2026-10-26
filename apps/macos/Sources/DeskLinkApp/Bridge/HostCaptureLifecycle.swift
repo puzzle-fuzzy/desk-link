@@ -1,5 +1,6 @@
 import CoreGraphics
 import CoreVideo
+import DeskLinkAppleCore
 import Foundation
 
 enum HostCaptureConnectionPhase: Equatable, Sendable {
@@ -25,6 +26,22 @@ struct HostCaptureOwner: Equatable, Hashable, Sendable {
 struct OwnedHostVideoEvent: Equatable, Sendable {
     let owner: HostCaptureOwner
     let event: EncodedVideoEvent
+}
+
+/// Original Rust input identity. Swift does not allocate or learn a current
+/// epoch from an input callback; Rust validates it against published geometry.
+struct HostInputContext: Equatable, Sendable {
+    let streamID: UInt64
+    let inputEpoch: UInt64
+}
+
+struct HostInputDelivery: Sendable {
+    let admission: HostCaptureAdmission
+    let connectionReceipt: HostCaptureConnectionReceipt
+    let captureOwner: HostCaptureOwner
+    let mediaGeneration: UInt64
+    let context: HostInputContext
+    let command: RemoteInputCommand
 }
 
 /// Shared by the native callback thread and final MainActor admission. Each
@@ -99,6 +116,32 @@ final class HostCaptureAdmission: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard permits(owner) else { return nil }
+        return body()
+    }
+
+    /// Snapshots the existing capture grant on the native callback thread.
+    /// Never call observe/register here or adopt a callback's epoch as current.
+    func captureInput(mediaGeneration: UInt64, context: HostInputContext,
+                      command: RemoteInputCommand) -> HostInputDelivery? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let capture, permits(capture), mediaGeneration > 0,
+              mediaGeneration == capture.mediaGeneration,
+              context.streamID > 0, context.streamID == capture.streamID,
+              context.inputEpoch > 0 else { return nil }
+        return HostInputDelivery(admission: self, connectionReceipt: receipt(), captureOwner: capture,
+                                 mediaGeneration: mediaGeneration, context: context, command: command)
+    }
+
+    /// Final synchronous OS admission. No network/crypto lock is held. Native
+    /// retirement cannot run between this check and the local backend call.
+    func withInputAdmission<T>(_ input: HostInputDelivery, _ body: () -> T) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard input.admission === self, input.connectionReceipt == receipt(),
+              permits(input.captureOwner), input.mediaGeneration == input.captureOwner.mediaGeneration,
+              input.context.streamID == input.captureOwner.streamID,
+              input.context.inputEpoch > 0 else { return nil }
         return body()
     }
 

@@ -238,6 +238,10 @@
 - [x] Mac Host 最后投递归属：每 capture attempt 独立 source / encoder，所有配置 / 帧 / 错误闭包绑定 immutable runtime / connection receipt / native media_generation / stream；native callback 同步退役 gate，主线程 receipt 校验后最终 scoped C admission。失败 / 取消的 stream 号不复用；新 start 等旧 start / stop cleanup barrier，旧 catch / stop 不能影响后继 encoder。捕获错误只退役自身并保留可重试告警，旧错误不全局停止新 Noise。新增 8 项 portable 合同通过；10 个合成 Swift 生命周期 / 调度用例未运行，不能代替实际 ScreenCaptureKit / VideoToolbox / 权限 / GPU 验收。主题 `fix(DL2-013): retire captured host resources before a successor can start`。
 - [x] 本地组合门禁：`test -p desklink-ffi --lib --tests --locked` 实跑 88 passed / 0 failed / 0 ignored；`python -m unittest discover -s scripts/tests -p "test_*.py"` 实跑 201 passed；双 C 头生成检查、fmt / diff 检查通过。日志在 `E:/desk-link/.worktrees/dl2-targets/apple-ffi/evidence/`，最终不可变 HEAD 与日志哈希由交接证据绑定。Windows 本分支 producer 的 epoch=0 隔离占位仍待整合 Windows 联合快照；不能将 FFI 套通过宣称整包可交付。
 
+- [x] P2 排队输入的最终注入 admission 跟进（独立于冻结 f954）：修复旧 A.input 已排 MainActor、native 已观察 Connecting / B Connected、Swift state 尚显示 connected 时旧点击仍被注入的缺口。HostEvent 保留原 fixed Noise media_generation 与完整 InputEnvelope；C callback 传原 grant、stream_id、input_epoch，双头与 ABI 尾字段同步，不从 current 重新贴标签。native input 入队时固定连接 receipt / capture owner / 原 context，最后注入必须同时满足 captureRunning、当前 capture / runtime 身份及同一 native admission，检查和本地同步 backend 调用共享短 gate 临界区。ReleaseAll 与用户取消保持清理语义；不持 crypto / 网络锁跨注入。主题 `fix(DL2-013): preserve native host input admission until final injection`。
+- [x] 本条 Windows 实跑：FFI lib/tests 91 passed（新增 2 个真实 QUIC / Noise input 归属回环、1 个实际 C callback 快照；含全部 C struct sizeof / align / offset）；Python 全套 208 passed（新增 7 个输入 admission 源码合同）；workspace all-targets check、严格 FFI all-targets Clippy、双头生成、fmt / diff 检查通过。证据在 `E:/desk-link/.worktrees/dl2-targets/apple-ffi/evidence/host-input-admission/`。
+- [ ] 本条 Apple 行为验收：新增 6 个不调用真实系统注入的 Swift recording backend / native callback 调度用例，覆盖两个 UI 滞后交错、合法 B 输入、原 owner/context 不重贴、退役 capture、release / stop；Windows 无 Swift/Xcode，尚未编译或执行。真实 Mac 输入与权限验收、未来同 stream 完整源拓扑 / epoch 的权威映射仍不在本条已证范围，不整体关闭 013。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

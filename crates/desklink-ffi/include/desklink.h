@@ -229,6 +229,8 @@ typedef struct DesklinkHostInput {
     uint32_t character;
     uint8_t pressed;
     uint8_t modifiers;
+    uint64_t stream_id;
+    uint64_t input_epoch;
 } DesklinkHostInput;
 
 typedef struct DesklinkHostMetrics {

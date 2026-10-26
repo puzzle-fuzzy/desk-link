@@ -282,6 +282,9 @@ pub struct DesklinkHostInput {
     pub character: u32,
     pub pressed: u8,
     pub modifiers: u8,
+    /// Original input authorization context, never relabelled at dispatch.
+    pub stream_id: u64,
+    pub input_epoch: u64,
 }
 
 impl Default for DesklinkHostInput {
@@ -297,6 +300,8 @@ impl Default for DesklinkHostInput {
             character: 0,
             pressed: 0,
             modifiers: 0,
+            stream_id: 0,
+            input_epoch: 0,
         }
     }
 }
@@ -323,7 +328,7 @@ pub struct DesklinkHostEvent {
     pub fingerprint_len: usize,
     pub input: DesklinkHostInput,
     pub metrics: DesklinkHostMetrics,
-    /// Fixed producer grant from the Connected event; zero on other events.
+    /// Original Noise grant on Connected and Input; zero on other events.
     pub media_generation: u64,
 }
 
@@ -444,9 +449,15 @@ impl HostCallbackState {
                 c_event.controller_device_id = device_id;
                 c_event.controller_verify_key = verify_key;
             }
-            HostEvent::Input(input) => {
+            HostEvent::Input {
+                media_generation,
+                input,
+            } => {
                 c_event.kind = DesklinkHostEventKind::Input;
-                c_event.input = convert_host_input(input);
+                c_event.media_generation = media_generation;
+                c_event.input = convert_host_input(input.event);
+                c_event.input.stream_id = input.stream_id;
+                c_event.input.input_epoch = input.input_epoch;
             }
             HostEvent::Transfer(message) => {
                 data = encode_transfer(&message).ok();
@@ -2223,7 +2234,7 @@ fn dispatch_host_events(runtime: Arc<HostRuntime>, callback: Arc<HostCallbackSta
             Ok(event @ HostEvent::ApprovalRequested { .. }) => {
                 callback.emit(event, HostState::WaitingForApproval)
             }
-            Ok(event @ HostEvent::Input(_)) => callback.emit(event, HostState::Connected),
+            Ok(event @ HostEvent::Input { .. }) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::Transfer(_)) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::KeyframeRequested) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::ReleaseAll) => callback.emit(event, runtime.state()),
@@ -2487,6 +2498,59 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_input_c_callback_keeps_original_noise_grant_and_input_context() {
+        type Snapshot = (DesklinkHostEventKind, u64, u64, u64, u32, u8);
+        extern "C" fn record(context: *mut c_void, event: *const DesklinkHostEvent) {
+            let snapshots = unsafe { &mut *context.cast::<Vec<Snapshot>>() };
+            let event = unsafe { &*event };
+            snapshots.push((
+                event.kind,
+                event.media_generation,
+                event.input.stream_id,
+                event.input.input_epoch,
+                event.input.button,
+                event.input.pressed,
+            ));
+        }
+        let mut snapshots = Vec::<Snapshot>::new();
+        let callback =
+            HostCallbackState::new(Some(record), (&mut snapshots as *mut Vec<Snapshot>).cast());
+        let input = HostEvent::Input {
+            media_generation: 101,
+            input: desklink_protocol::InputEnvelope {
+                sequence: 7,
+                timestamp_us: 8,
+                stream_id: 9,
+                input_epoch: 47,
+                event: InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                },
+            },
+        };
+        callback.emit(input.clone(), HostState::Connected);
+        callback.emit(
+            HostEvent::Connected {
+                media_generation: 202,
+            },
+            HostState::Connected,
+        );
+        // This invokes the real C callback conversion after successor B became
+        // visible. Delayed A must retain A's original grant and nonzero target.
+        callback.emit(input, HostState::Connected);
+        callback.emit(HostEvent::ReleaseAll, HostState::Connecting);
+        assert_eq!(
+            snapshots,
+            vec![
+                (DesklinkHostEventKind::Input, 101, 9, 47, 1, 1),
+                (DesklinkHostEventKind::State, 202, 0, 0, 0, 0),
+                (DesklinkHostEventKind::Input, 101, 9, 47, 1, 1),
+                (DesklinkHostEventKind::ReleaseAll, 0, 0, 0, 0, 0),
+            ]
+        );
+    }
 
     #[test]
     fn connected_callback_preserves_the_queued_grant_and_zeroes_other_events() {

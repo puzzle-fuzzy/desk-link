@@ -34,7 +34,7 @@ fn c_header_layout_matches_every_public_rust_struct() {
     layout!(DesklinkPairingInfo; session_id, code, expires_at_unix_s);
     layout!(DesklinkInput; kind, x, y, wheel_x, wheel_y, button, key_code, character, pressed, modifiers, stream_id, input_epoch);
     layout!(DesklinkEvent; kind, data, data_len, stream_id, frame_id, config_version, width, height, state, error_code, recoverable, input_epoch);
-    layout!(DesklinkHostInput; kind, x, y, wheel_x, wheel_y, button, key_code, character, pressed, modifiers);
+    layout!(DesklinkHostInput; kind, x, y, wheel_x, wheel_y, button, key_code, character, pressed, modifiers, stream_id, input_epoch);
     layout!(DesklinkHostMetrics; sent_video_configs, sent_video_packets, received_input_events, keyframe_requests);
     layout!(DesklinkHostEvent; kind, state, data, data_len, controller_device_id, controller_verify_key, fingerprint, fingerprint_len, input, metrics, media_generation);
     layout!(DesklinkSavedHostMaterial; session_id, relay_authentication, host_verify_key, server_name, expires_at_unix_s, authorization_type, directory_device_id, directory_access_code);
