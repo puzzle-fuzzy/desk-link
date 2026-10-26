@@ -408,6 +408,7 @@
 - **复核：** 036～039 后的 `enforceRateLimit` 仍取 XFF 最左项，原 RateLimiter 在有效窗口内无键数上限；038 已将邮件移出请求，不能再描述成同步外发。
 - **实现（`fix(DL2-055)`）：** Bun 注入 socket peer；默认不信任转发头，精确配置 `DESKLINK_ACCOUNT_TRUSTED_PROXIES` 后仅接受直属代理覆盖的单值合法 X-Real-IP。最多 16,384 桶，每次最多检查 16 项过期状态；满额拒绝新键，不淘汰有效耗尽额度。
 - **验证（2026-10-26）：** Bun 1.3.14 账号 49 测试 / 397 断言及 typecheck 通过；直连/可信反代/缺 socket context、伪造 XFF/CF/X-Real-IP、IPv4-mapped peer、1 万随机键洪泛与额度保持回归通过。未部署代理；部署时须按 README 配置可信精确 peer、覆盖头和阻断外部直连。
+- [x] 独立修复继承的缺失邮箱身份桶问题（`fix(DL2-055)` 后续提交）：真实复现 11 个不同 IP / 不同账号 / 有效 reset 与 verify token 的第 11 次均 429。现只有真实邮箱动作的合法规范化邮箱使用邮箱桶；token 动作忽略 body.email，保留原可信 IP 额度并将 GET/POST verify 纳入同一全局 120/min 前置预算。定向 9 测试 / 383 断言、完整账号 79 测试 / 1072 断言及 typecheck 通过，覆盖跨身份互不耗尽、同源额度、GET/POST 共桶、121 次前置拒绝且 token 未消费、email 注入隔离与合法邮箱限额保持；未连接线上/provider。
 
 ### DL2-056 · P2 · 均衡账号发现路径并限制未认证计算资源
 

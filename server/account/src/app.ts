@@ -4,6 +4,7 @@ import { cleanupAccountHistory } from "./db/retention";
 import type { AccountConfig } from "./config";
 import { loadAccountConfig } from "./config";
 import { AccountError } from "./domain/errors";
+import { normalizeEmail } from "./domain/email";
 import { RateLimiter } from "./domain/rate-limit";
 import type { PasswordOperations } from "./domain/password";
 import { errorResponse, corsHeaders, jsonResponse, noContent, readJson, requestId } from "./http";
@@ -51,7 +52,10 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
           return new Response(null, { status: 204, headers: { ...cors, "x-request-id": id } });
         }
         const url = new URL(request.url);
-        if (request.method === "POST" && /^\/v1\/account\/(register|login|verify-email\/resend|password\/(forgot|reset))$/.test(url.pathname)
+        const publicAction = (request.method === "POST"
+          && /^\/v1\/account\/(register|login|verify-email(?:\/resend)?|password\/(forgot|reset))$/.test(url.pathname))
+          || (request.method === "GET" && url.pathname === "/v1/account/verify-email");
+        if (publicAction
           && !requestBudget.allow("unauthenticated", 120, 60, now())) {
           throw new AccountError("rate_limited", 429, "请求过于频繁，请稍后再试。");
         }
@@ -91,6 +95,7 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
           return jsonResponse({ user: await accounts.verifyEmail(body.token) }, 200, id, cors);
         }
         if (request.method === "GET" && url.pathname === "/v1/account/verify-email") {
+          enforceRateLimit(rateLimiter, ip, "verify-email", {}, now());
           const user = await accounts.verifyEmail(url.searchParams.get("token"));
           return htmlResponse("邮箱验证成功", `邮箱 ${escapeHtml(user.email)} 已验证成功，现在可以返回 DeskLink 登录。`, id);
         }
@@ -183,7 +188,12 @@ function enforceRateLimit(
   body: Record<string, unknown>,
   now: number,
 ): void {
-  const email = typeof body.email === "string" ? body.email.trim().toLowerCase().slice(0, 320) : "missing";
+  let email: string | undefined;
+  if (scope === "register" || scope === "login" || scope === "forgot-password" || scope === "resend-verification") {
+    // Only actions whose identity really is an email get an email bucket. Token
+    // actions must ignore arbitrary body.email and never share a missing bucket.
+    try { email = normalizeEmail(body.email); } catch { /* The action validates invalid input. */ }
+  }
   const limits: Record<string, [number, number]> = {
     register: [5, 3_600],
     "verify-email": [10, 600],
@@ -194,7 +204,7 @@ function enforceRateLimit(
   };
   const [limit, windowSeconds] = limits[scope] ?? [20, 60];
   const allowed = limiter.allow(`${scope}:ip:${ip}`, limit, windowSeconds, now)
-    && limiter.allow(`${scope}:email:${email}`, limit, windowSeconds, now);
+    && (email === undefined || limiter.allow(`${scope}:email:${email}`, limit, windowSeconds, now));
   if (!allowed) throw new AccountError("rate_limited", 429, "请求过于频繁，请稍后再试。");
 }
 

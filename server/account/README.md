@@ -61,6 +61,8 @@ bun run src/outbox-admin.ts /absolute/path/account.sqlite retry <outbox-id>
 
 生产环境只应通过反向代理暴露 HTTPS。Bun 将 socket peer 交给 app；直连按 peer 限流。显式配置可信代理时，代理必须使用 `proxy_set_header X-Real-IP $remote_addr` 覆盖客户端头。缺失/非法单值头回退为代理 peer，没有 socket context 的测试/嵌入调用共享 `unknown` 桶。限流最多保存 16,384 个键，每次固定最多检查 16 个过期键；容量用尽拒绝新键，避免淘汰仍有效的耗尽桶后重置其额度。
 
+只有注册、登录、找回与重发等邮箱动作中的合法规范化邮箱才占用邮箱额度。密码重置与邮箱验证按可信 IP 和全局预算限流，不使用共享的 `email:missing`，也不采用 token 请求中额外注入的 email。验证的 GET/POST 共用 IP 额度；敏感 POST 与 GET 邮箱验证合计共享 120 次/分钟的前置全局预算，不因删除缺失邮箱桶而放开总量。
+
 ## 数据和安全边界
 
 - 用户密码只保存 Argon2id 哈希。

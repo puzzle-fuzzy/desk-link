@@ -11,8 +11,11 @@ this is a mitigation, not a constant-time cryptographic claim.
 
 Unauthenticated resource limits apply before this extra work:
 
-- Global 120 sensitive POST requests per minute, before reading the body,
-  independent of client IP or account existence; per-peer and email limits remain.
+- Global 120 sensitive POST actions and GET email-verification actions per minute,
+  before reading the body, independent of client IP or account existence.
+  Per-peer limits remain; only actual email-based actions with a valid normalized
+  email use an email quota. Reset/verification bearer-token actions never share
+  a missing-email bucket and ignore injected `body.email` as an identity.
 - Request body 16 KiB and total body-read timeout 2 seconds. Bun also applies
   the body size limit at the socket boundary.
 - Process-wide maximum two Argon2 operations and sixteen waiting operations;
