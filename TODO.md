@@ -227,6 +227,8 @@
 - [x] 复用产品组有序 input sender：来源 `3ea72dc7f5a66d4cd96c197c0aadb7603cee2436`（其最小前置为bc合同+b473桥接，本分支已有等价9ad）；Runtime与clone共用序号并持input专用锁至可靠写完成，secure锁不跨网络await。此依赖的本分支接入回归将在后续worker切片记录，不能引用来源分支结果冒充当前证明。
 - [x] 共享 sender 接入回归：修正本分支 direct-silence 夹具的共享序号器构造；`python scripts/run-windows-cargo.py test -p desklink-ffi --lib --tests --locked` 实跑 71 项通过，包含 sender/runtime 加密序号与原始 context、直连静默及 C ABI 布局。此项仅证明 sender 接口，worker 并发事件轮询仍待后续切片。
 
+- [x] Host 配置版本跟进：保存完整已发布 VideoConfig；同 stream 任何版本回退在发布前拒绝，同版本的解码配置（含 SPS/PPS、尺寸、epoch、codec/protocol）必须完全一致；幂等重试不重发配置或把后续 delta 误标 CONFIG，新 stream 仍可从 version 1 开始。旧 access unit 不重贴新版本。`test -p desklink-ffi --test host_runtime --locked` 实跑 23 项通过（新增 4 个真实本地回环）；完整配置比较单测从当前编译的测试二进制运行通过。日志位于本机 apple-ffi target/evidence/host-version-*.log；Swift producer 最后投递归属另有后续切片，不能以此项替代。主题 `fix(DL2-013): reject regressed or mutated host decoder configurations`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

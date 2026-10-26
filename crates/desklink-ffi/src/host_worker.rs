@@ -992,21 +992,16 @@ impl HostInputPolicy {
 
 #[derive(Default)]
 struct VideoState {
-    config: Option<PublishedVideoConfig>,
+    config: Option<VideoConfig>,
     next_access_unit_is_keyframe: bool,
-}
-
-#[derive(Clone, Copy)]
-struct PublishedVideoConfig {
-    context: InputContext,
-    version: u32,
-    width: u16,
-    height: u16,
 }
 
 impl VideoState {
     fn input_context(&self) -> Option<InputContext> {
-        self.config.map(|config| config.context)
+        self.config.as_ref().map(|config| InputContext {
+            stream_id: config.stream_id,
+            input_epoch: config.input_epoch,
+        })
     }
 
     fn validate_geometry_version(
@@ -1016,13 +1011,34 @@ impl VideoState {
         width: u16,
         height: u16,
     ) -> Result<(), HostError> {
-        if let Some(current) = self.config
-            && current.context.stream_id == stream_id
+        if let Some(current) = self.config.as_ref()
+            && current.stream_id == stream_id
             && (current.width, current.height) != (width, height)
-            && version <= current.version
+            && version <= current.config_version
         {
             return Err(HostError::Protocol(
                 "input geometry requires a new video configuration version".into(),
+            ));
+        }
+        if let Some(current) = self.config.as_ref()
+            && current.stream_id == stream_id
+            && version < current.config_version
+        {
+            return Err(HostError::Protocol(
+                "video configuration version regressed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_decoder_configuration(&self, incoming: &VideoConfig) -> Result<(), HostError> {
+        if let Some(current) = self.config.as_ref()
+            && incoming.stream_id == current.stream_id
+            && incoming.config_version == current.config_version
+            && incoming != current
+        {
+            return Err(HostError::Protocol(
+                "video decoder configuration changed without increasing version".into(),
             ));
         }
         Ok(())
@@ -1034,11 +1050,13 @@ impl VideoState {
         width: u16,
         height: u16,
     ) -> Result<InputContext, HostError> {
-        if let Some(current) = self.config
-            && (current.context.stream_id, current.width, current.height)
-                == (stream_id, width, height)
+        if let Some(current) = self.config.as_ref()
+            && (current.stream_id, current.width, current.height) == (stream_id, width, height)
         {
-            return Ok(current.context);
+            return Ok(InputContext {
+                stream_id: current.stream_id,
+                input_epoch: current.input_epoch,
+            });
         }
         // The current FFI host only exposes encoded dimensions and stream ID.
         // A display ID/capture-topology generation must be added before these
@@ -1080,6 +1098,12 @@ async fn handle_command(
                 height,
                 sequence_header: bytes,
             };
+            video.validate_decoder_configuration(&config)?;
+            // Exact retries are idempotent. They neither republish the config
+            // nor relabel the next delta access unit as a configuration frame.
+            if video.config.as_ref() == Some(&config) {
+                return Ok(true);
+            }
             let plaintext = encode_video_config(&config).map_err(protocol_error)?;
             if video
                 .input_context()
@@ -1095,12 +1119,7 @@ async fn handle_command(
                 .send_video_config(ciphertext)
                 .await
                 .map_err(transport_error)?;
-            video.config = Some(PublishedVideoConfig {
-                context,
-                version,
-                width,
-                height,
-            });
+            video.config = Some(config);
             video.next_access_unit_is_keyframe = true;
             metrics.sent_video_configs = metrics.sent_video_configs.saturating_add(1);
             Ok(true)
@@ -1111,10 +1130,10 @@ async fn handle_command(
             config_version,
             bytes,
         } => {
-            let Some(config) = video.config else {
+            let Some(config) = video.config.as_ref() else {
                 return Err(HostError::InvalidState);
             };
-            if (stream_id, config_version) != (config.context.stream_id, config.version) {
+            if (stream_id, config_version) != (config.stream_id, config.config_version) {
                 return Err(HostError::InvalidState);
             }
             let config_flag = video.next_access_unit_is_keyframe;
@@ -1262,12 +1281,14 @@ mod tests {
 
     use super::{
         HostCommand, HostError, HostEvent, HostInputPolicy, HostState, InputClockAnchor,
-        PublishedVideoConfig, VideoState, WorkerPhase, advance_input_epoch,
-        allocate_input_epoch_with, command_is_admissible, contains_idr, emit_nonterminal,
-        emit_required, emit_terminal, is_retryable_host_error, record_terminal_admission,
-        try_advance_worker_phase, wait_for_approval_with_timeout,
+        VideoState, WorkerPhase, advance_input_epoch, allocate_input_epoch_with,
+        command_is_admissible, contains_idr, emit_nonterminal, emit_required, emit_terminal,
+        is_retryable_host_error, record_terminal_admission, try_advance_worker_phase,
+        wait_for_approval_with_timeout,
     };
-    use desklink_protocol::{InputContext, InputEnvelope, InputEvent};
+    use desklink_protocol::{
+        Codec, InputContext, InputEnvelope, InputEvent, PROTOCOL_VERSION, VideoConfig,
+    };
     use ed25519_dalek::SigningKey;
     use tokio::sync::{mpsc, watch};
 
@@ -1471,23 +1492,66 @@ mod tests {
         let context = state.context_for_geometry(7, 640, 360).unwrap();
         // Planning a configuration does not grant it before publication.
         assert_eq!(state.input_context(), None);
-        state.config = Some(PublishedVideoConfig {
-            context,
-            version: 1,
+        state.config = Some(VideoConfig {
+            protocol_version: PROTOCOL_VERSION,
+            stream_id: context.stream_id,
+            input_epoch: context.input_epoch,
+            config_version: 1,
+            codec: Codec::H264,
             width: 640,
             height: 360,
+            sequence_header: vec![0, 0, 0, 1, 0x67, 0x4d],
         });
         assert_eq!(state.context_for_geometry(7, 640, 360).unwrap(), context);
-        state.config.as_mut().unwrap().version = 2;
+        state.config.as_mut().unwrap().config_version = 2;
         assert!(state.validate_geometry_version(7, 2, 800, 600).is_err());
         assert!(state.validate_geometry_version(7, 1, 800, 600).is_err());
         assert!(state.validate_geometry_version(7, 3, 800, 600).is_ok());
         assert!(state.validate_geometry_version(7, 2, 640, 360).is_ok());
+        assert!(state.validate_geometry_version(7, 1, 640, 360).is_err());
         // A new stream is a distinct (stream, config_version) frame namespace.
         assert!(state.validate_geometry_version(8, 1, 800, 600).is_ok());
         assert_eq!(state.context_for_geometry(7, 640, 360).unwrap(), context);
         assert_ne!(state.context_for_geometry(7, 800, 600).unwrap(), context);
         assert_ne!(state.context_for_geometry(8, 640, 360).unwrap(), context);
+    }
+
+    #[test]
+    fn same_version_requires_the_complete_published_decoder_configuration() {
+        let config = VideoConfig {
+            protocol_version: PROTOCOL_VERSION,
+            stream_id: 7,
+            input_epoch: 15,
+            config_version: 2,
+            codec: Codec::H264,
+            width: 640,
+            height: 360,
+            sequence_header: vec![0, 0, 0, 1, 0x67, 0x4d, 0, 31],
+        };
+        let state = VideoState {
+            config: Some(config.clone()),
+            ..VideoState::default()
+        };
+        assert!(state.validate_decoder_configuration(&config).is_ok());
+        let mut changed = config.clone();
+        changed.sequence_header[5] = 0x64;
+        assert!(state.validate_decoder_configuration(&changed).is_err());
+        changed = config.clone();
+        changed.input_epoch += 1;
+        assert!(state.validate_decoder_configuration(&changed).is_err());
+        changed = config.clone();
+        changed.width += 1;
+        assert!(state.validate_decoder_configuration(&changed).is_err());
+        changed = config.clone();
+        changed.height += 1;
+        assert!(state.validate_decoder_configuration(&changed).is_err());
+        changed = config.clone();
+        changed.protocol_version -= 1;
+        assert!(state.validate_decoder_configuration(&changed).is_err());
+        changed = config.clone();
+        changed.config_version += 1;
+        changed.sequence_header[5] = 0x64;
+        assert!(state.validate_decoder_configuration(&changed).is_ok());
     }
 
     #[test]

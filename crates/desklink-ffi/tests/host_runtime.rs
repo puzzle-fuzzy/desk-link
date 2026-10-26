@@ -575,20 +575,20 @@ async fn publish_raw_config(
     width: u16,
     height: u16,
 ) -> VideoConfig {
-    send_command_eventually(
-        host,
-        HostCommand::SendVideoConfig {
-            stream_id,
-            version,
-            width,
-            height,
-            bytes: vec![
-                0, 0, 0, 1, 0x67, 0x4d, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
-            ],
-        },
-    )
-    .await;
+    send_command_eventually(host, raw_config_command(stream_id, version, width, height)).await;
     controller.receive_video_config().await
+}
+
+fn raw_config_command(stream_id: u64, version: u32, width: u16, height: u16) -> HostCommand {
+    HostCommand::SendVideoConfig {
+        stream_id,
+        version,
+        width,
+        height,
+        bytes: vec![
+            0, 0, 0, 1, 0x67, 0x4d, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
+        ],
+    }
 }
 
 async fn fill_event_queue(host: &HostRuntime) {
@@ -895,6 +895,116 @@ async fn host_input_context_follows_published_stream_and_geometry_not_encoder_ve
         .await;
     expect_input(&host, current_event).await;
     expect_no_input_until_quiet(&host).await;
+    host.destroy();
+}
+
+async fn expect_config_rejection_before_publication(
+    host: HostRuntime,
+    controller: &mut RawController,
+    command: HostCommand,
+) {
+    send_command_eventually(&host, command).await;
+    wait_for_state(&host, HostState::Closed).await;
+    assert!(
+        !matches!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                controller.client.next_video_config()
+            )
+            .await,
+            Ok(Ok(_))
+        ),
+        "invalid decoder configuration was published before rejection"
+    );
+    let events = terminal_events(&host).await;
+    assert!(matches!(
+        events.as_slice(),
+        [
+            HostEvent::ReleaseAll,
+            HostEvent::Error(HostError::Protocol(_)),
+            HostEvent::State(HostState::Closed)
+        ]
+    ));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_rejects_same_geometry_configuration_version_rollback_before_publication() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    publish_raw_config(&host, &mut controller, 9, 2, 640, 360).await;
+    expect_config_rejection_before_publication(
+        host,
+        &mut controller,
+        raw_config_command(9, 1, 640, 360),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_rejects_same_version_sps_profile_changes_before_publication() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    publish_raw_config(&host, &mut controller, 9, 2, 640, 360).await;
+    let mut changed = raw_config_command(9, 2, 640, 360);
+    if let HostCommand::SendVideoConfig { bytes, .. } = &mut changed {
+        bytes[5] = 0x64;
+    }
+    expect_config_rejection_before_publication(host, &mut controller, changed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_configuration_retry_is_not_republished_and_quality_version_can_advance() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    let first = publish_raw_config(&host, &mut controller, 9, 1, 640, 360).await;
+    send_command_eventually(&host, raw_config_command(9, 1, 640, 360)).await;
+    let quality = publish_raw_config(&host, &mut controller, 9, 2, 640, 360).await;
+    assert_eq!(
+        quality.config_version, 2,
+        "duplicate config must not remain queued for the peer"
+    );
+    assert_eq!(quality.input_epoch, first.input_epoch);
+    let new_stream = publish_raw_config(&host, &mut controller, 10, 1, 640, 360).await;
+    assert_eq!(new_stream.config_version, 1);
+    assert_ne!(new_stream.input_epoch, quality.input_epoch);
+    expect_release_all(&host).await;
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_access_unit_version_is_never_relabelled_as_the_new_configuration() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    publish_raw_config(&host, &mut controller, 9, 2, 640, 360).await;
+    send_command_eventually(
+        &host,
+        HostCommand::SendVideoAccessUnit {
+            stream_id: 9,
+            frame_id: 1,
+            config_version: 1,
+            bytes: vec![0, 0, 0, 1, 0x65, 1],
+        },
+    )
+    .await;
+    wait_for_state(&host, HostState::Closed).await;
+    assert!(!matches!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            controller.client.next_video_datagram()
+        )
+        .await,
+        Ok(Ok(_))
+    ));
+    let events = terminal_events(&host).await;
+    assert!(matches!(
+        events.as_slice(),
+        [
+            HostEvent::ReleaseAll,
+            HostEvent::Error(HostError::InvalidState),
+            HostEvent::State(HostState::Closed)
+        ]
+    ));
     host.destroy();
 }
 
