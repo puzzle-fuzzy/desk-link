@@ -52,16 +52,16 @@ enum ProbeCrypto<'a> {
 impl ProbeCrypto<'_> {
     async fn seal(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DirectLanProbeError> {
         match self {
-            Self::Exclusive(secure) => secure.seal(SecureLane::VideoDatagram, bytes),
-            Self::Shared(secure) => secure.lock().await.seal(SecureLane::VideoDatagram, bytes),
+            Self::Exclusive(secure) => secure.seal(SecureLane::DirectProbe, bytes),
+            Self::Shared(secure) => secure.lock().await.seal(SecureLane::DirectProbe, bytes),
         }
         .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))
     }
 
     async fn open(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DirectLanProbeError> {
         match self {
-            Self::Exclusive(secure) => secure.open(SecureLane::VideoDatagram, bytes),
-            Self::Shared(secure) => secure.lock().await.open(SecureLane::VideoDatagram, bytes),
+            Self::Exclusive(secure) => secure.open(SecureLane::DirectProbe, bytes),
+            Self::Shared(secure) => secure.lock().await.open(SecureLane::DirectProbe, bytes),
         }
         .map_err(|error| DirectLanProbeError::Crypto(error.to_string()))
     }
@@ -718,6 +718,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_probe_survives_video_window_and_still_rejects_replays() {
+        let (mut initiator, mut responder) = connected_secure_sessions();
+        let outbound_probe = ProbeCrypto::Exclusive(&mut initiator)
+            .seal(b"delayed request")
+            .await
+            .unwrap();
+        let inbound_probe = ProbeCrypto::Exclusive(&mut responder)
+            .seal(b"delayed response")
+            .await
+            .unwrap();
+        for _ in 0..256 {
+            let video = initiator
+                .seal(SecureLane::VideoDatagram, b"host video")
+                .unwrap();
+            assert_eq!(
+                responder.open(SecureLane::VideoDatagram, &video).unwrap(),
+                b"host video"
+            );
+            let reverse = responder
+                .seal(SecureLane::VideoDatagram, b"peer video")
+                .unwrap();
+            assert_eq!(
+                initiator.open(SecureLane::VideoDatagram, &reverse).unwrap(),
+                b"peer video"
+            );
+        }
+        assert_eq!(
+            ProbeCrypto::Exclusive(&mut responder)
+                .open(&outbound_probe)
+                .await
+                .unwrap(),
+            b"delayed request"
+        );
+        assert_eq!(
+            ProbeCrypto::Exclusive(&mut initiator)
+                .open(&inbound_probe)
+                .await
+                .unwrap(),
+            b"delayed response"
+        );
+        assert!(
+            ProbeCrypto::Exclusive(&mut responder)
+                .open(&outbound_probe)
+                .await
+                .is_err()
+        );
+        assert!(
+            ProbeCrypto::Exclusive(&mut initiator)
+                .open(&inbound_probe)
+                .await
+                .is_err()
+        );
+        let probe = ProbeCrypto::Exclusive(&mut initiator)
+            .seal(b"lane isolated")
+            .await
+            .unwrap();
+        assert!(responder.open(SecureLane::VideoDatagram, &probe).is_err());
+        assert_eq!(
+            ProbeCrypto::Exclusive(&mut responder)
+                .open(&probe)
+                .await
+                .unwrap(),
+            b"lane isolated"
+        );
+    }
+
+    #[tokio::test]
     async fn shared_probe_network_wait_does_not_hold_media_crypto_lock() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let responder = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
@@ -746,6 +813,19 @@ mod tests {
             .seal(SecureLane::Control, b"input remains live")
             .unwrap();
         drop(secure);
+        for _ in 0..256 {
+            let video = initiator_secure
+                .lock()
+                .await
+                .seal(SecureLane::VideoDatagram, b"moving desktop")
+                .unwrap();
+            responder_secure
+                .lock()
+                .await
+                .open(SecureLane::VideoDatagram, &video)
+                .unwrap();
+        }
+
         assert_eq!(
             responder_secure
                 .lock()
