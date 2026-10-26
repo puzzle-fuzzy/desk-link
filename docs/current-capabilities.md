@@ -86,7 +86,7 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 | --- | --- | --- |
 | 044 | 锁定Quinn拥塞淘汰旧包返回Ok，公开错误无QueueFull，wait内部Blocked等待；原一次拥塞结束会话的P1论证不成立 | 剩余cursor真实能力/尺寸/连接错误传播及可选通道降级，由媒体实际loopback/禁用对端/超限/终态回归；observer尝试/错误数不是实际丢包 |
 | 045 | Some(Err)原实现已continue；原瞬态Err永久禁用叙述不成立 | 剩余None终态可观测性和失败握手恢复验证，不重复算已有正确逻辑的修复 |
-| 046 | 取消树已由独立3277c2a实现，本工程已有9c41195等价提交 | 完成仲裁/覆盖仍待受控时序验证，不能由JoinSet存在直接关闭整项 |
+| 046 | 初始取消树已由3277c2a实现，本工程已有9c41195等价提交；冻结媒体65c的交接另将165fcca路径所有权/迟到结果仲裁切片列为主项完成 | 本工程未引入该后续切片或复跑来源；源分支完成不等于本工程/joint已通过，详见下方冻结记录 |
 | 048 | key经Noise message3 payload认证解密；未直接纳入Ed签名不足以证明已确认P1/网络替换或UKS路径 | 熵源/派生防御纵深与篡改/拼接测试待评估；不据此直接改crypto或背书新缺陷严重性 |
 
 上述分类没有新增真实远控/性能证明，也没有修改其他编号完成状态；其他新项继续按owner复核当前分支后逐项记录。
@@ -106,3 +106,18 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 | 媒体021修复及最终joint | 另一parent已固定为 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，源TODO及协调方报告transfer28与严格Clippy通过；协调方报告已开始27fec+65c真实remerge，10份人工resolution/新增联合测试已备份并有SHA256清单 | 最终jointSHA/完整报告仍待交付。本工程未复跑来源测试、未读取备份清单或joint WIP；备份不等于文件已纳入最终提交，合并后须重跑跨包严格检查及所有适用测试 |
 
 原产品16594与媒体89bd的合并安排、旧joint审查和工程d6f153e失败报告均保留其历史身份。021来源层已有修复及28项通过报告，联合层仍待复验；上述来源进展不关闭041联合验收、013完整生产接线或真实设备门禁。
+
+## 媒体源分支冻结交接（65c70fd）
+
+本工程只读核对 `E:/desk-link/.worktrees/dl2-targets/windows-media/validation/final-validation.json` 与同目录 `windows-media-handoff.json`。验证manifest的source_revision/source_revision_after均为 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，working_status为空；协调方另已核对该源HEAD、干净工作树与Cargo.lock哈希。冻结交接包含37笔提交，完整来源清单留在handoff，不按整文件覆盖或丢失逐问题历史。
+
+来源测试分三组为266通过/17忽略、177通过/1忽略、FFI controller_runtime 5通过/0忽略，合计 **448通过、0失败、18忽略**；manifest另记录workspace/all-targets check、指定媒体/共享包lib/tests严格Clippy与workspace fmt通过。它没有声明完整FFI、Bun/前端/安装包、真实远控或原生设备全部通过，18项忽略保留为未运行。完整计数及哈希核对见[审查证据记录](second-stage-review-evidence.md)。这些是媒体源范围结果，本工程未复跑，不替代最终joint树及Apple完整稳定来源聚合后的验收。
+
+| 交接主项状态 | 编号 / 已实现范围 | 仍需保留的边界 |
+| --- | --- | --- |
+| 完成（仅三项） | 020：可靠视频builder增量构造/复用buffer；046：同peer首接纳路径所有权、按Arc身份退役和迟到结果取消；050：重复视频chunk保留首次payload且不延长生命 | 仅对应65c源分支交接状态；不直接修改本工程或joint的完成状态 |
+| 部分实现 | 015：复用staging纹理与NV12 scratch | 仍有CPU读回；GPU缩放、NV12 surface、MFT设备绑定与租借池未实现，不能称GPU surface链完成 |
+| 部分实现 | 030：单次流式源hash、Windows只读snapshot、peer退出取消 | 仍限256MiB；大文件/4GiB、目录与持久块证明未实现 |
+| 切片完成、主项未完成 | 010、011、012、013、014、016、021、022、023、044、045 | 各自pending仍按handoff保留：生产者/呈现/产品接线、真实硬件成功编码、GPU/双机性能、慢盘/驱动/睡眠恢复或实际诊断等不能由源码和合成测试代替 |
+
+041与013保持未完成，当前工程过渡源码仍不可作为可交付整包；待最终joint完整SHA/原始报告和Apple完整依赖稳定聚合后再整体收口。

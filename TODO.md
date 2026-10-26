@@ -451,6 +451,8 @@
 
 - **021来源修复已交付（`docs(DL2-042): distinguish verified media source repair from pending joint acceptance`）：** 只读核对65c70fd658d0526a8a27b75fdbf120ae065222bf直接parent6dbe53d，仅TODO+transfer；ready发送失败同磁盘线程先preserve再退出。源TODO与协调方报告transfer28、lib/tests严格Clippy通过，回归源码覆盖真实open barrier/drop future、9次prefix/offset/hash保留、完整续传及空part/显式cancel/初始化错误/sync失败。当前为“源分支修复已验证、joint待复验”，不再把65c写成未修代码；协调方报告产品已开始27fec+65c真实remerge，本工程未操作joint或复跑来源，最终jointSHA/严格检查及所有适用测试报告仍待交付。
 
+- **媒体冻结交接范围（`docs(DL2-042): record frozen media evidence without widening completion claims`）：** 只读65c的final-validation与windows-media-handoff，记录source前后SHA/空working_status/Cargo.lock和报告SHA256、448通过0失败18忽略及37笔提交；只作为来源结果，本工程未复跑。主项仅020/046/050完成，其他按切片/部分实现与pending保留；015仍CPU读回且GPU surface链未实现，030仍256MiB/无目录、大文件与持久块证明。046后续源切片不冒充本工程已有初始取消树。041/013和可交付性不因来源计数关闭，最终joint/Apple完整稳定聚合证据待交付。
+
 ## 8. 扩展角色
 
 ### DL2-043 · P3 · 被控 Mac 的能力协商与实际编码一致

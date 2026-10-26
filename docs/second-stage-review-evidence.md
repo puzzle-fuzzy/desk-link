@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | DL2-044 | Cargo.lock锁定quinn0.11.11 / quinn-proto0.11.16；send_datagram用drop=true入队，拥塞可淘汰旧未发包后返回Ok。公开SendDatagramError只有UnsupportedByPeer/Disabled/TooLarge/ConnectionLost，无QueueFull；wait把内部Blocked保留为Pending。DeskLink cursor仍经?传播真实编码/seal/能力/尺寸/连接错误，peer编排select会接受其返回 | 原“队列满立即QueueFull、一次拥塞结束会话”不成立。剩余为可选cursor通道的真实错误分类/降级与作用域回归；严重性依据媒体实际测试，不沿用原拥塞P1论证。发送observer只能记录尝试/返回错误，不能记作真实丢包 |
 | DL2-045 | main `a905b88` 的 `accept_host_direct_connection` 已是 `let incoming = endpoint.accept().await?; let Ok(connection) = incoming else { continue; };`；`?`传播的是外层Option的None，Some(Err)继续循环 | “任一accept Err永久禁用直连”的原P1叙述不成立。剩余是None终态的可观测性，以及失败握手后仍能接收下一连接的恢复回归；不能把原实现已正确的分支重复算作修复 |
-| DL2-046 | main原出站探测曾为脱离生命周期的spawn；shared-probe独立提交 `3277c2a41af0ac923e1daa1c5cab5d952b355b9b` 已用JoinSet管理取消树，本工程复用为 `9c4119581508fc08c895aa8e3b24063ad03e657e` | 取消树部分与完成仲裁/活动连接覆盖分开。当前工程已有前者；后者继续由媒体owner用受控完成顺序回归验证，不能把已修部分再报一遍，也不能由JoinSet存在推导完成仲裁已正确 |
+| DL2-046 | main原出站探测曾为脱离生命周期的spawn；shared-probe独立提交 `3277c2a41af0ac923e1daa1c5cab5d952b355b9b` 已用JoinSet管理取消树，本工程复用为 `9c4119581508fc08c895aa8e3b24063ad03e657e` | 取消树部分与完成仲裁/活动连接覆盖分开。当前工程已有前者；后者随后由媒体165fcca切片处理，65c冻结handoff列046主项完成。本工程未引入或复跑后者，不能由初始JoinSet推导后续仲裁已在本工程接通，源交接完成也不代joint验收 |
 | DL2-048 | `NoiseInitiator::receive` 把auth与session_key放入message3 payload，经Snow.write_message；responder先经read_handshake_message/Snow.read_message再拆出key。vendored Snow握手payload经过decrypt_and_mix_hash，带key时调用decrypt_ad并混入hash。Ed25519输入未直接包含key不等于key是网络可替换的未认证明文字段 | 现有证据不足以确认为P1漏洞，未发现已复现的网络替换/UKS路径；按熵源、派生与防御纵深评估待证。授权端点知道最终密钥，单独展示恶意端点选择/泄露它不足以证明外部攻击者突破认证。不据此直接改crypto |
 
 044逐层核对本工程 `runtime.rs::send_cursor_loop` / peer select、transport `quic.rs::send_datagram` 及锁定缓存源码：quinn的 `connection.rs::Connection::send_datagram`（436）、公开错误枚举（1295）、`SendDatagram::poll`（837），quinn-proto的 `connection/datagrams.rs::Datagrams::send`（38）。与[版本化Connection API说明](https://docs.rs/quinn/0.11.11/quinn/struct.Connection.html#method.send_datagram)一致：非等待入队可淘汰旧包，wait在拥塞时等空间。这里核对的是API/实现语义，不是已运行的网络故障复现。
@@ -48,3 +48,13 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 协调方报告Apple最新源分支完整FFI71项、Python186项与双头检查实跑通过，013 worker owned future仍在进行；本次未给该报告的完整源码SHA，本工程不擅自绑定所见动态branch head。工程 `d6f153e` 的旧FFI Host8通过/2失败、旧joint的两个MacHost失败均属于未整合完整Apple ABI/Host链的快照，不能外推到Apple当前源分支。等待Apple最终稳定SHA和完整依赖一起整合，保留已有等价API/Sender扩展并去重，不单独flat-pick9ad；来源通过仍不能替代joint实际复跑、Swift/Xcode或真实Mac presented。
 
 最终joint计划以27fec为第一parent，以媒体65c70fd为另一parent；协调方报告产品已开始真实remerge，保留完整原问题历史、审计resolution和新联合测试。旧89bd仍是已核对缺陷来源，65c才是已交付修复来源。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验这些备份，也未操作joint WIP。最终revision须实际包含所需resolution/测试，重跑跨包严格检查与所有适用测试，并交付源码身份和原始报告，才能更新联合验收状态。
+
+## 媒体冻结manifest与交接范围
+
+本工程只读两份已交付文件：`E:/desk-link/.worktrees/dl2-targets/windows-media/validation/final-validation.json` 及 `windows-media-handoff.json`，没有读取或操作媒体/joint工作树。前者记录source_revision及source_revision_after均为 `65c70fd658d0526a8a27b75fdbf120ae065222bf`、working_status为空、Cargo.lock SHA256为 `4a3df4b7fc92340f5296c0691eb77c78ae8d45d689f1d2b323aec7fb371427f6`，与该固定Git对象Cargo.lock原始bytes计算结果吻合；源HEAD/干净工作树另由协调方确认。本工程读取报告并核对固定Git对象及日志，不把报告字段当作自行实跑或对动态工作树的当前检查。
+
+三组来源测试分别为Windows lib/tests 266通过/17忽略、protocol/crypto/transport/video/session 177通过/1忽略、FFI controller_runtime 5通过，合计448通过/0失败/18忽略。本工程重新合计final-1/2/3原日志的test-result行，分别17/19/1条，与manifest summary及handoff totals吻合；零测试行未增加通过数。其余三项为workspace/all-targets check、指定windows/transport/protocol/crypto/video包lib/tests严格Clippy、workspace fmt，退出码均为0；不是完整workspace Clippy或完整FFI/Swift/Bun/安装包结果。交接没有执行interactive desktop/live relay/physical soak忽略项，未运行真实远控/输入注入或发布。
+
+本次读取文件的SHA256：final-validation为 `9657b095b2050e17c1a1f96b33710db7504799b57bf6a8b90c074380a8d8b67e`；handoff为 `8a0f884575dcc42060bdddc4c08326469efaf6f226d513ddc6d3ff7fb5261bfb`。哈希仅绑定这次报告快照，文件路径后续可变化，不把它们当最终joint证据。
+
+handoff列37笔唯一提交，本工程核对其SHA/subject/ancestry均与Git对象吻合，集合精确覆盖main基线a905b88至65c的37笔提交，已包含三条imported contract，不额外再加三笔。仅020/046/050主项标完成，015/030明确部分实现，其他11项仅切片完成并有pending。015仍CPU读回，GPU缩放/NV12 surface/MFT设备绑定/租借池未实现；030仍256MiB，无大文件/4GiB、目录或持久块证明。046源分支的后续165fcca所有权/迟到结果切片不得与本工程已复用的初始3277取消树混为一笔。041/013和整包可交付性继续以最终joint及Apple完整稳定聚合的实际证据为准，不据448/18或37提交数关闭。
