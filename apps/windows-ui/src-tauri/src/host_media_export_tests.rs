@@ -12,7 +12,7 @@ use std::{
 
 use apps_windows::{
     diagnostics::DiagnosticLog,
-    runtime::{CursorDisableReason, HostMediaDiagnostic},
+    runtime::{CursorDisableReason, DirectListenerStopReason, HostMediaDiagnostic},
 };
 use serde::Deserialize;
 
@@ -163,13 +163,13 @@ fn cursor_callback_persists_exact_fields_and_reaches_the_production_report_build
 }
 
 #[derive(Deserialize)]
-struct CursorProducerFixture {
+struct HostMediaProducerFixture {
     producer_commit: String,
-    cases: Vec<CursorProducerCase>,
+    cases: Vec<HostMediaProducerCase>,
 }
 
 #[derive(Deserialize)]
-struct CursorProducerCase {
+struct HostMediaProducerCase {
     name: String,
     line: String,
 }
@@ -180,7 +180,7 @@ fn cursor_observer_matches_the_committed_producer_cases_with_exact_u64_values() 
     // This is producer/log compatibility, not a server-acceptance test. In
     // particular, u64_overflow is a services rejection case: the GUI must still
     // retain its original Rust u64 values, without rounding, clamping or hiding.
-    let fixture: CursorProducerFixture = serde_json::from_str(include_str!(
+    let fixture: HostMediaProducerFixture = serde_json::from_str(include_str!(
         "../tests/fixtures/host-media-cursor-producer.json"
     ))
     .unwrap();
@@ -300,5 +300,160 @@ fn cursor_observer_matches_the_committed_producer_cases_with_exact_u64_values() 
                 > 0
         );
         assert_eq!(actual, expected, "producer fixture case {}", case.name);
+    }
+}
+
+#[test]
+fn listener_observer_matches_committed_cases_and_preserves_them_in_the_report() {
+    // Byte-for-byte services fixture bf5d7eb27f3f41be59ac317b63d7e93d10f38066.
+    // u64_overflow is a server-negative case; retaining it locally does not
+    // assert cloud acceptance. Listener closure records a past local event,
+    // without implying that the current session recovered or became healthy.
+    let fixture: HostMediaProducerFixture = serde_json::from_str(include_str!(
+        "../tests/fixtures/host-media-listener-producer.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture.producer_commit,
+        "6dbe53d64c60bbdd50af4b592ebef7471b800fcc"
+    );
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>(),
+        ["retired_true", "retired_false", "max_safe", "u64_overflow"]
+    );
+    let temporary = TemporaryDirectory::new();
+    let snapshot = inactive_host_snapshot();
+    let controller = ControllerRuntimeSummary {
+        state: "idle",
+        title: "控制端未连接".to_owned(),
+        detail: "本地报告测试".to_owned(),
+        stream_id: None,
+    };
+    for case in fixture.cases {
+        let mut expected: serde_json::Value = serde_json::from_str(&case.line).unwrap();
+        assert_eq!(expected["schema"].as_u64(), Some(1), "{}", case.name);
+        assert_eq!(expected["level"].as_str(), Some("warning"), "{}", case.name);
+        assert_eq!(
+            expected["event"].as_str(),
+            Some("host_direct_listener_stopped"),
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            expected["reason"].as_str(),
+            Some("listener_closed"),
+            "{}",
+            case.name
+        );
+        let stream_id = expected["stream_id"].as_u64().unwrap();
+        let retired_active = expected["retired_active"].as_bool().unwrap();
+        let path = temporary.0.join(format!("listener-{}.jsonl", case.name));
+        let diagnostics = DiagnosticLog::new(&path);
+        let observer = host_media_diagnostics_observer(diagnostics.clone());
+        assert!(!path.exists());
+        observer(HostMediaDiagnostic::DirectListenerStopped {
+            stream_id,
+            retired_active,
+            reason: DirectListenerStopReason::ListenerClosed,
+        });
+        drop(observer);
+        assert!(fs::metadata(&path).unwrap().len() > 0);
+        let lines = diagnostics.recent_sanitized_lines().unwrap();
+        assert_eq!(lines.len(), 1, "{}", case.name);
+        let mut actual: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            actual
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "schema",
+                "timestamp_unix_ms",
+                "level",
+                "event",
+                "stream_id",
+                "retired_active",
+                "reason",
+            ]),
+            "{}",
+            case.name
+        );
+        assert_eq!(actual["schema"].as_u64(), Some(1), "{}", case.name);
+        assert_eq!(actual["level"].as_str(), Some("warning"), "{}", case.name);
+        assert_eq!(
+            actual["event"].as_str(),
+            Some("host_direct_listener_stopped"),
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            actual["stream_id"].as_u64(),
+            Some(stream_id),
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            actual["retired_active"].as_bool(),
+            Some(retired_active),
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            actual["reason"].as_str(),
+            Some("listener_closed"),
+            "{}",
+            case.name
+        );
+        if case.name == "u64_overflow" {
+            assert_eq!(stream_id, u64::MAX);
+            assert!(lines[0].contains("\"stream_id\":18446744073709551615"));
+        }
+        // Only timestamp varies; all other fields and their JSON types must
+        // equal the committed producer bytes, with no rounding or extra keys.
+        assert!(
+            actual
+                .as_object_mut()
+                .unwrap()
+                .remove("timestamp_unix_ms")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            expected
+                .as_object_mut()
+                .unwrap()
+                .remove("timestamp_unix_ms")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(actual, expected, "producer fixture case {}", case.name);
+
+        let merged = merge_recent_diagnostic_lines(lines, Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].starts_with("[主机] "));
+        let report =
+            build_diagnostic_report(&snapshot, &controller, "DL-WIN-LISTENER-TEST", 123, &merged);
+        assert!(report.contains(&merged[0]), "{}", case.name);
+        assert!(report.contains(&format!("\"stream_id\":{stream_id}")));
+        assert!(report.contains(&format!("\"retired_active\":{retired_active}")));
+        assert!(report.contains("\"reason\":\"listener_closed\""));
+        assert!(report.contains("运行状态: stopped"));
+        assert!(report.contains("控制端尚未捕获足够的视频渲染指标。"));
+        assert!(!report.contains("host_direct_listener_recovered"));
+        assert!(!report.contains("\"healthy\""));
+        assert!(!report.contains("\"recovered\""));
+        assert!(!report.contains("\"endpoint\""));
+        assert!(!report.contains("\"error\""));
+        assert_eq!(snapshot.runtime.state, "stopped");
     }
 }

@@ -16,7 +16,7 @@ use apps_windows::{
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
     runtime::{
-        ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver, HostMediaDiagnostic,
+        ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver,
         HostMediaDiagnosticsObserver, HostSessionControl, HostSupervisor,
     },
     tray::HostStatusViewModel,
@@ -1203,9 +1203,7 @@ pub(crate) fn host_media_diagnostics_observer(
     diagnostics: DiagnosticLog,
 ) -> HostMediaDiagnosticsObserver {
     Arc::new(move |event| {
-        if matches!(event, HostMediaDiagnostic::CursorSend { .. }) {
-            record_diagnostic(&diagnostics, &DiagnosticEvent::HostMedia(event));
-        }
+        record_diagnostic(&diagnostics, &DiagnosticEvent::HostMedia(event));
     })
 }
 

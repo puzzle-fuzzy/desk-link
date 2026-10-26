@@ -35,8 +35,9 @@ accept future instead of repeatedly returning None.
 
 `DiagnosticEvent::HostMedia(event)` formats the product log event. The Windows
 desktop registers a log observer in both normal and pairing Host preparation.
-The DL2-044 GUI slice records `CursorSend` into the same `DiagnosticLog` instance
-as that worker's lifecycle events. The existing report export reads its sanitized
+The DL2-044/045 GUI slices record both `CursorSend` and
+`DirectListenerStopped` into the same `DiagnosticLog` instance as that worker's
+lifecycle events. The existing report export reads its sanitized
 history and includes the exact event fields. The callback retains the original
 stream and writes history only; it never changes current GUI lifecycle state.
 Runtime dispatch keeps its filesystem work on the existing bounded worker.
@@ -46,13 +47,15 @@ The desktop uploader remains unchanged and retains these events in ordinary
 batches. Its current service contract is a separate source history:
 `b1118ad465703493255123e23b6f522662c3d603` for cursor events and
 `bf5d7eb27f3f41be59ac317b63d7e93d10f38066` for direct-listener events. That
-history is not merged into this GUI branch. The cursor regression fixture is copied
-byte-for-byte from the committed cursor producer fixture and compares the actual
+history is not merged into this GUI branch. Both regression fixtures are copied
+byte-for-byte from the committed service producer fixtures and compare the actual
 GUI callback/log representation, ignoring only the generated timestamp.
 The service's u64-overflow negative fixture remains valid local history; this
 does not claim that unsafe JavaScript integers are accepted by the service.
-Direct-listener GUI binding, actual Tauri interaction, combined service
-ingestion/storage and real devices remain separate acceptance work.
+The listener record preserves `retired_active` as an observed retirement state;
+it does not assert that relay media subsequently recovered. Actual Tauri
+interaction, combined service ingestion/storage and real devices remain separate
+acceptance work.
 
 Local validation:
 
@@ -66,3 +69,40 @@ python scripts/run-windows-cargo.py clippy -p desklink-windows -p desklink-trans
 The transport cases use real loopback QUIC, including unsupported datagrams,
 the peer's advertised size limit, connection/preflight errors and tiny send
 buffers. They do not create a remote-control session or inject native input.
+
+Desktop GUI source validation uses
+`CARGO_TARGET_DIR=E:/desk-link/.worktrees/dl2-targets/windows-diagnostics`:
+
+```powershell
+# 044: selected library targets, not a full-workspace test run
+python scripts/run-windows-cargo.py test -p desklink-windows -p desklink-windows-ui --lib --locked --no-fail-fast
+# 045: changed GUI library, including all three log/report/fixture regressions
+python scripts/run-windows-cargo.py test -p desklink-windows-ui --lib --locked
+# Both phases: full strict linting for these packages' library and test targets
+python scripts/run-windows-cargo.py clippy -p desklink-windows -p desklink-windows-ui --lib --tests --locked -- -D warnings
+```
+
+044 passed Windows **218 / 2 ignored** and GUI **137 / 1 ignored**. 045 passed
+GUI **138 / 1 ignored**, including both cursor tests again; Windows/shared
+source hashes remained identical to the 044 run. These library counts differ
+from the frozen joint's Windows **283 / 17 ignored**, which also included
+integration targets. Both strict Clippy runs passed without `allow` or
+`--no-deps`. The ignored GUI test requires a specifically built signed update
+asset; Windows exclusions cover interactive capture and an opt-in readback
+benchmark. Frontend JS and the uploader were unchanged. The inherited full-FFI
+Apple Host failures were not repaired or rerun by these GUI-only checks.
+
+The three GUI tests directly invoke the production callback, use real temporary
+logs and `sync_data`, then feed the existing history merger/report builder.
+They do not open Tauri, start an authenticated peer, exercise actual Downloads
+export or submit HTTP. Producer/dispatcher and real transport behavior retain
+their separate source tests; these callback tests do not claim a new physical
+end-to-end remote-control result.
+
+The copied cursor/listener fixture SHA256 values are respectively
+`8f3f077e9356144c63d302614851d0bb3e7dc8a2ad3b0dfe8c07146def2333c8` and
+`b370b5175e8807dd4f2b13faf3457214ba81209f60b644f4803d9b332a4145ae`.
+The raw logs, source-before/source-after manifests, commit identities and
+digests are indexed by
+[the GUI handoff](E:/desk-link/.worktrees/dl2-targets/windows-diagnostics/validation/handoff-final.json).
+The earlier `044-warmup-*` logs are not final evidence.
