@@ -97,6 +97,8 @@ python scripts/verify-managed-relay.py
 
 当前候选的协议、功能和发布边界以本节、[CHANGELOG.md](CHANGELOG.md)、[当前架构契约](docs/current-architecture-contract.md) 与[能力矩阵](docs/current-capabilities.md)为准。第一波协议 13 软件候选的已测试源码为 `a4c5b404d43794d646394923a481f23c9298c3ed`，完整合入 Windows joint、Apple/FFI 及其输入 admission 后继、网络、工程、GUI、诊断 producer 与 services 历史，v3 的 25 个软件门禁全部通过。它尚未合入 main，不代表 Swift/Xcode、实际 WebView、真实输入/双机/拓扑或正式发布验收通过；main 基线仍为协议 12。GPU 后续候选、文件协议 14 与 LAN024 后续生产接线不在本轮。
 
+第二波GPU候选已在独立分支从第一波冻结提交 `c3fa4df987fb88be08eb5aeea9c7983b556e87d3` 合入GPU235完整历史，干净测试源 `97ff7c08199cdad4511b0044ddf783d79e2295b1` 重新通过25项软件检查、24项选定合成GPU用例及19项签名/HTTP/SQLite案例。平台报告仍2通过/7跳过、incomplete；第一波冻结源不变。见[第二波GPU集成报告](docs/wave2-gpu-integration.md)。
+
 工程来源 `5501aad`、`56f53b4`、`d6f153e` 的零 producer、七处旧输入调用及失败报告保留为各自历史快照，不再描述当前已整合候选。下面的 0.1.91/0.1.92 段落也是历史协议说明；当前 checkout 的应用、协议和工具链用 `python scripts/verify-windows-release.py --versions-only` 读取。
 
 0.1.91 将开发协议统一升级到 12，加入 H.264 Main/High Profile 能力协商、按 Noise 会话派生的候选绑定和视频直连 Offer/Answer 状态机。Windows 控制端会先探测 High Profile，WebView2 不支持时自动请求主机切回 Main；主机编码器创建 High MFT 失败也会自动回退。同一局域网会阶段性尝试经过认证的 DirectLan 视频数据面，探测失败自动回落公网中继；跨网络仍使用中继，4K 仍未作为用户能力开放。项目尚未正式发布；0.1.92 保持协议 12，可与 0.1.91 互连。

@@ -3,6 +3,7 @@
 > 更新日期：2026-10-26（Asia/Shanghai）
 > 初始审查基线（历史）：`main@85bdf7278baf11b1adb9b401b978643c261daf2b`；Windows 客户端 `0.1.93`，协议 `12`。当前已提交成果的源码身份与子项检查框见下方快照；分支成果尚未合入 main。
 > 当前第一波软件验证源：`a4c5b404d43794d646394923a481f23c9298c3ed`（执行时干净，协议13），25个检查全部通过；平台报告仍 incomplete（2通过/7跳过）。完整来源、原始报告及本地签名→HTTP/SQLite证据见 [第一波集成记录](docs/wave1-integration.md)。本文后续文档收口不改写该测试源；main仍未合入。
+> 当前第二波GPU验证源：`97ff7c08199cdad4511b0044ddf783d79e2295b1`，tree `2319d0e73bb68c22496d43ec1fb99f84f4e1dd6f`（执行时干净）；25软件检查全通过，6条选中GPU命令共24通过/0忽略，新native签名→本地HTTP/SQLite19案例全通过。平台仍2通过/7跳过、incomplete；真捕获/恢复/同画质性能未验。见[第二波GPU集成记录](docs/wave2-gpu-integration.md)；第一波V/a4与冻结c3记录保留原来源。
 > 本阶段目标：补齐远控工作流、消除真实缺陷、重整模块职责，并以可重复测量推进低延迟、低资源占用和稳定吞吐。允许调整协议、ABI、模块边界及实现，不以开发成本或现有部署兼容性限制方案。
 > 用户已确认 Windows → Windows、macOS → Windows 可以正常连接并良好控制，这两条路径是已成立的产品基础。本文件不把旧文档中“尚未验收”的历史表述当作当前不可用证据。
 > 本清单已进入并行实施阶段。各项按下述会话分工推进，完成一个问题并通过对应验证后立即独立 commit，同时更新该项完成标记。第一阶段记录保留在文末，不能用其旧日期、版本或勾选状态代替本阶段验收。
@@ -45,6 +46,8 @@
 
 第一波独立候选已完整merge冻结Windows joint5782341、Apple f954a68及receipt后继cb751、网络4b15561、服务最终d2d4、工程6b31360、GUI506及原生诊断producer28c11，保留来源历史。干净a4c5b40已实际联合验证25检查全通过；main合入仍由主会话决定，工程组不切换或覆盖root checkout。GPU235的015/016、新文件030/协议14、024后续生产接线继续独立，不计入本第一波测试源。
 
+第二波在第一波冻结 `c3fa4df987fb88be08eb5aeea9c7983b556e87d3` 后另建独立worktree，正常merge GPU235完整七笔历史形成97ff；其两个parents确为c3fa4df与23526f23。GPU现已在此独立候选实际联合验证，仍不回写为第一波V包含；文件030/协议14、024后续生产接线另行集成。
+
 网络第一波已冻结 `4b15561586fab7a1481ba6dd4ff4854f34123018`（直接parent为a41e1e2），后续024在独立LAN runtime分支推进。**历史集成前快照：** 服务S快照后发现resetPassword预算满先消费token、token动作共用email:missing桶两处确定缺口，当时等待owner补修；当前最终 `d2d4f1c4c4942df03eda71e8aa1ebf3f8ab22c3a` 已包含补修并进入a4软件验证，部署/长期运行仍待验。
 
 044/045服务schema历史来源分别为 `b1118ad465703493255123e23b6f522662c3d603` / `bf5d7eb27f3f41be59ac317b63d7e93d10f38066`；GUI506、原生producer `28c11ee05a08183f7636ede7946e93029c7bbb16` 与服务最终d2d4已完整merge。a4新native签名fixture→本地HTTP验签/schema→临时SQLite重开/去重/分析共19案例全通过，关闭全u64本地合同切片；设备GUI和远端生产送达仍待验。历史未提交cloud过滤切片已全部撤回，正常上传策略保留；撤回前中间编译日志不作为当前源码证据，observer仍只计尝试/发送错误，不计真实丢包。
@@ -59,7 +62,7 @@
 
 ### 已提交成果检查框快照（2026-10-26；尚未合入main）
 
-下表的 `[x]` 只关闭其后明确列出的代码或自动验证切片，剩余验收继续 `[ ]`。来源均为不可变Git提交；V为当前第一波候选实际联合验证，其他代号保留来源/历史报告身份，不能把来源总数当V结果。main只读核对仍为 `a905b8807c83677f6f962c18f8fd1593f0d4ca32`，下列来源尚未成为main祖先。
+下表的 `[x]` 只关闭其后明确列出的代码或自动验证切片，剩余验收继续 `[ ]`。来源均为不可变Git提交；V保留第一波实际联合验证，G另列当前第二波独立候选实跑，其他代号保留来源/历史报告身份，不能跨范围累加或将来源总数当候选结果。main只读核对仍为 `a905b8807c83677f6f962c18f8fd1593f0d4ca32`，下列来源尚未成为main祖先。
 
 | 来源代号 | 不可变source / joint | 证据范围 |
 | --- | --- | --- |
@@ -70,7 +73,7 @@
 | N | `4b15561586fab7a1481ba6dd4ff4854f34123018` | 网络第一波冻结，继承a41e1e2；本地QUIC/调度/资源/deadline及Linux候选关停证据，生产部署/真实WAN另验 |
 | S | 最终 `d2d4f1c4c4942df03eda71e8aa1ebf3f8ab22c3a`；历史快照 `b1118ad465703493255123e23b6f522662c3d603` | 最终schema/预算/分桶/u64历史完整merge V，本地数据库/Bun/进程回归和19案例签名/store联合链已执行；旧快照后两处补修等待已结束，未部署 |
 | E | 最终 `6b31360ce4dc40d0f1715ce1e40c000788a6b812`；历史快照 `12b54ceedc0799a556e502436bc08830db7edca1` | 工程入口/合同及单一transport恢复分类完整merge V；29/18/12及三包严格Clippy/fmt为原策略切片报告，当前另有V整套25检查；其他历史报告见 `docs/local-verification.md` |
-| G（后续独立候选） | 最终 `23526f23f450e64edea098a36b07ed4c62d4982b`；早期 `2d79f9706303cb2dffa7abc764c8f7450591c3b6`，tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832` | 015/016完整七笔GPU历史；290通过/17忽略仅owner来源报告，未进入V、未在本候选复跑。早期204/6、7GPU含4合成及Clippy为当时来源记录；后续独立worktree集成与适用硬件验收另行执行 |
+| G（当前第二波独立候选） | 实测 `97ff7c08199cdad4511b0044ddf783d79e2295b1`，tree `2319d0e73bb68c22496d43ec1fb99f84f4e1dd6f`；GPU来源 `23526f23f450e64edea098a36b07ed4c62d4982b` 完整七笔 | 干净源25软件检查全pass：Windows297/32默认忽略、workspace516/18忽略、FFI91/0、relay64/3、Bun474/79/129、Python257；6条选中GPU命令8/6/4/1/1/4共24通过/0忽略，含15项原ignored（含inventory），5项lib默认用例与软件套件重叠，另4项example，不跨范围求和。新签名HTTP/SQLite19通过；platform2通过/7跳过仍incomplete。GPU290/17、早期2d79的204/6与7GPU仅保留owner历史来源，均不改写V；见[第二波报告](docs/wave2-gpu-integration.md) |
 | D / producer | `5069158584dfa1f729defe2fadb5b9933acdfcff`，parent67cd1bf、tree `3740f354bce3c1d14d32f8435bb44b0c2b6a1006`；后继 `28c11ee05a08183f7636ede7946e93029c7bbb16` | GUI044/045及完整u64 producer已merge V；Windows218/2、UI137/1与138/1及限定Clippy为D来源历史报告。V实际验证规范十进制string/原始签名字节与服务store/analysis全值域链；设备GUI/远端生产送达未验 |
 
 来源TODO已关闭的主项为：产品001/034/035，媒体020/046/050，服务036/037/038/039/054/055/058，工程042；这些主项的来源身份保留，当前第一波软件集成与服务补修已由V验证，平台、设备、部署及性能剩余验收继续按下表单独记录。
@@ -91,8 +94,8 @@
 | 012 · J/M | [x] 输入独立消费、慢配置合并与完成回执 | [x] 慢控制/输入并发回归 | [ ] 慢驱动双机输入预算 |
 | 013 · J/A/CB/V | [x] Windows完整u64/绘制/host映射、完整Apple ABI/owned future/media_generation与receipt/admission后继均已合入 | [x] V Rust本地FFI91、Windows292/17忽略及真实软件MFT/QUIC/Noise联合回环；J634/2/19仅旧源历史 | [ ] 6项Swift Recording、Swift/Xcode、实际presented与同stream完整拓扑映射；主项不因Rust本地通过关闭 |
 | 014 · M | [x] CPU离线分段基线与真实输入/输出身份 | [x] 可复跑离线工具及buffered时序校验 | [ ] GPU/双机/端到端/功耗温度/长稳对照 |
-| 015 · M/G | [x] V仅含M的staging/scratch复用；G235另有owned surface池/VP缩放转色/capture入口 | [x] V媒体软件回归；G290/17及合成GPU仅owner来源报告，不属于V | [ ] G独立候选集成/复跑、CPU/GPU同条件测量及适用硬件验收；主项保留未完成 |
-| 016 · M/G | [x] V含M的有界MFT泵/软件回退与timestamp校验；G235另有tracked-sample GPU编码/同帧回退 | [x] V后端/缓冲/输出身份软件回归；G合成硬件结果保留来源身份 | [ ] G独立候选、厂商/混合GPU/真实驱动丢失与性能矩阵，第二波推进 |
+| 015 · M/G | [x] G97ff已合入owned surface池/VP缩放转色/capture入口与生产runtime选路；V仅含M的历史范围不变 | [x] G25软件检查及共享GPU选中24用例通过，含池/lease/fence/预算/退役；代码/软件小项完成 | [ ] 真DXGI捕获/恢复、厂商/混合GPU、CPU/GPU同画质性能/帧龄/功耗/长稳；主项保留未完成 |
+| 016 · M/G | [x] G97ff已合入tracked-sample GPU编码、原输出身份、同帧软件回退与版本边界 | [x] G25软件检查及共享GPU选中24用例通过，含真实合成surface/MFT编码、解码内容与epoch归属；代码/软件小项完成 | [ ] 真实driver/device-loss、真桌面/双机、厂商/混合GPU与同画质性能/恢复矩阵；主项保留未完成 |
 | 017 · J | [x] 有界AudioWorklet音频播放 | [x] 环形缓冲/生命周期与前端回归 | [ ] 实际播放、欠载/延迟/分配率测量 |
 | 018 · A | [x] 专用解码队列、字节/帧龄预算与合并presenter | [x] Python静态media合同，Swift调度器用例已提交 | [ ] Swift/Xcode、VideoToolbox与阻塞主线程性能；保留现有复制 |
 | 019 · N | [x] 三类媒体独立有界sender及代数隔离 | [x] QUIC ACK黑洞、健康会话隔离及本机调度测量 | [ ] 真实WAN/双机/容量与音频体验 |
@@ -462,6 +465,8 @@
 - [x] **可复跑GPU计量工具（`perf(DL2-015): add source-bound synthetic GPU stage probes`）：** 新gpu_media_probe及benchmark-windows-gpu.py，分capability/benchmark、显式adapter/input-path/experimental4k；CPU输入不假定软件backend。确定性desktop glyph-like/gradient/panels及滚动，tiles专用于两phase颜色/方向/UV参考；报告requested/actual尺寸/profile/bitrate、真实MFT/active状态、sample ID、pending未drain范围。区分GPU copy/VP输出、CPU读回、fixture上传/clone、texture/query/view创建；GPU时间/driver copy/heap分配未知为null。wrapper逐run及跨repeat绑定完整源码hash/HEAD/clean状态，fallback或不稳定源不作GPU比较依据。4项示例测试、严格example Clippy及Python编译通过。
 - [x] **正式本机阶段矩阵（`docs(DL2-015): record the frozen synthetic GPU stage matrix`）：** 固定6a60f45、clean、同一files_sha256，desktop-motion的1080p/1440p/显式4K两输入路径各3×30样本/3预热，18benchmark+1capability native进程全部exit0；实际尺寸、Main18M/4K High40.5M匹配。GPU均NVIDIA surface后端、fallback0、normalCPU读回/NV12 CPU写入/MF输入copy=0；CPU实际同NVIDIA system-memory后端。每run正常GPU query60/views各30，motion fixture另建纹理30，非零分配/零拷贝。数据表和原始JSON/hash路径见docs/windows-gpu-media.md；严格不将返回30输出/lastpending0当drained cohort或FPS。
 - [ ] **性能外推仍待：** GPU实际执行时间/driver内部copy/heap分配、质量等效、真实桌面/多GPU/双机/帧龄/功耗/长稳；本机CPU墙钟分阶段数据不外推端到端收益。
+- [x] **当前第二波代码/软件收口（干净源97ff7c0）：** 第一波冻结c3后完整merge GPU235七笔，owned BGRA/NV12池、完成fence/lease、全局预算、退役清理及runtime GPU入口在独立候选中实际接通；25软件检查和6条选中GPU命令全部通过，GPU模块8项通过/0忽略。选中总24项含原ignored实际执行，不能与默认软件套件重叠项求和。见[第二波GPU集成记录](docs/wave2-gpu-integration.md)。
+- **来源/剩余验收：** 上述M早期CPU路径、G owner计数及6a60f45阶段矩阵保留各自来源，不冒充97ff性能复跑；本次完成代码/软件小项，真实DXGI Acquire/Release、设备恢复、多GPU、同画质性能/帧龄与长稳仍 `[ ]`，015主项不关闭。
 
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
@@ -487,6 +492,7 @@
 - [ ] **完整硬件/性能仍待：** Intel/AMD/混合GPU、实际driver/device loss、真实DXGI Acquire/Release、双机/长稳与帧龄/功耗；1080p/1440p/显式4K合成矩阵和可复跑阶段计量由后续015工具切片提供。首批64²软件兜底证据保留为历史，不再代表本机未成功GPU编码；本切片不把CopyResource+VP称零拷贝。
 
 - [x] **代表尺寸内容验证（`test(DL2-016): decode representative GPU frame sizes and display apertures`）：** 在原128帧回归外新增1080p/1440p Main18M及显式4K High40.5M，两phase各4帧共24帧真实GPU编码→软件MFT解码；decoded timestamp/实际SPS profile/首IDR/可见尺寸与tile内容更新均通过、CPU fallback与原GPU读回均0。1080实测coded1920×1088/visible1920×1080，仅依解码器MFVideoArea显示孔径裁padding，检查偶数offset/边界并正确裁Y/UV，不按expected尺寸盲裁。验证模块4项（含裁剪与错轴/UV/旧phase反证）及严格lib/tests Clippy通过。仍不代表复杂桌面视觉质量、真实DXGI或端到端性能通过。
+- [x] **当前第二波代码/软件收口（干净源97ff7c0）：** 独立候选实际完成GPU encoder6项、bitstream4项、runtime epoch1项与inventory1项选择运行，连同GPU池8项和example4项共24通过/0忽略；15项原ignored已显式执行，另5项lib默认用例与前套软件范围重叠，不能跨范围相加。保留TrackedSample最后引用释放才归还、同帧回退/配置耗尽拒绝、延迟输出身份与GPU→CPU→GPU/几何epoch边界。完整25软件检查同时通过，代码/软件小项 `[x]`；真实捕获/驱动恢复与同画质性能仍 `[ ]`。见[第二波报告](docs/wave2-gpu-integration.md)。
 
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
@@ -902,6 +908,8 @@
 - [x] **044/045全u64本地生产链收口：** 在干净a4重新运行production native签名fixture，以合成身份/临时日志产生原始body/hash/Ed25519签名，再经127.0.0.1真实HTTP接收、生产schema/store、临时文件SQLite关闭重开、去重与analysis验证，19案例全部通过、differences为空。覆盖12项当前/历史规范化正例、2项旧安全数值、4项旧不安全Number拒绝且零存储、1项重hash但保留旧签名的篡改拒绝；规范十进制string与原始签名字节保留。该结果关闭本地client签名/store/analysis切片，设备GUI与远端生产送达继续 `[ ]`；未读用户日志或执行远端上传。
 - [ ] **平台/设备门禁继续待验：** `platform-conditions.json` 为incomplete / passed=false，2通过/7跳过；通过的是双头检查与合成CPU离线基线，不能称真实捕获/编码、GPU或完整性能通过。Swift/Xcode、6项Swift Recording、实际WebView/拓扑/权限、真实输入/双机、设备恢复、长稳与签名安装/发布继续待验。041软件收口子项 `[x]`，主项保持 `[ ]`；GPU235及其owner来源290/17不属于本第一波候选。
 - **历史来源状态：** 本节此前5501/56f/d6/旧joint的failed报告、a97f2d4+dirty MSVC局部验证、首轮夹具失败、v2与待聚合/待u64补修记录均按其源码时点保留；本次a4最终报告收口对应软件缺项，不把历史失败改成通过，不把跳过平台项改成已验。
+- [x] **第二波独立候选软件/GPU收口（干净源97ff7c0）：** 第一波冻结c3与GPU235完整历史正常merge，实测source `97ff7c08199cdad4511b0044ddf783d79e2295b1` / tree `2319d0e73bb68c22496d43ec1fb99f84f4e1dd6f` 的25软件检查全pass：Windows297/32默认忽略、workspace lib516/18忽略、FFI91/0、relay64/3、Bun474/79/129、Python257。另6条GPU选中命令8/6/4/1/1/4共24通过/0忽略，其中15项原ignored（含inventory）实际执行；5项lib默认用例与软件套件重叠，另4项example，不能跨范围求和或把默认ignored计pass。新native签名→本地HTTP/SQLite19案例也全部通过，属于单列本地生产链证据。命令/原始报告见[第二波集成记录](docs/wave2-gpu-integration.md)。
+- [ ] **第二波平台/性能剩余门禁：** platform仍2通过/7跳过、incomplete / passed=false；本次选中GPU正确性用合成纹理/Recording输入，未采集真实桌面或注入真实输入。真capture、driver/device恢复、Swift/实际拓扑、设备GUI/双机、同画质性能/端到端/功耗/长稳及生产送达仍未验，041主项不关闭。第一波V/a4/c3及owner290/17保留原来源和结果，不以97ff新结果回写历史。
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 
@@ -931,6 +939,7 @@
 - [x] **当前第一波来源与逐项状态收口（2026-10-26）：** 首部增加V=`a4c5b404d43794d646394923a481f23c9298c3ed`、测试时干净tree154d51e，区分25检查全pass、本地签名→HTTP/SQLite19案例全过与native 2通过/7跳过incomplete；同步A+CB、服务最终d2d4和D+producer28完整merge，013代码/Rust本地、044/045全u64本地链、041软件子项完成，Swift/真实拓扑/设备GUI/远端送达/平台与性能仍待验。GPU235的290/17只列owner来源，未计入本候选；main仍a905b88/协议12，候选0.1.93/协议13尚未合main/推送/发布。证据索引为[第一波集成记录](docs/wave1-integration.md)，最终文档提交与已测试a4源码由交接manifest分别绑定。
 - **本次文档验证：** 根会话实际运行current_source_versions 5项通过；文档链接/diff及最终提交由根会话统一收口。
 - **历史来源状态：** 本节旧工程、媒体、产品、Apple及joint报告保留原SHA、原计数和当时失败/待验含义；上文“尚待完整Apple、服务最终来源或u64后继”均为当时快照，当前状态以首部V及本条为准，不用来源通过替代本候选实跑，也不把本地软件结果外推成设备或生产验收。
+- [x] **第二波来源/进度同步（2026-10-26）：** 首部新增G实测97ff/tree2319，保留c3第一波冻结与GPU235七笔两个parents，015/016代码/软件子项改为当前独立候选实际通过；25软件、GPU选中24/0、本地签名HTTP/SQLite19与platform2/7 incomplete分别列范围，明确默认ignored/重复用例不求和。第一波V/a4及既往owner来源记录不改写，真实捕获/恢复/同画质性能和设备平台保持待验。证据索引为[第二波GPU集成记录](docs/wave2-gpu-integration.md)，后续文档提交与已测试97ff源码分别绑定；未宣称已合main/推送/部署或发布。
 
 ## 8. 扩展角色
 

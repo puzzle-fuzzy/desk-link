@@ -82,6 +82,12 @@ python scripts/verify.py native perf --report dist/verify/device-status.json
 
 第一波软件候选通过不表示这些跳过项通过，也不表示已合main或正式release；main仍为协议12。GPU235后续独立候选、文件协议14与LAN024后续生产接线不合入第一波，不阻塞本轮已完成的软件检查。以下旧工程/J来源报告保留各自源码和失败结果，不再作为当前候选零producer或Apple未合入的结论。
 
+## 第二波GPU独立候选
+
+第一波冻结c3及其a4测试源不变。第二波干净源码 `97ff7c08199cdad4511b0044ddf783d79e2295b1` 从c3完整merge GPU235后，实际重新通过fast/integration的25检查：workspace lib516通过/18忽略、Windows tests297通过/32忽略，FFI91/0、relay64/3；Bun474/79/129和Python257通过。六条精确GPU命令合24通过/0忽略，其中15项在默认套件通常ignored，9项常规（与软件套件有重叠），不能把默认32忽略都写成未跑或把范围直接相加。
+
+新native fixture→原body/签名→本地HTTP/SQLite重开、去重及分析19案例通过。平台native/perf仍2通过/7跳过、incomplete，CPU离线基线encode=false；合成GPU编码/解码验证不是正式桌面、设备恢复、真实性能或Swift验收。原始报告、精确过滤器和剩余范围见[第二波集成报告](wave2-gpu-integration.md)。
+
 ## 追加跨层门禁：input epoch 与独立 probe
 
 严格几何绑定的共享契约由Apple/FFI单一owner交付，仍属未发布协议13开发线。历史来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`：`VideoConfig`在stream_id后有非零input_epoch:u64，`InputEnvelope`在timestamp_us后有非零stream_id/input_epoch:u64，并有共享InputContext类型。input codec统一保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]` 和exact解码，平台/transport不手工拼前缀、不fallback无context格式。最小显式 `send_input_with_context` 桥接b473498→56f53b4的本地加密loopback5项通过；**仅在当时5501aad/56f53b4/d6f153e工程阶段，生产调用、host和呈现尚未全部接线。** 当前a4已完整聚合J/A/CB并完成适用软件检查，不得在发送时补当前值；下表继续定义生产合同和设备验收边界。

@@ -2,7 +2,9 @@
 
 更新日期：2026-10-26。用户已确认 **Windows→Windows、macOS→Windows 的基础连接、画面与控制良好**。这条确认保留为产品事实；高级功能、特殊权限、故障恢复与性能仍分别核验。
 
-**当前第一波协议13候选已通过本地软件门禁。** 已完整合入Windows joint、Apple及输入退役补丁、网络、工程、GUI和producer/services历史，保留非零Windows producer；测试源为 `a4c5b404d43794d646394923a481f23c9298c3ed`。25项软件检查及新生成原生签名批次的19项HTTP/SQLite闭环通过，详细范围见[第一波报告](wave1-integration.md)。Swift/Xcode、真实WebView、权限/输入注入、双机与完整性能仍未验收，main尚未合入。下列旧零producer失败均按其历史源码保留。
+**第一波协议13候选已冻结并通过本地软件门禁。** 已完整合入Windows joint、Apple及输入退役补丁、网络、工程、GUI和producer/services历史，保留非零Windows producer；测试源为 `a4c5b404d43794d646394923a481f23c9298c3ed`。25项软件检查及新生成原生签名批次的19项HTTP/SQLite闭环通过，详细范围见[第一波报告](wave1-integration.md)。Swift/Xcode、真实WebView、权限/输入注入、双机与完整性能仍未验收，main尚未合入。下列旧零producer失败均按其历史源码保留。
+
+**当前第二波GPU候选亦已实际验证。** 独立分支从第一波冻结c3正常merge GPU235七笔历史；干净测试源 `97ff7c08199cdad4511b0044ddf783d79e2295b1` 的25软件检查、24选定合成GPU用例及19签名/HTTP/SQLite案例全部通过，native/perf仍2通过7跳过、incomplete。第一波a4/c3不变；真实捕获、设备恢复、同画质性能和原平台缺项保持未验。见[第二波报告](wave2-gpu-integration.md)。
 
 ## 源码身份与版本
 
@@ -130,7 +132,7 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 
 第一波协议13已在a4完成软件收口：Windows joint578、Apple完整历史f954及cb7514后继、网络4b、工程6b、GUI506、producer28与服务d2完整merge并实际验证，保留逐问题历史。main合入由主会话决定；根目录未知044–061未提交稿继续保留，工程组未写入且owner尚不明。
 
-GPU015/016在 `codex/dl2-windows-gpu` 已冻结后续来源 `23526f23f450e64edea098a36b07ed4c62d4982b`，7笔完整历史。来源报告为275项默认通过及15项显式GPU用例、17项仍忽略；合成矩阵在6a60执行，235仅文档后继。本工程已核对来源文件/日志清单，但这些不是新集成候选的测试。GPU代码、合成硬件链与测量进入第二波独立候选，第一波a4不含它们；真实捕获、质量等价、端到端性能与设备恢复仍待验收。
+GPU015/016在 `codex/dl2-windows-gpu` 已冻结后续来源 `23526f23f450e64edea098a36b07ed4c62d4982b`，7笔完整历史。来源报告为275项默认通过及15项显式GPU用例、17项仍忽略；合成矩阵在6a60执行，235仅文档后继。上述仍是owner来源结果；本工程另在97ff新集成候选实际复跑25软件检查和24选定合成GPU用例，原6a60性能矩阵未重跑。GPU代码与合成硬件链已进入第二波，第一波a4不含它们；真实捕获、质量等价、端到端性能与设备恢复仍待验收。
 
 文件030由第七会话 `01a17733-4bf0-79d3-831f-7c0190191591`、`codex/dl2-file-transfer` 从joint578负责，独占新增文件业务协议14；当前工程/Windows joint仍13、main12。GPU和文件后续开发不阻塞稳定13第一波。
 

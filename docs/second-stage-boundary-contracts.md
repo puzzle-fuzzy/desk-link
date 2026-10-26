@@ -4,6 +4,8 @@
 
 第一波已完整合入 J578、Apple f954及CBcb7514、网络4b、工程6b、GUI506、producer28与Sd2，并通过 v3 的25个软件门禁。它尚未合入协议12的 main；Swift/Xcode、实际 WebView、输入注入、双机/拓扑、完整 Mac 功能和硬件/性能门禁继续 `[ ]`。以下初始表格及5501/56/d6过渡报告保留各自历史身份，不再表示当前候选未合入 Apple 或仍有零 producer。
 
+后继GPU候选已在独立worktree从第一波冻结c3合入235完整七笔历史：干净 `97ff7c08199cdad4511b0044ddf783d79e2295b1` 的25软件检查、24选定合成GPU用例和19签名/store案例通过。实际合并保留捕获前context、按frame/config查回原输出身份及Host/Controller分类owner；native/perf仍2通过7跳过，040剩余职责拆分/性能未关闭。详见[第二波GPU报告](wave2-gpu-integration.md)。
+
 ## 初始源码核对（main@a905b88；历史）
 
 初始核对先用主 checkout 的 CodeGraph 查询 `SessionMachine`、`DesklinkResult`、`transport_error_is_retryable`、调用方与影响范围，再读取当时 worktree 源码确认。索引不是后续改动后的最终事实；下表记录当时的所有者与分散策略，当前共享错误分类的已落地切片见文末。
