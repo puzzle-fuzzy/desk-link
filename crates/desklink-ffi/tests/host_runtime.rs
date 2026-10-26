@@ -1,3 +1,6 @@
+#[path = "host_runtime/input_admission.rs"]
+mod input_admission;
+
 #[path = "host_runtime/media_generation.rs"]
 mod media_generation;
 
@@ -622,7 +625,16 @@ async fn expect_input(host: &HostRuntime, expected: InputEvent) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(event, HostEvent::Input(expected));
+    let HostEvent::Input {
+        media_generation,
+        input,
+    } = event
+    else {
+        panic!("expected captured input, received {event:?}");
+    };
+    assert_ne!(media_generation, 0);
+    assert!(input.context().is_valid());
+    assert_eq!(input.event, expected);
 }
 
 async fn expect_release_all(host: &HostRuntime) {
@@ -637,7 +649,7 @@ async fn expect_no_input_until_quiet(host: &HostRuntime) {
     loop {
         match tokio::time::timeout(Duration::from_millis(100), host.next_event()).await {
             Ok(Ok(event)) => assert!(
-                !matches!(event, HostEvent::Input(_)),
+                !matches!(event, HostEvent::Input { .. }),
                 "unexpected injection: {event:?}"
             ),
             Err(_) => return,
@@ -718,10 +730,20 @@ async fn host_decodes_input_and_keyframe_requests_after_approval() {
     let mut saw_keyframe = false;
     for _ in 0..8 {
         match fixture.next_event(&host).await {
-            HostEvent::Input(InputEvent::MouseWheel {
-                delta_x: -120,
-                delta_y: 240,
-            }) => saw_input = true,
+            HostEvent::Input {
+                media_generation,
+                input:
+                    InputEnvelope {
+                        event:
+                            InputEvent::MouseWheel {
+                                delta_x: -120,
+                                delta_y: 240,
+                            },
+                        stream_id: 9,
+                        input_epoch,
+                        ..
+                    },
+            } if media_generation != 0 && input_epoch != 0 => saw_input = true,
             HostEvent::KeyframeRequested => saw_keyframe = true,
             HostEvent::State(_) | HostEvent::Connected { .. } => continue,
             event => panic!("unexpected host event: {event:?}"),
@@ -1293,7 +1315,7 @@ async fn full_event_queue_terminates_before_losing_an_epoch_release_barrier() {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, HostEvent::Input(_)))
+            .any(|event| matches!(event, HostEvent::Input { .. }))
     );
     host.destroy();
 }

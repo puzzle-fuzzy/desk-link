@@ -1028,7 +1028,7 @@ async fn run_connected(
                         if !input_policy.admit(&input, video.input_context(), now_micros()) {
                             continue;
                         }
-                        emit_required(events, HostEvent::Input(input.event))?;
+                        emit_required(events, HostEvent::Input { media_generation, input })?;
                         metrics.received_input_events = metrics.received_input_events.saturating_add(1);
                     }
                     TransportEvent::Transfer(ciphertext) => {

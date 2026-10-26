@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use desklink_crypto::{DeviceIdentity, SessionId};
-use desklink_protocol::InputEvent;
+use desklink_protocol::InputEnvelope;
 use desklink_transport::{QuicClient, QuicClientConfig};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
@@ -156,7 +156,12 @@ pub enum HostEvent {
         verify_key: [u8; 32],
         fingerprint: String,
     },
-    Input(InputEvent),
+    /// Captured authorization belongs to the original authenticated Noise
+    /// session and input target, even when application delivery is delayed.
+    Input {
+        media_generation: u64,
+        input: InputEnvelope,
+    },
     Transfer(desklink_protocol::TransferMessage),
     KeyframeRequested,
     ReleaseAll,
