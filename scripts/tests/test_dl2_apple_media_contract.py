@@ -21,6 +21,8 @@ class MacHostVideoContractTests(unittest.TestCase):
             self.assertRegex(declaration, rf"{rust_name}: {value},")
             self.assertIn(f"{swift_name}: Int = MacHostVideoContract.{swift_name}", capture)
         self.assertIn("MacHostVideoContract.supports(width: width, height: height)", encoder)
+        self.assertIn("CMVideoFormatDescriptionGetDimensions(formatDescription)", encoder)
+        self.assertIn("encodedWidth == Int32(currentWidth), encodedHeight == Int32(currentHeight)", encoder)
 
     def test_encoder_checks_output_profile_before_event_construction(self):
         encoder = source("apps/macos/Sources/DeskLinkApp/Capture/MacH264Encoder.swift")

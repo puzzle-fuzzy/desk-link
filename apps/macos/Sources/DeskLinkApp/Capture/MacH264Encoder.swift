@@ -293,6 +293,9 @@ final class MacH264Encoder: @unchecked Sendable {
             report(error: .missingFormatDescription, generation: generation)
             return
         }
+        let encodedDimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+        let encodedWidth = encodedDimensions.width
+        let encodedHeight = encodedDimensions.height
         guard let avcc = Self.data(from: dataBuffer) else {
             report(error: .malformedAVCC, generation: generation)
             return
@@ -316,6 +319,10 @@ final class MacH264Encoder: @unchecked Sendable {
             let currentHeight = self.height
             self.lock.unlock()
             guard version > 0, self.isGenerationActive(generation) else { return }
+            guard encodedWidth == Int32(currentWidth), encodedHeight == Int32(currentHeight) else {
+                self.onError?(.invalidDimensions)
+                return
+            }
             do {
                 let events = try H264EncoderOutputAssembler.events(
                     avccAccessUnit: avcc,

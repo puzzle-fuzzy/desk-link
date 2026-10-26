@@ -417,7 +417,7 @@
 ### DL2-043 · P3 · 被控 Mac 的能力协商与实际编码一致
 
 - [ ] 在扩展 Windows→Mac / Mac→Mac 前，统一声明能力和真正的捕获编码参数。
-  - [x] 安全切片：捕获默认上限统一为 FFI 已声明的 1920×1080，VideoToolbox 请求 Main；启动拒绝超限尺寸，输出在发布配置/帧前校验 SPS profile_idc=77，后端意外产出 High 时明确失败而不发送未声明码流。
+  - [x] 安全切片：捕获默认上限统一为 FFI 已声明的 1920×1080，VideoToolbox 请求 Main；启动拒绝超限尺寸，输出在发布配置/帧前校验 SPS profile_idc=77，且 VideoToolbox 实际格式尺寸必须等于当前配置尺寸；后端意外产出 High 或尺寸不符时明确失败而不发送未声明码流。
   - [x] 自动验证：`python -m unittest discover -s scripts/tests -p test_dl2_apple_media_contract.py -v` 2 项跨 Swift/FFI 静态合同通过；新增 Swift Main 输出、High 拒绝及捕获尺寸用例，但本机无 Swift/Xcode，未执行 Swift。
   - [ ] 仍需接通控制端 profile/尺寸约束到实际后端的动态协商，验证 High 支持端、Main-only 端、编码器降级、切屏/分辨率变化及真实 Mac；当前安全切片未宣称完整协商或硬件验收完成。
   - 提交主题：`fix(DL2-043): constrain Mac capture and encoding to declared Main capability`；验证记录及换行归一在后续 `fix(DL2-043): record verified safety slice and normalize sources` 提交。
