@@ -596,6 +596,60 @@ async fn establish_mock_peer_generation(client: &QuicClient) {
     );
 }
 
+#[tokio::test]
+async fn generation_bound_business_backend_preserves_all_eight_lane_payloads() {
+    let relay = spawn_mock_relay(false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Controller)).await.unwrap();
+    establish_mock_peer_generation(&client).await;
+    assert_eq!(client.peer_generation(), MOCK_PEER_GENERATION);
+    for value in 1..=8 {
+        let channel = desklink_transport::ChannelKind::try_from(value).unwrap();
+        let ciphertext = bytes::Bytes::from(vec![value; 128]);
+        client
+            .send_channel_for_generation(channel, MOCK_PEER_GENERATION, ciphertext.clone())
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.next_channel_for_generation(channel, MOCK_PEER_GENERATION),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, ciphertext);
+        assert!(matches!(
+            client
+                .send_channel_for_generation(channel, MOCK_PEER_GENERATION + 1, ciphertext)
+                .await,
+            Err(TransportError::PeerReplaced)
+        ));
+        assert!(matches!(
+            client
+                .next_channel_for_generation(channel, MOCK_PEER_GENERATION + 1)
+                .await,
+            Err(TransportError::PeerReplaced)
+        ));
+    }
+    client.close(b"business backend test done");
+}
+
+#[tokio::test]
+async fn connection_health_wait_does_not_consume_runtime_closed_event() {
+    let relay = spawn_mock_relay(false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Controller)).await.unwrap();
+    assert!(!client.is_closed());
+    client.close(b"health observer test done");
+    tokio::time::timeout(Duration::from_secs(1), client.closed())
+        .await
+        .unwrap();
+    assert!(client.is_closed());
+    tokio::time::timeout(Duration::from_secs(1), client.next_closed_reason())
+        .await
+        .expect("health observer must not steal the runtime's closed event");
+}
+
 async fn assert_mock_reliable_lanes_work(client: &QuicClient) {
     client
         .send_control_for_generation(MOCK_PEER_GENERATION, vec![0xc0])

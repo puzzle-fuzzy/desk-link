@@ -26,3 +26,9 @@ test -p desklink-windows --lib --tests --locked --quiet
 5. 已认证 LAN 会话的 relay 离线策略必须明确：不重新授权、不接收新的身份材料、不把 relay 错误直接冒充 LAN 失效；本地结束/撤权应走仍存活的认证控制通道。LAN 与 relay 都不可用或输入发送结果不确定时，遵守既有 ReleaseAll/会话收尾。
 
 真实 Windows Host/Controller、双向切换/部分降级、断公网存活及任务清理仍需后续实现与自动验证。发现/本地配对、双机延迟/长稳与公网 NAT 环境保留未完成。
+
+## 真实 relay backend 接口切片
+
+`QuicClient::send_channel_for_generation` 和 `next_channel_for_generation` 对原有八个 ChannelKind 提供一致入口，原密文不重新 seal，仍使用既有可靠通道锁与 generation 检查；控制读取复用 pending control 保护，不消费新 peer 的握手。零/错误 generation 不会发送或读取业务。`peer_generation`、`is_closed`、`closed` 是只读健康观察，后者不偷走 runtime 的 Closed 事件。
+
+新增实际 localhost QUIC 行为验证逐 lane 字节一致和错误 generation 拒绝，以及健康等待后原 Closed 事件仍可消费。使用同一独立 target，`test -p desklink-transport --lib --tests --locked --quiet` 为 45 单元+23 localhost 通过，`clippy -p desklink-transport --all-targets --locked -- -D warnings` 与包级 fmt 通过。这是业务适配基础接口，未把它描述成可靠 LAN 生产已启用。

@@ -404,6 +404,7 @@
 
 - [ ] 设计认证后的多通道 LAN 数据面，再按测量决定公网 NAT 穿透方案。
 - [x] 第二波来源整合切片：在独立 `codex/dl2-lan-runtime` 合并冻结 Windows joint `5782341` 与完整网络 `4b15561`，保留双亲历史；七处冲突逐块确认，保留真实 epoch/owned input/媒体与任务生命周期。共享四包 215 通过、4 ignored；Windows 283 通过、17 ignored。只证明整合，LAN 生产接线和 Apple 完整上下文仍待后续；接口计划与来源边界见 [生产 LAN 接线记录](docs/lan-runtime-integration.md)。主题 `merge(DL2-024): combine frozen Windows and network snapshots`。
+- [x] 真实 relay backend 接口切片：QuicClient 为八条业务 lane 提供 generation 绑定的原密文发送/读取，以及不消费事件的连接健康观察；旧 generation 与零 generation 拒绝，控制 lane 保留替换 peer 的握手保护。新增真实 loopback 八 lane 字节一致与健康观察回归，transport 45 单元+23 localhost 通过、严格 Clippy/fmt 通过；尚未启用生产 LAN。主题 `feat(DL2-024): expose generation-bound relay business lanes`。
 - [x] 传输层独立切片：新增 opt-in DLD1/DLB1 数据面，复用既有认证 probe 与 Noise 会话，提供八通道有界队列、可靠流优先级、逐通道回退、同密文去重、截止时间与取消；收讫使用 AEAD 内随机 128bit token，拒绝伪造/旧 ACK，不推进反向业务 replay window。提交主题：`feat(DL2-024): add authenticated multi-lane LAN transport slice`。
 - [x] 本地自动验证：固定 Rust 工具链通过 transport **35 项单元测试（其中新增 LAN 数据面 11 项）+16 项 localhost 集成测试**，Clippy `--all-targets --locked -- -D warnings`、包级 fmt 与 `git diff --check` 通过。覆盖 relay backend 离线时八通道双向传输、慢文件消费者与输入/音频隔离、LAN/relay 去重、伪收讫、错会话/错 lane、双向 >128 包及持锁取消；不涉及公网或真实输入注入。
 - [x] 共享探测接入复核：复用 DL2-011 的 `3277c2a` 与 `0836a8b` 独立提交，保留 LAN 八个业务通道，探测统一使用独立 `DirectProbe=8`；crypto 36、transport 38+16、relay 34、FFI 39、Windows DirectLan 2 项测试通过，相关 Clippy/fmt 通过。仅透传输入业务正文，DL2-013 的 `stream_id/input_epoch` 编解码及校验等待 Apple/FFI 单一契约，不另造格式；主任务仍未完成。提交主题：`docs(DL2-024): verify shared probe integration boundaries`。

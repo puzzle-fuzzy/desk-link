@@ -274,6 +274,90 @@ impl QuicClient {
         self.inner.connection.remote_address()
     }
 
+    /// Relay generation observed during the authenticated handshake. A durable
+    /// host binds a business transport to this value, never to a later peer.
+    pub fn peer_generation(&self) -> u64 {
+        self.inner.active_peer_generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.connection.close_reason().is_some()
+    }
+
+    /// Does not consume any lane's disconnect event or steal a replacement
+    /// peer's control handshake from a durable host.
+    pub async fn closed(&self) {
+        self.inner.connection.closed().await;
+    }
+
+    /// Relay backend for a negotiated business transport. The supplied bytes
+    /// are already encrypted; retries are forwarded without resealing them.
+    pub async fn send_channel_for_generation(
+        &self,
+        channel: ChannelKind,
+        expected_generation: u64,
+        ciphertext: Bytes,
+    ) -> Result<(), TransportError> {
+        if expected_generation == 0 {
+            return Err(TransportError::PeerReplaced);
+        }
+        if channel.is_reliable() {
+            self.send_reliable(channel, Some(expected_generation), ciphertext.to_vec())
+                .await
+        } else if channel == ChannelKind::VideoDatagram {
+            self.send_datagram_wait(channel, Some(expected_generation), ciphertext.to_vec())
+                .await
+        } else {
+            self.send_datagram(channel, Some(expected_generation), ciphertext.to_vec())
+        }
+    }
+
+    /// Exactly one business reader may own each lane after negotiation. In
+    /// particular this must not run beside `next_event` for the same lanes.
+    /// Control retains the existing pending-handshake protection on takeover.
+    pub async fn next_channel_for_generation(
+        &self,
+        channel: ChannelKind,
+        expected_generation: u64,
+    ) -> Result<Bytes, TransportError> {
+        if expected_generation == 0 || self.peer_generation() != expected_generation {
+            return Err(TransportError::PeerReplaced);
+        }
+        if channel == ChannelKind::Control {
+            return self
+                .next_control_for_generation(expected_generation)
+                .await
+                .map(Bytes::from);
+        }
+        let receiver = match channel {
+            ChannelKind::Input => &self.inner.events.input,
+            ChannelKind::VideoConfig => &self.inner.events.video_config,
+            ChannelKind::VideoReliable => &self.inner.events.video_reliable,
+            ChannelKind::VideoDatagram => &self.inner.events.video_datagram,
+            ChannelKind::CursorDatagram => &self.inner.events.cursor_datagram,
+            ChannelKind::AudioDatagram => &self.inner.events.audio_datagram,
+            ChannelKind::Transfer => &self.inner.events.transfer,
+            ChannelKind::Control => unreachable!(),
+        };
+        let event = receive_current_inbound(receiver, &self.inner.active_peer_generation)
+            .await
+            .ok_or(TransportError::Closed)?;
+        if event.peer_generation != Some(expected_generation) {
+            return Err(TransportError::PeerReplaced);
+        }
+        match event.event {
+            TransportEvent::Input(bytes)
+            | TransportEvent::VideoConfig(bytes)
+            | TransportEvent::VideoReliable(bytes)
+            | TransportEvent::VideoDatagram(bytes)
+            | TransportEvent::CursorDatagram(bytes)
+            | TransportEvent::AudioDatagram(bytes)
+            | TransportEvent::Transfer(bytes) => Ok(bytes.into()),
+            TransportEvent::PeerDisconnected { .. } => Err(TransportError::PeerDisconnected),
+            _ => Err(TransportError::Malformed),
+        }
+    }
+
     pub async fn connect(config: QuicClientConfig) -> Result<Self, TransportError> {
         if config.server_name.is_empty() {
             return Err(TransportError::InvalidConfig(
