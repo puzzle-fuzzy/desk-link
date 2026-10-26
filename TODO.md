@@ -69,7 +69,7 @@
 | S | `b1118ad465703493255123e23b6f522662c3d603` | 服务已提交快照；各项本地数据库/Bun/进程级回归与诊断producer合同，未部署；上述两处token预算/分桶补修后的最终SHA待交付 |
 | E | `12b54ceedc0799a556e502436bc08830db7edca1` | 工程入口/合同及实际共享transport恢复分类；其源码blob与已运行29/18/12及严格Clippy/fmt报告一致；其他报告精确SHA见 `docs/local-verification.md` |
 | G（后续波） | `2d79f9706303cb2dffa7abc764c8f7450591c3b6`，tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832` | 015 owned BGRA/NV12池、VP与capture入口；owner报告204通过/6忽略、7GPU含4合成及Clippy，rawlog待落盘，未独立复跑；016 dirty烟测不计入 |
-| D044 | `67cd1bf69cbeacf2a761054f17454f40e4b821f1`，parent J | GUI044固定切片，cloud_diagnostics相对J无diff；owner报告Windows218/0/2、UI137/0/1及两包lib/tests Clippy，命令target范围/最终联合闭环待核对，045后续SHA待交付 |
+| D | `5069158584dfa1f729defe2fadb5b9933acdfcff`，parent67cd1bf、tree `3740f354bce3c1d14d32f8435bb44b0c2b6a1006` | GUI044/045固定历史；原日志核对044所选lib Windows218/2忽略、UI137/1忽略，045 UI138/1忽略及限定包Clippy；cloud代码相对J无diff，完整u64 JSON合同后继补修待交付 |
 
 来源TODO已关闭的主项为：产品001/034/035，媒体020/046/050，服务036/037/038/039/054/055/058，工程042；这些是各自来源范围的完成状态，剩余集成、已发现服务补修和设备验收继续按下表单独记录。
 
@@ -87,7 +87,7 @@
 | 010 · J/M | [x] 静态恢复IDR并保留buffered输出请求 | [x] 媒体恢复与联合软件MFT链 | [ ] 真桌面/双机恢复时延 |
 | 011 · J/M | [x] crypto短锁、独立probe窗口与取消树 | [x] 慢探测/重放/跨lane回归 | [ ] 双机黑洞输入/画面p95/p99 |
 | 012 · J/M | [x] 输入独立消费、慢配置合并与完成回执 | [x] 慢控制/输入并发回归 | [ ] 慢驱动双机输入预算 |
-| 013 · J/A | [x] Windows完整u64/绘制/host映射切片，A完整FFI/owned future/media_generation稳定历史 | [x] J两项软件MFT/QUIC/Noise联合回环；A源FFI88及相关传输回归 | [ ] J+A真实候选合并/复跑、真实呈现/拓扑矩阵；J单支仍2项Host失败 |
+| 013 · J/A | [x] Windows完整u64/绘制/host映射切片，A完整FFI/owned future/media_generation稳定历史 | [x] J两项软件MFT/QUIC/Noise联合回环；A源FFI88及相关传输回归 | [ ] 候选合并/复跑、Swift旧input receipt后继P2修复、真实呈现/拓扑；J单支仍2项Host失败 |
 | 014 · M | [x] CPU离线分段基线与真实输入/输出身份 | [x] 可复跑离线工具及buffered时序校验 | [ ] GPU/双机/端到端/功耗温度/长稳对照 |
 | 015 · M/G | [x] M复用staging/scratch；G新增owned surface池/VP缩放转色/capture入口 | [x] M缓冲回归；G204/6与合成GPU为owner报告，原日志待交付 | [ ] 016生产encoder链、tracked-sample lease寿命/CPU与GPU分别测量及适用硬件验收；主项保留未完成 |
 | 016 · M | [x] 硬件MFT枚举、有界异步泵/软件回退及timestamp校验 | [x] 后端/缓冲/输出身份回归 | [ ] 真实硬件成功编码及厂商/混合GPU/驱动丢失矩阵，第二波推进 |
@@ -123,10 +123,11 @@
 
 | 问题 | 已提交/核对的切片 | 未满足验收或成立性 |
 | --- | --- | --- |
-| 044 · J/M/S/D044 | [x] cursor降级/typed observer、b111服务合同与67cd GUI持久化切片；所选来源回归 | [ ] 最终producer→签名接收/store联合闭环、GUI测试命令口径与双机；无永久cloud过滤，observer不计作真实丢包 |
-| 045 · J/M/bf5d7eb | [x] Some(Err)反证、None退役/迟到probe隔离及服务固定字段schema | [ ] GUI最终重跑/真实事件签名接收/store闭环与实际监听；不延续“任一Err永久禁用” |
+| 044 · J/M/S/D | [x] cursor降级/typed observer、b111服务合同与GUI持久化切片/所选lib回归 | [ ] full-u64 JSON字符串后继补修及最终producer→签名接收/store全值域闭环、双机；observer不计真实丢包 |
+| 045 · J/M/D/bf5d7eb | [x] Some(Err)反证、None退役/迟到probe隔离、GUI/服务固定字段与所选lib回归 | [ ] full-u64 JSON后继补修、最终真实签名接收/store与实际监听；不延续“任一Err永久禁用” |
 | 046 · M/J | [x] 路径所有权/按连接身份退役/迟到结果取消与真实回归，M主项完成 | [ ] 第一波候选接入验证 |
 | 048 · E | [x] Noise message3认证payload链路已核对 | [ ] P1/UKS攻击路径证据不足，熵源/篡改/拼接待独立证明；未直接改crypto |
+| 049 · N | [x] 按relay IPv4/IPv6族绑定本地socket，真实::1/v4握手/join/目录/可靠与datagram回归 | [ ] 第一波候选接入；真实WAN IPv6/NAT/双栈路由另验 |
 | 050 · M/J | [x] 重复chunk保留首payload且不延寿与回归，M主项完成 | [ ] 第一波候选接入验证 |
 | 051 · A | [x] 网络/服务故障保留账号会话、generation隔离及旋转token取消落盘；Python10项合同 | [ ] Swift行为用例17项未运行，真实Keychain/断网/重新登录 |
 | 052 · N | [x] QUIC资源预算、join前datagram防护及固定容器负载/cgroup实测 | [ ] 第一波聚合；容量结论只限已测载荷，生产环境另验 |
@@ -139,7 +140,7 @@
 | 059 · A | [x] 未知Host事件固定计数/不解析、Transfer非终态；Windows2静态合同 | [ ] Swift及真实Transfer全流程 |
 | 060 · A | [x] 认证会话时钟校准/context先验隔离、策略/QUIC来源回归 | [ ] 真Mac时钟跳变/输入注入及完整Apple聚合 |
 | 061 · A | [x] direct绝对静默截止、真实loopback黑洞/持续收包红绿回归 | [ ] Mac/iOS实际启用、双机/防火墙与第一波聚合 |
-| 047/049 | [ ] 成立性、来源/owner与实跑范围待核实 | [ ] 保留root未提交稿，不能总括全部确认或修改其owner |
+| 047 | [ ] 成立性、来源/owner与实跑范围待核实 | [ ] 保留root未提交稿，不能总括全部确认或修改其owner |
 
 ## 2. 本次验证基线（初始记录，后续源码结果见上表）
 
