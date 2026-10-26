@@ -62,7 +62,7 @@ python scripts/verify.py native perf --report dist/verify/device-status.json
 
 ## 追加跨层门禁：input epoch 与独立 probe
 
-严格几何绑定的共享契约由 Apple/FFI 单一 owner 交付，仍属未发布协议 13 开发线。来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`：`VideoConfig` 在 `stream_id` 后有非零 `input_epoch: u64`；`InputEnvelope` 在 `timestamp_us` 后有非零 `stream_id: u64`、`input_epoch: u64`，并有共享 `InputContext` 类型。input codec 已统一保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]` 和 exact 解码；平台/transport 不手工拼前缀、不 fallback 无context格式。**显式 InputContext 发送 API 与生产接线仍待复用后续切片；不得在发送时补当前值。** 以下包含仍待执行的生产门禁，不是整体已通过记录。
+严格几何绑定的共享契约由 Apple/FFI 单一 owner 交付，仍属未发布协议 13 开发线。来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`：`VideoConfig` 在 `stream_id` 后有非零 `input_epoch: u64`；`InputEnvelope` 在 `timestamp_us` 后有非零 `stream_id: u64`、`input_epoch: u64`，并有共享 `InputContext` 类型。input codec 已统一保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]` 和 exact 解码；平台/transport 不手工拼前缀、不 fallback 无context格式。显式 `send_input_with_context` API 随最小桥接b473498复用为56f53b4，本地加密loopback5项通过；**生产调用迁移、host和呈现接线仍待完成，不得在发送时补当前值。** 以下不是整链已通过记录。
 
 | 门禁 | 必须从生产边界观察到的结果 | 执行层/证据边界 |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ probe 复用链与工程源码快照见[能力/版本记录](current-capabilitie
 
 ### 显式发送 API 的生产迁移清单
 
-以 `5501aad` 及随后仅文档的修订为源码快照，CodeGraph 发现入口后逐项核对实际 receiver 类型；旧 `ControllerRuntime::send_input(event)` 的生产直接调用共七处，当前都通向零 context 的失败关闭方法。不能把重名的底层 `QuicClient::send_input(bytes)` 作为同一个API盲改。
+以下清单在 `5501aad` 核对，桥接 `56f53b4` 后七处生产调用仍原样存在（迁移的两处测试调用不在生产清单中）。CodeGraph 发现入口后逐项核对实际 receiver 类型，旧 `ControllerRuntime::send_input(event)` 仍走零context拒绝方法；不能把重名的底层 `QuicClient::send_input(bytes)` 作为同一个API盲改。
 
 | 生产路径 | 当前直接调用/上游 | 迁移必须覆盖 |
 | --- | --- | --- |
@@ -96,6 +96,8 @@ probe 复用链与工程源码快照见[能力/版本记录](current-capabilitie
 
 ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释放展开及 `fireInput`，Apple `ControllerBridge.releaseAll`→C release API→FFI pressed ledger，以及 reject/destroy 的本机清理路径；远端过期release与用户取消/本机收回分开验证。`controller-loopback` 单独跑加密localhost controller测试，使其他FFI unit失败不会掩盖该二进制的实际结果；它不替代上表生产接线、ABI/C布局或真机呈现。
 
-该原语测试本次已独立运行，`controller-context-transition.json` 为 failed / passed=false（源码 `f6ff20b`、dirty=true）：3通过/2失败，两处旧 send_input 调用返回 `Protocol(InvalidInput)`；后台 Closed 是其后关闭的结果，不能把它误报成外部服务不可用。`transition-runner-python.json` 的入口/脚本134项通过只证明验证工具工作，不替代这两项业务失败。
+桥接前原语测试 `controller-context-transition.json` 为 failed / passed=false（源码 `f6ff20b`、dirty=true）：3通过/2失败，两处旧 send_input 调用返回 `Protocol(InvalidInput)`；后台 Closed 是其后关闭的结果，不能误报外部服务不可用。保留原始失败记录，不用后续结果覆盖旧源码身份。
 
-完整 FFI 切片 `9ad7154b365de875d725188cfa091f5c21da0b5a` 依赖 Apple 003/004/025 的错误ABI、send_cancellable、生成头和布局测试，本工程未pick整笔。按协调改为等产品组交付独立Rust显式API+encrypted-loopback桥接提交，复用后按等价patch去重；完整C/Swift/FFI以Apple源分支为准，不复制整份文件覆盖其他改动。新增C字段与Swift初始化/布局必须分别实测，来源报告34项不算本工程已验证。
+完整 FFI 切片 `9ad7154b365de875d725188cfa091f5c21da0b5a` 依赖 Apple 003/004/025 的错误ABI、send_cancellable、生成头和布局测试，本工程未pick整笔。已复用产品独立桥接 `b473498382bd163f6085c019521105741264707c` → `56f53b4a17347714a91a2cb269bc5addc5777916`，唯一新增前置是已复用的bc6合同。controller.rs/test两文件增量与9ad的稳定patch-id均为 `2f004b5c19baaa5f3df4360b605818df1f40f9b4`，后续Apple整合只保留一份等价API/测试，不重复pick或覆盖整文件。其余C/FFI ledger/worker/Swift仍以Apple源分支为准；新增C字段与Swift布局必须独立验证，来源报告34项不算本工程结果。
+
+桥接后实际 `captured-context-bridge.json` 来自干净源码 `56f53b4`、dirty=false：编译、protocol47和 controller加密loopback5项通过、0忽略；host-runtime-contract仍9通过/1失败（零epoch配置），整体failed / passed=false。该API原语成功不能关闭七处生产调用、Text/粘贴/ReleaseAll、host映射或呈现门禁。`captured-context-bridge-tooling.json` 在干净源码 `31e9fb0` 的Python134项与fmt通过，证明工具/格式，不替代业务失败。
