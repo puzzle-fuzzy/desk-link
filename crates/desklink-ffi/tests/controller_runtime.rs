@@ -262,10 +262,16 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     );
 
     runtime
-        .send_input(InputEvent::MouseWheel {
-            delta_x: -120,
-            delta_y: 240,
-        })
+        .send_input_with_context(
+            desklink_protocol::InputContext {
+                stream_id: config.stream_id,
+                input_epoch: config.input_epoch,
+            },
+            InputEvent::MouseWheel {
+                delta_x: -120,
+                delta_y: 240,
+            },
+        )
         .await
         .unwrap();
     runtime.request_keyframe().await.unwrap();
@@ -346,7 +352,10 @@ async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(event, ControllerEvent::VideoConfig(_)));
+    let config = match event {
+        ControllerEvent::VideoConfig(config) => config,
+        event => panic!("expected config, got {event:?}"),
+    };
     continue_sender.send(()).unwrap();
     for _ in 0..8 {
         if runtime.video_path_fallback_reason().is_some() {
@@ -367,10 +376,16 @@ async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
     );
 
     runtime
-        .send_input(InputEvent::MouseWheel {
-            delta_x: -30,
-            delta_y: 60,
-        })
+        .send_input_with_context(
+            desklink_protocol::InputContext {
+                stream_id: config.stream_id,
+                input_epoch: config.input_epoch,
+            },
+            InputEvent::MouseWheel {
+                delta_x: -30,
+                delta_y: 60,
+            },
+        )
         .await
         .unwrap();
     runtime.request_keyframe().await.unwrap();
