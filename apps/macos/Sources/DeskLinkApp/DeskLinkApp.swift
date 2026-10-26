@@ -67,10 +67,11 @@ struct DeskLinkApp: App {
                     ProgressView("正在准备 DeskLink…")
                 case .signedOut:
                     AccountLoginView(account: account, allowsSkipLogin: true)
-                case .signedIn:
-                    workspaceContent
-                case .skipped:
-                    workspaceContent
+                case .signedIn, .skipped, .offline:
+                    VStack(spacing: 0) {
+                        AccountRecoveryNotice(account: account)
+                        workspaceContent
+                    }
                 }
             }
             .sheet(item: pendingApproval) { approval in

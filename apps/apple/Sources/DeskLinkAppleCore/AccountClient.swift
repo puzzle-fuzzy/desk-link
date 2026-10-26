@@ -26,12 +26,30 @@ public enum AccountState: Equatable, Sendable {
     /// session and is used by clients that allow using the app without login.
     case skipped
     case signedIn(AccountUser)
+    /// Cached identity only; account services have not confirmed this session.
+    case offline(AccountUser?)
+
+    public var cachedUser: AccountUser? {
+        switch self {
+        case let .signedIn(user): user
+        case let .offline(user): user
+        default: nil
+        }
+    }
+
+    public var hasAccountSession: Bool {
+        switch self {
+        case .signedIn, .offline: true
+        default: false
+        }
+    }
 }
 
 public enum AccountClientError: LocalizedError, Equatable, Sendable {
     case invalidConfiguration
     case network(String)
     case server(String)
+    case http(status: Int, code: String?, message: String)
     case keychain(String)
 
     public var errorDescription: String? {
@@ -39,8 +57,25 @@ public enum AccountClientError: LocalizedError, Equatable, Sendable {
         case .invalidConfiguration: "账号服务地址无效，请联系管理员。"
         case let .network(message): message
         case let .server(message): message
+        case let .http(_, _, message): message
         case let .keychain(message): message
         }
+    }
+
+    var isInvalidToken: Bool {
+        guard case let .http(status, code, _) = self else { return false }
+        return status == 401 && code == "token_invalid"
+    }
+}
+
+public protocol AccountHTTPTransport: Sendable {
+    func data(for request: URLRequest) async throws -> (Data, URLResponse)
+}
+
+public struct URLSessionAccountHTTPTransport: AccountHTTPTransport {
+    public init() {}
+    public func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await URLSession.shared.data(for: request)
     }
 }
 
@@ -50,6 +85,13 @@ private struct AccountTokens: Codable, Sendable {
     let refreshToken: String
     let accessExpiresAt: Int
     let refreshExpiresAt: Int
+
+    func validate() throws {
+        guard tokenType == "Bearer", !accessToken.isEmpty, !refreshToken.isEmpty,
+              accessExpiresAt > 0, refreshExpiresAt > 0 else {
+            throw AccountClientError.server("账号服务返回了无效的登录状态，请稍后重试。")
+        }
+    }
 }
 
 private struct StoredAccountSession: Codable, Sendable {
@@ -68,7 +110,13 @@ private struct MeResponse: Codable {
 }
 
 private struct APIErrorResponse: Decodable {
+    let error: String?
     let message: String?
+}
+
+private enum SessionRestoreFailure: Error {
+    // Only the authenticated refresh endpoint can establish this outcome.
+    case invalidRefreshToken
 }
 
 @MainActor
@@ -76,60 +124,80 @@ public final class AccountClient: ObservableObject {
     @Published public private(set) var state: AccountState = .loading
     @Published public private(set) var lastError: String?
     @Published public private(set) var isBusy = false
+    @Published public private(set) var isRestoring = false
 
     public let platform: AccountPlatform
     public let deviceName: String
 
     private let baseURL: URL
     private let keychain: any KeychainStore
+    private let transport: any AccountHTTPTransport
     private let sessionService = "com.desklink.account-session"
     private let sessionAccount = "current"
     private let deviceService = "com.desklink.account-device"
     private let deviceAccount = "installation-id"
     private var storedSession: StoredAccountSession?
+    private var sessionGeneration: UInt64 = 0
+    private var restoringGeneration: UInt64?
 
     public init(
         baseURL: URL,
         platform: AccountPlatform,
         deviceName: String,
-        keychain: any KeychainStore = SystemKeychainStore()
+        keychain: any KeychainStore = SystemKeychainStore(),
+        transport: any AccountHTTPTransport = URLSessionAccountHTTPTransport()
     ) {
         self.baseURL = baseURL
         self.platform = platform
         self.deviceName = deviceName
         self.keychain = keychain
+        self.transport = transport
     }
 
     public func restore() async {
-        guard storedSession == nil else { return }
+        guard !isRestoring, !isBusy else { return }
+        switch state {
+        case .signedIn, .skipped: return
+        default: break
+        }
+        let generation = sessionGeneration
+        restoringGeneration = generation
+        isRestoring = true
+        lastError = nil
+        defer {
+            if restoringGeneration == generation {
+                restoringGeneration = nil
+                isRestoring = false
+            }
+        }
         do {
-            guard let data = try keychain.read(service: sessionService, account: sessionAccount) else {
-                state = .signedOut
-                return
+            if storedSession == nil {
+                guard let data = try keychain.read(service: sessionService, account: sessionAccount) else {
+                    state = .signedOut
+                    return
+                }
+                storedSession = try JSONDecoder().decode(StoredAccountSession.self, from: data)
             }
-            storedSession = try JSONDecoder().decode(StoredAccountSession.self, from: data)
-            guard let current = storedSession else {
-                state = .signedOut
-                return
-            }
-            do {
-                let data = try await request(
-                    path: "v1/account/me",
-                    method: "GET",
-                    body: nil,
-                    accessToken: current.tokens.accessToken
-                )
-                let response = try JSONDecoder().decode(MeResponse.self, from: data)
-                storedSession?.user = response.user
-                try persistSession()
-                state = .signedIn(response.user)
-            } catch {
-                let tokens = try await refreshTokens(current.tokens.refreshToken)
-                _ = tokens
-            }
+            guard let current = storedSession else { return }
+            let restored = try await validateSession(current, generation: generation)
+            try checkGeneration(generation)
+            // Refresh tokens rotate. Keep the received pair in memory even if
+            // Keychain is temporarily unavailable, so retry does not replay it.
+            storedSession = restored
+            try save(session: restored)
+            state = .signedIn(restored.user)
         } catch {
-            clearLocalSession()
-            lastError = error.localizedDescription
+            guard sessionGeneration == generation else { return }
+            if let failure = error as? SessionRestoreFailure, case .invalidRefreshToken = failure {
+                do {
+                    try clearLocalSession()
+                    lastError = "登录状态已失效，请重新登录。"
+                } catch {
+                    showOffline(error)
+                }
+            } else {
+                showOffline(error)
+            }
         }
     }
 
@@ -162,6 +230,8 @@ public final class AccountClient: ObservableObject {
     }
 
     public func login(email: String, password: String) async {
+        guard !isBusy else { return }
+        let generation = advanceSessionGeneration()
         await runBusy {
             let data = try await self.request(
                 path: "v1/account/login",
@@ -175,7 +245,9 @@ public final class AccountClient: ObservableObject {
                 ],
                 accessToken: nil
             )
+            try self.checkGeneration(generation)
             let response = try JSONDecoder().decode(LoginResponse.self, from: data)
+            try response.tokens.validate()
             let session = StoredAccountSession(
                 user: response.user,
                 deviceID: try self.installationID(),
@@ -220,15 +292,20 @@ public final class AccountClient: ObservableObject {
         }
     }
 
-    /// Revokes the account session when possible. Local account state is
-    /// cleared even if the network is unavailable, so logout never leaves a
-    /// usable bearer token in Keychain.
+    /// Delete locally before awaiting revocation. A late logout response cannot
+    /// clear a newer login. Keychain failures remain visible and retryable.
     public func logout() async {
         let token = storedSession?.tokens.accessToken
+        _ = advanceSessionGeneration()
+        lastError = nil
+        do {
+            try clearLocalSession()
+        } catch {
+            showOffline(error)
+        }
         if let token {
             _ = try? await request(path: "v1/account/logout", method: "POST", body: [:], accessToken: token)
         }
-        clearLocalSession()
     }
 
     /// Enters the local-only workspace without creating an account session.
@@ -236,6 +313,7 @@ public final class AccountClient: ObservableObject {
     /// login, so skipping login must not alter saved remote connections.
     public func skipLogin() {
         guard !isBusy else { return }
+        _ = advanceSessionGeneration()
         lastError = nil
         state = .skipped
     }
@@ -246,6 +324,7 @@ public final class AccountClient: ObservableObject {
 
 #if DEBUG
     public func activateForTesting(email: String = "test@example.com") {
+        _ = advanceSessionGeneration()
         let user = AccountUser(id: "ui-test-user", email: email, emailVerified: true)
         storedSession = StoredAccountSession(
             user: user,
@@ -262,6 +341,29 @@ public final class AccountClient: ObservableObject {
     }
 #endif
 
+    private func validateSession(_ current: StoredAccountSession, generation: UInt64) async throws -> StoredAccountSession {
+        var candidate = current
+        do {
+            let data = try await request(path: "v1/account/me", method: "GET", body: nil, accessToken: current.tokens.accessToken)
+            try checkGeneration(generation)
+            candidate.user = try JSONDecoder().decode(MeResponse.self, from: data).user
+        } catch {
+            try checkGeneration(generation)
+            guard let failure = error as? AccountClientError, failure.isInvalidToken else { throw error }
+            do {
+                candidate.tokens = try await refreshTokens(current.tokens.refreshToken)
+                try checkGeneration(generation)
+            } catch {
+                try checkGeneration(generation)
+                if let failure = error as? AccountClientError, failure.isInvalidToken {
+                    throw SessionRestoreFailure.invalidRefreshToken
+                }
+                throw error
+            }
+        }
+        return candidate
+    }
+
     private func refreshTokens(_ refreshToken: String) async throws -> AccountTokens {
         let data = try await request(
             path: "v1/account/refresh",
@@ -271,23 +373,45 @@ public final class AccountClient: ObservableObject {
         )
         struct RefreshResponse: Codable { let tokens: AccountTokens }
         let response = try JSONDecoder().decode(RefreshResponse.self, from: data)
-        guard var current = storedSession else { throw AccountClientError.server("登录状态已失效，请重新登录。") }
-        current.tokens = response.tokens
-        try save(session: current)
-        storedSession = current
-        state = .signedIn(current.user)
+        try response.tokens.validate()
         return response.tokens
+    }
+
+    private func advanceSessionGeneration() -> UInt64 {
+        sessionGeneration &+= 1
+        restoringGeneration = nil
+        isRestoring = false
+        isBusy = false
+        return sessionGeneration
+    }
+
+    private func checkGeneration(_ generation: UInt64) throws {
+        try Task.checkCancellation()
+        guard generation == sessionGeneration else { throw CancellationError() }
+    }
+
+    private func showOffline(_ error: any Error) {
+        state = .offline(storedSession?.user)
+        switch error {
+        case is CancellationError: lastError = "账号恢复已暂停，可稍后重试。"
+        case is DecodingError: lastError = "账号状态暂时无法读取，已保留本地会话，请稍后重试。"
+        case let error as AccountClientError: lastError = error.localizedDescription
+        case is KeychainStoreError: lastError = "钥匙串暂时不可用，已保留本地会话，请稍后重试。"
+        default: lastError = "账号暂时不可用，已保留本地会话，请稍后重试。"
+        }
     }
 
     private func runBusy(_ operation: @escaping () async throws -> Void) async {
         guard !isBusy else { return }
+        let generation = sessionGeneration
         isBusy = true
         lastError = nil
-        defer { isBusy = false }
+        defer { if generation == sessionGeneration { isBusy = false } }
         do {
             try await operation()
         } catch {
-            lastError = error.localizedDescription
+            guard generation == sessionGeneration else { return }
+            lastError = error is CancellationError ? "操作已取消，可稍后重试。" : error.localizedDescription
         }
     }
 
@@ -310,16 +434,23 @@ public final class AccountClient: ObservableObject {
         }
         if let accessToken { request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "authorization") }
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            try Task.checkCancellation()
+            let (data, response) = try await transport.data(for: request)
+            try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse else {
                 throw AccountClientError.network("账号服务返回了无效响应。")
             }
             guard (200..<300).contains(http.statusCode) else {
-                let message = (try? JSONDecoder().decode(APIErrorResponse.self, from: data).message)
+                let body = try? JSONDecoder().decode(APIErrorResponse.self, from: data)
+                let message = body?.message
                     ?? "账号服务暂时不可用，请稍后重试。"
-                throw AccountClientError.server(message)
+                throw AccountClientError.http(status: http.statusCode, code: body?.error, message: message)
             }
             return data
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
         } catch let error as AccountClientError {
             throw error
         } catch {
@@ -356,15 +487,34 @@ public final class AccountClient: ObservableObject {
         }
     }
 
-    private func persistSession() throws {
-        guard let storedSession else { return }
-        try save(session: storedSession)
-    }
-
-    private func clearLocalSession() {
-        try? keychain.delete(service: sessionService, account: sessionAccount)
+    private func clearLocalSession() throws {
+        try keychain.delete(service: sessionService, account: sessionAccount)
         storedSession = nil
         state = .signedOut
+    }
+}
+
+public struct AccountRecoveryNotice: View {
+    @ObservedObject private var account: AccountClient
+
+    public init(account: AccountClient) { self.account = account }
+
+    public var body: some View {
+        if case .offline = account.state {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("账号暂时离线，本机连接仍可继续使用。")
+                if let error = account.lastError { Text(error).foregroundStyle(.secondary) }
+                Button(account.isRestoring ? "正在重新连接账号…" : "重新连接账号") {
+                    Task { @MainActor in await account.restore() }
+                }
+                .disabled(account.isRestoring || account.isBusy)
+                .accessibilityIdentifier("retry-account-restore")
+            }
+            .font(.footnote)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .accessibilityIdentifier("offline-account-notice")
+        }
     }
 }
 

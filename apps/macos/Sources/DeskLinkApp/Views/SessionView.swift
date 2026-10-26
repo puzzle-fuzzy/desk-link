@@ -187,13 +187,15 @@ struct SessionView: View {
                     .buttonStyle(.borderedProminent)
                     .accessibilityIdentifier("cancel-controller-session")
             }
-            if case .signedIn = account.state {
+            if account.state.hasAccountSession {
                 ToolbarItem(placement: .primaryAction) {
                     Button("退出登录") {
                         Task { @MainActor in
                             bridge.clearRemoteLinksForLogout()
-                            await host.shutdownAndWait()
+                            let stoppingHost = host
+                            async let stopped: Void = stoppingHost.shutdownAndWait()
                             await account.logout()
+                            await stopped
                         }
                     }
                     .buttonStyle(.bordered)

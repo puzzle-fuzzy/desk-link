@@ -521,6 +521,19 @@
 
 不得为了减少本清单数量，把未验证条目直接标成已完成。
 
+## Apple/FFI 追加复核
+
+### DL2-051 · P2 · Mac 账号 restore 遇瞬时网络故障即删除钥匙串会话
+
+- [ ] 区分令牌失效与网络/服务不可达，只有前者清除本地会话。
+- **证据 / 类型：源码缺陷。** `apps/apple/Sources/DeskLinkAppleCore/AccountClient.swift:127-132` restore 中 me 请求失败后尝试 refresh，refresh 再失败落入外层 catch 执行 `clearLocalSession()`（删除 Keychain token 并置 signedOut）。启动时无网或账号服务瞬时不可达即被永久登出。Windows 侧 `apps/windows-ui/src-tauri/src/account.rs:80-127` 失败仅返回 Err 并保留存储会话，两端行为不一致。
+- **方案：** 网络类错误保留会话进入"离线、稍后重试"；仅明确的令牌无效/被撤销才清除；与 DL2-035 的迟到响应隔离一起设计。
+- **验收：** 断网启动、服务 5xx、refresh token 过期三种场景行为各自正确；恢复网络后自动或一键恢复登录。
+
+- [x] 代码与离线入口：HTTP status + 稳定 error code 分类；仅 `/me` 的明确令牌错误触发 refresh，仅 refresh 明确 `401 / token_invalid` 清除会话。网络、服务、429、解码、取消及 Keychain 故障保留凭据并进入离线可重试状态；Mac/iOS 本机工作区继续可用。single-flight 与 session generation 隔离迟到恢复 / 刷新 / 登出；旋转令牌落盘失败先保留内存新令牌，避免重试旧 refresh。主题 `fix(DL2-051): preserve Apple account sessions across transient restore failures`。
+- [x] Windows 静态验证：`python -m unittest scripts.tests.test_dl2_apple_account_restore_contract -v`，8 项协议与源码合同通过；`git diff --check` 通过。新增 Swift mock transport + Keychain spy 行为用例覆盖断网、5xx、429、明确失效、重试、并发恢复、迟到响应、取消和持久化错误，全为合成数据且不访问真实服务 / 系统 Keychain。
+- [ ] Apple 自动 / 真机：Windows 无 Swift/AppKit/UIKit，新增行为用例尚未运行；断网启动、真实 Keychain 锁定 / 恢复、账号服务恢复后一键重试及明确失效后的重新登录仍需 Mac/iOS 验收，不能以源码合同代替。
+
 ## 10. 第一阶段历史记录
 
 以下原文按本次审查前状态保留，仅供追溯。里面的“当前”“未验收”“下一阶段”、旧版本、线上探针结果和勾选项均属于原记录日期；第二阶段以本文前九节为准。尚未完成的签名、安装或设备组合验收可以继续引用，但不能用来否定用户本次已确认的两条远控路径。

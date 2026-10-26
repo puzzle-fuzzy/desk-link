@@ -233,7 +233,7 @@ struct IOSMoreView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("账号") {
-                    if case let .signedIn(user) = account.state {
+                    if let user = account.state.cachedUser {
                         Label(user.email, systemImage: "person.crop.circle")
                     }
                     Button("退出登录", role: .destructive) {
