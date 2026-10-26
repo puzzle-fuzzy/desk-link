@@ -1908,20 +1908,34 @@ async fn notify_local_control_ended(
     secure: &SharedSecureSession,
     peer_generation: u64,
 ) -> bool {
-    // A terminal encrypted denial makes controllers stop automatic recovery.
-    // Wait for their disconnect while the reliable stream is still alive.
+    // The ended peer must disconnect. A replacement generation proves that
+    // another connection is already trying to regain control, not that the
+    // terminal state was acknowledged by the peer we ended.
     tokio::time::timeout(END_CONTROL_TIMEOUT, async {
-        let mut secure = secure.lock().await;
-        send_access_denied(
+        send_runtime_failure(
             client,
+            secure,
             peer_generation,
-            &mut secure,
             AccessDenialReason::HostUnavailable,
         )
-        .await
+        .await?;
+        wait_for_ended_controller_disconnect(client, peer_generation).await
     })
     .await
     .is_ok_and(|result| result.is_ok())
+}
+
+async fn wait_for_ended_controller_disconnect(
+    client: &QuicClient,
+    peer_generation: u64,
+) -> Result<(), HostRuntimeError> {
+    loop {
+        match client.next_control_for_generation(peer_generation).await {
+            Ok(_) => {}
+            Err(TransportError::PeerDisconnected) => return Ok(()),
+            Err(error) => return Err(HostRuntimeError::Transport(error)),
+        }
+    }
 }
 
 async fn send_runtime_failure(

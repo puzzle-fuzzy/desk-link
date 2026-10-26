@@ -224,3 +224,126 @@ fn acknowledged_end_rearms_persistent_host_but_unconfirmed_end_does_not() {
         true
     ));
 }
+
+#[tokio::test]
+async fn a_real_replacement_peer_is_not_an_acknowledgement_of_the_ended_controller() {
+    use desklink_crypto::NoiseInitiator;
+    let (server_tls, client_tls) = local_tls();
+    let relay = Arc::new(
+        RelayServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_tls,
+            RelayConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let address = relay.local_addr().unwrap();
+    let server = relay.clone();
+    let relay_task = tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+    let config = QuicClientConfig::with_client_config(address, "localhost", client_tls);
+    let session_id = SessionId::from_bytes([0x57; 16]);
+    let authentication = [0x72; 32];
+    let host_identity = DeviceIdentity::generate(&mut OsRng);
+    let controller_identity = DeviceIdentity::generate(&mut OsRng);
+    let host_id = host_identity.device_id;
+    let controller_id = controller_identity.device_id;
+    let host_key = host_identity.verify_key();
+    let controller_key = controller_identity.verify_key();
+    let (mut initiator, first) = NoiseInitiator::start(controller_identity, host_key).unwrap();
+    let (mut responder, second) =
+        NoiseResponder::accept(&first, host_identity, controller_key).unwrap();
+    let finish = initiator.receive(&second).unwrap();
+    responder.receive(&finish).unwrap();
+    let mut controller_secure = initiator
+        .finish()
+        .unwrap()
+        .into_secure_session(SecureRole::Initiator);
+    let host_secure = Arc::new(AsyncMutex::new(
+        responder
+            .finish()
+            .unwrap()
+            .into_secure_session(SecureRole::Responder),
+    ));
+    let host = QuicClient::connect(config.clone()).await.unwrap();
+    host.join(RelayJoin::host_with_participant(
+        session_id,
+        authentication,
+        host_id,
+    ))
+    .await
+    .unwrap();
+    let original = QuicClient::connect(config.clone()).await.unwrap();
+    original
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            controller_id,
+        ))
+        .await
+        .unwrap();
+    let hello = encode_control(&ControlMessage::Hello {
+        platform: Platform::MacOS,
+        role: DeviceRole::Controller,
+    })
+    .unwrap();
+    original
+        .send_control(controller_secure.seal(SecureLane::Control, &hello).unwrap())
+        .await
+        .unwrap();
+    let (generation, ciphertext) = host.next_control_with_generation().await.unwrap();
+    assert_eq!(
+        open(&host_secure, SecureLane::Control, &ciphertext)
+            .await
+            .unwrap(),
+        hello
+    );
+    send_runtime_failure(
+        &host,
+        &host_secure,
+        generation,
+        AccessDenialReason::HostUnavailable,
+    )
+    .await
+    .unwrap();
+    // Read only opaque transport bytes. The old Controller has not processed
+    // the terminal state and may still be attempting automatic replacement.
+    assert!(!original.next_control().await.unwrap().is_empty());
+    let replacement = QuicClient::connect(config).await.unwrap();
+    replacement
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            controller_id,
+        ))
+        .await
+        .unwrap();
+    replacement.send_input(vec![0x51]).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            host.next_input_for_generation(generation)
+        )
+        .await
+        .unwrap(),
+        Err(TransportError::PeerReplaced)
+    ));
+    replacement.send_control(vec![0x52]).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_ended_controller_disconnect(&host, generation),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        Err(HostRuntimeError::Transport(TransportError::PeerReplaced))
+    ));
+    drop(original);
+    drop(replacement);
+    drop(host);
+    relay.close();
+    relay_task.await.unwrap();
+}
