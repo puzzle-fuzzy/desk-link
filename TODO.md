@@ -419,10 +419,10 @@
 
 ### DL2-057 · P2 · relay 受控停机与任务收尾（Rust 切片）
 
-- [ ] 汇总 Bun 服务关闭、Unix/候选容器实际 SIGTERM 和 Windows Ctrl+C 验收后，再关闭整个 057；本提交只处理 Rust relay。
+- [ ] 汇总 Bun 服务关闭与实际 Windows Ctrl+C 验收后，再关闭整个 057；Rust relay、Linux 真实 child 与候选容器 SIGTERM 已验证。
 - [x] relay 注册 Unix TERM/INT 或 Windows Ctrl+C，close 停止新 admission 并主动关闭 QUIC；JoinSet 管理连接、拒绝、可靠子任务与媒体，总收尾预算默认 7 秒并等待 endpoint idle，超时明确报告 forced/timed_out，metrics task 取消等待。两个 CLI 检查在注册信号前直接返回。
 - [x] 真实 loopback 覆盖两条可靠流背压时只关闭源、目标仍活/健康会话继续、混合认证/未 join/媒体/TLS 拒绝任务、重复 close、ApplicationClosed、新 admission 不可用和超时分类；58 项常规回归、对应 Clippy `--locked -- -D warnings`、fmt/diff 检查通过。Tokio 只启 signal，锁文件只补已有包依赖边，无版本升级。
-- [ ] 已准备 Unix 真实 child SIGTERM → peer ApplicationClosed → binary exit 0 夹具，当前 Windows 未运行；不以旧 052 镜像或本地 close() 调用冒充信号实测。
+- [x] Linux 同源 `020c5b3` 真实 child SIGTERM 用例 1 通过；同源静态候选容器完成资源负载后，实际 docker stop 触发 SIGTERM，正常 peer 收到 relay shutdown、退出码 0、graceful 各计数归零、endpoint idle。日志 85ms 仅为服务端收尾阶段，不是 Docker 命令端到端耗时；镜像 ID 与原始日志 hash 见关停记录。
 - **修复主题：** `fix(DL2-057): drain relay tasks and notify peers on shutdown`。任务生命周期与 052 缓冲预算的关系、实际验证和 Linux 执行命令见 [relay 受控停机](docs/relay-graceful-shutdown.md)。未部署。
 
 ## 7. 代码整理与验证体系

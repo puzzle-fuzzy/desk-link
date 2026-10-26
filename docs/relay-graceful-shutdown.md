@@ -33,14 +33,33 @@ python scripts/run-windows-cargo.py clippy -p desklink-relay --lib --bins --test
 
 signal feature 仅加在 relay 的 Tokio 依赖。首次 `--locked` 因新增 feature 依赖边拒绝后，离线 check 只增加 Cargo.lock 中 `tokio -> signal-hook-registry` 这一条边；已锁定包和版本均未升级，后续检查恢复 `--locked`。
 
-## 待执行的 Unix 信号验收
+## 已运行的 Linux 与候选容器信号验收
 
 `process_shutdown.rs` 在 Unix 上另有真实子进程回归：启动同次 Cargo 构建的 relay binary，完成本地 QUIC join，对该测试独占 Child PID 发送 SIGTERM，验证 peer 及时收到 `ApplicationClosed`、子进程成功退出，且日志中 graceful 与各计数归零。信号通过 POSIX kill FFI 发送，常量来自 Tokio，**不需要 shell、独立 kill executable 或新依赖**。子进程 stdout/stderr 持续消费，超时只终止本夹具创建的 child。
 
-在包含本次精确源码的 Linux builder 中执行：
+在包含精确源码 `020c5b342aeb2ef2545339be799a8eb1a252c83c` 的 Linux builder 中，使用仓库 Rust 1.97.1 执行：
 
 ```sh
-cargo test --locked -p desklink-relay --test process_shutdown sigterm_closes_a_normal_quic_peer_and_exits_the_real_binary -- --nocapture --test-threads=1
+cargo +1.97.1 test --offline --locked -p desklink-relay --test process_shutdown sigterm_closes_a_normal_quic_peer_and_exits_the_real_binary -- --nocapture --test-threads=1
 ```
 
-`CARGO_BIN_EXE_desklink-relay` 由该次 Cargo 构建绑定真实 binary，不能拿旧 052 镜像替代。当前 Windows 本机未执行这个 `cfg(unix)` 用例，也未做实际 Windows Ctrl+C、候选容器 SIGTERM 或线上部署。本提交只完成 Rust 代码和对应 Windows 自动验证；Bun 服务及整个 DL2-057 的关闭状态由各自验收汇总。
+结果为 **1 passed、0 failed、0 ignored**，测试阶段 0.10 秒。`CARGO_BIN_EXE_desklink-relay` 由该次 Cargo 构建绑定真实 debug binary；这证明 Linux 主程序真实信号路径，不把它描述为静态候选 binary 的替代验收。builder 的该次执行禁用网络，源码上下文与锁文件核对见资源记录。原始日志：
+
+- `E:\desk-link\.worktrees\dl2-targets\network\dl2-network-020c5b3-linux-sigterm-debug.log`
+- SHA-256：`6A96A37277AC3A8EEB63F931322156F6925303B1693B0DE8B79320B0A6A0DF2C`
+
+另对同源静态候选镜像 `sha256:f5029e8400e61b0b80fe51e3f7a1d3fe75d1df7cbbcb39d991ee55d2d30a3847` 运行 `container_resource_probe.rs`。在 256MiB、0.75CPU、PIDs64 限制下，完成 DL2-052 的 64 连接、480 started writers 压力与清理后，重新加入一个正常 peer，再对夹具独占的容器 ID 执行 `docker stop --time 10`。实测 peer 收到 `ApplicationClosed`，原因 `relay shutdown`；容器 exit code 0、未 OOM，日志为：
+
+```text
+relay_stop_requested signal=sigterm
+relay_shutdown outcome=graceful accepted_connections=0 attached_participants=0 media_workers=0 reliable_workers=0 rejection_tasks=0 forced_tasks=0 endpoint_idle_confirmed=true elapsed_ms=85
+```
+
+**85ms 只是服务端 finish_shutdown 阶段，未测 Docker 命令或信号发出至退出的端到端耗时。** 整个组合夹具 1 passed，耗时 7.66 秒；其资源计数是已记录负载下的观察，客户端 write_all 完成数不等于服务端完整收帧数。cgroup 观测包含短时 observer，其 process RSS 不是 relay PID 1 RSS；完整资源 JSON 与边界见 [relay 资源记录](relay-resource-bounds.md)。原始通过日志：
+
+- `E:\desk-link\.worktrees\dl2-targets\network-lan\dl052-057-020c5b3-final-02.log`
+- SHA-256：`F932416B8DE69ACCB2185803212C8CD71206BCA8A6856756DBD53D43CF42A0F3`
+
+`final-01` 因 Docker 29 把 `--time` 弃用提示写到 stdout，夹具误把整段输出当成容器 ID 而失败；修正为核对最后一行后，`final-02` 才是正式通过证据。未放宽资源限制，失败日志保留。测试只清理其独占容器和临时 TLS 文件，未部署。
+
+本网络切片保持业务协议 13 与 relay JOIN wire 不变；文件业务协议 14 由文件任务负责。实际 Windows Ctrl+C 和 Bun 服务关闭仍待各自验收，整个 DL2-057 保留未完成。
