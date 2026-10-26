@@ -781,6 +781,8 @@
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 
+- [x] **Windows真实C ABI环境修复（`fix(DL2-041): initialize MSVC for native verification subprocesses`）：** Cargo wrapper调用的native helper先复用有效developer环境，否则定位VS并只在内存捕获/验证x64 cl与标准头环境，再保留Ninja/CRT策略；不输出整环境。17项回归含真实cmd空格路径通过；当前整合源码实际FFI91通过0忽略、真实MSVC C布局和双头检查通过（merged-ffi-msvc.json，源a97f2d4+dirty环境切片）。初轮缺cl失败报告保留，不跳过ABI；源码哈希提交后绑定。第一波最终服务/诊断闭环及整套门禁仍待完成。
+
 - [ ] 提供 Windows/macOS 可运行的统一验证命令，以及分层可选择的重型验收。
 - **证据 / 类型：工程缺口。** `scripts/verify.sh` 覆盖 Rust、Windows 前端和部分 macOS，却未汇总 account、diagnostics、Python；原 TODO 的“FFI 已连接取消 / shutdown 背压”仍未关闭。246 项前端及 Rust 输入测试均通过，但 DL2-001 的不一致依然存在。
 - **方案：** fast：format/typecheck/领域与契约测试；integration：本地 transport、慢发送/慢盘、取消/代数、跨 ABI；native：捕获/编码/权限/设备；performance：可重复基准与 soak。固定 Bun 1.3.14 与仓库 Rust toolchain，输出版本、源码 SHA、命令、跳过原因。

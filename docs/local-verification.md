@@ -117,6 +117,8 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 
 ### Windows joint固定证据与第一波候选
 
+当前候选已真实合入J、完整Apple f954及cb7514c、网络4b、工程6b、GUI506及producer28c完整历史。首次完整FFI在真实C布局测试因cl未在PATH失败，记录于merged-ffi.json；native helper修复为加载完整MSVC developer环境后，merged-ffi-msvc.json实际记录FFI91通过/0失败/0忽略及双头检查通过（42 lib、7 ABI、2 C布局、1平台、6 controller、5 directory、28 host），原J两项Host失败已在整合源码恢复。MSVC helper本身17回归通过，包含真实cmd空格路径；本次源a97f2d4加未提交环境切片，后续按源码blob绑定，不把它当最终候选全栈报告。Swift/Xcode/Metal/真机仍未运行，服务consumer补丁及上云签名/store/analysis完整验收继续待交付。
+
 产品组在独立 `codex/dl2-windows-joint` 的原始安排为产品 `16594c4f8780cd565afd57695f88e29277ec5939` 整合媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a`（媒体更早为 `fb9734499fc560af79b11709aae185eb4ddcc81a`）。最新第一parent改用产品 **`27fec756ba97ee6f67228dc9530c7b0578a49ff3`**，本工程只读Git确认它直接接续16594，代码仅提取InputSendFuture类型别名；另一parent已固定为媒体021初始化取消修复 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`**，直接parent为 `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`。协调方报告产品已开始按这两个parents真实remerge；保留已解冲突、审计resolution、联合测试与逐问题历史，不重置或覆盖原WIP。本工程未操作该joint worktree。
 
 产品源交接路径 `E:/desk-link/.worktrees/dl2-targets/windows-product/evidence/handoff-16594c4.json` 只证明旧16594快照；27fec提交TODO报告UI库135通过/1项签名资产忽略、本包 `--lib --tests --no-deps` Clippy通过，本工程未复跑。跨包严格检查仍须在新parents整合后执行，不能用本包检查或媒体源分支结果替代。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验备份；最终提交须实际纳入所需resolution和测试，并核对备份清单、最终tree与去重结果。
