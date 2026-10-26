@@ -242,7 +242,8 @@
 - [x] **生产策略（`fix(DL2-044): disable unsupported cursor datagrams without ending peers`）：** 首个Datagram错误仅停用当前peer的可选光标，后续不采样、不加密、不重发，future保持pending等待主peer取消。连接/代数/身份/preflight错误仍立即传播。每个peer独立状态，一次固定capability_or_size原因；send_attempts/send_errors/disabled字段只表示本地操作。
 - [x] **有界诊断接线：** HostSupervisor/HostRuntime提供with_media_diagnostics_observer，构造时初始化进程唯一32槽队列/工作线程；热路径try_send、不做同步文件或HTTP，回调异常不杀接收器。DiagnosticEvent::HostMedia提供固定JSON字段映射；队列拒绝数与网络丢包明确分离。未绑定observer时仅后台stderr回退，不视为用户导出/服务端可见性已交付。接口见docs/windows-host-media-diagnostics.md。
 - **验证：** 光标10项（含真实生产循环停止采样但不完成peer future）+诊断分发2项通过；真实127.0.0.1传输20项通过，包括对端禁用、低于应用preflight上限的TooLarge、终态/代数检查及1字节Quinn发送缓冲下1000次Ok，之后同连接控制/输入可用。Windows+transport lib/tests严格Clippy通过。
-- [ ] 产品层绑定observer到实际诊断导出/服务端schema并验证最终可见性；真实网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
+- [x] **GUI 日志与报告接线（`fix(DL2-044): persist cursor diagnostics in desktop reports`）：** 普通Host与配对Host均注册typed observer，复用各worker的DiagnosticLog；既有后台有界dispatcher执行落盘，原stream保持为历史记录，不更新当前GUI状态。实际callback→临时日志/sync_data→sanitized history→生产合并/报告builder回归通过；同services `b1118ad465703493255123e23b6f522662c3d603` 原样fixture的4个case逐字段/类型比对通过（仅忽略动态timestamp，u64溢出仍是服务拒绝的negative）。Windows lib218通过/2忽略、管理库137通过/1签名资产忽略，两包lib+tests严格Clippy通过。云上传源码保持冻结基线，不吞事件；服务历史尚未合入本GUI分支，整体验签/存储另验。
+- [ ] 将已提交服务合同与GUI接线纳入最终整体候选并验证真实接收/存储；真实GUI导出操作、网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
 
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 

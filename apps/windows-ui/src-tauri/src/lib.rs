@@ -2118,3 +2118,6 @@ mod tests {
         assert!(summary.contains("尚未捕获足够的视频渲染指标"));
     }
 }
+
+#[cfg(test)]
+mod host_media_export_tests;

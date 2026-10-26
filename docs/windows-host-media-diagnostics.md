@@ -33,10 +33,26 @@ Disabling and every installation share the path mutex, so a late successful
 probe cannot repopulate a disabled slot. A missing direct session parks the
 accept future instead of repeatedly returning None.
 
-`DiagnosticEvent::HostMedia(event)` formats the product log event. The product
-owner must bind the observer to the actual log/export sink (and, separately, any
-server schema). Without an observer the worker uses stderr as a fallback; this
-does not establish user-visible export or cloud delivery.
+`DiagnosticEvent::HostMedia(event)` formats the product log event. The Windows
+desktop registers a log observer in both normal and pairing Host preparation.
+The DL2-044 GUI slice records `CursorSend` into the same `DiagnosticLog` instance
+as that worker's lifecycle events. The existing report export reads its sanitized
+history and includes the exact event fields. The callback retains the original
+stream and writes history only; it never changes current GUI lifecycle state.
+Runtime dispatch keeps its filesystem work on the existing bounded worker.
+Without an observer, other consumers still use the background stderr fallback.
+
+The desktop uploader remains unchanged and retains these events in ordinary
+batches. Its current service contract is a separate source history:
+`b1118ad465703493255123e23b6f522662c3d603` for cursor events and
+`bf5d7eb27f3f41be59ac317b63d7e93d10f38066` for direct-listener events. That
+history is not merged into this GUI branch. The cursor regression fixture is copied
+byte-for-byte from the committed cursor producer fixture and compares the actual
+GUI callback/log representation, ignoring only the generated timestamp.
+The service's u64-overflow negative fixture remains valid local history; this
+does not claim that unsafe JavaScript integers are accepted by the service.
+Direct-listener GUI binding, actual Tauri interaction, combined service
+ingestion/storage and real devices remain separate acceptance work.
 
 Local validation:
 
