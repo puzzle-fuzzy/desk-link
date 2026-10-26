@@ -227,6 +227,13 @@
 - [x] **已有正确行为的真实回归（`test(DL2-045): distinguish transient direct handshakes from listener shutdown`）：** 空truststore触发真实127.0.0.1 QUIC证书握手失败，确认Some(Err)，同一listener随后使用生产配置+Noise会话成功认证probe并收发datagram；显式endpoint关闭才在100ms内返回None（重复等待一致）。probe 14项通过，transport lib+tests严格Clippy通过。
 - [ ] 终态禁用的稳定原因/诊断接通与真实监听故障状态验收；本提交未把原有continue实现冒称新修复。
 
+### DL2-046 · P1 · 出站探测生命周期与活动直连仲裁
+
+- [x] 探测任务纳入会话取消树；活动路径按同一peer槽位和连接分配身份仲裁。
+- **审查/修复边界：** 基线出站spawn脱离生命周期与无条件覆盖存在；011的JoinSet已接管取消，本条补实际回归及剩余抢占/旧egress清空新路径问题，不重复冒称取消是本笔才实现。
+- **修复（`fix(DL2-046): retain active direct paths and retire only matching connections`）：** 入/出站认证完成统一安装，健康活动连接保留、关闭连接才替换，相同Arc不误关；健康路径期间拒绝冗余offer。旧发送失败只移除同一Arc实例，不能按候选ID清掉后继；拒绝/退役连接在释放槽锁后关闭。
+- **验证：** 6个固定槽位用例+3个真实127.0.0.1 QUIC/Noise回归通过，lib+tests严格Clippy通过。两条竞争路径共用同Noise会话，晚出站被关闭后原入站仍双向传输加密VideoDatagram；关闭旧路径可替换且旧egress不能清新路径；真实connect_shared响应等待时Drop JoinSet后250ms内guard/permit释放、crypto锁可取。未建立实际远控/输入会话；011的双机p95/p99仍单列。
+
 ## 4. 性能与数据通道
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线

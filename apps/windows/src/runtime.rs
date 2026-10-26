@@ -1,4 +1,7 @@
 mod adaptive_bitrate;
+#[cfg(test)]
+mod direct_arbitration_tests;
+mod direct_path_slot;
 use adaptive_bitrate::AdaptiveBitrate;
 mod configuration_queue;
 use configuration_queue::{
@@ -2849,12 +2852,8 @@ async fn send_video_loop(
                             index,
                         );
                     }
-                    let mut direct_path = direct_connection
-                        .lock()
-                        .await
-                        .clone()
-                        .map(DirectLanVideoPath::new);
-                    let had_direct_path = direct_path.is_some();
+                    let direct_snapshot = direct_connection.lock().await.clone();
+                    let mut direct_path = direct_snapshot.clone().map(DirectLanVideoPath::new);
                     let send_result = if reliable_relay_keyframe && direct_path.is_none() {
                         let ciphertext =
                             seal(&secure, SecureLane::VideoReliable, &datagram).await?;
@@ -2895,8 +2894,16 @@ async fn send_video_loop(
                         );
                         reported_first_datagram_stage = true;
                     }
-                    if had_direct_path && direct_path.is_none() {
-                        *direct_connection.lock().await = None;
+                    if direct_path.is_none()
+                        && let Some(failed) = direct_snapshot.as_ref()
+                    {
+                        let retired = {
+                            let mut active = direct_connection.lock().await;
+                            direct_path_slot::retire_if_current(&mut active, failed)
+                        };
+                        if let Some(retired) = retired {
+                            retired.close(b"desklink direct egress failed");
+                        }
                     }
                     match send_result {
                         Ok(_) => {
@@ -3480,7 +3487,7 @@ async fn receive_host_control(
             _ = direct_probes.join_next(), if !direct_probes.is_empty() => {}
             direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
                 if let Some(connection) = direct {
-                    *direct_connection.lock().await = Some(connection);
+                    install_direct_connection(&direct_connection, connection).await;
                 } else {
                     direct_session = None;
                 }
@@ -3540,7 +3547,9 @@ async fn receive_host_control(
                         }
                     }
                     ControlMessage::VideoPathCandidateOffer { candidate } => {
+                        let has_active = direct_connection.lock().await.as_ref().is_some_and(|path| !path.is_closed());
                         let answer = if let Some(session) = direct_session.as_ref()
+                            && !has_active
                             && candidate
                                 .validate(now_unix_s(), session.session_binding())
                                 .is_ok()
@@ -3568,8 +3577,7 @@ async fn receive_host_control(
                                         )
                                         .await;
                                     if let Ok((connection, _)) = result {
-                                        *direct_connection_for_probe.lock().await =
-                                            Some(Arc::new(connection));
+                                        install_direct_connection(&direct_connection_for_probe, Arc::new(connection)).await;
                                     }
                                 });
                                 true
@@ -3619,6 +3627,30 @@ fn apply_input_event<B: crate::input::InputBackend>(
         | Err(InputInjectionError::Blocked)
         | Err(InputInjectionError::UnsupportedKey)
         | Err(InputInjectionError::InvalidInput) => Ok(()),
+    }
+}
+
+async fn install_direct_connection(
+    slot: &Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    candidate: Arc<DirectLanConnection>,
+) -> bool {
+    let outcome = {
+        let mut active = slot.lock().await;
+        direct_path_slot::install(&mut active, candidate, DirectLanConnection::is_closed)
+    };
+    // No network close/drop while holding the path arbitration mutex.
+    match outcome {
+        direct_path_slot::InstallOutcome::Installed { retired } => {
+            if let Some(retired) = retired {
+                retired.close(b"desklink retired closed direct path");
+            }
+            true
+        }
+        direct_path_slot::InstallOutcome::Retained { rejected } => {
+            rejected.close(b"desklink retained active direct path");
+            false
+        }
+        direct_path_slot::InstallOutcome::AlreadyCurrent => true,
     }
 }
 
