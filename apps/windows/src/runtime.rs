@@ -18,7 +18,7 @@ use desklink_protocol::{
     VideoQualityPreference, VideoQualityPreset, decode_control, decode_noise_handshake,
     decode_session_input, decode_transfer, encode_audio_packet, encode_control,
     encode_cursor_update, encode_noise_handshake, encode_transfer, encode_video_config,
-    encode_video_reliable_batch,
+    VideoReliableBatchBuilder,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -2295,27 +2295,20 @@ async fn send_video_reliable_batches(
     datagrams: Vec<Vec<u8>>,
 ) -> Result<usize, HostRuntimeError> {
     let mut batches = 0_usize;
-    let mut current = Vec::new();
+    let mut batch = VideoReliableBatchBuilder::new();
     for datagram in datagrams {
-        if current.is_empty() {
-            current.push(datagram);
-            continue;
-        }
-        let mut candidate = current.clone();
-        candidate.push(datagram.clone());
-        match encode_video_reliable_batch(&candidate) {
-            Ok(_) => current.push(datagram),
-            Err(ProtocolError::MessageTooLarge { .. }) => {
-                send_video_reliable_batch(client, secure, peer_generation, &current).await?;
-                batches += 1;
-                current.clear();
-                current.push(datagram);
-            }
-            Err(error) => return Err(error.into()),
+        if !batch.try_push(&datagram)? {
+            send_video_reliable_batch(client, secure, peer_generation, batch.bytes()).await?;
+            batches += 1;
+            batch.clear();
+            // Execute the push in release too; the debug assertion is only
+            // proof that a legal single packet fits in an empty batch.
+            let added = batch.try_push(&datagram)?;
+            debug_assert!(added);
         }
     }
-    if !current.is_empty() {
-        send_video_reliable_batch(client, secure, peer_generation, &current).await?;
+    if !batch.is_empty() {
+        send_video_reliable_batch(client, secure, peer_generation, batch.bytes()).await?;
         batches += 1;
     }
     Ok(batches)
@@ -2325,10 +2318,9 @@ async fn send_video_reliable_batch(
     client: &QuicClient,
     secure: &SharedSecureSession,
     peer_generation: u64,
-    datagrams: &[Vec<u8>],
+    plaintext: &[u8],
 ) -> Result<(), HostRuntimeError> {
-    let plaintext = encode_video_reliable_batch(datagrams)?;
-    let ciphertext = seal(secure, SecureLane::VideoReliable, &plaintext).await?;
+    let ciphertext = seal(secure, SecureLane::VideoReliable, plaintext).await?;
     client
         .send_video_reliable_for_generation(peer_generation, ciphertext)
         .await?;

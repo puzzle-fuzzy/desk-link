@@ -1,11 +1,12 @@
 mod codec;
 
 pub use codec::{
-    ProtocolError, decode_audio_packet, decode_control, decode_cursor_update, decode_input,
-    decode_noise_handshake, decode_session_input, decode_transfer, decode_video_config,
-    decode_video_header, decode_video_packet, decode_video_reliable_batch, encode_audio_packet,
-    encode_control, encode_cursor_update, encode_input, encode_noise_handshake, encode_transfer,
-    encode_video_config, encode_video_header, encode_video_packet, encode_video_packet_parts,
+    ProtocolError, VideoReliableBatchBuilder, decode_audio_packet, decode_control,
+    decode_cursor_update, decode_input, decode_noise_handshake, decode_session_input,
+    decode_transfer, decode_video_config, decode_video_header, decode_video_packet,
+    decode_video_reliable_batch, encode_audio_packet, encode_control, encode_cursor_update,
+    encode_input, encode_noise_handshake, encode_transfer, encode_video_config,
+    encode_video_header, encode_video_packet, encode_video_packet_parts,
     encode_video_reliable_batch,
 };
 use serde::{Deserialize, Serialize};

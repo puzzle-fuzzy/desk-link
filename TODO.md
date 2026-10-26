@@ -251,10 +251,14 @@
 
 ### DL2-020 · P2 · 关键帧可靠批次一次计长、一次编码
 
-- [ ] 移除组批时反复克隆并序列化整个候选批次。
+- [x] 移除组批时反复克隆并序列化整个候选批次。
 - **证据 / 类型：性能结构。** `apps/windows/src/runtime.rs:2263-2293` 每增加分片先 clone 当前批次/datagram，再 encode 判断大小；`2302` 发送时再次编码。`crates/desklink-protocol/src/lib.rs:66` 批次上限 60 KiB。
 - **方案：** 依据 wire header 与分片长度增量计算边界，最终一次编码；复用 Bytes/切片，保留协议长度验证。
 - **验收：** 最大合法关键帧的分配/复制次数下降；精确边界、跨批、超限和 round-trip 不变。此重复工作有单批大小上限，不是整个会话无限增长。
+
+- [x] **已实现并验证（`perf(DL2-020): build reliable video batches once in reusable buffers`）：** 协议builder一次预留60KiB，按3字节header+2字节片长增量校验/复制，Host发送直接复用最终wire切片，clear保留同一allocation；旧wire及编码入口保持。
+- **验证：** protocol `--lib --tests --locked` 34既有+4新增通过、1基准忽略；Windows `--lib direct_video_tests --locked` 2通过；两crate lib Clippy严格通过。覆盖精确60KiB、4096片、跨批无丢失/重复、超限不修改、round-trip及固定buffer指针。
+- **可复跑构造基准：** `python scripts/run-windows-cargo.py test -p desklink-protocol --release --test video_batch_builder benchmark_maximal_keyframe_batch_construction --locked -- --ignored --nocapture`：4096片/71批/4276309 wire字节，两实现输出相同；单次本地CPU样本旧候选克隆编码8946μs、builder1665μs。此结果仅说明该构造工作负载，不外推网络/GPU/端到端收益。
 
 ### DL2-021 · P1 · 慢磁盘写入与远控 async 调度隔离
 

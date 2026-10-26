@@ -406,6 +406,76 @@ pub fn encode_video_reliable_batch(packets: &[Vec<u8>]) -> Result<Vec<u8>, Proto
     bounded(bytes, MAX_VIDEO_RELIABLE_BATCH_BYTES)
 }
 
+/// Incrementally frames already encoded video packets without cloning candidate
+/// batches or serializing them to discover their size. Each packet is copied
+/// once into a preallocated wire buffer; clear reuses that buffer after send.
+/// Inner packet validation remains the decoder's job, as with the batch encoder.
+pub struct VideoReliableBatchBuilder {
+    bytes: Vec<u8>,
+    count: u16,
+}
+
+impl VideoReliableBatchBuilder {
+    pub fn new() -> Self {
+        let mut bytes = Vec::with_capacity(MAX_VIDEO_RELIABLE_BATCH_BYTES);
+        bytes.extend_from_slice(&[VIDEO_RELIABLE_BATCH_TAG, 0, 0]);
+        Self { bytes, count: 0 }
+    }
+
+    /// Returns false without modifying the batch when this packet belongs in
+    /// the next batch. A packet that cannot fit even in an empty batch is an
+    /// error, so callers cannot retry it forever after clearing the builder.
+    pub fn try_push(&mut self, packet: &[u8]) -> Result<bool, ProtocolError> {
+        if packet.is_empty() {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        let length = u16::try_from(packet.len()).map_err(|_| ProtocolError::MessageTooLarge {
+            actual: packet.len(),
+            maximum: usize::from(u16::MAX),
+        })?;
+        if packet.len() > MAX_VIDEO_PACKET_BYTES {
+            return Err(ProtocolError::MessageTooLarge {
+                actual: packet.len(),
+                maximum: MAX_VIDEO_PACKET_BYTES,
+            });
+        }
+        let next_length = self.bytes.len() + 2 + packet.len();
+        if self.count >= MAX_VIDEO_CHUNKS || next_length > MAX_VIDEO_RELIABLE_BATCH_BYTES {
+            return Ok(false);
+        }
+        self.bytes.extend_from_slice(&length.to_le_bytes());
+        self.bytes.extend_from_slice(packet);
+        self.count += 1;
+        self.bytes[1..3].copy_from_slice(&self.count.to_le_bytes());
+        Ok(true)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn packet_count(&self) -> u16 {
+        self.count
+    }
+
+    /// Contains a complete wire batch whenever is_empty returns false.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn clear(&mut self) {
+        self.bytes.truncate(3);
+        self.bytes[1..3].fill(0);
+        self.count = 0;
+    }
+}
+
+impl Default for VideoReliableBatchBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Decodes one reliable relay batch and validates every contained video
 /// packet. The caller may still accept a single packet for test fixtures and
 /// direct callers; production relay keyframes use this batch form.
