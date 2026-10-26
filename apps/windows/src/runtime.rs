@@ -56,6 +56,7 @@ use crate::{
 };
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
+const STATIC_KEYFRAME_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_ENCODED_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const CURSOR_INTERVAL: Duration = Duration::from_millis(16);
@@ -1873,6 +1874,7 @@ fn capture_encode_loop(
     let mut frame_pacer =
         VideoFramePacer::new(video_quality_settings_with_profile(video_quality, video_profile).fps);
     let mut first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+    let mut static_recovery = StaticKeyframeRecovery::default();
     let mut captured_any_frame = false;
     let mut first_encoded_frame_deadline = None;
     let mut encoded_any_frame = false;
@@ -1987,7 +1989,16 @@ fn capture_encode_loop(
                             .to_owned(),
                     )));
                 }
-                continue;
+                // DXGI reports only changes. Recover a decoder using a fresh
+                // owned snapshot, without copying every normal captured frame.
+                if static_recovery.snapshot_due(
+                    force_keyframe.load(Ordering::Acquire),
+                    Instant::now(),
+                ) {
+                    capture.snapshot_frame().map_err(HostRuntimeError::Capture)?
+                } else {
+                    continue;
+                }
             }
             CaptureOutcome::Recovered => {
                 if !captured_any_frame {
@@ -2074,6 +2085,25 @@ fn capture_encode_loop(
         notify.notify_one();
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct StaticKeyframeRecovery {
+    last_snapshot: Option<Instant>,
+}
+
+impl StaticKeyframeRecovery {
+    fn snapshot_due(&mut self, requested: bool, now: Instant) -> bool {
+        if !requested
+            || self.last_snapshot.is_some_and(|last| {
+                now.saturating_duration_since(last) < STATIC_KEYFRAME_INTERVAL
+            })
+        {
+            return false;
+        }
+        self.last_snapshot = Some(now);
+        true
+    }
 }
 
 fn initial_frame_deadline_expired(
@@ -3393,6 +3423,18 @@ mod retry_policy_tests {
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
         }
+    }
+
+    #[test]
+    fn static_keyframe_recovery_is_request_driven_and_rate_limited() {
+        let now = Instant::now();
+        let mut recovery = super::StaticKeyframeRecovery::default();
+        assert!(!recovery.snapshot_due(false, now));
+        assert!(recovery.snapshot_due(true, now));
+        assert!(!recovery.snapshot_due(true, now));
+        assert!(!recovery.snapshot_due(true, now + std::time::Duration::from_millis(249)));
+        assert!(recovery.snapshot_due(true, now + super::STATIC_KEYFRAME_INTERVAL));
+        assert!(!recovery.snapshot_due(false, now + std::time::Duration::from_secs(10)));
     }
 
     #[test]

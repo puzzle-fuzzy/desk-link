@@ -115,6 +115,19 @@ impl DxgiDesktopCapturer {
         self.display_id
     }
 
+    /// Capture an owned image only when recovery needs a frame on an otherwise
+    /// idle desktop. Normal frame production remains driven by DXGI changes.
+    pub fn snapshot_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        #[cfg(windows)]
+        {
+            capture_gdi_frame(self.desktop_rect)
+        }
+        #[cfg(not(windows))]
+        {
+            self.next_frame(Duration::from_millis(1))
+        }
+    }
+
     #[cfg(windows)]
     fn new_dxgi_primary() -> Result<Self, CaptureError> {
         use windows::Win32::Foundation::HMODULE;
