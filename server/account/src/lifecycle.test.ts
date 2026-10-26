@@ -115,7 +115,7 @@ describe("account lifecycle", () => {
     expect((await app.fetch(new Request("http://account.test/v1/account/me", {
       headers: { authorization: `Bearer ${accessToken}` },
     }))).status).toBe(401);
-    expect(store.findDevice(deviceId)?.revokedAt).not.toBeNull();
+    expect(store.listDevices(store.findUserByEmail("mac@example.com")!.id).find(device => device.id === deviceId)?.revokedAt).not.toBeNull();
     store.close();
   });
 

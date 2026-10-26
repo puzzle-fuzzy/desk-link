@@ -52,7 +52,7 @@ bun run src/outbox-admin.ts /absolute/path/account.sqlite list-failed
 bun run src/outbox-admin.ts /absolute/path/account.sqlite retry <outbox-id>
 ```
 
-查询仅输出最多 100 条任务 ID、状态、次数、时间和固定错误类别；重投重置该任务次数，不立即调用 provider。操作前确认目标是所需数据库。迁移将旧的 10 次失败记录转换为 `failed`，旧已发送记录转换为 `delivered`，新 schema 版本为 3。
+查询仅输出最多 100 条任务 ID、状态、次数、时间和固定错误类别；重投重置该任务次数，不立即调用 provider。操作前确认目标是所需数据库。生命周期迁移 v3 将旧的 10 次失败记录转换为 `failed`，旧已发送记录转换为 `delivered`；当前 schema 为设备隔离版本 4。
 
 ## HTTP 检查
 
@@ -66,6 +66,7 @@ bun run src/outbox-admin.ts /absolute/path/account.sqlite retry <outbox-id>
 - 用户密码只保存 Argon2id 哈希。
 - access/refresh token、邮箱验证 token、密码重置 token 只保存 SHA-256 哈希；平台客户端把 bearer token 放在 Keychain 或 Windows DPAPI 中。
 - `account_devices` 只是应用登录设备登记，不是远程连接权限表。
+- 客户端 `deviceId` 是安装标签，不是所有权凭据；设备登记键为 `(user_id, id)`。不同账号可使用同一安装标签，各自的登录/撤销/设备名称相互隔离，正常退出后换号保留原 ID。v4 迁移保留旧 session 的 token/family/rotation 历史，为旧全局改绑留下的跨账号历史补已撤销的通用占位设备，不复制另一账号设备名称，也不复活旧会话；坏源或迁移失败原子回滚。
 - 服务端不保存 PairingInvite 原文、relay authentication、远程主机私钥、控制端身份私钥或视频/输入数据。
 - 账号登录不会复制其他设备的已保存主机；退出登录会撤销当前应用会话和设备登记，但不会代替主机端撤销可信控制端。
 - SQLite 仍是单写者本地存储；租约支持进程重启和本地连接竞争，不代表跨主机共享 SQLite 或水平扩展。

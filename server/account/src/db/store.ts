@@ -4,7 +4,6 @@ import { readFileSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import { AccountDatabase } from "./database";
 
-import { AccountError } from "../domain/errors";
 import type {
   AccountDevice,
   AccountPlatform,
@@ -134,15 +133,38 @@ export class AccountStore {
       this.database.exec("PRAGMA journal_mode = WAL");
       this.database.exec("PRAGMA synchronous = NORMAL");
     }
-    this.database.transaction(() => {
-      const version = (this.database.query("PRAGMA user_version").all()[0] as { user_version: number }).user_version;
-      if (version > 3) throw new Error("unsupported account schema version");
-      if (version < 2) {
-        this.database.exec(readFileSync(new URL("./migrations/001_account.sql", import.meta.url), "utf8"));
-        this.database.exec(readFileSync(new URL("./migrations/002_readiness.sql", import.meta.url), "utf8"));
-      }
-      if (version < 3) this.database.exec(readFileSync(new URL("./migrations/003_lifecycle.sql", import.meta.url), "utf8"));
-    })();
+    try {
+      this.database.transaction(() => {
+        const version = (this.database.query("PRAGMA user_version").all()[0] as { user_version: number }).user_version;
+        if (version > 4) throw new Error("unsupported account schema version");
+        if (version < 2) {
+          this.database.exec(readFileSync(new URL("./migrations/001_account.sql", import.meta.url), "utf8"));
+          this.database.exec(readFileSync(new URL("./migrations/002_readiness.sql", import.meta.url), "utf8"));
+        }
+        if (version < 3) this.database.exec(readFileSync(new URL("./migrations/003_lifecycle.sql", import.meta.url), "utf8"));
+        if (version < 4) {
+          if (this.database.query("PRAGMA foreign_key_check").all().length > 0) {
+            throw new Error("account migration source failed foreign key validation");
+          }
+          const sessionCount = (this.database.query("SELECT count(*) AS n FROM account_sessions").get() as { n: number }).n;
+          // Bun 1.3.14 exec() can continue a multi-statement script after a
+          // constraint failure. This fixed DDL migration contains no embedded
+          // semicolons or triggers: step/finalize every statement explicitly.
+          for (const sql of readFileSync(new URL("./migrations/004_account_devices.sql", import.meta.url), "utf8").split(";")) {
+            if (!sql.trim()) continue;
+            const statement = this.database.prepare(sql);
+            try { statement.run(); } finally { statement.finalize(); }
+          }
+          if (this.database.query("PRAGMA foreign_key_check").all().length > 0
+            || (this.database.query("SELECT count(*) AS n FROM account_sessions").get() as { n: number }).n !== sessionCount) {
+            throw new Error("account migration failed data validation");
+          }
+        }
+      }).immediate();
+    } catch (error) {
+      this.database.close(true);
+      throw error;
+    }
   }
 
   close(): void {
@@ -152,7 +174,7 @@ export class AccountStore {
   readiness(): { database: "ready" | "unavailable" | "schema_mismatch"; mail: "ready" | "degraded" } {
     let begun = false;
     try {
-      if ((this.database.query("PRAGMA user_version").all()[0] as { user_version: number }).user_version !== 3) {
+      if ((this.database.query("PRAGMA user_version").all()[0] as { user_version: number }).user_version !== 4) {
         return { database: "schema_mismatch", mail: "degraded" };
       }
       // Prepare against the current schema, including all request-critical columns.
@@ -220,28 +242,16 @@ export class AccountStore {
   }
 
   upsertDevice(input: CreateDeviceInput): AccountDevice {
-    const existing = this.database.query("SELECT * FROM account_devices WHERE id = ?")
-      .get(input.id) as DeviceRow | null;
-    if (existing && existing.user_id !== input.userId && existing.revoked_at === null) {
-      throw new AccountError("conflict", 409, "设备正在使用其他账号。请先退出原账号。");
-    }
-    if (existing && existing.user_id !== input.userId) {
-      this.database.query("UPDATE account_devices SET user_id = ?, platform = ?, name = ?, created_at = ?, last_seen_at = ?, revoked_at = NULL WHERE id = ?")
-        .run(input.userId, input.platform, input.name, input.now, input.now, input.id);
-      return this.findDevice(input.id)!;
-    }
-    if (existing) {
-      this.database.query("UPDATE account_devices SET name = ?, platform = ?, last_seen_at = ?, revoked_at = NULL WHERE id = ?")
-        .run(input.name, input.platform, input.now, input.id);
-    } else {
-      this.database.query("INSERT INTO account_devices (id, user_id, platform, name, created_at, last_seen_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, NULL)")
-        .run(input.id, input.userId, input.platform, input.name, input.now, input.now);
-    }
-    return this.findDevice(input.id)!;
+    this.database.query(`INSERT INTO account_devices (id, user_id, platform, name, created_at, last_seen_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(user_id, id) DO UPDATE SET platform = excluded.platform, name = excluded.name,
+        last_seen_at = excluded.last_seen_at, revoked_at = NULL`)
+      .run(input.id, input.userId, input.platform, input.name, input.now, input.now);
+    return this.findDevice(input.userId, input.id)!;
   }
 
-  findDevice(id: string): AccountDevice | undefined {
-    const row = this.database.query("SELECT * FROM account_devices WHERE id = ?").get(id) as DeviceRow | null;
+  findDevice(userId: string, id: string): AccountDevice | undefined {
+    const row = this.database.query("SELECT * FROM account_devices WHERE user_id = ? AND id = ?").get(userId, id) as DeviceRow | null;
     return row ? mapDevice(row) : undefined;
   }
 

@@ -24,7 +24,7 @@ test("incomplete migration and damaged schema are not ready", async () => {
   try {
     store.database.exec("PRAGMA user_version = 1");
     expect((await ready(store)).status).toBe(503);
-    store.database.exec("PRAGMA user_version = 3; DROP TABLE audit_events");
+    store.database.exec("PRAGMA user_version = 4; DROP TABLE audit_events");
     expect((await ready(store)).status).toBe(503);
   } finally { store.close(); }
 });
