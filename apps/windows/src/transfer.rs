@@ -175,6 +175,11 @@ impl IncomingFileWorker {
                     file.resume_prefix_hash(),
                 );
                 if ready.send(Ok(metadata)).is_err() {
+                    // Initialization may finish after the awaiting create
+                    // future is cancelled. Keep an existing validated prefix
+                    // just as on a later transport disconnect; cleanup and
+                    // permit release must stay on this disk thread.
+                    let _ = file.preserve();
                     return;
                 }
                 while let Some(command) = pending.blocking_recv() {
@@ -672,6 +677,24 @@ impl IncomingFile {
         directory: PathBuf,
         destination_directory: PathBuf,
     ) -> Result<Self, TransferResult> {
+        Self::create_in_with_open_hook(
+            transfer_id,
+            name,
+            expected_size,
+            directory,
+            destination_directory,
+            || {},
+        )
+    }
+
+    fn create_in_with_open_hook(
+        transfer_id: TransferId,
+        name: String,
+        expected_size: u64,
+        directory: PathBuf,
+        destination_directory: PathBuf,
+        after_open: impl FnOnce(),
+    ) -> Result<Self, TransferResult> {
         if !is_valid_transfer_file_name(&name) {
             return Err(TransferResult::InvalidData);
         }
@@ -686,7 +709,10 @@ impl IncomingFile {
             .create_new(true)
             .open(&temporary_path)
         {
-            Ok(file) => (file, 0),
+            Ok(file) => {
+                after_open();
+                (file, 0)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let metadata =
                     fs::symlink_metadata(&temporary_path).map_err(|_| TransferResult::IoFailed)?;
@@ -706,6 +732,7 @@ impl IncomingFile {
                     let _ = fs::remove_file(&temporary_path);
                     return Err(TransferResult::InvalidData);
                 }
+                after_open();
                 let mut buffer = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
                 loop {
                     let read = file
@@ -1206,6 +1233,11 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    // Worker tests share the production process-wide eight-thread admission
+    // budget. Serialize these fixtures while unrelated library tests stay
+    // parallel, so resource contention is not mistaken for an IO failure.
+    static DISK_WORKER_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn roots(test: &str) -> (PathBuf, PathBuf, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1218,6 +1250,272 @@ mod tests {
         let staging = root.join("staging");
         let downloads = root.join("downloads");
         (root, staging, downloads)
+    }
+
+    struct DiskThreadExit(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DiskThreadExit {
+        fn drop(&mut self) {
+            if let Some(exit) = self.0.take() {
+                let _ = exit.send(());
+            }
+        }
+    }
+
+    fn disk_thread_exit_notice() -> (impl Fn() + Send, tokio::sync::oneshot::Receiver<()>) {
+        let (exit, exited) = tokio::sync::oneshot::channel();
+        let notice = DiskThreadExit(Some(exit));
+        (
+            move || {
+                let _ = &notice;
+            },
+            exited,
+        )
+    }
+
+    async fn abandon_opening_worker(
+        transfer_id: [u8; 16],
+        expected_size: u64,
+        staging: &std::path::Path,
+        downloads: &std::path::Path,
+    ) {
+        use std::{
+            future::Future,
+            sync::{Arc, Condvar, Mutex},
+            task::Poll,
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let worker_staging = staging.to_owned();
+                let worker_downloads = downloads.to_owned();
+                let gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let worker_gate = gate.clone();
+                let (entered, opened) = tokio::sync::oneshot::channel();
+                let (before_write, mut exited) = disk_thread_exit_notice();
+                let mut creating = Box::pin(IncomingFileWorker::spawn_with(
+                    move || {
+                        IncomingFile::create_in_with_open_hook(
+                            transfer_id,
+                            "initializing.bin".to_owned(),
+                            expected_size,
+                            worker_staging,
+                            worker_downloads,
+                            move || {
+                                let _ = entered.send(());
+                                let (lock, wake) = &*worker_gate;
+                                let mut open = lock.lock().unwrap();
+                                while !*open {
+                                    open = wake.wait(open).unwrap();
+                                }
+                            },
+                        )
+                    },
+                    before_write,
+                ));
+                let initial =
+                    std::future::poll_fn(|cx| Poll::Ready(creating.as_mut().poll(cx))).await;
+                if matches!(initial, Poll::Ready(Err(TransferResult::Busy))) {
+                    // Other worker tests can temporarily use all eight slots.
+                    drop(creating);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    continue;
+                }
+                assert!(matches!(initial, Poll::Pending));
+                opened.await.unwrap();
+                assert_eq!(
+                    exited.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                );
+                assert!(matches!(
+                    IncomingFile::create_in(
+                        transfer_id,
+                        "initializing.bin".to_owned(),
+                        expected_size,
+                        staging.to_owned(),
+                        downloads.to_owned(),
+                    ),
+                    Err(TransferResult::Busy)
+                ));
+                // This is the real opened.await future, not a synthetic ready
+                // channel: cancellation happens while the disk thread owns an
+                // open file and has not yet hashed its existing prefix.
+                drop(creating);
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_one();
+                // before_write remains owned by the worker closure; its exit
+                // notice drops after local file and worker-permit cleanup.
+                exited.await.unwrap();
+                break;
+            }
+        })
+        .await
+        .expect("cancelled initialization must eventually release its worker");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_creation_preserves_verified_prefix_and_releases_worker_and_path_ownership() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("cancel-create-resume");
+        let transfer_id = [29; 16];
+        let partial = incoming_temporary_path(&staging, transfer_id);
+        let mut first = IncomingFile::create_in(
+            transfer_id,
+            "initializing.bin".to_owned(),
+            8,
+            staging.clone(),
+            downloads.clone(),
+        )
+        .unwrap();
+        first.write_chunk(0, b"desk").unwrap();
+        first.preserve().unwrap();
+        // More cancellations than the worker cap prove cancelled initialization
+        // does not retain a thread slot. Do not inspect unrelated live workers.
+        for _ in 0..=super::MAX_INCOMING_DISK_WORKERS {
+            abandon_opening_worker(transfer_id, 8, &staging, &downloads).await;
+            assert_eq!(fs::read(&partial).unwrap(), b"desk");
+            let reopened = IncomingFile::create_in(
+                transfer_id,
+                "initializing.bin".to_owned(),
+                8,
+                staging.clone(),
+                downloads.clone(),
+            )
+            .unwrap();
+            assert_eq!(reopened.transfer_id(), transfer_id);
+            assert_eq!(reopened.name, "initializing.bin");
+            assert_eq!(reopened.expected_size, 8);
+            assert_eq!(reopened.resume_offset(), 4);
+            assert_eq!(
+                reopened.resume_prefix_hash(),
+                Some(Blake2s256::digest(b"desk").into())
+            );
+            reopened.preserve().unwrap();
+        }
+        let mut resumed = IncomingFile::create_in(
+            transfer_id,
+            "initializing.bin".to_owned(),
+            8,
+            staging,
+            downloads,
+        )
+        .unwrap();
+        resumed.write_chunk(4, b"link").unwrap();
+        let published = resumed
+            .finish(Blake2s256::digest(b"desklink").into())
+            .unwrap();
+        assert_eq!(fs::read(published).unwrap(), b"desklink");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_empty_creation_preserves_an_empty_part_but_explicit_cancel_still_removes_it()
+    {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("cancel-create-empty");
+        let transfer_id = [30; 16];
+        let partial = incoming_temporary_path(&staging, transfer_id);
+        abandon_opening_worker(transfer_id, 3, &staging, &downloads).await;
+        assert_eq!(fs::metadata(&partial).unwrap().len(), 0);
+        let (before_write, exited) = disk_thread_exit_notice();
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    transfer_id,
+                    "initializing.bin".to_owned(),
+                    3,
+                    staging,
+                    downloads,
+                )
+            },
+            before_write,
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.resume_offset(), 0);
+        assert_eq!(worker.resume_prefix_hash(), None);
+        worker.cancel();
+        tokio::time::timeout(Duration::from_secs(2), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!partial.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialization_failure_reports_its_error_without_deleting_a_staged_prefix() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("create-failed");
+        let transfer_id = [31; 16];
+        let partial = incoming_temporary_path(&staging, transfer_id);
+        let mut first = IncomingFile::create_in(
+            transfer_id,
+            "initializing.bin".to_owned(),
+            8,
+            staging.clone(),
+            downloads.clone(),
+        )
+        .unwrap();
+        first.write_chunk(0, b"desk").unwrap();
+        first.preserve().unwrap();
+        let (before_write, exited) = disk_thread_exit_notice();
+        let result = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    transfer_id,
+                    "initializing.bin".to_owned(),
+                    MAX_TRANSFER_FILE_BYTES + 1,
+                    staging,
+                    downloads,
+                )
+            },
+            before_write,
+        )
+        .await;
+        assert!(matches!(result, Err(TransferResult::TooLarge)));
+        tokio::time::timeout(Duration::from_secs(2), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(partial).unwrap(), b"desk");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_flush_failure_is_reported_without_publishing_completion() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let (root, staging, downloads) = roots("preserve-flush-failed");
+        let published = downloads.join("not-published.bin");
+        let (before_write, exited) = disk_thread_exit_notice();
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                let mut file = IncomingFile::create_in(
+                    [32; 16],
+                    "not-published.bin".to_owned(),
+                    3,
+                    staging,
+                    downloads,
+                )?;
+                file.write_chunk(0, b"new")?;
+                file.file.take();
+                // Windows FlushFileBuffers requires write access. Reopen the
+                // real staging handle read-only to exercise an actual failure.
+                file.file =
+                    Some(File::open(&file.temporary_path).map_err(|_| TransferResult::IoFailed)?);
+                Ok(file)
+            },
+            before_write,
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.preserve().await, Err(TransferResult::IoFailed));
+        tokio::time::timeout(Duration::from_secs(2), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!published.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1351,6 +1649,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_orders_chunks_and_only_acknowledges_verified_publication() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         let (root, staging, downloads) = roots("worker-publish");
         let target = downloads.join("worker.bin");
         let mut worker = IncomingFileWorker::spawn_with(
@@ -1376,6 +1675,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_disk_worker_does_not_block_async_timers() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-slow");
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1417,6 +1717,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_preserve_then_resume_keeps_only_acknowledged_prefix() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         let (root, staging, downloads) = roots("worker-resume");
         let worker_staging = staging.clone();
         let worker_downloads = downloads.clone();
@@ -1455,6 +1756,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_queue_has_a_fixed_chunk_budget_and_cancel_discards_pending_work() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-budget");
         let partial = incoming_temporary_path(&staging, [24; 16]);
@@ -1513,6 +1815,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_rejects_oversized_chunks_and_invalid_hashes() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         let (root, staging, downloads) = roots("worker-invalid");
         let mut worker = IncomingFileWorker::spawn_with(
             move || {
@@ -1538,6 +1841,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dropped_worker_keeps_writer_ownership_until_pending_write_and_preserve_finish() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-reconnect-preserve");
         let worker_staging = staging.clone();
@@ -1630,6 +1934,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_worker_cannot_delete_a_new_receiver_staging_file() {
+        let _test = DISK_WORKER_TEST_GATE.lock().await;
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-reconnect-cancel");
         let worker_staging = staging.clone();

@@ -342,6 +342,9 @@
 - [x] **暂存所有权跟进（`fix(DL2-021): hold exclusive staging ownership through disk cleanup`）：** 异步Drop/保留期间，以规范化暂存路径RAII许可持有至文件关闭和清理结束；同文件重连先返回Busy，避免旧新worker并写/旧取消删除新文件。Windows写句柄只共享读取，续传先独占打开同一handle再扫描前缀；丢弃/陈旧清理同样遵守许可。
 - **验证：** transfer单测23通过、lib严格Clippy通过；3个新增回归覆盖旧写阻塞→Drop→别名路径重连Busy→释放后精确续传、旧cancel不删新文件、Windows绕过API的写/删除也被拒绝。未把不能中断的OS写线程视为已经退出。
 
+- [x] **初始化取消窗口（`fix(DL2-021): preserve resumed files when receiver creation is cancelled`）：** create future在opened.await期间被断连取消，磁盘线程后续ready发送失败时，先走同一preserve/sync路径再退出，避免直接Drop误删已校验旧prefix；文件/写许可/线程额度仍在磁盘线程释放。保留失败不发布完成，也不宣称成功保留。
+- **验证：** transfer 28通过、lib/tests严格Clippy及定向rustfmt/diff检查通过。真实spawn_with→create路径在已取得独占句柄、读取/哈希前阻塞，poll Pending后丢创建future，放行并等实际线程退出；9次取消后原4字节prefix/offset/hash/元数据不变，再续传通过完整哈希。另覆盖新空part保留、显式cancel删除、实际初始化TooLarge错误不删旧prefix、Windows只读handle导致sync_data返回IoFailed且未发布。资源型worker测试共享异步测试锁，未提高生产8线程上限或把外部忙碌当作泄漏。
+
 ### DL2-022 · P2 · 从 GDI 兜底恢复到高性能捕获后端
 
 - [ ] 增加有退避、有限失败预算的 DXGI 恢复探测。
