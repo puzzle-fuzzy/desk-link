@@ -36,8 +36,12 @@ fn c_header_layout_matches_every_public_rust_struct() {
     layout!(DesklinkEvent; kind, data, data_len, stream_id, frame_id, config_version, width, height, state, error_code, recoverable, input_epoch);
     layout!(DesklinkHostInput; kind, x, y, wheel_x, wheel_y, button, key_code, character, pressed, modifiers);
     layout!(DesklinkHostMetrics; sent_video_configs, sent_video_packets, received_input_events, keyframe_requests);
-    layout!(DesklinkHostEvent; kind, state, data, data_len, controller_device_id, controller_verify_key, fingerprint, fingerprint_len, input, metrics);
+    layout!(DesklinkHostEvent; kind, state, data, data_len, controller_device_id, controller_verify_key, fingerprint, fingerprint_len, input, metrics, media_generation);
     layout!(DesklinkSavedHostMaterial; session_id, relay_authentication, host_verify_key, server_name, expires_at_unix_s, authorization_type, directory_device_id, directory_access_code);
+    checks.push_str("_Static_assert(DESKLINK_OK == 0 && DESKLINK_INVALID_ARGUMENT == 1 && DESKLINK_INVALID_UTF8 == 2 && DESKLINK_INVALID_STATE == 3 && DESKLINK_INTERNAL_ERROR == 4 && DESKLINK_STALE_GENERATION == 5, \"result values\");\n");
+    checks.push_str("static DesklinkResult (*config_for_generation)(DesklinkHostHandle *, uint64_t, uint64_t, uint32_t, uint16_t, uint16_t, const uint8_t *, size_t) = desklink_host_send_video_config_for_generation;\n");
+    checks.push_str("static DesklinkResult (*access_unit_for_generation)(DesklinkHostHandle *, uint64_t, uint64_t, uint64_t, uint32_t, const uint8_t *, size_t) = desklink_host_send_video_access_unit_for_generation;\n");
+    checks.push_str("static DesklinkResult (*cursor_for_generation)(DesklinkHostHandle *, uint64_t, uint64_t, const uint8_t *, size_t) = desklink_host_send_cursor_for_generation;\n");
     let temp = std::env::temp_dir().join(format!("desklink-abi-{}", std::process::id()));
     fs::create_dir_all(&temp).unwrap();
     let source = temp.join("layout.c");

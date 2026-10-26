@@ -24,6 +24,7 @@ typedef enum DesklinkResult {
     DESKLINK_INVALID_UTF8 = 2,
     DESKLINK_INVALID_STATE = 3,
     DESKLINK_INTERNAL_ERROR = 4,
+    DESKLINK_STALE_GENERATION = 5,
 } DesklinkResult;
 
 typedef enum DesklinkPlatform {
@@ -248,6 +249,7 @@ typedef struct DesklinkHostEvent {
     size_t fingerprint_len;
     DesklinkHostInput input;
     DesklinkHostMetrics metrics;
+    uint64_t media_generation;
 } DesklinkHostEvent;
 
 typedef struct DesklinkSavedHostMaterial {
@@ -316,9 +318,15 @@ DesklinkResult desklink_host_reject(DesklinkHostHandle * handle);
 
 DesklinkResult desklink_host_send_video_config(DesklinkHostHandle * handle, uint64_t stream_id, uint32_t config_version, uint16_t width, uint16_t height, const uint8_t * bytes, size_t bytes_len);
 
+DesklinkResult desklink_host_send_video_config_for_generation(DesklinkHostHandle * handle, uint64_t media_generation, uint64_t stream_id, uint32_t config_version, uint16_t width, uint16_t height, const uint8_t * bytes, size_t bytes_len);
+
 DesklinkResult desklink_host_send_video_access_unit(DesklinkHostHandle * handle, uint64_t stream_id, uint64_t frame_id, uint32_t config_version, const uint8_t * bytes, size_t bytes_len);
 
+DesklinkResult desklink_host_send_video_access_unit_for_generation(DesklinkHostHandle * handle, uint64_t media_generation, uint64_t stream_id, uint64_t frame_id, uint32_t config_version, const uint8_t * bytes, size_t bytes_len);
+
 DesklinkResult desklink_host_send_cursor(DesklinkHostHandle * handle, uint64_t stream_id, const uint8_t * bytes, size_t bytes_len);
+
+DesklinkResult desklink_host_send_cursor_for_generation(DesklinkHostHandle * handle, uint64_t media_generation, uint64_t stream_id, const uint8_t * bytes, size_t bytes_len);
 
 DesklinkResult desklink_host_request_keyframe(DesklinkHostHandle * handle);
 

@@ -1,3 +1,6 @@
+#[path = "host_runtime/media_generation.rs"]
+mod media_generation;
+
 use std::{sync::Arc, time::Duration};
 
 use desklink_crypto::{
@@ -174,6 +177,23 @@ impl HostTestFixture {
     }
 
     async fn send_test_video(&self, host: &HostRuntime) {
+        // Approval only begins capability negotiation. Capture can submit once
+        // the worker grants the actual Connected producer, recorded like every
+        // other fixture event so later assertions retain the full history.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match self.next_event(host).await {
+                    HostEvent::Connected { media_generation } => {
+                        assert_ne!(media_generation, 0);
+                        return;
+                    }
+                    HostEvent::State(HostState::NegotiatingCapabilities) => {}
+                    event => panic!("unexpected event before capture grant: {event:?}"),
+                }
+            }
+        })
+        .await
+        .expect("host did not grant capture after approval");
         host.send(HostCommand::SendVideoConfig {
             stream_id: 9,
             version: 1,
@@ -516,7 +536,7 @@ async fn terminal_events(host: &HostRuntime) -> Vec<HostEvent> {
             .unwrap()
             .unwrap();
         let closed = matches!(event, HostEvent::State(HostState::Closed));
-        if !matches!(event, HostEvent::State(_)) || closed {
+        if !matches!(event, HostEvent::State(_) | HostEvent::Connected { .. }) || closed {
             events.push(event);
         }
         if closed {
@@ -530,7 +550,7 @@ async fn next_connected_state(host: &HostRuntime) {
         loop {
             if matches!(
                 host.next_event().await.unwrap(),
-                HostEvent::State(HostState::Connected)
+                HostEvent::Connected { .. }
             ) {
                 return;
             }
@@ -703,7 +723,7 @@ async fn host_decodes_input_and_keyframe_requests_after_approval() {
                 delta_y: 240,
             }) => saw_input = true,
             HostEvent::KeyframeRequested => saw_keyframe = true,
-            HostEvent::State(_) => continue,
+            HostEvent::State(_) | HostEvent::Connected { .. } => continue,
             event => panic!("unexpected host event: {event:?}"),
         }
         if saw_input && saw_keyframe {

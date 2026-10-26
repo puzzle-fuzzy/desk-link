@@ -136,12 +136,47 @@ fn record_closed(phase: &AtomicU8, phase_gate: &Mutex<()>) {
     phase.store(WorkerPhase::Closed as u8, Ordering::Release);
 }
 
+/// Retire capture admission on every exit from a Noise session, including
+/// errors and cancellation. Publication and retirement share the send gate.
+struct MediaGenerationLease<'a> {
+    current: &'a AtomicU64,
+    phase_gate: &'a Mutex<()>,
+}
+
+impl Drop for MediaGenerationLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(_gate) = self.phase_gate.lock() {
+            self.current.store(0, Ordering::Release);
+        }
+    }
+}
+
 pub(crate) struct HostWorker {
-    commands: mpsc::Sender<HostCommand>,
+    commands: mpsc::Sender<QueuedHostCommand>,
     cancellation: watch::Sender<bool>,
     phase: Arc<AtomicU8>,
     phase_gate: Arc<Mutex<()>>,
+    media_generation: Arc<AtomicU64>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct QueuedHostCommand {
+    media_generation: Option<u64>,
+    command: HostCommand,
+}
+
+impl QueuedHostCommand {
+    fn for_owner(self, owner: u64) -> Option<HostCommand> {
+        if self
+            .media_generation
+            .is_some_and(|generation| generation == 0 || generation != owner)
+        {
+            None
+        } else {
+            Some(self.command)
+        }
+    }
 }
 
 impl HostWorker {
@@ -160,6 +195,8 @@ impl HostWorker {
         let phase_gate = Arc::new(Mutex::new(()));
         let worker_phase = phase.clone();
         let worker_phase_gate = phase_gate.clone();
+        let media_generation = Arc::new(AtomicU64::new(0));
+        let worker_media_generation = media_generation.clone();
         let thread = thread::Builder::new()
             .name("desklink-host".into())
             .spawn(move || {
@@ -179,6 +216,7 @@ impl HostWorker {
                         events,
                         worker_phase.clone(),
                         worker_phase_gate.clone(),
+                        worker_media_generation.clone(),
                         ready_sender,
                     )),
                     Err(_) => {
@@ -198,6 +236,7 @@ impl HostWorker {
                 cancellation,
                 phase,
                 phase_gate,
+                media_generation,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -221,6 +260,8 @@ impl HostWorker {
         let phase_gate = Arc::new(Mutex::new(()));
         let worker_phase = phase.clone();
         let worker_phase_gate = phase_gate.clone();
+        let media_generation = Arc::new(AtomicU64::new(0));
+        let worker_media_generation = media_generation.clone();
         let initial_config = reconnect_config.clone();
         let thread = thread::Builder::new()
             .name("desklink-host".into())
@@ -244,6 +285,7 @@ impl HostWorker {
                                     events,
                                     worker_phase.clone(),
                                     worker_phase_gate.clone(),
+                                    worker_media_generation.clone(),
                                     ready_sender,
                                 )
                                 .await;
@@ -273,6 +315,7 @@ impl HostWorker {
                 cancellation,
                 phase,
                 phase_gate,
+                media_generation,
                 thread: Some(thread),
             }),
             Err(error) => {
@@ -287,14 +330,45 @@ impl HostWorker {
     }
 
     pub(crate) fn send(&self, command: HostCommand) -> Result<(), HostError> {
+        self.send_owned(None, command)
+    }
+
+    pub(crate) fn send_for_generation(
+        &self,
+        generation: u64,
+        command: HostCommand,
+    ) -> Result<(), HostError> {
+        if !command.is_media() {
+            return Err(HostError::InvalidState);
+        }
+        self.send_owned(Some(generation), command)
+    }
+
+    fn send_owned(
+        &self,
+        supplied_generation: Option<u64>,
+        command: HostCommand,
+    ) -> Result<(), HostError> {
         let _phase_gate = self
             .phase_gate
             .lock()
             .map_err(|_| HostError::WorkerStopped)?;
         let phase = WorkerPhase::load(&self.phase);
+        let current_owner = self.media_generation.load(Ordering::Acquire);
+        if supplied_generation.is_some_and(|owner| owner == 0 || owner != current_owner) {
+            return Err(HostError::StaleMediaGeneration);
+        }
         if !command_is_admissible(&command, phase) {
             return Err(HostError::InvalidState);
         }
+        let media_generation = if command.is_media() {
+            if current_owner == 0 {
+                return Err(HostError::InvalidState);
+            }
+            Some(supplied_generation.unwrap_or(current_owner))
+        } else {
+            None
+        };
         let next_phase = match &command {
             HostCommand::Approve { .. } => Some(WorkerPhase::NegotiatingCapabilities),
             HostCommand::Reject | HostCommand::Stop => Some(WorkerPhase::Stopping),
@@ -302,13 +376,17 @@ impl HostWorker {
         };
         let cancels_worker = matches!(&command, HostCommand::Reject | HostCommand::Stop);
         self.commands
-            .try_send(command)
+            .try_send(QueuedHostCommand {
+                media_generation,
+                command,
+            })
             .map_err(|_| HostError::CommandQueueFull)?;
 
         // Command acceptance and the externally visible phase transition share this gate. A
         // full command queue therefore leaves the prior phase intact, so a rejected Approve
         // cannot unlock media and a rejected Reject/Stop cannot invent a terminal state.
         if cancels_worker {
+            self.media_generation.store(0, Ordering::Release);
             record_terminal_admission_locked(&self.phase);
         } else if let Some(next_phase) = next_phase {
             self.phase.store(next_phase as u8, Ordering::Release);
@@ -331,7 +409,14 @@ impl HostWorker {
     pub(crate) fn cancel(&self) {
         // Cancellation is deliberately independent of command-queue admission. Destruction
         // must still interrupt a worker whose bounded command queue is saturated.
-        let _ = self.commands.try_send(HostCommand::Stop);
+        if let Ok(_gate) = self.phase_gate.lock() {
+            self.media_generation.store(0, Ordering::Release);
+            record_terminal_admission_locked(&self.phase);
+        }
+        let _ = self.commands.try_send(QueuedHostCommand {
+            media_generation: None,
+            command: HostCommand::Stop,
+        });
         let _ = self.cancellation.send(true);
     }
 }
@@ -375,13 +460,20 @@ fn emit_nonterminal(events: &mpsc::Sender<HostEvent>, event: HostEvent) {
 }
 
 fn emit_required(events: &mpsc::Sender<HostEvent>, event: HostEvent) -> Result<(), HostError> {
+    reserve_required(events)?.send(event);
+    Ok(())
+}
+
+fn reserve_required(
+    events: &mpsc::Sender<HostEvent>,
+) -> Result<mpsc::Permit<'_, HostEvent>, HostError> {
     // Stateful input and release barriers may never be silently dropped. If the
     // application is stalled, fail closed while the three terminal slots still
     // guarantee ReleaseAll/Error/Closed without waiting on event capacity.
     if events.capacity() <= TERMINAL_EVENT_RESERVE {
         return Err(HostError::CommandQueueFull);
     }
-    events.try_send(event).map_err(|_| HostError::WorkerStopped)
+    events.try_reserve().map_err(|_| HostError::WorkerStopped)
 }
 
 fn emit_terminal(events: &mpsc::Sender<HostEvent>, error: Option<HostError>) {
@@ -401,11 +493,12 @@ async fn run_worker(
     identity: DeviceIdentity,
     session_id: SessionId,
     relay_authentication: [u8; 32],
-    mut commands: mpsc::Receiver<HostCommand>,
+    mut commands: mpsc::Receiver<QueuedHostCommand>,
     mut cancellation: watch::Receiver<bool>,
     events: mpsc::Sender<HostEvent>,
     phase: Arc<AtomicU8>,
     phase_gate: Arc<Mutex<()>>,
+    media_generation: Arc<AtomicU64>,
     ready: std::sync::mpsc::SyncSender<Result<(), HostError>>,
 ) {
     let mut relay_authentication = relay_authentication;
@@ -436,6 +529,7 @@ async fn run_worker(
             &events,
             &phase,
             &phase_gate,
+            &media_generation,
             &mut approved_controller,
         )
         .await
@@ -490,13 +584,18 @@ async fn run_worker(
 async fn run_session(
     client: &QuicClient,
     identity: &DeviceIdentity,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut mpsc::Receiver<QueuedHostCommand>,
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
     phase: &Arc<AtomicU8>,
     phase_gate: &Arc<Mutex<()>>,
+    current_media_generation: &Arc<AtomicU64>,
     approved_controller: &mut Option<ApprovedController>,
 ) -> Result<(), HostError> {
+    let _media_lease = MediaGenerationLease {
+        current: current_media_generation,
+        phase_gate,
+    };
     let handshake_identity = identity.with_secret_key_bytes(|secret| {
         DeviceIdentity::from_secret_key(identity.device_id, secret)
     });
@@ -556,11 +655,34 @@ async fn run_session(
     if *cancellation.borrow() {
         return Ok(());
     }
-    if !try_advance_worker_phase(phase, phase_gate, WorkerPhase::Connected) {
-        return Ok(());
-    }
-    emit_nonterminal(events, HostEvent::State(HostState::Connected));
-    run_connected(client, &mut secure, commands, cancellation, events).await
+    let media_generation = {
+        let _gate = phase_gate.lock().map_err(|_| HostError::WorkerStopped)?;
+        if WorkerPhase::load(phase).is_terminal() {
+            return Ok(());
+        }
+        // Reuse the process-wide fallible, checked allocator: grants cannot be
+        // reused by another handle, Noise session, or video input context.
+        let generation = allocate_input_epoch()?;
+        let connected_event = reserve_required(events)?;
+        current_media_generation.store(generation, Ordering::Release);
+        phase.store(WorkerPhase::Connected as u8, Ordering::Release);
+        // Reserve before publication, then make the grant visible only after
+        // both atomics are published. Consumers can immediately observe state
+        // and send, while send admission still shares this phase gate.
+        connected_event.send(HostEvent::Connected {
+            media_generation: generation,
+        });
+        generation
+    };
+    run_connected(
+        client,
+        &mut secure,
+        commands,
+        cancellation,
+        events,
+        media_generation,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -714,7 +836,7 @@ async fn perform_noise_handshake(
 async fn wait_for_approval(
     device_id: [u8; 16],
     verify_key: VerifyingKey,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut mpsc::Receiver<QueuedHostCommand>,
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
 ) -> Result<bool, HostError> {
@@ -733,7 +855,7 @@ async fn wait_for_approval_with_timeout(
     timeout: Duration,
     device_id: [u8; 16],
     verify_key: VerifyingKey,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut mpsc::Receiver<QueuedHostCommand>,
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
 ) -> Result<bool, HostError> {
@@ -748,7 +870,7 @@ async fn wait_for_approval_with_timeout(
 async fn wait_for_approval_command(
     device_id: [u8; 16],
     verify_key: VerifyingKey,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut mpsc::Receiver<QueuedHostCommand>,
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
 ) -> Result<bool, HostError> {
@@ -760,17 +882,21 @@ async fn wait_for_approval_command(
                 return Ok(false);
             }
             command = commands.recv() => match command {
+                Some(queued) => match queued.for_owner(0) {
+                None => continue,
                 Some(HostCommand::Approve { controller_device_id, controller_verify_key }) => {
                     if controller_device_id != device_id || controller_verify_key != *verify_key.as_bytes() {
                         return Err(HostError::ControllerIdentityMismatch);
                     }
                     return Ok(true);
                 }
-                Some(HostCommand::Reject | HostCommand::Stop) | None => return Ok(false),
+                Some(HostCommand::Reject | HostCommand::Stop) => return Ok(false),
                 Some(HostCommand::ReleaseAll) => {
                     emit_required(events, HostEvent::ReleaseAll)?;
                 }
                 Some(_) => return Err(HostError::InvalidState),
+                },
+                None => return Ok(false),
             },
         }
     }
@@ -858,9 +984,10 @@ async fn negotiate_controller(
 async fn run_connected(
     client: &QuicClient,
     secure: &mut SecureSession,
-    commands: &mut mpsc::Receiver<HostCommand>,
+    commands: &mut mpsc::Receiver<QueuedHostCommand>,
     cancellation: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<HostEvent>,
+    media_generation: u64,
 ) -> Result<(), HostError> {
     let mut video = VideoState::default();
     let mut input_policy = HostInputPolicy::default();
@@ -877,6 +1004,9 @@ async fn run_connected(
             }
             command = commands.recv() => match command {
                 Some(command) => {
+                    let Some(command) = command.for_owner(media_generation) else {
+                        continue;
+                    };
                     if !handle_command(client, secure, command, &mut video, &mut metrics, events).await? {
                         return Ok(());
                     }
@@ -1270,6 +1400,343 @@ fn protocol_error(error: desklink_protocol::ProtocolError) -> HostError {
 
 fn crypto_error(error: desklink_crypto::CryptoError) -> HostError {
     HostError::Crypto(error.to_string())
+}
+
+#[cfg(test)]
+mod media_generation_loopback {
+    use super::*;
+    use desklink_crypto::NoiseInitiator;
+    use desklink_protocol::decode_video_config;
+    use desklink_relay::{RelayConfig, RelayServer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    struct TestRelay {
+        config: QuicClientConfig,
+        server: Arc<RelayServer>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestRelay {
+        fn drop(&mut self) {
+            self.server.close();
+            self.task.abort();
+        }
+    }
+
+    async fn relay() -> TestRelay {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate_der = certificate.cert.der().to_vec();
+        let server_config = quinn::ServerConfig::with_single_cert(
+            vec![CertificateDer::from(certificate_der.clone())],
+            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+        )
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(certificate_der)).unwrap();
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        let server = Arc::new(
+            RelayServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                server_config,
+                RelayConfig::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let config = QuicClientConfig::with_client_config(
+            server.local_addr().unwrap(),
+            "localhost",
+            client_config,
+        );
+        let running = server.clone();
+        let task = tokio::spawn(async move {
+            let _ = running.run().await;
+        });
+        TestRelay {
+            config,
+            server,
+            task,
+        }
+    }
+
+    struct Peer {
+        client: QuicClient,
+        secure: SecureSession,
+        host_generation: u64,
+    }
+
+    impl Peer {
+        async fn pair(
+            relay: &TestRelay,
+            session: SessionId,
+            auth: [u8; 32],
+            identity: DeviceIdentity,
+            host_key: VerifyingKey,
+        ) -> Self {
+            let client = QuicClient::connect(relay.config.clone()).await.unwrap();
+            client
+                .join(RelayJoin::controller_with_participant(
+                    session,
+                    auth,
+                    identity.device_id,
+                ))
+                .await
+                .unwrap();
+            let (mut initiator, payload) = NoiseInitiator::start(identity, host_key).unwrap();
+            client
+                .send_control(
+                    encode_noise_handshake(&NoiseHandshake {
+                        protocol_version: PROTOCOL_VERSION,
+                        step: NoiseHandshakeStep::InitiatorHello,
+                        payload,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (host_generation, response) = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.next_control_with_generation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response = decode_noise_handshake(&response).unwrap();
+            let payload = initiator.receive(&response.payload).unwrap();
+            client
+                .send_control(
+                    encode_noise_handshake(&NoiseHandshake {
+                        protocol_version: PROTOCOL_VERSION,
+                        step: NoiseHandshakeStep::InitiatorFinish,
+                        payload,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let secure = initiator
+                .finish()
+                .unwrap()
+                .into_secure_session(SecureRole::Initiator);
+            Self {
+                client,
+                secure,
+                host_generation,
+            }
+        }
+
+        async fn negotiate(&mut self) {
+            for control in [
+                ControlMessage::Hello {
+                    platform: Platform::MacOS,
+                    role: DeviceRole::Controller,
+                },
+                ControlMessage::Capabilities(DeviceCapabilities {
+                    platform: Platform::MacOS,
+                    role: DeviceRole::Controller,
+                    codecs: vec![Codec::H264],
+                    h264_profiles: vec![H264Profile::Main],
+                    width: 640,
+                    height: 360,
+                }),
+            ] {
+                let plaintext = encode_control(&control).unwrap();
+                let ciphertext = self.secure.seal(SecureLane::Control, &plaintext).unwrap();
+                self.client.send_control(ciphertext).await.unwrap();
+            }
+        }
+
+        async fn config(&mut self) -> VideoConfig {
+            let ciphertext =
+                tokio::time::timeout(Duration::from_secs(3), self.client.next_video_config())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let plaintext = self
+                .secure
+                .open(SecureLane::VideoConfig, &ciphertext)
+                .unwrap();
+            decode_video_config(&plaintext).unwrap()
+        }
+    }
+
+    async fn event_until(
+        events: &mut mpsc::Receiver<HostEvent>,
+        matches: impl Fn(&HostEvent) -> bool,
+    ) -> HostEvent {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.expect("host event channel closed");
+                assert!(
+                    !matches!(
+                        event,
+                        HostEvent::Error(_) | HostEvent::State(HostState::Closed)
+                    ),
+                    "unexpected host failure: {event:?}"
+                );
+                if matches(&event) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("host did not reach the required phase")
+    }
+
+    fn config_command(width: u16) -> HostCommand {
+        HostCommand::SendVideoConfig {
+            stream_id: 9,
+            version: 1,
+            width,
+            height: 360,
+            bytes: vec![0, 0, 0, 1, 0x67, 0x4d, 0, 31, 0, 0, 0, 1, 0x68, 0xee],
+        }
+    }
+
+    fn inject_retired(worker: &HostWorker, owner: u64) {
+        // Bypass admission deliberately, exactly as a command accepted before
+        // retirement would already occupy the worker's bounded queue.
+        for command in [
+            config_command(640),
+            HostCommand::SendVideoAccessUnit {
+                stream_id: 9,
+                frame_id: 1,
+                config_version: 99,
+                bytes: vec![0, 0, 1, 0x65],
+            },
+            HostCommand::SendCursor {
+                stream_id: 9,
+                bytes: vec![0],
+            },
+        ] {
+            worker
+                .commands
+                .try_send(QueuedHostCommand {
+                    media_generation: Some(owner),
+                    command,
+                })
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retired_queued_media_is_dropped_at_successor_approval_negotiation_and_connected() {
+        let relay = relay().await;
+        let session = SessionId::from_bytes([71; 16]);
+        let auth = [72; 32];
+        let identity = DeviceIdentity::from_secret_key([73; 16], &[74; 32]);
+        let host_key = identity.verify_key();
+        let first_identity = DeviceIdentity::from_secret_key([75; 16], &[76; 32]);
+        let first_key = *first_identity.verify_key().as_bytes();
+        let (events_sender, mut events) = mpsc::channel(64);
+        let worker = HostWorker::start_from_config(
+            relay.config.clone(),
+            identity,
+            session,
+            auth,
+            events_sender,
+        )
+        .unwrap();
+        let mut first = Peer::pair(&relay, session, auth, first_identity, host_key).await;
+        event_until(&mut events, |event| {
+            matches!(event, HostEvent::ApprovalRequested { .. })
+        })
+        .await;
+        worker
+            .send(HostCommand::Approve {
+                controller_device_id: [75; 16],
+                controller_verify_key: first_key,
+            })
+            .unwrap();
+        first.negotiate().await;
+        let HostEvent::Connected {
+            media_generation: retired,
+        } = event_until(&mut events, |event| {
+            matches!(event, HostEvent::Connected { .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(worker.media_generation.load(Ordering::Acquire), retired);
+        let relay_generation = first.host_generation;
+        first.client.close(b"retire queued test producer");
+        drop(first);
+        event_until(&mut events, |event| {
+            matches!(event, HostEvent::State(HostState::Connecting))
+        })
+        .await;
+        assert_eq!(worker.media_generation.load(Ordering::Acquire), 0);
+        // Observe actual relay replacement before opening another controller;
+        // phase events and table predicates determine all race boundaries.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = relay.server.capacity_snapshot();
+                if !relay
+                    .server
+                    .session_table()
+                    .has_connection(session, relay_generation)
+                    && snapshot.attached_participants == 1
+                    && snapshot.accepted_connections == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let next_identity = DeviceIdentity::from_secret_key([77; 16], &[78; 32]);
+        let next_key = *next_identity.verify_key().as_bytes();
+        let mut successor = Peer::pair(&relay, session, auth, next_identity, host_key).await;
+        event_until(&mut events, |event| {
+            matches!(event, HostEvent::ApprovalRequested { .. })
+        })
+        .await;
+        inject_retired(&worker, retired);
+        // FIFO approval proves the stale media before it was discarded rather
+        // than converted to InvalidState by the approval command matcher.
+        worker
+            .send(HostCommand::Approve {
+                controller_device_id: [77; 16],
+                controller_verify_key: next_key,
+            })
+            .unwrap();
+        event_until(&mut events, |event| {
+            matches!(event, HostEvent::State(HostState::NegotiatingCapabilities))
+        })
+        .await;
+        inject_retired(&worker, retired);
+        successor.negotiate().await;
+        let HostEvent::Connected {
+            media_generation: current,
+        } = event_until(&mut events, |event| {
+            matches!(event, HostEvent::Connected { .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert_ne!(current, retired);
+        inject_retired(&worker, retired);
+        worker
+            .send_for_generation(current, config_command(800))
+            .unwrap();
+        let config = successor.config().await;
+        assert_eq!(
+            config.width, 800,
+            "retired queued config must never reach the new Noise peer"
+        );
+        assert_eq!(worker.state(), HostState::Connected);
+        assert_eq!(worker.media_generation.load(Ordering::Acquire), current);
+        worker.cancel();
+        drop(worker);
+    }
 }
 
 #[cfg(test)]

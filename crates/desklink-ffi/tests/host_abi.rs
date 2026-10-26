@@ -8,8 +8,10 @@ use desklink_ffi::{
     DesklinkConfig, DesklinkHostConfig, DesklinkHostEvent, DesklinkHostEventCallback,
     DesklinkHostEventKind, DesklinkHostHandle, DesklinkResult, desklink_host_approve,
     desklink_host_create, desklink_host_destroy, desklink_host_release_all,
-    desklink_host_send_cursor, desklink_host_send_video_access_unit,
-    desklink_host_send_video_config, desklink_host_start_from_invite, desklink_host_start_pairing,
+    desklink_host_send_cursor, desklink_host_send_cursor_for_generation,
+    desklink_host_send_video_access_unit, desklink_host_send_video_access_unit_for_generation,
+    desklink_host_send_video_config, desklink_host_send_video_config_for_generation,
+    desklink_host_start_from_invite, desklink_host_start_pairing,
 };
 
 static CALLBACK_EVENTS: OnceLock<Mutex<Vec<DesklinkHostEventKind>>> = OnceLock::new();
@@ -111,6 +113,139 @@ fn host_abi_validates_invites_approval_and_media_arguments() {
         unsafe { desklink_host_send_cursor(handle, 1, null(), 1) },
         DesklinkResult::InvalidArgument
     );
+    unsafe { desklink_host_destroy(handle) };
+}
+
+#[test]
+fn scoped_media_abi_preserves_signatures_and_validates_arguments() {
+    let _: unsafe extern "C" fn(
+        *mut DesklinkHostHandle,
+        u64,
+        u64,
+        u32,
+        u16,
+        u16,
+        *const u8,
+        usize,
+    ) -> DesklinkResult = desklink_host_send_video_config_for_generation;
+    let _: unsafe extern "C" fn(
+        *mut DesklinkHostHandle,
+        u64,
+        u64,
+        u64,
+        u32,
+        *const u8,
+        usize,
+    ) -> DesklinkResult = desklink_host_send_video_access_unit_for_generation;
+    let _: unsafe extern "C" fn(
+        *mut DesklinkHostHandle,
+        u64,
+        u64,
+        *const u8,
+        usize,
+    ) -> DesklinkResult = desklink_host_send_cursor_for_generation;
+    assert_eq!(DesklinkResult::Ok as i32, 0);
+    assert_eq!(DesklinkResult::InvalidArgument as i32, 1);
+    assert_eq!(DesklinkResult::InvalidUtf8 as i32, 2);
+    assert_eq!(DesklinkResult::InvalidState as i32, 3);
+    assert_eq!(DesklinkResult::InternalError as i32, 4);
+    assert_eq!(DesklinkResult::StaleGeneration as i32, 5);
+    let (handle, _relay_url, _server_name) = unsafe { create_host() };
+    let payload = [0, 0, 1, 0x67];
+    for invalid_handle in [null_mut(), handle] {
+        assert_eq!(
+            unsafe {
+                desklink_host_send_video_config_for_generation(
+                    invalid_handle,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    null(),
+                    1,
+                )
+            },
+            DesklinkResult::InvalidArgument
+        );
+        assert_eq!(
+            unsafe {
+                desklink_host_send_video_access_unit_for_generation(
+                    invalid_handle,
+                    1,
+                    1,
+                    1,
+                    1,
+                    null(),
+                    1,
+                )
+            },
+            DesklinkResult::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { desklink_host_send_cursor_for_generation(invalid_handle, 1, 1, null(), 1) },
+            DesklinkResult::InvalidArgument
+        );
+    }
+    assert_eq!(
+        unsafe { desklink_host_send_video_config_for_generation(handle, 1, 1, 1, 1, 1, null(), 0) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe {
+            desklink_host_send_video_access_unit_for_generation(handle, 1, 1, 1, 1, null(), 0)
+        },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_host_send_cursor_for_generation(handle, 1, 1, null(), 0) },
+        DesklinkResult::InvalidArgument
+    );
+    // A live idle handle owns no producer grant; valid payloads fail closed
+    // without starting a transport or manufacturing a generation.
+    for generation in [0, 1] {
+        assert_eq!(
+            unsafe {
+                desklink_host_send_video_config_for_generation(
+                    handle,
+                    generation,
+                    1,
+                    1,
+                    1,
+                    1,
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            },
+            DesklinkResult::StaleGeneration
+        );
+        assert_eq!(
+            unsafe {
+                desklink_host_send_video_access_unit_for_generation(
+                    handle,
+                    generation,
+                    1,
+                    1,
+                    1,
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            },
+            DesklinkResult::StaleGeneration
+        );
+        assert_eq!(
+            unsafe {
+                desklink_host_send_cursor_for_generation(
+                    handle,
+                    generation,
+                    1,
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            },
+            DesklinkResult::StaleGeneration
+        );
+    }
     unsafe { desklink_host_destroy(handle) };
 }
 

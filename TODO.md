@@ -231,6 +231,8 @@
 
 - [x] 真实背压夹具所需的传输构造入口：QuicFlowControlLimits 显式限制 send / connection receive / stream receive，非零、最多 512 MiB 且 stream 不超过 connection；默认行为保持原值。client connect 应用限值后统一 keepalive / dead timeout，relay 新 bind_with_transport 保留传入窗口并统一生命周期超时。原来只设置 TLS client/server config 的窗口会被构造器覆盖，不能据此声称制造了背压。`test -p desklink-transport -p desklink-relay --lib --tests --locked` 实跑 77 项通过；最终端点背压证明见后续 worker 切片。主题 `feat(DL2-013): expose explicit bounded QUIC flow-control tuning`。
 
+- [x] Host 原生生产者归属：每次认证 Noise 的 Connected 固定生成非零、全局随机起点后 checked 推进的 media_generation；Connected 先保留 required event 槽、发布 owner / state，再投递原始令牌，断会话立即退役。scoped config / access-unit / cursor C 入口在入队和所有实际出队阶段校验原 owner，旧 producer 或已入队旧媒体只拒绝 / 丢弃，不关闭后继会话；StaleGeneration=5，事件尾字段与双头、C ABI 布局同步。Rust legacy 同步媒体入队也保留当时 owner，异步 producer 必须使用 scoped 入口。Host runtime 26 项、Host ABI 5 项、双头与全部 public struct 布局 2 项通过；另实际首连→换 Noise→审批 / 协商 / Connected 注入旧队列的 lib 回环及不可改写 Connected callback 快照通过。完整 source display / topology 仍未覆盖。主题 `fix(DL2-013): bind host media producers to their authenticated Noise session`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

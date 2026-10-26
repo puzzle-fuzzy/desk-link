@@ -51,6 +51,7 @@ pub enum DesklinkResult {
     InvalidUtf8 = 2,
     InvalidState = 3,
     InternalError = 4,
+    StaleGeneration = 5,
 }
 
 /// Apple controller platforms exposed through the stable C ABI.
@@ -322,6 +323,8 @@ pub struct DesklinkHostEvent {
     pub fingerprint_len: usize,
     pub input: DesklinkHostInput,
     pub metrics: DesklinkHostMetrics,
+    /// Fixed producer grant from the Connected event; zero on other events.
+    pub media_generation: u64,
 }
 
 pub type DesklinkHostEventCallback = extern "C" fn(*mut c_void, *const DesklinkHostEvent);
@@ -416,11 +419,16 @@ impl HostCallbackState {
             fingerprint_len: 0,
             input: DesklinkHostInput::default(),
             metrics: DesklinkHostMetrics::default(),
+            media_generation: 0,
         };
         match event {
             HostEvent::State(host_state) => {
                 c_event.kind = DesklinkHostEventKind::State;
                 c_event.state = map_host_state(host_state);
+            }
+            HostEvent::Connected { media_generation } => {
+                c_event.state = DesklinkHostState::Connected;
+                c_event.media_generation = media_generation;
             }
             HostEvent::Error(error) => {
                 data = Some(error.to_string().into_bytes());
@@ -1750,6 +1758,52 @@ pub unsafe extern "C" fn desklink_host_send_video_config(
 /// # Safety
 /// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
 /// that many readable bytes.
+pub unsafe extern "C" fn desklink_host_send_video_config_for_generation(
+    handle: *mut DesklinkHostHandle,
+    media_generation: u64,
+    stream_id: u64,
+    config_version: u32,
+    width: u16,
+    height: u16,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if stream_id == 0
+        || config_version == 0
+        || width == 0
+        || height == 0
+        || width > MAX_MVP_WIDTH
+        || height > MAX_MVP_HEIGHT
+    {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(bytes) = copy_payload(bytes, bytes_len, MAX_VIDEO_CONFIG_BYTES) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_host_command_for_generation(
+        handle,
+        media_generation,
+        HostCommand::SendVideoConfig {
+            stream_id,
+            version: config_version,
+            width,
+            height,
+            bytes,
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+///
+/// # Safety
+/// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
+/// that many readable bytes.
 pub unsafe extern "C" fn desklink_host_send_video_access_unit(
     handle: *mut DesklinkHostHandle,
     stream_id: u64,
@@ -1787,6 +1841,45 @@ pub unsafe extern "C" fn desklink_host_send_video_access_unit(
 /// # Safety
 /// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
 /// that many readable bytes.
+pub unsafe extern "C" fn desklink_host_send_video_access_unit_for_generation(
+    handle: *mut DesklinkHostHandle,
+    media_generation: u64,
+    stream_id: u64,
+    frame_id: u64,
+    config_version: u32,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if stream_id == 0 || frame_id == 0 || config_version == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let maximum = MAX_VIDEO_PACKET_PAYLOAD_BYTES * usize::from(MAX_VIDEO_CHUNKS);
+    let Some(bytes) = copy_payload(bytes, bytes_len, maximum) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_host_command_for_generation(
+        handle,
+        media_generation,
+        HostCommand::SendVideoAccessUnit {
+            stream_id,
+            frame_id,
+            config_version,
+            bytes,
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+///
+/// # Safety
+/// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
+/// that many readable bytes.
 pub unsafe extern "C" fn desklink_host_send_cursor(
     handle: *mut DesklinkHostHandle,
     stream_id: u64,
@@ -1806,6 +1899,37 @@ pub unsafe extern "C" fn desklink_host_send_cursor(
         return DesklinkResult::InvalidArgument;
     }
     send_host_command(handle, HostCommand::SendCursor { stream_id, bytes })
+}
+
+#[unsafe(no_mangle)]
+///
+/// # Safety
+/// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
+/// that many readable bytes.
+pub unsafe extern "C" fn desklink_host_send_cursor_for_generation(
+    handle: *mut DesklinkHostHandle,
+    media_generation: u64,
+    stream_id: u64,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if stream_id == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(bytes) = copy_payload(bytes, bytes_len, MAX_CURSOR_MESSAGE_BYTES) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_host_command_for_generation(
+        handle,
+        media_generation,
+        HostCommand::SendCursor { stream_id, bytes },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -2095,6 +2219,7 @@ fn dispatch_host_events(runtime: Arc<HostRuntime>, callback: Arc<HostCallbackSta
                 }
             }
             Ok(event @ HostEvent::Error(_)) => callback.emit(event, runtime.state()),
+            Ok(event @ HostEvent::Connected { .. }) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::ApprovalRequested { .. }) => {
                 callback.emit(event, HostState::WaitingForApproval)
             }
@@ -2117,8 +2242,22 @@ fn send_host_command(handle: &DesklinkHostHandle, command: HostCommand) -> Deskl
         .map_or_else(map_host_error, |_| DesklinkResult::Ok)
 }
 
+fn send_host_command_for_generation(
+    handle: &DesklinkHostHandle,
+    media_generation: u64,
+    command: HostCommand,
+) -> DesklinkResult {
+    let Some(runtime) = host_runtime(handle) else {
+        return DesklinkResult::StaleGeneration;
+    };
+    runtime
+        .send_for_generation(media_generation, command)
+        .map_or_else(map_host_error, |_| DesklinkResult::Ok)
+}
+
 fn map_host_error(error: HostError) -> DesklinkResult {
     match error {
+        HostError::StaleMediaGeneration => DesklinkResult::StaleGeneration,
         HostError::InvalidState
         | HostError::ControllerIdentityMismatch
         | HostError::InvalidControllerCapabilities
@@ -2348,6 +2487,57 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_callback_preserves_the_queued_grant_and_zeroes_other_events() {
+        extern "C" fn record(context: *mut c_void, event: *const DesklinkHostEvent) {
+            let received = unsafe {
+                &mut *context.cast::<Vec<(DesklinkHostEventKind, DesklinkHostState, u64)>>()
+            };
+            let event = unsafe { &*event };
+            received.push((event.kind, event.state, event.media_generation));
+        }
+        let mut received = Vec::new();
+        let callback = HostCallbackState::new(
+            Some(record),
+            (&mut received as *mut Vec<(DesklinkHostEventKind, DesklinkHostState, u64)>).cast(),
+        );
+        // Dispatch can be delayed past a successor connection. The immutable
+        // event carries its original grant, irrespective of the current state.
+        callback.emit(
+            HostEvent::Connected {
+                media_generation: 43,
+            },
+            HostState::Closed,
+        );
+        callback.emit(
+            HostEvent::Connected {
+                media_generation: 44,
+            },
+            HostState::Connected,
+        );
+        callback.emit(HostEvent::ReleaseAll, HostState::Connecting);
+        assert_eq!(
+            received,
+            vec![
+                (
+                    DesklinkHostEventKind::State,
+                    DesklinkHostState::Connected,
+                    43_u64
+                ),
+                (
+                    DesklinkHostEventKind::State,
+                    DesklinkHostState::Connected,
+                    44_u64
+                ),
+                (
+                    DesklinkHostEventKind::ReleaseAll,
+                    DesklinkHostState::Connecting,
+                    0_u64
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn context_specific_release_cannot_clear_a_successor_epochs_identical_key() {
