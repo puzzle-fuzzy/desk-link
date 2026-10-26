@@ -8,30 +8,37 @@ func deskLinkSessionStatusText(for state: ConnectionState) -> String {
     deskLinkConnectionStatus(for: state).title
 }
 
+@MainActor
+private final class SessionVideoPresentation: ObservableObject {
+    @Published var rect: CGRect = .zero
+}
+
+@MainActor
 struct SessionView: View {
     @ObservedObject var bridge: ControllerBridge
     @ObservedObject var host: HostBridge
     @ObservedObject var account: AccountClient
     @State private var modifierMode = ModifierMode.automatic
     @State private var operations = SessionOperationStatus()
+    @StateObject private var videoPresentation = SessionVideoPresentation()
+    private var presentedVideoRect: CGRect { videoPresentation.rect }
 
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                MetalVideoView(pixelBuffer: bridge.latestPixelBuffer)
+                MetalVideoView(frame: bridge.videoFrame, onFramePresented: { [bridge, videoPresentation] token, rect in
+                    guard bridge.confirmVideoFramePresentation(token) else { return false }
+                    videoPresentation.rect = rect
+                    return true
+                })
                     .background(Color.black)
-                SessionInputView(bridge: bridge, videoSize: videoSize, modifierMode: modifierMode)
+                SessionInputView(bridge: bridge, videoSize: videoSize, visibleVideoRect: presentedVideoRect, modifierMode: modifierMode)
                     .background(Color.clear)
-                GeometryReader { proxy in
-                    RemoteCursorPositionLayer(
-                        overlay: bridge.cursorOverlay,
-                        activeStreamID: cursorStreamID,
-                        videoRect: VideoGeometry.aspectFit(
-                            source: videoSize ?? .zero,
-                            in: CGRect(origin: .zero, size: proxy.size)
-                        )
-                    )
-                }
+                RemoteCursorPositionLayer(
+                    overlay: bridge.cursorOverlay,
+                    activeStreamID: cursorStreamID,
+                    videoRect: presentedVideoRect
+                )
                 .allowsHitTesting(false)
                 if bridge.latestPixelBuffer == nil {
                     VStack(spacing: 10) {
@@ -81,7 +88,6 @@ struct SessionView: View {
             .background(DeskLinkPalette.subtle)
         }
         .frame(minWidth: 760, minHeight: 520)
-        .onDisappear { bridge.releaseAll() }
         .onChange(of: bridge.state) { _ in
             if !sessionOperationsAvailable { operations.reset() }
         }
@@ -158,8 +164,9 @@ struct SessionView: View {
                         Button("切换窗口（Alt+Tab）") { sendSystemKey(DeskLinkKeyCode.tab, modifiers: .option) }
                         Button("Windows 键") { sendSystemKey(DeskLinkKeyCode.meta) }
                         Button("运行（Win+R）") {
-                            bridge.send(input: .character(114, pressed: true, modifiers: .meta))
-                            bridge.send(input: .character(114, pressed: false, modifiers: .meta))
+                            guard let context = bridge.captureInputContext() else { return }
+                            bridge.send(input: .character(114, pressed: true, modifiers: .meta), context: context)
+                            bridge.send(input: .character(114, pressed: false, modifiers: .meta), context: context)
                         }
                     } else if bridge.remotePlatform != .unknown {
                         Divider()
@@ -222,7 +229,7 @@ struct SessionView: View {
     private func selectDisplay(_ identifier: UInt32) {
         guard sessionOperationsAvailable, !operations.hasPending,
               bridge.remoteDisplays.contains(where: { $0.id == identifier }) else { return }
-        bridge.releaseAll()
+        if let context = bridge.captureInputContext() { bridge.releaseAll(context: context) }
         if bridge.sendSessionCommand(1, value: identifier) {
             operations.displayQueued(identifier)
         } else {
@@ -236,9 +243,10 @@ struct SessionView: View {
     }
 
     private func sendSystemKey(_ code: UInt32, modifiers: Modifiers = []) {
-        bridge.releaseAll()
-        bridge.send(input: .key(code: code, pressed: true, modifiers: modifiers))
-        bridge.send(input: .key(code: code, pressed: false, modifiers: modifiers))
+        guard let context = bridge.captureInputContext() else { return }
+        bridge.releaseAll(context: context)
+        bridge.send(input: .key(code: code, pressed: true, modifiers: modifiers), context: context)
+        bridge.send(input: .key(code: code, pressed: false, modifiers: modifiers), context: context)
     }
 
     private var cursorStreamID: UInt64? {

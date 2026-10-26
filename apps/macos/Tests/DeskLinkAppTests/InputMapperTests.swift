@@ -5,6 +5,7 @@ import XCTest
 @testable import DeskLinkApp
 
 final class InputMapperTests: XCTestCase {
+    private let inputContext = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 2, runtimeGeneration: 3)
     func testNormalisedPointUsesOnlyVisibleVideoRect() {
         let mapper = InputMapper(videoRect: CGRect(x: 100, y: 50, width: 800, height: 450))
 
@@ -100,65 +101,65 @@ final class InputMapperTests: XCTestCase {
 
     func testCharacterReleaseUsesOriginalUppercaseAfterShiftIsReleased() {
         var keyboard = KeyboardInputState()
-        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: false), [
+        XCTAssertEqual(keyboard.keyDown(context: inputContext, keyCode: 0, characters: "A", modifiers: .shift, isRepeat: false).map(\.command), [
             .character(65, pressed: true, modifiers: .shift),
         ])
-        _ = keyboard.flagsChanged([])
-        XCTAssertEqual(keyboard.keyUp(keyCode: 0), [.character(65, pressed: false, modifiers: .shift)])
-        XCTAssertTrue(keyboard.keyUp(keyCode: 0).isEmpty)
+        _ = keyboard.flagsChanged(context: inputContext, []).map(\.command)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0).map(\.command), [.character(65, pressed: false, modifiers: .shift)])
+        XCTAssertTrue(keyboard.keyUp(keyCode: 0).map(\.command).isEmpty)
     }
 
     func testRepeatGlyphChangeReleasesOldIdentityBeforePressingNewIdentity() {
         var keyboard = KeyboardInputState()
         let down: [RemoteInputCommand] = [.character(97, pressed: true, modifiers: [])]
-        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: false), down)
-        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: true), down)
-        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true), [
+        XCTAssertEqual(keyboard.keyDown(context: inputContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: false).map(\.command), down)
+        XCTAssertEqual(keyboard.keyDown(context: inputContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: true).map(\.command), down)
+        XCTAssertEqual(keyboard.keyDown(context: inputContext, keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true).map(\.command), [
             .character(97, pressed: false, modifiers: []),
             .character(65, pressed: true, modifiers: .shift),
         ])
-        XCTAssertTrue(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: false).isEmpty)
-        XCTAssertEqual(keyboard.keyUp(keyCode: 0), [.character(65, pressed: false, modifiers: .shift)])
+        XCTAssertTrue(keyboard.keyDown(context: inputContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: false).map(\.command).isEmpty)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0).map(\.command), [.character(65, pressed: false, modifiers: .shift)])
     }
 
     func testCapsLockOnlyTogglesForItsPhysicalFlagsEvent() {
         var keyboard = KeyboardInputState()
         // Local Caps Lock was already on before focus. Pressing Shift must not
         // guess the host's lock state or toggle it as a side effect.
-        XCTAssertEqual(keyboard.flagsChanged([.capsLock, .shift], keyCode: 0x38), [
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, [.capsLock, .shift], keyCode: 0x38).map(\.command), [
             .key(code: 30, pressed: true, modifiers: []),
         ])
-        XCTAssertEqual(keyboard.flagsChanged(.capsLock, keyCode: 0x38), [
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, .capsLock, keyCode: 0x38).map(\.command), [
             .key(code: 30, pressed: false, modifiers: []),
         ])
         let toggle: [RemoteInputCommand] = [
             .key(code: 15, pressed: true, modifiers: []), .key(code: 15, pressed: false, modifiers: []),
         ]
-        XCTAssertEqual(keyboard.flagsChanged([], keyCode: 0x39), toggle)
-        XCTAssertTrue(keyboard.flagsChanged([], keyCode: 0x39).isEmpty)
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, [], keyCode: 0x39).map(\.command), toggle)
+        XCTAssertTrue(keyboard.flagsChanged(context: inputContext, [], keyCode: 0x39).map(\.command).isEmpty)
         keyboard.reset()
-        XCTAssertEqual(keyboard.flagsChanged([], keyCode: 0x39), toggle)
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, [], keyCode: 0x39).map(\.command), toggle)
     }
 
     func testFlagsChangedEmitsOnlyModifierDifferencesAndKeepsDragModifier() {
         var keyboard = KeyboardInputState()
-        XCTAssertEqual(keyboard.flagsChanged(.control), [.key(code: 28, pressed: true, modifiers: [])])
-        XCTAssertTrue(keyboard.flagsChanged(.control).isEmpty)
-        _ = keyboard.keyDown(keyCode: 8, characters: "c", modifiers: .control, isRepeat: false)
-        XCTAssertEqual(keyboard.keyUp(keyCode: 8), [
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, .control).map(\.command), [.key(code: 28, pressed: true, modifiers: [])])
+        XCTAssertTrue(keyboard.flagsChanged(context: inputContext, .control).map(\.command).isEmpty)
+        _ = keyboard.keyDown(context: inputContext, keyCode: 8, characters: "c", modifiers: .control, isRepeat: false).map(\.command)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 8).map(\.command), [
             .character(99, pressed: false, modifiers: .control),
             .key(code: 28, pressed: true, modifiers: []),
         ])
-        XCTAssertEqual(keyboard.flagsChanged([]), [.key(code: 28, pressed: false, modifiers: [])])
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, []).map(\.command), [.key(code: 28, pressed: false, modifiers: [])])
     }
 
     func testResetDoesNotReleaseOldKeysIntoNewSession() {
         var keyboard = KeyboardInputState()
-        _ = keyboard.flagsChanged(.shift)
-        _ = keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: false)
+        _ = keyboard.flagsChanged(context: inputContext, .shift).map(\.command)
+        _ = keyboard.keyDown(context: inputContext, keyCode: 0, characters: "A", modifiers: .shift, isRepeat: false).map(\.command)
         keyboard.reset()
-        XCTAssertTrue(keyboard.keyUp(keyCode: 0).isEmpty)
-        XCTAssertTrue(keyboard.flagsChanged([]).isEmpty)
+        XCTAssertTrue(keyboard.keyUp(keyCode: 0).map(\.command).isEmpty)
+        XCTAssertTrue(keyboard.flagsChanged(context: inputContext, []).map(\.command).isEmpty)
     }
 
     func testAutomaticMappingRequiresAuthenticatedWindowsPlatform() {
@@ -173,10 +174,10 @@ final class InputMapperTests: XCTestCase {
     func testMappedCommandAndLocalControlShareOneBalancedRemoteModifier() {
         var keyboard = KeyboardInputState()
         let policy = KeyboardMappingPolicy(remotePlatform: .windows)
-        XCTAssertEqual(keyboard.flagsChanged(.command, policy: policy), [.key(code: 28, pressed: true, modifiers: [])])
-        XCTAssertTrue(keyboard.flagsChanged([.command, .control], policy: policy).isEmpty)
-        XCTAssertTrue(keyboard.flagsChanged(.control, policy: policy).isEmpty)
-        XCTAssertEqual(keyboard.flagsChanged([], policy: policy), [.key(code: 28, pressed: false, modifiers: [])])
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, .command, policy: policy).map(\.command), [.key(code: 28, pressed: true, modifiers: [])])
+        XCTAssertTrue(keyboard.flagsChanged(context: inputContext, [.command, .control], policy: policy).map(\.command).isEmpty)
+        XCTAssertTrue(keyboard.flagsChanged(context: inputContext, .control, policy: policy).map(\.command).isEmpty)
+        XCTAssertEqual(keyboard.flagsChanged(context: inputContext, [], policy: policy).map(\.command), [.key(code: 28, pressed: false, modifiers: [])])
     }
 
     func testCopyPasteSelectAllUndoUseMappedModifiersInPhysicalState() {
@@ -184,11 +185,78 @@ final class InputMapperTests: XCTestCase {
             var keyboard = KeyboardInputState()
             let policy = KeyboardMappingPolicy(remotePlatform: .windows)
             let scalar = text.unicodeScalars.first!.value
-            XCTAssertEqual(keyboard.keyDown(keyCode: keyCode, characters: text, modifiers: .command, isRepeat: false, policy: policy), [
+            XCTAssertEqual(keyboard.keyDown(context: inputContext, keyCode: keyCode, characters: text, modifiers: .command, isRepeat: false, policy: policy).map(\.command), [
                 .character(scalar, pressed: true, modifiers: .control),
             ])
-            XCTAssertEqual(keyboard.keyUp(keyCode: keyCode), [.character(scalar, pressed: false, modifiers: .control)])
+            XCTAssertEqual(keyboard.keyUp(keyCode: keyCode).map(\.command), [.character(scalar, pressed: false, modifiers: .control)])
         }
+    }
+
+    func testKeyReleaseAndModifierRestoreKeepTheirOriginalPresentedContext() {
+        var keyboard = KeyboardInputState()
+        let original = inputContext
+        _ = keyboard.flagsChanged(context: original, .control)
+        let down = keyboard.keyDown(context: original, keyCode: 8, characters: "c", modifiers: .control, isRepeat: false)
+        XCTAssertTrue(down.allSatisfy { $0.context == original })
+        let up = keyboard.keyUp(keyCode: 8)
+        XCTAssertEqual(up.map(\.command), [
+            .character(99, pressed: false, modifiers: .control),
+            .key(code: 28, pressed: true, modifiers: []),
+        ])
+        XCTAssertTrue(up.allSatisfy { $0.context == original })
+        let newContext = CapturedInputContext(streamID: 7, inputEpoch: 12, configVersion: 3, runtimeGeneration: 3)
+        // Even if the flags-up arrives after a new frame, release the old press.
+        XCTAssertEqual(keyboard.flagsChanged(context: newContext, []).map(\.context), [original])
+    }
+
+    func testPresentationBarrierDoesNotRecreateHeldRepeatOnNewEpoch() {
+        var keyboard = KeyboardInputState()
+        _ = keyboard.keyDown(context: inputContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: false)
+        let newContext = CapturedInputContext(streamID: 7, inputEpoch: 12, configVersion: 3, runtimeGeneration: 3)
+        XCTAssertTrue(keyboard.keyDown(context: newContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: true).isEmpty)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0).map(\.context), [inputContext])
+        keyboard.reset()
+        XCTAssertTrue(keyboard.keyDown(context: newContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: true).isEmpty)
+        XCTAssertEqual(keyboard.keyDown(context: newContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: false).map(\.context), [newContext])
+    }
+
+    func testGlyphTransitionKeepsOneCapturedEpochForItsReleaseAndNewDown() {
+        var keyboard = KeyboardInputState()
+        _ = keyboard.keyDown(context: inputContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: false)
+        let transition = keyboard.keyDown(context: inputContext, keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true)
+        XCTAssertEqual(transition.map(\.command), [.character(97, pressed: false, modifiers: []), .character(65, pressed: true, modifiers: .shift)])
+        XCTAssertEqual(transition.map(\.context), [inputContext, inputContext])
+    }
+
+    func testOtherModifierFlagsDoNotResurrectAnOldHeldKeyAfterBarrier() {
+        var keyboard = KeyboardInputState()
+        _ = keyboard.flagsChanged(context: inputContext, .shift, keyCode: 0x38)
+        keyboard.reset()
+        let next = CapturedInputContext(streamID: 7, inputEpoch: 12, configVersion: 3, runtimeGeneration: 3)
+        // Control was released while Shift was still held across the barrier.
+        XCTAssertTrue(keyboard.flagsChanged(context: next, .shift, keyCode: 0x3b).isEmpty)
+        XCTAssertTrue(keyboard.flagsChanged(context: next, [], keyCode: 0x38).isEmpty)
+        XCTAssertEqual(keyboard.flagsChanged(context: next, .shift, keyCode: 0x38).map(\.context), [next])
+    }
+
+    func testQualityReconfigurationDoesNotRelabelHeldRepeatOrGlyphTransition() {
+        var keyboard = KeyboardInputState()
+        let quality = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 3, runtimeGeneration: 3)
+        _ = keyboard.keyDown(context: inputContext, keyCode: 0, characters: "a", modifiers: [], isRepeat: false)
+        let repeated = keyboard.keyDown(context: quality, keyCode: 0, characters: "a", modifiers: [], isRepeat: true)
+        XCTAssertEqual(repeated.map(\.context), [inputContext])
+        let glyph = keyboard.keyDown(context: quality, keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true)
+        XCTAssertEqual(glyph.map(\.context), [inputContext, inputContext])
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0).map(\.context), [inputContext])
+    }
+
+    func testModifierRestoreAfterQualityChangeKeepsItsOwnOriginalContext() {
+        var keyboard = KeyboardInputState()
+        let quality = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 3, runtimeGeneration: 3)
+        _ = keyboard.flagsChanged(context: inputContext, .control, keyCode: 0x3b)
+        _ = keyboard.keyDown(context: quality, keyCode: 8, characters: "c", modifiers: .control, isRepeat: false)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 8).map(\.context), [quality, inputContext])
+        XCTAssertEqual(keyboard.flagsChanged(context: quality, [], keyCode: 0x3b).map(\.context), [inputContext])
     }
 
     func testScrollQuantizationNeverSendsInvalidZeroOrOversizedDeltas() {

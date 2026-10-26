@@ -5,8 +5,8 @@ import DeskLinkAppleCore
 import SwiftUI
 
 struct IOSMetalVideoView: UIViewRepresentable {
-    let pixelBuffer: CVPixelBuffer?
-    let videoSize: CGSize?
+    let frame: PresentedVideoFrame?
+    let onFramePresented: @MainActor @Sendable (VideoFramePresentationToken, CGRect) -> Bool
     let zoomScale: CGFloat
     let panOffset: CGSize
     @Binding var visibleVideoRect: CGRect
@@ -16,9 +16,9 @@ struct IOSMetalVideoView: UIViewRepresentable {
         view.onVisibleVideoRectChanged = { rect in
             visibleVideoRect = rect
         }
+        view.onFramePresented = onFramePresented
         view.update(
-            pixelBuffer: pixelBuffer,
-            videoSize: videoSize,
+            frame: frame,
             zoomScale: zoomScale,
             panOffset: panOffset
         )
@@ -29,9 +29,9 @@ struct IOSMetalVideoView: UIViewRepresentable {
         view.onVisibleVideoRectChanged = { rect in
             visibleVideoRect = rect
         }
+        view.onFramePresented = onFramePresented
         view.update(
-            pixelBuffer: pixelBuffer,
-            videoSize: videoSize,
+            frame: frame,
             zoomScale: zoomScale,
             panOffset: panOffset
         )
@@ -41,11 +41,15 @@ struct IOSMetalVideoView: UIViewRepresentable {
 @MainActor
 final class IOSMetalVideoSurface: MTKView {
     var onVisibleVideoRectChanged: ((CGRect) -> Void)?
+    var onFramePresented: (@MainActor @Sendable (VideoFramePresentationToken, CGRect) -> Bool)?
 
     private let commandQueue: MTLCommandQueue?
     private let ciContext: CIContext?
-    private var pixelBuffer: CVPixelBuffer?
-    private var videoSize: CGSize?
+    private var currentFrame: PresentedVideoFrame?
+    private var pixelBuffer: CVPixelBuffer? { currentFrame?.pixelBuffer }
+    private var presentationToken: VideoFramePresentationToken? { currentFrame?.token }
+    private var presentedVideoRect: CGRect = .zero
+    private var lastPresentedTime: CFTimeInterval = 0
     private var zoomScale: CGFloat = 1
     private var panOffset: CGSize = .zero
     private var lastPublishedRect: CGRect = .null
@@ -68,16 +72,15 @@ final class IOSMetalVideoSurface: MTKView {
     required init(coder: NSCoder) { fatalError("IOSMetalVideoSurface does not support NSCoder initialization") }
 
     func update(
-        pixelBuffer: CVPixelBuffer?,
-        videoSize: CGSize?,
+        frame: PresentedVideoFrame?,
         zoomScale: CGFloat,
         panOffset: CGSize
     ) {
-        guard self.pixelBuffer !== pixelBuffer || self.videoSize != videoSize
+        let pixelBuffer = frame?.pixelBuffer
+        guard self.pixelBuffer !== pixelBuffer || self.presentationToken != frame?.token
                 || self.zoomScale != zoomScale || self.panOffset != panOffset
         else { return }
-        self.pixelBuffer = pixelBuffer
-        self.videoSize = videoSize
+        currentFrame = frame
         self.zoomScale = zoomScale
         self.panOffset = panOffset
         lastPublishedRect = .null
@@ -100,7 +103,14 @@ final class IOSMetalVideoSurface: MTKView {
               let ciContext
         else { return }
 
+        // Freeze pixels and identity together for this drawable. Neither a
+        // later decoded frame nor the previous presented size can affect its
+        // rendered geometry or the receipt captured below.
+        let frame = currentFrame
+        let pixelBuffer = frame?.pixelBuffer
+        let token = frame?.token
         let targetRect = CGRect(origin: .zero, size: drawableSize)
+        var visibleRect: CGRect = .zero
         let output: CIImage
         if let pixelBuffer {
             let image = CIImage(cvPixelBuffer: pixelBuffer)
@@ -117,6 +127,8 @@ final class IOSMetalVideoSurface: MTKView {
                 )
             )
 
+            visibleRect = CGRect(x: renderedRect.minX / scaleX, y: renderedRect.minY / scaleY,
+                                 width: renderedRect.width / scaleX, height: renderedRect.height / scaleY)
             let normalized = image.transformed(
                 by: CGAffineTransform(
                     translationX: -image.extent.minX,
@@ -149,22 +161,30 @@ final class IOSMetalVideoSurface: MTKView {
             bounds: targetRect,
             colorSpace: CGColorSpaceCreateDeviceRGB()
         )
+        if let token, let receipt = onFramePresented, pixelBuffer != nil, !visibleRect.isEmpty {
+            let presentedRect = visibleRect
+            drawable.addPresentedHandler { [weak self] drawable in
+                let presentedTime = drawable.presentedTime
+                guard presentedTime > 0 else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, presentedTime >= self.lastPresentedTime,
+                          self.presentationToken?.context == token.context,
+                          receipt(token, presentedRect) else { return }
+                    self.lastPresentedTime = presentedTime
+                    self.presentedVideoRect = presentedRect
+                    self.publishVisibleVideoRect()
+                }
+            }
+        }
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
 
     private func publishVisibleVideoRect() {
-        let source = videoSize ?? pixelBuffer.map {
-            CGSize(width: CVPixelBufferGetWidth($0), height: CVPixelBufferGetHeight($0))
-        } ?? .zero
-        let baseRect = VideoGeometry.aspectFit(source: source, in: bounds)
-        let rect = iosRenderedVideoRect(
-            baseRect: baseRect,
-            zoomScale: zoomScale,
-            panOffset: panOffset
-        )
-        guard rect != lastPublishedRect else { return }
-        lastPublishedRect = rect
-        onVisibleVideoRectChanged?(rect)
+        // update/layout may run before GPU presentation. Keep the last actual
+        // presented geometry until the drawable receipt replaces it.
+        guard presentedVideoRect != lastPublishedRect else { return }
+        lastPublishedRect = presentedVideoRect
+        onVisibleVideoRectChanged?(presentedVideoRect)
     }
 }

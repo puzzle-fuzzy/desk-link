@@ -5,6 +5,26 @@ import XCTest
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
+    func testUnpresentedSurfaceCannotCaptureOrEncodeInput() {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
+        bridge.recordInputsForTesting = true
+        XCTAssertNil(bridge.captureInputContext())
+        bridge.send(input: .unicode("pending", modifiers: []))
+        XCTAssertTrue(bridge.sentInputsForTesting.isEmpty)
+    }
+
+    func testCapturedTextAndReleaseKeepOriginalWireContextAcrossPresentedEpochChange() {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
+        bridge.recordInputsForTesting = true
+        let old = CapturedInputContext(streamID: 4, inputEpoch: 9, configVersion: 1, runtimeGeneration: 0)
+        bridge.acceptPresentedInputContextForTesting(CapturedInputContext(streamID: 4, inputEpoch: 10, configVersion: 2, runtimeGeneration: 0))
+        bridge.send(input: .unicode("中😀", modifiers: []), context: old)
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.stream_id), [4, 4, 4, 4])
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.input_epoch), [9, 9, 9, 9])
+        bridge.releaseAll(context: old)
+        XCTAssertEqual(bridge.releasedContextsForTesting, [old])
+    }
+
     func testInputRestrictionAndRecoveryKeepSessionAndRepeatedAcknowledgementsAdvance() {
         let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
         bridge.acceptControlForTesting(Data([14, 1, 0]))
@@ -22,12 +42,53 @@ final class ControllerBridgeTests: XCTestCase {
         XCTAssertNil(bridge.confirmedQuality)
     }
 
+    func testSameHandleReconnectReplaysSmallerStreamAndVersionOne() {
+        let bridge = ControllerBridge.testing()
+        bridge.stageDecodedMetadataForTesting(streamID: 9, version: 4, inputEpoch: 99)
+        bridge.acceptStateForTesting(streamID: 9)
+        bridge.retireDecodeStreamForTesting()
+        bridge.stageDecodedMetadataForTesting(streamID: 1, version: 1, inputEpoch: 2)
+        bridge.acceptReconnectingForTesting() // Delayed MainActor state after future metadata.
+        bridge.acceptStateForTesting(streamID: 1)
+        XCTAssertEqual(bridge.state, .connected(streamID: 1))
+        XCTAssertEqual(bridge.activeConfigVersionForTesting, 1)
+        XCTAssertNil(bridge.presentedInputContext)
+    }
+
+    func testDelayedReconnectDoesNotClearCurrentFuturePresentationMetadata() {
+        let bridge = ControllerBridge.testing()
+        bridge.stageDecodedMetadataForTesting(streamID: 9, version: 4, inputEpoch: 99)
+        bridge.acceptStateForTesting(streamID: 9)
+        bridge.retireDecodeStreamForTesting()
+        bridge.stageDecodedMetadataForTesting(streamID: 9, version: 1, inputEpoch: 2)
+        // Explicit metadata fixture only; this does not prove native presentation.
+        let future = CapturedInputContext(streamID: 9, inputEpoch: 2, configVersion: 1, runtimeGeneration: 0)
+        bridge.acceptPresentedInputContextForTesting(future)
+        bridge.acceptReconnectingForTesting()
+        XCTAssertEqual(bridge.state, .connected(streamID: 9))
+        XCTAssertEqual(bridge.activeConfigVersionForTesting, 1)
+        XCTAssertEqual(bridge.presentedInputContext, future)
+    }
+
+    func testQualityVersionDoesNotDiscardPresentedSurfaceContext() {
+        let bridge = ControllerBridge.testing()
+        bridge.stageDecodedMetadataForTesting(streamID: 9, version: 1, inputEpoch: 2)
+        bridge.acceptStateForTesting(streamID: 9)
+        let presented = CapturedInputContext(streamID: 9, inputEpoch: 2, configVersion: 1, runtimeGeneration: 0)
+        bridge.acceptPresentedInputContextForTesting(presented)
+        bridge.stageDecodedMetadataForTesting(streamID: 9, version: 2, inputEpoch: 2)
+        XCTAssertEqual(bridge.presentedInputContext, presented)
+        XCTAssertEqual(bridge.activeConfigVersionForTesting, 2)
+    }
+
     func testDecodedConfigurationArrivingBeforeConnectedIsReplayed() {
         let bridge = ControllerBridge.testing()
         bridge.stageDecodedMetadataForTesting(streamID: 4, version: 1)
         XCTAssertNil(bridge.videoSize)
         bridge.acceptStateForTesting(streamID: 4)
-        XCTAssertEqual(bridge.videoSize, CGSize(width: 1920, height: 1080))
+        XCTAssertEqual(bridge.activeConfigVersionForTesting, 1)
+        XCTAssertNil(bridge.videoSize) // Metadata is not a drawable presentation.
+        XCTAssertNil(bridge.presentedInputContext)
     }
 
     func testDisconnectDiscardsDecodedConfigurationWaitingForState() {
@@ -41,6 +102,8 @@ final class ControllerBridgeTests: XCTestCase {
     func testMultilineCommittedTextMapsCRLFAndTabToBalancedSpecialKeys() {
         let bridge = ControllerBridge.testing()
         bridge.recordInputsForTesting = true
+        // Metadata fixture exercises encoding only, not drawable presentation.
+        bridge.acceptPresentedInputContextForTesting(CapturedInputContext(streamID: 4, inputEpoch: 9, configVersion: 1, runtimeGeneration: 0))
         bridge.send(input: .unicode("中\r\n\t😀\n", modifiers: []))
         XCTAssertEqual(bridge.sentInputsForTesting.map(\.pressed), [1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
         XCTAssertEqual(bridge.sentInputsForTesting.map(\.key_code), [0, 0, 1, 1, 4, 4, 0, 0, 1, 1])
@@ -49,6 +112,8 @@ final class ControllerBridgeTests: XCTestCase {
     func testPhysicalCharacterEncodesPressedStateAndModifierMaskIntoFFIInput() {
         let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
         bridge.recordInputsForTesting = true
+        // Metadata fixture exercises encoding only, not drawable presentation.
+        bridge.acceptPresentedInputContextForTesting(CapturedInputContext(streamID: 4, inputEpoch: 9, configVersion: 1, runtimeGeneration: 0))
         bridge.send(input: .character(65, pressed: true, modifiers: [.shift, .control]))
         bridge.send(input: .character(65, pressed: false, modifiers: [.shift, .control]))
         let inputs = bridge.sentInputsForTesting
@@ -62,6 +127,8 @@ final class ControllerBridgeTests: XCTestCase {
     func testCommittedUnicodeEncodesOrderedDownUpForEveryScalar() {
         let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
         bridge.recordInputsForTesting = true
+        // Metadata fixture exercises encoding only, not drawable presentation.
+        bridge.acceptPresentedInputContextForTesting(CapturedInputContext(streamID: 4, inputEpoch: 9, configVersion: 1, runtimeGeneration: 0))
         bridge.send(input: .unicode("中😀", modifiers: []))
         XCTAssertEqual(bridge.sentInputsForTesting.map(\.character), [0x4e2d, 0x4e2d, 0x1f600, 0x1f600])
         XCTAssertEqual(bridge.sentInputsForTesting.map(\.pressed), [1, 0, 1, 0])

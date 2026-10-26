@@ -23,85 +23,112 @@ enum KeyboardMapper {
 
 // A key's release must use its original character and modifiers. AppKit may
 // report different characters after Shift, the keyboard layout, or IME changes.
-struct KeyboardInputState {
-    private var pressedKeys: [UInt16: [RemoteInputCommand]] = [:]
-    private var heldModifiers: Modifiers = []
+struct KeyboardInputState: Sendable {
+    private struct KeyPress: Sendable {
+        let context: CapturedInputContext
+        let commands: [RemoteInputCommand]
+    }
+    private var pressedKeys: [UInt16: KeyPress] = [:]
+    private var modifierContexts: [UInt32: CapturedInputContext] = [:]
     private var capsLockEnabled: Bool?
 
+    var activeContexts: Set<CapturedInputContext> {
+        Set(pressedKeys.values.map(\.context)).union(modifierContexts.values)
+    }
+
     mutating func keyDown(
+        context: CapturedInputContext,
         keyCode: UInt16,
         characters: String?,
         modifiers: NSEvent.ModifierFlags,
         isRepeat: Bool,
         policy: KeyboardMappingPolicy = KeyboardMappingPolicy()
-    ) -> [RemoteInputCommand] {
+    ) -> [CapturedRemoteInput] {
         let commands = KeyboardMapper.map(
             keyCode: keyCode, characters: characters, modifiers: modifiers, isDown: true, policy: policy
         )
         if let held = pressedKeys[keyCode] {
-            guard isRepeat else { return [] }
-            guard commands != held else { return held }
-            // A held physical key can change glyph or chord when Shift or the
-            // layout changes. Release its previous logical identity first.
+            guard isRepeat, held.context.hasSameInputTarget(as: context) else { return [] }
+            guard commands != held.commands else { return capture(held.commands, context: held.context) }
             let releases = keyUp(keyCode: keyCode)
-            if !commands.isEmpty { pressedKeys[keyCode] = commands }
-            return releases + commands
+            if !commands.isEmpty { pressedKeys[keyCode] = KeyPress(context: held.context, commands: commands) }
+            return releases + capture(commands, context: held.context)
         }
-        if !commands.isEmpty { pressedKeys[keyCode] = commands }
-        return commands
+        // A presentation barrier clears presses. A key still held across that
+        // barrier must be physically released and pressed again on the new view.
+        guard !isRepeat else { return [] }
+        if !commands.isEmpty { pressedKeys[keyCode] = KeyPress(context: context, commands: commands) }
+        return capture(commands, context: context)
     }
 
-    mutating func keyUp(keyCode: UInt16) -> [RemoteInputCommand] {
+    mutating func keyUp(keyCode: UInt16) -> [CapturedRemoteInput] {
         guard let held = pressedKeys.removeValue(forKey: keyCode) else { return [] }
-        let releases = held.reversed().compactMap { command -> RemoteInputCommand? in
+        let releases = held.commands.reversed().compactMap { command -> RemoteInputCommand? in
             switch command {
             case let .key(code, _, modifiers): .key(code: code, pressed: false, modifiers: modifiers)
             case let .character(scalar, _, modifiers): .character(scalar, pressed: false, modifiers: modifiers)
             default: nil
             }
         }
-        // The protocol's chord key-up also releases its modifier mask. Restore
-        // modifiers still physically held for a subsequent drag or key chord.
-        let chordModifiers = held.reduce(Modifiers()) { result, command in
+        let chordModifiers = held.commands.reduce(Modifiers()) { result, command in
             switch command {
             case let .key(_, _, modifiers), let .character(_, _, modifiers): result.union(modifiers)
             default: result
             }
         }
-        return releases + modifierCommands(chordModifiers.intersection(heldModifiers), pressed: true)
+        let restore = modifierEntries.compactMap { flag, code -> CapturedRemoteInput? in
+            guard chordModifiers.contains(flag), let original = modifierContexts[flag.rawValue],
+                  original.hasSameInputTarget(as: held.context) else { return nil }
+            return CapturedRemoteInput(.key(code: code, pressed: true, modifiers: []), context: original)
+        }
+        return capture(releases, context: held.context) + restore
     }
 
-    mutating func flagsChanged(_ flags: NSEvent.ModifierFlags, keyCode: UInt16? = nil, policy: KeyboardMappingPolicy = KeyboardMappingPolicy()) -> [RemoteInputCommand] {
+    mutating func flagsChanged(context: CapturedInputContext, _ flags: NSEvent.ModifierFlags, keyCode: UInt16? = nil, policy: KeyboardMappingPolicy = KeyboardMappingPolicy()) -> [CapturedRemoteInput] {
         let next = policy.modifiers(for: flags)
-        var commands = modifierCommands(heldModifiers.subtracting(next), pressed: false)
-        commands += modifierCommands(next.subtracting(heldModifiers), pressed: true)
-        heldModifiers = next
+        let localTransition: NSEvent.ModifierFlags
+        switch keyCode {
+        case 0x36, 0x37: localTransition = .command
+        case 0x38, 0x3c: localTransition = .shift
+        case 0x3a, 0x3d: localTransition = .option
+        case 0x3b, 0x3e: localTransition = .control
+        default: localTransition = []
+        }
+        let additions = keyCode == nil ? next : policy.modifiers(for: localTransition)
+        var captured: [CapturedRemoteInput] = []
+        for (flag, code) in modifierEntries.reversed() {
+            if !next.contains(flag), let original = modifierContexts.removeValue(forKey: flag.rawValue) {
+                captured.append(CapturedRemoteInput(.key(code: code, pressed: false, modifiers: []), context: original))
+            }
+        }
+        for (flag, code) in modifierEntries where next.contains(flag) && additions.contains(flag) && modifierContexts[flag.rawValue] == nil {
+            modifierContexts[flag.rawValue] = context
+            captured.append(CapturedRemoteInput(.key(code: code, pressed: true, modifiers: []), context: context))
+        }
         let capsLock = flags.contains(.capsLock)
         if keyCode == 0x39, capsLockEnabled == nil || capsLock != capsLockEnabled {
-            commands += [
+            captured += capture([
                 .key(code: DeskLinkKeyCode.capsLock, pressed: true, modifiers: []),
                 .key(code: DeskLinkKeyCode.capsLock, pressed: false, modifiers: []),
-            ]
+            ], context: context)
         }
         capsLockEnabled = capsLock
-        return commands
+        return captured
     }
 
     mutating func reset() {
         pressedKeys.removeAll()
-        heldModifiers = []
+        modifierContexts.removeAll()
         capsLockEnabled = nil
     }
 
-    private func modifierCommands(_ flags: Modifiers, pressed: Bool) -> [RemoteInputCommand] {
-        let mapping: [(Modifiers, UInt32)] = [
-            (.control, DeskLinkKeyCode.control), (.option, DeskLinkKeyCode.alt),
-            (.shift, DeskLinkKeyCode.shift), (.meta, DeskLinkKeyCode.meta),
-        ]
-        let entries = pressed ? mapping : Array(mapping.reversed())
-        return entries.compactMap { flag, code in
-            flags.contains(flag) ? .key(code: code, pressed: pressed, modifiers: []) : nil
-        }
+    private var modifierEntries: [(Modifiers, UInt32)] {
+        [(.control, DeskLinkKeyCode.control), (.option, DeskLinkKeyCode.alt),
+         (.shift, DeskLinkKeyCode.shift), (.meta, DeskLinkKeyCode.meta)]
+    }
+
+    private func capture(_ commands: [RemoteInputCommand], context: CapturedInputContext) -> [CapturedRemoteInput] {
+        commands.map { CapturedRemoteInput($0, context: context) }
     }
 }
 

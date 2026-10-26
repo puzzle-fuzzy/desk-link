@@ -60,6 +60,7 @@ struct IOSSessionView: View {
             .padding(.trailing, 18)
 
             IOSKeyboardInputView(input: keyboard)
+                .id(controller.presentedInputContext?.targetIdentity)
                 .frame(width: 1, height: 1)
                 .opacity(0.01)
                 .allowsHitTesting(false)
@@ -68,8 +69,9 @@ struct IOSSessionView: View {
         .toolbar(.hidden, for: .tabBar)
         .onDisappear {
             keyboard.resign()
-            controller.releaseAll()
         }
+        .onChange(of: controller.presentedInputContext) { keyboard.synchronizeInputContext($0) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in keyboard.resign() }
         .onChange(of: controller.state) { state in
             guard !IOSSessionPresentation.isActive(state) else { return }
             viewport.reset()
@@ -185,8 +187,8 @@ struct IOSSessionView: View {
             ZStack {
                 Color.black
                 IOSMetalVideoView(
-                    pixelBuffer: controller.latestPixelBuffer,
-                    videoSize: controller.videoSize,
+                    frame: controller.videoFrame,
+                    onFramePresented: { [controller] token, _ in controller.confirmVideoFramePresentation(token) },
                     zoomScale: viewport.zoomScale,
                     panOffset: viewport.panOffset,
                     visibleVideoRect: $visibleVideoRect

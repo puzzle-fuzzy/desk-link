@@ -47,6 +47,7 @@ private struct RetiredControllerHandle: @unchecked Sendable {
 private struct DecodedConfiguration: Sendable {
     let generation: UInt64
     let streamID: UInt64
+    let inputEpoch: UInt64
     let version: UInt32
     let width: UInt16
     let height: UInt16
@@ -60,6 +61,8 @@ public final class ControllerBridge: ObservableObject {
     @Published public private(set) var lastError: String?
     @Published public private(set) var latestAccessUnit: Data?
     @Published public private(set) var latestPixelBuffer: CVPixelBuffer?
+    @Published public private(set) var videoFrame: PresentedVideoFrame?
+    @Published public private(set) var presentedInputContext: CapturedInputContext?
     @Published public private(set) var videoSize: CGSize?
     @Published public private(set) var controllerVerifyKeyHex: String?
     @Published public private(set) var cursorOverlay: CursorOverlay?
@@ -84,8 +87,8 @@ public final class ControllerBridge: ObservableObject {
     private let handleOwner = DeskLinkHandleOwner()
     private lazy var decodeScheduler = H264DecodeScheduler(
         onFrame: { [weak self] frame in self?.consumeDecodedFrame(frame) },
-        onConfiguration: { [weak self] generation, streamID, version, width, height in
-            self?.consumeDecodedConfiguration(generation: generation, streamID: streamID,
+        onConfiguration: { [weak self] generation, streamID, inputEpoch, version, width, height in
+            self?.consumeDecodedConfiguration(generation: generation, streamID: streamID, inputEpoch: inputEpoch,
                                               version: version, width: width, height: height)
         },
         onKeyframeRequest: { [weak self] generation, streamID in
@@ -98,6 +101,8 @@ public final class ControllerBridge: ObservableObject {
     private var savedHostForResume: SavedHost?
     private var activeStreamID: UInt64 = 0
     private var activeConfigVersion: UInt32 = 0
+    private var activeInputEpoch: UInt64 = 0
+    private var presentationState = VideoPresentationState()
     private var pendingDecodedConfiguration: DecodedConfiguration?
     private var pendingDecodedFrame: H264DecodedFrame?
     private var pendingDecodeKeyframeRequest: (generation: UInt64, streamID: UInt64)?
@@ -110,6 +115,9 @@ public final class ControllerBridge: ObservableObject {
     public private(set) var releaseAllCallCountForTesting = 0
     public var recordInputsForTesting = false
     public private(set) var sentInputsForTesting: [DesklinkInput] = []
+    public private(set) var releasedContextsForTesting: [CapturedInputContext] = []
+    private var presentedInputContextFixtureForTesting: CapturedInputContext?
+    public var activeConfigVersionForTesting: UInt32 { activeConfigVersion }
     public var activeRuntimeForTesting: Bool { handleOwner.pointer != nil }
     public var activeStreamIDForTesting: UInt64 { activeStreamID }
 #endif
@@ -143,6 +151,46 @@ public final class ControllerBridge: ObservableObject {
         bridge.state = state
         if let error { bridge.publishErrorMessage(error) }
         return bridge
+    }
+
+    /// Capture once at the original input event. A configuration may have been
+    /// admitted on the FFI thread before its main-actor invalidation arrives.
+    public func captureInputContext() -> CapturedInputContext? {
+#if DEBUG
+        if let fixture = presentedInputContextFixtureForTesting { return fixture }
+#endif
+        guard let context = presentedInputContext, acceptsInputContext(context),
+              decodeScheduler.acceptsInputSurface(generation: context.runtimeGeneration, streamID: context.streamID,
+                                                  inputEpoch: context.inputEpoch) else { return nil }
+        return context
+    }
+
+    /// Old captured releases may still enter the current runtime. Never relabel
+    /// them with a new epoch/version; the host validates their original context.
+    public func acceptsInputContext(_ context: CapturedInputContext) -> Bool {
+        guard case .connected = state, handleOwner.pointer != nil else { return false }
+        return context.runtimeGeneration == callbackGeneration && context.streamID > 0 && context.inputEpoch > 0
+    }
+
+    /// Called only by the Metal drawable's presented handler, never by decode.
+    @discardableResult
+    public func confirmVideoFramePresentation(_ token: VideoFramePresentationToken) -> Bool {
+        guard acceptsInputContext(token.context), let issued = videoFrame,
+              issued.token.context == token.context,
+              decodeScheduler.accepts(generation: token.context.runtimeGeneration, streamID: token.context.streamID,
+                                      version: token.context.configVersion, inputEpoch: token.context.inputEpoch),
+              presentationState.confirm(token, current: issued.token.context, newestIssuedFrameID: issued.token.frameID) else { return false }
+        videoSize = token.videoSize
+        presentedInputContext = token.context
+        return true
+    }
+
+    private func clearPresentedInputContext() {
+        presentationState.reset()
+        presentedInputContext = nil
+#if DEBUG
+        presentedInputContextFixtureForTesting = nil
+#endif
     }
 
     public func connect(invite: Data) {
@@ -308,32 +356,42 @@ public final class ControllerBridge: ObservableObject {
     }
 
     public func send(input command: RemoteInputCommand) {
+        guard let context = captureInputContext() else { return }
+        send(input: command, context: context)
+    }
+
+    public func send(captured input: CapturedRemoteInput) {
+        send(input: input.command, context: input.context)
+    }
+
+    public func send(input command: RemoteInputCommand, context: CapturedInputContext) {
+        guard context.streamID > 0, context.inputEpoch > 0 else { return }
         var input: DesklinkInput
         switch command {
         case let .move(x, y):
-            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_MOVE, x: x, y: y, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0)
+            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_MOVE, x: x, y: y, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0, stream_id: context.streamID, input_epoch: context.inputEpoch)
         case let .mouseButton(button, pressed):
-            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_BUTTON, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: button.rawValue + 1, key_code: 0, character: 0, pressed: pressed ? 1 : 0, modifiers: 0)
+            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_BUTTON, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: button.rawValue + 1, key_code: 0, character: 0, pressed: pressed ? 1 : 0, modifiers: 0, stream_id: context.streamID, input_epoch: context.inputEpoch)
         case let .wheel(x, y):
-            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_WHEEL, x: 0, y: 0, wheel_x: x, wheel_y: y, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0)
+            input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_WHEEL, x: 0, y: 0, wheel_x: x, wheel_y: y, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0, stream_id: context.streamID, input_epoch: context.inputEpoch)
         case let .key(code, pressed, modifiers):
-            input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: code, character: 0, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
+            input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: code, character: 0, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f), stream_id: context.streamID, input_epoch: context.inputEpoch)
         case let .character(scalar, pressed, modifiers):
-            input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: scalar, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
+            input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: scalar, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f), stream_id: context.streamID, input_epoch: context.inputEpoch)
         case let .unicode(text, modifiers):
             var previousWasCR = false
             for scalar in text.unicodeScalars {
                 if scalar.value == 10 && previousWasCR { previousWasCR = false; continue }
                 previousWasCR = scalar.value == 13
                 let specialKey: UInt32 = scalar.value == 10 || scalar.value == 13 ? 1 : (scalar.value == 9 ? 4 : 0)
-                var characterInput = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: specialKey, character: specialKey == 0 ? scalar.value : 0, pressed: 1, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
-                sendInput(&characterInput)
+                var characterInput = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: specialKey, character: specialKey == 0 ? scalar.value : 0, pressed: 1, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f), stream_id: context.streamID, input_epoch: context.inputEpoch)
+                sendInput(&characterInput, context: context)
                 characterInput.pressed = 0
-                sendInput(&characterInput)
+                sendInput(&characterInput, context: context)
             }
             return
         }
-        sendInput(&input)
+        sendInput(&input, context: context)
     }
 
     public func releaseAll() {
@@ -342,6 +400,17 @@ public final class ControllerBridge: ObservableObject {
 #endif
         guard let handle = handleOwner.pointer else { return }
         _ = desklink_release_all(handle)
+    }
+
+    public func releaseAll(context: CapturedInputContext) {
+#if DEBUG
+        releaseAllCallCountForTesting += 1
+        if recordInputsForTesting { releasedContextsForTesting.append(context) }
+#endif
+        guard context.runtimeGeneration == callbackGeneration,
+              context.streamID > 0, context.inputEpoch > 0,
+              let handle = handleOwner.pointer else { return }
+        _ = desklink_release_all_for_context(handle, context.streamID, context.inputEpoch)
     }
 
     /// Stops the active native runtime while retaining the approved host
@@ -452,6 +521,7 @@ public final class ControllerBridge: ObservableObject {
     private func createIfNeeded() {
         guard handleOwner.pointer == nil else { return }
         callbackGeneration &+= 1
+        clearPresentedInputContext()
         decodeScheduler.reset(generation: callbackGeneration)
         let callbackContext = ControllerCallbackContext(bridge: self, generation: callbackGeneration, decodeScheduler: decodeScheduler)
         let callbackPointer = Unmanaged.passRetained(callbackContext).toOpaque()
@@ -483,14 +553,18 @@ public final class ControllerBridge: ObservableObject {
     private func consumeState(streamID: UInt64, stateValue: Int) {
         switch stateValue {
         case Int(DESKLINK_CONNECTED.rawValue):
+            let current = decodeScheduler.currentInputContext(generation: callbackGeneration)
             guard streamID > 0,
-                  streamID == activeStreamID || streamID > highestStreamID
+                  current.map({ $0.streamID == streamID })
+                    ?? (streamID == activeStreamID || streamID > highestStreamID)
             else { return }
             if activeStreamID != streamID {
                 // Configuration/frames may already be admitted by the FFI
                 // callback. configure owns their stream barrier; do not clear it
                 // from this delayed main-actor state notification.
                 activeConfigVersion = 0
+                activeInputEpoch = 0
+                clearPresentedInputContext()
                 activeStreamID = streamID
                 metrics.lastFrameID = nil
                 videoSize = nil
@@ -504,6 +578,9 @@ public final class ControllerBridge: ObservableObject {
             guard streamID == 0 || activeStreamID == 0 || streamID == activeStreamID else { return }
             decodeScheduler.reset(generation: callbackGeneration)
             activeConfigVersion = 0
+            activeInputEpoch = 0
+            clearPresentedInputContext()
+            videoFrame = nil
             pendingDecodedConfiguration = nil
             pendingDecodedFrame = nil
             pendingDecodeKeyframeRequest = nil
@@ -512,16 +589,53 @@ public final class ControllerBridge: ObservableObject {
             videoSize = nil
             cursorOverlay = nil
             state = .closed
-        case Int(DESKLINK_WAITING_FOR_APPROVAL.rawValue): state = .pairing
-        case Int(DESKLINK_IDLE.rawValue): state = .idle
-        case Int(DESKLINK_DEGRADED.rawValue): state = .frozen
-        case Int(DESKLINK_RECOVERING_VIDEO.rawValue): state = .recovering
+        case Int(DESKLINK_WAITING_FOR_APPROVAL.rawValue):
+            clearPresentedInputContext()
+            state = .pairing
+        case Int(DESKLINK_IDLE.rawValue):
+            clearPresentedInputContext()
+            state = .idle
+        case Int(DESKLINK_DEGRADED.rawValue):
+            clearPresentedInputContext()
+            state = .frozen
+        case Int(DESKLINK_RECOVERING_VIDEO.rawValue):
+            clearPresentedInputContext()
+            state = .recovering
         case Int(DESKLINK_RECONNECTING.rawValue):
+            // The FFI callback already retired the old decode stream. A newer
+            // configuration/frame may reach this actor before this notification;
+            // never reset that future work from a delayed main-queue event.
+            highestStreamID = 0
             inputRestriction = nil
             if savedHostForResume != nil { awaitingApprovedHostMaterial = true }
+            if let context = presentedInputContext,
+               !decodeScheduler.acceptsInputSurface(generation: context.runtimeGeneration,
+                                                    streamID: context.streamID, inputEpoch: context.inputEpoch) {
+                clearPresentedInputContext()
+            }
+            if let pending = pendingDecodedConfiguration,
+               !decodeScheduler.accepts(generation: pending.generation, streamID: pending.streamID,
+                                        version: pending.version, inputEpoch: pending.inputEpoch) {
+                pendingDecodedConfiguration = nil
+            }
+            if let pending = pendingDecodedFrame,
+               !decodeScheduler.accepts(generation: pending.generation, streamID: pending.streamID,
+                                        version: pending.version, inputEpoch: pending.inputEpoch) {
+                pendingDecodedFrame = nil
+            }
+            if decodeScheduler.acceptsInputSurface(generation: callbackGeneration, streamID: activeStreamID,
+                                                   inputEpoch: activeInputEpoch) { return }
+            activeStreamID = 0
+            activeConfigVersion = 0
+            activeInputEpoch = 0
+            metrics.lastFrameID = nil
             state = .reconnecting
-        case Int(DESKLINK_DISCONNECTING.rawValue): state = .reconnecting
-        default: state = .connecting
+        case Int(DESKLINK_DISCONNECTING.rawValue):
+            clearPresentedInputContext()
+            state = .reconnecting
+        default:
+            clearPresentedInputContext()
+            state = .connecting
         }
     }
 
@@ -555,14 +669,18 @@ public final class ControllerBridge: ObservableObject {
         displayStateRevision &+= 1
     }
 
-    private func consumeDecodedConfiguration(generation: UInt64, streamID: UInt64,
+    private func consumeDecodedConfiguration(generation: UInt64, streamID: UInt64, inputEpoch: UInt64,
                                              version: UInt32, width: UInt16, height: UInt16) {
         guard acceptsCallback(generation: generation),
-              decodeScheduler.accepts(generation: generation, streamID: streamID, version: version) else { return }
+              decodeScheduler.accepts(generation: generation, streamID: streamID, version: version, inputEpoch: inputEpoch) else { return }
+        if let presented = presentedInputContext,
+           presented.runtimeGeneration != generation || presented.streamID != streamID || presented.inputEpoch != inputEpoch {
+            clearPresentedInputContext()
+        }
         // Decoder delivery uses a MainActor task while Rust state uses main.async;
         // neither mechanism orders the other. Retain one config until Connected
         // arrives instead of losing a config delivered first.
-        pendingDecodedConfiguration = DecodedConfiguration(generation: generation, streamID: streamID,
+        pendingDecodedConfiguration = DecodedConfiguration(generation: generation, streamID: streamID, inputEpoch: inputEpoch,
                                                            version: version, width: width, height: height)
         applyPendingDecodedConfiguration()
     }
@@ -570,10 +688,11 @@ public final class ControllerBridge: ObservableObject {
     private func applyPendingDecodedConfiguration() {
         guard let pending = pendingDecodedConfiguration, pending.streamID == activeStreamID,
               acceptsCallback(generation: pending.generation),
-              decodeScheduler.accepts(generation: pending.generation, streamID: pending.streamID, version: pending.version) else { return }
+              decodeScheduler.accepts(generation: pending.generation, streamID: pending.streamID, version: pending.version, inputEpoch: pending.inputEpoch) else { return }
         pendingDecodedConfiguration = nil
+        if activeInputEpoch != pending.inputEpoch { metrics.lastFrameID = nil }
         activeConfigVersion = pending.version
-        videoSize = CGSize(width: Int(pending.width), height: Int(pending.height))
+        activeInputEpoch = pending.inputEpoch
         if requestKeyframeAfterNextVideoConfig {
             requestKeyframeAfterNextVideoConfig = false
             requestDecodeKeyframe()
@@ -587,13 +706,17 @@ public final class ControllerBridge: ObservableObject {
 
     private func consumeDecodedFrame(_ frame: H264DecodedFrame) {
         guard acceptsCallback(generation: frame.generation),
-              decodeScheduler.accepts(generation: frame.generation, streamID: frame.streamID, version: frame.version) else { return }
-        guard activeStreamID == frame.streamID, activeConfigVersion == frame.version else {
+              decodeScheduler.accepts(generation: frame.generation, streamID: frame.streamID, version: frame.version, inputEpoch: frame.inputEpoch) else { return }
+        guard activeStreamID == frame.streamID, activeConfigVersion == frame.version, activeInputEpoch == frame.inputEpoch else {
             pendingDecodedFrame = frame
             return
         }
         guard frame.frameID > (metrics.lastFrameID ?? 0) else { return }
+        let context = CapturedInputContext(streamID: frame.streamID, inputEpoch: frame.inputEpoch,
+                                           configVersion: frame.version, runtimeGeneration: frame.generation)
+        let token = VideoFramePresentationToken(context: context, frameID: frame.frameID, width: frame.width, height: frame.height)
         latestPixelBuffer = frame.pixelBuffer
+        videoFrame = PresentedVideoFrame(pixelBuffer: frame.pixelBuffer, token: token)
         let snapshot = decodeScheduler.snapshot()
         metrics.receivedFrames = Int(clamping: snapshot.decodedFrames)
         metrics.droppedFrames = Int(clamping: snapshot.droppedFrames)
@@ -609,7 +732,7 @@ public final class ControllerBridge: ObservableObject {
     private func flushPendingDecodeKeyframeRequest() {
         guard let pending = pendingDecodeKeyframeRequest, activeStreamID == pending.streamID,
               acceptsCallback(generation: pending.generation), activeConfigVersion > 0,
-              decodeScheduler.accepts(generation: pending.generation, streamID: pending.streamID, version: activeConfigVersion) else { return }
+              decodeScheduler.accepts(generation: pending.generation, streamID: pending.streamID, version: activeConfigVersion, inputEpoch: activeInputEpoch) else { return }
         pendingDecodeKeyframeRequest = nil
         requestDecodeKeyframe()
     }
@@ -651,11 +774,11 @@ public final class ControllerBridge: ObservableObject {
         }
     }
 
-    private func sendInput(_ input: inout DesklinkInput) {
+    private func sendInput(_ input: inout DesklinkInput, context: CapturedInputContext) {
 #if DEBUG
         if recordInputsForTesting { sentInputsForTesting.append(input) }
 #endif
-        guard case .connected = state, let handle = handleOwner.pointer else { return }
+        guard acceptsInputContext(context), let handle = handleOwner.pointer else { return }
         let result = desklink_send_input(handle, &input)
         guard result != DESKLINK_INVALID_ARGUMENT else { return }
         if result != DESKLINK_OK {
@@ -686,6 +809,9 @@ public final class ControllerBridge: ObservableObject {
         latestAudioPacket = nil
         decodeScheduler.reset(generation: callbackGeneration)
         activeConfigVersion = 0
+        activeInputEpoch = 0
+        clearPresentedInputContext()
+        videoFrame = nil
         pendingDecodedConfiguration = nil
         pendingDecodedFrame = nil
         pendingDecodeKeyframeRequest = nil
@@ -746,13 +872,27 @@ public final class ControllerBridge: ObservableObject {
 #if DEBUG
     public func acceptControlForTesting(_ data: Data) { consumeControl(data) }
 
+    /// Explicit metadata fixture for input unit tests only. This does not create
+    /// a native runtime or establish that any drawable was actually presented.
+    public func acceptPresentedInputContextForTesting(_ context: CapturedInputContext) {
+        guard handleOwner.pointer == nil else { return }
+        presentedInputContextFixtureForTesting = context
+        presentedInputContext = context
+    }
+
     /// Exercises UI state ordering only; the invalid header cannot configure a
     /// native decoder and is not evidence of video or hardware acceptance.
-    public func stageDecodedMetadataForTesting(streamID: UInt64, version: UInt32) {
-        decodeScheduler.configure(sequenceHeader: Data([1]), streamID: streamID,
+    public func stageDecodedMetadataForTesting(streamID: UInt64, version: UInt32, inputEpoch: UInt64 = 1) {
+        decodeScheduler.configure(sequenceHeader: Data([1]), streamID: streamID, inputEpoch: inputEpoch,
                                   width: 1920, height: 1080, version: version, generation: callbackGeneration)
-        consumeDecodedConfiguration(generation: callbackGeneration, streamID: streamID,
+        consumeDecodedConfiguration(generation: callbackGeneration, streamID: streamID, inputEpoch: inputEpoch,
                                     version: version, width: 1920, height: 1080)
+    }
+
+    public func retireDecodeStreamForTesting() { decodeScheduler.retireStream(generation: callbackGeneration) }
+
+    public func acceptReconnectingForTesting() {
+        consumeState(streamID: 0, stateValue: Int(DESKLINK_RECONNECTING.rawValue))
     }
 
     public func acceptCapabilitiesForTesting(platform: RemotePlatform) {
@@ -777,13 +917,16 @@ private func desklinkEventCallback(_ context: UnsafeMutableRawPointer?, _ event:
     guard let bridge = callbackContext.bridge else { return }
     let value = event.pointee
     let generation = callbackContext.generation
+    if value.kind == DESKLINK_EVENT_STATE, value.state == DESKLINK_RECONNECTING {
+        callbackContext.decodeScheduler.retireStream(generation: generation)
+    }
     // Admit encoded media on the FFI callback thread before any main-queue
     // scheduling. Data is copied once while the borrowed FFI buffer is alive.
     if value.kind == DESKLINK_EVENT_VIDEO_CONFIG {
         guard value.data_len > 0, value.data_len <= H264DecodeScheduler.maximumSequenceHeaderBytes,
               let pointer = value.data else { return }
         callbackContext.decodeScheduler.configure(sequenceHeader: Data(bytes: pointer, count: value.data_len),
-            streamID: value.stream_id, width: value.width, height: value.height,
+            streamID: value.stream_id, inputEpoch: value.input_epoch, width: value.width, height: value.height,
             version: value.config_version, generation: generation)
         return
     }

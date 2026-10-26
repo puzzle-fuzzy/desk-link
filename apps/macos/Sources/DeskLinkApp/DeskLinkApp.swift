@@ -29,7 +29,6 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        controller?.releaseAll()
         controller?.disconnect()
     }
 
@@ -37,7 +36,6 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
         guard !terminationStarted else { return .terminateNow }
         terminationStarted = true
         Task { @MainActor [weak self] in
-            self?.controller?.releaseAll()
             self?.controller?.disconnect()
             await self?.host?.shutdownAndWait()
             sender.reply(toApplicationShouldTerminate: true)
@@ -84,7 +82,6 @@ struct DeskLinkApp: App {
             .onAppear { lifecycle.configure(controller: controller, host: host) }
             .onDisappear {
                 host.shutdown()
-                controller.releaseAll()
                 controller.disconnect()
             }
             .task { await account.restore() }

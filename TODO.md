@@ -196,6 +196,8 @@
 ### DL2-013 · P1 · 连接中刷新显示拓扑并稳定识别屏幕
 
 - [ ] 将显示列表、活动屏幕、视频配置和输入坐标作为带版本的拓扑快照。
+- [x] Apple 输入生产侧切片：按实际呈现 context 捕获事件；Mac key / modifiers / mouse-button / IME 与 iOS 键盘 / 手势 / 延迟长按保留原 stream / epoch，keyup、文本整段和合成释放不重新贴当前标签。仅 stream / inputEpoch / runtimeGeneration 的目标屏障取消旧组合与 gesture；纯 configVersion 画质重配保留按键 / IME / gesture 与原始 context，跨目标屏障 repeat 不重建 press；UI 清理同步或按原 context 释放，Mac 输入几何使用已呈现 rect。主题 `fix(DL2-013): retain captured presentation context across Apple input lifetimes`。
+- [x] Windows 可运行验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract scripts.tests.test_dl2_apple_input_capture_contract scripts.tests.test_dl2_mac_session_contract -v`，27 项源码合同通过；新增 Swift 事件模型 / FFI 编码回归覆盖迟到 keyup、旧 modifier、IME 屏障与长按 ticket，但本机无 Swift/AppKit/UIKit，尚未执行，不能代替 Apple 编译或硬件呈现验收。
 - **证据 / 类型：源码缺陷。** `apps/windows/src/runtime.rs:1597-1622` 只在会话建立时枚举；`1414-1417` 保存不可变列表，`2545,2565-2571` 按旧列表校验并回发；`1992-2015` 恢复捕获时未刷新列表。`apps/windows/src/capture.rs:387-390` 的 ID 使用枚举序号。
 - **用户影响：** 扩展屏热插拔、主屏变化后，新屏不可选，序号变更还可能选择到不同输出。
 - **方案：** 监听/检测拓扑变化，用稳定输出身份而非临时索引；活动屏移除时明确回退；旧拓扑下的输入不落入新输出。
@@ -212,6 +214,9 @@
 - [ ] FFI Mac Host 当前只可绑定 stream 与编码尺寸；完整源显示器/捕获拓扑身份和真实 Mac 注入验收仍缺，不能据此整体关闭 013。
 
 - [x] Controller 同 epoch 改编码尺寸视为配置合同错误，拒绝保留可输入的旧几何；同几何画质重配保持 epoch，epoch 身份不按数值排序。新增真实运行 Rust guard 回归；本分支 FFI 全57项与 Clippy all-targets `-D warnings` 通过。主题 `fix(DL2-013): reject geometry changes that reuse an input epoch`。
+
+- [x] Apple 呈现与输入完整代码切片：VideoConfig epoch 绑定解码/呈现令牌；Metal drawable 真正呈现且 presentedTime>0 才启用新输入 surface，迟到回调校验 runtime/stream/config/epoch。Mac/iOS 按键、IME、手势和延迟长按捕获原 context，纯画质重配同 target 不释放；重连在 FFI callback 同步退役旧流，支持新认证会话较小 epoch/stream，旧 callback 不清新 runtime。Python DL2 合同74项通过（其中呈现10、输入捕获9）；Swift模型/事件测试已补但本Windows环境未执行。主题 `fix(DL2-013): bind Apple input lifetimes to actual frame presentation`。
+- [ ] 本分支 Windows Host/前端仍有合同隔离点，待媒体/产品分支接通整合；FFI Mac Host 完整捕获拓扑身份、Swift6编译、真机呈现/输入/跨设备验收仍缺。以上是代码/本地合成证明，不是013整体验收。
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 

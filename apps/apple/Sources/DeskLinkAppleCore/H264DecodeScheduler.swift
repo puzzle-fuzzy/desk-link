@@ -4,7 +4,10 @@ import Foundation
 public struct H264DecodedFrame: @unchecked Sendable {
     public let generation: UInt64
     public let streamID: UInt64
+    public let inputEpoch: UInt64
     public let version: UInt32
+    public let width: UInt16
+    public let height: UInt16
     public let frameID: UInt64
     public let pixelBuffer: CVPixelBuffer
 }
@@ -15,6 +18,7 @@ private final class DecodeOutputDelivery: @unchecked Sendable {
     struct Configuration: Sendable {
         let generation: UInt64
         let streamID: UInt64
+        let inputEpoch: UInt64
         let version: UInt32
         let width: UInt16
         let height: UInt16
@@ -26,12 +30,12 @@ private final class DecodeOutputDelivery: @unchecked Sendable {
     private var keyframe: (UInt64, UInt64)?
     private var scheduled = false
     private let onFrame: @MainActor @Sendable (H264DecodedFrame) -> Void
-    private let onConfiguration: @MainActor @Sendable (UInt64, UInt64, UInt32, UInt16, UInt16) -> Void
+    private let onConfiguration: @MainActor @Sendable (UInt64, UInt64, UInt64, UInt32, UInt16, UInt16) -> Void
     private let onKeyframeRequest: @MainActor @Sendable (UInt64, UInt64) -> Void
 
     init(
         onFrame: @escaping @MainActor @Sendable (H264DecodedFrame) -> Void,
-        onConfiguration: @escaping @MainActor @Sendable (UInt64, UInt64, UInt32, UInt16, UInt16) -> Void,
+        onConfiguration: @escaping @MainActor @Sendable (UInt64, UInt64, UInt64, UInt32, UInt16, UInt16) -> Void,
         onKeyframeRequest: @escaping @MainActor @Sendable (UInt64, UInt64) -> Void
     ) {
         self.onFrame = onFrame
@@ -60,7 +64,7 @@ private final class DecodeOutputDelivery: @unchecked Sendable {
             guard let self else { return }
             while let next = take() {
                 if let configuration = next.1 {
-                    onConfiguration(configuration.generation, configuration.streamID, configuration.version,
+                    onConfiguration(configuration.generation, configuration.streamID, configuration.inputEpoch, configuration.version,
                                     configuration.width, configuration.height)
                 }
                 if let frame = next.0 { onFrame(frame) }
@@ -116,6 +120,7 @@ public final class H264DecodeScheduler: @unchecked Sendable {
         let generation: UInt64
         let epoch: UInt64
         let streamID: UInt64
+        let inputEpoch: UInt64
         let version: UInt32
         let width: UInt16
         let height: UInt16
@@ -153,12 +158,13 @@ public final class H264DecodeScheduler: @unchecked Sendable {
     private var awaitingKeyframe = true
     private var keyframeRequestIssued = false
     private var draining = false
+    private var inputSurfaceContractViolated = false
 
     public init(
         limits: Limits = Limits(),
         decodeQueue: DispatchQueue = DispatchQueue(label: "com.desklink.decoder.input", qos: .userInitiated),
         onFrame: @escaping @MainActor @Sendable (H264DecodedFrame) -> Void,
-        onConfiguration: @escaping @MainActor @Sendable (UInt64, UInt64, UInt32, UInt16, UInt16) -> Void,
+        onConfiguration: @escaping @MainActor @Sendable (UInt64, UInt64, UInt64, UInt32, UInt16, UInt16) -> Void,
         onKeyframeRequest: @escaping @MainActor @Sendable (UInt64, UInt64) -> Void
     ) {
         self.limits = limits
@@ -171,6 +177,22 @@ public final class H264DecodeScheduler: @unchecked Sendable {
     /// accepting callbacks. Stream/config changes are handled by configure.
     public func reset(generation: UInt64) {
         lock.lock()
+        defer { lock.unlock() }
+        resetLocked(generation: generation)
+    }
+
+    /// A reconnect notification is handled synchronously at FFI ingress. An
+    /// already retired callback must never reset the successor handle's queue.
+    @discardableResult
+    public func retireStream(generation: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == self.generation else { return false }
+        resetLocked(generation: generation)
+        return true
+    }
+
+    private func resetLocked(generation: UInt64) {
         self.generation = generation
         epoch &+= 1
         configuration = nil
@@ -179,25 +201,34 @@ public final class H264DecodeScheduler: @unchecked Sendable {
         lastAdmittedFrameID = 0
         awaitingKeyframe = true
         keyframeRequestIssued = false
+        inputSurfaceContractViolated = false
         pendingReset = true
         delivery.clear()
         scheduleDrain()
-        lock.unlock()
     }
 
-    public func configure(sequenceHeader: Data, streamID: UInt64, width: UInt16, height: UInt16,
+    public func configure(sequenceHeader: Data, streamID: UInt64, inputEpoch: UInt64, width: UInt16, height: UInt16,
                           version: UInt32, generation: UInt64) {
-        guard streamID > 0, width > 0, height > 0, version > 0,
+        guard streamID > 0, inputEpoch > 0, width > 0, height > 0, version > 0,
               !sequenceHeader.isEmpty, sequenceHeader.count <= Self.maximumSequenceHeaderBytes else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard generation == self.generation else { return }
+        guard generation == self.generation, !inputSurfaceContractViolated else { return }
         if let current = configuration {
             guard streamID > current.streamID || (streamID == current.streamID && version >= current.version) else { return }
-            if streamID == current.streamID, version == current.version { return }
+            if streamID == current.streamID {
+                // Input epochs are opaque nonzero identities. A restarted host
+                // may choose a numerically smaller one; only equality matters.
+                if inputEpoch == current.inputEpoch, width != current.width || height != current.height {
+                    resetLocked(generation: generation)
+                    inputSurfaceContractViolated = true
+                    return
+                }
+                if version == current.version { return }
+            }
         }
         epoch &+= 1
-        let next = Configuration(generation: generation, epoch: epoch, streamID: streamID,
+        let next = Configuration(generation: generation, epoch: epoch, streamID: streamID, inputEpoch: inputEpoch,
                                  version: version, width: width, height: height, sequenceHeader: sequenceHeader)
         configuration = next
         pendingConfiguration = next
@@ -207,6 +238,11 @@ public final class H264DecodeScheduler: @unchecked Sendable {
         awaitingKeyframe = true
         keyframeRequestIssued = false
         delivery.clear()
+        // This is a configuration admission barrier, not a decode-success
+        // notification. Invalidate the old input context even if native decode
+        // is busy; input becomes valid only after an actual drawable receipt.
+        delivery.submit(configuration: .init(generation: next.generation, streamID: next.streamID, inputEpoch: next.inputEpoch,
+                        version: next.version, width: next.width, height: next.height))
         scheduleDrain()
     }
 
@@ -245,10 +281,28 @@ public final class H264DecodeScheduler: @unchecked Sendable {
 
     /// Validate coalesced UI callbacks again when they run: reset/configure can
     /// happen after the mailbox was taken but before the main actor executes it.
-    public func accepts(generation: UInt64, streamID: UInt64, version: UInt32) -> Bool {
+    public func accepts(generation: UInt64, streamID: UInt64, version: UInt32, inputEpoch: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return generation == self.generation && configuration?.streamID == streamID && configuration?.version == version
+        return inputEpoch > 0 && generation == self.generation && configuration?.streamID == streamID
+            && configuration?.version == version && configuration?.inputEpoch == inputEpoch
+    }
+
+    /// Capture may retain a genuinely presented frame across a pure encoding
+    /// reconfiguration. Same-epoch dimension changes are rejected at admission.
+    public func acceptsInputSurface(generation: UInt64, streamID: UInt64, inputEpoch: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inputEpoch > 0 && generation == self.generation && configuration?.streamID == streamID
+            && configuration?.inputEpoch == inputEpoch
+    }
+
+    public func currentInputContext(generation: UInt64) -> CapturedInputContext? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == self.generation, let current = configuration else { return nil }
+        return CapturedInputContext(streamID: current.streamID, inputEpoch: current.inputEpoch,
+                                    configVersion: current.version, runtimeGeneration: generation)
     }
 
     public func snapshot() -> Snapshot {
@@ -309,7 +363,6 @@ public final class H264DecodeScheduler: @unchecked Sendable {
                 decoder.onFrame = { [weak self] buffer, frameID in
                     self?.publishFrame(buffer, frameID: frameID, configuration: config)
                 }
-                publishConfiguration(config)
             case let .frame(frame):
                 guard isCurrent(frame.configuration) else { continue }
                 if !decoder.receive(accessUnit: frame.accessUnit, frameID: frame.frameID, version: frame.configuration.version) {
@@ -325,16 +378,8 @@ public final class H264DecodeScheduler: @unchecked Sendable {
         defer { lock.unlock() }
         guard generation == config.generation, epoch == config.epoch else { return }
         decodedFrames &+= 1
-        delivery.submit(frame: H264DecodedFrame(generation: config.generation, streamID: config.streamID,
-                        version: config.version, frameID: frameID, pixelBuffer: buffer))
-    }
-
-    private func publishConfiguration(_ config: Configuration) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard generation == config.generation, epoch == config.epoch else { return }
-        delivery.submit(configuration: .init(generation: config.generation, streamID: config.streamID,
-                        version: config.version, width: config.width, height: config.height))
+        delivery.submit(frame: H264DecodedFrame(generation: config.generation, streamID: config.streamID, inputEpoch: config.inputEpoch,
+                        version: config.version, width: config.width, height: config.height, frameID: frameID, pixelBuffer: buffer))
     }
 
     private func isCurrent(_ config: Configuration) -> Bool {

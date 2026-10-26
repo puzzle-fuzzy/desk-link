@@ -53,9 +53,26 @@ final class KeyboardMappingIntegrationTests: XCTestCase {
         XCTAssertEqual(bridge.sentInputsForTesting.map(\.modifiers), [2, 8, 8])
     }
 
+    func testLateKeyUpEncodesOriginalEpochAndBarrierReleaseTargetsOriginalContext() throws {
+        let bridge = recordingBridge(platform: .windows)
+        let original = try XCTUnwrap(bridge.captureInputContext())
+        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        view.keyDown(with: try event(type: .keyDown, keyCode: 8, character: "c"))
+        let next = CapturedInputContext(streamID: 1, inputEpoch: 8, configVersion: 3, runtimeGeneration: 3)
+        bridge.acceptPresentedInputContextForTesting(next)
+        view.keyUp(with: try event(type: .keyUp, keyCode: 8, character: "c"))
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.input_epoch), [original.inputEpoch, original.inputEpoch])
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.stream_id), [original.streamID, original.streamID])
+        view.synchronizeInputContext(next)
+        XCTAssertTrue(bridge.releasedContextsForTesting.contains(original))
+        XCTAssertFalse(bridge.releasedContextsForTesting.contains(next))
+    }
+
     private func recordingBridge(platform: RemotePlatform) -> ControllerBridge {
         let bridge = ControllerBridge.testing(state: .connected(streamID: 1))
         bridge.acceptCapabilitiesForTesting(platform: platform)
+        // Explicit metadata fixture; not proof of Metal presentation.
+        bridge.acceptPresentedInputContextForTesting(CapturedInputContext(streamID: 1, inputEpoch: 7, configVersion: 2, runtimeGeneration: 3))
         bridge.recordInputsForTesting = true
         return bridge
     }

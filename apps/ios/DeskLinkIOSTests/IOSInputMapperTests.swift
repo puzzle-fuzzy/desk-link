@@ -188,3 +188,119 @@ final class IOSKeyboardInputTests: XCTestCase {
         XCTAssertFalse(IOSKeyboardInput.isReturnText("a"))
     }
 }
+
+final class IOSGestureCapturedInputTests: XCTestCase {
+    private let first = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 2, runtimeGeneration: 3)
+    private let second = CapturedInputContext(streamID: 7, inputEpoch: 12, configVersion: 3, runtimeGeneration: 3)
+
+    func testDelayedLongPressKeepsBeganContextAndCannotJoinNewGesture() throws {
+        var gesture = IOSGestureInputCapture()
+        gesture.begin(context: first)
+        let delayed = try XCTUnwrap(gesture.ticket)
+        XCTAssertEqual(delayed.context, first)
+        gesture.cancel()
+        gesture.begin(context: second)
+        XCTAssertFalse(gesture.accepts(delayed))
+        XCTAssertEqual(gesture.ticket?.context, second)
+    }
+
+    func testCancelledTimerIsRejectedEvenWhenNextGestureUsesSameEpoch() throws {
+        var gesture = IOSGestureInputCapture()
+        gesture.begin(context: first)
+        let delayed = try XCTUnwrap(gesture.ticket)
+        gesture.cancel()
+        gesture.begin(context: first)
+        XCTAssertFalse(gesture.accepts(delayed))
+        XCTAssertNotEqual(gesture.ticket?.serial, delayed.serial)
+    }
+
+    func testQualityVersionChangeKeepsGestureAndItsOriginalLongPressTicket() throws {
+        var gesture = IOSGestureInputCapture()
+        gesture.begin(context: first)
+        let delayed = try XCTUnwrap(gesture.ticket)
+        let quality = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 3, runtimeGeneration: 3)
+        XCTAssertTrue(gesture.matchesInputTarget(quality))
+        XCTAssertTrue(gesture.accepts(delayed))
+        XCTAssertEqual(gesture.ticket?.context, first)
+        XCTAssertFalse(gesture.matchesInputTarget(second))
+    }
+}
+
+@MainActor
+final class IOSKeyboardCapturedInputTests: XCTestCase {
+    private let context = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 2, runtimeGeneration: 3)
+
+    func testProductionShortcutDownAndUpEncodeOneCapturedEpoch() {
+        let bridge = readyBridge()
+        let input = IOSKeyboardInput(bridge: bridge)
+        input.sendSpecialKey(.control, pressed: true)
+        input.sendSpecialKey(.control, pressed: false)
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.stream_id), [7, 7])
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.input_epoch), [11, 11])
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.pressed), [1, 0])
+    }
+
+    func testRetiredUIKitResponderCannotCommitIntoNewEpoch() {
+        let bridge = readyBridge()
+        let input = IOSKeyboardInput(bridge: bridge)
+        let retired = input.makeResponderView()
+        retired.capturedTextContext = context
+        retired.insertText("中")
+        let before = bridge.sentInputsForTesting.count
+        let next = CapturedInputContext(streamID: 7, inputEpoch: 12, configVersion: 3, runtimeGeneration: 3)
+        bridge.acceptPresentedInputContextForTesting(next)
+        input.synchronizeInputContext(next)
+        retired.insertText("迟到文本")
+        XCTAssertEqual(bridge.sentInputsForTesting.count, before)
+        XCTAssertNil(retired.owner)
+        XCTAssertNil(retired.capturedTextContext)
+    }
+
+    func testLateModifierUpAndResignKeepOriginalContext() {
+        let bridge = readyBridge()
+        let input = IOSKeyboardInput(bridge: bridge)
+        input.sendSpecialKey(.control, pressed: true)
+        let next = CapturedInputContext(streamID: 7, inputEpoch: 12, configVersion: 3, runtimeGeneration: 3)
+        bridge.acceptPresentedInputContextForTesting(next)
+        input.sendSpecialKey(.control, pressed: false)
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.input_epoch), [11, 11])
+        input.sendSpecialKey(.shift, pressed: true)
+        input.resign()
+        XCTAssertTrue(bridge.releasedContextsForTesting.contains(next))
+        XCTAssertTrue(input.activeModifiers.isEmpty)
+    }
+
+    func testResignClearsModifierStateSynchronously() {
+        let bridge = readyBridge()
+        let input = IOSKeyboardInput(bridge: bridge)
+        input.sendSpecialKey(.control, pressed: true)
+        XCTAssertEqual(input.activeModifiers, .control)
+        input.resign()
+        XCTAssertTrue(input.activeModifiers.isEmpty)
+    }
+
+    func testQualityReconfigurationKeepsResponderAndHeldModifierWithoutRelease() {
+        let bridge = readyBridge()
+        let input = IOSKeyboardInput(bridge: bridge)
+        let responder = input.makeResponderView()
+        responder.capturedTextContext = context
+        input.sendSpecialKey(.control, pressed: true)
+        let quality = CapturedInputContext(streamID: 7, inputEpoch: 11, configVersion: 3, runtimeGeneration: 3)
+        bridge.acceptPresentedInputContextForTesting(quality)
+        input.synchronizeInputContext(quality)
+        XCTAssertTrue(input.makeResponderView() === responder)
+        XCTAssertEqual(responder.capturedTextContext, context)
+        XCTAssertEqual(input.activeModifiers, .control)
+        XCTAssertTrue(bridge.releasedContextsForTesting.isEmpty)
+        input.sendSpecialKey(.control, pressed: false)
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.input_epoch), [11, 11])
+    }
+
+    private func readyBridge() -> ControllerBridge {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 7))
+        // Explicit metadata fixture only; not proof of a presented drawable.
+        bridge.acceptPresentedInputContextForTesting(context)
+        bridge.recordInputsForTesting = true
+        return bridge
+    }
+}
