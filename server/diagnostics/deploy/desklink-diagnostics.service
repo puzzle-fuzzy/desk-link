@@ -15,6 +15,7 @@ Environment=DESKLINK_DIAGNOSTICS_TRUSTED_PROXIES=127.0.0.1,::1
 ExecStart=/opt/desklink-diagnostics/bin/bun run src/index.ts
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=20s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

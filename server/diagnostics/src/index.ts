@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 
 import { DiagnosticStore } from "./store";
 import { DiagnosticMaintenance } from "./maintenance";
-import { MAX_BATCH_BYTES } from "./validation";
+import { createDiagnosticsRuntime } from "./runtime";
 import { createDiagnosticsApp } from "./app";
 import { diagnosticConfiguration } from "./configuration";
 
@@ -14,28 +14,22 @@ mkdirSync(dirname(databasePath), { recursive: true });
 const configuration = diagnosticConfiguration(process.env);
 const store = new DiagnosticStore(databasePath, configuration.storageLimits);
 const maintenance = new DiagnosticMaintenance(store);
-maintenance.start();
 const app = createDiagnosticsApp({ store, retention: () => maintenance.snapshot(),
   trustedProxies: configuration.trustedProxies, admission: configuration.admission });
 
-const server = Bun.serve({
+const runtime = createDiagnosticsRuntime(store, maintenance, app, {
   hostname: address,
   port,
-  maxRequestBodySize: MAX_BATCH_BYTES,
-  fetch(request, serverInstance) {
-    return app.fetch(request, serverInstance.requestIP(request)?.address);
-  },
 });
+const server = runtime.server;
 
 console.log(`DeskLink diagnostics listening on http://${server.hostname}:${server.port}`);
 
-let stopping = false;
-async function shutdown() {
-  if (stopping) return;
-  stopping = true;
-  maintenance.stop();
-  await server.stop();
-  store.close();
+function shutdown() {
+  void runtime.shutdown().catch(() => {
+    console.error("diagnostics shutdown failed");
+    process.exitCode = 1;
+  });
 }
 process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);

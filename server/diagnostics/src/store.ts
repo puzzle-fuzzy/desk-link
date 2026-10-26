@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
+import { DiagnosticDatabase } from "./database";
 
 import type { DiagnosticBatch, DiagnosticEvent } from "./validation";
 import { configureStorageQuota, DEFAULT_STORAGE_LIMITS, DiagnosticStorageFull, storageUsage, type StorageLimits } from "./storage-quota";
@@ -23,45 +24,50 @@ export class DiagnosticStore {
   readonly database: Database;
 
   constructor(private readonly path: string, limits: StorageLimits = DEFAULT_STORAGE_LIMITS) {
-    this.database = new Database(path, { create: true, strict: true });
-    this.database.exec("PRAGMA journal_mode = WAL");
-    this.database.exec("PRAGMA synchronous = NORMAL");
-    // Never wait on another writer from the ingestion event loop.
-    this.database.exec("PRAGMA busy_timeout = 0");
-    this.database.exec(`
-      CREATE TABLE IF NOT EXISTS batches (
-        batch_id TEXT PRIMARY KEY,
-        received_at_unix_s INTEGER NOT NULL,
-        installation_id TEXT NOT NULL,
-        correlation_id TEXT,
-        app_version TEXT NOT NULL,
-        source TEXT NOT NULL,
-        event_count INTEGER NOT NULL,
-        remote_address TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS events (
-        event_id TEXT PRIMARY KEY,
-        batch_id TEXT NOT NULL,
-        received_at_unix_s INTEGER NOT NULL,
-        installation_id TEXT NOT NULL,
-        correlation_id TEXT,
-        app_version TEXT NOT NULL,
-        source TEXT NOT NULL,
-        timestamp_unix_ms INTEGER NOT NULL,
-        level TEXT NOT NULL,
-        event TEXT NOT NULL,
-        payload_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS events_by_correlation
-        ON events(correlation_id, timestamp_unix_ms);
-      CREATE INDEX IF NOT EXISTS events_by_installation
-        ON events(installation_id, timestamp_unix_ms);
-      CREATE INDEX IF NOT EXISTS events_by_received_at
-        ON events(received_at_unix_s);
-      CREATE INDEX IF NOT EXISTS batches_by_received_at
-        ON batches(received_at_unix_s);
-    `);
-    configureStorageQuota(this.database, limits);
+    this.database = new DiagnosticDatabase(path, { create: true, strict: true });
+    try {
+      this.database.exec("PRAGMA journal_mode = WAL");
+      this.database.exec("PRAGMA synchronous = NORMAL");
+      // Never wait on another writer from the ingestion event loop.
+      this.database.exec("PRAGMA busy_timeout = 0");
+      this.database.exec(`
+        CREATE TABLE IF NOT EXISTS batches (
+          batch_id TEXT PRIMARY KEY,
+          received_at_unix_s INTEGER NOT NULL,
+          installation_id TEXT NOT NULL,
+          correlation_id TEXT,
+          app_version TEXT NOT NULL,
+          source TEXT NOT NULL,
+          event_count INTEGER NOT NULL,
+          remote_address TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS events (
+          event_id TEXT PRIMARY KEY,
+          batch_id TEXT NOT NULL,
+          received_at_unix_s INTEGER NOT NULL,
+          installation_id TEXT NOT NULL,
+          correlation_id TEXT,
+          app_version TEXT NOT NULL,
+          source TEXT NOT NULL,
+          timestamp_unix_ms INTEGER NOT NULL,
+          level TEXT NOT NULL,
+          event TEXT NOT NULL,
+          payload_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS events_by_correlation
+          ON events(correlation_id, timestamp_unix_ms);
+        CREATE INDEX IF NOT EXISTS events_by_installation
+          ON events(installation_id, timestamp_unix_ms);
+        CREATE INDEX IF NOT EXISTS events_by_received_at
+          ON events(received_at_unix_s);
+        CREATE INDEX IF NOT EXISTS batches_by_received_at
+          ON batches(received_at_unix_s);
+      `);
+      configureStorageQuota(this.database, limits);
+    } catch (error) {
+      this.database.close(true);
+      throw error;
+    }
   }
 
   insert(
@@ -179,7 +185,7 @@ export class DiagnosticStore {
   }
 
   close(): void {
-    this.database.close(false);
+    this.database.close(true);
   }
 }
 

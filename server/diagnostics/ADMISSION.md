@@ -1,5 +1,24 @@
 # Diagnostic ingestion budgets
 
+## Shutdown
+
+SIGTERM/SIGINT use one idempotent runtime shutdown promise. Maintenance timers
+stop first; `server.stop(false)` refuses new socket connections and drains
+accepted requests before SQLite closes. `true` would abort in-flight requests
+and is reserved for forced termination. Body reads have a 5-second timeout;
+the systemd template explicitly allows 20 seconds for normal shutdown, without
+claiming a hard deadline under CPU/disk failure. Runtime shutdown rejections are
+handled with a fixed error category and nonzero exit status.
+
+Local Bun 1.3.14 tests use real loopback sockets and a signed receipt: new
+connections fail, the accepted batch commits before database closure, repeated
+shutdown shares one promise, maintenance cannot run afterward, and native
+statements/files release without GC. Failed initialization also releases its
+file. Windows local tests do not prove actual deployment SIGTERM delivery or
+relay QUIC CONNECTION_CLOSE behavior; those acceptance steps remain open.
+
+## Admission model
+
 A signature proves that an installation ID and its public key belong together.
 It is not an admission allowlist: anyone can generate another key. Ingestion
 therefore applies independent socket-IP and global budgets before reading a body,
