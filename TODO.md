@@ -260,6 +260,9 @@
 ### DL2-024 · P2 · 将低延迟直连从视频优化扩展为完整数据路径
 
 - [ ] 设计认证后的多通道 LAN 数据面，再按测量决定公网 NAT 穿透方案。
+- [x] 传输层独立切片：新增 opt-in DLD1/DLB1 数据面，复用既有认证 probe 与 Noise 会话，提供八通道有界队列、可靠流优先级、逐通道回退、同密文去重、截止时间与取消；收讫使用 AEAD 内随机 128bit token，拒绝伪造/旧 ACK，不推进反向业务 replay window。提交主题：`feat(DL2-024): add authenticated multi-lane LAN transport slice`。
+- [x] 本地自动验证：固定 Rust 工具链通过 transport **35 项单元测试（其中新增 LAN 数据面 11 项）+16 项 localhost 集成测试**，Clippy `--all-targets --locked -- -D warnings`、包级 fmt 与 `git diff --check` 通过。覆盖 relay backend 离线时八通道双向传输、慢文件消费者与输入/音频隔离、LAN/relay 去重、伪收讫、错会话/错 lane、双向 >128 包及持锁取消；不涉及公网或真实输入注入。
+- [ ] 生产接线与验收：capability/代数/切换边界接入 DL2-009 统一 v13 契约，适配媒体 packetizer 与 relay readers，接通 Windows/FFI 的输入/控制/音频/文件；定义断开公网后的 LAN 授权与存活、发现/本地配对，进行双机延迟/吞吐/长稳及公网 NAT 实验。当前生产 runtime 仍仅视频直连，不能用上述传输夹具勾选主项；接线契约、wire 预算与未验证条件见 [LAN 数据面记录](docs/lan-data-plane.md)。
 - **证据 / 类型：架构能力限制。** `crates/desklink-transport/src/video_egress.rs:5-8` 明确只优化视频；`apps/windows/src/runtime.rs:2424-2428` 音频仍通过 relay QuicClient；可靠通道位于 `crates/desklink-transport/src/quic.rs:925-930`。因此同网视频直连不代表键鼠/文件也在 LAN 内传输。
 - **方案：** 同一已认证路径承载独立优先级的输入、控制、音频和文件，并支持逐通道切换、回退和去重；完善局域网发现/本地配对与 relay 不可达时的行为。公网打洞作为独立实验，不把“换 WebRTC”本身当性能结论。
 - **验收：** 同网输入延迟符合实际 LAN 路径；断开公网后按定义保持本地连接；切换不重放按键、不串会话、不中断授权。公网方案另测不同 NAT/IPv6/UDP 限制与回退时间。

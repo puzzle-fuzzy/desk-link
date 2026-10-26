@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod direct_probe;
 mod lan_candidate;
+mod lan_data;
 mod quic;
 mod video_egress;
 mod video_path;
@@ -15,6 +16,7 @@ pub use direct_probe::{
     DirectLanSession,
 };
 pub use lan_candidate::{discover_local_private_address, make_local_candidate};
+pub use lan_data::{LanDataConfig, LanDataError, LanDataPlane, LanDataRoute, LanRelayBackend};
 pub use quic::QuicClient;
 pub use video_egress::{
     DirectLanVideoPath, RelayVideoPath, VideoDatagramBackend, VideoDatagramRoute,
