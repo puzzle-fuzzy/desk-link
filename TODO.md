@@ -307,6 +307,8 @@
 - **内容/R2联合验证：** GPU AnnexB→强制软件CMSH264DecoderMFT实际解码128帧，Main/High各512²及640×384重配、两phase更新；颜色/方向/UV/严格timestamp与SPS profile77/100、resize新SPS/首IDR通过，左右/上下/UV交换及旧phase反证也通过。真实runtime编码入口→submission归属→HostPipeline→VideoConfig token回归通过：GPU→CPU→GPU与纯codec重配保持epoch，同尺寸原点变化分配新epoch，旧实际GPU输出/旧release不能进入新映射。没有调用真实SendInput或采集桌面。相关库/tests严格Clippy通过。
 - [ ] **完整硬件/性能仍待：** Intel/AMD/混合GPU、实际driver/device loss、真实DXGI Acquire/Release、双机/长稳与帧龄/功耗；1080p/1440p/显式4K合成矩阵和可复跑阶段计量由后续015工具切片提供。首批64²软件兜底证据保留为历史，不再代表本机未成功GPU编码；本切片不把CopyResource+VP称零拷贝。
 
+- [x] **代表尺寸内容验证（`test(DL2-016): decode representative GPU frame sizes and display apertures`）：** 在原128帧回归外新增1080p/1440p Main18M及显式4K High40.5M，两phase各4帧共24帧真实GPU编码→软件MFT解码；decoded timestamp/实际SPS profile/首IDR/可见尺寸与tile内容更新均通过、CPU fallback与原GPU读回均0。1080实测coded1920×1088/visible1920×1080，仅依解码器MFVideoArea显示孔径裁padding，检查偶数offset/边界并正确裁Y/UV，不按expected尺寸盲裁。验证模块4项（含裁剪与错轴/UV/旧phase反证）及严格lib/tests Clippy通过。仍不代表复杂桌面视觉质量、真实DXGI或端到端性能通过。
+
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
 - [ ] 用 AudioWorklet 或经测量更合适的原生播放路径，替代逐包节点创建。

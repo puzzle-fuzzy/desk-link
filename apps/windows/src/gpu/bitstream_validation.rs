@@ -64,6 +64,7 @@ struct DecodedFrame {
     timestamp_us: u64,
     width: u32,
     height: u32,
+    coded_dimensions: (u32, u32),
     nv12: Vec<u8>,
 }
 
@@ -232,15 +233,95 @@ impl SoftwareDecoder {
             let buffer = unsafe { sample.ConvertToContiguousBuffer() }
                 .map_err(at("decoder contiguous output"))?;
             let nv12 = copy_nv12(&buffer, &self.output_type, width, height)?;
+            let (nv12, visible_width, visible_height) =
+                display_aperture_nv12(nv12, &self.output_type, (width, height))?;
             decoded.push(DecodedFrame {
                 timestamp_us,
-                width,
-                height,
+                width: visible_width,
+                height: visible_height,
+                coded_dimensions: (width, height),
                 nv12,
             });
         }
         Err("decoder output/stream-change budget exceeded".into())
     }
+}
+
+fn display_aperture_nv12(
+    nv12: Vec<u8>,
+    media_type: &IMFMediaType,
+    coded: (u32, u32),
+) -> ValidationResult<(Vec<u8>, u32, u32)> {
+    for key in [MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_GEOMETRIC_APERTURE] {
+        let size = match unsafe { media_type.GetBlobSize(&key) } {
+            Ok(size) => size as usize,
+            Err(error) if error.code() == MF_E_ATTRIBUTENOTFOUND => continue,
+            Err(error) => return Err(at("decoder display aperture size")(error)),
+        };
+        if size != size_of::<MFVideoArea>() {
+            return Err(format!(
+                "decoder display aperture blob size {size} != {}",
+                size_of::<MFVideoArea>()
+            ));
+        }
+        let mut blob = vec![0; size];
+        unsafe { media_type.GetBlob(&key, &mut blob, None) }
+            .map_err(at("decoder display aperture"))?;
+        let area = unsafe { ptr::read_unaligned(blob.as_ptr().cast::<MFVideoArea>()) };
+        if area.OffsetX.fract != 0
+            || area.OffsetY.fract != 0
+            || area.OffsetX.value < 0
+            || area.OffsetY.value < 0
+            || area.Area.cx <= 0
+            || area.Area.cy <= 0
+        {
+            return Err(format!(
+                "decoder display aperture is not an integral positive rectangle: {area:?}"
+            ));
+        }
+        let rect = (
+            area.OffsetX.value as u32,
+            area.OffsetY.value as u32,
+            area.Area.cx as u32,
+            area.Area.cy as u32,
+        );
+        return Ok((crop_nv12(&nv12, coded, rect)?, rect.2, rect.3));
+    }
+    Ok((nv12, coded.0, coded.1))
+}
+
+fn crop_nv12(
+    nv12: &[u8],
+    coded: (u32, u32),
+    rect: (u32, u32, u32, u32),
+) -> ValidationResult<Vec<u8>> {
+    let (left, top, width, height) = rect;
+    if [left, top, width, height, coded.0, coded.1]
+        .iter()
+        .any(|value| !value.is_multiple_of(2))
+        || width == 0
+        || height == 0
+        || left.checked_add(width).is_none_or(|right| right > coded.0)
+        || top
+            .checked_add(height)
+            .is_none_or(|bottom| bottom > coded.1)
+        || nv12.len() != coded.0 as usize * coded.1 as usize * 3 / 2
+    {
+        return Err(format!(
+            "invalid NV12 display aperture {rect:?} within coded {coded:?}"
+        ));
+    }
+    let mut visible = Vec::with_capacity(width as usize * height as usize * 3 / 2);
+    for row in top..top + height {
+        let start = row as usize * coded.0 as usize + left as usize;
+        visible.extend_from_slice(&nv12[start..start + width as usize]);
+    }
+    let uv_start = coded.0 as usize * coded.1 as usize;
+    for row in top / 2..(top + height) / 2 {
+        let start = uv_start + row as usize * coded.0 as usize + left as usize;
+        visible.extend_from_slice(&nv12[start..start + width as usize]);
+    }
+    Ok(visible)
 }
 
 impl Drop for SoftwareDecoder {
@@ -420,6 +501,7 @@ fn synthetic_reference_rejects_vertical_horizontal_uv_swaps_and_old_phase() {
         timestamp_us: 1,
         width: 512,
         height: 512,
+        coded_dimensions: (512, 512),
         nv12: reference.clone(),
     };
     validate_tiles(&frame, &reference, (512, 512)).unwrap();
@@ -450,6 +532,17 @@ fn synthetic_reference_rejects_vertical_horizontal_uv_swaps_and_old_phase() {
     )
     .unwrap();
     assert!(validate_tiles(&frame, &reference, (512, 512)).is_err());
+}
+
+#[test]
+fn decoder_display_aperture_crop_preserves_luma_and_interleaved_uv() {
+    let padded: Vec<u8> = (0..24).collect();
+    assert_eq!(
+        crop_nv12(&padded, (4, 4), (2, 2, 2, 2)).unwrap(),
+        [10, 11, 14, 15, 22, 23]
+    );
+    assert!(crop_nv12(&padded, (4, 4), (2, 2, 4, 2)).is_err());
+    assert!(crop_nv12(&padded, (4, 4), (1, 0, 2, 2)).is_err());
 }
 
 #[test]
@@ -588,5 +681,135 @@ fn actual_gpu_h264_bitstream_decodes_two_phases_main_high_and_reconfigured_dimen
                 "gpu_encoded_pixels profile={profile:?} dimensions={dimensions:?} decoded_phases={decoded_phases:?} config={previous_version} raw_gpu_readback=0"
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "opt-in representative 1080p/1440p/explicit-4K GPU encode -> software decoded pixels; synthetic only"]
+fn representative_gpu_h264_bitstreams_decode_correct_pixels_at_1080p_1440p_and_explicit_4k() {
+    let _runtime = MfRuntime::start().unwrap();
+    let adapter = enumerate_adapters()
+        .unwrap()
+        .into_iter()
+        .find(|adapter| !adapter.software)
+        .expect("hardware adapter required");
+    let device = create_device(adapter.index).unwrap();
+    for (dimensions, settings) in [
+        ((1920, 1080), H264EncoderSettings::default()),
+        ((2560, 1440), H264EncoderSettings::default()),
+        ((3840, 2160), H264EncoderSettings::experimental_4k()),
+    ] {
+        let mut encoder =
+            H264Encoder::new_with_settings(dimensions.0, dimensions.1, settings).unwrap();
+        assert_eq!(
+            encoder.dimensions(),
+            dimensions,
+            "representative mode must not silently downscale"
+        );
+        let pool = GpuBgraPool::from_device(device.clone(), dimensions.0, dimensions.1, 4).unwrap();
+        let mut decoder =
+            SoftwareDecoder::new(dimensions.0, dimensions.1).unwrap_or_else(|error| {
+                panic!("software decoder creation for {dimensions:?}: {error}")
+            });
+        let mut references = BTreeMap::new();
+        let mut decoded_phases = [0_usize; 2];
+        let mut parameter_set = None;
+        let mut config_version = None;
+        let mut coded_dimensions = None;
+        let mut timestamp_us = 1_000_000;
+        let before = gpu_metrics().cpu_readback_bytes;
+        for phase_index in 0..2 {
+            let pixels = tiles(dimensions.0, dimensions.1, phase_index * 3);
+            let reference = convert_to_nv12(
+                &pixels,
+                dimensions.0,
+                dimensions.1,
+                dimensions.0 as usize * 4,
+                dimensions.0,
+                dimensions.1,
+                PixelOrder::Bgra,
+            )
+            .unwrap();
+            let source =
+                create_synthetic_bgra(&device, dimensions.0, dimensions.1, &pixels).unwrap();
+            for index in 0..4 {
+                timestamp_us += 33_333;
+                references.insert(timestamp_us, (phase_index, reference.clone()));
+                let frame = pool.copy_from(&source, timestamp_us).unwrap();
+                let encoded = match encoder.encode_gpu(&frame, index == 0) {
+                    Ok(encoded) => encoded,
+                    Err(EncoderError::NeedMoreInput) => continue,
+                    Err(error) => panic!("GPU encoding at {dimensions:?}: {error:?}"),
+                };
+                assert!(
+                    encoder.last_performance_sample().unwrap().gpu_surface_input,
+                    "CPU fallback cannot prove representative GPU content"
+                );
+                if config_version.is_none() {
+                    assert!(
+                        encoded.keyframe,
+                        "representative bitstream must begin with IDR"
+                    );
+                    config_version = Some(encoded.config_version);
+                }
+                assert_eq!(Some(encoded.config_version), config_version);
+                parameter_set = parameter_set
+                    .or_else(|| encoded.sequence_header.as_deref().and_then(sps))
+                    .or_else(|| sps(&encoded.access_unit));
+                for decoded in decoder.submit(&encoded).unwrap_or_else(|error| {
+                    panic!("software decoder submission at {dimensions:?}: {error}")
+                }) {
+                    let coded = coded_dimensions.get_or_insert(decoded.coded_dimensions);
+                    assert_eq!(*coded, decoded.coded_dimensions);
+                    let (phase_index, reference) = references
+                        .get(&decoded.timestamp_us)
+                        .expect("decoded timestamp must strictly identify submitted phase");
+                    validate_tiles(&decoded, reference, dimensions).unwrap_or_else(|error| {
+                        panic!("decoded content at {dimensions:?}: {error}")
+                    });
+                    decoded_phases[*phase_index] += 1;
+                }
+            }
+        }
+        for decoded in decoder
+            .drain()
+            .unwrap_or_else(|error| panic!("software decoder drain at {dimensions:?}: {error}"))
+        {
+            let coded = coded_dimensions.get_or_insert(decoded.coded_dimensions);
+            assert_eq!(*coded, decoded.coded_dimensions);
+            let (phase_index, reference) = references
+                .get(&decoded.timestamp_us)
+                .expect("drained decoded timestamp must strictly identify submitted phase");
+            validate_tiles(&decoded, reference, dimensions)
+                .unwrap_or_else(|error| panic!("drained content at {dimensions:?}: {error}"));
+            decoded_phases[*phase_index] += 1;
+        }
+        assert!(
+            decoded_phases.iter().all(|count| *count >= 2),
+            "representative dimensions {dimensions:?} must decode both updates: {decoded_phases:?}"
+        );
+        let expected_profile_idc = match settings.profile {
+            H264Profile::Main => 77,
+            H264Profile::High => 100,
+        };
+        assert_eq!(
+            parameter_set
+                .expect("actual representative SPS required")
+                .get(1),
+            Some(&expected_profile_idc)
+        );
+        assert_eq!(encoder.gpu_status().cpu_fallbacks, 0);
+        assert_eq!(
+            gpu_metrics().cpu_readback_bytes,
+            before,
+            "representative GPU input must not be read back to CPU"
+        );
+        println!(
+            "representative_gpu_encoded_pixels visible_dimensions={dimensions:?} coded_dimensions={:?} profile={:?} bitrate={} decoded_phases={decoded_phases:?} config={} raw_gpu_readback=0",
+            coded_dimensions.unwrap(),
+            settings.profile,
+            settings.bitrate,
+            config_version.unwrap()
+        );
     }
 }

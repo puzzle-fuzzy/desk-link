@@ -103,6 +103,15 @@ Main/High, two phases and 512²→640×384 reconfiguration. It checks timestamp,
 SPS/profile/dimensions and tile colors with compression tolerance; swapped
 axes/UV and stale-phase counterexamples fail the comparator.
 
+The representative-size extension decodes another 24 actual frames: two phases
+of four frames each at 1080p/1440p Main 18 Mbps and explicitly opted-in 4K High
+40.5 Mbps. The 1080p software decoder reports coded 1920×1088 and visible
+1920×1080. Validation reads its MFVideoArea display aperture, checks integral,
+even offsets and image bounds, and crops luma/interleaved chroma accordingly.
+It never clips to the expected dimensions without decoder metadata. Actual SPS
+profiles, visible sizes, timestamps and phase content pass. This is synthetic
+tile correctness, not decoded text-quality or end-to-end performance proof.
+
 The R2 regression obtains input tokens from real encoded pipeline VideoConfig
 bytes. GPU→CPU→GPU and codec-only changes preserve the epoch. Same-size origin
 changes renew it; old encoded output and old input releases cannot acquire the
