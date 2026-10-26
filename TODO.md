@@ -220,6 +220,8 @@
 - [x] Apple 呈现与输入完整代码切片：VideoConfig epoch 绑定解码/呈现令牌；Metal drawable 真正呈现且 presentedTime>0 才启用新输入 surface，迟到回调校验 runtime/stream/config/epoch。Mac/iOS 按键、IME、手势和延迟长按捕获原 context，纯画质重配同 target 不释放；重连在 FFI callback 同步退役旧流，支持新认证会话较小 epoch/stream，旧 callback 不清新 runtime。Python DL2 合同74项通过（其中呈现10、输入捕获9）；Swift模型/事件测试已补但本Windows环境未执行。主题 `fix(DL2-013): bind Apple input lifetimes to actual frame presentation`。
 - [ ] 本分支 Windows Host/前端仍有合同隔离点，待媒体/产品分支接通整合；FFI Mac Host 完整捕获拓扑身份、Swift6编译、真机呈现/输入/跨设备验收仍缺。以上是代码/本地合成证明，不是013整体验收。
 
+- [x] 新认证会话与熵源补充：每个新 Noise 即使 stream/尺寸复用也取得不同随机起点序列中的 context；RNG 使用 try_fill_bytes，错误/零值/MAX 初始化失败均明确拒绝并缓存，无panic/回落1。新增合成熵源边界与真实 relay generation 切换回归；修复夹具无截止等待后新Noise回环0.70s通过，本分支完整FFI 62项通过。主题 `fix(DL2-013): fail closed on epoch entropy errors and verify reconnect identity`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

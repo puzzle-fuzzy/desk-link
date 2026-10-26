@@ -38,19 +38,35 @@ const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // bounded event path nonblocking while guaranteeing room for ReleaseAll, Error, and Closed.
 const TERMINAL_EVENT_RESERVE: usize = 3;
 
-static INPUT_EPOCH_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+static INPUT_EPOCH_COUNTER: OnceLock<Result<AtomicU64, ()>> = OnceLock::new();
 
 fn allocate_input_epoch() -> Result<u64, HostError> {
-    let counter = INPUT_EPOCH_COUNTER.get_or_init(|| {
-        let seed = loop {
-            let seed = OsRng.next_u64();
-            if seed != 0 && seed != u64::MAX {
-                break seed;
-            }
-        };
-        AtomicU64::new(seed)
-    });
+    allocate_input_epoch_with(&INPUT_EPOCH_COUNTER, |bytes| {
+        OsRng.try_fill_bytes(bytes).map_err(|_| ())
+    })
+}
+
+fn allocate_input_epoch_with(
+    counter: &OnceLock<Result<AtomicU64, ()>>,
+    fill_random: impl FnOnce(&mut [u8]) -> Result<(), ()>,
+) -> Result<u64, HostError> {
+    let initialized = counter.get_or_init(|| initialize_input_epoch_counter(fill_random));
+    let counter = initialized
+        .as_ref()
+        .map_err(|_| HostError::Protocol("host input epoch initialization failed".into()))?;
     advance_input_epoch(counter)
+}
+
+fn initialize_input_epoch_counter(
+    fill_random: impl FnOnce(&mut [u8]) -> Result<(), ()>,
+) -> Result<AtomicU64, ()> {
+    let mut bytes = [0_u8; 8];
+    fill_random(&mut bytes)?;
+    let seed = u64::from_le_bytes(bytes);
+    if seed == 0 || seed == u64::MAX {
+        return Err(());
+    }
+    Ok(AtomicU64::new(seed))
 }
 
 fn advance_input_epoch(counter: &AtomicU64) -> Result<u64, HostError> {
@@ -1162,18 +1178,63 @@ fn crypto_error(error: desklink_crypto::CryptoError) -> HostError {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicU8, AtomicU64, Ordering},
     };
 
     use super::{
         HostCommand, HostError, HostEvent, HostState, PublishedVideoConfig, VideoState,
-        WorkerPhase, advance_input_epoch, command_is_admissible, contains_idr, emit_nonterminal,
-        emit_required, emit_terminal, is_retryable_host_error, record_terminal_admission,
-        try_advance_worker_phase, wait_for_approval_with_timeout,
+        WorkerPhase, advance_input_epoch, allocate_input_epoch_with, command_is_admissible,
+        contains_idr, emit_nonterminal, emit_required, emit_terminal, is_retryable_host_error,
+        record_terminal_admission, try_advance_worker_phase, wait_for_approval_with_timeout,
     };
     use ed25519_dalek::SigningKey;
     use tokio::sync::{mpsc, watch};
+
+    #[test]
+    fn epoch_seed_rejects_zero_maximum_and_entropy_errors_without_fallback_or_retry() {
+        let expected = HostError::Protocol("host input epoch initialization failed".into());
+        for seed in [0_u64, u64::MAX] {
+            let counter = OnceLock::new();
+            let result = allocate_input_epoch_with(&counter, |bytes| {
+                bytes.copy_from_slice(&seed.to_le_bytes());
+                Ok(())
+            });
+            assert_eq!(result, Err(expected.clone()));
+            assert_eq!(
+                allocate_input_epoch_with(&counter, |_| panic!(
+                    "failed initialization must stay failed"
+                )),
+                Err(expected.clone())
+            );
+        }
+        let counter = OnceLock::new();
+        let result = allocate_input_epoch_with(&counter, |bytes| {
+            bytes.copy_from_slice(&42_u64.to_le_bytes());
+            Err(())
+        });
+        assert_eq!(result, Err(expected.clone()));
+        assert_eq!(
+            allocate_input_epoch_with(&counter, |_| panic!("entropy failure must not be retried")),
+            Err(expected)
+        );
+    }
+
+    #[test]
+    fn valid_epoch_seed_is_read_once_and_then_checked_monotonically() {
+        let counter = OnceLock::new();
+        assert_eq!(
+            allocate_input_epoch_with(&counter, |bytes| {
+                bytes.copy_from_slice(&42_u64.to_le_bytes());
+                Ok(())
+            }),
+            Ok(43)
+        );
+        assert_eq!(
+            allocate_input_epoch_with(&counter, |_| panic!("seed must not be regenerated")),
+            Ok(44)
+        );
+    }
 
     #[test]
     fn epoch_allocator_is_shared_across_video_state_and_refuses_to_wrap() {
