@@ -162,18 +162,46 @@ async fn account_restore(
     app: AppHandle,
     manager: State<'_, AccountManager>,
     host_manager: State<'_, HostManager>,
+    operation_generation: u64,
 ) -> Result<AccountSnapshot, String> {
-    let snapshot = match manager.restore().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            host_manager.restart(app).await;
-            return Err(error);
-        }
-    };
-    // Account login is optional. The host must be available for local-mode
-    // users and for inbound control before the account screen is completed.
-    host_manager.restart(app).await;
-    Ok(snapshot)
+    let result = manager.restore(operation_generation).await;
+    if !matches!(&result, Ok(snapshot) if snapshot.signed_in) {
+        // Local sharing does not require an account. Preserve startup when
+        // signed out/offline, while a newer view can still cancel this restart.
+        host_manager
+            .restart_if_account_current(app, manager.operation_owner(), operation_generation)
+            .await?;
+    }
+    result
+}
+
+#[tauri::command]
+async fn account_cancel_operation(
+    manager: State<'_, AccountManager>,
+    operation_generation: u64,
+) -> Result<(), String> {
+    manager.cancel_operation(operation_generation)
+}
+
+#[tauri::command]
+async fn account_accept_operation(
+    app: AppHandle,
+    manager: State<'_, AccountManager>,
+    host_manager: State<'_, HostManager>,
+    operation_generation: u64,
+) -> Result<(), String> {
+    manager.accept_operation(operation_generation)?;
+    host_manager
+        .restart_if_account_current(app, manager.operation_owner(), operation_generation)
+        .await
+}
+
+#[tauri::command]
+async fn account_finish_operation(
+    manager: State<'_, AccountManager>,
+    operation_generation: u64,
+) -> Result<(), String> {
+    manager.finish_operation(operation_generation)
 }
 
 #[tauri::command]
@@ -181,8 +209,11 @@ async fn account_register(
     manager: State<'_, AccountManager>,
     email: String,
     password: String,
+    operation_generation: u64,
 ) -> Result<(), String> {
-    manager.register(email, password).await
+    manager
+        .register(email, password, operation_generation)
+        .await
 }
 
 #[tauri::command]
@@ -197,29 +228,30 @@ async fn account_verify_email(
 async fn account_resend_verification(
     manager: State<'_, AccountManager>,
     email: String,
+    operation_generation: u64,
 ) -> Result<(), String> {
-    manager.resend_verification(email).await
+    manager
+        .resend_verification(email, operation_generation)
+        .await
 }
 
 #[tauri::command]
 async fn account_login(
-    app: AppHandle,
     manager: State<'_, AccountManager>,
-    host_manager: State<'_, HostManager>,
     email: String,
     password: String,
+    operation_generation: u64,
 ) -> Result<AccountSnapshot, String> {
-    let snapshot = manager.login(email, password).await?;
-    host_manager.restart(app).await;
-    Ok(snapshot)
+    manager.login(email, password, operation_generation).await
 }
 
 #[tauri::command]
 async fn account_forgot_password(
     manager: State<'_, AccountManager>,
     email: String,
+    operation_generation: u64,
 ) -> Result<(), String> {
-    manager.forgot_password(email).await
+    manager.forgot_password(email, operation_generation).await
 }
 
 #[tauri::command]
@@ -1676,6 +1708,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             account_restore,
+            account_cancel_operation,
+            account_accept_operation,
+            account_finish_operation,
             account_register,
             account_verify_email,
             account_resend_verification,
