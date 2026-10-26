@@ -3100,8 +3100,9 @@ async fn receive_transfer_loop_inner(
                 if incoming
                     .as_ref()
                     .is_some_and(|file| file.transfer_id() == transfer_id)
+                    && let Some(file) = incoming.take()
                 {
-                    if let Some(file) = incoming.take() { file.cancel(); }
+                    file.cancel();
                 }
                 if outgoing
                     .as_ref()
