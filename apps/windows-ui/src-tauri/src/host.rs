@@ -361,6 +361,30 @@ impl HostManager {
         self.start_normal_worker(app, generation);
     }
 
+    /// Account IPC may wait for a previous Host shutdown. Recheck ownership
+    /// after that wait and serialize the final spawn with view cancellation.
+    pub async fn restart_if_account_current(
+        &self,
+        app: AppHandle,
+        owner: crate::account::AccountOperationOwner,
+        operation_generation: u64,
+    ) -> Result<(), String> {
+        let _restart = self.restart_lock.lock().await;
+        let generation =
+            owner.with_current(
+                operation_generation,
+                || Ok(self.next_lifecycle_generation()),
+            )?;
+        owner
+            .after_wait(operation_generation, self.stop_current(), || {
+                self.set_pairing_active(false);
+                self.publish_if_current(&app, generation, HostRuntimeSummary::starting());
+                self.start_normal_worker(app, generation);
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn start_pairing(&self, app: AppHandle) -> Result<PairingSessionSummary, String> {
         let _restart = self.restart_lock.lock().await;
         let generation = self.next_lifecycle_generation();

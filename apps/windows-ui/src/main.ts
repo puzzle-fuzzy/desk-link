@@ -8,6 +8,9 @@ import { getVersion } from "@tauri-apps/api/app";
 
 import {
   accountForgotPassword,
+  accountCancelOperation,
+  accountAcceptOperation,
+  accountFinishOperation,
   accountLogin,
   accountLogout,
   accountRegister,
@@ -78,6 +81,7 @@ import { hostSnapshotPresentationChanged } from "./host-snapshot-presentation";
 import { approvalNeedsFocus, approvalTabFocusIndex } from "./approval-focus";
 import { WindowsUpdater, windowsUpdateProgressLabel } from "./windows-update";
 import { AccountFormDraft } from "./account-form-draft";
+import { AccountOperations } from "./account-operation";
 
 type View = "controller" | "connection" | "devices" | "pairing" | "fixedAccess" | "settings" | "about";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -149,6 +153,7 @@ let accountBusy = false;
 let accountNotice: string | null = null;
 let accountCanResendVerification = false;
 const accountDraft = new AccountFormDraft();
+const accountOperations = new AccountOperations();
 let accountErrorField: "email" | "password" | "confirmation" | null = null;
 let snapshotRecoveryTimer: number | null = null;
 const workspaceHostEvents = ["host-runtime-changed", "host-approval-changed"] as const;
@@ -248,6 +253,7 @@ function bindAccountInteractions(): void {
   const selectAccountMode = (button: HTMLButtonElement): void => {
     const mode = button.dataset.accountMode;
     if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
+    invalidateAccountOperation();
     accountMode = mode;
     accountDraft.clearSecrets();
     accountError = null;
@@ -283,6 +289,8 @@ function bindAccountInteractions(): void {
 }
 
 async function enterAccountLocalMode(): Promise<void> {
+  const cancelled = invalidateAccountOperation();
+  const operation = accountOperations.begin("local");
   accountDraft.leave();
   accountLocalMode = true;
   accountError = null;
@@ -290,7 +298,10 @@ async function enterAccountLocalMode(): Promise<void> {
   setAccountLocalModeEnabled(true);
   render();
   try {
+    await cancelled;
+    if (!accountOperations.current(operation)) return;
     await restartHost();
+    if (!accountOperations.current(operation)) return;
     await startWorkspace();
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
@@ -307,17 +318,30 @@ async function resendVerification(): Promise<void> {
     return;
   }
   accountBusy = true;
+  const operation = accountOperations.begin("resend");
   accountError = null;
   render();
   try {
-    await accountResendVerification(email);
+    await accountResendVerification(email, operation.generation);
+    if (!accountOperations.current(operation)) return;
     accountNotice = "验证邮件已重新发送，请检查收件箱。";
   } catch (error) {
+    if (!accountOperations.current(operation)) return;
     accountError = normalizeError(error);
   } finally {
-    accountBusy = false;
-    render();
+    if (accountOperations.current(operation)) {
+      accountBusy = false;
+      render();
+    }
   }
+}
+
+function invalidateAccountOperation(): Promise<void> {
+  accountBusy = false;
+  const generation = accountOperations.invalidate();
+  return accountCancelOperation(generation).catch((error) => {
+    if (accountOperations.current({ generation, action: "cancel" })) accountError = normalizeError(error);
+  });
 }
 
 async function submitAccount(form: HTMLFormElement): Promise<void> {
@@ -334,36 +358,48 @@ async function submitAccount(form: HTMLFormElement): Promise<void> {
     return;
   }
   accountBusy = true;
+  const operation = accountOperations.begin(accountMode);
   accountError = null;
   accountNotice = null;
   render();
   try {
-    if (accountMode === "login") {
-      account = await accountLogin(email, password);
-      if (account.signedIn) {
+    if (operation.action === "login") {
+      const result = await accountLogin(email, password, operation.generation);
+      if (!accountOperations.current(operation)) return;
+      if (result.signedIn) {
+        await accountAcceptOperation(operation.generation);
+        if (!accountOperations.current(operation)) return;
+        await accountFinishOperation(operation.generation);
+        if (!accountOperations.current(operation)) return;
+        account = result;
         accountDraft.leave();
         accountLocalMode = false;
         setAccountLocalModeEnabled(false);
         await startWorkspace();
       }
-    } else if (accountMode === "register") {
-      await accountRegister(email, password);
+    } else if (operation.action === "register") {
+      await accountRegister(email, password, operation.generation);
+      if (!accountOperations.current(operation)) return;
       accountDraft.registered(email);
       accountMode = "login";
       accountNotice = "验证邮件已发送，请完成邮箱验证后再登录。";
       accountCanResendVerification = true;
     } else {
-      await accountForgotPassword(email);
+      await accountForgotPassword(email, operation.generation);
+      if (!accountOperations.current(operation)) return;
       accountDraft.clearSecrets();
       accountMode = "login";
       accountNotice = "如果邮箱已注册，重置密码邮件会很快送达。";
       accountCanResendVerification = false;
     }
   } catch (error) {
+    if (!accountOperations.current(operation)) return;
     accountError = normalizeError(error);
   } finally {
-    accountBusy = false;
-    render();
+    if (accountOperations.current(operation)) {
+      accountBusy = false;
+      render();
+    }
   }
 }
 
@@ -2263,8 +2299,15 @@ function randomHex(byteLength: number): string {
 
 async function bootstrap(): Promise<void> {
   startWindowsUpdateChecks();
+  const operation = accountOperations.begin("restore");
   try {
-    account = await accountRestore();
+    const result = await accountRestore(operation.generation);
+    if (!accountOperations.current(operation)) return;
+    if (result.signedIn) await accountAcceptOperation(operation.generation);
+    if (!accountOperations.current(operation)) return;
+    await accountFinishOperation(operation.generation);
+    if (!accountOperations.current(operation)) return;
+    account = result;
     accountLocalMode = shouldStartInLocalMode(account.signedIn);
   } catch (error) {
     accountError = normalizeError(error);

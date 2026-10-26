@@ -342,7 +342,8 @@
 
 ### DL2-035 · P2 · 隔离账号迟到响应与用户后续选择
 
-- [ ] 为账号动作增加操作类型、请求代数和视图所有权。
+- [x] 为账号动作增加操作类型、请求代数和视图所有权。
+- **修复 / 自动验证：** `fix(DL2-035): bind account persistence and Host restart to operation ownership`；前端捕获动作/邮箱/代数，切模式或本机模式使旧结果失效；原生登录先暂存，accept/finish 分阶段确认，取消时回滚尚未接受的落盘；Host 等待停止后再次复核所有权，保留未登录启动共享。Bun 1.3.14 账号/更新宿主相关测试 11 通过、生产构建通过；`python scripts/run-windows-cargo.py test -p desklink-windows-ui --lib --locked` 98 通过、1 签名包资产测试忽略，含 8 项新增延迟 HTTP、DPAPI 存储、连续重试、旧 logout 与 Host 等待守卫测试。未向真实账号服务写入。
 - **证据 / 类型：源码缺陷。** `apps/windows-ui/src/main.ts:211-223` 请求中仍能切换模式/进入本机模式，`327-349` 和 `295-302` 的完成结果未校验代数。迟到注册可切回登录，迟到登录可覆盖本机模式选择并再次初始化 workspace。
 - **原生副作用：** `apps/windows-ui/src-tauri/src/account.rs:169-201` 在登录响应后保存会话，`apps/windows-ui/src-tauri/src/lib.rs:205-214` 随后重启 Host；只丢弃前端结果仍无法隔离这两步。
 - **方案：** 请求捕获不可变的动作/邮箱/代数；切换使旧结果失效，必要时取消底层请求；原生持久化和重启 Host 前同样复核操作所有权。对已完成但用户已离开的登录明确处理本机会话，不直接使用会清空远控记录的 account_logout 作为补偿；不要求用户留在等待页，也不重复订阅 workspace。
