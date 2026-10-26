@@ -208,10 +208,11 @@
 - **验证：** Windows lib 128通过/2忽略，含7拓扑和4注入/发布帮助器回归；严格lib+tests Clippy通过；补充编码器准备后OS快照复核后再跑 `--lib topology --locked` 11通过。所有输入用记录/阻塞合成后端，无真实注入或远控。
 - [ ] **严格上下文/真机仍待：** 目前wire无拓扑标记，发布后才迟到的旧包（含release）不能严格识别；等待统一input_epoch契约，不以本机seq/timestamp代替。热插拔/旋转/DPI/睡眠及资源/帧龄实测继续未完成。
 
-## 4. 性能与数据通道
-
 - [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
+- [x] Windows 共享 Rust API 来源切片 `feat(DL2-013): expose the captured-context runtime input bridge`：准确提取 Apple 已提交 `9ad7154b365de875d725188cfa091f5c21da0b5a` 的 ControllerRuntime::send_input_with_context(&self, InputContext, InputEvent)、必要 import、旧 send_input 明确拒绝及 encrypted controller_runtime 回归；未引入 C/Swift/worker 队列依赖。唯一必要前置为 `bc6c0a62` 的共享合同。`python scripts/run-windows-cargo.py test -p desklink-ffi --test controller_runtime --locked` 5 通过，包含真实加密输入传输；不表示主机/呈现/生产者整链已接通。
 - [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
+
+## 4. 性能与数据通道
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
