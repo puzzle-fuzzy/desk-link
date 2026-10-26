@@ -64,6 +64,9 @@ mod incoming_file;
 use incoming_file::{
     INCOMING_EVENT_CAPACITY, IncomingFileEvent, IncomingFileEventKind, IncomingFilePipeline,
 };
+#[path = "controller-handshake-budget.rs"]
+mod handshake_budget;
+use handshake_budget::HandshakeResponseBudget;
 
 const COMMAND_CAPACITY: usize = 512;
 const MAX_BUFFERED_POINTER_MOVES: usize = 8;
@@ -2407,6 +2410,7 @@ async fn run_controller(
         set_session_correlation(DiagnosticSource::Controller, settings.session_id()).ok();
     let host_device_id = settings.host_device_id();
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+    let mut handshake_budget = HandshakeResponseBudget::default();
     let mut attempt = 0_u32;
     let mut audio_enabled = true;
     let mut video_quality = VideoQualityPreference::Sharp;
@@ -2486,8 +2490,12 @@ async fn run_controller(
                     | Some(ControllerCommand::CancelFile) => {}
                 },
                 result = &mut connection => match result {
-                    Ok(runtime) => break runtime,
+                    Ok(runtime) => {
+                        handshake_budget.authenticated();
+                        break runtime;
+                    }
                     Err(failure) => {
+                        let failure = failure.limit_unanswered_handshake(&mut handshake_budget);
                         if !schedule_failure(
                             &manager,
                             &signals,
@@ -4204,6 +4212,19 @@ struct ConnectFailure {
 }
 
 impl ConnectFailure {
+    fn limit_unanswered_handshake(self, budget: &mut HandshakeResponseBudget) -> Self {
+        if self.kind == "handshake_no_response" && !budget.record_no_response() {
+            Self::with_reason(
+                false,
+                "主机的安全握手多次未响应。请确认目标电脑在线、网络可达，并在两台电脑上安装同一个最新版本后重试。",
+                "handshake_no_response",
+                self.technical_reason,
+            )
+        } else {
+            self
+        }
+    }
+
     fn with_reason(
         retryable: bool,
         detail: &'static str,
@@ -4297,6 +4318,14 @@ impl ConnectFailure {
 
     fn from_controller(error: ControllerError) -> Self {
         let technical_reason = error.to_string();
+        if matches!(&error, ControllerError::HandshakeTimeout) {
+            return Self::with_reason(
+                true,
+                "主机的安全握手未响应，DeskLink 将在有限次数内重试。",
+                "handshake_no_response",
+                technical_reason,
+            );
+        }
         if let ControllerError::Protocol(ProtocolError::UnsupportedVersion(_)) = &error {
             return Self::with_reason(
                 false,
@@ -4367,8 +4396,7 @@ impl ConnectFailure {
         }
         let retryable = matches!(
             error,
-            ControllerError::HandshakeTimeout
-                | ControllerError::NegotiationTimeout
+            ControllerError::NegotiationTimeout
                 | ControllerError::Transport(
                     TransportError::Connection(_)
                         | TransportError::ConnectionLimit
@@ -5780,6 +5808,97 @@ mod tests {
         assert!(!failure.retryable);
         assert_eq!(failure.kind, "protocol_version_mismatch");
         assert!(failure.detail.contains("同一个最新版本"));
+    }
+
+    #[test]
+    fn three_unanswered_noise_handshakes_stop_with_an_accurate_terminal_reason() {
+        let mut budget = super::HandshakeResponseBudget::default();
+        for _ in 0..2 {
+            let failure = ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget);
+            assert!(failure.retryable);
+            assert_eq!(failure.kind, "handshake_no_response");
+        }
+        let failure = ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget);
+        assert!(!failure.retryable);
+        assert_eq!(failure.kind, "handshake_no_response");
+        assert!(failure.detail.contains("安全握手多次未响应"));
+        assert!(failure.detail.contains("确认目标电脑在线"));
+        assert!(!failure.detail.contains("不兼容"));
+    }
+
+    #[test]
+    fn fixed_host_offline_and_transport_waits_never_consume_handshake_response_budget() {
+        let mut budget = super::HandshakeResponseBudget::default();
+        for index in 0..100 {
+            let error = if index % 2 == 0 {
+                TransportError::JoinRejected(JoinRejectCode::SessionNotFound)
+            } else {
+                TransportError::Connection("synthetic temporary relay outage".into())
+            };
+            assert!(ConnectFailure::from_transport(error, true)
+                .limit_unanswered_handshake(&mut budget).retryable);
+        }
+        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget).retryable);
+        // Intervening offline periods preserve, but never consume or reset, the
+        // count of actual unanswered handshakes after the peer has joined.
+        for _ in 0..100 {
+            assert!(ConnectFailure::from_transport(
+                TransportError::JoinRejected(JoinRejectCode::SessionNotFound), true,
+            ).limit_unanswered_handshake(&mut budget).retryable);
+        }
+        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget).retryable);
+        assert!(!ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget).retryable);
+    }
+
+    #[test]
+    fn completed_authenticated_connection_resets_only_the_no_response_budget() {
+        let mut budget = super::HandshakeResponseBudget::default();
+        for _ in 0..2 {
+            assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget).retryable);
+        }
+        budget.authenticated();
+        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget).retryable);
+        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget).retryable);
+        assert!(!ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget).retryable);
+    }
+
+    #[tokio::test]
+    async fn exhausted_no_response_budget_stops_persistent_recovery_before_another_wait() {
+        let manager = ControllerManager::default();
+        let generation = manager.begin_operation();
+        let signals = tauri::ipc::Channel::new(|_| Ok(()));
+        let mut budget = super::HandshakeResponseBudget::default();
+        for _ in 0..2 {
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget);
+        }
+        let failure = ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+            .limit_unanswered_handshake(&mut budget);
+        let expected_detail = failure.detail;
+        let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
+        let (_commands, mut receiver) = mpsc::channel(1);
+        let (_cancellation, mut cancellation_receiver) = watch::channel(false);
+        let retry = tokio::time::timeout(Duration::from_millis(200), super::schedule_failure(
+            &manager, &signals, &mut schedule, failure,
+            super::ControllerWaitChannels {
+                generation, persistent: true, commands: &mut receiver,
+                cancellation: &mut cancellation_receiver,
+            },
+            None, 3,
+        )).await.expect("silent handshakes must stop before another persistent retry wait");
+        assert!(!retry);
+        assert_eq!(manager.snapshot().state, "stopped");
+        assert_eq!(manager.snapshot().detail, expected_detail);
+        assert_eq!(schedule.retries_used(), 0);
     }
 
     #[test]

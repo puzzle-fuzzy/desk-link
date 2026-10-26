@@ -149,6 +149,7 @@
 - [x] 输入反馈切片 `feat(DL2-009): report sustained input restrictions without disconnecting`：当前认证会话内按输入类别累计三次同因失败，去重发送有界最新状态；释放/零输入和其他类别成功不误清警，真实同类恢复后自动清除。发送等待独立于输入处理；控制端仅更新提示，不改连接状态，断开/新 stream 清旧提示。Windows 库 102 通过、1 交互桌面测试忽略；管理库 113 通过、1 签名资产忽略（含稳定 signal 回归）；前端 312 项全过，构建通过。权限边界见 `docs/windows-input-restriction-protocol13.md`，均未冒称真实 UAC/锁屏可控。
 - [x] 复用媒体组 `4dabcde` 的输入快路径切片，将输入限制 tracker 迁入 receive_host_input，保留独立有界反馈发送 future，慢配置不阻塞输入。整合后 Windows 库 107 通过、1 桌面忽略，管理库 123 通过、1 签名资产忽略；包含慢配置、输入反馈取消及结束控制回归。
 - [ ] 新旧直接/保存连接静默握手的有界退出与提示、持续输入失败汇总/恢复、前端提示及真实权限场景验收。
+- [x] 静默握手预算切片 `fix(DL2-009): bound unanswered native handshakes independently of offline retries`：仅已建 peer 的 HandshakeTimeout 累计三次后终止；离线传输失败不消耗预算，认证成功重置。稳定原因是 handshake_no_response，准确提示检查在线、网络和两端版本，不推断已证实不兼容；FFI 保留现有六次重试预算。生产分类/离线/认证/持久连接测试通过；最终管理库 123 通过、1 签名资产忽略，Windows 库 107 通过、1 桌面忽略。
 - **证据 / 类型：源码缺陷、能力边界。** `apps/windows/src/input.rs:306-326` 返回 Blocked；`apps/windows/src/runtime.rs:2714-2723` 把 Blocked / UnsupportedKey / InvalidInput 都转为 Ok。`apps/windows/assets/desklink.manifest:8` 为 asInvoker、uiAccess=false。
 - **用户影响：** 输入持续失败时，控制端仍只看到已连接；无法区分权限限制、不支持的键或远端没有响应。
 - **方案：** 临时失败保留会话，持续失败按稳定原因汇总反馈并自动解除；对普通桌面、管理员窗口、UAC、安全桌面、锁屏分别定义支持范围；需要提权或受信服务时采用明确的本机授权流程。
