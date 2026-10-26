@@ -119,6 +119,11 @@ private enum SessionRestoreFailure: Error {
     case invalidRefreshToken
 }
 
+private struct ValidatedAccountSession {
+    let session: StoredAccountSession
+    let tokensCheckpointed: Bool
+}
+
 @MainActor
 public final class AccountClient: ObservableObject {
     @Published public private(set) var state: AccountState = .loading
@@ -179,13 +184,13 @@ public final class AccountClient: ObservableObject {
                 storedSession = try JSONDecoder().decode(StoredAccountSession.self, from: data)
             }
             guard let current = storedSession else { return }
-            let restored = try await validateSession(current, generation: generation)
+            let validated = try await validateSession(current, generation: generation)
             try checkGeneration(generation)
-            // Refresh tokens rotate. Keep the received pair in memory even if
-            // Keychain is temporarily unavailable, so retry does not replay it.
-            storedSession = restored
-            try save(session: restored)
-            state = .signedIn(restored.user)
+            if !validated.tokensCheckpointed {
+                storedSession = validated.session
+                try save(session: validated.session)
+            }
+            state = .signedIn(validated.session.user)
         } catch {
             guard sessionGeneration == generation else { return }
             if let failure = error as? SessionRestoreFailure, case .invalidRefreshToken = failure {
@@ -341,27 +346,32 @@ public final class AccountClient: ObservableObject {
     }
 #endif
 
-    private func validateSession(_ current: StoredAccountSession, generation: UInt64) async throws -> StoredAccountSession {
+    private func validateSession(_ current: StoredAccountSession, generation: UInt64) async throws -> ValidatedAccountSession {
         var candidate = current
         do {
             let data = try await request(path: "v1/account/me", method: "GET", body: nil, accessToken: current.tokens.accessToken)
             try checkGeneration(generation)
             candidate.user = try JSONDecoder().decode(MeResponse.self, from: data).user
+            return ValidatedAccountSession(session: candidate, tokensCheckpointed: false)
         } catch {
             try checkGeneration(generation)
             guard let failure = error as? AccountClientError, failure.isInvalidToken else { throw error }
             do {
                 candidate.tokens = try await refreshTokens(current.tokens.refreshToken)
+                // The server has consumed the old refresh token. Do not discard
+                // a valid replacement merely because the caller was cancelled.
+                try checkpointRefreshedSession(candidate, generation: generation)
                 try checkGeneration(generation)
+                return ValidatedAccountSession(session: candidate, tokensCheckpointed: true)
             } catch {
-                try checkGeneration(generation)
+                try checkSessionGeneration(generation)
                 if let failure = error as? AccountClientError, failure.isInvalidToken {
+                    try Task.checkCancellation()
                     throw SessionRestoreFailure.invalidRefreshToken
                 }
                 throw error
             }
         }
-        return candidate
     }
 
     private func refreshTokens(_ refreshToken: String) async throws -> AccountTokens {
@@ -369,12 +379,21 @@ public final class AccountClient: ObservableObject {
             path: "v1/account/refresh",
             method: "POST",
             body: ["refreshToken": refreshToken],
-            accessToken: nil
+            accessToken: nil,
+            preserveSuccessfulRefreshResponse: true
         )
         struct RefreshResponse: Codable { let tokens: AccountTokens }
         let response = try JSONDecoder().decode(RefreshResponse.self, from: data)
         try response.tokens.validate()
         return response.tokens
+    }
+
+    private func checkpointRefreshedSession(_ session: StoredAccountSession, generation: UInt64) throws {
+        try checkSessionGeneration(generation)
+        // Keep the replacement in memory even if Keychain is unavailable.
+        // A later restore then retries with this pair instead of replaying the old one.
+        storedSession = session
+        try save(session: session)
     }
 
     private func advanceSessionGeneration() -> UInt64 {
@@ -387,6 +406,10 @@ public final class AccountClient: ObservableObject {
 
     private func checkGeneration(_ generation: UInt64) throws {
         try Task.checkCancellation()
+        try checkSessionGeneration(generation)
+    }
+
+    private func checkSessionGeneration(_ generation: UInt64) throws {
         guard generation == sessionGeneration else { throw CancellationError() }
     }
 
@@ -419,7 +442,8 @@ public final class AccountClient: ObservableObject {
         path: String,
         method: String,
         body: [String: String]?,
-        accessToken: String?
+        accessToken: String?,
+        preserveSuccessfulRefreshResponse: Bool = false
     ) async throws -> Data {
         guard baseURL.scheme != nil, baseURL.host != nil else {
             throw AccountClientError.invalidConfiguration
@@ -436,10 +460,15 @@ public final class AccountClient: ObservableObject {
         do {
             try Task.checkCancellation()
             let (data, response) = try await transport.data(for: request)
-            try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse else {
+                try Task.checkCancellation()
                 throw AccountClientError.network("账号服务返回了无效响应。")
             }
+            // Only a complete, successful token-rotation response may cross
+            // cancellation. Other commands retain their normal cancellation behavior.
+            let keepRotation = preserveSuccessfulRefreshResponse
+                && path == "v1/account/refresh" && (200..<300).contains(http.statusCode)
+            if !keepRotation { try Task.checkCancellation() }
             guard (200..<300).contains(http.statusCode) else {
                 let body = try? JSONDecoder().decode(APIErrorResponse.self, from: data)
                 let message = body?.message

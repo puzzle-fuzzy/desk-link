@@ -75,9 +75,10 @@ class AppleAccountRestoreContractTests(unittest.TestCase):
             self.assertIn("advanceSessionGeneration()", block(client, method))
         fence = block(client, "private func checkGeneration(")
         self.assertIn("Task.checkCancellation()", fence)
-        self.assertRegex(fence, r"generation\s*==\s*sessionGeneration")
+        self.assertIn("checkSessionGeneration(generation)", fence)
+        self.assertRegex(block(client, "private func checkSessionGeneration("), r"generation\s*==\s*sessionGeneration")
         restore = block(client, "public func restore()")
-        self.assertLess(restore.index("checkGeneration(generation)"), restore.index("storedSession = restored"))
+        self.assertLess(restore.index("checkGeneration(generation)"), restore.index("storedSession = validated.session"))
         logout = block(client, "public func logout()")
         self.assertLess(logout.index("clearLocalSession()"), logout.index("await request("))
 
@@ -85,7 +86,7 @@ class AppleAccountRestoreContractTests(unittest.TestCase):
         restore = block(read(CLIENT), "public func restore()")
         self.assertRegex(restore, r"guard\s+!isRestoring,\s*!isBusy")
         self.assertNotIn("guard storedSession == nil", restore)
-        self.assertLess(restore.index("storedSession = restored"), restore.index("save(session: restored)"))
+        self.assertLess(restore.index("storedSession = validated.session"), restore.index("save(session: validated.session)"))
         self.assertIn("restoringGeneration == generation", restore)
 
     def test_keychain_failure_is_reported_instead_of_erasing_in_memory_state(self):
@@ -113,6 +114,30 @@ class AppleAccountRestoreContractTests(unittest.TestCase):
         self.assertNotIn("URLSession.shared", tests)
         for scenario in ["testTransientMeFailures", "testOnlyExplicitInvalidRefreshToken", "testOfflineSessionCanRetry", "testConcurrentRestoreIsSingleFlight", "testNewLoginSurvivesOldRefresh", "testCancelledRefreshEvenWithInvalidation", "testRotatedTokensRemainInMemory"]:
             self.assertIn(scenario, tests)
+
+    def test_only_complete_successful_refresh_reply_may_cross_cancellation(self):
+        client = read(CLIENT)
+        request = block(client, "private func request(")
+        rotation = request.split("let keepRotation", 1)[1].split("if !keepRotation", 1)[0]
+        self.assertIn('path == "v1/account/refresh"', rotation)
+        self.assertIn("(200..<300).contains(http.statusCode)", rotation)
+        self.assertRegex(request, r"if !keepRotation\s*\{\s*try Task.checkCancellation\(\)")
+        self.assertEqual(client.count("preserveSuccessfulRefreshResponse: true"), 1)
+        self.assertIn("preserveSuccessfulRefreshResponse: true", block(client, "private func refreshTokens("))
+
+    def test_rotated_pair_is_checkpointed_before_cancel_with_generation_only_fence(self):
+        client = read(CLIENT)
+        checkpoint = block(client, "private func checkpointRefreshedSession(")
+        self.assertNotIn("Task.checkCancellation", checkpoint)
+        self.assertLess(checkpoint.index("checkSessionGeneration(generation)"), checkpoint.index("storedSession = session"))
+        self.assertLess(checkpoint.index("storedSession = session"), checkpoint.index("save(session: session)"))
+        rotation = block(client, "private func validateSession(").split("candidate.tokens = try await refreshTokens", 1)[1]
+        self.assertLess(rotation.index("checkpointRefreshedSession("), rotation.index("checkGeneration(generation)"))
+        self.assertIn("tokensCheckpointed: true", rotation)
+        tests = read(ROOT / "apps/apple/Tests/DeskLinkAppleCoreTests/AccountRestoreTests.swift")
+        self.assertIn("testCancelledSuccessfulRotationRetainsReplacementEvenIfKeychainWriteFails", tests)
+        self.assertIn("testCancelledOldRotationCannotCheckpointOverNewLogin", tests)
+        self.assertIn("testCancelledOldRotationCannotResurrectLoggedOutCredential", tests)
 
 
 if __name__ == "__main__":

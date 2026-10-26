@@ -227,6 +227,80 @@ final class AccountRestoreTests: XCTestCase {
         XCTAssertFalse(AccountClientError.server("token_invalid").isInvalidToken)
     }
 
+    func testCancelledSuccessfulRotationRetainsReplacementEvenIfKeychainWriteFails() async throws {
+        for failWrite in [false, true] {
+            let gate = AccountTestGate()
+            let store = AccountTestKeychain(session: sessionBody())
+            store.failWrites = failWrite
+            let transport = AccountTestTransport([
+                .response(401, errorBody("token_invalid")), .suspended(200, refreshBody(prefix: "rotated-a"), gate),
+                .response(200, meBody()),
+            ])
+            let client = makeClient(store, transport)
+            let pending = Task { await client.restore() }
+            await gate.waitUntilEntered()
+            pending.cancel()
+            await gate.release()
+            await pending.value
+            XCTAssertEqual(client.state, .offline(userA))
+            XCTAssertEqual(store.deleteAttempts, 0)
+            if failWrite {
+                XCTAssertEqual(store.sessionData, sessionBody())
+            } else {
+                let saved = try XCTUnwrap(store.sessionData)
+                let object = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
+                let pair = try XCTUnwrap(object["tokens"] as? [String: Any])
+                XCTAssertEqual(pair["refreshToken"] as? String, "rotated-a-refresh")
+            }
+            store.failWrites = false
+            await client.restore()
+            XCTAssertEqual(client.state, .signedIn(userA))
+            let authorizations = await transport.authorizations()
+            XCTAssertEqual(authorizations.last ?? nil, "Bearer rotated-a-access")
+            let paths = await transport.paths()
+            XCTAssertEqual(paths, ["/v1/account/me", "/v1/account/refresh", "/v1/account/me"])
+        }
+    }
+
+    func testCancelledOldRotationCannotCheckpointOverNewLogin() async {
+        let gate = AccountTestGate()
+        let store = AccountTestKeychain(session: sessionBody())
+        let transport = AccountTestTransport([
+            .response(401, errorBody("token_invalid")), .suspended(200, refreshBody(prefix: "rotated-a"), gate),
+            .response(200, loginBody()),
+        ])
+        let client = makeClient(store, transport)
+        let pending = Task { await client.restore() }
+        await gate.waitUntilEntered()
+        pending.cancel()
+        await client.login(email: userB.email, password: "synthetic-password-not-used")
+        let replacement = store.sessionData
+        await gate.release()
+        await pending.value
+        XCTAssertEqual(client.state, .signedIn(userB))
+        XCTAssertEqual(store.sessionData, replacement)
+        XCTAssertNil(client.lastError)
+        XCTAssertEqual(store.deleteAttempts, 0)
+    }
+
+    func testCancelledOldRotationCannotResurrectLoggedOutCredential() async {
+        let gate = AccountTestGate()
+        let store = AccountTestKeychain(session: sessionBody())
+        let transport = AccountTestTransport([
+            .response(401, errorBody("token_invalid")), .suspended(200, refreshBody(prefix: "rotated-a"), gate),
+            .response(200, Data("{}".utf8)),
+        ])
+        let client = makeClient(store, transport)
+        let pending = Task { await client.restore() }
+        await gate.waitUntilEntered()
+        pending.cancel()
+        await client.logout()
+        await gate.release()
+        await pending.value
+        XCTAssertEqual(client.state, .signedOut)
+        XCTAssertNil(store.sessionData)
+    }
+
     private var userA: AccountUser { AccountUser(id: "synthetic-a", email: "a@example.invalid", emailVerified: true) }
     private var userB: AccountUser { AccountUser(id: "synthetic-b", email: "b@example.invalid", emailVerified: true) }
 

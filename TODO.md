@@ -539,6 +539,8 @@
 - [x] Windows 静态验证：`python -m unittest scripts.tests.test_dl2_apple_account_restore_contract -v`，8 项协议与源码合同通过；`git diff --check` 通过。新增 Swift mock transport + Keychain spy 行为用例覆盖断网、5xx、429、明确失效、重试、并发恢复、迟到响应、取消和持久化错误，全为合成数据且不访问真实服务 / 系统 Keychain。
 - [ ] Apple 自动 / 真机：Windows 无 Swift/AppKit/UIKit，新增行为用例尚未运行；断网启动、真实 Keychain 锁定 / 恢复、账号服务恢复后一键重试及明确失效后的重新登录仍需 Mac/iOS 验收，不能以源码合同代替。
 
+- [x] 取消与 refresh 旋转跟进：只允许已完整收到的 refresh 2xx 在取消后继续验证；按 session generation 检查并先保留新令牌到内存及 Keychain，再表现取消。Keychain 失败仍保留内存新 pair 供重试，旧 generation 的响应不能覆盖新登录或复活已登出会话。`python -m unittest scripts.tests.test_dl2_apple_account_restore_contract -v` 实跑 10 项通过；新增 3 个 Swift 方法（取消成功响应含写成功 / 失败两分支），总 17 个行为测试仍未运行。主题 `fix(DL2-051): checkpoint rotated refresh tokens before honoring cancellation`。
+
 ### DL2-059 · P2 · Mac Host 把未知事件当致命错误，Transfer 流量会拆掉主机会话
 
 - [ ] 未知事件 kind 显式忽略并计数，错误只能由显式 error 事件表达。
