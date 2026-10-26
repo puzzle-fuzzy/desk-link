@@ -205,18 +205,26 @@ pub struct DirectLanProbeResult {
 pub struct DirectLanConnection {
     connection: quinn::Connection,
     candidate_id: u64,
+    session_binding: [u8; 16],
 }
 
 impl DirectLanConnection {
-    fn new(connection: quinn::Connection, candidate_id: u64) -> Self {
+    fn new(connection: quinn::Connection, candidate_id: u64, session_binding: [u8; 16]) -> Self {
         Self {
             connection,
             candidate_id,
+            session_binding,
         }
     }
 
     pub const fn candidate_id(&self) -> u64 {
         self.candidate_id
+    }
+
+    /// Noise binding actually checked by the successful path probe. A data
+    /// plane cannot attach a connection authenticated for a different session.
+    pub const fn session_binding(&self) -> &[u8; 16] {
+        &self.session_binding
     }
 
     pub(crate) fn authenticated_quic_connection(&self) -> quinn::Connection {
@@ -496,7 +504,7 @@ impl DirectLanEndpoint {
             return Err(DirectLanProbeError::Malformed);
         }
         Ok((
-            DirectLanConnection::new(connection, candidate.candidate_id()),
+            DirectLanConnection::new(connection, candidate.candidate_id(), *expected_binding),
             DirectLanProbeResult {
                 candidate_id: candidate.candidate_id(),
                 rtt_ms: started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
@@ -591,7 +599,7 @@ impl DirectLanEndpoint {
         let ciphertext = secure.seal(&response.encode()).await?;
         write_probe(&mut send, &ciphertext).await?;
         Ok((
-            DirectLanConnection::new(connection, request.candidate_id),
+            DirectLanConnection::new(connection, request.candidate_id, *expected_binding),
             DirectLanProbeResult {
                 candidate_id: request.candidate_id,
                 rtt_ms: 0,
@@ -1007,7 +1015,7 @@ mod tests {
                 // video replay window, but is deliberately not written yet.
                 wait_release.await.unwrap();
                 write_probe(&mut send, &encrypted_response).await.unwrap();
-                DirectLanConnection::new(connection, 88)
+                DirectLanConnection::new(connection, 88, binding)
             }
         });
         let initiator_task = tokio::spawn({

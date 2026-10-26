@@ -15,7 +15,7 @@ test -p desklink-windows --lib --tests --locked --quiet
 # 283 passed / 0 failed / 17 ignored
 ```
 
-原始日志是 `E:\desk-link\.worktrees\dl2-targets\lan-runtime-merge-shared.log` 与 `lan-runtime-merge-windows.log`。ignored 保持原有桌面/硬件/线上/手工性能验收条件，未计作通过。上述只证明来源整合，尚不证明 LAN 已生产接线；Apple 的 C/Swift 上下文传递及 FFI host 非零 epoch 仍由其 owner 完成，不以旧零值测试通过代替。
+原始日志是 `E:\desk-link\.worktrees\dl2-targets\lan-runtime-merge-shared.log` 与 `lan-runtime-merge-windows.log`。ignored 保持原有桌面/硬件/线上/手工性能验收条件，未计作通过。上述只证明首次来源整合，尚不证明 LAN 已生产接线；当时 Apple 的完整上下文来源尚未引入，后续完整整合见下节。
 
 ## 接口计划与协议所有权
 
@@ -32,3 +32,13 @@ test -p desklink-windows --lib --tests --locked --quiet
 `QuicClient::send_channel_for_generation` 和 `next_channel_for_generation` 对原有八个 ChannelKind 提供一致入口，原密文不重新 seal，仍使用既有可靠通道锁与 generation 检查；控制读取复用 pending control 保护，不消费新 peer 的握手。零/错误 generation 不会发送或读取业务。`peer_generation`、`is_closed`、`closed` 是只读健康观察，后者不偷走 runtime 的 Closed 事件。
 
 新增实际 localhost QUIC 行为验证逐 lane 字节一致和错误 generation 拒绝，以及健康等待后原 Closed 事件仍可消费。使用同一独立 target，`test -p desklink-transport --lib --tests --locked --quiet` 为 45 单元+23 localhost 通过，`clippy -p desklink-transport --all-targets --locked -- -D warnings` 与包级 fmt 通过。这是业务适配基础接口，未把它描述成可靠 LAN 生产已启用。
+
+## 完整 Apple 稳定来源整合
+
+在上述历史之上以双父 merge 引入完整 `f954a68153168a1ded048ddf93eb9c565684d096`，不挑旧 ABI 半成品。保留 C/worker 捕获的 InputContext、Host scoped producer generation、1 秒控制发送预算与 owned input future；Controller 保留 Windows 的 `next_event_with_transfer(false)` 隔离慢文件能力并贯穿 Apple 绝对静默时钟分支。Windows 两处冲突保持 joint 的真实 epoch/配置/拓扑；没有恢复 epoch 0。DirectLanConnection 在两个成功认证 probe 边界记录已验证的 session binding，供下一步 attach 核对，不改 probe wire。
+
+资源冲突采用有类型的 `RelayServer::bind_with_flow_control_limits`：只允许低于 DL2-052 上限的窗口，其他 uni/bidi/datagram/crypto/incoming 预算仍由 relay 设置。不能直接把 Apple 的任意 TransportConfig 入口放在预算配置之后，也不能覆盖其真实 2KiB flight 背压设置后宣称夹具通过。新增真实构造回归分别拒绝 send/connection/stream 超上限 1 字节；FFI 原背压夹具改用此入口。
+
+同一独立 target 实际执行六包 `test --lib --tests --locked --quiet`：**592 passed / 0 failed / 21 ignored**（FFI 全 88；Windows 283；其余四包 221）。C ABI 用本机已安装 MSVC 14.44.35207 与 SDK 10.0.26100.0 的 include 环境运行，未安装或更换工具链。初轮暴露两个 private test 参数冲突，已修为显式 include_transfer=true；第二轮因非开发终端 PATH 缺 cl 失败，补本次命令局部 PATH/INCLUDE 后完整通过，未跳过 C 布局测试。正式通过日志 `E:\desk-link\.worktrees\dl2-targets\lan-runtime-merge-apple-msvc.log`，失败轮分别保留在 `lan-runtime-merge-apple.log`、`lan-runtime-merge-apple-final.log`。六包 all-targets Clippy `--locked -- -D warnings` 通过，格式与 diff 检查通过。
+
+这些是 Windows 上的真实本地加密/生产 helper 与 ABI/合成回归；未执行 Swift 编译、macOS 原生捕获、实际键盘注入或双机验收。协议 14 与 LAN 生产能力仍将在唯一来源基础上单独接入，不把 13 整合当 LAN 闭环。

@@ -879,8 +879,28 @@ pub struct RelayServer {
 impl RelayServer {
     pub async fn bind(
         bind_addr: SocketAddr,
+        server_config: quinn::ServerConfig,
+        config: RelayConfig,
+    ) -> Result<Self, RelayError> {
+        Self::bind_with_optional_flow_limits(bind_addr, server_config, config, None).await
+    }
+
+    /// Lowers flow-control windows without bypassing relay resource ceilings
+    /// or lifecycle policy. This supports actual backpressure fixtures.
+    pub async fn bind_with_flow_control_limits(
+        bind_addr: SocketAddr,
+        server_config: quinn::ServerConfig,
+        config: RelayConfig,
+        limits: desklink_transport::QuicFlowControlLimits,
+    ) -> Result<Self, RelayError> {
+        Self::bind_with_optional_flow_limits(bind_addr, server_config, config, Some(limits)).await
+    }
+
+    async fn bind_with_optional_flow_limits(
+        bind_addr: SocketAddr,
         mut server_config: quinn::ServerConfig,
         config: RelayConfig,
+        limits: Option<desklink_transport::QuicFlowControlLimits>,
     ) -> Result<Self, RelayError> {
         if config.keep_alive.is_zero() || config.dead_timeout.is_zero() {
             return Err(RelayError::InvalidConfig(
@@ -910,8 +930,25 @@ impl RelayServer {
         }
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
+        let budget = config.resource_budget()?;
         let mut transport = quinn::TransportConfig::default();
-        config.resource_budget()?.configure(&mut transport);
+        budget.configure(&mut transport);
+        if let Some(limits) = limits {
+            let maximum = desklink_transport::QuicFlowControlLimits::new(
+                u32::try_from(budget.send_window_bytes).expect("bounded relay send window"),
+                u32::try_from(budget.connection_receive_window_bytes)
+                    .expect("bounded relay receive window"),
+                u32::try_from(budget.stream_receive_window_bytes)
+                    .expect("bounded relay stream window"),
+            )
+            .expect("validated relay buffer model");
+            if !limits.fits_within(maximum) {
+                return Err(RelayError::InvalidConfig(
+                    "flow-control tuning exceeds relay resource budget".to_owned(),
+                ));
+            }
+            limits.apply_to(&mut transport);
+        }
         transport
             .keep_alive_interval(Some(config.keep_alive))
             .max_idle_timeout(Some(idle_timeout));

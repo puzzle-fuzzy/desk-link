@@ -57,16 +57,28 @@ private final class LatestFrameDelivery: @unchecked Sendable {
     }
 }
 
-@MainActor
-public final class H264Decoder {
-    public static let decodeFlags = VTDecodeFrameFlags(rawValue: 1 << 0)
+/// Native decoder state has one owner: its caller's serial queue. Output callbacks
+/// only forward immutable frame data; they never mutate the decode state.
+final class H264DecodeSession: @unchecked Sendable {
+    public static var decodeFlags: VTDecodeFrameFlags { VTDecodeFrameFlags(rawValue: 1 << 0) }
 
-    public var onFrame: ((CVPixelBuffer) -> Void)?
+    private let outputHandlerLock = NSLock()
+    private var outputHandler: (@Sendable (CVPixelBuffer, UInt64) -> Void)?
+    var onFrame: (@Sendable (CVPixelBuffer, UInt64) -> Void)? {
+        get {
+            outputHandlerLock.lock()
+            defer { outputHandlerLock.unlock() }
+            return outputHandler
+        }
+        set {
+            outputHandlerLock.lock()
+            outputHandler = newValue
+            outputHandlerLock.unlock()
+        }
+    }
 
-    nonisolated(unsafe) private var decompressionSession: VTDecompressionSession?
-    private let frameDelivery = LatestFrameDelivery()
+    private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
-    public private(set) var latestPixelBuffer: CVPixelBuffer?
     public private(set) var lastFrameID: UInt64 = 0
     public private(set) var configVersion: UInt32 = 0
     public private(set) var configuredWidth: UInt16 = 0
@@ -260,6 +272,7 @@ public final class H264Decoder {
             return false
         }
         lastFrameID = frameID
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
         consecutiveFailures = 0
         keyframeRequestIssued = false
         return true
@@ -273,7 +286,6 @@ public final class H264Decoder {
 
     public func reset() {
         invalidateSession()
-        latestPixelBuffer = nil
         lastFrameID = 0
         configVersion = 0
         configuredWidth = 0
@@ -295,20 +307,13 @@ public final class H264Decoder {
         consecutiveFailures += 1
     }
 
-    private func accept(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
-        // Asynchronous callbacks can arrive after a newer access unit was accepted.
-        // Displaying only the current frame prevents old decoded output from regressing video.
-        guard frameID == lastFrameID else { return }
-        latestPixelBuffer = pixelBuffer
-        onFrame?(pixelBuffer)
+    fileprivate func enqueue(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
+        // VideoToolbox invokes this on its own output thread. Copy the handler
+        // under its lock, then invoke it without reading decoder-owned state.
+        let handler = onFrame
+        handler?(pixelBuffer, frameID)
     }
 
-    nonisolated fileprivate func enqueue(pixelBuffer: CVPixelBuffer, frameID: UInt64) {
-        let sendableBuffer = SendablePixelBuffer(pixelBuffer)
-        frameDelivery.submit(pixelBuffer: sendableBuffer, frameID: frameID) { [weak self] buffer, frameID in
-            self?.accept(pixelBuffer: buffer.value, frameID: frameID)
-        }
-    }
 }
 
 private func h264OutputCallback(
@@ -325,11 +330,67 @@ private func h264OutputCallback(
           let imageBuffer,
           presentationTimeStamp.value >= 0
     else { return }
-    let decoder = Unmanaged<H264Decoder>
+    let decoder = Unmanaged<H264DecodeSession>
         .fromOpaque(decompressionOutputRefCon)
         .takeUnretainedValue()
     decoder.enqueue(
         pixelBuffer: imageBuffer,
         frameID: UInt64(presentationTimeStamp.value)
     )
+}
+
+/// Compatibility facade for callers that explicitly decode on the main actor.
+/// The controller's production media path uses H264DecodeScheduler instead.
+@MainActor
+public final class H264Decoder {
+    public static var decodeFlags: VTDecodeFrameFlags { H264DecodeSession.decodeFlags }
+    public var onFrame: ((CVPixelBuffer) -> Void)?
+    public private(set) var latestPixelBuffer: CVPixelBuffer?
+    public var lastFrameID: UInt64 { session.lastFrameID }
+    public var configVersion: UInt32 { session.configVersion }
+    public var configuredWidth: UInt16 { session.configuredWidth }
+    public var configuredHeight: UInt16 { session.configuredHeight }
+    private let session = H264DecodeSession()
+    private let frameDelivery = LatestFrameDelivery()
+    private var outputGeneration: UInt64 = 0
+
+    public init() { bindOutput() }
+
+    private func bindOutput() {
+        let delivery = frameDelivery
+        let generation = outputGeneration
+        session.onFrame = { [weak self] pixelBuffer, frameID in
+            delivery.submit(pixelBuffer: SendablePixelBuffer(pixelBuffer), frameID: frameID) { [weak self] buffer, frameID in
+                guard let self, generation == self.outputGeneration,
+                      frameID == self.session.lastFrameID else { return }
+                self.latestPixelBuffer = buffer.value
+                self.onFrame?(buffer.value)
+            }
+        }
+    }
+
+    @discardableResult
+    public func configure(sequenceHeader: Data, width: UInt16, height: UInt16, version: UInt32) -> Bool {
+        let previous = (session.configVersion, session.configuredWidth, session.configuredHeight)
+        let result = session.configure(sequenceHeader: sequenceHeader, width: width, height: height, version: version)
+        if previous != (session.configVersion, session.configuredWidth, session.configuredHeight) {
+            outputGeneration &+= 1
+            bindOutput()
+        }
+        return result
+    }
+
+    @discardableResult
+    public func receive(accessUnit: Data, frameID: UInt64, version: UInt32) -> Bool {
+        session.receive(accessUnit: accessUnit, frameID: frameID, version: version)
+    }
+
+    public func takeKeyframeRequest() -> Bool { session.takeKeyframeRequest() }
+
+    public func reset() {
+        session.reset()
+        outputGeneration &+= 1
+        bindOutput()
+        latestPixelBuffer = nil
+    }
 }

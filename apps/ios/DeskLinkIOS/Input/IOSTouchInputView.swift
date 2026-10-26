@@ -258,6 +258,37 @@ func iosRenderedVideoRect(
     )
 }
 
+private final class IOSInputFocusObservation: @unchecked Sendable {
+    var token: NSObjectProtocol?
+    deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+}
+
+struct IOSGestureInputCapture: Sendable {
+    struct Ticket: Equatable, Sendable {
+        let context: CapturedInputContext
+        let serial: UInt64
+    }
+    private(set) var ticket: Ticket?
+    private var serial: UInt64 = 0
+
+    mutating func begin(context: CapturedInputContext) {
+        serial &+= 1
+        ticket = Ticket(context: context, serial: serial)
+    }
+
+    func accepts(_ candidate: Ticket) -> Bool { ticket == candidate }
+
+    func matchesInputTarget(_ context: CapturedInputContext?) -> Bool {
+        guard let context, let ticket else { return false }
+        return ticket.context.hasSameInputTarget(as: context)
+    }
+
+    mutating func cancel() {
+        serial &+= 1
+        ticket = nil
+    }
+}
+
 struct IOSTouchInputView: UIViewRepresentable {
     let bridge: ControllerBridge
     let videoSize: CGSize?
@@ -329,6 +360,9 @@ struct IOSTouchInputView: UIViewRepresentable {
         private var longPressTriggered = false
         private var activeButton: MouseButton?
         private var longPressWorkItem: DispatchWorkItem?
+        private var gestureCapture = IOSGestureInputCapture()
+        private var surfaceContext: CapturedInputContext?
+        private let focusObservation = IOSInputFocusObservation()
         private var onPinchChanged: (CGFloat, CGPoint) -> Void
         private var onFourFingerPan: (CGSize) -> Void
         private var onTrackpadPositionChanged: (CGPoint) -> Void
@@ -350,6 +384,7 @@ struct IOSTouchInputView: UIViewRepresentable {
             onTrackpadPositionChanged: @escaping (CGPoint) -> Void
         ) {
             self.bridge = bridge
+            self.surfaceContext = bridge.presentedInputContext
             self.videoSize = videoSize
             self.visibleVideoRect = visibleVideoRect
             self.mode = mode
@@ -365,6 +400,11 @@ struct IOSTouchInputView: UIViewRepresentable {
             super.init(frame: .zero)
             isMultipleTouchEnabled = true
             backgroundColor = .clear
+            focusObservation.token = NotificationCenter.default.addObserver(
+                forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.releaseAll() }
+            }
         }
 
         required init?(coder: NSCoder) { nil }
@@ -377,6 +417,7 @@ struct IOSTouchInputView: UIViewRepresentable {
             onFourFingerPan: @escaping (CGSize) -> Void,
             onTrackpadPositionChanged: @escaping (CGPoint) -> Void
         ) {
+            synchronizeInputContext(bridge?.presentedInputContext)
             let modeChanged = self.mode != mode
             if modeChanged {
                 releaseAll()
@@ -403,6 +444,12 @@ struct IOSTouchInputView: UIViewRepresentable {
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            if trackedTouches.isEmpty {
+                guard let context = bridge?.captureInputContext() else { return }
+                synchronizeInputContext(context)
+                gestureCapture.begin(context: context)
+            }
+            guard gestureCapture.ticket != nil else { return }
             for touch in touches { trackedTouches[ObjectIdentifier(touch)] = touch }
             if trackedTouches.count >= 2 {
                 if multiTouchGesture == .none || trackedTouches.count > multiTouchFingerCount {
@@ -418,13 +465,17 @@ struct IOSTouchInputView: UIViewRepresentable {
             longPressTriggered = false
             activeButton = nil
             if mode == .direct, let command = touchMapper.command(for: startPoint, phase: .began) {
-                bridge?.send(input: command)
+                sendGesture(command)
             }
             scheduleLongPress()
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-            for touch in touches { trackedTouches[ObjectIdentifier(touch)] = touch }
+            guard gestureCapture.ticket != nil else { return }
+            guard gestureCapture.matchesInputTarget(bridge?.captureInputContext()) else { releaseAll(); return }
+            let knownTouches = touches.filter { trackedTouches[ObjectIdentifier($0)] != nil }
+            guard !knownTouches.isEmpty else { return }
+            for touch in knownTouches { trackedTouches[ObjectIdentifier(touch)] = touch }
             if trackedTouches.count >= 2 {
                 if multiTouchGesture == .none || trackedTouches.count > multiTouchFingerCount {
                     beginMultiTouchGesture()
@@ -443,7 +494,7 @@ struct IOSTouchInputView: UIViewRepresentable {
                         }
                         if distance > 0 { lastPinchDistance = distance }
                     } else if delta.width != 0 || delta.height != 0 {
-                        bridge?.send(input: IOSTouchMapper.wheel(
+                        sendGesture(IOSTouchMapper.wheel(
                             deltaX: Int32((delta.width * 8).rounded()),
                             deltaY: Int32((-delta.height * 8).rounded())
                         ))
@@ -471,19 +522,20 @@ struct IOSTouchInputView: UIViewRepresentable {
                 let point = primary.location(in: self)
                 guard let command = touchMapper.command(for: point, phase: .moved) else { return }
                 if activeButton == nil, moved {
-                    bridge?.send(input: command)
-                    bridge?.send(input: .mouseButton(.left, pressed: true))
+                    sendGesture(command)
+                    sendGesture(.mouseButton(.left, pressed: true))
                     activeButton = .left
                 } else if activeButton != nil {
-                    bridge?.send(input: command)
+                    sendGesture(command)
                 }
             } else if moved, let command = touchMapper.relativeCommand(delta: delta) {
-                bridge?.send(input: command)
+                sendGesture(command)
                 onTrackpadPositionChanged(touchMapper.trackpadPosition)
             }
         }
 
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard gestureCapture.ticket != nil else { return }
             let endedPrimary = touches.contains { ObjectIdentifier($0) == primaryTouchID }
             let endingCenter = centerOfTrackedTouches()
             for touch in touches { trackedTouches.removeValue(forKey: ObjectIdentifier(touch)) }
@@ -494,9 +546,9 @@ struct IOSTouchInputView: UIViewRepresentable {
                 if multiTouchGesture == .threeFingerTap, !moved,
                    let command = pointerCommand(at: endingCenter)
                 {
-                    bridge?.send(input: command)
-                    bridge?.send(input: .mouseButton(.right, pressed: true))
-                    bridge?.send(input: .mouseButton(.right, pressed: false))
+                    sendGesture(command)
+                    sendGesture(.mouseButton(.right, pressed: true))
+                    sendGesture(.mouseButton(.right, pressed: false))
                 }
                 resetGestureState()
                 return
@@ -505,31 +557,43 @@ struct IOSTouchInputView: UIViewRepresentable {
             guard endedPrimary else { return }
 
             if let activeButton {
-                bridge?.send(input: .mouseButton(activeButton, pressed: false))
+                sendGesture(.mouseButton(activeButton, pressed: false))
             } else if longPressTriggered {
-                bridge?.send(input: .mouseButton(.right, pressed: false))
+                sendGesture(.mouseButton(.right, pressed: false))
             } else if !moved, let primary = touches.first {
                 let point = primary.location(in: self)
                 if mode == .direct, let command = touchMapper.command(for: point, phase: .ended) {
-                    bridge?.send(input: command)
-                    bridge?.send(input: .mouseButton(.left, pressed: true))
-                    bridge?.send(input: .mouseButton(.left, pressed: false))
+                    sendGesture(command)
+                    sendGesture(.mouseButton(.left, pressed: true))
+                    sendGesture(.mouseButton(.left, pressed: false))
                 } else if mode == .trackpad {
-                    bridge?.send(input: .mouseButton(.left, pressed: true))
-                    bridge?.send(input: .mouseButton(.left, pressed: false))
+                    sendGesture(.mouseButton(.left, pressed: true))
+                    sendGesture(.mouseButton(.left, pressed: false))
                 }
             }
             resetGestureState()
         }
 
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            guard touches.contains(where: { trackedTouches[ObjectIdentifier($0)] != nil }) else { return }
             releaseAll()
         }
 
         func releaseAll() {
             cancelLongPress()
-            bridge?.releaseAll()
+            if let context = gestureCapture.ticket?.context { bridge?.releaseAll(context: context) }
             resetGestureState()
+        }
+
+        func synchronizeInputContext(_ context: CapturedInputContext?) {
+            guard context?.targetIdentity != surfaceContext?.targetIdentity else { return }
+            releaseAll()
+            surfaceContext = context
+        }
+
+        private func sendGesture(_ command: RemoteInputCommand) {
+            guard let context = gestureCapture.ticket?.context else { return }
+            bridge?.send(input: command, context: context)
         }
 
         private func makeMapper(trackpadPosition: CGPoint? = nil) -> IOSTouchMapper {
@@ -550,19 +614,20 @@ struct IOSTouchInputView: UIViewRepresentable {
         }
 
         private func scheduleLongPress() {
-            let work = DispatchWorkItem { [weak self] in self?.triggerLongPress() }
+            guard let ticket = gestureCapture.ticket else { return }
+            let work = DispatchWorkItem { [weak self, ticket] in self?.triggerLongPress(ticket: ticket) }
             longPressWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
         }
 
-        private func triggerLongPress() {
-            guard !moved, multiTouchGesture == .none, !longPressTriggered else { return }
+        private func triggerLongPress(ticket: IOSGestureInputCapture.Ticket) {
+            guard gestureCapture.accepts(ticket), !moved, multiTouchGesture == .none, !longPressTriggered else { return }
             longPressTriggered = true
             if let primaryTouchID,
                let primary = trackedTouches[primaryTouchID],
                pointerCommand(at: primary.location(in: self)) != nil
             {
-                bridge?.send(input: .mouseButton(.right, pressed: true))
+                bridge?.send(input: .mouseButton(.right, pressed: true), context: ticket.context)
             }
         }
 
@@ -572,6 +637,7 @@ struct IOSTouchInputView: UIViewRepresentable {
         }
 
         private func resetGestureState() {
+            gestureCapture.cancel()
             trackedTouches.removeAll()
             primaryTouchID = nil
             activeButton = nil
@@ -584,7 +650,7 @@ struct IOSTouchInputView: UIViewRepresentable {
 
         private func beginMultiTouchGesture() {
             cancelLongPress()
-            bridge?.releaseAll()
+            if let context = gestureCapture.ticket?.context { bridge?.releaseAll(context: context) }
             primaryTouchID = nil
             activeButton = nil
             multiTouchFingerCount = min(trackedTouches.count, 4)

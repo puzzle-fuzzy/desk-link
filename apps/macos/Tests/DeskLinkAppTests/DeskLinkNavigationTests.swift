@@ -148,6 +148,20 @@ final class DeskLinkNavigationTests: XCTestCase {
         }
     }
 
+    func testEveryWaitingPhaseOffersCancellationAndExplainsTheNextStep() {
+        let waitingStates: [ConnectionState] = [.connecting, .pairing, .reconnecting, .recovering]
+        for state in waitingStates {
+            XCTAssertTrue(deskLinkConnectionIsWaiting(state))
+            XCTAssertTrue(deskLinkConnectionWaitingDetail(state)?.contains("取消") == true)
+        }
+
+        let otherStates: [ConnectionState] = [.idle, .closed, .failed("offline"), .connected(streamID: 7), .frozen]
+        for state in otherStates {
+            XCTAssertFalse(deskLinkConnectionIsWaiting(state))
+            XCTAssertNil(deskLinkConnectionWaitingDetail(state))
+        }
+    }
+
     func testActiveSessionKeepsOnlyReleaseSafetyCopyOutsideDiagnostics() {
         XCTAssertEqual(deskLinkSessionSafetyCopy, "退出窗口前，DeskLink 会释放所有按键与鼠标状态。")
         XCTAssertFalse(deskLinkSessionSafetyCopy.contains("帧"))

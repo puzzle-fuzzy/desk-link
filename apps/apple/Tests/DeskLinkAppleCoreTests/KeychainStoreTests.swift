@@ -104,6 +104,12 @@ final class KeychainStoreTests: XCTestCase {
         try store.save(second)
         try store.save(refreshedFirst)
 
-        XCTAssertEqual(try store.loadAll(), [refreshedFirst, second])
+        let saved = try store.loadAll()
+        XCTAssertEqual(saved.count, 2)
+        XCTAssertEqual(saved[0].id, first.id)
+        XCTAssertEqual(saved[0].sessionID, refreshedFirst.sessionID)
+        XCTAssertEqual(saved[0].relayAuthentication, refreshedFirst.relayAuthentication)
+        XCTAssertEqual(saved[0].hostVerifyKey, refreshedFirst.hostVerifyKey)
+        XCTAssertEqual(saved[1], second)
     }
 }

@@ -62,12 +62,16 @@ final class IOSKeyboardInput: ObservableObject {
 
     private let bridge: ControllerBridge
     private var responder: IOSKeyboardResponder?
+    private var pressedKeys: [IOSSpecialKey: CapturedRemoteInput] = [:]
+    private var surfaceContext: CapturedInputContext?
 
     init(bridge: ControllerBridge) {
         self.bridge = bridge
+        surfaceContext = bridge.presentedInputContext
     }
 
     func makeResponderView() -> IOSKeyboardResponder {
+        synchronizeInputContext(bridge.presentedInputContext)
         if let responder { return responder }
         let responder = IOSKeyboardResponder()
         responder.owner = self
@@ -76,7 +80,11 @@ final class IOSKeyboardInput: ObservableObject {
     }
 
     func becomeFirstResponder() {
-        isKeyboardVisible = makeResponderView().becomeFirstResponder()
+        guard let context = bridge.captureInputContext() else { return }
+        synchronizeInputContext(context)
+        let responder = makeResponderView()
+        responder.capturedTextContext = context
+        isKeyboardVisible = responder.becomeFirstResponder()
     }
 
     func resign() {
@@ -87,56 +95,73 @@ final class IOSKeyboardInput: ObservableObject {
         _ = responder.resignFirstResponder()
     }
 
-    fileprivate func responderDidResign() {
+    fileprivate func responderDidResign(_ source: IOSKeyboardResponder) {
+        guard responder === source else { return }
         finishResigning()
     }
 
     private func finishResigning() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.isKeyboardVisible = false
-            self.activeModifiers = []
-            self.bridge.releaseAll()
-        }
+        let contexts = Set(pressedKeys.values.map(\.context)).union([responder?.capturedTextContext].compactMap { $0 })
+        responder?.capturedTextContext = nil
+        isKeyboardVisible = false
+        activeModifiers = []
+        pressedKeys.removeAll()
+        for context in contexts { bridge.releaseAll(context: context) }
+    }
+
+    func synchronizeInputContext(_ context: CapturedInputContext?) {
+        guard context?.targetIdentity != surfaceContext?.targetIdentity else { return }
+        // Retire the responder too: a delayed UIKit composition callback from
+        // the old field must not inherit a freshly focused field's context.
+        finishResigning()
+        let retired = responder
+        responder = nil
+        retired?.owner = nil
+        _ = retired?.resignFirstResponder()
+        surfaceContext = context
     }
 
     func sendSpecialKey(_ key: IOSSpecialKey, pressed: Bool) {
-        if let modifier = key.modifier {
-            bridge.send(input: .key(code: key.code, pressed: pressed, modifiers: []))
-            if pressed {
-                activeModifiers.insert(modifier)
-            } else {
-                activeModifiers.remove(modifier)
-            }
+        if !pressed {
+            guard let original = pressedKeys.removeValue(forKey: key),
+                  case let .key(code, _, modifiers) = original.command else { return }
+            bridge.send(input: .key(code: code, pressed: false, modifiers: modifiers), context: original.context)
+            if let modifier = key.modifier { activeModifiers.remove(modifier) }
             return
         }
-
-        bridge.send(input: .key(code: key.code, pressed: pressed, modifiers: activeModifiers))
+        guard let context = bridge.captureInputContext() else { return }
+        synchronizeInputContext(context)
+        guard pressedKeys[key] == nil else { return }
+        let captured = CapturedRemoteInput(.key(code: key.code, pressed: true, modifiers: key.modifier == nil ? activeModifiers : []), context: context)
+        pressedKeys[key] = captured
+        bridge.send(captured: captured)
+        if let modifier = key.modifier { activeModifiers.insert(modifier) }
     }
 
-    fileprivate func sendCommittedText(_ text: String) {
+    fileprivate func sendCommittedText(_ text: String, context: CapturedInputContext) {
         guard !text.isEmpty else { return }
-        if Self.isReturnText(text) {
-            sendSpecialKey(.enter, pressed: true)
-            sendSpecialKey(.enter, pressed: false)
-            return
-        }
-        bridge.send(input: .unicode(text, modifiers: activeModifiers))
+        bridge.send(input: .unicode(text, modifiers: activeModifiers), context: context)
     }
 
     static func isReturnText(_ text: String) -> Bool {
         text == "\n" || text == "\r" || text == "\r\n"
     }
 
-    fileprivate func sendBackspace() {
-        sendSpecialKey(.backspace, pressed: true)
-        sendSpecialKey(.backspace, pressed: false)
+    fileprivate func sendBackspace(context: CapturedInputContext) {
+        bridge.send(input: .key(code: IOSSpecialKey.backspace.code, pressed: true, modifiers: activeModifiers), context: context)
+        bridge.send(input: .key(code: IOSSpecialKey.backspace.code, pressed: false, modifiers: activeModifiers), context: context)
+    }
+
+    fileprivate func sendCapturedSpecialKey(_ key: IOSSpecialKey, context: CapturedInputContext) {
+        bridge.send(input: .key(code: key.code, pressed: true, modifiers: activeModifiers), context: context)
+        bridge.send(input: .key(code: key.code, pressed: false, modifiers: activeModifiers), context: context)
     }
 }
 
 @MainActor
 final class IOSKeyboardResponder: UITextView {
     weak var owner: IOSKeyboardInput?
+    var capturedTextContext: CapturedInputContext?
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -171,7 +196,7 @@ final class IOSKeyboardResponder: UITextView {
 
     override func resignFirstResponder() -> Bool {
         let didResign = super.resignFirstResponder()
-        if didResign { owner?.responderDidResign() }
+        if didResign { owner?.responderDidResign(self) }
         return didResign
     }
 
@@ -180,11 +205,13 @@ final class IOSKeyboardResponder: UITextView {
     }
 
     override func insertText(_ text: String) {
-        owner?.sendCommittedText(text)
+        guard let context = capturedTextContext else { return }
+        owner?.sendCommittedText(text, context: context)
     }
 
     override func deleteBackward() {
-        owner?.sendBackspace()
+        guard let context = capturedTextContext else { return }
+        owner?.sendBackspace(context: context)
     }
 
     override var keyCommands: [UIKeyCommand]? {
@@ -201,9 +228,8 @@ final class IOSKeyboardResponder: UITextView {
     }
 
     @objc private func handleKeyCommand(_ command: UIKeyCommand) {
-        guard let key = Self.specialKey(for: command.input) else { return }
-        owner?.sendSpecialKey(key, pressed: true)
-        owner?.sendSpecialKey(key, pressed: false)
+        guard let key = Self.specialKey(for: command.input), let context = capturedTextContext else { return }
+        owner?.sendCapturedSpecialKey(key, context: context)
     }
 
     private static func specialKey(for input: String?) -> IOSSpecialKey? {

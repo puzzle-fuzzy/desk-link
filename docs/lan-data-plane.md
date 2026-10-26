@@ -2,7 +2,7 @@
 
 本切片提供 `desklink_transport::LanDataPlane`，传输组件本身不定义视频、音频、文件或 FFI 的业务消息格式。它尚未接入 Windows/FFI 生产 runtime，公网 NAT 穿透、LAN 发现/本地配对、实机延迟及长稳仍待实施或验收。
 
-当前分支已引入下文 DL2-013 编译过渡合同：生产输入/视频路径仍有零上下文占位，会被正式 codec 拒绝。因此此分支当前不能作为可用远控整包交付；本记录的 LAN/codec 夹具通过仅证明传输边界。后续必须复用 owner 的实际上下文生产、呈现放行和 Host 校验提交，不能通过默认值绕过。
+下文的零上下文说明对应第一波冻结分支 `4b15561` 的历史过渡状态。第二波 `codex/dl2-lan-runtime` 已完整整合 Windows joint `5782341` 与 Apple `f954a68`，保留真实上下文生产、捕获传递及 Host 校验；本地整合验证见 [生产 LAN 接线记录](lan-runtime-integration.md)。LAN/codec 夹具本身仍只证明传输边界，不能据此声称生产 LAN、实机呈现或真实注入已通过。
 
 ## 接线契约
 

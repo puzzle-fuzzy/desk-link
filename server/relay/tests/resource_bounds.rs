@@ -21,6 +21,35 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 const CREDIT_WAIT: Duration = Duration::from_millis(100);
 
+#[tokio::test]
+async fn explicit_flow_tuning_cannot_raise_relay_resource_ceilings() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let config = ServerConfig::with_single_cert(
+        vec![CertificateDer::from(certificate.cert.der().to_vec())],
+        PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+    )
+    .unwrap();
+    for (send, receive, stream) in [
+        (131_073, 131_072, 65_549),
+        (131_072, 131_073, 65_549),
+        (131_072, 131_072, 65_550),
+    ] {
+        let limits = desklink_transport::QuicFlowControlLimits::new(send, receive, stream).unwrap();
+        let result = RelayServer::bind_with_flow_control_limits(
+            "127.0.0.1:0".parse().unwrap(),
+            config.clone(),
+            RelayConfig::default(),
+            limits,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(desklink_relay::RelayError::InvalidConfig(reason))
+            if reason == "flow-control tuning exceeds relay resource budget")
+        );
+    }
+}
+
 struct TestRelay {
     server: Arc<RelayServer>,
     client_config: quinn::ClientConfig,

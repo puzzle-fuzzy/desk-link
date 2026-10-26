@@ -4,6 +4,19 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+/// Keep the capture/encoder contract within the Main/1080p capability currently
+/// advertised by the FFI host. Unsupported output fails before it reaches the wire.
+/// Higher profiles require negotiated constraints to be passed into this backend.
+enum MacHostVideoContract {
+    static let maximumWidth = 1_920
+    static let maximumHeight = 1_080
+    static let profileIDC: UInt8 = 77
+
+    static func supports(width: Int, height: Int) -> Bool {
+        width > 0 && height > 0 && width <= maximumWidth && height <= maximumHeight
+    }
+}
+
 struct H264EncoderFormat: Equatable, Sendable {
     let sps: Data
     let pps: Data
@@ -38,6 +51,7 @@ enum MacH264EncoderError: Error, Equatable, Sendable {
     case output(OSStatus)
     case malformedAVCC
     case missingFormatDescription
+    case unsupportedOutputProfile
 }
 
 func h264TargetBitrate(width: Int, height: Int) -> Int {
@@ -57,6 +71,12 @@ enum H264EncoderOutputAssembler {
         configVersion: UInt32,
         emitsConfiguration: Bool
     ) throws -> [EncodedVideoEvent] {
+        guard MacHostVideoContract.supports(width: Int(width), height: Int(height)) else {
+            throw MacH264EncoderError.invalidDimensions
+        }
+        guard format.sps.count >= 2, format.sps[format.sps.startIndex] & 0x1f == 7,
+              format.sps[format.sps.startIndex + 1] == MacHostVideoContract.profileIDC
+        else { throw MacH264EncoderError.unsupportedOutputProfile }
         let annexB = try annexB(fromAVCC: avccAccessUnit)
         var output: [EncodedVideoEvent] = []
         if emitsConfiguration {
@@ -139,7 +159,7 @@ final class MacH264Encoder: @unchecked Sendable {
     func start(width: Int, height: Int, streamID: UInt64 = 0) throws {
         guard let encodedWidth = UInt16(exactly: width),
               let encodedHeight = UInt16(exactly: height),
-              encodedWidth > 0, encodedHeight > 0
+              MacHostVideoContract.supports(width: width, height: height)
         else { throw MacH264EncoderError.invalidDimensions }
         sessionOperationLock.lock()
         defer { sessionOperationLock.unlock() }
@@ -273,6 +293,9 @@ final class MacH264Encoder: @unchecked Sendable {
             report(error: .missingFormatDescription, generation: generation)
             return
         }
+        let encodedDimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+        let encodedWidth = encodedDimensions.width
+        let encodedHeight = encodedDimensions.height
         guard let avcc = Self.data(from: dataBuffer) else {
             report(error: .malformedAVCC, generation: generation)
             return
@@ -296,6 +319,10 @@ final class MacH264Encoder: @unchecked Sendable {
             let currentHeight = self.height
             self.lock.unlock()
             guard version > 0, self.isGenerationActive(generation) else { return }
+            guard encodedWidth == Int32(currentWidth), encodedHeight == Int32(currentHeight) else {
+                self.onError?(.invalidDimensions)
+                return
+            }
             do {
                 let events = try H264EncoderOutputAssembler.events(
                     avccAccessUnit: avcc,
@@ -359,7 +386,7 @@ final class MacH264Encoder: @unchecked Sendable {
         try setProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
         try setProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 30 as CFTypeRef)
         try setProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFTypeRef)
-        try setProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        try setProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
     }
 
     private func setProperty(

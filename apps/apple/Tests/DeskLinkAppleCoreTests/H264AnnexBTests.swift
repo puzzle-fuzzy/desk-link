@@ -40,4 +40,11 @@ final class H264AnnexBTests: XCTestCase {
             XCTAssertEqual($0 as? H264AnnexBError, .missingParameterSets)
         }
     }
+    func testRangesHandleEmptyNALUnitsTrailingZerosAndIDR() throws {
+        let bytes = Data([0, 0, 0, 1, 0, 0, 1, 0x65, 0xaa, 0, 0, 0])
+        XCTAssertEqual(H264AnnexB.nalUnits(in: bytes), [Data([0x65, 0xaa])])
+        XCTAssertEqual(try H264AnnexB.avccAccessUnit(from: bytes), Data([0, 0, 0, 2, 0x65, 0xaa]))
+        XCTAssertTrue(H264AnnexB.containsIDR(in: bytes))
+        XCTAssertFalse(H264AnnexB.containsIDR(in: Data([0, 0, 1, 0x41, 1])))
+    }
 }
