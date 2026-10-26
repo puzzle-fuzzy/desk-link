@@ -27,7 +27,8 @@ func deskLinkHostStatus(
     for state: HostState,
     permissions: MacPermissionSnapshot,
     hasPendingApproval: Bool,
-    lastError: String?
+    lastError: String?,
+    sharingStatus: HostSharingStatus? = nil
 ) -> DeskLinkHostStatus {
     if lastError != nil {
         return DeskLinkHostStatus(
@@ -64,11 +65,26 @@ func deskLinkHostStatus(
         )
     }
 
+    if let sharingStatus {
+        switch sharingStatus {
+        case .ready:
+            return DeskLinkHostStatus(title: "共享已开启", detail: "可使用本机设备 ID 和访问密码发起连接", tone: .ready)
+        case .registering:
+            return DeskLinkHostStatus(title: "正在开启共享", detail: "正在向中继注册本机连接信息", tone: .working)
+        case .stopping:
+            return DeskLinkHostStatus(title: "正在停止共享", detail: "正在关闭连接并撤回本机连接信息", tone: .working)
+        case .failed:
+            return DeskLinkHostStatus(title: "需要处理", detail: "打开共享此设备查看错误并重试", tone: .attention)
+        case .off, .connected:
+            break
+        }
+    }
+
     switch state {
     case .idle, .closed:
         return DeskLinkHostStatus(
             title: "未开启共享",
-            detail: "需要共享这台 Mac 时生成连接码",
+            detail: "需要共享这台 Mac 时开启共享",
             tone: .idle
         )
     case .connecting, .waitingForApproval, .negotiating, .stopping:
@@ -116,7 +132,8 @@ struct DeskLinkHostStatusPopover: View {
             for: host.state,
             permissions: host.permissions,
             hasPendingApproval: host.pendingApproval != nil,
-            lastError: host.lastError
+            lastError: host.lastError,
+            sharingStatus: host.sharingStatus
         )
 
         VStack(alignment: .leading, spacing: 12) {
@@ -130,7 +147,7 @@ struct DeskLinkHostStatusPopover: View {
                 .font(.system(size: 12))
                 .foregroundStyle(DeskLinkPalette.secondaryInk)
             Divider()
-            Button("打开设置 / 诊断", action: openSettings)
+            Button("打开设置与诊断", action: openSettings)
             Button("共享此设备", action: openSharing)
         }
         .padding(16)

@@ -267,6 +267,14 @@ impl QuicClient {
             .close(quinn::VarInt::from_u32(0), reason);
     }
 
+    /// Flushes connection close packets before its owning Tokio runtime exits.
+    /// Directory hosts use this on stop so a retained transport task cannot
+    /// leave their registration live until the relay's idle timeout.
+    pub async fn close_and_wait_idle(&self, reason: &[u8]) {
+        self.close(reason);
+        self._endpoint.wait_idle().await;
+    }
+
     /// Returns the relay peer address selected during the QUIC connection.
     /// LAN candidate discovery uses this only as an operating-system route
     /// hint; it is never advertised as a direct candidate.

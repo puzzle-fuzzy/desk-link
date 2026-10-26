@@ -2,6 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/apple-build-tools.sh"
 CHECK_ONLY=0
 SIGN=0
 for argument in "$@"; do
@@ -32,6 +33,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$EXECUTABLE" "$APP/Contents/MacOS/DeskLinkApp"
 cp "$ROOT/apps/macos/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/apps/macos/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/apps/apple/Resources/ThirdPartyNotices.txt" "$APP/Contents/Resources/ThirdPartyNotices.txt"
 
 if [ "$SIGN" -eq 1 ] || [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
     test -n "${APPLE_SIGNING_IDENTITY:-}"
@@ -53,6 +55,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     test "$(lipo -archs "$RUST_LIBRARY")" = 'arm64'
     test -x "$APP/Contents/MacOS/DeskLinkApp"
     test -f "$APP/Contents/Resources/AppIcon.icns"
+    cmp -s "$ROOT/apps/apple/Resources/ThirdPartyNotices.txt" "$APP/Contents/Resources/ThirdPartyNotices.txt"
     test "$(lipo -archs "$APP/Contents/MacOS/DeskLinkApp")" = 'arm64'
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" | grep -qx 'com.desklink.desktop'
     /usr/libexec/PlistBuddy -c 'Print :NSScreenCaptureUsageDescription' "$APP/Contents/Info.plist" >/dev/null

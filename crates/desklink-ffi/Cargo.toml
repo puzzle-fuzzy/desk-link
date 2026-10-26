@@ -9,6 +9,7 @@ license.workspace = true
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
+blake2 = "0.10"
 desklink-crypto.workspace = true
 desklink-protocol.workspace = true
 desklink-session.workspace = true
@@ -16,6 +17,9 @@ desklink-transport.workspace = true
 desklink-video.workspace = true
 ed25519-dalek = "3.0"
 rand_core.workspace = true
+libc = "0.2"
+opus-head-sys = { version = "0.3.1", default-features = false }
+serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 zeroize = "1.8"

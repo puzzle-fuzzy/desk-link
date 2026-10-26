@@ -161,6 +161,9 @@ final class IOSMetalVideoSurface: MTKView {
             bounds: targetRect,
             colorSpace: CGColorSpaceCreateDeviceRGB()
         )
+#if !targetEnvironment(simulator)
+        // CAMetalDrawable presentation handlers are unavailable in the
+        // simulator; its tests assert against presentation fixtures instead.
         if let token, let receipt = onFramePresented, pixelBuffer != nil, !visibleRect.isEmpty {
             let presentedRect = visibleRect
             drawable.addPresentedHandler { [weak self] drawable in
@@ -176,6 +179,7 @@ final class IOSMetalVideoSurface: MTKView {
                 }
             }
         }
+#endif
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }

@@ -32,7 +32,7 @@ struct IOSSavedHostsView: View {
                     ForEach(hosts) { host in
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
-                                Text(host.displayName).font(.headline)
+                                Text(host.displayTitle).font(.headline)
                                 Spacer()
                                 Button("重新连接") {
                                     destination = .connect
@@ -44,7 +44,7 @@ struct IOSSavedHostsView: View {
                                     Image(systemName: "trash")
                                 }
                                 .buttonStyle(.borderless)
-                                .accessibilityLabel("删除 \(host.displayName)")
+                                .accessibilityLabel("删除 \(host.displayTitle)")
                             }
                             Text(host.canReconnect ? "认证材料保存在 Keychain" : "连接授权需更新，请重新配对")
                                 .font(.caption)

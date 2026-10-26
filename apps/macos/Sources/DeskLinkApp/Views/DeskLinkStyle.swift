@@ -4,6 +4,16 @@ import DeskLinkAppleCore
 
 enum DeskLinkSection: String, CaseIterable, Identifiable {
     case connect = "连接设备"
+    case share = "共享此设备"
+    case settings = "设置与诊断"
+
+    var systemImage: String {
+        switch self {
+        case .connect: "desktopcomputer.and.arrow.right"
+        case .share: "display"
+        case .settings: "gearshape"
+        }
+    }
 
     var id: Self { self }
 }
@@ -36,22 +46,69 @@ struct DeskLinkShell: View {
     @ObservedObject var controller: ControllerBridge
     @ObservedObject var account: AccountClient
 
+    @State private var section: DeskLinkSection? = .connect
     @State private var isShowingHostStatus = false
-    @State private var presentedHostPage: HostHomePage?
+    @StateObject private var connectionDraft = DeskLinkConnectionDraft()
 
     var body: some View {
-        ControllerHomeView(bridge: controller)
+        NavigationSplitView {
+            List(selection: $section) {
+                Section {
+                    ForEach(DeskLinkSection.allCases) { item in
+                        Label(item.rawValue, systemImage: item.systemImage)
+                            .tag(item)
+                            .padding(.vertical, 5)
+                    }
+                } header: {
+                    HStack(spacing: 9) {
+                        DeskLinkMark()
+                        Text("DeskLink")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(DeskLinkPalette.ink)
+                    }
+                    .padding(.vertical, 12)
+                }
+            }
+            .listStyle(.sidebar)
+            .accessibilityLabel("DeskLink 主导航")
+            .navigationSplitViewColumnWidth(min: 190, ideal: 205, max: 250)
+            .safeAreaInset(edge: .bottom) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label(hostStatus.title, systemImage: hostStatus.systemImage)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(hostStatus.tone == .attention ? DeskLinkPalette.warning : DeskLinkPalette.secondaryInk)
+                    Text(accountSummary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(DeskLinkPalette.mutedInk)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            }
+        } detail: {
+            Group {
+                switch section ?? .connect {
+                case .connect:
+                    ControllerHomeView(bridge: controller, draft: connectionDraft)
+                case .share:
+                    HostHomeView(bridge: host, page: .connection)
+                case .settings:
+                    HostHomeView(bridge: host, page: .overview, controller: controller, account: account)
+                }
+            }
+            .navigationTitle((section ?? .connect).rawValue)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(DeskLinkPalette.surface)
+        }
+        .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 980, minHeight: 620)
-        .background(DeskLinkPalette.surface)
+        .background(DeskLinkPalette.background)
         .tint(DeskLinkPalette.primary)
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     isShowingHostStatus = true
                 } label: {
-                    Image(systemName: hostStatusIcon)
+                    Label("本机共享", systemImage: hostStatus.systemImage)
                 }
                 .help("查看本机共享状态")
                 .popover(isPresented: $isShowingHostStatus) {
@@ -59,72 +116,38 @@ struct DeskLinkShell: View {
                         host: host,
                         openSettings: {
                             isShowingHostStatus = false
-                            presentedHostPage = .overview
+                            section = .settings
                         },
                         openSharing: {
                             isShowingHostStatus = false
-                            presentedHostPage = .connection
+                            section = .share
                         }
                     )
                 }
-
-                Button {
-                    presentedHostPage = .connection
-                } label: {
-                    Image(systemName: "macbook.and.iphone")
-                }
-                .help("共享此设备")
-
-                Menu {
-                    if account.state.hasAccountSession {
-                        Text(account.state.cachedUser?.email ?? "已保存的账号会话")
-                        Button("退出登录", systemImage: "rectangle.portrait.and.arrow.right") {
-                            Task { @MainActor in
-                                controller.clearRemoteLinksForLogout()
-                                let stoppingHost = host
-                                async let stopped: Void = stoppingHost.shutdownAndWait()
-                                await account.logout()
-                                await stopped
-                            }
-                        }
-                    } else if case .skipped = account.state {
-                        Text("未登录 · 本机模式")
-                    }
-                    Divider()
-                    Button("已批准设备", systemImage: "person.2") {
-                        presentedHostPage = .devices
-                    }
-                    Button("设置 / 诊断", systemImage: "gearshape") {
-                        presentedHostPage = .overview
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .help("更多管理功能")
-
             }
         }
-        .popover(item: $presentedHostPage) { page in
-            HostHomeView(bridge: host, page: page)
-                .frame(width: 680, height: 620)
-        }
+        .onChange(of: controller.state) { state in connectionDraft.observe(state) }
     }
 
-    private var hostStatusIcon: String {
-        let status = deskLinkHostStatus(
+    private var hostStatus: DeskLinkHostStatus {
+        deskLinkHostStatus(
             for: host.state,
             permissions: host.permissions,
             hasPendingApproval: host.pendingApproval != nil,
-            lastError: host.lastError
+            lastError: host.lastError,
+            sharingStatus: host.sharingStatus
         )
-        switch status.tone {
-        case .ready: return "checkmark.circle"
-        case .attention: return "exclamationmark.circle"
-        case .idle: return "circle"
-        case .working: return "arrow.triangle.2.circlepath"
-        }
     }
 
+    private var accountSummary: String {
+        switch account.state {
+        case let .signedIn(user): user.email
+        case let .offline(user): user?.email ?? "离线模式 · 未登录"
+        case .skipped: "本机模式 · 未登录"
+        case .loading: "正在加载账号"
+        case .signedOut: "未登录"
+        }
+    }
 }
 
 struct DeskLinkMark: View {

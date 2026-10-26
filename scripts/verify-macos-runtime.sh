@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/apple-build-tools.sh"
 
 cargo fmt --all -- --check
 cargo test -p desklink-session --test state_machine

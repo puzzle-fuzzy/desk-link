@@ -43,7 +43,7 @@ final class DeskLinkNavigationTests: XCTestCase {
     func testPrimaryNavigationUsesRemoteTasks() {
         XCTAssertEqual(
             DeskLinkSection.allCases.map(\.rawValue),
-            ["连接设备"]
+            ["连接设备", "共享此设备", "设置与诊断"]
         )
         XCTAssertEqual(DeskLinkSection.connect.rawValue, "连接设备")
     }
@@ -52,7 +52,7 @@ final class DeskLinkNavigationTests: XCTestCase {
         let summary = deskLinkHostStatus(for: .idle, lastError: nil)
 
         XCTAssertEqual(summary.title, "未开启共享")
-        XCTAssertEqual(summary.detail, "需要共享这台 Mac 时生成连接码")
+        XCTAssertEqual(summary.detail, "需要共享这台 Mac 时开启共享")
         XCTAssertFalse(summary.detail.contains("视频"))
         XCTAssertFalse(summary.detail.contains("关键帧"))
     }
@@ -189,5 +189,62 @@ final class DeskLinkNavigationTests: XCTestCase {
                 "A host approval must remain presentable while \(state) replaces the shell with SessionView."
             )
         }
+    }
+}
+
+
+extension DeskLinkNavigationTests {
+    func testConnectionProgressUsesActualRuntimeStagesAndProvidesDelayedGuidance() {
+        let stages: [(ControllerConnectionStage, Int?)] = [
+            (.idle, nil), (.creatingSession, 0), (.connectingRelay, 0),
+            (.secureHandshake, 1), (.waitingApproval, 2),
+            (.negotiating, 3), (.startingVideo, 3), (.connected, 3),
+            (.degraded, 1), (.recoveringVideo, 1), (.reconnecting, 1),
+            (.disconnecting, nil), (.closed, nil),
+        ]
+        for (stage, step) in stages {
+            XCTAssertEqual(deskLinkConnectionProgress(for: stage, elapsed: 0).activeStep, step)
+        }
+        XCTAssertTrue(deskLinkConnectionProgress(for: .waitingApproval, elapsed: 16).guidance.contains("取消后重试"))
+        XCTAssertFalse(deskLinkConnectionProgress(for: .waitingApproval, elapsed: 1).guidance.contains("取消后重试"))
+    }
+
+    func testConnectionElapsedBoundsNegativeTimeAndFormatsLongWaits() {
+        XCTAssertEqual(deskLinkConnectionElapsed(-1), "刚刚开始")
+        XCTAssertEqual(deskLinkConnectionElapsed(3.8), "已等待 3 秒")
+        XCTAssertEqual(deskLinkConnectionElapsed(60), "已等待 1 分钟")
+        XCTAssertEqual(deskLinkConnectionElapsed(125), "已等待 2 分 5 秒")
+    }
+
+    func testRecentDeviceTitlePrefersAliasThenDeviceID() {
+        let aliasHost = recentDevice(deviceID: "123456789012", displayName: "办公室电脑")
+        XCTAssertEqual(deskLinkSavedHostTitle(aliasHost), "办公室电脑")
+        XCTAssertEqual(deskLinkSavedHostDeviceID(aliasHost), "123 456 789 012")
+        XCTAssertEqual(deskLinkSavedHostTitle(recentDevice(deviceID: "123456789012")), "123 456 789 012")
+    }
+
+    func testLegacyDevicesOnSameRelayHaveDistinctNonSecretLabels() {
+        let first = recentDevice(key: 1)
+        let second = recentDevice(key: 2)
+        XCTAssertNotEqual(deskLinkSavedHostTitle(first), deskLinkSavedHostTitle(second))
+        XCTAssertFalse(deskLinkSavedHostTitle(first).contains(first.serverName))
+        XCTAssertEqual(deskLinkSavedHostIdentity(first).count, 12)
+        let rotatedCredentials = SavedHost(
+            id: UUID(), serverName: first.serverName,
+            sessionID: [UInt8](repeating: 9, count: 16),
+            relayAuthentication: [UInt8](repeating: 8, count: 32),
+            hostVerifyKey: first.hostVerifyKey
+        )
+        XCTAssertEqual(deskLinkSavedHostTitle(first), deskLinkSavedHostTitle(rotatedCredentials))
+    }
+
+    private func recentDevice(key: UInt8 = 3, deviceID: String? = nil, displayName: String? = nil) -> SavedHost {
+        SavedHost(
+            id: UUID(), serverName: "relay.example.com",
+            sessionID: [UInt8](repeating: 1, count: 16),
+            relayAuthentication: [UInt8](repeating: 2, count: 32),
+            hostVerifyKey: [UInt8](repeating: key, count: 32),
+            deviceID: deviceID, displayName: displayName
+        )
     }
 }

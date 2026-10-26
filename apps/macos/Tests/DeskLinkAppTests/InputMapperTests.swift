@@ -25,13 +25,14 @@ final class InputMapperTests: XCTestCase {
     }
 
     func testCaptureVideoDimensionsFitProtocolBounds() {
+        // DL2-043 constrained capture to the declared H264 Main capability.
         XCTAssertEqual(
             captureVideoDimensions(displayWidth: 3840, displayHeight: 2160),
-            CaptureVideoDimensions(width: 2560, height: 1440)
+            CaptureVideoDimensions(width: 1920, height: 1080)
         )
         XCTAssertEqual(
             captureVideoDimensions(displayWidth: 2560, displayHeight: 1600),
-            CaptureVideoDimensions(width: 2304, height: 1440)
+            CaptureVideoDimensions(width: 1728, height: 1080)
         )
     }
 
@@ -53,7 +54,8 @@ final class InputMapperTests: XCTestCase {
             keyCode: 0x00,
             characters: "中",
             modifiers: [.command, .shift],
-            isDown: true
+            isDown: true,
+            policy: KeyboardMappingPolicy()
         ), [
             .character(0x4e2d, pressed: true, modifiers: [.meta, .shift]),
         ])
@@ -70,7 +72,7 @@ final class InputMapperTests: XCTestCase {
 
     func testKeyboardMapperSendsOrdinaryASCIIAsProtocolCharacter() {
         XCTAssertEqual(
-            KeyboardMapper.map(keyCode: 0, characters: "a", modifiers: [], isDown: true),
+            KeyboardMapper.map(keyCode: 0, characters: "a", modifiers: [], isDown: true, policy: KeyboardMappingPolicy()),
             [.character(97, pressed: true, modifiers: [])]
         )
     }
@@ -257,6 +259,8 @@ final class InputMapperTests: XCTestCase {
         _ = keyboard.keyDown(context: quality, keyCode: 8, characters: "c", modifiers: .control, isRepeat: false)
         XCTAssertEqual(keyboard.keyUp(keyCode: 8).map(\.context), [quality, inputContext])
         XCTAssertEqual(keyboard.flagsChanged(context: quality, [], keyCode: 0x3b).map(\.context), [inputContext])
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 31), 0x37)
+        XCTAssertNil(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 32))
     }
 
     func testScrollQuantizationNeverSendsInvalidZeroOrOversizedDeltas() {

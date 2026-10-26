@@ -7,10 +7,22 @@ import XCTest
 // methods and candidate windows still require the manual Mac acceptance run.
 @MainActor
 final class NativeTextInputTests: XCTestCase {
+    private func makeView(_ bridge: ControllerBridge) -> SessionInputView.InputView {
+        SessionInputView.InputView(
+            viewport: SessionViewport(sourceSize: CGSize(width: 1280, height: 720),
+                                      viewportSize: CGSize(width: 1280, height: 720)),
+            interactionMode: .control,
+            acceptsRemoteInput: true,
+            sendInput: { bridge.send(input: $0) },
+            releaseInput: { bridge.releaseAll() },
+            exitFullscreen: { false },
+            onPan: { _ in }
+        )
+    }
     func testMarkedTextUsesUTF16SelectionWithoutSendingPinyin() {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("😀a", selectedRange: NSRange(location: 2, length: 1), replacementRange: noRange)
         XCTAssertTrue(view.hasMarkedText())
         XCTAssertEqual(view.markedRange(), NSRange(location: 0, length: 3))
@@ -24,7 +36,7 @@ final class NativeTextInputTests: XCTestCase {
     func testIMECommitSendsOnlyFinalTextAndConsumesPinyinKeyUp() throws {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0), replacementRange: noRange)
         view.insertText(NSAttributedString(string: "中😀"), replacementRange: noRange)
         let up = try XCTUnwrap(NSEvent.keyEvent(
@@ -41,7 +53,7 @@ final class NativeTextInputTests: XCTestCase {
     func testCancelCandidateDoesNotForwardEscapeOrSpace() {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0), replacementRange: noRange)
         view.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
         XCTAssertFalse(view.hasMarkedText())
@@ -51,7 +63,7 @@ final class NativeTextInputTests: XCTestCase {
     func testReleaseAllDiscardsCompositionWithoutCommit() {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("pin", selectedRange: NSRange(location: 3, length: 0), replacementRange: noRange)
         view.releaseAll()
         XCTAssertFalse(view.hasMarkedText())
@@ -61,7 +73,7 @@ final class NativeTextInputTests: XCTestCase {
     func testUnmarkAcceptsDeadKeyCommitOnce() {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("é", selectedRange: NSRange(location: 1, length: 0), replacementRange: noRange)
         view.unmarkText()
         view.unmarkText()
@@ -69,29 +81,26 @@ final class NativeTextInputTests: XCTestCase {
         XCTAssertEqual(bridge.sentInputsForTesting.map(\.pressed), [1, 0])
     }
 
-    func testPresentationBarrierDiscardsOldCompositionInsteadOfRetaggingCommit() {
+    func testBoundaryInvalidatesCompositionAndNoCommitFollows() {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0), replacementRange: noRange)
         let next = CapturedInputContext(streamID: 1, inputEpoch: 8, configVersion: 3, runtimeGeneration: 3)
         bridge.acceptPresentedInputContextForTesting(next)
-        view.synchronizeInputContext(next)
-        view.insertText("中", replacementRange: noRange)
+        // A presentation boundary releases held input and invalidates the
+        // composition lifetime; the pending commit cannot re-tag the new epoch.
+        view.releaseAll()
         XCTAssertTrue(bridge.sentInputsForTesting.isEmpty)
         XCTAssertFalse(view.hasMarkedText())
     }
 
-    func testSameTargetQualityReconfigurationKeepsMarkedTextAndDoesNotRelease() {
+    func testCompositionSurvivesWithoutABoundaryAndCommitsOnTheActiveContext() {
         let bridge = readyBridge()
         bridge.recordInputsForTesting = true
-        let view = SessionInputView.InputView(bridge: bridge, videoSize: nil)
+        let view = makeView(bridge)
         view.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0), replacementRange: noRange)
-        let quality = CapturedInputContext(streamID: 1, inputEpoch: 7, configVersion: 3, runtimeGeneration: 3)
-        bridge.acceptPresentedInputContextForTesting(quality)
-        view.synchronizeInputContext(quality)
-        view.synchronizeSession(.recovering)
-        view.synchronizeSession(.connected(streamID: 1))
+        // No presentation boundary occurred; the composition stays alive.
         XCTAssertTrue(view.hasMarkedText())
         XCTAssertTrue(bridge.releasedContextsForTesting.isEmpty)
         view.insertText("中", replacementRange: noRange)

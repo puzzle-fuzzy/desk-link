@@ -133,7 +133,17 @@ final class MacInputInjector {
         case let .wheel(deltaX, deltaY):
             try backend.postScroll(deltaX: deltaX, deltaY: deltaY)
         case let .key(code, pressed, modifiers):
-            try backend.postKey(code: code, pressed: pressed, modifiers: modifiers)
+            // Controller modifier edges are independent of a special key's
+            // up packet. Preserve their flags on macOS as well as Windows.
+            var effectiveModifiers = modifiers
+            for heldKey in pressedKeys {
+                if let modifier = modifier(forVirtualKey: heldKey) { effectiveModifiers.insert(modifier) }
+            }
+            if let modifier = modifier(forVirtualKey: code) {
+                if pressed { effectiveModifiers.insert(modifier) }
+                else { effectiveModifiers.remove(modifier) }
+            }
+            try backend.postKey(code: code, pressed: pressed, modifiers: effectiveModifiers)
             if pressed { pressedKeys.insert(code) } else { pressedKeys.remove(code) }
         case let .character(value, pressed, modifiers):
             guard let scalar = UnicodeScalar(value) else { throw MacInputInjectorError.invalidKeyCode }
@@ -142,6 +152,16 @@ final class MacInputInjector {
         case let .unicode(text, modifiers):
             try backend.postUnicode(text, pressed: true, modifiers: modifiers)
             try backend.postUnicode(text, pressed: false, modifiers: modifiers)
+        }
+    }
+
+    private func modifier(forVirtualKey code: UInt32) -> Modifiers? {
+        switch code {
+        case 0x3b, 0x3e: .control
+        case 0x3a, 0x3d: .option
+        case 0x38, 0x3c: .shift
+        case 0x37, 0x36: .meta
+        default: nil
         }
     }
 

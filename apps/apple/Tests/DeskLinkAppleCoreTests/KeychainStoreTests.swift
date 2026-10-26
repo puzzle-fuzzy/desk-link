@@ -113,3 +113,100 @@ final class KeychainStoreTests: XCTestCase {
         XCTAssertEqual(saved[1], second)
     }
 }
+
+extension KeychainStoreTests {
+    func testLegacySavedHostsDecodeWithoutPresentationMetadata() throws {
+        let legacyHost = presentationHost()
+        var records = try XCTUnwrap(JSONSerialization.jsonObject(with: SavedHostStore.encode([legacyHost])) as? [[String: Any]])
+        records[0].removeValue(forKey: "deviceID")
+        records[0].removeValue(forKey: "displayName")
+        records[0].removeValue(forKey: "lastConnectedAt")
+
+        let decoded = try SavedHostStore.decode(JSONSerialization.data(withJSONObject: records))
+
+        XCTAssertEqual(decoded, [legacyHost])
+        XCTAssertNil(decoded[0].deviceID)
+        XCTAssertNil(decoded[0].displayName)
+        XCTAssertNil(decoded[0].lastConnectedAt)
+    }
+
+    func testRenamingSavedHostPreservesCredentialsMetadataAndOrder() throws {
+        let keychain = InMemoryKeychainStore()
+        let store = SavedHostStore(keychain: keychain)
+        let first = presentationHost(deviceID: "123456789012", lastConnectedAt: Date(timeIntervalSince1970: 100))
+        let second = presentationHost(key: 4)
+        try store.save(first)
+        try store.save(second)
+
+        try store.rename(id: first.id, displayName: "  家里的电脑  ")
+        let hosts = try store.loadAll()
+
+        XCTAssertEqual(hosts.map(\.id), [second.id, first.id])
+        let renamed = try XCTUnwrap(hosts.last)
+        XCTAssertEqual(renamed.displayName, "家里的电脑")
+        XCTAssertEqual(renamed.deviceID, first.deviceID)
+        XCTAssertEqual(renamed.lastConnectedAt, first.lastConnectedAt)
+        XCTAssertEqual(renamed.sessionID, first.sessionID)
+        XCTAssertEqual(renamed.relayAuthentication, first.relayAuthentication)
+        XCTAssertEqual(renamed.hostVerifyKey, first.hostVerifyKey)
+        XCTAssertEqual(renamed.serverName, first.serverName)
+
+        try store.rename(id: first.id, displayName: "   ")
+        XCTAssertNil(try store.loadAll().last?.displayName)
+    }
+
+    func testRefreshingSavedHostPreservesAliasAndDeviceIDAndUpdatesLastConnection() throws {
+        let keychain = InMemoryKeychainStore()
+        let store = SavedHostStore(keychain: keychain)
+        let host = presentationHost(deviceID: "123456789012", displayName: "办公室", lastConnectedAt: Date(timeIntervalSince1970: 100))
+        try store.save(host)
+        let refreshed = SavedHost(
+            id: UUID(),
+            serverName: host.serverName,
+            sessionID: [UInt8](repeating: 8, count: 16),
+            relayAuthentication: [UInt8](repeating: 9, count: 32),
+            hostVerifyKey: host.hostVerifyKey,
+            lastConnectedAt: Date(timeIntervalSince1970: 200)
+        )
+        try store.save(refreshed)
+
+        let saved = try XCTUnwrap(try store.loadAll().first)
+        XCTAssertEqual(try store.loadAll().count, 1)
+        // The UUID identifies the local record; a credential refresh for
+        // the same authenticated host keeps the original stable id.
+        XCTAssertEqual(saved.id, host.id)
+        XCTAssertEqual(saved.displayName, "办公室")
+        XCTAssertEqual(saved.deviceID, host.deviceID)
+        XCTAssertEqual(saved.lastConnectedAt, refreshed.lastConnectedAt)
+        XCTAssertEqual(saved.relayAuthentication, refreshed.relayAuthentication)
+    }
+
+    func testSavedHostRenameRejectsUnusableLabelsWithoutChangingRecord() throws {
+        let keychain = InMemoryKeychainStore()
+        let store = SavedHostStore(keychain: keychain)
+        let host = presentationHost(displayName: "原名称")
+        try store.save(host)
+
+        XCTAssertThrowsError(try store.rename(id: host.id, displayName: String(repeating: "a", count: 81)))
+        XCTAssertThrowsError(try store.rename(id: host.id, displayName: "bad\0name"))
+        XCTAssertEqual(try store.loadAll(), [host])
+    }
+
+    private func presentationHost(
+        key: UInt8 = 3,
+        deviceID: String? = nil,
+        displayName: String? = nil,
+        lastConnectedAt: Date? = nil
+    ) -> SavedHost {
+        SavedHost(
+            id: UUID(),
+            serverName: "relay.example.com",
+            sessionID: [UInt8](repeating: 1, count: 16),
+            relayAuthentication: [UInt8](repeating: 2, count: 32),
+            hostVerifyKey: [UInt8](repeating: key, count: 32),
+            deviceID: deviceID,
+            displayName: displayName,
+            lastConnectedAt: lastConnectedAt
+        )
+    }
+}

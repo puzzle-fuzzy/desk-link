@@ -84,6 +84,54 @@ fn host_abi_rejects_null_and_wrong_invite_lengths() {
 }
 
 #[test]
+fn host_directory_abi_derives_public_id_and_rejects_invalid_credentials_before_network_start() {
+    let (handle, _url, _name) = unsafe { create_host() };
+    let mut id = 0;
+    assert_eq!(
+        unsafe { desklink_ffi::desklink_host_public_device_id(handle, &mut id) },
+        DesklinkResult::Ok
+    );
+    assert_eq!(id, desklink_ffi::public_host_device_id([7; 16]));
+    assert_eq!(
+        unsafe { desklink_ffi::desklink_host_public_device_id(handle, null_mut()) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_ffi::desklink_host_public_device_id(null_mut(), &mut id) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(id, 0);
+    let mut invite = [0; desklink_crypto::PAIRING_INVITE_BYTES];
+    for (mode, code, length, capacity) in [
+        (0, *b"ABCDEFGH", 8, 181),
+        (3, *b"ABCDEFGH", 8, 181),
+        (1, *b"ABCDEFGH", 7, 181),
+        (2, *b"ABCD0FGH", 8, 181),
+        (1, *b"ABCDEFGH", 8, 180),
+    ] {
+        let mut invite_len = 99;
+        let mut expiry = 99;
+        assert_eq!(
+            unsafe {
+                desklink_ffi::desklink_host_start_directory(
+                    handle,
+                    mode,
+                    code.as_ptr(),
+                    length,
+                    invite.as_mut_ptr(),
+                    capacity,
+                    &mut invite_len,
+                    &mut expiry,
+                )
+            },
+            DesklinkResult::InvalidArgument
+        );
+        assert_eq!((invite_len, expiry), (0, 0));
+    }
+    unsafe { desklink_host_destroy(handle) };
+}
+
+#[test]
 fn host_abi_validates_invites_approval_and_media_arguments() {
     let (handle, _relay_url, _server_name) = unsafe { create_host() };
     let invalid_invite = [0; desklink_crypto::PAIRING_INVITE_BYTES];

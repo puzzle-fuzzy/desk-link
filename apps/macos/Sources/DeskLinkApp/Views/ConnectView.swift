@@ -43,74 +43,232 @@ func deskLinkConnectionStatus(for state: ConnectionState) -> DeskLinkConnectionS
     }
 }
 
+/// UI-only draft survives main navigation without writing access passwords to
+/// preferences or Keychain. The bridge remains the source of runtime state.
+@MainActor
+final class DeskLinkConnectionDraft: ObservableObject {
+    @Published var deviceID = ""
+    @Published var accessPassword = ""
+    @Published private(set) var startedAt: Date?
+    @Published private(set) var endedAt: Date?
+    @Published private(set) var wasCancelled = false
+    private var savedHost: SavedHost?
+    private var usedDeviceCredentials = false
+    private var attemptedDeviceID = ""
+    private var attemptedPassword = ""
+
+    var canRetry: Bool { savedHost != nil || usedDeviceCredentials }
+    var targetName: String? { savedHost.map(deskLinkSavedHostTitle) }
+
+    func connectDevice(using bridge: ControllerBridge) {
+        savedHost = nil
+        usedDeviceCredentials = true
+        attemptedDeviceID = deviceID
+        attemptedPassword = accessPassword
+        begin()
+        bridge.connect(deviceID: attemptedDeviceID, temporaryPassword: attemptedPassword)
+        observe(bridge.state)
+    }
+
+    func connect(_ host: SavedHost, using bridge: ControllerBridge) {
+        savedHost = host
+        usedDeviceCredentials = false
+        attemptedDeviceID = ""
+        attemptedPassword = ""
+        begin()
+        bridge.connect(savedHost: host)
+        observe(bridge.state)
+    }
+
+    func retry(using bridge: ControllerBridge) {
+        guard canRetry else { return }
+        begin()
+        if let savedHost {
+            bridge.connect(savedHost: savedHost)
+        } else {
+            bridge.connect(deviceID: attemptedDeviceID, temporaryPassword: attemptedPassword)
+        }
+        observe(bridge.state)
+    }
+
+    func cancel(using bridge: ControllerBridge) {
+        wasCancelled = true
+        endedAt = Date()
+        bridge.disconnect()
+    }
+
+    func observe(_ state: ConnectionState) {
+        switch state {
+        case .failed, .closed, .connected:
+            if startedAt != nil, endedAt == nil { endedAt = Date() }
+        default: break
+        }
+    }
+
+    private func begin() {
+        startedAt = Date()
+        endedAt = nil
+        wasCancelled = false
+    }
+}
+
+let deskLinkConnectionSteps = ["准备连接", "建立加密连接", "等待主机确认", "打开远程桌面"]
+
+struct DeskLinkConnectionProgress: Equatable {
+    let activeStep: Int?
+    let guidance: String
+}
+
+func deskLinkConnectionProgress(for stage: ControllerConnectionStage, elapsed: TimeInterval) -> DeskLinkConnectionProgress {
+    let delayed = elapsed >= 15
+    switch stage {
+    case .idle, .closed, .disconnecting:
+        return .init(activeStep: nil, guidance: "当前没有正在进行的连接。")
+    case .creatingSession, .connectingRelay:
+        return .init(activeStep: 0, guidance: delayed
+            ? "准备时间较长，请确认两台设备在线，并核对设备 ID 和密码。"
+            : "正在联系中继服务并查找远程设备。")
+    case .secureHandshake:
+        return .init(activeStep: 1, guidance: delayed
+            ? "安全连接仍未完成，请保持两台设备联网，并确认主机没有退出 DeskLink。"
+            : "正在校验远程设备身份并建立加密通道。")
+    case .waitingApproval:
+        return .init(activeStep: 2, guidance: delayed
+            ? "请查看主机屏幕上的控制请求。如果没有出现请求，可取消后重试。"
+            : "请在另一台设备上确认允许本次远程控制。已批准设备可能自动通过。")
+    case .negotiating, .startingVideo:
+        return .init(activeStep: 3, guidance: delayed
+            ? "正在等待远程画面，请确认主机屏幕可用。也可以取消后重新连接。"
+            : "正在准备远程画面，桌面就绪后会自动打开。")
+    case .connected:
+        return .init(activeStep: 3, guidance: "远程桌面已连接。")
+    case .degraded, .recoveringVideo, .reconnecting:
+        return .init(activeStep: 1, guidance: "网络连接发生变化，DeskLink 正在自动恢复会话。")
+    }
+}
+
+func deskLinkConnectionElapsed(_ interval: TimeInterval) -> String {
+    let seconds = max(0, Int(interval))
+    if seconds == 0 { return "刚刚开始" }
+    if seconds < 60 { return "已等待 \(seconds) 秒" }
+    if seconds % 60 == 0 { return "已等待 \(seconds / 60) 分钟" }
+    return "已等待 \(seconds / 60) 分 \(seconds % 60) 秒"
+}
+
 struct ConnectView: View {
     @ObservedObject var bridge: ControllerBridge
-    @State private var deviceID = ""
-    @State private var accessPassword = ""
+    @ObservedObject var draft: DeskLinkConnectionDraft
 
     var body: some View {
-        DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 8) {
-                    Image(systemName: connectionStatus.systemImage)
-                    Text(connectionStatus.title)
-                }
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(DeskLinkPalette.ink)
-
-                if let detail = deskLinkConnectionWaitingDetail(bridge.state) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(alignment: .top, spacing: 10) {
-                            ProgressView().controlSize(.small)
-                            Text(detail)
-                                .font(.system(size: 12))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Button("取消连接") { bridge.disconnect() }
-                            .buttonStyle(DeskLinkSecondaryButtonStyle())
-                            .keyboardShortcut(.cancelAction)
-                            .accessibilityIdentifier("cancel-controller-connection")
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("使用设备 ID 和密码连接")
-                        .font(.system(size: 15, weight: .semibold))
+        VStack(alignment: .leading, spacing: 16) {
+            DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
+                VStack(alignment: .leading, spacing: 16) {
+                    Label("使用设备 ID 和密码连接", systemImage: "desktopcomputer.and.arrow.right")
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(DeskLinkPalette.ink)
-                    Text("输入另一台主机显示的设备 ID 和访问密码。连接成功并获得批准后，设备会保存到右侧列表。")
+                    Text("输入另一台设备显示的设备 ID 和访问密码。连接成功并获得批准后，可从最近设备再次连接。")
                         .font(.system(size: 12))
                         .foregroundStyle(DeskLinkPalette.secondaryInk)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    TextField("设备 ID，例如 123 456 789 012", text: $deviceID)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 13, design: .monospaced))
-                        .accessibilityLabel("设备 ID")
-                        .disabled(isBusy)
-
-                    SecureField("临时密码或固定密码", text: $accessPassword)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 13, design: .monospaced))
-                        .accessibilityLabel("访问密码")
-                        .disabled(isBusy)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("设备 ID").font(.system(size: 12, weight: .medium))
+                        TextField("例如 123 456 789 012", text: $draft.deviceID)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 14, design: .monospaced))
+                            .accessibilityLabel("设备 ID")
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("访问密码").font(.system(size: 12, weight: .medium))
+                        SecureField("临时密码或固定密码", text: $draft.accessPassword)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 14, design: .monospaced))
+                            .accessibilityLabel("访问密码")
+                    }
+                    .disabled(isBusy)
 
                     Button {
-                        bridge.connect(deviceID: deviceID, temporaryPassword: accessPassword)
+                        draft.connectDevice(using: bridge)
                     } label: {
-                        Text("连接设备")
-                            .frame(maxWidth: .infinity)
+                        Text("连接设备").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(DeskLinkPrimaryButtonStyle())
                     .keyboardShortcut(.defaultAction)
                     .disabled(isBusy || !directoryCredentialsAreComplete)
                 }
+                .disabled(isBusy)
+            }
+
+            if draft.startedAt != nil || isBusy || hasFailed {
+                TimelineView(.periodic(from: Date(), by: 1)) { context in
+                    progressPanel(now: context.date)
+                }
+            }
+        }
+        .onChange(of: bridge.state) { state in draft.observe(state) }
+    }
+
+    private func progressPanel(now: Date) -> some View {
+        let startedAt = bridge.connectionAttemptStartedAt ?? draft.startedAt ?? now
+        let elapsed = max(0, (draft.endedAt ?? now).timeIntervalSince(startedAt))
+        let progress = deskLinkConnectionProgress(for: bridge.connectionStage, elapsed: elapsed)
+        let terminal = hasFailed || draft.wasCancelled || bridge.state == .closed
+        return DeskLinkPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    if isBusy { ProgressView().controlSize(.small) }
+                    Label(progressTitle, systemImage: deskLinkConnectionStatus(for: bridge.state).systemImage)
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer(minLength: 8)
+                    Text(deskLinkConnectionElapsed(elapsed))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                }
+                if let target = draft.targetName {
+                    Text(target)
+                        .font(.system(size: 12))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                        .lineLimit(1)
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(deskLinkConnectionSteps.indices, id: \.self) { index in
+                        let isActive = progress.activeStep == index
+                        let complete = progress.activeStep.map { index < $0 } ?? false
+                        HStack(spacing: 9) {
+                            Image(systemName: complete ? "checkmark.circle.fill" : isActive ? "circle.inset.filled" : "circle")
+                                .foregroundStyle(complete ? DeskLinkPalette.success : isActive ? DeskLinkPalette.primary : DeskLinkPalette.mutedInk)
+                            Text(deskLinkConnectionSteps[index])
+                                .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                                .foregroundStyle(isActive ? DeskLinkPalette.ink : DeskLinkPalette.secondaryInk)
+                        }
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("远程连接进度")
+                Text(draft.wasCancelled ? "已取消本次连接。可以修改设备信息或重试。" : hasFailed ? "请检查设备 ID、密码和主机状态，然后重试。" : progress.guidance)
+                    .font(.system(size: 12))
+                    .foregroundStyle(elapsed >= 15 && !terminal ? DeskLinkPalette.warning : DeskLinkPalette.secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+                if isBusy {
+                    Button("取消连接") { draft.cancel(using: bridge) }
+                        .buttonStyle(DeskLinkSecondaryButtonStyle())
+                } else if terminal && draft.canRetry {
+                    Button("重试本次连接") { draft.retry(using: bridge) }
+                        .buttonStyle(DeskLinkPrimaryButtonStyle())
+                }
             }
         }
     }
 
-    private var connectionStatus: DeskLinkConnectionStatus {
-        deskLinkConnectionStatus(for: bridge.state)
+    private var progressTitle: String {
+        if draft.wasCancelled { return "已取消连接" }
+        if bridge.state == .closed { return "已断开连接" }
+        return deskLinkConnectionStatus(for: bridge.state).title
+    }
+
+    private var hasFailed: Bool {
+        if case .failed = bridge.state { return true }
+        return false
     }
 
     private var isBusy: Bool {
@@ -118,8 +276,8 @@ struct ConnectView: View {
     }
 
     private var directoryCredentialsAreComplete: Bool {
-        deviceID.filter(\.isNumber).count == 12
-            && accessPassword.uppercased().filter {
+        draft.deviceID.filter(\.isNumber).count == 12
+            && draft.accessPassword.uppercased().filter {
                 "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains($0)
             }.count == Int(DESKLINK_DIRECTORY_ACCESS_CODE_BYTES)
     }

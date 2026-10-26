@@ -28,6 +28,7 @@ use zeroize::Zeroize;
 use crate::host::{
     HOST_COMMAND_CAPACITY, HostCommand, HostError, HostEvent, HostMetrics, HostState,
 };
+use crate::host_directory::HostDirectorySession;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -186,6 +187,7 @@ impl HostWorker {
         identity: DeviceIdentity,
         session_id: SessionId,
         relay_authentication: [u8; 32],
+        directory: Option<HostDirectorySession>,
         events: mpsc::Sender<HostEvent>,
     ) -> Result<Self, HostError> {
         let (commands, receiver) = mpsc::channel(HOST_COMMAND_CAPACITY);
@@ -211,6 +213,7 @@ impl HostWorker {
                         identity,
                         session_id,
                         relay_authentication,
+                        directory,
                         receiver,
                         cancellation_receiver,
                         events,
@@ -251,6 +254,7 @@ impl HostWorker {
         identity: DeviceIdentity,
         session_id: SessionId,
         relay_authentication: [u8; 32],
+        directory: Option<HostDirectorySession>,
         events: mpsc::Sender<HostEvent>,
     ) -> Result<Self, HostError> {
         let (commands, receiver) = mpsc::channel(HOST_COMMAND_CAPACITY);
@@ -280,6 +284,7 @@ impl HostWorker {
                                     identity,
                                     session_id,
                                     relay_authentication,
+                                    directory,
                                     receiver,
                                     cancellation_receiver,
                                     events,
@@ -493,6 +498,7 @@ async fn run_worker(
     identity: DeviceIdentity,
     session_id: SessionId,
     relay_authentication: [u8; 32],
+    directory: Option<HostDirectorySession>,
     mut commands: mpsc::Receiver<QueuedHostCommand>,
     mut cancellation: watch::Receiver<bool>,
     events: mpsc::Sender<HostEvent>,
@@ -503,13 +509,18 @@ async fn run_worker(
 ) {
     let mut relay_authentication = relay_authentication;
     let host_participant_id = identity.device_id;
-    let join = join_relay(
-        &client,
-        RelayJoin::host_with_participant(session_id, relay_authentication, host_participant_id),
-    )
-    .await
-    .map_err(transport_error);
+    let join = host_join(
+        session_id,
+        relay_authentication,
+        host_participant_id,
+        directory.as_ref(),
+    );
+    let join = match join {
+        Ok(join) => join_relay(&client, join).await.map_err(transport_error),
+        Err(error) => Err(error),
+    };
     if let Err(error) = join {
+        close_host_connection(&client).await;
         relay_authentication.zeroize();
         let _ = ready.send(Err(error.clone()));
         emit_terminal(&events, Some(error));
@@ -521,7 +532,7 @@ async fn run_worker(
     let mut reconnect_schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
     let mut terminal_error = None;
     loop {
-        match run_session(
+        let session_result = run_session(
             &client,
             &identity,
             &mut commands,
@@ -531,9 +542,12 @@ async fn run_worker(
             &phase_gate,
             &media_generation,
             &mut approved_controller,
+            directory
+                .as_ref()
+                .and_then(HostDirectorySession::expires_at_unix_s),
         )
-        .await
-        {
+        .await;
+        match session_result {
             Ok(()) => break,
             Err(error)
                 if reconnect_config.is_some()
@@ -551,6 +565,7 @@ async fn run_worker(
                     session_id,
                     relay_authentication,
                     host_participant_id,
+                    directory.as_ref(),
                     &mut reconnect_schedule,
                     &mut cancellation,
                 )
@@ -574,6 +589,9 @@ async fn run_worker(
         }
     }
 
+    // Drop alone may leave transport tasks retaining the QUIC connection. Close
+    // explicitly before Closed so stop/destroy revokes the directory immediately.
+    close_host_connection(&client).await;
     emit_nonterminal(&events, HostEvent::State(HostState::Stopping));
     record_closed(&phase, &phase_gate);
     emit_terminal(&events, terminal_error);
@@ -591,24 +609,57 @@ async fn run_session(
     phase_gate: &Arc<Mutex<()>>,
     current_media_generation: &Arc<AtomicU64>,
     approved_controller: &mut Option<ApprovedController>,
+    expires_at_unix_s: Option<u64>,
 ) -> Result<(), HostError> {
     let _media_lease = MediaGenerationLease {
         current: current_media_generation,
         phase_gate,
     };
+    // Expiry revokes new authorization attempts, while a session already
+    // approved by the user can continue, matching the Windows host behavior.
+    let authorized = tokio::select! {
+        result = authorize_session(client, identity, commands, cancellation, events, phase, phase_gate, current_media_generation, approved_controller) => result?,
+        () = wait_for_access_expiry(expires_at_unix_s) => return Err(HostError::AccessExpired),
+    };
+    let Some((mut secure, media_generation)) = authorized else {
+        return Ok(());
+    };
+    run_connected(
+        client,
+        &mut secure,
+        commands,
+        cancellation,
+        events,
+        media_generation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn authorize_session(
+    client: &QuicClient,
+    identity: &DeviceIdentity,
+    commands: &mut mpsc::Receiver<QueuedHostCommand>,
+    cancellation: &mut watch::Receiver<bool>,
+    events: &mpsc::Sender<HostEvent>,
+    phase: &Arc<AtomicU8>,
+    phase_gate: &Arc<Mutex<()>>,
+    current_media_generation: &Arc<AtomicU64>,
+    approved_controller: &mut Option<ApprovedController>,
+) -> Result<Option<(SecureSession, u64)>, HostError> {
     let handshake_identity = identity.with_secret_key_bytes(|secret| {
         DeviceIdentity::from_secret_key(identity.device_id, secret)
     });
     let Some(mut secure) =
         perform_noise_handshake(client, handshake_identity, cancellation).await?
     else {
-        return Ok(());
+        return Ok(None);
     };
     let peer = secure.peer_identity();
     {
         let _phase_gate = phase_gate.lock().map_err(|_| HostError::WorkerStopped)?;
         if WorkerPhase::load(phase).is_terminal() {
-            return Ok(());
+            return Ok(None);
         }
         phase.store(WorkerPhase::WaitingForApproval as u8, Ordering::Release);
         if !approved_controller.is_some_and(|approved| {
@@ -640,7 +691,7 @@ async fn run_session(
         )
         .await?
         {
-            return Ok(());
+            return Ok(None);
         }
         *approved_controller = Some(ApprovedController {
             device_id: peer.device_id(),
@@ -648,17 +699,17 @@ async fn run_session(
         });
     }
     if !try_advance_worker_phase(phase, phase_gate, WorkerPhase::NegotiatingCapabilities) {
-        return Ok(());
+        return Ok(None);
     }
     emit_nonterminal(events, HostEvent::State(HostState::NegotiatingCapabilities));
     negotiate_controller(client, &mut secure, cancellation).await?;
     if *cancellation.borrow() {
-        return Ok(());
+        return Ok(None);
     }
     let media_generation = {
         let _gate = phase_gate.lock().map_err(|_| HostError::WorkerStopped)?;
         if WorkerPhase::load(phase).is_terminal() {
-            return Ok(());
+            return Ok(None);
         }
         // Reuse the process-wide fallible, checked allocator: grants cannot be
         // reused by another handle, Noise session, or video input context.
@@ -674,15 +725,7 @@ async fn run_session(
         });
         generation
     };
-    run_connected(
-        client,
-        &mut secure,
-        commands,
-        cancellation,
-        events,
-        media_generation,
-    )
-    .await
+    Ok(Some((secure, media_generation)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -700,11 +743,18 @@ async fn reconnect_host(
     session_id: SessionId,
     relay_authentication: [u8; 32],
     host_participant_id: [u8; 16],
+    directory: Option<&HostDirectorySession>,
     schedule: &mut ReconnectSchedule,
     cancellation: &mut watch::Receiver<bool>,
 ) -> Result<Option<QuicClient>, HostError> {
     let mut last_error = None;
     loop {
+        if directory
+            .and_then(HostDirectorySession::expires_at_unix_s)
+            .is_some_and(|expiry| now_unix_s() >= expiry)
+        {
+            return Err(HostError::AccessExpired);
+        }
         let decision = schedule.next(now_unix_s());
         let delay = match decision {
             ReconnectDecision::RetryAfter { delay, .. } => delay,
@@ -737,10 +787,12 @@ async fn reconnect_host(
             session_id,
             relay_authentication,
             host_participant_id,
+            directory,
         )
         .await
         {
             Ok(client) => return Ok(Some(client)),
+            Err(error @ HostError::AccessExpired) => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
@@ -751,17 +803,59 @@ async fn connect_and_join(
     session_id: SessionId,
     relay_authentication: [u8; 32],
     host_participant_id: [u8; 16],
+    directory: Option<&HostDirectorySession>,
 ) -> Result<QuicClient, HostError> {
     let client = connect_relay(config.clone())
         .await
         .map_err(transport_error)?;
-    join_relay(
-        &client,
-        RelayJoin::host_with_participant(session_id, relay_authentication, host_participant_id),
-    )
-    .await
-    .map_err(transport_error)?;
+    let join = host_join(
+        session_id,
+        relay_authentication,
+        host_participant_id,
+        directory,
+    );
+    let result = match join {
+        Ok(join) => join_relay(&client, join).await.map_err(transport_error),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        close_host_connection(&client).await;
+        return Err(error);
+    }
     Ok(client)
+}
+
+fn host_join(
+    session_id: SessionId,
+    authentication: [u8; 32],
+    participant_id: [u8; 16],
+    directory: Option<&HostDirectorySession>,
+) -> Result<RelayJoin, HostError> {
+    let join = RelayJoin::host_with_participant(session_id, authentication, participant_id);
+    match directory {
+        Some(directory) => directory.decorate_join(join, now_unix_s()),
+        None => Ok(join),
+    }
+}
+
+async fn wait_for_access_expiry(expires_at_unix_s: Option<u64>) {
+    match expires_at_unix_s {
+        Some(expiry) => {
+            tokio::time::sleep(Duration::from_secs(expiry.saturating_sub(now_unix_s()))).await
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn close_host_connection(client: &QuicClient) {
+    // Quinn recommends wait_idle before shutting down the runtime. Bound the
+    // drain if the network is unavailable; local revocation and cancellation
+    // are already complete even when the relay cannot receive the close.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.close_and_wait_idle(b"host stopped"),
+    )
+    .await;
 }
 
 async fn connect_relay(config: QuicClientConfig) -> Result<QuicClient, TransportError> {
@@ -1658,6 +1752,7 @@ mod media_generation_loopback {
             identity,
             session,
             auth,
+            None,
             events_sender,
         )
         .unwrap();

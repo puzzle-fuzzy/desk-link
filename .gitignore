@@ -15,3 +15,5 @@ apps/windows-ui/src-tauri/gen/
 
 # Machine-local code navigation indexes.
 .codegraph/
+xcuserdata/
+*.xcuserstate

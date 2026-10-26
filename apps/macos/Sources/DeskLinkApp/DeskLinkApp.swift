@@ -32,6 +32,11 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
         controller?.disconnect()
     }
 
+    func applicationDidResignActive(_ notification: Notification) {
+        controller?.cancelPendingPaste()
+        controller?.releaseAll()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminationStarted else { return .terminateNow }
         terminationStarted = true
@@ -47,11 +52,37 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
 @main
 struct DeskLinkApp: App {
     @NSApplicationDelegateAdaptor(DeskLinkLifecycleDelegate.self) private var lifecycle
-    @StateObject private var controller = ControllerBridge(configuration: .macOSDefaults)
-    @StateObject private var host = HostBridge()
+    @StateObject private var controller: ControllerBridge
+    @StateObject private var host: HostBridge
     @StateObject private var account: AccountClient
 
     init() {
+#if DEBUG
+        if MacHostAcceptance.isEnabled {
+            _controller = StateObject(wrappedValue: ControllerBridge.testing(state: .idle))
+            _host = StateObject(wrappedValue: MacHostAcceptance.host())
+            let account = AccountClient(baseURL: URL(string: "https://example.invalid")!, platform: .macos,
+                deviceName: "Host acceptance", keychain: InMemoryKeychainStore())
+            account.skipLogin()
+            _account = StateObject(wrappedValue: account)
+            return
+        }
+        if MacSessionAcceptance.isEnabled {
+            _controller = StateObject(wrappedValue: MacSessionAcceptance.controller())
+            _host = StateObject(wrappedValue: HostBridge.testing(permissionSnapshot: .denied))
+            let account = AccountClient(
+                baseURL: URL(string: "https://example.invalid")!,
+                platform: .macos,
+                deviceName: "Session acceptance",
+                keychain: InMemoryKeychainStore()
+            )
+            account.skipLogin()
+            _account = StateObject(wrappedValue: account)
+            return
+        }
+#endif
+        _controller = StateObject(wrappedValue: ControllerBridge(configuration: .macOSDefaults))
+        _host = StateObject(wrappedValue: HostBridge())
         _account = StateObject(wrappedValue: AccountClient(
             baseURL: MacAccountConfiguration.accountURL,
             platform: .macos,
@@ -85,7 +116,12 @@ struct DeskLinkApp: App {
                 host.shutdown()
                 controller.disconnect()
             }
-            .task { await account.restore() }
+            .task {
+#if DEBUG
+                if MacSessionAcceptance.isEnabled || MacHostAcceptance.isEnabled { return }
+#endif
+                await account.restore()
+            }
         }
         .defaultSize(width: 1080, height: 700)
         .windowStyle(.titleBar)
@@ -94,6 +130,25 @@ struct DeskLinkApp: App {
 
     @ViewBuilder
     private var workspaceContent: some View {
+#if DEBUG
+        if MacHostAcceptance.isEnabled {
+            HostHomeView(bridge: host, page: .connection)
+                .frame(minWidth: 980, minHeight: 620)
+        } else if MacSessionAcceptance.isEnabled {
+            // Keep the acceptance process isolated even after disconnecting or
+            // beginning termination; the regular workspace reads saved hosts.
+            SessionView(bridge: controller, host: host, account: account,
+                        clipboard: MacSessionAcceptance.clipboard())
+        } else {
+            regularWorkspaceContent
+        }
+#else
+        regularWorkspaceContent
+#endif
+    }
+
+    @ViewBuilder
+    private var regularWorkspaceContent: some View {
         if isControllerSessionState(controller.state) {
             SessionView(bridge: controller, host: host, account: account)
         } else {

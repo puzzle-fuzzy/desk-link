@@ -3,6 +3,33 @@ import XCTest
 
 @MainActor
 final class H264DecoderTests: XCTestCase {
+    func testDecodedOutputCanTrailSubmissionWithoutFreezingPresentation() {
+        var order = DecodedFrameOrder()
+        let generation = order.generation
+        order.submitted(10)
+        order.submitted(11)
+        order.submitted(12)
+
+        XCTAssertTrue(order.accept(frameID: 10, generation: generation))
+        XCTAssertTrue(order.accept(frameID: 12, generation: generation))
+        XCTAssertFalse(order.accept(frameID: 11, generation: generation))
+        XCTAssertFalse(order.accept(frameID: 12, generation: generation))
+        XCTAssertFalse(order.accept(frameID: 13, generation: generation))
+    }
+
+    func testResetRejectsQueuedOutputEvenWhenNewStreamReusesFrameNumbers() {
+        var order = DecodedFrameOrder()
+        let oldGeneration = order.generation
+        order.submitted(20)
+        order.reset()
+        order.submitted(20)
+
+        XCTAssertFalse(order.accept(frameID: 20, generation: oldGeneration))
+        XCTAssertTrue(order.accept(frameID: 20, generation: order.generation))
+        order.reset()
+        XCTAssertFalse(order.accept(frameID: 20, generation: order.generation))
+    }
+
     func testDecoderStartsAndResetsWithoutRetainingStreamState() {
         let decoder = H264Decoder()
         XCTAssertNil(decoder.latestPixelBuffer)

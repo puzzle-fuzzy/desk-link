@@ -17,430 +17,546 @@ private final class WindowFocusObservation: @unchecked Sendable {
 
 struct SessionInputView: NSViewRepresentable {
     @ObservedObject var bridge: ControllerBridge
-    let videoSize: CGSize?
-    let visibleVideoRect: CGRect?
-    let modifierMode: ModifierMode
-
-    init(bridge: ControllerBridge, videoSize: CGSize? = nil, visibleVideoRect: CGRect? = nil, modifierMode: ModifierMode = .automatic) {
-        self.bridge = bridge
-        self.videoSize = videoSize
-        self.visibleVideoRect = visibleVideoRect
-        self.modifierMode = modifierMode
-    }
+    let viewport: SessionViewport
+    let interactionMode: SessionInteractionMode
+    let acceptsRemoteInput: Bool
+    let exitFullscreen: () -> Bool
+    let onPan: (CGSize) -> Void
+    let onPointerActivity: (CGPoint) -> Void
+    var modifierMode: ModifierMode = .automatic
+    var inputContextID: UInt64 = 0
+    var onPasteClipboard: (() -> Void)? = nil
+    var onFocusLost: (() -> Void)? = nil
 
     func makeNSView(context: Context) -> InputView {
-        InputView(bridge: bridge, videoSize: videoSize, visibleVideoRect: visibleVideoRect, modifierMode: modifierMode)
+        InputView(viewport: viewport, interactionMode: interactionMode,
+                  acceptsRemoteInput: acceptsRemoteInput,
+                  sendInput: { [weak bridge] in bridge?.send(input: $0) },
+                  releaseInput: { [weak bridge] in bridge?.releaseAll() },
+                  exitFullscreen: exitFullscreen, onPan: onPan,
+                  onPointerActivity: onPointerActivity,
+                  modifierMode: modifierMode, inputContextID: inputContextID,
+                  onPasteClipboard: onPasteClipboard, onFocusLost: onFocusLost)
     }
 
     func updateNSView(_ view: InputView, context: Context) {
-        view.bridge = bridge
-        view.videoSize = videoSize
-        view.visibleVideoRect = visibleVideoRect
-        view.synchronizeSession(bridge.state)
-        view.synchronizeKeyboardPolicy(KeyboardMappingPolicy(mode: modifierMode, remotePlatform: bridge.remotePlatform))
-        view.synchronizeInputContext(bridge.presentedInputContext)
+        view.viewport = viewport
+        view.interactionMode = interactionMode
+        view.acceptsRemoteInput = acceptsRemoteInput
+        view.exitFullscreen = exitFullscreen
+        view.onPan = onPan
+        view.onPointerActivity = onPointerActivity
+        view.modifierMode = modifierMode
+        view.inputContextID = inputContextID
+        view.onPasteClipboard = onPasteClipboard
+        view.onFocusLost = onFocusLost
     }
 
-    static func dismantleNSView(_ view: InputView, coordinator: ()) {
-        view.releaseAll()
-    }
+    static func dismantleNSView(_ view: InputView, coordinator: ()) { view.releaseAll() }
 
-    final class InputView: NSView, NSTextInputClient {
-        weak var bridge: ControllerBridge?
-        var videoSize: CGSize? {
+    // NSTextInputClient predates Swift concurrency; AppKit invokes its client
+    // callbacks on the UI thread. Keep all NSView state MainActor-isolated.
+    final class InputView: NSView, @preconcurrency NSTextInputClient {
+        var viewport: SessionViewport
+        var interactionMode: SessionInteractionMode {
             didSet {
-                needsDisplay = true
-                inputContext?.invalidateCharacterCoordinates()
+                if oldValue != interactionMode {
+                    onFocusLost?()
+                    releaseAll()
+                    window?.invalidateCursorRects(for: self)
+                }
             }
         }
-        var visibleVideoRect: CGRect? {
-            didSet {
-                needsDisplay = true
-                inputContext?.invalidateCharacterCoordinates()
-            }
+        var acceptsRemoteInput: Bool {
+            didSet { if oldValue && !acceptsRemoteInput { releaseAll() } }
         }
-        private var pressedButtons: [MouseButton: CapturedInputContext] = [:]
-        private var keyboard = KeyboardInputState()
-        private var keyboardPolicy: KeyboardMappingPolicy
-        private var sessionState: ConnectionState
-        private let windowFocusObservation = WindowFocusObservation()
-        private var markedText = NSMutableAttributedString(string: "")
-        private var textSelection = NSRange(location: 0, length: 0)
-        private var interpretingEvent: NSEvent?
-        private var interpretingInputContext: CapturedInputContext?
-        private var compositionInputContext: CapturedInputContext?
-        private var textFocusContext: CapturedInputContext?
-        private var surfaceContext: CapturedInputContext?
-        private var compositionAtKeyDown = false
-        private var composedDuringKeyDown = false
-        private var discardingComposition = false
-        // No remote caret geometry is negotiated yet. The last remote click
-        // provides the known text-focus anchor, normalized to the video rect.
-        private var textFocusAnchor = CGPoint(x: 0.5, y: 0.5)
+        var exitFullscreen: () -> Bool
+        var onPan: (CGSize) -> Void
+        var onPointerActivity: (CGPoint) -> Void
+        var modifierMode: ModifierMode { didSet { if oldValue != modifierMode { onFocusLost?(); releaseAll() } } }
+        var inputContextID: UInt64 { didSet { if oldValue != inputContextID { onFocusLost?(); releaseAll() } } }
+        var onPasteClipboard: (() -> Void)?
+        var onFocusLost: (() -> Void)?
+        private let sendInput: (RemoteInputCommand) -> Void
+        private let releaseInput: () -> Void
+        private let makeTextInputContext: (any NSTextInputClient) -> NSTextInputContext
+        private var pressedButtons = Set<MouseButton>()
+        private var suppressedEscapeKeyUp = false
+        private var lastDragPoint: CGPoint?
+        private var trackingArea: NSTrackingArea?
+        private var remoteModifiers: Modifiers = []
+        private var physicalKeys = Set<UInt16>()
+        private var localKeys = Set<UInt16>()
+        private var markedText = NSAttributedString(string: "")
+        private var markedSelection = NSRange(location: 0, length: 0)
+        private var candidatePoint = CGPoint(x: 20, y: 20)
+        private var textInputEnabled = true
+        private var textGeneration: UInt64 = 0
+        private var textClient: GenerationTextInputClient?
+        private var textContext: NSTextInputContext?
+        private var currentKeyEvent: NSEvent?
+        private var keyBeganInComposition = false
+        private var keyProducedOutput = false
+        private var keyCommittedText = false
 
-        init(bridge: ControllerBridge, videoSize: CGSize?, visibleVideoRect: CGRect? = nil, modifierMode: ModifierMode = .automatic) {
-            self.bridge = bridge
-            self.videoSize = videoSize
-            self.visibleVideoRect = visibleVideoRect
-            keyboardPolicy = KeyboardMappingPolicy(mode: modifierMode, remotePlatform: bridge.remotePlatform)
-            surfaceContext = bridge.presentedInputContext
-            textFocusContext = bridge.captureInputContext()
-            sessionState = bridge.state
+        init(viewport: SessionViewport,
+             interactionMode: SessionInteractionMode,
+             acceptsRemoteInput: Bool,
+             sendInput: @escaping (RemoteInputCommand) -> Void,
+             releaseInput: @escaping () -> Void,
+             exitFullscreen: @escaping () -> Bool,
+             onPan: @escaping (CGSize) -> Void,
+             onPointerActivity: @escaping (CGPoint) -> Void = { _ in },
+             modifierMode: ModifierMode = .automatic,
+             inputContextID: UInt64 = 0,
+             onPasteClipboard: (() -> Void)? = nil,
+             onFocusLost: (() -> Void)? = nil,
+             makeTextInputContext: @escaping (any NSTextInputClient) -> NSTextInputContext = { NSTextInputContext(client: $0) }) {
+            self.viewport = viewport
+            self.interactionMode = interactionMode
+            self.acceptsRemoteInput = acceptsRemoteInput
+            self.sendInput = sendInput
+            self.releaseInput = releaseInput
+            self.exitFullscreen = exitFullscreen
+            self.onPan = onPan
+            self.onPointerActivity = onPointerActivity
+            self.modifierMode = modifierMode
+            self.inputContextID = inputContextID
+            self.onPasteClipboard = onPasteClipboard
+            self.onFocusLost = onFocusLost
+            self.makeTextInputContext = makeTextInputContext
             super.init(frame: .zero)
             wantsLayer = true
         }
 
         required init?(coder: NSCoder) { nil }
-
+        override var isFlipped: Bool { true }
         override var acceptsFirstResponder: Bool { true }
+        private var canControl: Bool { interactionMode == .control && acceptsRemoteInput }
+
+        override var inputContext: NSTextInputContext? {
+            guard canControl, textInputEnabled else { return nil }
+            if textContext == nil {
+                // Each input lifetime has its own client. An asynchronous IME
+                // callback retained by an old context cannot commit to a new
+                // stream, focused view, or interaction mode.
+                let client = GenerationTextInputClient(view: self, generation: textGeneration)
+                textClient = client
+                textContext = makeTextInputContext(client)
+            }
+            return textContext
+        }
 
         override func becomeFirstResponder() -> Bool {
             let accepted = super.becomeFirstResponder()
-            if accepted { textFocusContext = bridge?.captureInputContext() }
+            if accepted { textInputEnabled = true }
             return accepted
-        }
-
-        override func draw(_ dirtyRect: NSRect) {
-            super.draw(dirtyRect)
-            guard hasMarkedText() else { return }
-            let preview = NSMutableAttributedString(attributedString: markedText)
-            preview.addAttributes(
-                [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.textColor],
-                range: NSRange(location: 0, length: preview.length)
-            )
-            let size = preview.size()
-            let anchor = localTextAnchorRect()
-            let origin = CGPoint(
-                x: max(bounds.minX, min(anchor.minX, bounds.maxX - size.width - 8)),
-                y: max(bounds.minY, min(anchor.minY, bounds.maxY - size.height - 4))
-            )
-            let background = NSRect(origin: origin, size: CGSize(width: size.width + 8, height: size.height + 4))
-            NSColor.textBackgroundColor.setFill()
-            NSBezierPath(roundedRect: background, xRadius: 3, yRadius: 3).fill()
-            preview.draw(at: CGPoint(x: origin.x + 4, y: origin.y + 2))
         }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            windowFocusObservation.cancel()
-            if window == nil {
-                releaseAll()
-                return
-            }
-            window?.acceptsMouseMovedEvents = true
-            windowFocusObservation.token = NotificationCenter.default.addObserver(
-                forName: NSWindow.didResignKeyNotification, object: window, queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.releaseAll() }
-            }
+            NotificationCenter.default.removeObserver(self)
+            guard let window else { releaseAll(); return }
+            window.acceptsMouseMovedEvents = true
+            NotificationCenter.default.addObserver(self, selector: #selector(windowLostFocus),
+                                                   name: NSWindow.didResignKeyNotification, object: window)
+            NotificationCenter.default.addObserver(self, selector: #selector(windowLostFocus),
+                                                   name: NSApplication.didResignActiveNotification, object: nil)
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.window?.isKeyWindow == true else { return }
                 self.window?.makeFirstResponder(self)
             }
         }
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {
-            if newWindow == nil { releaseAll() }
+            if newWindow == nil { onFocusLost?(); releaseAll() }
             super.viewWillMove(toWindow: newWindow)
         }
 
         override func resignFirstResponder() -> Bool {
+            onFocusLost?()
             releaseAll()
             return super.resignFirstResponder()
         }
 
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea { removeTrackingArea(trackingArea) }
+            let area = NSTrackingArea(rect: bounds,
+                                     options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved],
+                                     owner: self)
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func resetCursorRects() {
+            if interactionMode == .browse { addCursorRect(bounds, cursor: .openHand) }
+        }
+
         override func keyDown(with event: NSEvent) {
-            guard let context = bridge?.captureInputContext() else { releaseAll(); return }
-            synchronizeInputContext(context)
-            textFocusContext = context
-            if !hasMarkedText(), !event.modifierFlags.intersection([.command, .control]).isEmpty {
-                sendKeyboard(event, isDown: true, context: context)
+            if event.keyCode == 0x35, suppressedEscapeKeyUp { return }
+            if event.keyCode == 0x35, exitFullscreen() {
+                suppressedEscapeKeyUp = true
+                releaseAll()
                 return
             }
-            interpretingEvent = event
-            interpretingInputContext = context
-            compositionAtKeyDown = hasMarkedText()
-            composedDuringKeyDown = false
-            // AppKit's input context owns pinyin, dead keys, candidate
-            // selection and cancellation. Raw characters never bypass it.
-            interpretKeyEvents([event])
-            interpretingEvent = nil
-            interpretingInputContext = nil
-            compositionAtKeyDown = false
-            composedDuringKeyDown = false
-        }
-        override func keyUp(with event: NSEvent) { sendKeyboard(event, isDown: false) }
-        override func performKeyEquivalent(with event: NSEvent) -> Bool {
-            guard window?.firstResponder === self, !hasMarkedText(), event.modifierFlags.contains(.command),
-                  let context = bridge?.captureInputContext() else {
-                return super.performKeyEquivalent(with: event)
+            guard canControl else { return }
+            textInputEnabled = true
+            let wasComposing = hasMarkedText()
+            let shortcut = !event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+            if shortcut, !wasComposing {
+                if event.keyCode == 0x09,
+                   !event.modifierFlags.contains(.option),
+                   !event.modifierFlags.contains(.shift),
+                   KeyboardMapper.mappedModifiers(event.modifierFlags, mode: modifierMode).contains(.control),
+                   let onPasteClipboard {
+                    localKeys.insert(event.keyCode)
+                    releaseRemoteModifiers()
+                    onPasteClipboard()
+                    return
+                }
+                sendKeyboard(event, isDown: true)
+                return
             }
-            // AppKit routes Command shortcuts through key equivalents before
-            // keyDown. Send one balanced chord so local menus cannot consume it.
-            synchronizeInputContext(context)
-            sendKeyboard(event, isDown: true, context: context)
+
+            // All printable input (including Latin, dead keys, Chinese and
+            // emoji) has exactly one commit route: insertText. Never send the
+            // physical spelling of a composition to the remote computer.
+            localKeys.insert(event.keyCode)
+            currentKeyEvent = event
+            keyBeganInComposition = wasComposing
+            keyProducedOutput = false
+            keyCommittedText = false
+            let consumed = inputContext?.handleEvent(event) ?? false
+            if !consumed, !keyProducedOutput, !wasComposing, !hasMarkedText() {
+                if MacKeyCodeMapper.protocolCode(forAppKitKeyCode: event.keyCode) != nil {
+                    sendKeyboard(event, isDown: true)
+                } else if let text = event.characters, !text.isEmpty {
+                    insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+                }
+            }
+            currentKeyEvent = nil
+            keyBeganInComposition = false
+        }
+
+        override func keyUp(with event: NSEvent) {
+            if event.keyCode == 0x35, suppressedEscapeKeyUp {
+                suppressedEscapeKeyUp = false
+                return
+            }
+            if localKeys.remove(event.keyCode) != nil { return }
+            guard physicalKeys.remove(event.keyCode) != nil else { return }
             sendKeyboard(event, isDown: false)
+        }
+
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            guard canControl, window?.firstResponder === self,
+                  event.type == .keyDown,
+                  !event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return false }
+            keyDown(with: event)
             return true
         }
-        override func flagsChanged(with event: NSEvent) {
-            guard !hasMarkedText() else { return }
-            guard let context = bridge?.captureInputContext() else { releaseAll(); return }
-            synchronizeInputContext(context)
-            for command in keyboard.flagsChanged(context: context, event.modifierFlags, keyCode: event.keyCode, policy: keyboardPolicy) { bridge?.send(captured: command) }
-        }
-        override func mouseMoved(with event: NSEvent) { sendPointer(event) }
-        override func mouseDragged(with event: NSEvent) { sendPointer(event, isDrag: true) }
-        override func rightMouseDragged(with event: NSEvent) { sendPointer(event, isDrag: true) }
-        override func otherMouseDragged(with event: NSEvent) { sendPointer(event, isDrag: true) }
 
-        override func mouseDown(with event: NSEvent) { sendButton(event, pressed: true) }
-        override func mouseUp(with event: NSEvent) { sendButton(event, pressed: false) }
+        override func flagsChanged(with event: NSEvent) {
+            guard canControl, textInputEnabled else { return }
+            let wasComposing = hasMarkedText()
+            _ = inputContext?.handleEvent(event)
+            if wasComposing || hasMarkedText() { releaseRemoteModifiers(); return }
+            setRemoteModifiers(KeyboardMapper.mappedModifiers(event.modifierFlags, mode: modifierMode))
+        }
+
+        override func cancelOperation(_ sender: Any?) {
+            if exitFullscreen() { releaseAll() }
+            else if hasMarkedText() { cancelComposition() }
+        }
+        override func mouseMoved(with event: NSEvent) {
+            candidatePoint = convert(event.locationInWindow, from: nil)
+            onPointerActivity(candidatePoint)
+            sendPointer(event)
+        }
+        override func mouseDragged(with event: NSEvent) {
+            if interactionMode == .browse {
+                let point = convert(event.locationInWindow, from: nil)
+                if let previous = lastDragPoint {
+                    onPan(CGSize(width: point.x - previous.x, height: point.y - previous.y))
+                }
+                lastDragPoint = point
+            } else { sendPointer(event) }
+        }
+        override func rightMouseDragged(with event: NSEvent) { sendPointer(event) }
+        override func otherMouseDragged(with event: NSEvent) { sendPointer(event) }
+
+        override func mouseDown(with event: NSEvent) {
+            window?.makeFirstResponder(self)
+            candidatePoint = convert(event.locationInWindow, from: nil)
+            if interactionMode == .browse {
+                lastDragPoint = convert(event.locationInWindow, from: nil)
+                return
+            }
+            sendButton(event, pressed: true)
+        }
+        override func mouseUp(with event: NSEvent) {
+            lastDragPoint = nil
+            sendButton(event, pressed: false)
+        }
         override func rightMouseDown(with event: NSEvent) { sendButton(event, pressed: true) }
         override func rightMouseUp(with event: NSEvent) { sendButton(event, pressed: false) }
         override func otherMouseDown(with event: NSEvent) { sendButton(event, pressed: true) }
         override func otherMouseUp(with event: NSEvent) { sendButton(event, pressed: false) }
 
         override func scrollWheel(with event: NSEvent) {
+            if interactionMode == .browse {
+                onPan(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
+                return
+            }
+            guard canControl, normalizedPoint(for: event) != nil else { return }
             let deltaX = quantizeScrollDelta(event.scrollingDeltaX)
             let deltaY = quantizeScrollDelta(event.scrollingDeltaY)
             guard deltaX != 0 || deltaY != 0 else { return }
-            guard let context = bridge?.captureInputContext() else { return }
-            synchronizeInputContext(context)
-            bridge?.send(input: .wheel(deltaX: deltaX, deltaY: deltaY), context: context)
+            sendInput(.wheel(deltaX: deltaX, deltaY: deltaY))
         }
 
         func releaseAll() {
-            let textContexts = [compositionInputContext, interpretingInputContext, textFocusContext].compactMap { $0 }
-            let contexts = keyboard.activeContexts.union(pressedButtons.values).union(textContexts)
-            for context in contexts { bridge?.releaseAll(context: context) }
+            invalidateTextInput()
+            releaseInput()
+            remoteModifiers = []
+            physicalKeys.removeAll()
+            localKeys.removeAll()
             pressedButtons.removeAll()
-            keyboard.reset()
-            discardComposition()
-            textFocusContext = nil
-            interpretingInputContext = nil
+            lastDragPoint = nil
         }
 
-        private func releasePhysicalInputs() {
-            let contexts = keyboard.activeContexts.union(pressedButtons.values)
-            for context in contexts { bridge?.releaseAll(context: context) }
-            pressedButtons.removeAll()
-            keyboard.reset()
+        @objc private func windowLostFocus(_ notification: Notification) { onFocusLost?(); releaseAll() }
+
+        private func sendKeyboard(_ event: NSEvent, isDown: Bool) {
+            guard canControl else { return }
+            let logicalKey = MacKeyCodeMapper.protocolCode(forAppKitKeyCode: event.keyCode)
+            if isDown {
+                if logicalKey != nil { physicalKeys.insert(event.keyCode); localKeys.remove(event.keyCode) }
+                else { localKeys.insert(event.keyCode) }
+            }
+            let restoreModifiers = isDown && logicalKey == nil ? remoteModifiers : nil
+            if restoreModifiers != nil { releaseRemoteModifiers() }
+            let eventModifiers = KeyboardMapper.mappedModifiers(event.modifierFlags, mode: modifierMode)
+            if logicalKey != nil { setRemoteModifiers(eventModifiers) }
+            for command in KeyboardMapper.map(keyCode: event.keyCode, characters: event.characters,
+                                               modifiers: event.modifierFlags, isDown: isDown,
+                                               modifierMode: modifierMode,
+                                               charactersIgnoringModifiers: event.charactersIgnoringModifiers) {
+                if let logicalKey, !isDown {
+                    // The held modifiers already have independent key edges.
+                    // A key-up mask would make Windows release Alt in between
+                    // consecutive Alt+Tab presses and close its switcher.
+                    sendInput(.key(code: logicalKey, pressed: false, modifiers: []))
+                } else {
+                    sendInput(command)
+                }
+            }
+            if let restoreModifiers { setRemoteModifiers(restoreModifiers) }
         }
 
-        func synchronizeInputContext(_ context: CapturedInputContext?) {
-            guard context?.targetIdentity != surfaceContext?.targetIdentity else { return }
-            releaseAll()
-            surfaceContext = context
-        }
-
-        func synchronizeSession(_ state: ConnectionState) {
-            guard state != sessionState else { return }
-            sessionState = state
-            switch state {
-            case .connected, .recovering, .frozen: break
-            default: releaseAll()
+        private func setRemoteModifiers(_ desired: Modifiers) {
+            // These are physical modifier edges. Piggybacking other modifiers
+            // would make the Windows host release them with this key's up edge.
+            for (modifier, code) in KeyboardMapper.modifierKeys where remoteModifiers.contains(modifier) && !desired.contains(modifier) {
+                remoteModifiers.remove(modifier)
+                sendInput(.key(code: code, pressed: false, modifiers: []))
+            }
+            for (modifier, code) in KeyboardMapper.modifierKeys where !remoteModifiers.contains(modifier) && desired.contains(modifier) {
+                remoteModifiers.insert(modifier)
+                sendInput(.key(code: code, pressed: true, modifiers: []))
             }
         }
 
-        func synchronizeKeyboardPolicy(_ policy: KeyboardMappingPolicy) {
-            guard policy != keyboardPolicy else { return }
-            releaseAll()
-            keyboardPolicy = policy
+        private func releaseRemoteModifiers() { setRemoteModifiers([]) }
+
+        private func invalidateTextInput() {
+            textInputEnabled = false
+            textGeneration &+= 1
+            clearMarkedText()
+            let oldContext = textContext
+            textContext = nil
+            oldContext?.discardMarkedText()
+            oldContext?.deactivate()
+            textClient = nil
+            currentKeyEvent = nil
         }
 
-        func hasMarkedText() -> Bool { markedText.length > 0 }
-
-        func markedRange() -> NSRange {
-            hasMarkedText() ? NSRange(location: 0, length: markedText.length) : NSRange(location: NSNotFound, length: 0)
+        private func cancelComposition() {
+            clearMarkedText()
+            textContext?.discardMarkedText()
         }
 
-        func selectedRange() -> NSRange { textSelection }
-
-        func validAttributesForMarkedText() -> [NSAttributedString.Key] { [.underlineStyle, .markedClauseSegment] }
-
-        func setMarkedText(_ value: Any, selectedRange: NSRange, replacementRange: NSRange) {
-            guard let context = compositionInputContext ?? interpretingInputContext ?? textFocusContext else { return }
-            if !hasMarkedText() {
-                releasePhysicalInputs()
-            }
-            compositionInputContext = context
-            composedDuringKeyDown = true
-            let text = attributedText(value)
-            let target: NSRange
-            if replacementRange.location != NSNotFound,
-               replacementRange.location <= markedText.length,
-               replacementRange.length <= markedText.length - replacementRange.location {
-                target = replacementRange
-            } else {
-                target = NSRange(location: 0, length: markedText.length)
-            }
-            markedText.replaceCharacters(in: target, with: text)
-            let location = min(selectedRange.location, markedText.length)
-            textSelection = NSRange(location: location, length: min(selectedRange.length, markedText.length - location))
+        private func clearMarkedText() {
+            markedText = NSAttributedString(string: "")
+            markedSelection = NSRange(location: 0, length: 0)
             needsDisplay = true
-            inputContext?.invalidateCharacterCoordinates()
+        }
+
+        // The toolbar's explicit text sender can use this same commit path.
+        func sendText(_ text: String) {
+            guard canControl, !text.isEmpty else { return }
+            let restoreModifiers = remoteModifiers
+            releaseRemoteModifiers()
+            sendInput(.unicode(text, modifiers: []))
+            setRemoteModifiers(restoreModifiers)
+        }
+
+        func insertText(_ string: Any, replacementRange: NSRange) {
+            guard canControl, textInputEnabled, !keyCommittedText || currentKeyEvent == nil else { return }
+            let text = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
+            guard !text.isEmpty else { clearMarkedText(); return }
+            keyProducedOutput = true
+            keyCommittedText = true
+            clearMarkedText()
+            sendText(text)
+        }
+
+        func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+            guard canControl, textInputEnabled else { return }
+            let text = (string as? NSAttributedString) ?? NSAttributedString(string: (string as? String) ?? "")
+            markedText = text
+            let location = min(text.length, max(0, selectedRange.location == NSNotFound ? text.length : selectedRange.location))
+            markedSelection = NSRange(location: location, length: min(selectedRange.length, text.length - location))
+            keyProducedOutput = true
+            releaseRemoteModifiers()
+            needsDisplay = true
         }
 
         func unmarkText() {
-            let committed = markedText.string
-            let context = compositionInputContext
-            clearComposition()
-            if !discardingComposition, !committed.isEmpty, let context {
-                bridge?.send(input: .unicode(committed, modifiers: []), context: context)
-            }
+            guard markedText.length > 0 else { return }
+            let text = markedText.string
+            clearMarkedText()
+            sendText(text)
         }
-
-        func insertText(_ value: Any, replacementRange: NSRange) {
-            let text = attributedText(value).string
-            let wasComposing = hasMarkedText() || compositionAtKeyDown || composedDuringKeyDown
-            let context = compositionInputContext ?? interpretingInputContext ?? textFocusContext
-            clearComposition()
-            guard !discardingComposition, !text.isEmpty, let context else { return }
-            // Preserve physical press/repeat/release for direct typing. IME
-            // and dead-key commits have atomic text semantics instead.
-            if !wasComposing, let event = interpretingEvent,
-               text == event.characters,
-               !event.modifierFlags.contains(.option),
-               text.unicodeScalars.count == 1,
-               text.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) {
-                sendKeyboard(event, isDown: true, context: context)
-            } else {
-                bridge?.send(input: .unicode(text, modifiers: []), context: context)
-            }
+        func hasMarkedText() -> Bool { markedText.length > 0 }
+        func markedRange() -> NSRange {
+            hasMarkedText() ? NSRange(location: 0, length: markedText.length) : NSRange(location: NSNotFound, length: 0)
         }
-
-        override func doCommand(by selector: Selector) {
-            if hasMarkedText() || compositionAtKeyDown || composedDuringKeyDown {
-                if selector == #selector(NSResponder.cancelOperation(_:)) { discardComposition() }
-                return
-            }
-            guard let event = interpretingEvent, let context = interpretingInputContext,
-                  MacKeyCodeMapper.protocolCode(forAppKitKeyCode: event.keyCode) != nil else { return }
-            sendKeyboard(event, isDown: true, context: context)
-        }
-
+        func selectedRange() -> NSRange { markedSelection }
+        func validAttributesForMarkedText() -> [NSAttributedString.Key] { [.underlineStyle, .foregroundColor] }
         func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-            guard range.location != NSNotFound, range.location <= markedText.length else {
+            guard range.location != NSNotFound, range.location < markedText.length else {
                 actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
                 return nil
             }
-            let available = NSRange(location: range.location, length: min(range.length, markedText.length - range.location))
-            actualRange?.pointee = available
-            return markedText.attributedSubstring(from: available)
+            let actual = NSIntersectionRange(range, NSRange(location: 0, length: markedText.length))
+            actualRange?.pointee = actual
+            return markedText.attributedSubstring(from: actual)
         }
-
-        func characterIndex(for point: NSPoint) -> Int { textSelection.location }
-
         func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
-            actualRange?.pointee = selectedRange()
-            let anchor = localTextAnchorRect()
-            guard let window else { return .zero }
-            return window.convertToScreen(convert(anchor, to: nil))
+            actualRange?.pointee = markedRange()
+            let rect = CGRect(x: min(max(12, candidatePoint.x), max(12, bounds.width - 20)),
+                              y: min(max(12, candidatePoint.y), max(12, bounds.height - 30)),
+                              width: 1, height: 22)
+            guard let window else { return rect }
+            return window.convertToScreen(convert(rect, to: nil))
         }
+        func characterIndex(for point: NSPoint) -> Int { NSNotFound }
 
-        private func localTextAnchorRect() -> NSRect {
-            let videoRect = inputVideoRect
-            return NSRect(
-                x: videoRect.minX + textFocusAnchor.x * videoRect.width,
-                y: videoRect.maxY - textFocusAnchor.y * videoRect.height,
-                width: 0, height: 18
-            )
-        }
-
-        private func attributedText(_ value: Any) -> NSAttributedString {
-            if let text = value as? NSAttributedString { return text }
-            return NSAttributedString(string: value as? String ?? "")
-        }
-
-        private func clearComposition() {
-            markedText = NSMutableAttributedString(string: "")
-            compositionInputContext = nil
-            textSelection = NSRange(location: 0, length: 0)
-            needsDisplay = true
-            inputContext?.invalidateCharacterCoordinates()
-        }
-
-        private func discardComposition() {
-            discardingComposition = true
-            inputContext?.discardMarkedText()
-            clearComposition()
-            discardingComposition = false
-        }
-
-        private func sendKeyboard(_ event: NSEvent, isDown: Bool, context: CapturedInputContext? = nil) {
-            let commands: [CapturedRemoteInput]
-            if isDown {
-                guard let context else { return }
-                let isShortcut = !event.modifierFlags.intersection([.command, .control]).isEmpty
-                commands = keyboard.keyDown(
-                    context: context,
-                    keyCode: event.keyCode,
-                    characters: isShortcut ? event.charactersIgnoringModifiers : event.characters,
-                    modifiers: event.modifierFlags,
-                    isRepeat: event.isARepeat,
-                    policy: keyboardPolicy
-                )
-            } else {
-                commands = keyboard.keyUp(keyCode: event.keyCode)
+        override func doCommand(by selector: Selector) {
+            keyProducedOutput = true
+            // Return, Delete, arrows and Escape are often candidate actions.
+            // The input method owns both edges throughout that key event,
+            // including a confirming key after it calls insertText.
+            guard !keyBeganInComposition, !hasMarkedText(), !keyCommittedText,
+                  let event = currentKeyEvent else {
+                if selector == #selector(cancelOperation(_:)) { cancelComposition() }
+                return
             }
-            for command in commands {
-                bridge?.send(captured: command)
-            }
+            sendKeyboard(event, isDown: true)
         }
 
-        private func sendPointer(_ event: NSEvent, isDrag: Bool = false) {
-            let context = isDrag ? pressedButtons.values.first : bridge?.captureInputContext()
-            guard let context else { return }
-            if !isDrag { synchronizeInputContext(context) }
-            sendPointer(event, context: context)
+        override func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            guard hasMarkedText() else { return }
+            let text = NSAttributedString(string: markedText.string, attributes: [
+                .font: NSFont.systemFont(ofSize: 16), .foregroundColor: NSColor.labelColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+            ])
+            let size = text.size()
+            let rect = CGRect(x: min(max(8, candidatePoint.x), max(8, bounds.width - size.width - 20)),
+                              y: min(max(8, candidatePoint.y), max(8, bounds.height - size.height - 16)),
+                              width: size.width + 16, height: size.height + 12)
+            NSColor.controlBackgroundColor.withAlphaComponent(0.96).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+            text.draw(at: CGPoint(x: rect.minX + 8, y: rect.minY + 6))
         }
 
-        private func sendPointer(_ event: NSEvent, context: CapturedInputContext) {
-            guard let normalizedPoint = normalizedPoint(for: event) else { return }
-            bridge?.send(input: .move(
-                normalizedX: Float(normalizedPoint.x),
-                normalizedY: Float(normalizedPoint.y)
-            ), context: context)
+        fileprivate func acceptsTextCallback(generation: UInt64) -> Bool {
+            textInputEnabled && canControl && generation == textGeneration
+        }
+
+        private func sendPointer(_ event: NSEvent) {
+            guard canControl, let point = normalizedPoint(for: event) else { return }
+            sendInput(.move(normalizedX: Float(point.x), normalizedY: Float(point.y)))
         }
 
         private func sendButton(_ event: NSEvent, pressed: Bool) {
-            let button: MouseButton
-            switch event.buttonNumber {
-            case 0: button = .left
-            case 1: button = .right
-            default: button = .center
+            guard canControl else { return }
+            if pressed, !hasMarkedText() {
+                setRemoteModifiers(KeyboardMapper.mappedModifiers(event.modifierFlags, mode: modifierMode))
             }
-            if !pressed {
-                guard let context = pressedButtons.removeValue(forKey: button) else { return }
-                if bridge?.captureInputContext()?.hasSameInputTarget(as: context) == true { sendPointer(event, context: context) }
-                bridge?.send(input: .mouseButton(button, pressed: false), context: context)
+            let button: MouseButton = switch event.buttonNumber {
+            case 0: .left
+            case 1: .right
+            default: .center
+            }
+            guard normalizedPoint(for: event) != nil else {
+                if !pressed, pressedButtons.remove(button) != nil {
+                    sendInput(.mouseButton(button, pressed: false))
+                }
                 return
             }
-            guard let context = bridge?.captureInputContext() else { return }
-            synchronizeInputContext(context)
-            guard let point = normalizedPoint(for: event) else {
-                return
-            }
-            if pressed {
-                textFocusAnchor = point
-                needsDisplay = true
-                inputContext?.invalidateCharacterCoordinates()
-            }
-            sendPointer(event, context: context)
-            bridge?.send(input: .mouseButton(button, pressed: true), context: context)
-            pressedButtons[button] = context
+            sendPointer(event)
+            sendInput(.mouseButton(button, pressed: pressed))
+            if pressed { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
         }
 
         private func normalizedPoint(for event: NSEvent) -> CGPoint? {
-            InputMapper(videoRect: inputVideoRect).normalizedPoint(for: convert(event.locationInWindow, from: nil))
-        }
-
-        private var inputVideoRect: CGRect {
-            // A production rect is supplied only after drawable presentation.
-            // An explicitly empty rect means input is not ready.
-            visibleVideoRect ?? VideoGeometry.aspectFit(source: videoSize ?? bounds.size, in: bounds)
+            viewport.normalizedPoint(for: convert(event.locationInWindow, from: nil))
         }
     }
+}
+
+/// AppKit may retain a text client while its input method finishes work. Give
+/// each focus/stream lifetime a separate object so late replies are harmless.
+@MainActor
+private final class GenerationTextInputClient: NSObject, @preconcurrency NSTextInputClient {
+    private weak var view: SessionInputView.InputView?
+    private let generation: UInt64
+
+    init(view: SessionInputView.InputView, generation: UInt64) {
+        self.view = view
+        self.generation = generation
+    }
+
+    private var activeView: SessionInputView.InputView? {
+        guard let view, view.acceptsTextCallback(generation: generation) else { return nil }
+        return view
+    }
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        activeView?.insertText(string, replacementRange: replacementRange)
+    }
+    func doCommand(by selector: Selector) { activeView?.doCommand(by: selector) }
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        activeView?.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+    }
+    func unmarkText() { activeView?.unmarkText() }
+    func selectedRange() -> NSRange { activeView?.selectedRange() ?? NSRange(location: NSNotFound, length: 0) }
+    func markedRange() -> NSRange { activeView?.markedRange() ?? NSRange(location: NSNotFound, length: 0) }
+    func hasMarkedText() -> Bool { activeView?.hasMarkedText() ?? false }
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        guard let view = activeView else { actualRange?.pointee = NSRange(location: NSNotFound, length: 0); return nil }
+        return view.attributedSubstring(forProposedRange: range, actualRange: actualRange)
+    }
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] { activeView?.validAttributesForMarkedText() ?? [] }
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        guard let view = activeView else { actualRange?.pointee = NSRange(location: NSNotFound, length: 0); return .zero }
+        return view.firstRect(forCharacterRange: range, actualRange: actualRange)
+    }
+    func characterIndex(for point: NSPoint) -> Int { activeView?.characterIndex(for: point) ?? NSNotFound }
 }
 
 func quantizeScrollDelta(_ delta: CGFloat) -> Int32 {

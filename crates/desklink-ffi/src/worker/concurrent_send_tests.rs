@@ -61,6 +61,10 @@ impl Driver {
             // Keep the callback address alive even when a failed test aborts
             // this task before Drop has been polled by the Tokio executor.
             let _callback_owner = callback_owner;
+            let gates = (
+                Arc::new(super::SessionGate::default()),
+                Arc::new(super::SessionGate::default()),
+            );
             run_connected(
                 runtime,
                 &mut receiver,
@@ -72,6 +76,8 @@ impl Driver {
                 },
                 &worker_releases,
                 &worker_pending,
+                &gates.0,
+                &gates.1,
             )
             .await
         });

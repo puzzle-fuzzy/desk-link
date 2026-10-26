@@ -6,6 +6,7 @@ import SwiftUI
 
 struct MetalVideoView: NSViewRepresentable {
     let frame: PresentedVideoFrame?
+    let viewport: SessionViewport
     let onFramePresented: @MainActor @Sendable (VideoFramePresentationToken, CGRect) -> Bool
 
     func makeNSView(context: Context) -> MTKView {
@@ -21,10 +22,11 @@ struct MetalVideoView: NSViewRepresentable {
 
     func updateNSView(_ view: MTKView, context: Context) {
         context.coordinator.onFramePresented = onFramePresented
-        let pixelBuffer = frame?.pixelBuffer
-        guard context.coordinator.pixelBuffer !== pixelBuffer
-                || context.coordinator.presentationToken != frame?.token else { return }
+        guard context.coordinator.pixelBuffer !== frame?.pixelBuffer
+                || context.coordinator.presentationToken != frame?.token
+                || context.coordinator.viewport != viewport else { return }
         context.coordinator.frame = frame
+        context.coordinator.viewport = viewport
         view.setNeedsDisplay(view.bounds)
     }
 
@@ -37,6 +39,7 @@ struct MetalVideoView: NSViewRepresentable {
         var pixelBuffer: CVPixelBuffer? { frame?.pixelBuffer }
         var presentationToken: VideoFramePresentationToken? { frame?.token }
         var onFramePresented: (@MainActor @Sendable (VideoFramePresentationToken, CGRect) -> Bool)?
+        var viewport = SessionViewport(sourceSize: .zero, viewportSize: .zero)
         private var lastPresentedTime: CFTimeInterval = 0
         private let context = CIContext()
         private var commandQueue: MTLCommandQueue?
@@ -64,7 +67,7 @@ struct MetalVideoView: NSViewRepresentable {
             }
             let image = CIImage(cvPixelBuffer: pixelBuffer)
             let target = CGRect(origin: .zero, size: view.drawableSize)
-            let fitted = VideoGeometry.aspectFit(source: image.extent.size, in: target)
+            let fitted = viewport.drawableVideoRect(drawableSize: view.drawableSize)
             guard !fitted.isEmpty else { return }
             let normalized = image.transformed(
                 by: CGAffineTransform(

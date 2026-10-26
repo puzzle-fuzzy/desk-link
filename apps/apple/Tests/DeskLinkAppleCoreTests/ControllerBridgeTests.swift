@@ -152,6 +152,153 @@ final class ControllerBridgeTests: XCTestCase {
         if case .failed = bridge.state {} else { XCTFail("terminal error must fail") }
     }
 
+    func testRecoverableErrorPreservesRuntimeAndRetiresInputsAndStream() {
+        let bridge = localRuntimeBridge()
+        bridge.connect(deviceID: "123456789012", temporaryPassword: "ABCD2345")
+        bridge.acceptStateForTesting(streamID: 8)
+        let generation = bridge.callbackGenerationForTesting
+        XCTAssertTrue(bridge.activeRuntimeForTesting)
+
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_ERROR.rawValue),
+            stateValue: Int(DESKLINK_RECONNECTING.rawValue), message: "transport unavailable: secret must never be shown")
+
+        XCTAssertEqual(bridge.state, .reconnecting)
+        XCTAssertEqual(bridge.connectionStage, .reconnecting)
+        XCTAssertTrue(bridge.activeRuntimeForTesting)
+        XCTAssertEqual(bridge.callbackGenerationForTesting, generation)
+        XCTAssertFalse(bridge.userFacingError.contains("secret"))
+        // Input retirement belongs to the explicit reconnect boundary event.
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+            stateValue: Int(DESKLINK_RECONNECTING.rawValue))
+        XCTAssertEqual(bridge.releaseAllCallCountForTesting, 1)
+        XCTAssertEqual(bridge.activeStreamIDForTesting, 0)
+        bridge.acceptStateForTesting(streamID: 8)
+        XCTAssertEqual(bridge.state, .reconnecting, "a retired stream cannot resurrect during retry")
+        bridge.acceptStateForTesting(streamID: 9)
+        XCTAssertEqual(bridge.state, .reconnecting, "no stream is accepted before the new handshake")
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+            stateValue: Int(DESKLINK_SECURE_HANDSHAKE.rawValue))
+        bridge.acceptStateForTesting(streamID: 9)
+        XCTAssertEqual(bridge.state, .connected(streamID: 9))
+        XCTAssertNil(bridge.lastError)
+        bridge.disconnect()
+    }
+
+    func testReconnectedHostCanReuseOrLowerItsStreamIDAfterNewHandshake() {
+        for resumedStreamID in [UInt64(8), UInt64(1)] {
+            let bridge = ControllerBridge.testing()
+            bridge.acceptStateForTesting(streamID: 8)
+            bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+                stateValue: Int(DESKLINK_RECONNECTING.rawValue))
+            bridge.acceptStateForTesting(streamID: resumedStreamID)
+            XCTAssertEqual(bridge.state, .reconnecting)
+
+            for stage in [DESKLINK_SECURE_HANDSHAKE, DESKLINK_WAITING_FOR_APPROVAL, DESKLINK_NEGOTIATING_CAPABILITIES, DESKLINK_STARTING_VIDEO] {
+                bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue), stateValue: Int(stage.rawValue))
+                XCTAssertEqual(bridge.state, .reconnecting, "recovery must keep the existing session view")
+                XCTAssertEqual(bridge.connectionStage.rawValue, Int(stage.rawValue))
+            }
+            bridge.acceptStateForTesting(streamID: resumedStreamID)
+            XCTAssertEqual(bridge.state, .connected(streamID: resumedStreamID))
+            XCTAssertEqual(bridge.activeStreamIDForTesting, resumedStreamID)
+            XCTAssertEqual(bridge.releaseAllCallCountForTesting, 1)
+        }
+    }
+
+    func testFailedReconnectHandshakeCannotAdmitAStreamDuringNextRetry() {
+        let bridge = ControllerBridge.testing()
+        bridge.acceptStateForTesting(streamID: 8)
+        for stage in [DESKLINK_RECONNECTING, DESKLINK_SECURE_HANDSHAKE, DESKLINK_RECONNECTING] {
+            bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue), stateValue: Int(stage.rawValue))
+        }
+        for streamID in [UInt64(1), UInt64(8), UInt64(9)] { bridge.acceptStateForTesting(streamID: streamID) }
+        XCTAssertEqual(bridge.state, .reconnecting)
+        XCTAssertEqual(bridge.activeStreamIDForTesting, 0)
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+            stateValue: Int(DESKLINK_SECURE_HANDSHAKE.rawValue))
+        bridge.acceptStateForTesting(streamID: 1)
+        XCTAssertEqual(bridge.state, .connected(streamID: 1))
+    }
+
+    func testFatalErrorClosesRuntimeAndOldGenerationCannotChangeNextAttempt() {
+        let bridge = localRuntimeBridge()
+        bridge.connect(deviceID: "123456789012", temporaryPassword: "ABCD2345")
+        bridge.acceptStateForTesting(streamID: 8)
+        let retiredGeneration = bridge.callbackGenerationForTesting
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_ERROR.rawValue),
+            stateValue: Int(DESKLINK_CLOSED.rawValue), streamID: 8, message: "authentication failed: private secret")
+
+        XCTAssertFalse(bridge.activeRuntimeForTesting)
+        XCTAssertEqual(bridge.connectionStage, .closed)
+        XCTAssertEqual(bridge.releaseAllCallCountForTesting, 1)
+        guard case .failed = bridge.state else { return XCTFail("fatal errors must stay visible") }
+
+        bridge.connect(deviceID: "123456789012", temporaryPassword: "ABCD2345")
+        bridge.acceptStateForTesting(streamID: 1)
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_ERROR.rawValue),
+            stateValue: Int(DESKLINK_CLOSED.rawValue), message: "old worker error", generation: retiredGeneration)
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+            stateValue: Int(DESKLINK_CONNECTED.rawValue), streamID: 99, generation: retiredGeneration)
+        XCTAssertEqual(bridge.state, .connected(streamID: 1))
+        XCTAssertTrue(bridge.activeRuntimeForTesting)
+        bridge.disconnect()
+    }
+
+    func testOldStreamCannotCloseOrDegradeNewStream() {
+        let bridge = ControllerBridge.testing()
+        bridge.acceptStateForTesting(streamID: 8)
+        bridge.acceptStateForTesting(streamID: 9)
+        for state in [DESKLINK_CLOSED, DESKLINK_DEGRADED, DESKLINK_RECONNECTING] {
+            bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+                stateValue: Int(state.rawValue), streamID: 8)
+        }
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_ERROR.rawValue),
+            stateValue: Int(DESKLINK_CLOSED.rawValue), streamID: 8, message: "retired stream failed")
+        XCTAssertEqual(bridge.state, .connected(streamID: 9))
+        XCTAssertEqual(bridge.connectionStage, .connected)
+        XCTAssertNil(bridge.lastError)
+    }
+
+    func testRealConnectionStagesAndUnknownEvents() {
+        let bridge = ControllerBridge.testing()
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue),
+            stateValue: Int(DESKLINK_SECURE_HANDSHAKE.rawValue))
+        XCTAssertEqual(bridge.connectionStage, .secureHandshake)
+        for kind in [Int(DESKLINK_EVENT_TRANSFER.rawValue), Int(DESKLINK_EVENT_AUDIO.rawValue), 999] {
+            bridge.acceptEventForTesting(eventKind: kind, stateValue: Int(DESKLINK_CLOSED.rawValue))
+        }
+        bridge.acceptEventForTesting(eventKind: Int(DESKLINK_EVENT_STATE.rawValue), stateValue: 999)
+        XCTAssertEqual(bridge.connectionStage, .secureHandshake)
+        XCTAssertEqual(bridge.state, .connecting)
+    }
+
+    func testSavedHostReconnectUpdatesRecencyAndPreservesNameAndDeviceID() throws {
+        let keychain = InMemoryKeychainStore()
+        let store = SavedHostStore(keychain: keychain)
+        let previous = SavedHost(id: UUID(), serverName: "localhost",
+            sessionID: [UInt8](repeating: 1, count: 16), relayAuthentication: [UInt8](repeating: 2, count: 32),
+            hostVerifyKey: [UInt8](repeating: 3, count: 32), expiresAtUnixS: 0, authorizationType: 2,
+            deviceID: "123456789012", displayName: "工作电脑",
+            lastConnectedAt: Date(timeIntervalSince1970: 1))
+        try store.save(previous)
+        let bridge = ControllerBridge(configuration: .init(relayURL: "quic://127.0.0.1:1", relayServerName: "localhost", platform: .macos),
+            identityStore: ControllerIdentityStore(keychain: keychain), savedHostStore: store)
+        bridge.connect(savedHost: previous)
+        bridge.acceptStateForTesting(streamID: 1)
+        let saved = try XCTUnwrap(store.loadAll().first)
+        XCTAssertEqual(saved.id, previous.id)
+        XCTAssertEqual(saved.deviceID, previous.deviceID)
+        XCTAssertEqual(saved.displayName, previous.displayName)
+        XCTAssertGreaterThan(try XCTUnwrap(saved.lastConnectedAt), try XCTUnwrap(previous.lastConnectedAt))
+        let began = bridge.connectionAttemptStartedAt
+        bridge.disconnect()
+        XCTAssertEqual(bridge.connectionAttemptStartedAt, began, "completed attempt duration remains available to UI")
+    }
+
+    private func localRuntimeBridge() -> ControllerBridge {
+        ControllerBridge.testing(configuration: .init(relayURL: "quic://127.0.0.1:1", relayServerName: "localhost", platform: .macos))
+    }
+
     func testControllerErrorDoesNotExposeRelayAuthentication() {
         let bridge = ControllerBridge.testing(error: "relay authentication failed: AUTH_KEY relay secret")
 

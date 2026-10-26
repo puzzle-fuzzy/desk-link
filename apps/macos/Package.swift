@@ -26,6 +26,7 @@ let package = Package(
             path: "Sources/DeskLinkApp",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("AVFAudio"),
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreGraphics"),

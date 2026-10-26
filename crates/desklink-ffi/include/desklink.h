@@ -8,6 +8,12 @@
 
 #define DESKLINK_PAIRING_INVITE_BYTES 181
 #define DESKLINK_DIRECTORY_ACCESS_CODE_BYTES 8
+#define DESKLINK_SESSION_JSON_MAX_BYTES 307200
+#define DESKLINK_CLIPBOARD_TEXT_MAX_BYTES 49152
+#define DESKLINK_COMMITTED_TEXT_MAX_BYTES 4096
+#define DESKLINK_FILE_PATH_MAX_BYTES 4096
+#define DESKLINK_AUDIO_SAMPLE_RATE 48000
+#define DESKLINK_AUDIO_FRAME_SAMPLES 480
 
 #define DESKLINK_PROTOCOL_VERSION 14
 
@@ -62,6 +68,14 @@ typedef enum DesklinkEventKind {
     DESKLINK_EVENT_TRANSFER = 11,
     DESKLINK_EVENT_AUDIO = 12,
     DESKLINK_EVENT_CAPABILITIES = 13,
+    /* UTF-8 JSON; callback storage is valid only for the callback duration. */
+    DESKLINK_EVENT_SESSION = 14,
+    DESKLINK_EVENT_CLIPBOARD = 15,
+    /* Decoded 10 ms PCM: 960 bytes signed16 little-endian, 48 kHz mono.
+     * stream_id is active stream, frame_id is sequence; callback lifetime. */
+    DESKLINK_EVENT_AUDIO_PCM = 16,
+    /* UTF-8 JSON metadata only; never file contents. */
+    DESKLINK_EVENT_FILE = 17,
 } DesklinkEventKind;
 
 typedef enum DesklinkControllerCommand {
@@ -296,6 +310,45 @@ DesklinkResult desklink_send_input(DesklinkHandle * handle, const DesklinkInput 
 
 DesklinkResult desklink_request_keyframe(DesklinkHandle * handle);
 
+/* Stream/connection/display bound actions. A nonzero expected_stream_id must
+ * match the active video. Queue acceptance is not remote acknowledgement.
+ * SESSION JSON: kind display_list (displays: id,width,height,is_primary;
+ * selected_display_id), video_quality_state (quality_preference: automatic,
+ * smooth,balanced,sharp; applied_preset: smooth,balanced,sharp), or
+ * audio_state (available,enabled), audio_error (message), or
+ * operation_error (operation,message). Initial state may use stream_id=0;
+ * known states are repeated after VideoConfig with its actual stream id.
+ * CLIPBOARD JSON: request_id, operation(send/request), status(completed/failed),
+ * result, optional text. Request ids must increase within a connection.
+ * Responses expire after 10 seconds and are discarded across display changes
+ * or reconnects. UTF-8 JSON payloads are bounded by SESSION_JSON_MAX_BYTES. */
+DesklinkResult desklink_send_input_for_stream(DesklinkHandle * handle, uint64_t expected_stream_id, const DesklinkInput * input);
+/* Committed text: max4096 UTF-8 bytes; CRLF/CR/LF -> Enter, TAB -> Tab.
+ * Other control characters are rejected before queuing any input. */
+DesklinkResult desklink_send_text(DesklinkHandle * handle, uint64_t expected_stream_id, const uint8_t * text, size_t text_len);
+DesklinkResult desklink_select_display(DesklinkHandle * handle, uint64_t expected_stream_id, uint32_t display_id);
+/* preference: 0 automatic, 1 smooth, 2 balanced, 3 sharp. */
+DesklinkResult desklink_set_video_quality(DesklinkHandle * handle, uint64_t expected_stream_id, uint32_t preference);
+/* enabled must be 0 or 1; authenticated SESSION audio_state confirms availability
+ * and enabled state. PCM is emitted only after an enabled acknowledgement. */
+DesklinkResult desklink_set_audio_enabled(DesklinkHandle * handle, uint64_t expected_stream_id, uint8_t enabled);
+/* File paths are absolute UTF-8, max4096bytes, no embedded NUL. transfer_id is
+ * 16 bytes, nonzero. One active transfer or request; unsolicited offers rejected.
+ * Remote selection requires an explicit local destination directory first.
+ * Existing destination files are never overwritten. FILE JSON reports progress,
+ * final result, and safe names/paths; cancellation cleans incomplete files.
+ * FILE JSON: kind=file_transfer,transfer_id(32hex or empty pending selection),
+ * request_id(0 for uploads),state,direction(upload/download),name,transferred,
+ * total,result,optional saved_path after verified successful download.
+ * Terminal states: completed,failed,rejected,cancelled. A reconnect requires
+ * a new user action; a same-stream display transition preserves transfers. */
+DesklinkResult desklink_send_file(DesklinkHandle * handle, uint64_t expected_stream_id, const uint8_t transfer_id[16], const uint8_t * path, size_t path_len);
+DesklinkResult desklink_request_remote_file(DesklinkHandle * handle, uint64_t expected_stream_id, uint64_t request_id, const uint8_t * directory, size_t directory_len);
+DesklinkResult desklink_cancel_file_transfer(DesklinkHandle * handle, uint64_t expected_stream_id);
+/* Explicit actions only: these functions never access the local OS clipboard. */
+DesklinkResult desklink_send_clipboard_text(DesklinkHandle * handle, uint64_t expected_stream_id, uint64_t request_id, const uint8_t * text, size_t text_len);
+DesklinkResult desklink_request_clipboard_text(DesklinkHandle * handle, uint64_t expected_stream_id, uint64_t request_id);
+
 DesklinkResult desklink_release_all(DesklinkHandle * handle);
 
 DesklinkResult desklink_release_all_for_context(DesklinkHandle * handle, uint64_t stream_id, uint64_t input_epoch);
@@ -311,6 +364,17 @@ DesklinkResult desklink_controller_copy_saved_host_material(DesklinkHandle * han
 DesklinkResult desklink_host_create(const DesklinkHostConfig * config, DesklinkHostEventCallback callback, void * callback_context, DesklinkHostHandle * * out_handle);
 
 DesklinkResult desklink_host_start_pairing(DesklinkHostHandle * handle, uint8_t * invite_out, size_t invite_capacity, size_t * invite_len_out, uint64_t * expires_at_unix_s_out);
+
+/* Stable 12-digit number, derived from the persisted host identity. */
+DesklinkResult desklink_host_public_device_id(DesklinkHostHandle * handle, uint64_t * out_device_id);
+
+/* mode: 1 temporary (600s), 2 fixed (live connection, expiry output zero).
+ * access_code: exactly 8 bytes from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ.
+ * Outputs are populated only after the relay accepted the directory entry.
+ * Blocking bounded network call: invoke off the UI thread. Wait for return
+ * before stop/destroy; do not destroy the handle concurrently with startup.
+ * Stop/destroy the old handle fully before rotating credentials or modes. */
+DesklinkResult desklink_host_start_directory(DesklinkHostHandle * handle, uint32_t mode, const uint8_t * access_code, size_t access_code_len, uint8_t * invite_out, size_t invite_capacity, size_t * invite_len_out, uint64_t * expires_at_unix_s_out);
 
 DesklinkResult desklink_host_start_from_invite(DesklinkHostHandle * handle, const uint8_t * invite, size_t invite_len);
 

@@ -804,13 +804,20 @@ impl ControllerRuntime {
                     return Ok(ControllerEvent::Cursor(cursor));
                 }
                 ControllerInboundEvent::Data(ChannelKind::AudioDatagram, ciphertext) => {
-                    let Some(plaintext) = ciphertext
+                    let plaintext = match ciphertext
                         .open_datagram(&self.secure, SecureLane::AudioDatagram)
-                        .await?
-                    else {
+                        .await
+                    {
+                        Ok(Some(plaintext)) => plaintext,
+                        // Loss, replay, corrupt envelopes and invalid audio
+                        // are all isolated to this optional datagram lane.
+                        Ok(None) | Err(_) => continue,
+                    };
+                    // Audio is an independent lossy lane. A malformed audio
+                    // frame must not tear down video or a live input session.
+                    let Ok(packet) = decode_audio_packet(&plaintext) else {
                         continue;
                     };
-                    let packet = decode_audio_packet(&plaintext)?;
                     if self
                         .active_stream_id()
                         .is_some_and(|id| id != packet.stream_id)

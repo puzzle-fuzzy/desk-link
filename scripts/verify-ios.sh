@@ -2,6 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/apple-build-tools.sh"
 
 "$ROOT/scripts/build-apple-rust.sh"
 (cd "$ROOT/apps/apple" && swift test --arch arm64)

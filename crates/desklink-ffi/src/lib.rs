@@ -15,7 +15,7 @@ use desklink_protocol::{
     ControlMessage, InputContext, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES,
     MAX_MVP_HEIGHT, MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES,
     MAX_VIDEO_PACKET_PAYLOAD_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform,
-    encode_control, encode_input, encode_transfer,
+    TransferMessage, TransferResult, encode_control, encode_input, encode_transfer,
 };
 use desklink_session::{
     InputSequencer, PressedInputState, SessionEvent, SessionMachine, SessionState,
@@ -23,9 +23,14 @@ use desklink_session::{
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
+mod audio_decode;
 mod controller;
+mod file_commands;
+mod file_io;
 mod host;
+mod host_directory;
 mod host_worker;
+mod session_commands;
 mod worker;
 
 pub use controller::{
@@ -35,6 +40,8 @@ pub use controller::{
 pub use host::{
     HostCommand, HostError, HostEvent, HostIdentity, HostMetrics, HostRuntime, HostState,
 };
+pub use host_directory::{HostAccessMode, HostDirectoryCredentials, public_host_device_id};
+use session_commands::{MAX_TEXT_BYTES, SessionAction};
 use worker::{
     CapturedInput, ControllerCommand, ControllerWorker, DirectoryConnectionConfigOwned,
     SecureConnectionConfigOwned,
@@ -117,6 +124,10 @@ pub enum DesklinkEventKind {
     Transfer = 11,
     Audio = 12,
     Capabilities = 13,
+    Session = 14,
+    Clipboard = 15,
+    AudioPcm = 16,
+    File = 17,
 }
 
 #[repr(u32)]
@@ -1285,8 +1296,8 @@ pub unsafe extern "C" fn desklink_request_keyframe(handle: *mut DesklinkHandle) 
     }
     if let Some(worker) = &runtime.worker {
         return worker
-            .send(ControllerCommand::RequestKeyframe)
-            .map_or(DesklinkResult::InternalError, |_| DesklinkResult::Ok);
+            .send_action(worker.active_stream_id(), SessionAction::RequestKeyframe)
+            .map_or_else(|error| error, |_| DesklinkResult::Ok);
     }
     if runtime.stream_id == 0 {
         return DesklinkResult::InvalidState;
@@ -1444,6 +1455,407 @@ pub unsafe extern "C" fn desklink_controller_send_transfer(
     worker
         .send(ControllerCommand::Transfer(message))
         .map_or(DesklinkResult::InternalError, |_| DesklinkResult::Ok)
+}
+
+/// Sends input only to the expected active stream. The input context comes
+/// from the latest authenticated VideoConfig observed through the session
+/// gate, so queued work is bound to its connection/display epoch even when
+/// hosts reuse stream ids.
+///
+/// # Safety
+/// `handle` is live and `input` points to a readable DesklinkInput.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_send_input_for_stream(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    input: *const DesklinkInput,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let Some(input) = (unsafe { input.as_ref() }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if let Err(error) = runtime.ensure_active() {
+        return error;
+    }
+    let Some(worker) = &runtime.worker else {
+        return DesklinkResult::InvalidState;
+    };
+    let Some(context) = worker.input_context_for(expected_stream_id) else {
+        return DesklinkResult::InvalidState;
+    };
+    if context.validate().is_err() {
+        return DesklinkResult::InvalidArgument;
+    }
+    let event = match convert_input(input) {
+        Ok(event) => event,
+        Err(error) => return error,
+    };
+    let is_press = matches!(
+        &event,
+        InputEvent::MouseButton { pressed: true, .. } | InputEvent::Key { pressed: true, .. }
+    );
+    if is_press && !runtime.pressed.contains_key(&context) && runtime.pressed.len() >= 8 {
+        return DesklinkResult::InvalidState;
+    }
+    let result = runtime.dispatch_input(CapturedInput {
+        context,
+        event: event.clone(),
+    });
+    if result.is_ok() {
+        if matches!(
+            &event,
+            InputEvent::MouseButton { pressed: false, .. } | InputEvent::Key { pressed: false, .. }
+        ) {
+            if let Some(pressed) = runtime.pressed.get_mut(&context) {
+                pressed.release(&event);
+                if pressed.release_events().is_empty() {
+                    runtime.pressed.remove(&context);
+                }
+            }
+        } else if is_press {
+            runtime.pressed.entry(context).or_default().press(&event);
+        }
+    }
+    result.map_or_else(|error| error, |_| DesklinkResult::Ok)
+}
+
+/// Queues one bounded committed text string as ordered Unicode key pairs.
+/// This never reads or writes the local clipboard.
+///
+/// # Safety
+/// `handle` is live; `text` references `text_len` readable bytes (or is null
+/// when text_len is zero).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_send_text(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    text: *const u8,
+    text_len: usize,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let text = match copy_utf8(text, text_len, MAX_TEXT_BYTES) {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|scalar| scalar.is_control() && !matches!(scalar, '\r' | '\n' | '\t'))
+    {
+        return DesklinkResult::InvalidArgument;
+    }
+    if let Err(error) = session_worker(runtime, expected_stream_id) {
+        return error;
+    }
+    let release = runtime.release_all();
+    if release != DesklinkResult::Ok {
+        return release;
+    }
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::Text(text.replace("\r\n", "\n")),
+    )
+}
+
+/// Requests a host display; an authentic display_list SESSION callback
+/// confirms the host's actual selection. Pressed local input is released first.
+///
+/// # Safety
+/// `handle` is a live controller handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_select_display(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    display_id: u32,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if let Err(error) = session_worker(runtime, expected_stream_id) {
+        return error;
+    }
+    let release_result = runtime.release_all();
+    if release_result != DesklinkResult::Ok {
+        return release_result;
+    }
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::SelectDisplay(display_id),
+    )
+}
+
+/// Selects automatic(0), smooth(1), balanced(2), or sharp(3) video quality.
+/// Actual applied state is supplied by the host's SESSION callback.
+///
+/// # Safety
+/// `handle` is a live controller handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_set_video_quality(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    preference: u32,
+) -> DesklinkResult {
+    use desklink_protocol::VideoQualityPreference;
+    let preference = match preference {
+        0 => VideoQualityPreference::Automatic,
+        1 => VideoQualityPreference::Smooth,
+        2 => VideoQualityPreference::Balanced,
+        3 => VideoQualityPreference::Sharp,
+        _ => return DesklinkResult::InvalidArgument,
+    };
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::SetVideoQuality(preference),
+    )
+}
+
+/// Requests remote system sound. Playback starts only after the authenticated
+/// host AudioState acknowledgement, reported as SESSION audio_state JSON.
+///
+/// # Safety
+/// `handle` is a live controller handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_set_audio_enabled(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    enabled: u8,
+) -> DesklinkResult {
+    if enabled > 1 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::SetAudioEnabled(enabled == 1),
+    )
+}
+
+/// Sends one explicitly selected regular file. The source is opened by the
+/// bounded transfer worker; it is never loaded entirely into memory.
+///
+/// # Safety
+/// `handle` is live; `transfer_id` references 16 readable bytes and `path`
+/// references `path_len` readable UTF-8 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_send_file(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    transfer_id: *const u8,
+    path: *const u8,
+    path_len: usize,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if transfer_id.is_null() {
+        return DesklinkResult::InvalidArgument;
+    }
+    let mut id = [0; 16];
+    id.copy_from_slice(unsafe { std::slice::from_raw_parts(transfer_id, 16) });
+    if id == [0; 16] {
+        return DesklinkResult::InvalidArgument;
+    }
+    let path = match copy_absolute_path(path, path_len) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::File(file_commands::FileAction::Send {
+            transfer_id: id,
+            path,
+        }),
+    )
+}
+
+/// Asks the peer to select one file and saves it only into the explicitly
+/// selected destination directory. Existing files are never overwritten.
+///
+/// # Safety
+/// `handle` is live; `directory` references `directory_len` readable UTF-8 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_request_remote_file(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    request_id: u64,
+    directory: *const u8,
+    directory_len: usize,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if request_id == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let destination = match copy_absolute_path(directory, directory_len) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::File(file_commands::FileAction::Request {
+            request_id,
+            destination,
+        }),
+    )
+}
+
+/// Cancels the session's pending selection or file transfer and removes any
+/// uncommitted temporary receive file.
+///
+/// # Safety
+/// `handle` is a live controller handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_cancel_file_transfer(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::File(file_commands::FileAction::CancelAll),
+    )
+}
+
+fn copy_absolute_path(
+    pointer: *const u8,
+    length: usize,
+) -> Result<std::path::PathBuf, DesklinkResult> {
+    let text = copy_utf8(pointer, length, 4096)?;
+    let path = std::path::PathBuf::from(&text);
+    if text.contains('\0') || !path.is_absolute() {
+        return Err(DesklinkResult::InvalidArgument);
+    }
+    Ok(path)
+}
+
+/// Explicitly sends UTF-8 text to the peer's clipboard. No automatic local
+/// clipboard access occurs. Request ids must increase within a connection.
+///
+/// # Safety
+/// `handle` is live; `text` references `text_len` readable bytes (or is null
+/// when text_len is zero).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_send_clipboard_text(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    request_id: u64,
+    text: *const u8,
+    text_len: usize,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if request_id == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let text = match copy_utf8(text, text_len, desklink_protocol::MAX_CLIPBOARD_TEXT_BYTES) {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    if text.contains('\0') {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::SendClipboard { request_id, text },
+    )
+}
+
+/// Explicitly fetches the peer's clipboard. A correlated CLIPBOARD callback
+/// returns text or a bounded failure; unsolicited replies are ignored.
+///
+/// # Safety
+/// `handle` is a live controller handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_request_clipboard_text(
+    handle: *mut DesklinkHandle,
+    expected_stream_id: u64,
+    request_id: u64,
+) -> DesklinkResult {
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if request_id == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_session_action(
+        runtime,
+        expected_stream_id,
+        SessionAction::RequestClipboard { request_id },
+    )
+}
+
+fn session_worker(
+    runtime: &DesklinkRuntime,
+    expected_stream_id: u64,
+) -> Result<&ControllerWorker, DesklinkResult> {
+    runtime.ensure_active()?;
+    let worker = runtime
+        .worker
+        .as_ref()
+        .ok_or(DesklinkResult::InvalidState)?;
+    if expected_stream_id == 0
+        || worker.active_stream_id() != expected_stream_id
+        || !worker.is_running()
+    {
+        return Err(DesklinkResult::InvalidState);
+    }
+    Ok(worker)
+}
+
+fn send_session_action(
+    runtime: &DesklinkRuntime,
+    expected_stream_id: u64,
+    action: SessionAction,
+) -> DesklinkResult {
+    if matches!(action, SessionAction::File(_)) {
+        // A display transition releases input without interrupting a file
+        // operation on the same authenticated stream. Its independent gate
+        // still invalidates on a real stream change or reconnect.
+        if let Err(error) = runtime.ensure_active() {
+            return error;
+        }
+        return match runtime
+            .worker
+            .as_ref()
+            .ok_or(DesklinkResult::InvalidState)
+            .and_then(|worker| worker.send_action(expected_stream_id, action))
+        {
+            Ok(()) => DesklinkResult::Ok,
+            Err(error) => error,
+        };
+    }
+    match session_worker(runtime, expected_stream_id)
+        .and_then(|worker| worker.send_action(expected_stream_id, action))
+    {
+        Ok(()) => DesklinkResult::Ok,
+        Err(error) => error,
+    }
+}
+
+fn copy_utf8(pointer: *const u8, length: usize, maximum: usize) -> Result<String, DesklinkResult> {
+    let bytes = copy_payload(pointer, length, maximum).ok_or(DesklinkResult::InvalidArgument)?;
+    String::from_utf8(bytes).map_err(|_| DesklinkResult::InvalidUtf8)
 }
 
 /// Destroys a handle and releases all pressed input.
@@ -1638,6 +2050,111 @@ pub unsafe extern "C" fn desklink_host_start_pairing(
         *expires_at_unix_s_out = expires_at;
     }
     DesklinkResult::Ok
+}
+
+/// Returns the stable public directory number derived from the host identity.
+///
+/// # Safety
+/// `handle` must be live and `out_device_id` must point to writable storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_host_public_device_id(
+    handle: *mut DesklinkHostHandle,
+    out_device_id: *mut u64,
+) -> DesklinkResult {
+    if out_device_id.is_null() {
+        return DesklinkResult::InvalidArgument;
+    }
+    unsafe {
+        *out_device_id = 0;
+    }
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    unsafe {
+        *out_device_id = public_host_device_id(handle.config.host_device_id);
+    }
+    DesklinkResult::Ok
+}
+
+/// Starts an identified host and publishes its signed invitation in the relay
+/// directory. Mode 1 is temporary (600 seconds), mode 2 fixed (live connection).
+/// The eight-byte access code is never returned, logged or written to disk.
+/// This bounded network call must run outside the application main thread.
+///
+/// # Safety
+/// `handle` must be live. Inputs must refer to readable storage of the given
+/// length. Outputs must refer to writable storage. Do not destroy the handle
+/// concurrently with this call; wait for it to return, then stop and destroy.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_host_start_directory(
+    handle: *mut DesklinkHostHandle,
+    mode: u32,
+    access_code: *const u8,
+    access_code_len: usize,
+    invite_out: *mut u8,
+    invite_capacity: usize,
+    invite_len_out: *mut usize,
+    expires_at_unix_s_out: *mut u64,
+) -> DesklinkResult {
+    if invite_len_out.is_null() || expires_at_unix_s_out.is_null() {
+        return DesklinkResult::InvalidArgument;
+    }
+    unsafe {
+        *invite_len_out = 0;
+        *expires_at_unix_s_out = 0;
+    }
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if invite_out.is_null() || invite_capacity < PAIRING_INVITE_BYTES || access_code_len != 8 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let mode = match mode {
+        1 => HostAccessMode::Temporary,
+        2 => HostAccessMode::Fixed,
+        _ => return DesklinkResult::InvalidArgument,
+    };
+    let Some(code) = copy_fixed::<8>(access_code) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let code = Zeroizing::new(code);
+    if desklink_crypto::PairingCode::from_bytes(*code).is_err() {
+        return DesklinkResult::InvalidArgument;
+    }
+    if let Err(error) = reserve_host_start(handle) {
+        return error;
+    }
+    let result = (|| {
+        let config = host_transport_config(handle)?;
+        let identity = HostIdentity::from_secret_key(
+            handle.config.host_device_id,
+            &handle.config.host_secret_key,
+        );
+        let (runtime, credentials) =
+            HostRuntime::start_directory_from_config(config, identity, mode, *code, now_unix_s())
+                .map_err(|_| DesklinkResult::InternalError)?;
+        let result = install_host_runtime(handle, Arc::new(runtime));
+        if result != DesklinkResult::Ok {
+            return Err(result);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                credentials.invitation.as_bytes().as_ptr(),
+                invite_out,
+                PAIRING_INVITE_BYTES,
+            );
+            *invite_len_out = PAIRING_INVITE_BYTES;
+            *expires_at_unix_s_out = credentials.expires_at_unix_s;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => DesklinkResult::Ok,
+        Err(error) => {
+            release_host_start(handle);
+            error
+        }
+    }
 }
 
 /// Starts a host session from a signed invitation belonging to this host.
@@ -2153,16 +2670,9 @@ fn start_host_runtime_inner(
     session_id: [u8; 16],
     relay_authentication: [u8; 32],
 ) -> DesklinkResult {
-    let relay_addr = match resolve_relay(&handle.config.relay_url) {
-        Ok(address) => address,
-        Err(_) => return DesklinkResult::InvalidArgument,
-    };
-    let transport_config = match desklink_transport::QuicClientConfig::new(
-        relay_addr,
-        handle.config.server_name.clone(),
-    ) {
+    let transport_config = match host_transport_config(handle) {
         Ok(config) => config,
-        Err(_) => return DesklinkResult::InternalError,
+        Err(error) => return error,
     };
     let identity =
         HostIdentity::from_secret_key(handle.config.host_device_id, &handle.config.host_secret_key);
@@ -2175,6 +2685,19 @@ fn start_host_runtime_inner(
         Ok(runtime) => Arc::new(runtime),
         Err(_) => return DesklinkResult::InternalError,
     };
+    install_host_runtime(handle, runtime)
+}
+
+fn host_transport_config(
+    handle: &DesklinkHostHandle,
+) -> Result<desklink_transport::QuicClientConfig, DesklinkResult> {
+    let relay_addr =
+        resolve_relay(&handle.config.relay_url).map_err(|_| DesklinkResult::InvalidArgument)?;
+    desklink_transport::QuicClientConfig::new(relay_addr, handle.config.server_name.clone())
+        .map_err(|_| DesklinkResult::InternalError)
+}
+
+fn install_host_runtime(handle: &DesklinkHostHandle, runtime: Arc<HostRuntime>) -> DesklinkResult {
     let callback = handle.callback.clone();
     let event_runtime = runtime.clone();
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
@@ -2235,12 +2758,46 @@ fn dispatch_host_events(runtime: Arc<HostRuntime>, callback: Arc<HostCallbackSta
                 callback.emit(event, HostState::WaitingForApproval)
             }
             Ok(event @ HostEvent::Input { .. }) => callback.emit(event, HostState::Connected),
-            Ok(event @ HostEvent::Transfer(_)) => callback.emit(event, HostState::Connected),
+            Ok(HostEvent::Transfer(message)) => {
+                // The C ABI has no clipboard/file receiver yet. Reject only
+                // requests, through the existing bounded command queue, rather
+                // than leaving the peer waiting or closing its control session.
+                // Results/cancellation/chunks are ignored to avoid reply loops.
+                if let Some(response) = unsupported_transfer_response(&message) {
+                    let _ = runtime.send(HostCommand::SendTransfer(response));
+                }
+                callback.emit(HostEvent::Transfer(message), HostState::Connected);
+            }
             Ok(event @ HostEvent::KeyframeRequested) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::ReleaseAll) => callback.emit(event, runtime.state()),
             Ok(event @ HostEvent::Metrics(_)) => callback.emit(event, runtime.state()),
             Err(_) => break,
         }
+    }
+}
+
+fn unsupported_transfer_response(message: &TransferMessage) -> Option<TransferMessage> {
+    match message {
+        TransferMessage::ClipboardSet { request_id, .. }
+        | TransferMessage::ClipboardRequest { request_id } => {
+            Some(TransferMessage::ClipboardResult {
+                request_id: *request_id,
+                result: TransferResult::Unsupported,
+            })
+        }
+        TransferMessage::FileSelectionRequest { request_id, .. } => {
+            Some(TransferMessage::FileSelectionResult {
+                request_id: *request_id,
+                result: TransferResult::Unsupported,
+            })
+        }
+        TransferMessage::FileOffer { transfer_id, .. } => Some(TransferMessage::FileDecision {
+            transfer_id: *transfer_id,
+            result: TransferResult::Unsupported,
+            resume_offset: 0,
+            resume_prefix_hash: None,
+        }),
+        _ => None,
     }
 }
 
@@ -2269,10 +2826,12 @@ fn send_host_command_for_generation(
 fn map_host_error(error: HostError) -> DesklinkResult {
     match error {
         HostError::StaleMediaGeneration => DesklinkResult::StaleGeneration,
+        HostError::InvalidAccessCode => DesklinkResult::InvalidArgument,
         HostError::InvalidState
         | HostError::ControllerIdentityMismatch
         | HostError::InvalidControllerCapabilities
-        | HostError::ApprovalTimeout => DesklinkResult::InvalidState,
+        | HostError::ApprovalTimeout
+        | HostError::AccessExpired => DesklinkResult::InvalidState,
         HostError::CommandQueueFull
         | HostError::WorkerStopped
         | HostError::Transport(_)
@@ -2703,6 +3262,72 @@ mod tests {
                 desklink_controller_send_transfer(null_mut(), null(), usize::MAX),
                 DesklinkResult::InvalidArgument
             );
+        }
+    }
+
+    #[test]
+    fn c_host_explicitly_rejects_unsupported_transfer_requests_without_reply_loops() {
+        for request in [
+            TransferMessage::ClipboardSet {
+                request_id: 41,
+                text: "test".into(),
+            },
+            TransferMessage::ClipboardRequest { request_id: 41 },
+        ] {
+            assert_eq!(
+                unsupported_transfer_response(&request),
+                Some(TransferMessage::ClipboardResult {
+                    request_id: 41,
+                    result: TransferResult::Unsupported,
+                })
+            );
+        }
+        assert_eq!(
+            unsupported_transfer_response(&TransferMessage::FileSelectionRequest {
+                request_id: 42,
+                resume: None,
+            }),
+            Some(TransferMessage::FileSelectionResult {
+                request_id: 42,
+                result: TransferResult::Unsupported,
+            })
+        );
+        let response = unsupported_transfer_response(&TransferMessage::FileOffer {
+            transfer_id: [43; 16],
+            request_id: None,
+            name: "test.txt".into(),
+            size: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            response,
+            TransferMessage::FileDecision {
+                transfer_id: [43; 16],
+                result: TransferResult::Unsupported,
+                resume_offset: 0,
+                resume_prefix_hash: None,
+            }
+        );
+        for message in [
+            response,
+            TransferMessage::ClipboardResult {
+                request_id: 41,
+                result: TransferResult::Unsupported,
+            },
+            TransferMessage::FileSelectionResult {
+                request_id: 42,
+                result: TransferResult::Unsupported,
+            },
+            TransferMessage::FileChunk {
+                transfer_id: [43; 16],
+                offset: 0,
+                bytes: vec![1],
+            },
+            TransferMessage::Cancel {
+                transfer_id: [43; 16],
+            },
+        ] {
+            assert_eq!(unsupported_transfer_response(&message), None);
         }
     }
 

@@ -6,6 +6,7 @@ use desklink_transport::{QuicClient, QuicClientConfig};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 
+use crate::host_directory::{HostAccessMode, HostDirectoryCredentials, HostDirectorySession};
 use crate::host_worker::{HostWorker, WorkerPhase};
 
 pub const HOST_COMMAND_CAPACITY: usize = 1_024;
@@ -135,6 +136,10 @@ pub enum HostError {
     InvalidControllerCapabilities,
     #[error("controller approval timed out")]
     ApprovalTimeout,
+    #[error("host access code is invalid")]
+    InvalidAccessCode,
+    #[error("temporary host access has expired")]
+    AccessExpired,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -191,6 +196,7 @@ impl HostRuntime {
             identity.into_device_identity(),
             session_id,
             relay_authentication,
+            None,
             events,
         )?;
         Ok(Self {
@@ -213,6 +219,7 @@ impl HostRuntime {
             identity.into_device_identity(),
             session_id,
             relay_authentication,
+            None,
             events,
         )?;
         Ok(Self {
@@ -233,6 +240,7 @@ impl HostRuntime {
             identity.into_device_identity(),
             session_id,
             relay_authentication,
+            None,
             events,
         )?;
         Ok(Self {
@@ -243,6 +251,37 @@ impl HostRuntime {
 
     pub fn state(&self) -> HostState {
         self.worker.state()
+    }
+
+    /// Publishes the host on the existing relay directory. Knowing the access
+    /// code only obtains a signed invitation; unknown controllers still require
+    /// the same authenticated local approval as QR pairing.
+    pub fn start_directory_from_config(
+        reconnect_config: QuicClientConfig,
+        identity: HostIdentity,
+        mode: HostAccessMode,
+        access_code: [u8; 8],
+        now_unix_s: u64,
+    ) -> Result<(Self, HostDirectoryCredentials), HostError> {
+        let identity = identity.into_device_identity();
+        let (directory, invite, credentials) =
+            HostDirectorySession::prepare(&identity, mode, access_code, now_unix_s)?;
+        let (events, receiver) = mpsc::channel(HOST_EVENT_CAPACITY);
+        let worker = HostWorker::start_from_config(
+            reconnect_config,
+            identity,
+            invite.session_id(),
+            *invite.relay_authentication(),
+            Some(directory),
+            events,
+        )?;
+        Ok((
+            Self {
+                worker,
+                events: Arc::new(Mutex::new(receiver)),
+            },
+            credentials,
+        ))
     }
 
     pub fn send(&self, command: HostCommand) -> Result<(), HostError> {

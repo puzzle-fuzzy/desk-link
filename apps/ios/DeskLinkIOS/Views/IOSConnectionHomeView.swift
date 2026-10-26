@@ -52,7 +52,7 @@ struct IOSConnectionHomeView: View {
                                     controller.connect(savedHost: host)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 3) {
-                                        Text(host.displayName)
+                                        Text(host.displayTitle)
                                             .foregroundStyle(.primary)
                                         Text(host.canReconnect ? "已保存的安全连接" : "连接授权需更新，请重新配对")
                                             .font(.caption)
@@ -69,7 +69,7 @@ struct IOSConnectionHomeView: View {
                                     Image(systemName: "trash")
                                 }
                                 .buttonStyle(.borderless)
-                                .accessibilityLabel("删除 \(host.displayName)")
+                                .accessibilityLabel("删除 \(host.displayTitle)")
                             }
                         }
                     }

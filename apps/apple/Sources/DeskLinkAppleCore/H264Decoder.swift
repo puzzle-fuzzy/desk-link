@@ -1,3 +1,31 @@
+/// Presentation-order gate: rejects frames from a retired decode
+/// generation even when a new stream reuses frame numbers.
+struct DecodedFrameOrder {
+    private(set) var generation: UInt64 = 1
+    private(set) var lastSubmittedFrameID: UInt64 = 0
+    private(set) var lastPresentedFrameID: UInt64 = 0
+
+    mutating func reset() {
+        generation &+= 1
+        lastSubmittedFrameID = 0
+        lastPresentedFrameID = 0
+    }
+
+    mutating func submitted(_ frameID: UInt64) {
+        lastSubmittedFrameID = frameID
+    }
+
+    mutating func accept(frameID: UInt64, generation: UInt64) -> Bool {
+        guard generation == self.generation,
+              frameID > lastPresentedFrameID,
+              frameID <= lastSubmittedFrameID
+        else { return false }
+        lastPresentedFrameID = frameID
+        return true
+    }
+}
+
+
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -394,3 +422,4 @@ public final class H264Decoder {
         latestPixelBuffer = nil
     }
 }
+

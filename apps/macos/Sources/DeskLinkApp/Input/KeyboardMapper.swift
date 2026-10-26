@@ -7,18 +7,50 @@ enum KeyboardMapper {
         characters: String?,
         modifiers: NSEvent.ModifierFlags,
         isDown: Bool,
-        policy: KeyboardMappingPolicy = KeyboardMappingPolicy()
+        policy: KeyboardMappingPolicy? = nil,
+        modifierMode: ModifierMode = .raw,
+        charactersIgnoringModifiers: String? = nil
     ) -> [RemoteInputCommand] {
-        let mappedModifiers = policy.modifiers(for: modifiers)
+        // Main's capture-context callers pass a platform-aware policy; the
+        // branch's view-level callers pass the UI modifier mode instead.
+        let remoteModifiers = policy.map { $0.modifiers(for: modifiers) }
+            ?? mappedModifiers(modifiers, mode: modifierMode)
         if let logicalKeyCode = MacKeyCodeMapper.protocolCode(forAppKitKeyCode: keyCode) {
-            return [.key(code: logicalKeyCode, pressed: isDown, modifiers: mappedModifiers)]
+            return [.key(code: logicalKeyCode, pressed: isDown, modifiers: remoteModifiers)]
         }
-        guard let characters, !characters.isEmpty else { return [] }
-        return characters.unicodeScalars
-            .filter { !CharacterSet.controlCharacters.contains($0) }
-            .map { .character($0.value, pressed: isDown, modifiers: mappedModifiers) }
+        // Control-modified NSEvent.characters can be a control character
+        // (Control+A is U+0001). Remote shortcuts require the base character.
+        let resolved = modifiers.intersection([.command, .control, .option]).isEmpty
+            ? characters : (charactersIgnoringModifiers ?? characters)
+        if let policy {
+            // Policy callers (KeyboardInputState) drive physical key edges:
+            // every scalar keeps its pressed state and the original modifier
+            // mask so late key-ups still target the identity that went down.
+            guard let resolved, !resolved.isEmpty else { return [] }
+            return resolved.unicodeScalars
+                .filter { !CharacterSet.controlCharacters.contains($0) }
+                .map { .character($0.value, pressed: isDown, modifiers: remoteModifiers) }
+        }
+        guard isDown, let resolved, !resolved.isEmpty else { return [] }
+        return [.unicode(resolved, modifiers: remoteModifiers)]
     }
 
+    static func mappedModifiers(_ flags: NSEvent.ModifierFlags,
+                                mode: ModifierMode) -> Modifiers {
+        var result: Modifiers = []
+        if flags.contains(.shift) { result.insert(.shift) }
+        if flags.contains(.control) { result.insert(.control) }
+        if flags.contains(.option) { result.insert(.option) }
+        if flags.contains(.command) {
+            result.insert(mode == .automatic ? .control : .meta)
+        }
+        return result
+    }
+
+    static let modifierKeys: [(modifier: Modifiers, code: UInt32)] = [
+        (.control, DeskLinkKeyCode.control), (.option, DeskLinkKeyCode.alt),
+        (.shift, DeskLinkKeyCode.shift), (.meta, DeskLinkKeyCode.meta),
+    ]
 }
 
 // A key's release must use its original character and modifiers. AppKit may
@@ -162,6 +194,10 @@ enum MacKeyCodeMapper {
         case 0x6d: return 25 // F10
         case 0x67: return 26 // F11
         case 0x6f: return 27 // F12
+        case 0x3b, 0x3e: return 28 // Left / right Control
+        case 0x3a, 0x3d: return 29 // Left / right Option (Alt)
+        case 0x38, 0x3c: return 30 // Left / right Shift
+        case 0x37, 0x36: return 31 // Left / right Command (Windows key)
         default: return nil
         }
     }

@@ -85,9 +85,9 @@ final class SavedHostStoreTests: XCTestCase {
         let saved = host(deviceID: 123_456_789_012, code: directoryCode)
         try store.save(saved)
         try store.rename(id: saved.id, alias: "  工作电脑  ")
-        XCTAssertEqual(try store.loadAll().first?.displayName, "工作电脑")
+        XCTAssertEqual(try store.loadAll().first?.displayTitle, "工作电脑")
         try store.rename(id: saved.id, alias: " ")
-        XCTAssertEqual(try store.loadAll().first?.displayName, "设备 123456789012")
+        XCTAssertEqual(try store.loadAll().first?.displayTitle, "设备 123456789012")
         XCTAssertThrowsError(try store.rename(id: saved.id, alias: "a\nb"))
         XCTAssertThrowsError(try store.rename(id: saved.id, alias: String(repeating: "a", count: 81)))
     }
@@ -101,10 +101,10 @@ final class SavedHostStoreTests: XCTestCase {
     }
 
     func testDisplayNameDistinguishesHostsOnOneRelayWithoutLeakingCredentials() {
-        XCTAssertEqual(host(alias: "书房").displayName, "书房")
-        XCTAssertEqual(host(deviceID: 123_456_789_012, code: directoryCode).displayName, "设备 123456789012")
-        XCTAssertNotEqual(host(key: 3).displayName, host(key: 4).displayName)
-        XCTAssertFalse(host().displayName.contains("relay.example.com"))
+        XCTAssertEqual(host(alias: "书房").displayTitle, "书房")
+        XCTAssertEqual(host(deviceID: 123_456_789_012, code: directoryCode).displayTitle, "设备 123456789012")
+        XCTAssertNotEqual(host(key: 3).displayTitle, host(key: 4).displayTitle)
+        XCTAssertFalse(host().displayTitle.contains("relay.example.com"))
     }
 
     func testIncompleteOrInvalidDirectoryMaterialCannotReconnect() {

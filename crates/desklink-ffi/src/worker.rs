@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -13,8 +13,8 @@ use std::{
 
 use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
 use desklink_protocol::{
-    ControlMessage, InputContext, InputEvent, Platform, TransferMessage, encode_audio_packet,
-    encode_control, encode_cursor_update, encode_transfer,
+    ControlMessage, InputContext, InputEvent, Platform, TransferMessage, VideoQualityPreference,
+    encode_audio_packet, encode_control, encode_cursor_update, encode_transfer,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -25,6 +25,7 @@ use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::session_commands::{SessionAction, SessionCommands};
 use crate::{
     ControllerError, ControllerEvent, ControllerRuntime, DesklinkEvent, DesklinkEventCallback,
     DesklinkEventKind, DesklinkState, EventMeta, SavedHostMaterialOwned,
@@ -84,20 +85,66 @@ impl Drop for DirectoryConnectionConfigOwned {
 pub(crate) enum ControllerCommand {
     SendInput(CapturedInput),
     ReleaseAll,
+    // Session-scoped requests route through the gate via send_action; kept
+    // for the legacy queue contract and tests.
+    #[allow(dead_code)]
     RequestKeyframe,
     Control(ControlMessage),
     Transfer(TransferMessage),
+    Session {
+        scope: CommandScope,
+        action: SessionAction,
+    },
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommandScope {
+    pub epoch: u64,
+    pub stream_id: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct SessionGate {
+    pub epoch: AtomicU64,
+    pub stream_id: AtomicU64,
+    pub input_epoch: AtomicU64,
+}
+
+impl SessionGate {
+    pub fn invalidate(&self) {
+        self.stream_id.store(0, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn scope(&self, expected_stream_id: u64) -> Option<CommandScope> {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let stream_id = self.stream_id.load(Ordering::Acquire);
+        if stream_id == 0 || stream_id != expected_stream_id {
+            return None;
+        }
+        Some(CommandScope { epoch, stream_id })
+    }
+
+    pub fn accepts(&self, scope: CommandScope) -> bool {
+        self.scope(scope.stream_id) == Some(scope)
+    }
+}
+
 #[derive(Clone, Copy)]
-struct CallbackTarget {
-    callback: Option<DesklinkEventCallback>,
-    context: usize,
+pub(crate) struct CallbackTarget {
+    pub(crate) callback: Option<DesklinkEventCallback>,
+    pub(crate) context: usize,
 }
 
 impl CallbackTarget {
-    fn emit(&self, kind: DesklinkEventKind, data: &[u8], meta: EventMeta, state: DesklinkState) {
+    pub(crate) fn emit(
+        &self,
+        kind: DesklinkEventKind,
+        data: &[u8],
+        meta: EventMeta,
+        state: DesklinkState,
+    ) {
         let Some(callback) = self.callback else {
             return;
         };
@@ -163,6 +210,8 @@ pub(crate) struct ControllerWorker {
     release_events: Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: Arc<AtomicU8>,
     phase: Arc<AtomicU8>,
+    gate: Arc<SessionGate>,
+    file_gate: Arc<SessionGate>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -181,6 +230,10 @@ impl ControllerWorker {
         let release_events = Arc::new(Mutex::new(Vec::new()));
         let release_pending = Arc::new(AtomicU8::new(0));
         let phase = Arc::new(AtomicU8::new(PHASE_CONNECTING));
+        let gate = Arc::new(SessionGate::default());
+        let worker_gate = gate.clone();
+        let file_gate = Arc::new(SessionGate::default());
+        let worker_file_gate = file_gate.clone();
         let worker_phase = phase.clone();
         let worker_release_pending = release_pending.clone();
         let worker_release_events = release_events.clone();
@@ -211,6 +264,8 @@ impl ControllerWorker {
                             material_publisher: worker_material_publisher,
                             release_events: worker_release_events,
                             release_pending: worker_release_pending,
+                            gate: worker_gate,
+                            file_gate: worker_file_gate,
                         },
                     )),
                     Err(error) => callback.emit_error(&error.to_string(), 0),
@@ -223,6 +278,8 @@ impl ControllerWorker {
             release_events,
             release_pending,
             phase,
+            gate,
+            file_gate,
             thread: Some(thread),
         })
     }
@@ -232,6 +289,49 @@ impl ControllerWorker {
             return Err(());
         }
         self.commands.try_send(command).map_err(|_| ())
+    }
+
+    pub(crate) fn send_action(
+        &self,
+        expected_stream_id: u64,
+        action: SessionAction,
+    ) -> Result<(), crate::DesklinkResult> {
+        if !self.is_running() {
+            return Err(crate::DesklinkResult::InvalidState);
+        }
+        let action_gate = if matches!(action, SessionAction::File(_)) {
+            &self.file_gate
+        } else {
+            &self.gate
+        };
+        let scope = action_gate
+            .scope(expected_stream_id)
+            .ok_or(crate::DesklinkResult::InvalidState)?;
+        if self.commands.capacity() <= RELEASE_RESERVE {
+            return Err(crate::DesklinkResult::InternalError);
+        }
+        self.commands
+            .try_send(ControllerCommand::Session { scope, action })
+            .map_err(|_| crate::DesklinkResult::InternalError)
+    }
+
+    pub(crate) fn active_stream_id(&self) -> u64 {
+        self.gate.stream_id.load(Ordering::Acquire)
+    }
+
+    /// The input geometry bound to the latest authenticated VideoConfig for
+    /// `expected_stream_id`, when that stream is still the gated active one.
+    pub(crate) fn input_context_for(&self, expected_stream_id: u64) -> Option<InputContext> {
+        let stream_id = self.gate.stream_id.load(Ordering::Acquire);
+        let input_epoch = self.gate.input_epoch.load(Ordering::Acquire);
+        (stream_id != 0
+            && input_epoch != 0
+            && stream_id == expected_stream_id
+            && self.gate.scope(expected_stream_id).is_some())
+        .then_some(InputContext {
+            stream_id,
+            input_epoch,
+        })
     }
 
     pub(crate) fn release_all(&self, events: Vec<CapturedInput>) -> Result<(), ()> {
@@ -284,6 +384,8 @@ struct WorkerContext {
     material_publisher: Option<MaterialPublisher>,
     release_events: Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: Arc<AtomicU8>,
+    gate: Arc<SessionGate>,
+    file_gate: Arc<SessionGate>,
 }
 
 async fn run_worker(
@@ -301,6 +403,8 @@ async fn run_worker(
         material_publisher,
         release_events,
         release_pending,
+        gate,
+        file_gate,
     } = context;
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
@@ -310,6 +414,8 @@ async fn run_worker(
             invalidate();
         }
         phase.store(PHASE_CONNECTING, Ordering::Release);
+        gate.invalidate();
+        file_gate.invalidate();
         callback.emit_state(
             if first_attempt {
                 DesklinkState::ConnectingRelay
@@ -392,6 +498,8 @@ async fn run_worker(
             callback,
             &release_events,
             &release_pending,
+            &gate,
+            &file_gate,
         )
         .await
         {
@@ -558,6 +666,7 @@ enum ConnectedWork {
     Event(Result<ControllerEvent, ControllerError>),
     Sent(Result<(), ControllerError>),
     Command(Option<ControllerCommand>),
+    Maintenance,
 }
 
 fn fail_connected(
@@ -574,6 +683,94 @@ fn fail_connected(
     }
 }
 
+struct GateReset(Arc<SessionGate>);
+impl Drop for GateReset {
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
+}
+
+/// Sender-only I/O used by session-scoped actions while the stack-pinned
+/// `next_event` future keeps its exclusive borrow of the runtime across the
+/// connected loop.
+pub(crate) struct SessionIo {
+    senders: Arc<ConnectedSenders>,
+    input_context: Option<InputContext>,
+    active_stream_id: Option<u64>,
+}
+
+impl SessionIo {
+    #[cfg(test)]
+    pub(crate) fn for_runtime(
+        runtime: &ControllerRuntime,
+        input_context: Option<InputContext>,
+    ) -> Self {
+        Self {
+            senders: Arc::new(ConnectedSenders {
+                input: runtime.input_sender(),
+                control: runtime.control_sender(),
+                transfer: runtime.transfer_sender(),
+            }),
+            active_stream_id: input_context.map(|context| context.stream_id),
+            input_context,
+        }
+    }
+
+    pub(crate) fn active_stream_id(&self) -> Option<u64> {
+        self.active_stream_id
+    }
+
+    pub(crate) async fn send_input(&self, event: InputEvent) -> Result<(), ControllerError> {
+        let context = self.input_context.ok_or(ControllerError::NoActiveStream)?;
+        self.senders
+            .input
+            .send_input_with_context(context, event)
+            .await
+    }
+
+    pub(crate) async fn request_keyframe(&self) -> Result<(), ControllerError> {
+        let stream_id = self
+            .active_stream_id
+            .ok_or(ControllerError::NoActiveStream)?;
+        self.senders
+            .control
+            .send(ControlMessage::RequestKeyframe { stream_id })
+            .await
+    }
+
+    pub(crate) async fn select_display(&self, display_id: u32) -> Result<(), ControllerError> {
+        self.senders
+            .control
+            .send(ControlMessage::SelectDisplay { display_id })
+            .await
+    }
+
+    pub(crate) async fn set_audio_enabled(&self, enabled: bool) -> Result<(), ControllerError> {
+        self.senders
+            .control
+            .send(ControlMessage::SetAudioEnabled { enabled })
+            .await
+    }
+
+    pub(crate) async fn set_video_quality(
+        &self,
+        preference: VideoQualityPreference,
+    ) -> Result<(), ControllerError> {
+        self.senders
+            .control
+            .send(ControlMessage::SetVideoQuality { preference })
+            .await
+    }
+
+    pub(crate) async fn send_transfer(
+        &self,
+        message: TransferMessage,
+    ) -> Result<(), ControllerError> {
+        self.senders.transfer.send(message).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
@@ -582,6 +779,8 @@ async fn run_connected(
     callback: CallbackTarget,
     release_events: &Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &Arc<AtomicU8>,
+    gate: &Arc<SessionGate>,
+    file_gate: &Arc<SessionGate>,
 ) -> ConnectedOutcome {
     let senders = Arc::new(ConnectedSenders {
         input: controller.input_sender(),
@@ -603,6 +802,24 @@ async fn run_connected(
     let mut releases = initial.into_iter();
     let mut sending: Option<OwnedConnectedSend> = None;
     let mut transfer_available = true;
+    // Queued file actions fail as stale whenever this connection ends.
+    let _file_gate_reset = GateReset(file_gate.clone());
+    let mut session_commands = SessionCommands::new(callback, gate.clone());
+    let mut files: Option<(u64, crate::file_commands::FileTransfers)> = None;
+    let mut maintenance = tokio::time::interval(Duration::from_millis(100));
+    // Windows capture defaults to enabled. Each authenticated controller
+    // connection starts muted until its user explicitly enables playback.
+    let initial_mute = tokio::select! {
+        _ = cancellation.changed() => return ConnectedOutcome::Shutdown { stream_id: 0 },
+        result = tokio::time::timeout(Duration::from_secs(5), controller.set_audio_enabled(false)) => result,
+    };
+    if let Err(error) = initial_mute.unwrap_or_else(|_| {
+        Err(ControllerError::Transport(TransportError::Connection(
+            "initial audio mute timed out".into(),
+        )))
+    }) {
+        return fail_connected(&senders, error, input_context, stable);
+    }
     loop {
         // This stack-pinned reader survives every send completion and command.
         // Dropping next_event after it dequeued a reliable message but before
@@ -644,6 +861,7 @@ async fn run_connected(
                         event = &mut next_event => ConnectedWork::Event(event),
                         result = async { Pin::new(sending.as_mut().expect("send enabled")).await }, if has_send => ConnectedWork::Sent(result),
                         command = commands.recv(), if receive_command => ConnectedWork::Command(command),
+                        _ = maintenance.tick() => ConnectedWork::Maintenance,
                     }
                 } => work,
             };
@@ -672,6 +890,9 @@ async fn run_connected(
                         }
                         return fail_connected(&senders, error, input_context, stable);
                     }
+                }
+                ConnectedWork::Maintenance => {
+                    session_commands.expire(input_context.map_or(0, |context| context.stream_id));
                 }
                 ConnectedWork::Command(command) => match command {
                     Some(ControllerCommand::SendInput(input)) => {
@@ -740,6 +961,31 @@ async fn run_connected(
                             ConnectedSend::Transfer(message),
                         ));
                     }
+                    Some(ControllerCommand::Session { scope, action }) => {
+                        // Commands arrive only while no owned send is in
+                        // flight, so these bounded inline sends stay ordered.
+                        if let SessionAction::File(file_action) = action {
+                            if file_gate.accepts(scope)
+                                && input_context
+                                    .is_some_and(|context| context.stream_id == scope.stream_id)
+                                && let Some((stream_id, transfers)) = &files
+                                && *stream_id == scope.stream_id
+                            {
+                                let _ = transfers.execute(file_action);
+                            } else {
+                                file_action.fail_stale(callback, scope.stream_id);
+                            }
+                            continue;
+                        }
+                        let io = SessionIo {
+                            senders: senders.clone(),
+                            input_context,
+                            active_stream_id: input_context.map(|context| context.stream_id),
+                        };
+                        if let Err(error) = session_commands.execute(&io, scope, action).await {
+                            return fail_connected(&senders, error, input_context, stable);
+                        }
+                    }
                     Some(ControllerCommand::Shutdown) | None => {
                         senders.control.close();
                         return ConnectedOutcome::Shutdown {
@@ -762,6 +1008,7 @@ async fn run_connected(
                 if !transfer_available && matches!(&event, ControllerEvent::Transfer(_)) {
                     continue;
                 }
+                let video_config = matches!(&event, ControllerEvent::VideoConfig(_));
                 if let ControllerEvent::VideoConfig(config) = &event {
                     stable = true;
                     let current = InputContext {
@@ -770,8 +1017,45 @@ async fn run_connected(
                     };
                     discard_unstarted_input(&mut sending, current);
                     input_context = Some(current);
+                    // File-transfer state is scoped to one authenticated stream.
+                    let stream_id = config.stream_id;
+                    if files.as_ref().is_none_or(|(id, _)| *id != stream_id) {
+                        file_gate.invalidate();
+                        file_gate.stream_id.store(stream_id, Ordering::Release);
+                        files = Some((
+                            stream_id,
+                            crate::file_commands::FileTransfers::new(
+                                callback,
+                                senders.transfer.clone(),
+                                stream_id,
+                            ),
+                        ));
+                    }
                 }
+                if let ControllerEvent::Transfer(message) = &event
+                    && let Some((_, transfers)) = &files
+                {
+                    transfers.observe(message);
+                }
+                let active_stream = input_context.map_or(0, |context| context.stream_id);
+                let display_confirmed = session_commands.observe(&event, active_stream);
                 let _ = emit_controller_event(callback, event);
+                if video_config {
+                    session_commands.replay(active_stream);
+                }
+                if display_confirmed && let Some(scope) = gate.scope(active_stream) {
+                    let io = SessionIo {
+                        senders: senders.clone(),
+                        input_context,
+                        active_stream_id: input_context.map(|context| context.stream_id),
+                    };
+                    if let Err(error) = session_commands
+                        .execute(&io, scope, SessionAction::RequestKeyframe)
+                        .await
+                    {
+                        return fail_connected(&senders, error, input_context, stable);
+                    }
+                }
             }
             Err(error) => return fail_connected(&senders, error, input_context, stable),
         }
@@ -928,7 +1212,8 @@ async fn wait_for_retry(
                 Some(ControllerCommand::SendInput(_))
                 | Some(ControllerCommand::RequestKeyframe)
                 | Some(ControllerCommand::Control(_))
-                | Some(ControllerCommand::Transfer(_)) => {}
+                | Some(ControllerCommand::Transfer(_))
+                | Some(ControllerCommand::Session { .. }) => {}
                 Some(ControllerCommand::Shutdown) | None => return false,
             },
             changed = cancellation.changed() => {
@@ -1064,23 +1349,31 @@ async fn connect_controller(
     let expected_host = VerifyingKey::from_bytes(&host_verify_key).map_err(|error| {
         ConnectFailure::permanent(format!("invalid host verification key: {error}"))
     })?;
+    // Noise is complete before WaitingForApproval. Host capabilities only
+    // arrive after authorization, so do not claim negotiation before approval.
+    let controller = ControllerRuntime::connect_for_platform_with_observer(
+        client,
+        identity,
+        expected_host,
+        platform,
+        || callback.emit_state(DesklinkState::WaitingForApproval, 0),
+    )
+    .await
+    .map_err(ConnectFailure::from_controller)?;
     callback.emit_state(DesklinkState::NegotiatingCapabilities, 0);
-    ControllerRuntime::connect_for_platform(client, identity, expected_host, platform)
-        .await
-        .map(|controller| ResolvedControllerConnection {
-            controller,
-            expires_at_unix_s,
-            material: SavedHostMaterialOwned {
-                session_id,
-                relay_authentication: Zeroizing::new(relay_authentication),
-                host_verify_key,
-                server_name: config.server_name.clone(),
-                expires_at_unix_s: expires_at_unix_s.unwrap_or(0),
-                authorization_type: if expires_at_unix_s.is_some() { 1 } else { 2 },
-                directory: config.directory.clone(),
-            },
-        })
-        .map_err(ConnectFailure::from_controller)
+    Ok(ResolvedControllerConnection {
+        controller,
+        expires_at_unix_s,
+        material: SavedHostMaterialOwned {
+            session_id,
+            relay_authentication: Zeroizing::new(relay_authentication),
+            host_verify_key,
+            server_name: config.server_name.clone(),
+            expires_at_unix_s: expires_at_unix_s.unwrap_or(0),
+            authorization_type: if expires_at_unix_s.is_some() { 1 } else { 2 },
+            directory: config.directory.clone(),
+        },
+    })
 }
 
 async fn connect_relay(config: QuicClientConfig) -> Result<QuicClient, TransportError> {
@@ -1244,6 +1537,106 @@ mod tests {
     use desklink_transport::JoinRejectCode;
 
     use super::*;
+
+    type AbiEvents = Mutex<Vec<(DesklinkEventKind, u64, Vec<u8>)>>;
+    extern "C" fn record_abi(context: *mut std::ffi::c_void, event: *const DesklinkEvent) {
+        let event = unsafe { &*event };
+        let bytes = if event.data_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(event.data, event.data_len) }.to_vec()
+        };
+        unsafe { &*context.cast::<AbiEvents>() }
+            .lock()
+            .unwrap()
+            .push((event.kind, event.stream_id, bytes));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn c_audio_and_file_actions_cross_worker_and_encrypted_peer_boundaries() {
+        use crate::{
+            DesklinkConfig, DesklinkResult, desklink_create, desklink_destroy, desklink_send_file,
+            desklink_set_audio_enabled,
+        };
+        use desklink_crypto::SecureLane;
+        use desklink_protocol::{
+            AudioCodec, AudioPacket, ControlMessage, TransferMessage, TransferResult,
+            decode_control, decode_transfer, encode_audio_packet, encode_control, encode_transfer,
+        };
+        tokio::time::timeout(Duration::from_secs(10),async {
+            let (controller,host,mut secure,relay_task)=crate::session_commands::tests::encrypted_runtime().await;
+            let events=AbiEvents::default();
+            let callback=CallbackTarget{callback:Some(record_abi),context:(&events as *const AbiEvents) as usize};
+            let (commands,mut receiver)=mpsc::channel(COMMAND_CAPACITY+RELEASE_RESERVE);
+            let (cancellation,mut cancel_receiver)=watch::channel(false);
+            let release_events=Arc::new(Mutex::new(Vec::new()));
+            let release_pending=Arc::new(AtomicU8::new(0));
+            let gate=Arc::new(SessionGate::default());
+            let file_gate=Arc::new(SessionGate::default());
+            let test_gate=gate.clone();
+            let test_file_gate=file_gate.clone();
+            let test_release_events=release_events.clone();
+            let test_release_pending=release_pending.clone();
+            // Match production ownership: destroying the C handle joins the
+            // worker runtime, including its file actor callbacks, before the
+            // borrowed callback storage may be released.
+            let thread=std::thread::spawn(move || {
+                let runtime=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+                runtime.block_on(run_connected(controller,&mut receiver,&mut None,&mut cancel_receiver,callback,
+                    &test_release_events,&test_release_pending,&test_gate,&test_file_gate));
+            });
+            let worker=ControllerWorker {commands,cancellation,release_events,release_pending,
+                phase:Arc::new(AtomicU8::new(PHASE_RUNNING)),gate:gate.clone(),file_gate,thread:Some(thread)};
+            let url=std::ffi::CString::new("quic://127.0.0.1:1").unwrap();
+            let mut handle=std::ptr::null_mut();
+            assert_eq!(unsafe { desklink_create(&DesklinkConfig{relay_url:url.as_ptr(),log_level:0},Some(record_abi),callback.context as *mut _,&mut handle) },DesklinkResult::Ok);
+            unsafe {(*handle).runtime.worker=Some(worker)};
+            let bytes=secure.open(SecureLane::Control,&host.next_control().await.unwrap()).unwrap();
+            assert_eq!(decode_control(&bytes).unwrap(),ControlMessage::SetAudioEnabled{enabled:false},"a new controller starts muted");
+            while gate.stream_id.load(Ordering::Acquire)!=9 {tokio::task::yield_now().await;}
+            assert_eq!(unsafe { desklink_set_audio_enabled(handle,8,1) },DesklinkResult::InvalidState);
+            assert_eq!(unsafe { desklink_set_audio_enabled(handle,9,1) },DesklinkResult::Ok);
+            let bytes=secure.open(SecureLane::Control,&host.next_control().await.unwrap()).unwrap();
+            assert_eq!(decode_control(&bytes).unwrap(),ControlMessage::SetAudioEnabled{enabled:true});
+            let bytes=encode_control(&ControlMessage::AudioState{available:true,enabled:true}).unwrap();
+            host.send_control(secure.seal(SecureLane::Control,&bytes).unwrap()).await.unwrap();
+            // Control and datagram lanes are independent; wait for ack callback
+            // before sending this first audio frame to avoid a race in the probe.
+            while !events.lock().unwrap().iter().any(|(kind,_,bytes)| *kind==DesklinkEventKind::Session && serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v|v["kind"]=="audio_state")) {tokio::task::yield_now().await;}
+            let bytes=encode_audio_packet(&AudioPacket{protocol_version:desklink_protocol::PROTOCOL_VERSION,stream_id:9,sequence:1,
+                capture_timestamp_us:10_000,codec:AudioCodec::PcmS16Le,sample_rate:48_000,channels:1,payload:vec![1;960]}).unwrap();
+            host.send_audio_datagram(secure.seal(SecureLane::AudioDatagram,&bytes).unwrap()).await.unwrap();
+            while !events.lock().unwrap().iter().any(|(kind,stream,bytes)| *kind==DesklinkEventKind::AudioPcm && *stream==9 && bytes.len()==960) {tokio::task::yield_now().await;}
+            let directory=std::env::temp_dir().join(format!("desklink-abi-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let source=directory.join("中文😀.bin");std::fs::write(&source,b"phase4 file boundary").unwrap();
+            let path=source.to_str().unwrap();let transfer_id=[17;16];
+            gate.invalidate(); // A same-stream display transition releases input.
+            assert_eq!(unsafe { desklink_send_file(handle,8,transfer_id.as_ptr(),path.as_ptr(),path.len()) },DesklinkResult::InvalidState);
+            assert_eq!(unsafe { desklink_send_file(handle,9,transfer_id.as_ptr(),path.as_ptr(),path.len()) },DesklinkResult::Ok);
+            let bytes=secure.open(SecureLane::Transfer,&host.next_transfer().await.unwrap()).unwrap();
+            assert_eq!(decode_transfer(&bytes).unwrap(),TransferMessage::FileOffer{transfer_id,request_id:None,name:"中文😀.bin".into(),size:20});
+            let bytes=encode_transfer(&TransferMessage::FileDecision{transfer_id,result:TransferResult::Completed,resume_offset:0,resume_prefix_hash:None}).unwrap();
+            host.send_transfer(secure.seal(SecureLane::Transfer,&bytes).unwrap()).await.unwrap();
+            let bytes=secure.open(SecureLane::Transfer,&host.next_transfer().await.unwrap()).unwrap();
+            assert_eq!(decode_transfer(&bytes).unwrap(),TransferMessage::FileChunk{transfer_id,offset:0,bytes:b"phase4 file boundary".to_vec()});
+            let bytes=secure.open(SecureLane::Transfer,&host.next_transfer().await.unwrap()).unwrap();
+            assert!(matches!(decode_transfer(&bytes).unwrap(),TransferMessage::FileComplete{transfer_id:id,..} if id==transfer_id));
+            let bytes=encode_transfer(&TransferMessage::FileResult{transfer_id,result:TransferResult::Completed}).unwrap();
+            host.send_transfer(secure.seal(SecureLane::Transfer,&bytes).unwrap()).await.unwrap();
+            while !events.lock().unwrap().iter().any(|(kind,_,bytes)| *kind==DesklinkEventKind::File && serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v|v["state"]=="completed")) {tokio::task::yield_now().await;}
+            let destination=directory.to_str().unwrap();
+            assert_eq!(unsafe{crate::desklink_request_remote_file(handle,9,1,destination.as_ptr(),destination.len())},DesklinkResult::Ok);
+            let bytes=secure.open(SecureLane::Transfer,&host.next_transfer().await.unwrap()).unwrap();
+            assert_eq!(decode_transfer(&bytes).unwrap(),TransferMessage::FileSelectionRequest{request_id:1,resume:None});
+            assert_eq!(unsafe{crate::desklink_cancel_file_transfer(handle,9)},DesklinkResult::Ok,
+                "file cancellation remains available while same-stream input is suspended");
+            let bytes=secure.open(SecureLane::Transfer,&host.next_transfer().await.unwrap()).unwrap();
+            assert_eq!(decode_transfer(&bytes).unwrap(),TransferMessage::FileSelectionCancel{request_id:1});
+            unsafe {desklink_destroy(handle)};
+            relay_task.abort();std::fs::remove_dir_all(directory).unwrap();
+        }).await.expect("C media probe must complete");
+    }
 
     #[test]
     fn directory_relookup_cannot_replace_an_approved_host_identity() {
@@ -1469,7 +1862,13 @@ mod tests {
         let release_pending = Arc::new(AtomicU8::new(0));
         let mut pending_release = None;
         sender
-            .send(ControllerCommand::RequestKeyframe)
+            .send(ControllerCommand::Session {
+                scope: CommandScope {
+                    epoch: 1,
+                    stream_id: 1,
+                },
+                action: SessionAction::RequestKeyframe,
+            })
             .await
             .unwrap();
         assert!(

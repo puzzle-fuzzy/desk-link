@@ -13,6 +13,17 @@ enum HostHomePage: String, Identifiable {
 struct HostHomeView: View {
     @ObservedObject var bridge: HostBridge
     let page: HostHomePage
+    let controller: ControllerBridge?
+    let account: AccountClient?
+    @State private var pendingRevocation: TrustedController?
+    @State private var showingRevocation = false
+
+    init(bridge: HostBridge, page: HostHomePage, controller: ControllerBridge? = nil, account: AccountClient? = nil) {
+        self.bridge = bridge
+        self.page = page
+        self.controller = controller
+        self.account = account
+    }
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -31,56 +42,53 @@ struct HostHomeView: View {
             .frame(maxWidth: 1040, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .background(DeskLinkPalette.surface)
+        .background(DeskLinkPalette.background)
         .onAppear { bridge.refreshPermissions() }
+        .task { await bridge.prepareAccessCredentials() }
         .onChange(of: scenePhase) { phase in
             if phase == .active { bridge.refreshPermissions() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             bridge.refreshPermissions()
         }
+        .alert("撤销此设备的访问？", isPresented: $showingRevocation) {
+            Button("取消", role: .cancel) { pendingRevocation = nil }
+            Button("撤销访问", role: .destructive) {
+                if let pendingRevocation { bridge.revoke(controller: pendingRevocation) }
+                pendingRevocation = nil
+            }
+        } message: {
+            Text("撤销后，该设备需要重新获得此 Mac 的批准才能控制。")
+        }
     }
 
     private var overview: some View {
         VStack(alignment: .leading, spacing: 16) {
             pageHeading(
-                "设置 / 诊断",
-                detail: "检查本机共享权限、已批准设备和运行信息。"
+                "设置与诊断",
+                detail: "管理账号、本机共享权限、已批准设备与运行状态。"
             )
 
             permissionPanel
 
-            DeskLinkPanel {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(alignment: .firstTextBaseline) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("已批准的访问")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(DeskLinkPalette.ink)
-                            Text("只有在此 Mac 上批准过的控制端才能建立加密会话。")
-                                .font(.system(size: 12))
-                                .foregroundStyle(DeskLinkPalette.mutedInk)
-                        }
-                        Spacer()
-                        Text("共 \(bridge.trustedControllers.count) 台")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(DeskLinkPalette.secondaryInk)
-                    }
-                    if bridge.trustedControllers.isEmpty {
-                        Text("还没有已批准设备。创建连接码，并在另一台设备发起连接后在这里确认。")
-                            .font(.system(size: 13))
-                            .foregroundStyle(DeskLinkPalette.secondaryInk)
-                    } else {
-                        ForEach(Array(bridge.trustedControllers.prefix(3).enumerated()), id: \.offset) { _, controller in
-                            trustedControllerSummary(controller)
-                        }
-                    }
-                }
+            if let account {
+                DeskLinkAccountPanel(account: account, host: bridge, controller: controller)
             }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("已批准设备 · \(bridge.trustedControllers.count) 台")
+                    .font(.system(size: 16, weight: .semibold))
+                Text("只有在此 Mac 上批准过的设备才能建立远程控制会话。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskLinkPalette.secondaryInk)
+                approvedDevicesPanel
+            }
+
+            if let controller { DiagnosticsView(bridge: controller) }
 
             DeskLinkPanel {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("仅在诊断时展开")
+                    Text("本机共享诊断")
                         .font(.system(size: 12))
                         .foregroundStyle(DeskLinkPalette.secondaryInk)
                     DisclosureGroup("运行指标") {
@@ -105,33 +113,39 @@ struct HostHomeView: View {
         VStack(alignment: .leading, spacing: 16) {
             pageHeading(
                 "共享此设备",
-                detail: "需要让别人控制这台 Mac 时，先完成权限检查并生成连接码。"
+                detail: "将本机设备 ID 和访问密码提供给另一台设备，并在此 Mac 上批准首次连接。"
             )
+
+            DeskLinkPanel {
+                let status = deskLinkHostStatus(
+                    for: bridge.state,
+                    permissions: bridge.permissions,
+                    hasPendingApproval: bridge.pendingApproval != nil,
+                    lastError: bridge.lastError,
+                    sharingStatus: bridge.sharingStatus
+                )
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(status.title, systemImage: status.systemImage)
+                        .font(.system(size: 15, weight: .semibold))
+                    Text(status.detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                }
+            }
+
+            HostAccessPanel(bridge: bridge)
 
             permissionPanel
 
-            DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
-                if let invite = bridge.pairingInvite {
-                    TimelineView(.periodic(from: Date(), by: 1)) { context in
-                        pairingInvitePanel(invite, now: context.date)
-                    }
-                } else {
-                    HStack(alignment: .center, spacing: 20) {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("创建安全连接码")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(DeskLinkPalette.ink)
-                            Text(bridge.isCreatingInvite
-                                ? "正在连接托管中继，连接码准备好后会显示二维码。"
-                                : "连接码包含一次性加入凭据，不会在此页面明文显示。")
-                                .font(.system(size: 12))
-                                .foregroundStyle(DeskLinkPalette.secondaryInk)
+            if let invite = bridge.pairingInvite, bridge.accessMode == .temporary {
+                DeskLinkPanel {
+                    DisclosureGroup("使用 iPhone 扫码连接") {
+                        TimelineView(.periodic(from: Date(), by: 1)) { context in
+                            pairingInvitePanel(invite, now: context.date)
                         }
-                        Spacer()
-                        Button(bridge.isCreatingInvite ? "正在连接中继…" : "创建连接码") { bridge.createInvite() }
-                            .buttonStyle(DeskLinkPrimaryButtonStyle())
-                            .disabled(!bridge.permissions.canCaptureAndControl || bridge.isCreatingInvite)
+                        .padding(.top, 14)
                     }
+                    .font(.system(size: 13, weight: .medium))
                 }
             }
 
@@ -167,7 +181,7 @@ struct HostHomeView: View {
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(DeskLinkPalette.ink)
                     if isExpired {
-                        Button("重新生成") { bridge.createInvite() }
+                        Button("重新生成") { bridge.refreshTemporaryPassword() }
                             .buttonStyle(DeskLinkPrimaryButtonStyle())
                     }
                 }
@@ -238,47 +252,54 @@ struct HostHomeView: View {
                 "已批准设备",
                 detail: "撤销后，该设备保存的连接信息将不能再次控制此 Mac。"
             )
-            DeskLinkPanel {
-                if bridge.trustedControllers.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("还没有已批准设备")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(DeskLinkPalette.ink)
-                        Text("请先在“共享此设备”创建连接码，然后在另一台设备发起连接并在此 Mac 上批准。")
-                            .font(.system(size: 13))
-                            .foregroundStyle(DeskLinkPalette.secondaryInk)
-                    }
-                } else {
-                    VStack(spacing: 0) {
-                        ForEach(Array(bridge.trustedControllers.enumerated()), id: \.offset) { index, controller in
-                            HStack(alignment: .center, spacing: 16) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(controller.displayName)
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(DeskLinkPalette.ink)
-                                        .lineLimit(1)
-                                    Text(deviceID(controller.deviceID))
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(DeskLinkPalette.mutedInk)
-                                        .textSelection(.enabled)
-                                }
-                                Spacer()
-                                Text("批准于 \(date(controller.approvedAtUnixSeconds))")
-                                    .font(.system(size: 11))
+            approvedDevicesPanel
+            if let error = bridge.lastError {
+                DeskLinkErrorView(message: error)
+            }
+        }
+    }
+
+    private var approvedDevicesPanel: some View {
+        DeskLinkPanel {
+            if bridge.trustedControllers.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("还没有已批准设备")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(DeskLinkPalette.ink)
+                    Text("请在“共享此设备”开启共享，然后在另一台设备发起连接并在此 Mac 上批准。")
+                        .font(.system(size: 13))
+                        .foregroundStyle(DeskLinkPalette.secondaryInk)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(bridge.trustedControllers.enumerated()), id: \.offset) { index, controller in
+                        HStack(alignment: .center, spacing: 16) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(controller.displayName)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(DeskLinkPalette.ink)
+                                    .lineLimit(1)
+                                Text(deviceID(controller.deviceID))
+                                    .font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(DeskLinkPalette.mutedInk)
-                                Button("撤销设备") { bridge.revoke(controller: controller) }
-                                    .buttonStyle(DeskLinkSecondaryButtonStyle())
+                                    .textSelection(.enabled)
                             }
-                            .padding(.vertical, 8)
-                            if index < bridge.trustedControllers.count - 1 {
-                                Divider()
+                            Spacer()
+                            Text("批准于 \(date(controller.approvedAtUnixSeconds))")
+                                .font(.system(size: 11))
+                                .foregroundStyle(DeskLinkPalette.mutedInk)
+                            Button("撤销设备…") {
+                                pendingRevocation = controller
+                                showingRevocation = true
                             }
+                                .buttonStyle(DeskLinkSecondaryButtonStyle())
+                        }
+                        .padding(.vertical, 8)
+                        if index < bridge.trustedControllers.count - 1 {
+                            Divider()
                         }
                     }
                 }
-            }
-            if let error = bridge.lastError {
-                DeskLinkErrorView(message: error)
             }
         }
     }
@@ -323,23 +344,6 @@ struct HostHomeView: View {
         }
     }
 
-    private func trustedControllerSummary(_ controller: TrustedController) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "desktopcomputer")
-                .foregroundStyle(DeskLinkPalette.secondaryInk)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(controller.displayName)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(DeskLinkPalette.ink)
-                    .lineLimit(1)
-                Text("上次记录：\(date(controller.lastSeenAtUnixSeconds))")
-                    .font(.system(size: 11))
-                    .foregroundStyle(DeskLinkPalette.mutedInk)
-            }
-            Spacer()
-        }
-    }
-
     private func metric(_ title: String, value: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(String(value))
@@ -358,5 +362,82 @@ struct HostHomeView: View {
     private func date(_ unixSeconds: UInt64) -> String {
         Date(timeIntervalSince1970: TimeInterval(unixSeconds))
             .formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+private struct DeskLinkAccountPanel: View {
+    @ObservedObject var account: AccountClient
+    @ObservedObject var host: HostBridge
+    let controller: ControllerBridge?
+    @State private var showingLogin = false
+    @State private var showingLogout = false
+    @State private var isLoggingOut = false
+
+    var body: some View {
+        DeskLinkPanel {
+            HStack(alignment: .center, spacing: 16) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 24))
+                    .foregroundStyle(DeskLinkPalette.secondaryInk)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("账号")
+                        .font(.system(size: 16, weight: .semibold))
+                    if case let .signedIn(user) = account.state {
+                        Text(user.email)
+                            .font(.system(size: 13))
+                            .foregroundStyle(DeskLinkPalette.secondaryInk)
+                            .textSelection(.enabled)
+                    } else {
+                        Text("当前使用本机模式。登录后可管理 DeskLink 账号。")
+                            .font(.system(size: 12))
+                            .foregroundStyle(DeskLinkPalette.secondaryInk)
+                    }
+                }
+                Spacer(minLength: 8)
+                if case .signedIn = account.state {
+                    Button(isLoggingOut ? "正在退出…" : "退出登录") { showingLogout = true }
+                        .buttonStyle(DeskLinkSecondaryButtonStyle())
+                        .disabled(isLoggingOut)
+                } else {
+                    Button("登录账号") {
+                        account.clearError()
+                        showingLogin = true
+                    }
+                    .buttonStyle(DeskLinkSecondaryButtonStyle())
+                }
+            }
+        }
+        .sheet(isPresented: $showingLogin) {
+            VStack(spacing: 0) {
+                HStack {
+                    Text("账号登录").font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    Button("关闭") { showingLogin = false }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(account.isBusy)
+                }
+                .padding([.horizontal, .top], 20)
+                AccountLoginView(account: account)
+            }
+            .frame(width: 460)
+            .interactiveDismissDisabled(account.isBusy)
+        }
+        .onChange(of: account.state) { state in
+            if case .signedIn = state { showingLogin = false }
+        }
+        .alert("退出登录？", isPresented: $showingLogout) {
+            Button("取消", role: .cancel) {}
+            Button("退出登录", role: .destructive) {
+                isLoggingOut = true
+                Task { @MainActor in
+                    controller?.clearRemoteLinksForLogout()
+                    await host.shutdownAndWait()
+                    await account.logout()
+                    isLoggingOut = false
+                }
+            }
+        } message: {
+            Text("将断开连接、停止本机共享，并清除本机保存的远程连接记录。")
+        }
     }
 }

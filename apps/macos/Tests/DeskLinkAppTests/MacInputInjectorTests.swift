@@ -97,6 +97,7 @@ private final class RecordingCGEventBackend: CGEventBackend {
     var unicodeModifiers: [Modifiers] = []
     var unicodePressed: [Bool] = []
     var releasedKeys: [UInt32] = []
+    var keyEvents: [(code: UInt32, pressed: Bool, modifiers: Modifiers)] = []
     var releasedButtons: [MouseButton] = []
 
     func moveMouse(to point: CGPoint) throws { moves.append(point) }
@@ -110,6 +111,7 @@ private final class RecordingCGEventBackend: CGEventBackend {
 
     func postKey(code: UInt32, pressed: Bool, modifiers: Modifiers) throws {
         if !pressed, failReleases { throw MacInputInjectorError.eventCreationFailed }
+        keyEvents.append((code, pressed, modifiers))
         if !pressed { releasedKeys.append(code) }
     }
 
@@ -118,5 +120,25 @@ private final class RecordingCGEventBackend: CGEventBackend {
         unicodeEvents.append(text)
         unicodeModifiers.append(modifiers)
         unicodePressed.append(pressed)
+    }
+
+
+
+    func testIndependentAltStaysInMacKeyUpFlagsAcrossRepeatedTabPresses() throws {
+        let backend = RecordingCGEventBackend()
+        let injector = MacInputInjector(backend: backend)
+        try injector.inject(.key(code: 0x3a, pressed: true, modifiers: []))
+        for _ in 0..<2 {
+            try injector.inject(.key(code: 0x30, pressed: true, modifiers: [.option]))
+            try injector.inject(.key(code: 0x30, pressed: false, modifiers: []))
+        }
+        // An independently pressed Alt must stay in the flags of every Mac
+        // key-up even while repeated Tab presses reset their own modifiers.
+        XCTAssertEqual(backend.keyEvents.map(\.code), [0x3a, 0x30, 0x30, 0x30, 0x30])
+        XCTAssertEqual(backend.keyEvents.map(\.pressed), [true, true, false, true, false])
+        XCTAssertEqual(backend.keyEvents.map(\.modifiers),
+                       [[], [.option], [.option], [.option], [.option]])
+        try injector.inject(.key(code: 0x3a, pressed: false, modifiers: []))
+        XCTAssertTrue(injector.pressedInputs.isEmpty)
     }
 }

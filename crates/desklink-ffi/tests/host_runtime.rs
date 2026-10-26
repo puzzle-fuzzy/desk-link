@@ -7,11 +7,11 @@ mod media_generation;
 use std::{sync::Arc, time::Duration};
 
 use desklink_crypto::{
-    DeviceIdentity, NoiseInitiator, SecureLane, SecureRole, SecureSession, SessionId,
+    DeviceIdentity, NoiseInitiator, PairingInvite, SecureLane, SecureRole, SecureSession, SessionId,
 };
 use desklink_ffi::{
-    ControllerEvent, ControllerRuntime, HostCommand, HostError, HostEvent, HostIdentity,
-    HostRuntime, HostState,
+    ControllerEvent, ControllerRuntime, HostAccessMode, HostCommand, HostError, HostEvent,
+    HostIdentity, HostRuntime, HostState, public_host_device_id,
 };
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FileTaskMessage,
@@ -21,7 +21,9 @@ use desklink_protocol::{
     decode_video_config, encode_control, encode_input, encode_noise_handshake, encode_transfer,
 };
 use desklink_relay::{RelayConfig, RelayServer};
-use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
+use desklink_transport::{
+    QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayJoin, TransportError,
+};
 use quinn::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Mutex, oneshot};
@@ -112,6 +114,62 @@ impl HostTestFixture {
             self.relay_authentication,
         )
         .unwrap()
+    }
+
+    fn transport_config(&self) -> QuicClientConfig {
+        QuicClientConfig::with_client_config(
+            self.relay_addr,
+            "localhost",
+            self.relay.client_config.clone(),
+        )
+    }
+
+    fn start_directory(&mut self, mode: HostAccessMode, code: [u8; 8]) -> HostRuntime {
+        self.start_directory_at(mode, code, now_micros() / 1_000_000)
+    }
+
+    fn start_directory_at(
+        &mut self,
+        mode: HostAccessMode,
+        code: [u8; 8],
+        created_at: u64,
+    ) -> HostRuntime {
+        let identity = self.host_identity.with_secret_key_bytes(|secret| {
+            HostIdentity::from_secret_key(self.host_identity.device_id, secret)
+        });
+        let (host, credentials) = HostRuntime::start_directory_from_config(
+            self.transport_config(),
+            identity,
+            mode,
+            code,
+            created_at,
+        )
+        .unwrap();
+        let invite =
+            PairingInvite::decode(credentials.invitation.as_bytes(), now_micros() / 1_000_000)
+                .unwrap();
+        self.session_id = invite.session_id();
+        self.relay_authentication = *invite.relay_authentication();
+        assert_eq!(
+            credentials.expires_at_unix_s == 0,
+            mode == HostAccessMode::Fixed
+        );
+        host
+    }
+
+    async fn lookup(&self, code: [u8; 8]) -> Result<Vec<u8>, TransportError> {
+        let client = QuicClient::connect(self.transport_config()).await.unwrap();
+        let result = client
+            .lookup_directory(
+                RelayDirectoryLookup::new(
+                    public_host_device_id(self.host_identity.device_id),
+                    code,
+                )
+                .unwrap(),
+            )
+            .await;
+        client.close(b"test lookup completed");
+        result
     }
 
     async fn join_controller(&self) -> QuicClient {
@@ -682,6 +740,147 @@ async fn expect_no_input_until_quiet(host: &HostRuntime) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_temporary_password_reaches_encrypted_approval_and_stop_revokes_lookup() {
+    directory_requires_approval_and_revokes(HostAccessMode::Temporary).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_fixed_password_reaches_encrypted_approval_and_stop_revokes_lookup() {
+    directory_requires_approval_and_revokes(HostAccessMode::Fixed).await;
+}
+
+async fn directory_requires_approval_and_revokes(mode: HostAccessMode) {
+    let mut fixture = HostTestFixture::new().await;
+    let host = fixture.start_directory(mode, *b"ABCDEFGH");
+    let bytes = fixture.lookup(*b"ABCDEFGH").await.unwrap();
+    let resolved = PairingInvite::decode(&bytes, now_micros() / 1_000_000).unwrap();
+    assert_eq!(resolved.session_id(), fixture.session_id);
+    assert_eq!(
+        resolved.host_verify_key(),
+        fixture.host_identity.verify_key()
+    );
+    assert!(matches!(
+        fixture.lookup(*b"ABCDEFGJ").await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+    let mut controller = RawController::pair(&fixture).await;
+    let request = fixture.next_event(&host).await;
+    assert!(
+        matches!(request, HostEvent::ApprovalRequested { device_id, verify_key, .. }
+        if device_id == fixture.controller_identity.device_id && verify_key == *fixture.controller_identity.verify_key().as_bytes())
+    );
+    assert_eq!(host.state(), HostState::WaitingForApproval);
+    assert_eq!(
+        host.send(HostCommand::SendCursor {
+            stream_id: 9,
+            bytes: vec![1]
+        }),
+        Err(HostError::InvalidState)
+    );
+    fixture.approve(&host).await;
+    controller.negotiate().await;
+    next_connected_state(&host).await;
+    // Input admission requires the geometry epoch from a published VideoConfig.
+    publish_raw_config(&host, &mut controller, 9, 1, 1280, 720).await;
+    controller.send_input().await;
+    loop {
+        if matches!(fixture.next_event(&host).await, HostEvent::Input { .. }) {
+            break;
+        }
+    }
+    host.destroy();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(
+        fixture.lookup(*b"ABCDEFGH").await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn temporary_expiry_closes_unapproved_host_and_removes_directory_entry() {
+    let mut fixture = HostTestFixture::new().await;
+    let host = fixture.start_directory_at(
+        HostAccessMode::Temporary,
+        *b"ABCDEFGH",
+        now_micros() / 1_000_000 - 598,
+    );
+    let events = tokio::time::timeout(Duration::from_secs(5), terminal_events(&host))
+        .await
+        .unwrap();
+    assert!(events.contains(&HostEvent::Error(HostError::AccessExpired)));
+    assert_eq!(host.state(), HostState::Closed);
+    assert!(matches!(
+        fixture.lookup(*b"ABCDEFGH").await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn temporary_expiry_preserves_already_approved_connection_but_revokes_new_lookup() {
+    let mut fixture = HostTestFixture::new().await;
+    let host = fixture.start_directory_at(
+        HostAccessMode::Temporary,
+        *b"ABCDEFGH",
+        now_micros() / 1_000_000 - 598,
+    );
+    let mut controller = RawController::pair(&fixture).await;
+    assert!(matches!(
+        fixture.next_event(&host).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    fixture.approve(&host).await;
+    controller.negotiate().await;
+    next_connected_state(&host).await;
+    publish_raw_config(&host, &mut controller, 9, 1, 1280, 720).await;
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(host.state(), HostState::Connected);
+    controller.send_input().await;
+    loop {
+        if matches!(fixture.next_event(&host).await, HostEvent::Input { .. }) {
+            break;
+        }
+    }
+    assert!(matches!(
+        fixture.lookup(*b"ABCDEFGH").await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotating_directory_password_replaces_code_invitation_and_session_and_does_not_cache_approval()
+ {
+    let mut fixture = HostTestFixture::new().await;
+    let first = fixture.start_directory(HostAccessMode::Temporary, *b"ABCDEFGH");
+    let first_invitation = fixture.lookup(*b"ABCDEFGH").await.unwrap();
+    let first_session = fixture.session_id;
+    let first_auth = fixture.relay_authentication;
+    first.destroy();
+    let second = fixture.start_directory(HostAccessMode::Fixed, *b"BCDEFGHJ");
+    let second_invitation = fixture.lookup(*b"BCDEFGHJ").await.unwrap();
+    assert_ne!(first_invitation, second_invitation);
+    assert_ne!(first_session, fixture.session_id);
+    assert_ne!(first_auth, fixture.relay_authentication);
+    assert!(matches!(
+        fixture.lookup(*b"ABCDEFGH").await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+    let _controller = RawController::pair(&fixture).await;
+    assert!(matches!(
+        fixture.next_event(&second).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    assert_eq!(second.state(), HostState::WaitingForApproval);
+    second.destroy();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(
+        fixture.lookup(*b"BCDEFGHJ").await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approval_emits_connected_state_for_capture_start() {
     let fixture = HostTestFixture::new().await;
     let host = fixture.start_host().await;
@@ -691,6 +890,45 @@ async fn approval_emits_connected_state_for_capture_start() {
     ));
     fixture.approve(&host).await;
     next_connected_state(&host).await;
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_reconnect_republishes_same_invitation_without_approving_a_different_controller()
+{
+    let mut fixture = HostTestFixture::new().await;
+    let host = fixture.start_directory(HostAccessMode::Fixed, *b"ABCDEFGH");
+    let invitation = fixture.lookup(*b"ABCDEFGH").await.unwrap();
+    let mut first = RawController::pair(&fixture).await;
+    assert!(matches!(
+        fixture.next_event(&host).await,
+        HostEvent::ApprovalRequested { .. }
+    ));
+    fixture.approve(&host).await;
+    first.negotiate().await;
+    next_connected_state(&host).await;
+    first.client.close(b"test controller disconnected");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                fixture.next_event(&host).await,
+                HostEvent::State(HostState::Connecting)
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(fixture.lookup(*b"ABCDEFGH").await.unwrap(), invitation);
+    fixture.controller_identity = DeviceIdentity::from_secret_key([51; 16], &[52; 32]);
+    let _second = RawController::pair(&fixture).await;
+    assert!(
+        matches!(fixture.next_event(&host).await, HostEvent::ApprovalRequested { device_id, .. }
+        if device_id == fixture.controller_identity.device_id)
+    );
+    assert_eq!(host.state(), HostState::WaitingForApproval);
     host.destroy();
 }
 

@@ -2,6 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/apple-build-tools.sh"
 DEVICE_TARGET=aarch64-apple-ios
 SIMULATOR_TARGET=aarch64-apple-ios-sim
 OUTPUT="$ROOT/dist/apple/DeskLinkFFI.xcframework"

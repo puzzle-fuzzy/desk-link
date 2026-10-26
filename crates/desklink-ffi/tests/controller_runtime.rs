@@ -289,6 +289,146 @@ async fn input_sender_and_runtime_share_encrypted_sequence_without_adopting_a_ne
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encrypted_observer_precedes_host_approval_and_successful_capability_negotiation() {
+    let relay = spawn_test_relay().await;
+    let config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+    let host = QuicClient::connect(config()).await.unwrap();
+    let controller = QuicClient::connect(config()).await.unwrap();
+    let session_id = SessionId::from_bytes([181; 16]);
+    let authentication = [182; 32];
+    host.join(RelayJoin::host_with_participant(
+        session_id,
+        authentication,
+        [1; 16],
+    ))
+    .await
+    .unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session_id,
+            authentication,
+            [2; 16],
+        ))
+        .await
+        .unwrap();
+    let host_identity = DeviceIdentity::from_secret_key([183; 16], &[184; 32]);
+    let controller_identity = DeviceIdentity::from_secret_key([185; 16], &[186; 32]);
+    let host_verify_key = host_identity.verify_key();
+    let controller_verify_key = controller_identity.verify_key();
+    let (encrypted_sender, mut encrypted_receiver) = oneshot::channel();
+    let connection = tokio::spawn(async move {
+        ControllerRuntime::connect_for_platform_with_observer(
+            controller,
+            controller_identity,
+            host_verify_key,
+            Platform::MacOS,
+            || {
+                let _ = encrypted_sender.send(());
+            },
+        )
+        .await
+    });
+
+    let first = tokio::time::timeout(Duration::from_secs(3), host.next_control())
+        .await
+        .unwrap()
+        .unwrap();
+    let first = decode_noise_handshake(&first).unwrap();
+    assert_eq!(first.step, NoiseHandshakeStep::InitiatorHello);
+    assert!(
+        matches!(
+            encrypted_receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "approval cannot be reported while Noise is still awaiting its response"
+    );
+    let (mut responder, response) =
+        NoiseResponder::accept(&first.payload, host_identity, controller_verify_key).unwrap();
+    host.send_control(
+        encode_noise_handshake(&NoiseHandshake {
+            protocol_version: PROTOCOL_VERSION,
+            step: NoiseHandshakeStep::ResponderHello,
+            payload: response,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let finish = tokio::time::timeout(Duration::from_secs(3), host.next_control())
+        .await
+        .unwrap()
+        .unwrap();
+    let finish = decode_noise_handshake(&finish).unwrap();
+    assert_eq!(finish.step, NoiseHandshakeStep::InitiatorFinish);
+    responder.receive(&finish.payload).unwrap();
+    let mut secure = responder
+        .finish()
+        .unwrap()
+        .into_secure_session(SecureRole::Responder);
+    tokio::time::timeout(Duration::from_secs(3), encrypted_receiver)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Hold host authorization: the controller must report encrypted/waiting,
+    // but cannot finish connecting until the approved host sends capabilities.
+    let hello = open_control(&mut secure, host.next_control().await.unwrap());
+    let capabilities = open_control(&mut secure, host.next_control().await.unwrap());
+    assert!(matches!(
+        hello,
+        ControlMessage::Hello {
+            role: DeviceRole::Controller,
+            ..
+        }
+    ));
+    assert!(matches!(capabilities, ControlMessage::Capabilities(_)));
+    assert!(!connection.is_finished());
+    send_control(
+        &host,
+        &mut secure,
+        ControlMessage::Hello {
+            platform: Platform::Windows,
+            role: DeviceRole::Host,
+        },
+    )
+    .await;
+    assert!(
+        !connection.is_finished(),
+        "host Hello alone is not successful capability negotiation"
+    );
+    send_control(
+        &host,
+        &mut secure,
+        ControlMessage::Capabilities(DeviceCapabilities {
+            platform: Platform::Windows,
+            role: DeviceRole::Host,
+            codecs: vec![Codec::H264],
+            h264_profiles: vec![H264Profile::Main],
+            width: 1280,
+            height: 720,
+            lan_data: None,
+        }),
+    )
+    .await;
+    let runtime = tokio::time::timeout(Duration::from_secs(3), connection)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.active_stream_id(),
+        None,
+        "successful negotiation still precedes first video"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypted_actions() {
     let relay = spawn_test_relay().await;
     let config = || {

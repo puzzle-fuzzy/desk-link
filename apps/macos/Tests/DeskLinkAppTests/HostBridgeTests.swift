@@ -1,5 +1,6 @@
 import CoreGraphics
 import XCTest
+import DeskLinkC
 @testable import DeskLinkApp
 
 @MainActor
@@ -14,6 +15,49 @@ final class HostBridgeTests: XCTestCase {
         XCTAssertEqual(bridge.ignoredHostEventCount, 1)
         XCTAssertEqual(bridge.state, .idle)
         XCTAssertTrue(bridge.lastError?.contains("尚不支持") == true)
+    }
+
+    func testTransferAndFutureEventsCannotStopAnActiveHost() {
+        let bridge = HostBridge.testing(permissionSnapshot: .denied, state: .connected)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_TRANSFER.rawValue)
+        bridge.acceptEventForTesting(kind: 999)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_STATE.rawValue, state: 999)
+        // Transfer stays informational (main's bounded warning) and future
+        // events must never become fatal for an active host.
+        XCTAssertEqual(bridge.state, .connected)
+        if let error = bridge.lastError {
+            XCTAssertTrue(error.contains("尚不支持"), "unexpected fatal error: \(error)")
+        }
+    }
+
+    func testHostErrorIsStillFatalAndReleasedInputsAreExplicit() {
+        let bridge = HostBridge.testing(permissionSnapshot: .denied, state: .connected)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_RELEASE_ALL.rawValue)
+        XCTAssertEqual(bridge.releaseAllCallCountForTesting, 1)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_ERROR.rawValue)
+        guard case .failed = bridge.state else { return XCTFail("host runtime errors must be fatal") }
+        XCTAssertNotNil(bridge.lastError)
+    }
+
+    func testHostStopRejectsQueuedCallbacksFromRetiredGeneration() async {
+        let bridge = HostBridge.testing(permissionSnapshot: .denied, state: .connected)
+        let retiredGeneration = bridge.callbackGenerationForTesting
+        bridge.stop()
+        XCTAssertGreaterThan(bridge.releaseAllCallCountForTesting, 0)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_STATE.rawValue,
+            state: DESKLINK_HOST_CONNECTED.rawValue, generation: retiredGeneration)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_ERROR.rawValue, generation: retiredGeneration)
+        XCTAssertEqual(bridge.state, .stopping)
+        XCTAssertNil(bridge.lastError)
+        await bridge.shutdownAndWait()
+        XCTAssertEqual(bridge.state, .closed)
+    }
+
+    func testHostReconnectReleasesInputsBeforeWaitingForCapture() {
+        let bridge = HostBridge.testing(permissionSnapshot: .denied, state: .connected)
+        bridge.acceptEventForTesting(kind: DESKLINK_HOST_EVENT_STATE.rawValue, state: DESKLINK_HOST_CONNECTING.rawValue)
+        XCTAssertEqual(bridge.state, .connecting)
+        XCTAssertEqual(bridge.releaseAllCallCountForTesting, 1)
     }
 
     func testHostBridgeStartsSafeAndApprovalIsNotImplicit() {

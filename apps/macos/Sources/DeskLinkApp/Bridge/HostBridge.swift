@@ -8,40 +8,112 @@ private final class HostCallbackContext: @unchecked Sendable {
     weak var bridge: HostBridge?
     let generation: UInt64
     let captureAdmission: HostCaptureAdmission
+    let onEvent: (@Sendable (HostCallbackEvent) -> Void)?
 
     init(bridge: HostBridge, generation: UInt64, captureAdmission: HostCaptureAdmission) {
         self.bridge = bridge
         self.generation = generation
         self.captureAdmission = captureAdmission
+        self.onEvent = nil
+    }
+
+    /// Directory-runtime contexts deliver prepared events through the sharing
+    /// closure, which performs its own generation gate and main-actor hop.
+    init(onEvent: @escaping @Sendable (HostCallbackEvent) -> Void) {
+        self.bridge = nil
+        self.generation = 0
+        self.captureAdmission = HostCaptureAdmission(runtimeGeneration: 0)
+        self.onEvent = onEvent
     }
 }
 
-private final class HostHandleOwner: @unchecked Sendable {
-    var pointer: OpaquePointer?
-    var callbackContext: UnsafeMutableRawPointer?
+private final class NativeHostDirectoryRuntime: HostDirectoryRuntime, @unchecked Sendable {
+    private(set) var nativeHandle: OpaquePointer?
+    private var callbackContext: UnsafeMutableRawPointer?
 
-    func destroy() {
-        let pointer = self.pointer
-        self.pointer = nil
-        if let pointer { desklink_host_destroy(pointer) }
+    init(identity: HostIdentity, relayURL: String, serverName: String,
+         bridge: HostBridge? = nil, generation: UInt64 = 0, captureAdmission: HostCaptureAdmission? = nil,
+         onEvent: (@Sendable (HostCallbackEvent) -> Void)? = nil) throws {
+        let callback: HostCallbackContext
+        if let bridge, let captureAdmission {
+            // The native runtime shares the bridge's admission-gated scheduling.
+            callback = HostCallbackContext(bridge: bridge, generation: generation, captureAdmission: captureAdmission)
+        } else {
+            callback = HostCallbackContext(onEvent: onEvent ?? { _ in })
+        }
+        let context = Unmanaged.passRetained(callback).toOpaque()
+        var handle: OpaquePointer?
+        let result = relayURL.withCString { relayURL in
+            serverName.withCString { serverName in
+                var config = DesklinkHostConfig()
+                config.relay_url = relayURL
+                config.server_name = serverName
+                withUnsafeMutableBytes(of: &config.host_device_id) { $0.copyBytes(from: identity.deviceID) }
+                withUnsafeMutableBytes(of: &config.host_secret_key) { $0.copyBytes(from: identity.secretKey) }
+                config.log_level = 1
+                return desklink_host_create(&config, desklinkHostEventCallback, context, &handle)
+            }
+        }
+        guard result == DESKLINK_OK, let handle else {
+            Unmanaged<HostCallbackContext>.fromOpaque(context).release()
+            throw HostDirectoryError.runtime(result.rawValue)
+        }
+        nativeHandle = handle
+        callbackContext = context
+    }
+
+    func register(_ request: HostDirectoryStartRequest) -> HostDirectoryRegistration {
+        guard let handle = nativeHandle else {
+            return HostDirectoryRegistration(resultCode: DESKLINK_INVALID_STATE.rawValue,
+                expiresAt: .distantPast, encodedInvite: Data())
+        }
+        let capacity = Int(DESKLINK_PAIRING_INVITE_BYTES)
+        var bytes = [UInt8](repeating: 0, count: capacity)
+        var length = 0
+        var expiry: UInt64 = 0
+        var runtimeDeviceNumber: UInt64 = 0
+        guard desklink_host_public_device_id(handle, &runtimeDeviceNumber) == DESKLINK_OK,
+              runtimeDeviceNumber == request.deviceNumber else {
+            return HostDirectoryRegistration(resultCode: DESKLINK_INVALID_ARGUMENT.rawValue,
+                expiresAt: .distantPast, encodedInvite: Data())
+        }
+        let result = request.password.bytes.withUnsafeBytes { password in
+            bytes.withUnsafeMutableBytes { bytes in
+                desklink_host_start_directory(handle, request.mode == .fixed ? 2 : 1,
+                    password.bindMemory(to: UInt8.self).baseAddress, request.password.bytes.count,
+                    bytes.bindMemory(to: UInt8.self).baseAddress, capacity, &length, &expiry)
+            }
+        }
+        return HostDirectoryRegistration(resultCode: result.rawValue,
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(expiry)),
+            encodedInvite: length == capacity ? Data(bytes) : Data())
+    }
+
+    func stopAndDestroy() {
+        let handle = nativeHandle
+        nativeHandle = nil
+        if let handle {
+            _ = desklink_host_release_all(handle)
+            _ = desklink_host_stop(handle)
+            desklink_host_destroy(handle)
+        }
         if let callbackContext {
             self.callbackContext = nil
             Unmanaged<HostCallbackContext>.fromOpaque(callbackContext).release()
         }
     }
 
-    deinit { destroy() }
+    deinit { stopAndDestroy() }
 }
 
-private struct PairingStartResult: Sendable {
-    let resultCode: UInt32
-    let length: Int
-    let expiry: UInt64
-    let bytes: Data
+private enum HostDirectoryError: Error {
+    case runtime(UInt32)
 }
 
-private struct HostHandleReference: @unchecked Sendable {
-    let pointer: OpaquePointer
+private struct PreparedHostCredentials: Sendable {
+    let identity: HostIdentity
+    let fixedPassword: HostAccessPassword?
+    let fixedPasswordLoadFailed: Bool
 }
 
 @MainActor
@@ -55,6 +127,14 @@ final class HostBridge: ObservableObject {
     @Published private(set) var trustedControllers: [TrustedController] = []
     @Published private(set) var lastError: String?
     @Published private(set) var ignoredHostEventCount: UInt64 = 0
+    @Published private(set) var publicDeviceID: String?
+    @Published private(set) var accessMode: HostAccessMode = .temporary
+    @Published private(set) var sharingStatus: HostSharingStatus = .off
+    @Published private(set) var temporaryPassword: String?
+    @Published private(set) var temporaryPasswordExpiresAt: Date?
+    @Published private(set) var hasFixedPassword = false
+    @Published private(set) var isUpdatingCredentials = false
+    @Published private(set) var credentialsError: String?
 
     var canStartCapture: Bool {
         permissions.screenRecording == .granted && state == .connected
@@ -65,31 +145,50 @@ final class HostBridge: ObservableObject {
     }
 
     var canApprove: Bool {
-        permissions.canCaptureAndControl && pendingApproval != nil
+        permissions.canCaptureAndControl && state == .waitingForApproval && stopTask == nil && pendingApproval != nil
     }
 
+    private let permissionProvider: MacPermissions
     private let relayURL: String
     private let serverName: String
-    private let permissionProvider: MacPermissions
-    private let identityStore: HostIdentityStore
-    private let trustedControllerStore: TrustedControllerStore
-    private let handleOwner = HostHandleOwner()
+    private let identityLoader: @Sendable () throws -> HostIdentity
+    private let fixedAccessStore: any HostFixedAccessStoring
+    private let runtimeFactory: HostDirectoryRuntimeFactory?
+    private let passwordGenerator: @Sendable () throws -> HostAccessPassword
+    private let trustedControllerStore: any HostControllerTrustStoring
     private let captureFactory: HostCaptureFactory
     private var captureAdmission: HostCaptureAdmission?
     private var connectionReceipt: HostCaptureConnectionReceipt?
     private var activeCapture: HostCaptureAttempt?
     private var captureCleanupTask: Task<Void, Never>?
     private var captureWarningOwner: HostCaptureOwner?
+    private var runtime: (any HostDirectoryRuntime)?
+    private var handle: OpaquePointer? { runtime?.nativeHandle }
     private var inputInjector = MacInputInjector()
     private var captureStarting = false
     private var captureRunning = false
+    private var captureGeneration: UInt64 = 0
+    private var activeCaptureStreamID: UInt64 = 0
     private var nextStreamID: UInt64 = 0
     private var stopTask: Task<Void, Never>?
-    private var pairingTask: Task<PairingStartResult, Never>?
+    private var registrationTask: Task<HostDirectoryRegistration, Never>?
+    private var credentialsLoadTask: Task<PreparedHostCredentials, Error>?
+    private var credentialsPrepared = false
+    private var credentialsRevision: UInt64 = 0
+    private var credentialsLoadGeneration: UInt64 = 0
+    private var storedIdentity: HostIdentity?
+    private var fixedPassword: HostAccessPassword?
+    private var sharingGeneration: UInt64 = 0
+    private var sharingRequested = false
+    private var registrationConfirmed = false
+    private var expiryTask: Task<Void, Never>?
     private var permissionRefreshTask: Task<Void, Never>?
     private var callbackGeneration: UInt64 = 0
     private var activeControllerDeviceID: [UInt8]?
 #if DEBUG
+    private(set) var releaseAllCallCountForTesting = 0
+    var callbackGenerationForTesting: UInt64 { callbackGeneration }
+
     func observeConnectionForTesting(_ phase: HostCaptureConnectionPhase, mediaGeneration: UInt64,
                                      deliver: Bool = true) -> HostCaptureConnectionReceipt? {
         let raw = testingRawState(phase)
@@ -169,67 +268,245 @@ final class HostBridge: ObservableObject {
         serverName: String = DeskLinkRuntimeConfiguration.macOSDefaults.relayServerName,
         permissions: MacPermissions = MacPermissions(),
         identityStore: HostIdentityStore = HostIdentityStore(),
-        trustedControllerStore: TrustedControllerStore = TrustedControllerStore(),
-        captureFactory: @escaping HostCaptureFactory = { owner, callbacks in NativeHostCaptureSession(owner: owner, callbacks: callbacks) },
-        loadTrustedControllers: Bool = true
+        trustedControllerStore: any HostControllerTrustStoring = TrustedControllerStore(),
+        loadStoredTrust: Bool = true,
+        identityLoader: (@Sendable () throws -> HostIdentity)? = nil,
+        fixedAccessStore: any HostFixedAccessStoring = HostFixedAccessStore(),
+        runtimeFactory: HostDirectoryRuntimeFactory? = nil,
+        passwordGenerator: @escaping @Sendable () throws -> HostAccessPassword = { try HostAccessPassword.generate() },
+        captureFactory: @escaping HostCaptureFactory = { owner, callbacks in NativeHostCaptureSession(owner: owner, callbacks: callbacks) }
     ) {
+        permissionProvider = permissions
+        self.identityLoader = identityLoader ?? { try identityStore.loadOrCreate() }
+        self.fixedAccessStore = fixedAccessStore
+        self.passwordGenerator = passwordGenerator
+        self.runtimeFactory = runtimeFactory
         self.relayURL = relayURL
         self.serverName = serverName
-        permissionProvider = permissions
-        self.identityStore = identityStore
         self.trustedControllerStore = trustedControllerStore
         self.captureFactory = captureFactory
         self.permissions = permissions.snapshot()
-        if loadTrustedControllers { reloadTrustedControllers() }
+        if loadStoredTrust { reloadTrustedControllers() }
     }
 
-    static func testing(permissionSnapshot: MacPermissionSnapshot,
+    static func testing(permissionSnapshot: MacPermissionSnapshot, state: HostState = .idle,
                         captureFactory: @escaping HostCaptureFactory = { _, _ in InertHostCaptureSession() }) -> HostBridge {
         let bridge = HostBridge(permissions: MacPermissions(provider: StaticMacPermissionProvider(
             screenRecordingGranted: permissionSnapshot.screenRecording == .granted,
             accessibilityGranted: permissionSnapshot.accessibility == .granted
-        )), captureFactory: captureFactory, loadTrustedControllers: false)
+        )), loadStoredTrust: false, captureFactory: captureFactory)
         bridge.permissions = permissionSnapshot
-        bridge.state = .idle
+        bridge.state = state
 #if DEBUG
         bridge.syntheticCaptureForTesting = true
 #endif
         return bridge
     }
 
-    func start() {
-        guard handleOwner.pointer == nil else { return }
-        do {
-            let identity = try identityStore.loadOrCreate()
-            callbackGeneration &+= 1
-            let admission = HostCaptureAdmission(runtimeGeneration: callbackGeneration)
-            captureAdmission = admission
-            connectionReceipt = nil
-            let context = HostCallbackContext(bridge: self, generation: callbackGeneration, captureAdmission: admission)
-            let contextPointer = Unmanaged.passRetained(context).toOpaque()
-            var handle: OpaquePointer?
-            let result = relayURL.withCString { relayURL in
-                serverName.withCString { serverName in
-                    var config = DesklinkHostConfig()
-                    config.relay_url = relayURL
-                    config.server_name = serverName
-                    withUnsafeMutableBytes(of: &config.host_device_id) { $0.copyBytes(from: identity.deviceID) }
-                    withUnsafeMutableBytes(of: &config.host_secret_key) { $0.copyBytes(from: identity.secretKey) }
-                    config.log_level = 1
-                    return desklink_host_create(&config, desklinkHostEventCallback, contextPointer, &handle)
+    /// Identity and fixed-password status can be prepared without enabling capture.
+    func prepareAccessCredentials() async {
+        guard !credentialsPrepared else { return }
+        if credentialsLoadTask == nil {
+            credentialsLoadGeneration &+= 1
+            let loader = identityLoader
+            let store = fixedAccessStore
+            credentialsLoadTask = Task.detached(priority: .userInitiated) {
+                let identity = try loader()
+                do {
+                    return PreparedHostCredentials(identity: identity, fixedPassword: try store.load(),
+                        fixedPasswordLoadFailed: false)
+                } catch {
+                    return PreparedHostCredentials(identity: identity, fixedPassword: nil,
+                        fixedPasswordLoadFailed: true)
                 }
             }
-            guard result == DESKLINK_OK, let handle else {
-                Unmanaged<HostCallbackContext>.fromOpaque(contextPointer).release()
-                publishResultError("DeskLink could not prepare host mode.", result: result)
+        }
+        guard let task = credentialsLoadTask else { return }
+        let loadGeneration = credentialsLoadGeneration
+        let revision = credentialsRevision
+        do {
+            let loaded = try await task.value
+            publicDeviceID = try HostPublicDeviceID.formatted(for: loaded.identity)
+            storedIdentity = loaded.identity
+            if revision == credentialsRevision {
+                fixedPassword = loaded.fixedPassword
+                hasFixedPassword = loaded.fixedPassword != nil
+                credentialsPrepared = !loaded.fixedPasswordLoadFailed
+                credentialsError = loaded.fixedPasswordLoadFailed
+                    ? "无法读取固定密码状态，请检查钥匙串授权或重新设置。" : nil
+            }
+        } catch {
+            credentialsError = "无法读取本机安全凭据，请检查钥匙串授权后重试。"
+        }
+        if credentialsLoadGeneration == loadGeneration { credentialsLoadTask = nil }
+    }
+
+    func start() { startSharing() }
+
+    func startSharing() {
+        guard !sharingRequested else { return }
+        sharingRequested = true
+        sharingGeneration &+= 1
+        let generation = sharingGeneration
+        Task { @MainActor [weak self] in await self?.replaceSharing(generation: generation) }
+    }
+
+    func setAccessMode(_ mode: HostAccessMode) {
+        guard accessMode != mode else { return }
+        accessMode = mode
+        if sharingRequested { restartSharing() }
+    }
+
+    func refreshTemporaryPassword() {
+        guard accessMode == .temporary else { return }
+        if sharingRequested { restartSharing() } else { startSharing() }
+    }
+
+    @discardableResult
+    func setFixedPassword(_ userInput: String) async -> Bool {
+        guard !isUpdatingCredentials else { return false }
+        let password: HostAccessPassword
+        do { password = try HostAccessPassword(userInput) }
+        catch { credentialsError = error.localizedDescription; return false }
+        isUpdatingCredentials = true
+        defer { isUpdatingCredentials = false }
+        await prepareAccessCredentials()
+        let store = fixedAccessStore
+        do {
+            try await Task.detached(priority: .userInitiated) { try store.save(password) }.value
+            credentialsRevision &+= 1
+            fixedPassword = password
+            hasFixedPassword = true
+            credentialsPrepared = storedIdentity != nil
+            credentialsError = nil
+            if sharingRequested && accessMode == .fixed { restartSharing() }
+            return true
+        } catch {
+            credentialsError = "固定密码未保存，请检查钥匙串授权后重试。"
+            return false
+        }
+    }
+
+    @discardableResult
+    func removeFixedPassword() async -> Bool {
+        guard !isUpdatingCredentials else { return false }
+        isUpdatingCredentials = true
+        defer { isUpdatingCredentials = false }
+        await prepareAccessCredentials()
+        let store = fixedAccessStore
+        do {
+            try await Task.detached(priority: .userInitiated) { try store.clear() }.value
+            credentialsRevision &+= 1
+            fixedPassword = nil
+            hasFixedPassword = false
+            credentialsPrepared = storedIdentity != nil
+            credentialsError = nil
+            if accessMode == .fixed {
+                accessMode = .temporary
+                if sharingRequested { restartSharing() }
+            }
+            return true
+        } catch {
+            credentialsError = "固定密码未移除，请检查钥匙串授权后重试。"
+            return false
+        }
+    }
+
+    private func restartSharing() {
+        sharingGeneration &+= 1
+        let generation = sharingGeneration
+        Task { @MainActor [weak self] in await self?.replaceSharing(generation: generation) }
+    }
+
+    private func replaceSharing(generation: UInt64) async {
+        await stopRuntimeAndWait()
+        guard sharingGeneration == generation, sharingRequested else { return }
+        guard permissions.canCaptureAndControl else {
+            failSharing("请先允许屏幕录制和辅助功能，再开启本机共享。")
+            return
+        }
+        await prepareAccessCredentials()
+        guard sharingGeneration == generation, sharingRequested else { return }
+        guard let identity = storedIdentity else {
+            failSharing(credentialsError ?? "无法读取本机安全凭据。")
+            return
+        }
+        let password: HostAccessPassword
+        do {
+            if accessMode == .fixed {
+                guard let fixedPassword else { failSharing("请先设置固定密码。"); return }
+                password = fixedPassword
+            } else {
+                password = try passwordGenerator()
+            }
+            callbackGeneration &+= 1
+            let callbackID = callbackGeneration
+            let admission = HostCaptureAdmission(runtimeGeneration: callbackID)
+            captureAdmission = admission
+            connectionReceipt = nil
+            let preparedRuntime: any HostDirectoryRuntime
+            if let runtimeFactory {
+                preparedRuntime = try runtimeFactory(identity) { [weak self] event in
+                    Task { @MainActor [weak self] in self?.consume(event, generation: callbackID) }
+                }
+            } else {
+                // The native runtime shares the bridge's callback context, so
+                // its events keep the admission-gated scheduling path.
+                preparedRuntime = try NativeHostDirectoryRuntime(identity: identity, relayURL: relayURL,
+                    serverName: serverName, bridge: self, generation: callbackID, captureAdmission: admission)
+            }
+            runtime = preparedRuntime
+            let mode = accessMode
+            let request = HostDirectoryStartRequest(deviceNumber: try HostPublicDeviceID.number(for: identity), password: password, mode: mode)
+            state = .connecting
+            sharingStatus = .registering
+            isCreatingInvite = true
+            lastError = nil
+            let task = Task.detached(priority: .userInitiated) { preparedRuntime.register(request) }
+            registrationTask = task
+            let outcome = await task.value
+            guard sharingGeneration == generation, callbackGeneration == callbackID,
+                  sharingRequested else { return }
+            registrationTask = nil
+            isCreatingInvite = false
+            guard outcome.resultCode == DESKLINK_OK.rawValue,
+                  outcome.encodedInvite.count == Int(DESKLINK_PAIRING_INVITE_BYTES),
+                  mode == .fixed || outcome.expiresAt > Date() else {
+                failSharing("本机共享注册失败，请检查网络后重试。")
                 return
             }
-            handleOwner.pointer = handle
-            handleOwner.callbackContext = contextPointer
-            state = .idle
-            lastError = nil
+            registrationConfirmed = true
+            temporaryPassword = mode == .temporary ? password.revealed : nil
+            temporaryPasswordExpiresAt = mode == .temporary ? outcome.expiresAt : nil
+            pairingInvite = mode == .temporary
+                ? HostPairingInvite(expiresAt: outcome.expiresAt, encoded: outcome.encodedInvite) : nil
+            if state != .connected { sharingStatus = .ready }
+            if mode == .temporary { scheduleRegistrationExpiry(at: outcome.expiresAt, generation: generation) }
         } catch {
-            publishError(error.localizedDescription)
+            failSharing("无法准备本机共享，请重试。")
+        }
+    }
+
+    private func failSharing(_ message: String) {
+        lastError = message
+        sharingStatus = .failed(message)
+        sharingRequested = false
+        if runtime != nil { stop() }
+        else { state = .failed(message) }
+    }
+
+    private func scheduleRegistrationExpiry(at expiry: Date, generation: UInt64) {
+        expiryTask?.cancel()
+        expiryTask = Task { @MainActor [weak self] in
+            let delay = max(0, expiry.timeIntervalSinceNow)
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self, sharingGeneration == generation else { return }
+            // An established session can finish normally, but the invitation must
+            // never remain visible after its actual relay expiry.
+            temporaryPassword = nil
+            temporaryPasswordExpiresAt = nil
+            pairingInvite = nil
+            if state != .connected { stop() }
         }
     }
 
@@ -248,73 +525,23 @@ final class HostBridge: ObservableObject {
     }
 
     func createInvite() {
-        guard permissions.canCaptureAndControl, !isCreatingInvite else {
-            if !permissions.canCaptureAndControl {
-                publishError("Grant Screen Recording and Accessibility before creating an invitation.")
-            }
-            return
-        }
-        start()
-        guard let handle = handleOwner.pointer else { return }
-        let capacity = Int(DESKLINK_PAIRING_INVITE_BYTES)
-        let handleReference = HostHandleReference(pointer: handle)
-        let generation = callbackGeneration
-        isCreatingInvite = true
-        pairingInvite = nil
-        state = .connecting
-        lastError = nil
-        pairingTask = Task.detached(priority: .userInitiated) {
-            var bytes = [UInt8](repeating: 0, count: capacity)
-            var length = 0
-            var expiry: UInt64 = 0
-            let result = bytes.withUnsafeMutableBytes {
-                desklink_host_start_pairing(
-                    handleReference.pointer,
-                    $0.bindMemory(to: UInt8.self).baseAddress,
-                    capacity,
-                    &length,
-                    &expiry
-                )
-            }
-            return PairingStartResult(
-                resultCode: result.rawValue,
-                length: length,
-                expiry: expiry,
-                bytes: Data(bytes)
-            )
-        }
-        Task { @MainActor [weak self] in
-            guard let self, let pairingTask = self.pairingTask else { return }
-            let outcome = await pairingTask.value
-            self.pairingTask = nil
-            self.isCreatingInvite = false
-            guard self.callbackGeneration == generation, self.handleOwner.pointer == handle else { return }
-            guard outcome.resultCode == DESKLINK_OK.rawValue, outcome.length == capacity else {
-                self.publishResultError(
-                    "The relay could not start the host invitation.",
-                    result: DesklinkResult(rawValue: outcome.resultCode)
-                )
-                return
-            }
-            self.pairingInvite = HostPairingInvite(
-                expiresAt: Date(timeIntervalSince1970: TimeInterval(outcome.expiry)),
-                encoded: outcome.bytes
-            )
-            self.state = .connecting
-            self.lastError = nil
+        if accessMode != .temporary {
+            setAccessMode(.temporary)
+            if !sharingRequested { startSharing() }
+        } else if sharingRequested {
+            if pairingInvite == nil { refreshTemporaryPassword() }
+        } else {
+            startSharing()
         }
     }
 
     func approve() {
-        guard var approval = pendingApproval, canApprove, let handle = handleOwner.pointer else { return }
+        guard var approval = pendingApproval, canApprove, let runtime else { return }
         approval.isApproved = true
-        let result = approval.controllerDeviceID.withUnsafeBytes { deviceID in
-            approval.controllerVerifyKey.withUnsafeBytes { verifyKey in
-                desklink_host_approve(handle, deviceID.bindMemory(to: UInt8.self).baseAddress, verifyKey.bindMemory(to: UInt8.self).baseAddress)
-            }
-        }
-        guard result == DESKLINK_OK else {
-            publishResultError("The controller could not be approved.", result: result)
+        let result = runtime.approve(controllerDeviceID: approval.controllerDeviceID,
+            controllerVerifyKey: approval.controllerVerifyKey)
+        guard result == DESKLINK_OK.rawValue else {
+            publishResultError("The controller could not be approved.", result: DesklinkResult(rawValue: result))
             return
         }
         pendingApproval = nil
@@ -335,7 +562,7 @@ final class HostBridge: ObservableObject {
     }
 
     func reject() {
-        guard let handle = handleOwner.pointer else { return }
+        guard let handle = handle else { return }
         let result = desklink_host_reject(handle)
         guard result == DESKLINK_OK else {
             publishResultError("The controller could not be rejected.", result: result)
@@ -364,6 +591,8 @@ final class HostBridge: ObservableObject {
     }
 
     func stop() {
+        sharingRequested = false
+        sharingGeneration &+= 1
         guard stopTask == nil else { return }
         beginStop()
         stopTask = Task { @MainActor [weak self] in await self?.performStop() }
@@ -374,12 +603,20 @@ final class HostBridge: ObservableObject {
     }
 
     func shutdownAndWait() async {
+        sharingRequested = false
+        sharingGeneration &+= 1
+        await stopRuntimeAndWait()
+    }
+
+    private func stopRuntimeAndWait() async {
         if let stopTask {
             await stopTask.value
-        } else {
-            beginStop()
-            await performStop()
+            return
         }
+        beginStop()
+        let task = Task<Void, Never> { @MainActor [weak self] in await self?.performStop() }
+        stopTask = task
+        await task.value
     }
 
     private func beginStop() {
@@ -387,31 +624,44 @@ final class HostBridge: ObservableObject {
         retireActiveCapture()
         connectionReceipt = nil
         callbackGeneration &+= 1
+        captureGeneration &+= 1
+        activeCaptureStreamID = 0
         activeControllerDeviceID = nil
+        pendingApproval = nil
+        releaseAllLocalInput()
         state = .stopping
+        sharingStatus = .stopping
+        registrationConfirmed = false
+        temporaryPassword = nil
+        temporaryPasswordExpiresAt = nil
+        pairingInvite = nil
+        expiryTask?.cancel()
+        expiryTask = nil
     }
 
     private func performStop() async {
-        if let pairingTask {
-            _ = await pairingTask.value
-            self.pairingTask = nil
+        if let registrationTask {
+            _ = await registrationTask.value
+            self.registrationTask = nil
         }
         isCreatingInvite = false
         if let captureCleanupTask { await captureCleanupTask.value }
-        if let handle = handleOwner.pointer {
-            _ = desklink_host_release_all(handle)
-            _ = desklink_host_stop(handle)
+        let retiringRuntime = runtime
+        runtime = nil
+        if let retiringRuntime {
+            await Task.detached(priority: .userInitiated) { retiringRuntime.stopAndDestroy() }.value
         }
-        handleOwner.destroy()
         captureAdmission = nil
         releaseAllLocalInput()
         pairingInvite = nil
         pendingApproval = nil
         state = .closed
+        sharingStatus = lastError.map { .failed($0) } ?? .off
         stopTask = nil
     }
 
-    fileprivate func consume(_ event: HostCallbackEvent) {
+    fileprivate func consume(_ event: HostCallbackEvent, generation: UInt64) {
+        guard acceptsCallback(generation: generation) else { return }
         switch event.kind {
         case .state:
             consumeState(event.state, receipt: event.connectionReceipt)
@@ -426,6 +676,7 @@ final class HostBridge: ObservableObject {
                 controllerVerifyKey: event.controllerVerifyKey
             )
             state = .waitingForApproval
+            approveTrustedControllerIfEligible()
         case .input:
             guard let input = event.inputDelivery else { return }
             inject(input)
@@ -440,6 +691,24 @@ final class HostBridge: ObservableObject {
         case .unknown:
             ignoredHostEventCount &+= 1
         }
+    }
+
+    private func approveTrustedControllerIfEligible() {
+        guard canApprove, let approval = pendingApproval, let runtime,
+              approval.controllerDeviceID.count == TrustedController.deviceIDLength,
+              approval.controllerVerifyKey.count == TrustedController.verifyKeyLength,
+              trustedControllers.contains(where: {
+                  $0.deviceID == approval.controllerDeviceID && $0.verifyKey == approval.controllerVerifyKey
+              }) else { return }
+        let result = runtime.approve(controllerDeviceID: approval.controllerDeviceID,
+            controllerVerifyKey: approval.controllerVerifyKey)
+        guard result == DESKLINK_OK.rawValue else {
+            lastError = "无法恢复已批准设备的连接，请在此 Mac 上重新确认。"
+            return
+        }
+        activeControllerDeviceID = approval.controllerDeviceID
+        pendingApproval = nil
+        lastError = nil
     }
 
 #if DEBUG
@@ -479,24 +748,37 @@ final class HostBridge: ObservableObject {
             value.metrics.received_input_events = UInt64.max
             value.metrics.keyframe_requests = UInt64.max
         }
-        consume(hostCallbackEvent(value))
+        consume(hostCallbackEvent(value), generation: callbackGeneration)
     }
 #endif
 
     private func consumeState(_ rawState: Int, receipt: HostCaptureConnectionReceipt?) {
-        guard let receipt, let admission = captureAdmission,
-              receipt.runtimeGeneration == callbackGeneration, admission.matches(receipt) else { return }
-        connectionReceipt = receipt
-        if receipt.phase != .connected { retireActiveCapture() }
+        if let receipt {
+            guard let admission = captureAdmission,
+                  receipt.runtimeGeneration == callbackGeneration, admission.matches(receipt) else { return }
+            connectionReceipt = receipt
+            if receipt.phase != .connected { retireActiveCapture() }
+        }
+        // Directory-runtime and synthetic events carry no native receipt; their
+        // callback generation was already gated before the main-actor hop.
         switch rawState {
-        case Int(DESKLINK_HOST_CONNECTING.rawValue): state = .connecting
-        case Int(DESKLINK_HOST_WAITING_FOR_APPROVAL.rawValue): state = .waitingForApproval
-        case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue): state = .negotiating
+        case Int(DESKLINK_HOST_CONNECTING.rawValue):
+            state = .connecting
+            if sharingRequested { sharingStatus = .registering }
+            releaseAllLocalInput()
+        case Int(DESKLINK_HOST_WAITING_FOR_APPROVAL.rawValue):
+            state = .waitingForApproval
+            if registrationConfirmed { sharingStatus = .ready }
+        case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue):
+            state = .negotiating
+            if sharingRequested { sharingStatus = .registering }
+            releaseAllLocalInput()
         case Int(DESKLINK_HOST_CONNECTED.rawValue):
             // Connecting may have been superseded while its UI delivery waited.
             // The native gate already retired that connection's capture.
-            if let current = activeCapture, !admission.allows(current.owner) { retireActiveCapture() }
+            if let current = activeCapture, captureAdmission?.allows(current.owner) != true { retireActiveCapture() }
             state = .connected
+            sharingStatus = .connected
             pendingApproval = nil
             if captureWarningOwner != nil {
                 captureWarningOwner = nil
@@ -507,7 +789,7 @@ final class HostBridge: ObservableObject {
         case Int(DESKLINK_HOST_CLOSED.rawValue):
             state = .closed
             if stopTask == nil { stop() }
-        default: state = .idle
+        default: break
         }
     }
 
@@ -630,6 +912,10 @@ final class HostBridge: ObservableObject {
             releaseAllLocalInput()
             if state == .connected { stop() }
         }
+        if previous.canCaptureAndControl && !snapshot.canCaptureAndControl,
+           sharingRequested || runtime != nil {
+            stop()
+        }
         startCaptureIfPermitted()
     }
 
@@ -654,7 +940,7 @@ final class HostBridge: ObservableObject {
 #if DEBUG
             if recordCaptureEventsForTesting { admittedVideoEventsForTesting.append(OwnedHostVideoEvent(owner: owner, event: event)) }
 #endif
-            guard let handle = handleOwner.pointer else {
+            guard let handle = runtime?.nativeHandle else {
 #if DEBUG
                 if syntheticCaptureForTesting { return DesklinkResult(rawValue: captureSubmitResultForTesting) }
 #endif
@@ -683,6 +969,9 @@ final class HostBridge: ObservableObject {
     }
 
     private func releaseAllLocalInput() {
+#if DEBUG
+        releaseAllCallCountForTesting += 1
+#endif
         _ = inputInjector.releaseAll()
     }
 
@@ -726,7 +1015,9 @@ final class HostBridge: ObservableObject {
         let safe = Self.redact(message)
         lastError = safe
         state = .failed(safe)
-        if handleOwner.pointer != nil, stopTask == nil { stop() }
+        sharingStatus = .failed(safe)
+        if runtime != nil, stopTask == nil { stop() }
+        else { sharingRequested = false }
     }
 
     private static func redact(_ message: String) -> String {
@@ -736,9 +1027,21 @@ final class HostBridge: ObservableObject {
         }
         return message
     }
+
+#if DEBUG
+    func acceptEventForTesting(kind: UInt32, state: UInt32 = 0, generation: UInt64? = nil,
+        controllerDeviceID: [UInt8] = [], controllerVerifyKey: [UInt8] = []) {
+        consume(HostCallbackEvent(
+            kind: hostCallbackKind(DesklinkHostEventKind(rawValue: kind)),
+            state: Int(state), message: nil, fingerprint: nil,
+            controllerDeviceID: controllerDeviceID, controllerVerifyKey: controllerVerifyKey,
+            inputDelivery: nil, metrics: nil, connectionReceipt: nil
+        ), generation: generation ?? callbackGeneration)
+    }
+#endif
 }
 
-private enum HostCallbackKind: Sendable {
+enum HostCallbackKind: Sendable {
     case state
     case error
     case approvalRequested
@@ -750,7 +1053,7 @@ private enum HostCallbackKind: Sendable {
     case unknown
 }
 
-private struct HostCallbackEvent: Sendable {
+struct HostCallbackEvent: Sendable {
     let kind: HostCallbackKind
     let state: Int
     let message: String?
@@ -771,7 +1074,12 @@ private func desklinkHostEventCallback(_ context: UnsafeMutableRawPointer?, _ ev
 /// Both C callbacks and synthetic queue regressions enter this preparation path.
 /// All original Rust fields are copied before scheduling any MainActor work.
 private func scheduleHostCallbackEvent(_ callbackContext: HostCallbackContext, _ value: DesklinkHostEvent) -> HostInputDelivery? {
-    guard let bridge = callbackContext.bridge else { return nil }
+    guard let bridge = callbackContext.bridge else {
+        // Runtimes injected by tests keep the sharing closure's routing; that
+        // closure performs its own generation gate and main-actor hop.
+        callbackContext.onEvent?(hostCallbackEvent(value))
+        return nil
+    }
     let generation = callbackContext.generation
     let kind = hostCallbackKind(value.kind)
     let receipt: HostCaptureConnectionReceipt?
@@ -806,7 +1114,7 @@ private func scheduleHostCallbackEvent(_ callbackContext: HostCallbackContext, _
     DispatchQueue.main.async {
         guard bridge.acceptsCallback(generation: generation) else { return }
         if let receipt, !callbackContext.captureAdmission.matches(receipt) { return }
-        bridge.consume(mapped)
+        bridge.consume(mapped, generation: generation)
     }
     return inputDelivery
 }

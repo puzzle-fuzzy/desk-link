@@ -986,6 +986,7 @@ dependencies = [
 name = "desklink-ffi"
 version = "0.1.0"
 dependencies = [
+ "blake2 0.10.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "desklink-crypto",
  "desklink-protocol",
  "desklink-relay",
@@ -993,10 +994,13 @@ dependencies = [
  "desklink-transport",
  "desklink-video",
  "ed25519-dalek",
+ "libc",
+ "opus-head-sys",
  "quinn",
  "rand_core 0.6.4",
  "rcgen",
  "rustls",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "zeroize",

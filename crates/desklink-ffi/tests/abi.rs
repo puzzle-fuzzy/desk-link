@@ -9,10 +9,13 @@ use std::{
 use desklink_ffi::{
     DesklinkConfig, DesklinkEvent, DesklinkEventCallback, DesklinkEventKind, DesklinkHandle,
     DesklinkInput, DesklinkInputKind, DesklinkPairingInviteConnectionConfig, DesklinkResult,
-    DesklinkSecureConnectionConfig, desklink_connect_pairing_invite, desklink_connect_secure,
-    desklink_connect_with_code, desklink_create, desklink_create_for_platform, desklink_destroy,
-    desklink_identity_verify_key, desklink_reject, desklink_release_all, desklink_request_keyframe,
-    desklink_send_input, desklink_start_pairing,
+    DesklinkSecureConnectionConfig, desklink_cancel_file_transfer, desklink_connect_pairing_invite,
+    desklink_connect_secure, desklink_connect_with_code, desklink_create,
+    desklink_create_for_platform, desklink_destroy, desklink_identity_verify_key, desklink_reject,
+    desklink_release_all, desklink_request_clipboard_text, desklink_request_keyframe,
+    desklink_request_remote_file, desklink_select_display, desklink_send_clipboard_text,
+    desklink_send_file, desklink_send_input, desklink_send_input_for_stream, desklink_send_text,
+    desklink_set_audio_enabled, desklink_set_video_quality, desklink_start_pairing,
 };
 
 static CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -47,6 +50,157 @@ unsafe fn create_handle(callback: Option<DesklinkEventCallback>) -> (*mut Deskli
 fn ffi_handle_can_be_created_and_destroyed() {
     let (handle, _url) = unsafe { create_handle(None) };
     assert!(!handle.is_null());
+    unsafe { desklink_destroy(handle) };
+}
+
+#[test]
+fn ffi_session_commands_validate_utf8_bounds_and_require_an_active_secure_stream() {
+    let (handle, _url) = unsafe { create_handle(None) };
+    let invalid_utf8 = [0xff];
+    let oversized = vec![b'x'; desklink_protocol::MAX_CLIPBOARD_TEXT_BYTES + 1];
+    assert_eq!(
+        unsafe { desklink_send_clipboard_text(handle, 9, 1, invalid_utf8.as_ptr(), 1) },
+        DesklinkResult::InvalidUtf8
+    );
+    assert_eq!(
+        unsafe { desklink_send_clipboard_text(handle, 9, 1, oversized.as_ptr(), oversized.len()) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_clipboard_text(handle, 9, 0, null(), 0) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_clipboard_text(handle, 9, 1, null(), 1) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_clipboard_text(handle, 9, 1, [0_u8].as_ptr(), 1) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_clipboard_text(handle, 9, 1, null(), 0) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_send_text(handle, 9, invalid_utf8.as_ptr(), 1) },
+        DesklinkResult::InvalidUtf8
+    );
+    assert_eq!(
+        unsafe { desklink_send_text(handle, 9, null(), 0) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_text(handle, 9, b"\x01\n".as_ptr(), 2) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_text(handle, 9, b"\r\n\t".as_ptr(), 3) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_send_text(handle, 9, oversized.as_ptr(), 4097) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_text(handle, 9, "中文😀".as_ptr(), "中文😀".len()) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_request_clipboard_text(handle, 9, 0) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_request_clipboard_text(handle, 9, 1) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_select_display(handle, 9, 0) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_set_video_quality(handle, 9, 4) },
+        DesklinkResult::InvalidArgument
+    );
+    for quality in 0..4 {
+        assert_eq!(
+            unsafe { desklink_set_video_quality(handle, 9, quality) },
+            DesklinkResult::InvalidState
+        );
+    }
+    assert_eq!(
+        unsafe { desklink_send_input_for_stream(handle, 9, null()) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_select_display(null_mut(), 9, 0) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_request_clipboard_text(null_mut(), 9, 1) },
+        DesklinkResult::InvalidArgument
+    );
+    unsafe {
+        desklink_destroy(handle);
+    }
+}
+
+#[test]
+fn ffi_media_actions_reject_invalid_values_paths_and_inactive_sessions() {
+    let (handle, _url) = unsafe { create_handle(None) };
+    let id = [7_u8; 16];
+    assert_eq!(
+        unsafe { desklink_set_audio_enabled(handle, 9, 2) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_set_audio_enabled(null_mut(), 9, 1) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_set_audio_enabled(handle, 9, 1) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_send_file(handle, 9, null(), b"/tmp/file".as_ptr(), 9) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_file(handle, 9, [0_u8; 16].as_ptr(), b"/tmp/file".as_ptr(), 9) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_file(handle, 9, id.as_ptr(), b"relative".as_ptr(), 8) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_file(handle, 9, id.as_ptr(), b"/tmp/\0x".as_ptr(), 7) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_send_file(handle, 9, id.as_ptr(), [0xff].as_ptr(), 1) },
+        DesklinkResult::InvalidUtf8
+    );
+    assert_eq!(
+        unsafe { desklink_send_file(handle, 9, id.as_ptr(), b"/tmp/file".as_ptr(), 9) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_request_remote_file(handle, 9, 0, b"/tmp".as_ptr(), 4) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_request_remote_file(handle, 9, 1, b"relative".as_ptr(), 8) },
+        DesklinkResult::InvalidArgument
+    );
+    assert_eq!(
+        unsafe { desklink_request_remote_file(handle, 9, 1, b"/tmp".as_ptr(), 4) },
+        DesklinkResult::InvalidState
+    );
+    assert_eq!(
+        unsafe { desklink_cancel_file_transfer(handle, 9) },
+        DesklinkResult::InvalidState
+    );
     unsafe { desklink_destroy(handle) };
 }
 

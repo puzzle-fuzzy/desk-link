@@ -1,13 +1,11 @@
 import XCTest
 
 final class IOSConnectionFlowUITests: XCTestCase {
-    func testLoginCanBeSkippedBeforeOpeningTheRemoteWorkspace() {
+    func testWorkspaceOpensDirectlyWithConnectionTab() {
         let app = XCUIApplication()
         app.launch()
 
-        let skipButton = app.buttons["跳过登录，直接使用"]
-        XCTAssertTrue(skipButton.waitForExistence(timeout: 5))
-        skipButton.tap()
+        // Phase 1-2 ships a local-mode workspace without an account gate.
         XCTAssertTrue(app.tabBars.buttons["连接设备"].waitForExistence(timeout: 5))
     }
 
@@ -15,11 +13,7 @@ final class IOSConnectionFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
 
-        let skipButton = app.buttons["跳过登录，直接使用"]
-        if skipButton.waitForExistence(timeout: 5) {
-            skipButton.tap()
-            XCTAssertTrue(app.tabBars.buttons["连接设备"].waitForExistence(timeout: 5))
-        }
+        XCTAssertTrue(app.tabBars.buttons["连接设备"].waitForExistence(timeout: 5))
 
         let scanButton = app.buttons["scan-invite"]
         XCTAssertTrue(scanButton.waitForExistence(timeout: 5))
