@@ -31,6 +31,21 @@
 
 ## 本次验证
 
-验证日志与引用清单保存在本地 `E:/desk-link/.worktrees/dl2-targets/all-branches-integration/evidence/`。最终计数在验证完成后填入此节；旧分支报告继续绑定原提交，不作为整合后主分支的测试结果。
+最终 Rust 验证源码为干净提交 `60a9afcb9262b354a9cbc381444e9e1783cd45b5`，tree `d323f1860a24cac3a7caf01d020f1e5401b5305e`。本记录后继只补充此验证结果，源码、依赖与测试保持相同。日志、引用审计及源码身份保存在本地 `E:/desk-link/.worktrees/dl2-targets/all-branches-integration/evidence/`。
+
+| 检查 | 本次结果 |
+| --- | --- |
+| Rust 全 workspace / all features / lib 与 tests | 58 个测试程序，1011 通过、0 失败、38 按配置忽略；含新增平台门控、LAN 文件任务和实际暂停回归 |
+| Rust 全 targets / all features check 与严格 Clippy | 均通过，使用 `--locked`；Clippy 使用 `-D warnings` |
+| Rust fmt | 全 workspace 检查通过 |
+| Windows UI Bun | 508 通过、0 失败；2052 assertions；类型检查、输入合同检查与生产构建通过 |
+| account Bun | 79 通过、0 失败；1072 assertions；类型检查通过 |
+| diagnostics Bun | 129 通过、0 失败；6017 assertions；类型检查通过 |
+| Python 脚本回归 | 263 通过、0 失败 |
+| FFI 双头同步 | `sync-ffi-header.py --check` 通过 |
+
+Bun 使用固定 1.3.14，服务安装使用 frozen lockfile，两个服务锁文件未变化。服务验证的 71 个源码指纹与最终提交逐一相同；前端源码、脚本、配置和锁文件也与实际测试输入一致。Rust 最终命令为 `test --workspace --all-features --lib --tests --no-fail-fast --locked -- --test-threads=1`。all-features 的 installer 使用构建脚本提供的验证占位 payload，没有生成可安装发布包。
+
+旧分支报告继续绑定原提交，不作为此整合源码的测试结果；38 个忽略用例保持其硬件、容器、长时运行或专用 fixture 等显式执行条件。
 
 Swift/Xcode、真实桌面捕获与远控输入、双机与设备矩阵、同画质性能、安装签名和线上部署均未在本轮重新验收。原文件分支超过 4 GiB 的独立回读证据仍只绑定其原提交，本轮不会将其重标为整合主分支的结果。
