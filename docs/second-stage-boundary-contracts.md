@@ -87,4 +87,14 @@ DL2-011 的独立 lane 已有提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`�
 
 合并后用[统一入口](local-verification.md)验证共享 unit/contract、transport/FFI localhost、媒体恢复和平台 native；特别补背压中停止、迟到回调/代数、持续输入受限与恢复、普通 shell 更新存活、慢盘/网络黑洞。Apple Swift/Xcode、真实权限和设备缺条件时明确 skipped；代码移动或模块行数下降不能作为性能收益。
 
-本切片只完成现状核对和合同整理。先前工程 `verified-local.json` 已验证基线的 Rust/三个 Bun/Python，`dl2-042-python.json` 为文档元数据回归；二者都不是各组整合后的回归。巨型模块拆分、生产策略唯一所有者、Windows/Apple 同语义和 DL2-014 前后比较继续保持未完成。
+初始切片只完成现状核对和合同整理。先前工程 `verified-local.json` 已验证基线的 Rust/三个 Bun/Python，`dl2-042-python.json` 为文档元数据回归；二者都不是各组整合后的回归。后续稳定职责拆分逐项记录如下，巨型模块整体拆分和 DL2-014 前后比较继续保持未完成。
+
+## 已落地040切片：传输错误分类的单一所有者
+
+新增 `crates/desklink-transport/src/retry_policy.rs`，由共享层唯一穷尽匹配TransportError/JoinRejectCode；Windows host runtime与FFI controller worker删除原重复match，按 `TransportRetryContext::HostSupervisor` / `ControllerSession` 委托同一函数。CodeGraph导航后读取本工程及固定Apple880e3f87、网络a41e1e2源码，确认两处原分类在这些来源逐字相同；此次抽取不选择某一分支覆盖另一分支语义。
+
+共同的暂时连接/流/数据报错误和容量拒绝仍可重试，认证、角色、协议/参数、目录错误仍永久失败；Malformed、SessionNotFound、SessionOccupied仅让HostSupervisor重新接纳peer，不让ControllerSession重试无效会话。测试覆盖全部25个error/rejection用例的双上下文，以及两个生产包装入口。SessionMachine、persistent/expiry/重试次数/退避、取消与停止决策仍由原所有者执行；该纯函数不做I/O、不读错误字符串、不修改wire或ABI。
+
+实际报告 `dist/verify/transport-policy/report.json` 来自f8a89d6加本切片（dirty=true），Rust1.97.1、Windows Cargo wrapper、隔离target engineering：transport lib29、Windows retry_policy_tests18、FFI lib12全部通过且0忽略；三个相关包lib/tests严格Clippy（无no-deps）及workspace fmt通过。它只证明本职责迁移，完整工程的旧Host零epoch失败、未整合Apple/平台验收继续按各自源码记录；未宣称性能提升。
+
+其余具体边界：controller的input/presentation/media_generation及FFI worker输入发送所有权仍由Apple当前013稳定切片决定，当前不大改；FFI HostError::Transport(String)已擦除类型，需独立类型化迁移及Host生命周期回归后才能复用该策略，不能顺手改成Controller语义。LAN024与文件协议14后续独立合入，不阻塞本次共享错误策略及稳定13第一波候选验证。

@@ -25,9 +25,9 @@ use desklink_protocol::{
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    DirectLanConnection, DirectLanSession, DirectLanVideoPath, JoinRejectCode, QuicClient,
-    QuicClientConfig, RelayDirectoryRegistration, RelayJoin, RelayVideoPath, TransportError,
-    VideoDatagramBackend, VideoDatagramRoute,
+    DirectLanConnection, DirectLanSession, DirectLanVideoPath, QuicClient, QuicClientConfig,
+    RelayDirectoryRegistration, RelayJoin, RelayVideoPath, TransportError, VideoDatagramBackend,
+    VideoDatagramRoute,
 };
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
@@ -685,31 +685,10 @@ fn host_error_is_retryable_for_session(error: &HostRuntimeError, persistent_sess
 }
 
 fn transport_error_is_retryable(error: &TransportError) -> bool {
-    match error {
-        TransportError::Connection(_)
-        | TransportError::ConnectionLimit
-        | TransportError::Stream(_)
-        | TransportError::Datagram(_)
-        | TransportError::Closed
-        | TransportError::PeerDisconnected
-        | TransportError::PeerReplaced
-        | TransportError::Malformed => true,
-        TransportError::JoinRejected(code) => matches!(
-            code,
-            JoinRejectCode::SessionNotFound
-                | JoinRejectCode::SessionOccupied
-                | JoinRejectCode::Internal
-                | JoinRejectCode::ConnectionLimit
-                | JoinRejectCode::SessionLimit
-        ),
-        TransportError::MessageTooLarge { .. }
-        | TransportError::NotJoined
-        | TransportError::AlreadyJoined
-        | TransportError::DirectoryNotFound
-        | TransportError::DirectoryRateLimited
-        | TransportError::DirectoryProtocolMismatch { .. }
-        | TransportError::InvalidConfig(_) => false,
-    }
+    desklink_transport::transport_error_is_retryable(
+        error,
+        desklink_transport::TransportRetryContext::HostSupervisor,
+    )
 }
 
 fn host_error_rearms_on_connected_relay(error: &HostRuntimeError) -> bool {
@@ -3371,7 +3350,7 @@ mod retry_policy_tests {
     };
 
     use desklink_protocol::AccessDenialReason;
-    use desklink_transport::TransportError;
+    use desklink_transport::{JoinRejectCode, TransportError};
 
     use super::{
         AdaptiveVideoQuality, HostRuntimeError, VideoFramePacer, encoder_error_is_recoverable,
@@ -3392,6 +3371,25 @@ mod retry_policy_tests {
             _desktop: VirtualDesktop,
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn host_transport_retry_uses_supervisor_context() {
+        for error in [
+            TransportError::Malformed,
+            TransportError::JoinRejected(JoinRejectCode::SessionNotFound),
+            TransportError::JoinRejected(JoinRejectCode::SessionOccupied),
+        ] {
+            assert!(host_error_is_retryable(&HostRuntimeError::Transport(error)));
+        }
+        for error in [
+            TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch),
+            TransportError::DirectoryRateLimited,
+        ] {
+            assert!(!host_error_is_retryable(&HostRuntimeError::Transport(
+                error
+            )));
         }
     }
 

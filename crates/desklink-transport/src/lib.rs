@@ -7,6 +7,7 @@ use thiserror::Error;
 mod direct_probe;
 mod lan_candidate;
 mod quic;
+mod retry_policy;
 mod video_egress;
 mod video_path;
 
@@ -16,6 +17,7 @@ pub use direct_probe::{
 };
 pub use lan_candidate::{discover_local_private_address, make_local_candidate};
 pub use quic::QuicClient;
+pub use retry_policy::{TransportRetryContext, transport_error_is_retryable};
 pub use video_egress::{
     DirectLanVideoPath, RelayVideoPath, VideoDatagramBackend, VideoDatagramRoute,
 };
