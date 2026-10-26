@@ -857,4 +857,57 @@ mod tests {
         assert!(!spawned.load(Ordering::Acquire));
         assert!(fixture.saved_user().is_none());
     }
+    #[test]
+    fn failed_rollback_retains_the_prior_session_for_a_later_safe_retry() {
+        let fixture = TestAccount::new("http://127.0.0.1:1".to_owned());
+        fixture
+            .manager
+            .store
+            .as_ref()
+            .unwrap()
+            .save(&session("prior-user"))
+            .unwrap();
+        fixture.manager.begin_operation(100).unwrap();
+        fixture
+            .manager
+            .stage_session(100, session("unaccepted-user"))
+            .unwrap();
+        fixture.manager.accept_operation(100).unwrap();
+        // Block the store's actual atomic replacement file using an owned
+        // synthetic directory, without changing real account permissions.
+        let temporary = fixture.directory.join("account.tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        assert!(fixture.manager.cancel_operation(101).is_err());
+        assert_eq!(fixture.saved_user().as_deref(), Some("unaccepted-user"));
+        assert!(
+            fixture
+                .manager
+                .operation
+                .state
+                .lock()
+                .unwrap()
+                .previous_session
+                .is_some()
+        );
+        assert!(
+            fixture
+                .manager
+                .operation_owner()
+                .with_current(100, || Ok(()))
+                .is_err()
+        );
+        std::fs::remove_dir(&temporary).unwrap();
+        fixture.manager.cancel_operation(102).unwrap();
+        assert_eq!(fixture.saved_user().as_deref(), Some("prior-user"));
+        assert!(
+            fixture
+                .manager
+                .operation
+                .state
+                .lock()
+                .unwrap()
+                .previous_session
+                .is_none()
+        );
+    }
 }

@@ -293,7 +293,13 @@ function bindAccountInteractions(): void {
   const selectAccountMode = (button: HTMLButtonElement): void => {
     const mode = button.dataset.accountMode;
     if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
-    invalidateAccountOperation();
+    const cancelled = invalidateAccountOperation();
+    const selection = accountOperations.begin("account-view");
+    void cancelled.catch((error) => {
+      if (!accountOperations.current(selection)) return;
+      accountError = `未能完成账号切换，请重试：${normalizeError(error)}`;
+      render();
+    });
     accountMode = mode;
     accountDraft.clearSecrets();
     accountError = null;
@@ -331,21 +337,32 @@ function bindAccountInteractions(): void {
 async function enterAccountLocalMode(): Promise<void> {
   const cancelled = invalidateAccountOperation();
   const operation = accountOperations.begin("local");
-  accountDraft.leave();
-  accountLocalMode = true;
+  accountDraft.clearSecrets();
+  accountBusy = true;
   accountError = null;
   accountNotice = null;
-  setAccountLocalModeEnabled(true);
   render();
   try {
     await cancelled;
     if (!accountOperations.current(operation)) return;
     await restartHost();
     if (!accountOperations.current(operation)) return;
+    accountDraft.leave();
+    accountLocalMode = true;
+    setAccountLocalModeEnabled(true);
     await startWorkspace();
   } catch (error) {
-    feedback = { tone: "error", message: normalizeError(error) };
-    render();
+    if (!accountOperations.current(operation)) return;
+    if (accountLocalMode) {
+      feedback = { tone: "error", message: normalizeError(error) };
+    } else {
+      accountError = `未能切换到本机模式，请重试：${normalizeError(error)}`;
+    }
+  } finally {
+    if (accountOperations.current(operation)) {
+      accountBusy = false;
+      render();
+    }
   }
 }
 
@@ -379,9 +396,7 @@ async function resendVerification(): Promise<void> {
 function invalidateAccountOperation(): Promise<void> {
   accountBusy = false;
   const generation = accountOperations.invalidate();
-  return accountCancelOperation(generation).catch((error) => {
-    if (accountOperations.current({ generation, action: "cancel" })) accountError = normalizeError(error);
-  });
+  return accountCancelOperation(generation);
 }
 
 async function submitAccount(form: HTMLFormElement): Promise<void> {
