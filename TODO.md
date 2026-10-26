@@ -210,6 +210,8 @@
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
 - [ ] 用 AudioWorklet 或经测量更合适的原生播放路径，替代逐包节点创建。
+- [x] `perf(DL2-017): play remote audio through a bounded AudioWorklet`：单个 Worklet 消费 250ms 有界 PCM 环形缓冲，固定 25 包可回收 transfer 池；欠载/过载/过期/抖动指标按低频反馈，声音真正挂起或失败时显示本机重试并避免误静音远端。Bun 1.3.14 `bun test remote-audio` 17 通过、458 断言，实际 Worklet bundle 独立作用域回归及生产构建通过。
+- [ ] 真机 UI 长任务下听感连续性、分配率、欠载、设备恢复及端到端音频延迟对照；尚无性能改善百分比或声学测量结论。
 - **证据 / 类型：性能结构。** `apps/windows-ui/src/remote-audio.ts:42,115-126` 每包建立 Float32Array、AudioBuffer、AudioBufferSourceNode 并复制；480 样本 / 48kHz 对应约每秒 100 个包时，节点创建也达到同等频率。`14-16` 已有 40ms 提前量和 250ms 调度上限，不能称为无界队列。
 - **方案：** 有界环形缓冲、复用内存、抖动/欠载指标和可调目标缓冲；按真实 AudioContext 状态反馈静音、恢复与播放失败。[AudioWorklet](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet)可在独立音频线程处理数据。
 - **验收：** UI 主线程忙时仍保持音频连续且不过期堆积；比较分配率、长任务、欠载及实测音频延迟，保留明确缓冲上限，不预先承诺改善百分比。

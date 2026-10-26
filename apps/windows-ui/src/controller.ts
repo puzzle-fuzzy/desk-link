@@ -119,6 +119,7 @@ import { fileQueueProtectionPresentation } from "./file-queue-protection";
 import { FileQueueView } from "./file-queue-view";
 import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
 import { REMOTE_SHORTCUTS, remoteShortcutInput } from "./remote-shortcuts";
+import { remoteAudioControl } from "./remote-audio-control";
 import {
   FileQueueActionGate,
   type FileQueueActionKind,
@@ -286,6 +287,13 @@ const inputDispatcher = new RemoteInputDispatcher(
     : Promise.reject(new Error("Remote session changed")),
 );
 const remoteAudio = new RemoteAudioPlayer();
+let audioPlaybackPresentation = "";
+remoteAudio.subscribe((playback) => {
+  const next = `${playback.state}:${playback.message}`;
+  if (next === audioPlaybackPresentation) return;
+  audioPlaybackPresentation = next;
+  updateAudioControl();
+});
 const videoPlaybackPressure = new VideoPlaybackPressure();
 const videoPull = new SerialVideoPull<ControllerVideoPayload>();
 const videoRenderTiming = new VideoRenderTiming();
@@ -1059,20 +1067,11 @@ function renderRemoteDesktop(): string {
 }
 
 function renderAudioControl(): string {
-  const unavailable = audioStatus === "starting" || audioStatus === "unavailable";
-  const muted = audioStatus === "muted" || !audioEnabled;
-  const iconName = unavailable ? "volume-off" : muted ? "volume-x" : "volume-2";
-  const label = audioStatus === "starting"
-    ? "声音准备中"
-    : audioStatus === "unavailable"
-      ? "无声音"
-      : muted
-        ? "打开声音"
-        : "静音";
+  const { unavailable, muted, iconName, label, message } = remoteAudioControl(audioStatus, audioEnabled, audioMessage, remoteAudio.getSnapshot());
   return '<button class="toolbar-button" type="button" data-controller-audio aria-pressed="'
     + String(muted)
     + '" title="'
-    + escapeHtml(audioMessage)
+    + escapeHtml(message)
     + '"'
     + (unavailable || audioToggleBusy ? " disabled" : "")
     + ">"
@@ -1736,6 +1735,11 @@ async function toggleRemoteAudio(): Promise<void> {
   ) {
     return;
   }
+  if (remoteAudioControl(audioStatus, audioEnabled, audioMessage, remoteAudio.getSnapshot()).retry) {
+    remoteAudio.prepare();
+    updateAudioControl();
+    return;
+  }
   const previousEnabled = audioEnabled;
   const previousStatus = audioStatus;
   const previousMessage = audioMessage;
@@ -1764,18 +1768,9 @@ async function toggleRemoteAudio(): Promise<void> {
 function updateAudioControl(): void {
   const button = document.querySelector<HTMLButtonElement>("[data-controller-audio]");
   if (!button) return;
-  const unavailable = audioStatus === "starting" || audioStatus === "unavailable";
-  const muted = audioStatus === "muted" || !audioEnabled;
-  const iconName = unavailable ? "volume-off" : muted ? "volume-x" : "volume-2";
-  const label = audioStatus === "starting"
-    ? "声音准备中"
-    : audioStatus === "unavailable"
-      ? "无声音"
-      : muted
-        ? "打开声音"
-        : "静音";
+  const { unavailable, muted, iconName, label, message } = remoteAudioControl(audioStatus, audioEnabled, audioMessage, remoteAudio.getSnapshot());
   button.disabled = unavailable || audioToggleBusy;
-  button.title = audioMessage;
+  button.title = message;
   button.setAttribute("aria-pressed", String(muted));
   button.innerHTML = icon(iconName) + '<span data-controller-audio-label>' + label + "</span>";
   renderLucideIcons(button);
