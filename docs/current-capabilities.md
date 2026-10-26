@@ -2,15 +2,17 @@
 
 更新日期：2026-10-26。用户已确认 **Windows→Windows、macOS→Windows 的基础连接、画面与控制良好**。这条确认保留为产品事实；高级功能、特殊权限、故障恢复与性能仍分别核验。
 
-**当前工程分支不可作为可用整包交付。** 后续已复用 DL2-013 wire/codec 合同，但生产 context/epoch 仍为零；编译与 codec 测试通过，host runtime 业务测试实际失败。此过渡状态不改变用户确认的 main 基础路径，也不能被先前 probe 接入的绿色报告覆盖。
+**当前工程分支不可作为可用整包交付。** 已复用 DL2-013 wire/codec 与显式 Rust 输入 API 桥接，后者加密loopback通过；七处旧生产调用仍未迁移，host仍发布零epoch，host runtime业务测试实际失败。此过渡状态不改变用户确认的 main 基础路径，也不能被局部绿色报告覆盖。
 
 ## 源码身份与版本
 
-本矩阵的功能实现基线是 `main@a905b8807c83677f6f962c18f8fd1593f0d4ca32`，初始工程入口切片是 `44a2a997834d01157ae27a08bc810804422a0f72`。后续工程 probe 接入源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，再复用 input context 合同后为 `5501aad9f7d160f751048036ac2a14cf0a315680`；尚不包含 host/发送/呈现接线及其他分支完整修复，也不是 main 已整合。下面的功能矩阵仍按 main 基线逐项说明；当前工程 checkout 的协议版本和失败状态单列。
+本矩阵的功能实现基线是 `main@a905b8807c83677f6f962c18f8fd1593f0d4ca32`，初始工程入口切片是 `44a2a997834d01157ae27a08bc810804422a0f72`。后续 probe 接入源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，input context 合同后为 `5501aad9f7d160f751048036ac2a14cf0a315680`，显式API桥接后为 `56f53b4a17347714a91a2cb269bc5addc5777916`；尚不包含 host/生产者/呈现完整接线，也不是 main 已整合。下面的功能矩阵仍按 main 基线逐项说明；当前工程 checkout 的协议版本和失败状态单列。
 
 复用来源：协议 `9979c6424cf99f704feb212c7700833fce466dae` → 本分支 `e0d8df8a10fecab5818e04b999fbd424b12b933f`；shared-probe `3277c2a41af0ac923e1daa1c5cab5d952b355b9b` → `9c4119581508fc08c895aa8e3b24063ad03e657e`；probe lane `0836a8b311a858bf12f0d0b4427961c35f5986a7` → `673ec15a50afdffa06f9d65462a568ad2bb8f440`。shared-probe 的合并仅保留探测接线，排除依赖未引入 DL2-010 的两处 snapshot 格式调整；未为此引入整个媒体分支。接入测试另有带源码身份的报告，不用来源提交的测试结果替代。
 
-input context 合同 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` → `5501aad9f7d160f751048036ac2a14cf0a315680`。字段、非零校验和统一输入前缀已落地；`ControllerRuntime::send_input` 的显式 InputContext 参数和两平台生产者还未接通，不得在发送时补当前值。Windows HostVideoPipeline、FFI host 配置和两处 controller 输入生产者仍显式为零；非零校验会拒绝，不可用默认 1 绕过。
+input context 合同 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` → `5501aad9f7d160f751048036ac2a14cf0a315680`，字段、非零校验和统一输入前缀已落地。最小显式API桥接 `b473498382bd163f6085c019521105741264707c` → `56f53b4a17347714a91a2cb269bc5addc5777916`，仅复用 `send_input_with_context` 与其加密loopback测试；旧send_input继续拒绝，七处生产调用尚未迁移，Windows HostVideoPipeline、FFI host 配置和旧输入路径仍显式零，不能默认1或发送时取当前epoch。
+
+该桥接的 controller.rs/test 两文件 hunk 与完整Apple `9ad7154b365de875d725188cfa091f5c21da0b5a` 等价，稳定patch-id为 `2f004b5c19baaa5f3df4360b605818df1f40f9b4`；后续按等价patch去重，不能重复覆盖。完整9ad的C头、lib.rs、worker、ledger与其003/004/025前置没有被本工程引入，C/Swift接线仍以Apple源分支为准。
 
 版本从 manifest/配置读取，命令只读，不构建、不访问设备或网络：
 
@@ -55,6 +57,8 @@ Windows 0.1.93 是公开测试构建，测试更新清单有独立签名；尚�
 `native perf` 在当前 Windows 环境实际记录 Apple、未授权交互设备、未集成离线基线和完整性能条件为 skipped，报告 incomplete / passed=false。未运行真实远控、输入注入、线上发布/探针、Swift/Xcode、双机、GPU/CPU 对照或长稳。入口说明见[分层本地验证](local-verification.md)。2026-07-26 的 Apple、旧 Windows 发布冻结和其他历史报告保留原范围；第二阶段以 [TODO](../TODO.md) 前九节及本矩阵为准。
 
 最新合同过渡报告 `dist/verify/input-context-transition.json` 记录源码 `5501aad`、dirty=true：workspace 全target/feature编译、protocol **47项**、crypto/transport79项通过；host runtime 9通过/1失败，生产 `HostVideoPipeline::prepare` 的零epoch被拒绝为 `Protocol(InvalidVideoConfig)`，报告整体 failed / passed=false。来源分支报告49项，本工程实际执行47项，计数不能照搬。它是待owner接线的业务失败，没有 skip、填默认值或改断言标绿。此前 `probe-integration.json` / `probe-clippy.json` 的源码是 `4c3648a`，仅证明此前 probe 接入，不能证明新过渡源码可运行。
+
+API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `56f53b4`、dirty=false：编译、protocol47项及 controller加密loopback5项通过（0忽略）；host runtime仍9通过/1失败，整体failed / passed=false。这是新API原语通过，不是七处生产调用、完整C/Swift/FFI、host epoch或实际呈现已接通；DL2-013严格绑定继续未完成。
 
 ## 独立分支的已提交证据快照
 

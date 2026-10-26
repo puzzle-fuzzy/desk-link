@@ -56,7 +56,7 @@ Windows 的 persistent 会话、临时邀请、host 服务和单次 controller a
 
 2026-10-26 的协调决定：**Apple/FFI 组是严格输入上下文的唯一共享契约 owner**。该组合同 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为本工程 `5501aad9f7d160f751048036ac2a14cf0a315680`，仍在同一未发布协议 13 开发线。`VideoConfig` 在 `stream_id` 后有非零 `input_epoch: u64`；`InputEnvelope` 在 `timestamp_us` 后有非零 `stream_id: u64`、`input_epoch: u64`，共享层已有 `InputContext` 类型。codec 的 `encode_input` / `decode_session_input` 已统一保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]` 和 exact 解码，拒绝旧包混淆与尾字节；平台/transport 不另拼前缀或 fallback。
 
-**只有 wire/codec 合同已经落地，当前是不可交付的编译过渡。** `ControllerRuntime::send_input` 的显式 InputContext 发送 API 仍待后续提交，当前代码仍填零；FFI `DesklinkRuntime::emit_input` 也填零；Windows `HostVideoPipeline::prepare` 与 FFI host 的视频配置均填 epoch=0。非零校验会拒绝这些生产结果，本工程 host runtime 契约已实际观察到 `Protocol(InvalidVideoConfig)`。禁止把零改成默认 1、发送时补当前 epoch 或跳过失败来标绿。媒体 host 分配/映射、两平台生产者、队列 context 和实际呈现门禁仍待 owner 接线；已有本机拓扑切片 `631cb3258d1cc3b53977611a0603f17d685b850c` 不等于端到端绑定完成。下表是尚未全部完成的所有权合同。
+**wire/codec 与最小 Rust 显式发送 API 已落地，当前仍不可交付。** 来源桥接 `b473498382bd163f6085c019521105741264707c` 已复用为 `56f53b4a17347714a91a2cb269bc5addc5777916`：`ControllerRuntime::send_input_with_context` 显式校验并保留捕获值，旧send_input继续拒绝；加密loopback本地5项通过。该两文件增量与完整9ad等价，后续Apple整合须去重，不包含完整C/FFI ledger或worker接线。七处生产旧API调用仍未迁移；FFI `DesklinkRuntime::emit_input` 仍填零；Windows `HostVideoPipeline::prepare` 与FFI host配置仍填epoch=0，host runtime继续失败InvalidVideoConfig。禁止默认1、发送时补当前epoch或跳过失败标绿。媒体host映射、两平台生产者、队列context与实际呈现门禁仍待owner接线；已有本机拓扑切片 `631cb3258d1cc3b53977611a0603f17d685b850c` 不等于端到端绑定完成。下表仍是未全部完成的所有权合同。
 
 | 唯一 owner | 必须交付的边界 | 不能替代它的近似 |
 | --- | --- | --- |
