@@ -29,6 +29,7 @@ export interface SessionFinding {
     | "input_backpressure"
     | "slow_first_frame"
     | "cursor_lane_disabled"
+    | "direct_listener_stopped"
     | "incomplete_evidence";
   severity: FindingSeverity;
   title: string;
@@ -386,6 +387,14 @@ function analyzeSession(
       detail: "主机因本地能力或大小限制停用了可选光标通道；该事件不表示视频、输入或远程连接已中断。",
     });
   }
+  if (events.some(isStoppedDirectListener)) {
+    findings.push({
+      code: "direct_listener_stopped",
+      severity: "warning",
+      title: "直连监听器已关闭",
+      detail: "主机直连监听器已关闭，媒体发送按中继回退策略处理；是否恢复需结合后续媒体事件确认，该事件本身不表示主机或远程会话已停止。",
+    });
+  }
   if (findings.length === 0) {
     findings.push({
       code: "incomplete_evidence",
@@ -447,6 +456,17 @@ function isDisabledCursorLane(event: ParsedEvent): boolean {
   const errors = safeInteger(event.payload.send_errors);
   return streamId !== null && streamId > 0 && attempts !== null
     && errors !== null && errors > 0 && errors <= attempts;
+}
+
+function isStoppedDirectListener(event: ParsedEvent): boolean {
+  const streamId = safeInteger(event.payload.stream_id);
+  return event.source === "host" && event.level === "warning"
+    && event.event === "host_direct_listener_stopped"
+    && event.payload.schema === 1 && event.payload.level === "warning"
+    && event.payload.event === "host_direct_listener_stopped"
+    && event.payload.reason === "listener_closed"
+    && typeof event.payload.retired_active === "boolean"
+    && streamId !== null && streamId > 0;
 }
 
 function videoByAttempt(events: ParsedEvent[]): Map<number, VideoAttempt> {

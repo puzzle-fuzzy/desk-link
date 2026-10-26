@@ -319,6 +319,68 @@ describe("correlated diagnostic analysis", () => {
     }
   });
 
+  test("a stopped direct listener keeps healthy video and cursor findings separate without claiming host failure or network loss", () => {
+    const videoRows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 10_000, {
+        attempt: 1, received_video_packets: 200, dropped_video_packets: 0,
+        completed_frames: 80, delivered_video_frames: 80,
+      }),
+      event("controller_render_metrics", 10_100, {
+        stream_id: 7, received_frames: 80, submitted_frames: 80, displayed_frames: 80,
+      }),
+    ];
+    const baseline = analyzeDiagnosticRows(videoRows, 24, NOW).sessions[0]!;
+    const session = analyzeDiagnosticRows([...videoRows, cursorEvent(), directListenerEvent()], 24, NOW).sessions[0]!;
+    expect(session.video).toEqual(baseline.video);
+    expect(session.render).toEqual(baseline.render);
+    expect(session.connected_count).toBe(1);
+    expect(session.stop_reason_kinds).toEqual([]);
+    expect(session.outcome).toBe("warning");
+    expect(session.findings.map(finding => finding.code)).toEqual(["healthy_video", "cursor_lane_disabled", "direct_listener_stopped"]);
+    expect(session.findings.find(finding => finding.code === "direct_listener_stopped")).toMatchObject({ severity: "warning", title: "直连监听器已关闭" });
+  });
+
+  test("listener termination with or without a selected direct path produces one fixed warning without inferred fallback success", () => {
+    for (const retired of [true, false]) {
+      const rows = [directListenerEvent({ retired_active: retired }), directListenerEvent({ retired_active: retired }),
+        directListenerEvent({ retired_active: retired, stream_id: 8 }, 1)];
+      const report = analyzeDiagnosticRows(rows, 24, NOW);
+      const session = report.sessions[0]!;
+      expect(session.findings.map(finding => finding.code)).toEqual(["direct_listener_stopped"]);
+      expect(report.summary.finding_counts.direct_listener_stopped).toBe(1);
+      expect(session.outcome).toBe("warning");
+      expect(session.connected_count).toBe(0);
+      expect(session.video.loss_percent).toBeNull();
+      expect(session.video.received_packets).toBe(0);
+      expect(session.video.dropped_packets).toBe(0);
+      expect(session.stop_reason_kinds).toEqual([]);
+      expect(session.findings[0]?.detail).toContain("是否恢复需结合后续媒体事件确认");
+    }
+  });
+
+  test("malformed or unrelated historical listener payloads cannot report listener termination", () => {
+    const invalidRows = [
+      directListenerEvent({ retired_active: "true" }), directListenerEvent({ retired_active: 1 }),
+      directListenerEvent({ retired_active: null }), directListenerEvent({ retired_active: undefined }),
+      directListenerEvent({ reason: "capability_or_size" }), directListenerEvent({ reason: "listener_closed: synthetic raw error" }),
+      directListenerEvent({ reason: null }), directListenerEvent({ event: "host_stopped" }),
+      directListenerEvent({ schema: 2 }), directListenerEvent({ level: "info" }),
+      { ...directListenerEvent(), source: "controller" as const },
+      { ...directListenerEvent(), level: "error" as const },
+      { ...directListenerEvent(), event: "controller_video_metrics" },
+      { ...directListenerEvent(), payload_json: "not JSON" },
+      { ...directListenerEvent(), payload_json: "[]" },
+      ...["7", true, null, undefined, -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1].map(stream_id => directListenerEvent({ stream_id })),
+    ];
+    for (const row of invalidRows) {
+      const session = analyzeDiagnosticRows([row], 24, NOW).sessions[0]!;
+      expect(session.findings.map(finding => finding.code)).not.toContain("direct_listener_stopped");
+      expect(session.findings.map(finding => finding.code)).not.toContain("host_stopped");
+      expect(session.stop_reason_kinds).toEqual([]);
+    }
+  });
+
   test("raises attention for any error or three warning sessions", () => {
     const errorAnalysis = analyzeDiagnosticRows([
       event("controller_stopped", 0, { reason: "host_unavailable: capture failed" }),
@@ -349,6 +411,12 @@ function cursorEvent(payload: Record<string, unknown> = {}, offsetMs = 10_200): 
     level: "warning",
     stream_id: 7, send_attempts: 2, send_errors: 1, disabled: true,
     reason: "capability_or_size", ...payload,
+  }, "a".repeat(32), "host"), level: "warning" };
+}
+
+function directListenerEvent(payload: Record<string, unknown> = {}, offsetMs = 10_300): AnalysisEventRow {
+  return { ...event("host_direct_listener_stopped", offsetMs, {
+    level: "warning", stream_id: 7, retired_active: true, reason: "listener_closed", ...payload,
   }, "a".repeat(32), "host"), level: "warning" };
 }
 

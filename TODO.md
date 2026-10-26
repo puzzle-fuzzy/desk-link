@@ -384,8 +384,16 @@
 - [x] 核实 producer `a599246535b73f57e0425cbbfd18c7156e050bba` 的 `DiagnosticEvent::HostMedia(CursorSend)`；仅为 `host_cursor_send` 接受精确 9 字段、host source / warning / 固定 `capability_or_size` reason，三个新增字段不向其他事件开放。无需存储迁移。
 - [x] `fix(DL2-044)` 服务切片：保留完整 payload / 批次原子性与去重；分析仅生成一次可选光标通道停用 warning，保留独立视频健康证据，不累加跨 peer 快照、不把 send_errors 转为真实丢包/送达率或主机停止。
 - [x] 实际 rustc 1.97.1 经仓库 Cargo wrapper、producer 锁版本 `--locked --offline` 编译原 encoder 生成四组 JSONL fixture；六份输入 blob / SHA-256 已复核，独立重跑除 timestamp 外一致。Bun 1.3.14：54 测试 / 665 断言及 typecheck 通过，包含原 Rust JSONL → Ed25519 签名批次 → 验签/schema → app/store → analysis、混合批次、去重、错误字段/类型/source/reason/签名和 safe integer / u64 边界。
-- [ ] GUI observer 绑定 / 导出、真实硬件与媒体链路整体验收由产品 / 媒体工作面继续；本项不能关闭整个 044。045 listener_closed 等待其真实 producer SHA，不预先扩 schema；桌面上传器对永久 400 的重试生命周期也不由本地 server 回归证明。
+- [ ] GUI observer 绑定 / 导出、真实硬件与媒体链路整体验收由产品 / 媒体工作面继续；本项不能关闭整个 044。045 listener_closed 已按后续真实 SHA 接线（见下方服务切片）；桌面上传器对永久 400 的重试生命周期仍不由本地 server 回归证明。
 - **契约 / 证据：** `server/diagnostics/HOST_MEDIA.md`、`fixtures/host-media-cursor-producer.json`、`scripts/generate-host-media-contract.py`。仅运行隔离编码 harness 和本地签名 / 数据库测试，未编造 GUI 已接通或远端送达证据。
+
+#### DL2-045 · 服务端直连监听诊断契约切片（整体仍由媒体 / 产品验收）
+
+- [x] 核实 producer `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`（区别于 98dd 前置测试）；仅为 `host_direct_listener_stopped` 接受精确 7 字段，host source / warning / 固定 `listener_closed` reason / 严格 boolean `retired_active`，不向其他事件开放新字段。存储无需迁移，044 光标契约保留。
+- [x] `fix(DL2-045)` 服务切片：新增一次固定 listener 终止 warning；保留独立健康视频/光标证据，不判主机或整个会话停止，不推导网络丢包、中继已恢复成功或重复 peer 次数。retired_active 两值都合法，仅反映是否从 slot 取出选定连接。
+- [x] 原 Rust encoder 经仓库 wrapper / rustc 1.97.1 / `--locked --offline` 生成四组真实 JSONL fixture；六份输入 blob / SHA-256 已复核。Bun 1.3.14：诊断 61 测试 / 868 断言及 typecheck 通过，覆盖 producer → 签名/验签 → 固定 schema → 混合 cursor/legacy/listener 批次入库/去重 → analysis，以及坏字段/类型/source/reason、签名篡改和 safe integer/u64 边界；原 cursor fixture 字节未改且其完整回归仍过。
+- [ ] 产品 observer 接线 / 导出、真实 listener 生命周期与 relay 回退验收继续由媒体 / 产品工作面处理，不能据 server 契约测试关闭整个 045。未知未来 schema 仍需真实 producer SHA；永久 400 的桌面重试策略不在本服务验证内。
+- **契约 / 证据：** `server/diagnostics/HOST_MEDIA.md`、`fixtures/host-media-listener-producer.json`、`scripts/generate-host-media-contract.py --event direct-listener`。仅隔离编码 harness 和本地合成签名/SQLite，未连接线上。
 
 ### DL2-054 · P2 · 诊断接收在验签前限额，持久配额限制留存增长
 

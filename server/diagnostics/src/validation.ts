@@ -57,6 +57,10 @@ const CURSOR_SEND_FIELDS = new Set([
   "schema", "timestamp_unix_ms", "level", "event", "stream_id",
   "send_attempts", "send_errors", "disabled", "reason",
 ]);
+// DirectListenerStopped product encoding, pinned to 6dbe53d.
+const DIRECT_LISTENER_FIELDS = new Set([
+  "schema", "timestamp_unix_ms", "level", "event", "stream_id", "retired_active", "reason",
+]);
 
 export interface DiagnosticEvent {
   schema: 1;
@@ -183,7 +187,9 @@ function validateEvent(value: unknown, nowUnixMs: number, source: DiagnosticBatc
     throw new BatchValidationError(400, "diagnostic event must be an object");
   }
   const cursorSend = value.event === "host_cursor_send";
-  const allowedFields = cursorSend ? CURSOR_SEND_FIELDS : ALLOWED_EVENT_FIELDS;
+  const directListenerStopped = value.event === "host_direct_listener_stopped";
+  const allowedFields = cursorSend ? CURSOR_SEND_FIELDS
+    : directListenerStopped ? DIRECT_LISTENER_FIELDS : ALLOWED_EVENT_FIELDS;
   if (Object.keys(value).some((key) => !allowedFields.has(key))) {
     throw new BatchValidationError(400, "diagnostic event contains unsupported fields");
   }
@@ -210,6 +216,14 @@ function validateEvent(value: unknown, nowUnixMs: number, source: DiagnosticBatc
     || typeof value.disabled !== "boolean" || value.reason !== "capability_or_size"
   )) {
     throw new BatchValidationError(400, "host cursor send fields are invalid");
+  }
+  if (directListenerStopped && (
+    Object.keys(value).length !== DIRECT_LISTENER_FIELDS.size
+    || source !== "host" || value.level !== "warning"
+    || !Number.isSafeInteger(value.stream_id) || Number(value.stream_id) <= 0
+    || typeof value.retired_active !== "boolean" || value.reason !== "listener_closed"
+  )) {
+    throw new BatchValidationError(400, "host direct listener fields are invalid");
   }
   for (const [key, field] of Object.entries(value)) {
     if (typeof field === "number" && (!Number.isSafeInteger(field) || field < 0)) {

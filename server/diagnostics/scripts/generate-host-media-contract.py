@@ -14,6 +14,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[3]
 PRODUCER = "a599246535b73f57e0425cbbfd18c7156e050bba"
+LISTENER_PRODUCER = "6dbe53d64c60bbdd50af4b592ebef7471b800fcc"
 CRATE = "desklink-host-media-contract-fixture"
 SOURCE_PATHS = [
     "apps/windows/src/diagnostics.rs",
@@ -85,7 +86,7 @@ def selected_packages(lock: dict, manifest: dict) -> tuple[dict[str, dict], list
     return roots, sorted(closure.values(), key=lambda entry: (entry["name"], entry["version"]))
 
 
-def crate_files(scratch: Path, sources: dict[str, bytes]) -> None:
+def crate_files(scratch: Path, sources: dict[str, bytes], event: str = "cursor") -> None:
     manifest = tomllib.loads(sources["Cargo.toml"].decode())
     lock = tomllib.loads(sources["Cargo.lock"].decode())
     roots, packages = selected_packages(lock, manifest)
@@ -150,6 +151,7 @@ mod runtime {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/source/apps/windows/src/runtime/media_diagnostics.rs"));
     }
     pub use media_diagnostics::HostMediaDiagnostic;
+    // DIRECT_LISTENER_REASON_REEXPORT
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum HostLifecycleEvent {
         Connecting { attempt: u32, stream_id: u64 },
@@ -165,7 +167,26 @@ mod diagnostics {
         encode_event(&DiagnosticEvent::HostMedia(event))
     }
 }
-fn main() {
+'''
+    if event == "direct-listener":
+        main = main.replace("pub use cursor_send::CursorDisableReason;",
+                            "#[allow(unused_imports)]\n    pub use cursor_send::CursorDisableReason;")
+        main = main.replace("// DIRECT_LISTENER_REASON_REEXPORT",
+                            "pub use media_diagnostics::DirectListenerStopReason;")
+        main += r'''fn main() {
+    const MAX_SAFE: u64 = 9_007_199_254_740_991;
+    for (stream_id, retired_active) in [
+        (7, true), (8, false), (MAX_SAFE, true), (u64::MAX, true),
+    ] {
+        print!("{}", diagnostics::producer_line(runtime::HostMediaDiagnostic::DirectListenerStopped {
+            stream_id, retired_active,
+            reason: runtime::DirectListenerStopReason::ListenerClosed,
+        }));
+    }
+}
+'''
+    else:
+        main += r'''fn main() {
     const MAX_SAFE: u64 = 9_007_199_254_740_991;
     for (stream_id, send_attempts, send_errors, disabled) in [
         (7, 2, 1, true), (8, 5, 2, false),
@@ -185,11 +206,17 @@ fn main() {
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--producer-commit", default=PRODUCER)
-    parser.add_argument("--scratch", type=Path, default=Path(r"E:\desk-link\.worktrees\dl2-targets\dl2-services\cursor-contract"))
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "fixtures/host-media-cursor-producer.json")
+    parser.add_argument("--event", choices=("cursor", "direct-listener"), default="cursor")
+    parser.add_argument("--producer-commit")
+    parser.add_argument("--scratch", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    commit = command("git", "rev-parse", "--verify", args.producer_commit + "^{commit}").decode().strip()
+    listener = args.event == "direct-listener"
+    producer = args.producer_commit or (LISTENER_PRODUCER if listener else PRODUCER)
+    contract = "listener" if listener else "cursor"
+    args.scratch = args.scratch or Path(r"E:\desk-link\.worktrees\dl2-targets\dl2-services") / f"{contract}-contract"
+    args.output = args.output or Path(__file__).resolve().parents[1] / f"fixtures/host-media-{contract}-producer.json"
+    commit = command("git", "rev-parse", "--verify", producer + "^{commit}").decode().strip()
     sources = {path: command("git", "show", f"{commit}:{path}") for path in SOURCE_PATHS}
     scratch = args.scratch.resolve()
     marker = scratch / ".host-media-contract-scratch"
@@ -197,7 +224,7 @@ def main() -> int:
         raise RuntimeError("refusing to overwrite an unmarked nonempty scratch directory")
     scratch.mkdir(parents=True, exist_ok=True)
     marker.write_text("Owned by generate-host-media-contract.py; source snapshots are scratch only.\n", encoding="utf8", newline="\n")
-    crate_files(scratch, sources)
+    crate_files(scratch, sources, args.event)
     toolchain = tomllib.loads(sources["rust-toolchain.toml"].decode())["toolchain"]["channel"]
     env = {**os.environ, "RUSTUP_TOOLCHAIN": toolchain, "CARGO_TARGET_DIR": str(scratch / "target")}
     rustc = command("rustup", "run", toolchain, "rustc", "-Vv", env=env).decode().strip()
@@ -207,13 +234,24 @@ def main() -> int:
     lines = raw.decode("utf8").splitlines(keepends=True)
     if len(lines) != 4 or any(not line.endswith("\n") or "\r" in line for line in lines):
         raise RuntimeError("producer did not emit exactly four LF JSONL records")
-    for line, expected in zip(lines, [(7, 2, 1, True), (8, 5, 2, False),
-                                      (2**53 - 1, 2**53 - 1, 2**53 - 1, True),
-                                      (2**64 - 1, 2**64 - 1, 2**64 - 1, True)], strict=True):
+    if listener:
+        names = ("retired_true", "retired_false", "max_safe", "u64_overflow")
+        fields = ("stream_id", "retired_active")
+        expectations = [(7, True), (8, False), (2**53 - 1, True), (2**64 - 1, True)]
+        event_name, reason = "host_direct_listener_stopped", "listener_closed"
+    else:
+        names = ("disabled", "enabled", "max_safe", "u64_overflow")
+        fields = ("stream_id", "send_attempts", "send_errors", "disabled")
+        expectations = [(7, 2, 1, True), (8, 5, 2, False),
+                        (2**53 - 1, 2**53 - 1, 2**53 - 1, True),
+                        (2**64 - 1, 2**64 - 1, 2**64 - 1, True)]
+        event_name, reason = "host_cursor_send", "capability_or_size"
+    for line, expected in zip(lines, expectations, strict=True):
         value = json.loads(line)
-        actual = (value["stream_id"], value["send_attempts"], value["send_errors"], value["disabled"])
-        if actual != expected or value["event"] != "host_cursor_send" or value["reason"] != "capability_or_size":
-            raise RuntimeError("unexpected production cursor encoder output")
+        actual = tuple(value[field] for field in fields)
+        if (actual != expected or value["event"] != event_name or value["reason"] != reason
+                or value["schema"] != 1 or value["level"] != "warning"):
+            raise RuntimeError("unexpected production encoder output")
     fixture = {
         "producer_commit": commit,
         "sources": [{"path": path,
@@ -222,7 +260,7 @@ def main() -> int:
                     for path, contents in sources.items()],
         "rustc_version": rustc,
         "cases": [{"name": name, "line": line} for name, line in
-                  zip(("disabled", "enabled", "max_safe", "u64_overflow"), lines, strict=True)],
+                  zip(names, lines, strict=True)],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(fixture, ensure_ascii=False, indent=2) + "\n", encoding="utf8", newline="\n")
