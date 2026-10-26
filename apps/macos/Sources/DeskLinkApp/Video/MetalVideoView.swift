@@ -1,11 +1,12 @@
 import CoreImage
 import DeskLinkAppleCore
 import CoreVideo
-import MetalKit
+@preconcurrency import MetalKit
 import SwiftUI
 
 struct MetalVideoView: NSViewRepresentable {
-    let pixelBuffer: CVPixelBuffer?
+    let frame: PresentedVideoFrame?
+    let onFramePresented: @MainActor @Sendable (VideoFramePresentationToken, CGRect) -> Bool
 
     func makeNSView(context: Context) -> MTKView {
         let view = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
@@ -19,7 +20,11 @@ struct MetalVideoView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
-        context.coordinator.pixelBuffer = pixelBuffer
+        context.coordinator.onFramePresented = onFramePresented
+        let pixelBuffer = frame?.pixelBuffer
+        guard context.coordinator.pixelBuffer !== pixelBuffer
+                || context.coordinator.presentationToken != frame?.token else { return }
+        context.coordinator.frame = frame
         view.setNeedsDisplay(view.bounds)
     }
 
@@ -27,8 +32,12 @@ struct MetalVideoView: NSViewRepresentable {
         Renderer()
     }
 
-    final class Renderer: NSObject, MTKViewDelegate {
-        var pixelBuffer: CVPixelBuffer?
+    final class Renderer: NSObject, MTKViewDelegate, @unchecked Sendable {
+        var frame: PresentedVideoFrame?
+        var pixelBuffer: CVPixelBuffer? { frame?.pixelBuffer }
+        var presentationToken: VideoFramePresentationToken? { frame?.token }
+        var onFramePresented: (@MainActor @Sendable (VideoFramePresentationToken, CGRect) -> Bool)?
+        private var lastPresentedTime: CFTimeInterval = 0
         private let context = CIContext()
         private var commandQueue: MTLCommandQueue?
 
@@ -38,7 +47,9 @@ struct MetalVideoView: NSViewRepresentable {
                 commandQueue = drawable.texture.device.makeCommandQueue()
             }
             guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
-            guard let pixelBuffer else {
+            let frame = self.frame
+            let token = frame?.token
+            guard let pixelBuffer = frame?.pixelBuffer else {
                 let target = CGRect(origin: .zero, size: view.drawableSize)
                 context.render(
                     CIImage(color: .black).cropped(to: target),
@@ -80,10 +91,28 @@ struct MetalVideoView: NSViewRepresentable {
                 bounds: target,
                 colorSpace: CGColorSpaceCreateDeviceRGB()
             )
+            if let token, let receipt = onFramePresented {
+                let scaleX = target.width > 0 ? view.bounds.width / target.width : 0
+                let scaleY = target.height > 0 ? view.bounds.height / target.height : 0
+                let presentedRect = CGRect(x: fitted.minX * scaleX, y: fitted.minY * scaleY,
+                                           width: fitted.width * scaleX, height: fitted.height * scaleY)
+                drawable.addPresentedHandler { [weak self] drawable in
+                    let presentedTime = drawable.presentedTime
+                    guard presentedTime > 0, !presentedRect.isEmpty else { return } // Dropped drawables never activate input.
+                    Task { @MainActor [weak self] in
+                        guard let self, presentedTime >= self.lastPresentedTime,
+                              self.presentationToken?.context == token.context,
+                              receipt(token, presentedRect) else { return }
+                        self.lastPresentedTime = presentedTime
+                    }
+                }
+            }
             commandBuffer.present(drawable)
             commandBuffer.commit()
         }
 
-        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+            view.setNeedsDisplay(view.bounds)
+        }
     }
 }

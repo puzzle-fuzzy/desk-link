@@ -87,8 +87,8 @@ struct CaptureVideoDimensions: Equatable, Sendable {
 func captureVideoDimensions(
     displayWidth: Int,
     displayHeight: Int,
-    maximumWidth: Int = 2_560,
-    maximumHeight: Int = 1_440
+    maximumWidth: Int = MacHostVideoContract.maximumWidth,
+    maximumHeight: Int = MacHostVideoContract.maximumHeight
 ) -> CaptureVideoDimensions {
     guard displayWidth > 0, displayHeight > 0, maximumWidth > 0, maximumHeight > 0 else {
         return CaptureVideoDimensions(width: 0, height: 0)

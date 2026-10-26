@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::{CStr, c_char, c_void},
     net::{SocketAddr, ToSocketAddrs},
     ptr::{null, null_mut},
@@ -11,10 +12,10 @@ use desklink_crypto::{
     DeviceIdentity, MAX_PAIRING_TTL_S, PAIRING_INVITE_BYTES, PairingInvite, PairingOffer, SessionId,
 };
 use desklink_protocol::{
-    ControlMessage, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES, MAX_MVP_HEIGHT,
-    MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES, MAX_VIDEO_PACKET_PAYLOAD_BYTES,
-    MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, encode_control, encode_input,
-    encode_transfer,
+    ControlMessage, InputContext, InputEnvelope, InputEvent, KeyCode, MAX_CURSOR_MESSAGE_BYTES,
+    MAX_MVP_HEIGHT, MAX_MVP_WIDTH, MAX_VIDEO_CHUNKS, MAX_VIDEO_CONFIG_BYTES,
+    MAX_VIDEO_PACKET_PAYLOAD_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform,
+    encode_control, encode_input, encode_transfer,
 };
 use desklink_session::{
     InputSequencer, PressedInputState, SessionEvent, SessionMachine, SessionState,
@@ -35,7 +36,7 @@ pub use host::{
     HostCommand, HostError, HostEvent, HostIdentity, HostMetrics, HostRuntime, HostState,
 };
 use worker::{
-    ControllerCommand, ControllerWorker, DirectoryConnectionConfigOwned,
+    CapturedInput, ControllerCommand, ControllerWorker, DirectoryConnectionConfigOwned,
     SecureConnectionConfigOwned,
 };
 
@@ -50,6 +51,7 @@ pub enum DesklinkResult {
     InvalidUtf8 = 2,
     InvalidState = 3,
     InternalError = 4,
+    StaleGeneration = 5,
 }
 
 /// Apple controller platforms exposed through the stable C ABI.
@@ -114,6 +116,16 @@ pub enum DesklinkEventKind {
     ReleaseAll = 10,
     Transfer = 11,
     Audio = 12,
+    Capabilities = 13,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesklinkControllerCommand {
+    SelectDisplay = 1,
+    SetAudioEnabled = 2,
+    SetVideoQuality = 3,
+    SetVideoProfile = 4,
 }
 
 #[repr(u32)]
@@ -175,6 +187,11 @@ pub struct DesklinkSecureConnectionConfig {
     pub controller_device_id: [u8; 16],
     pub controller_secret_key: [u8; 32],
     pub host_verify_key: [u8; 32],
+    pub expires_at_unix_s: u64,
+    /// 0 unknown (requires re-pair), 1 temporary, 2 persistent.
+    pub authorization_type: u32,
+    pub directory_device_id: u64,
+    pub directory_access_code: [u8; 8],
 }
 
 #[repr(C)]
@@ -228,6 +245,8 @@ pub struct DesklinkInput {
     pub character: u32,
     pub pressed: u8,
     pub modifiers: u8,
+    pub stream_id: u64,
+    pub input_epoch: u64,
 }
 
 #[repr(C)]
@@ -242,6 +261,10 @@ pub struct DesklinkEvent {
     pub width: u16,
     pub height: u16,
     pub state: DesklinkState,
+    /// Stable classification; message bytes are diagnostic text only.
+    pub error_code: u32,
+    pub recoverable: u8,
+    pub input_epoch: u64,
 }
 
 pub type DesklinkEventCallback = extern "C" fn(*mut c_void, *const DesklinkEvent);
@@ -300,6 +323,8 @@ pub struct DesklinkHostEvent {
     pub fingerprint_len: usize,
     pub input: DesklinkHostInput,
     pub metrics: DesklinkHostMetrics,
+    /// Fixed producer grant from the Connected event; zero on other events.
+    pub media_generation: u64,
 }
 
 pub type DesklinkHostEventCallback = extern "C" fn(*mut c_void, *const DesklinkHostEvent);
@@ -311,6 +336,10 @@ pub struct DesklinkSavedHostMaterial {
     pub relay_authentication: [u8; 32],
     pub host_verify_key: [u8; 32],
     pub server_name: [c_char; 256],
+    pub expires_at_unix_s: u64,
+    pub authorization_type: u32,
+    pub directory_device_id: u64,
+    pub directory_access_code: [u8; 8],
 }
 
 pub struct DesklinkHandle {
@@ -339,6 +368,9 @@ pub(crate) struct SavedHostMaterialOwned {
     pub(crate) relay_authentication: Zeroizing<[u8; 32]>,
     pub(crate) host_verify_key: [u8; 32],
     pub(crate) server_name: String,
+    pub(crate) expires_at_unix_s: u64,
+    pub(crate) authorization_type: u32,
+    pub(crate) directory: Option<DirectoryConnectionConfigOwned>,
 }
 
 struct HostCallbackState {
@@ -387,11 +419,16 @@ impl HostCallbackState {
             fingerprint_len: 0,
             input: DesklinkHostInput::default(),
             metrics: DesklinkHostMetrics::default(),
+            media_generation: 0,
         };
         match event {
             HostEvent::State(host_state) => {
                 c_event.kind = DesklinkHostEventKind::State;
                 c_event.state = map_host_state(host_state);
+            }
+            HostEvent::Connected { media_generation } => {
+                c_event.state = DesklinkHostState::Connected;
+                c_event.media_generation = media_generation;
             }
             HostEvent::Error(error) => {
                 data = Some(error.to_string().into_bytes());
@@ -450,6 +487,7 @@ pub(crate) struct EventMeta {
     config_version: u32,
     width: u16,
     height: u16,
+    input_epoch: u64,
 }
 
 impl EventMeta {
@@ -460,6 +498,7 @@ impl EventMeta {
             config_version: 0,
             width: 0,
             height: 0,
+            input_epoch: 0,
         }
     }
 }
@@ -472,7 +511,7 @@ struct DesklinkRuntime {
     callback_context: *mut c_void,
     session: SessionMachine,
     pairing: Option<PairingOffer>,
-    pressed: PressedInputState,
+    pressed: HashMap<InputContext, PressedInputState>,
     input_sequence: InputSequencer,
     stream_id: u64,
     closed: bool,
@@ -503,6 +542,13 @@ impl DesklinkRuntime {
             width: meta.width,
             height: meta.height,
             state: self.state(),
+            error_code: if kind == DesklinkEventKind::Error {
+                3
+            } else {
+                0
+            },
+            recoverable: 0,
+            input_epoch: meta.input_epoch,
         };
         callback(self.callback_context, &event);
     }
@@ -517,6 +563,7 @@ impl DesklinkRuntime {
                 config_version: 0,
                 width: 0,
                 height: 0,
+                input_epoch: 0,
             },
         );
     }
@@ -531,6 +578,7 @@ impl DesklinkRuntime {
                 config_version: 0,
                 width: 0,
                 height: 0,
+                input_epoch: 0,
             },
         );
     }
@@ -558,64 +606,77 @@ impl DesklinkRuntime {
     }
 
     fn release_all(&mut self) -> DesklinkResult {
-        let events = self.pressed.release_events();
+        self.release_context(None)
+    }
+
+    fn release_context(&mut self, only: Option<InputContext>) -> DesklinkResult {
+        let mut releases = Vec::new();
+        for (&context, pressed) in &self.pressed {
+            if only.is_none_or(|expected| expected == context) {
+                releases.extend(
+                    pressed
+                        .release_events()
+                        .into_iter()
+                        .map(|event| CapturedInput { context, event }),
+                );
+            }
+        }
         if let Some(worker) = &self.worker {
-            if worker.release_all(events).is_err() {
+            if worker.release_all(releases).is_err() {
                 return DesklinkResult::InternalError;
             }
         } else {
-            for event in events {
-                if let Err(error) = self.dispatch_input(event) {
+            for input in releases {
+                if let Err(error) = self.dispatch_input(input) {
                     return error;
                 }
             }
         }
-        self.pressed.release_all();
+        self.pressed
+            .retain(|context, _| only.is_some_and(|expected| expected != *context));
         self.emit(
             DesklinkEventKind::ReleaseAll,
             &[],
+            EventMeta::for_stream(only.map_or(0, |context| context.stream_id)),
+        );
+        DesklinkResult::Ok
+    }
+
+    fn emit_input(&mut self, input: CapturedInput) -> Result<(), DesklinkResult> {
+        let envelope = InputEnvelope {
+            sequence: self.input_sequence.next_sequence(),
+            timestamp_us: now_micros(),
+            stream_id: input.context.stream_id,
+            input_epoch: input.context.input_epoch,
+            event: input.event,
+        };
+        let bytes = encode_input(&envelope).map_err(|_| DesklinkResult::InvalidArgument)?;
+        self.emit(
+            DesklinkEventKind::Input,
+            &bytes,
             EventMeta {
-                stream_id: self.stream_id,
+                stream_id: input.context.stream_id,
+                input_epoch: input.context.input_epoch,
                 frame_id: 0,
                 config_version: 0,
                 width: 0,
                 height: 0,
             },
         );
-        DesklinkResult::Ok
+        Ok(())
     }
 
-    fn emit_input(&mut self, event: InputEvent) {
-        let envelope = InputEnvelope {
-            sequence: self.input_sequence.next_sequence(),
-            timestamp_us: now_micros(),
-            stream_id: 0,
-            input_epoch: 0,
-            event,
-        };
-        if let Ok(bytes) = encode_input(&envelope) {
-            self.emit(
-                DesklinkEventKind::Input,
-                &bytes,
-                EventMeta {
-                    stream_id: self.stream_id,
-                    frame_id: 0,
-                    config_version: 0,
-                    width: 0,
-                    height: 0,
-                },
-            );
-        }
-    }
-
-    fn dispatch_input(&mut self, event: InputEvent) -> Result<(), DesklinkResult> {
+    fn dispatch_input(&mut self, input: CapturedInput) -> Result<(), DesklinkResult> {
+        input
+            .context
+            .validate()
+            .map_err(|_| DesklinkResult::InvalidArgument)?;
         if let Some(worker) = &self.worker {
             worker
-                .send(ControllerCommand::SendInput(event))
+                .send(ControllerCommand::SendInput(input))
                 .map_err(|_| DesklinkResult::InternalError)
         } else {
-            self.emit_input(event);
-            Ok(())
+            self.emit_input(input)
         }
     }
 
@@ -695,7 +756,7 @@ pub unsafe extern "C" fn desklink_create_for_platform(
         callback_context,
         session: SessionMachine::new(desklink_protocol::DeviceRole::Controller),
         pairing: None,
-        pressed: PressedInputState::default(),
+        pressed: HashMap::new(),
         input_sequence: InputSequencer::new(),
         stream_id: 0,
         closed: false,
@@ -780,6 +841,7 @@ pub unsafe extern "C" fn desklink_start_pairing(
             config_version: 0,
             width: 0,
             height: 0,
+            input_epoch: 0,
         },
     );
     DesklinkResult::Ok
@@ -867,11 +929,37 @@ pub unsafe extern "C" fn desklink_connect_secure(
     if ed25519_dalek::VerifyingKey::from_bytes(&config.host_verify_key).is_err() {
         return DesklinkResult::InvalidArgument;
     }
+    if !saved_authorization_valid(
+        config.authorization_type,
+        config.expires_at_unix_s,
+        now_unix_s(),
+    ) {
+        return DesklinkResult::InvalidArgument;
+    }
+    let directory = if config.directory_device_id != 0 {
+        if desklink_transport::RelayDirectoryLookup::new(
+            config.directory_device_id,
+            config.directory_access_code,
+        )
+        .is_err()
+        {
+            return DesklinkResult::InvalidArgument;
+        }
+        Some(DirectoryConnectionConfigOwned {
+            device_id: config.directory_device_id,
+            access_code: config.directory_access_code,
+        })
+    } else {
+        None
+    };
     let saved = SavedHostMaterialOwned {
         session_id: config.session_id,
         relay_authentication: Zeroizing::new(config.relay_authentication),
         host_verify_key: config.host_verify_key,
         server_name: server_name.clone(),
+        expires_at_unix_s: config.expires_at_unix_s,
+        authorization_type: config.authorization_type,
+        directory: directory.clone(),
     };
     let Ok(mut material) = runtime.saved_host_material.lock() else {
         return DesklinkResult::InternalError;
@@ -887,8 +975,9 @@ pub unsafe extern "C" fn desklink_connect_secure(
             controller_device_id: config.controller_device_id,
             controller_secret_key: config.controller_secret_key,
             host_verify_key: config.host_verify_key,
-            expires_at_unix_s: None,
-            directory: None,
+            expires_at_unix_s: (config.authorization_type == 1).then_some(config.expires_at_unix_s),
+            authorization_type: config.authorization_type,
+            directory,
         },
     );
     if result != DesklinkResult::Ok {
@@ -952,6 +1041,9 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
         relay_authentication: Zeroizing::new(relay_authentication),
         host_verify_key,
         server_name: server_name.clone(),
+        expires_at_unix_s: invite.expires_at_unix_s(),
+        authorization_type: if invite.is_persistent() { 2 } else { 1 },
+        directory: None,
     };
     let Ok(mut material) = runtime.saved_host_material.lock() else {
         return DesklinkResult::InternalError;
@@ -967,7 +1059,8 @@ pub unsafe extern "C" fn desklink_connect_pairing_invite(
             controller_device_id: config.controller_device_id,
             controller_secret_key: config.controller_secret_key,
             host_verify_key,
-            expires_at_unix_s: Some(invite.expires_at_unix_s()),
+            expires_at_unix_s: Some(invite.expires_at_unix_s()).filter(|expiry| *expiry != 0),
+            authorization_type: if invite.is_persistent() { 2 } else { 1 },
             directory: None,
         },
     );
@@ -1027,6 +1120,7 @@ pub unsafe extern "C" fn desklink_connect_directory(
             controller_secret_key: config.controller_secret_key,
             host_verify_key: [0; 32],
             expires_at_unix_s: None,
+            authorization_type: 0,
             directory: Some(DirectoryConnectionConfigOwned {
                 device_id: config.device_id,
                 access_code: config.access_code,
@@ -1126,19 +1220,41 @@ pub unsafe extern "C" fn desklink_send_input(
         return error;
     }
     let input = unsafe { &*input };
+    let context = InputContext {
+        stream_id: input.stream_id,
+        input_epoch: input.input_epoch,
+    };
+    if context.validate().is_err() {
+        return DesklinkResult::InvalidArgument;
+    }
     let event = match convert_input(input) {
         Ok(event) => event,
         Err(error) => return error,
     };
-    let result = runtime.dispatch_input(event.clone());
+    let is_press = matches!(
+        &event,
+        InputEvent::MouseButton { pressed: true, .. } | InputEvent::Key { pressed: true, .. }
+    );
+    if is_press && !runtime.pressed.contains_key(&context) && runtime.pressed.len() >= 8 {
+        return DesklinkResult::InvalidState;
+    }
+    let result = runtime.dispatch_input(CapturedInput {
+        context,
+        event: event.clone(),
+    });
     if result.is_ok() {
         if matches!(
             &event,
             InputEvent::MouseButton { pressed: false, .. } | InputEvent::Key { pressed: false, .. }
         ) {
-            runtime.pressed.release(&event);
-        } else {
-            runtime.pressed.press(&event);
+            if let Some(pressed) = runtime.pressed.get_mut(&context) {
+                pressed.release(&event);
+                if pressed.release_events().is_empty() {
+                    runtime.pressed.remove(&context);
+                }
+            }
+        } else if is_press {
+            runtime.pressed.entry(context).or_default().press(&event);
         }
     }
     result.map_or_else(|error| error, |_| DesklinkResult::Ok)
@@ -1179,6 +1295,7 @@ pub unsafe extern "C" fn desklink_request_keyframe(handle: *mut DesklinkHandle) 
             config_version: 0,
             width: 0,
             height: 0,
+            input_epoch: 0,
         },
     );
     DesklinkResult::Ok
@@ -1197,6 +1314,125 @@ pub unsafe extern "C" fn desklink_release_all(handle: *mut DesklinkHandle) -> De
         return error;
     }
     runtime.release_all()
+}
+
+/// Releases only keys/buttons captured on this surface; it never substitutes a
+/// newer context or releases a successor epoch's identical keys.
+/// # Safety
+/// `handle` must be a live, exclusively accessed handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_release_all_for_context(
+    handle: *mut DesklinkHandle,
+    stream_id: u64,
+    input_epoch: u64,
+) -> DesklinkResult {
+    let context = InputContext {
+        stream_id,
+        input_epoch,
+    };
+    if context.validate().is_err() {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if let Err(error) = runtime.ensure_active() {
+        return error;
+    }
+    runtime.release_context(Some(context))
+}
+
+/// Queues a bounded controller command. command/value are validated before enqueue.
+/// Values: display ID; audio 0/1; quality automatic/smooth/balanced/sharp 0..3;
+/// profile Main/High 0/1. Success means queued, remote state arrives via Control.
+/// # Safety
+/// `handle` must be a live, exclusively accessed handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_controller_command(
+    handle: *mut DesklinkHandle,
+    command: u32,
+    value: u32,
+) -> DesklinkResult {
+    let message = match controller_control_message(command, value) {
+        Some(message) => message,
+        None => return DesklinkResult::InvalidArgument,
+    };
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let Some(worker) = &runtime.worker else {
+        return DesklinkResult::InvalidState;
+    };
+    if !worker.is_running() {
+        return DesklinkResult::InvalidState;
+    }
+    worker
+        .send(ControllerCommand::Control(message))
+        .map_or(DesklinkResult::InternalError, |_| DesklinkResult::Ok)
+}
+
+fn controller_control_message(command: u32, value: u32) -> Option<ControlMessage> {
+    use desklink_protocol::{H264Profile, VideoQualityPreference};
+    Some(match command {
+        1 => ControlMessage::SelectDisplay { display_id: value },
+        2 if value <= 1 => ControlMessage::SetAudioEnabled {
+            enabled: value != 0,
+        },
+        3 => ControlMessage::SetVideoQuality {
+            preference: match value {
+                0 => VideoQualityPreference::Automatic,
+                1 => VideoQualityPreference::Smooth,
+                2 => VideoQualityPreference::Balanced,
+                3 => VideoQualityPreference::Sharp,
+                _ => return None,
+            },
+        },
+        4 => ControlMessage::SetVideoProfile {
+            profile: match value {
+                0 => H264Profile::Main,
+                1 => H264Profile::High,
+                _ => return None,
+            },
+        },
+        _ => return None,
+    })
+}
+
+/// Copies and validates a protocol TransferMessage before bounded enqueue.
+/// Callback bytes are borrowed only during the callback; caller bytes only
+/// during this function. The queue owns the decoded message afterward.
+/// # Safety
+/// `handle` must be exclusively accessed; `bytes` must cover `bytes_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_controller_send_transfer(
+    handle: *mut DesklinkHandle,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    if bytes.is_null()
+        || bytes_len == 0
+        || bytes_len > desklink_protocol::MAX_TRANSFER_MESSAGE_BYTES
+    {
+        return DesklinkResult::InvalidArgument;
+    }
+    let message = match desklink_protocol::decode_transfer(unsafe {
+        std::slice::from_raw_parts(bytes, bytes_len)
+    }) {
+        Ok(message) => message,
+        Err(_) => return DesklinkResult::InvalidArgument,
+    };
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let Some(worker) = &runtime.worker else {
+        return DesklinkResult::InvalidState;
+    };
+    if !worker.is_running() {
+        return DesklinkResult::InvalidState;
+    }
+    worker
+        .send(ControllerCommand::Transfer(message))
+        .map_or(DesklinkResult::InternalError, |_| DesklinkResult::Ok)
 }
 
 /// Destroys a handle and releases all pressed input.
@@ -1255,6 +1491,16 @@ pub unsafe extern "C" fn desklink_controller_copy_saved_host_material(
         relay_authentication: *material.relay_authentication,
         host_verify_key: material.host_verify_key,
         server_name: [0; 256],
+        expires_at_unix_s: material.expires_at_unix_s,
+        authorization_type: material.authorization_type,
+        directory_device_id: material
+            .directory
+            .as_ref()
+            .map_or(0, |directory| directory.device_id),
+        directory_access_code: material
+            .directory
+            .as_ref()
+            .map_or([0; 8], |directory| directory.access_code),
     };
     for (destination, source) in output
         .server_name
@@ -1512,6 +1758,52 @@ pub unsafe extern "C" fn desklink_host_send_video_config(
 /// # Safety
 /// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
 /// that many readable bytes.
+pub unsafe extern "C" fn desklink_host_send_video_config_for_generation(
+    handle: *mut DesklinkHostHandle,
+    media_generation: u64,
+    stream_id: u64,
+    config_version: u32,
+    width: u16,
+    height: u16,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if stream_id == 0
+        || config_version == 0
+        || width == 0
+        || height == 0
+        || width > MAX_MVP_WIDTH
+        || height > MAX_MVP_HEIGHT
+    {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(bytes) = copy_payload(bytes, bytes_len, MAX_VIDEO_CONFIG_BYTES) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_host_command_for_generation(
+        handle,
+        media_generation,
+        HostCommand::SendVideoConfig {
+            stream_id,
+            version: config_version,
+            width,
+            height,
+            bytes,
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+///
+/// # Safety
+/// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
+/// that many readable bytes.
 pub unsafe extern "C" fn desklink_host_send_video_access_unit(
     handle: *mut DesklinkHostHandle,
     stream_id: u64,
@@ -1549,6 +1841,45 @@ pub unsafe extern "C" fn desklink_host_send_video_access_unit(
 /// # Safety
 /// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
 /// that many readable bytes.
+pub unsafe extern "C" fn desklink_host_send_video_access_unit_for_generation(
+    handle: *mut DesklinkHostHandle,
+    media_generation: u64,
+    stream_id: u64,
+    frame_id: u64,
+    config_version: u32,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if stream_id == 0 || frame_id == 0 || config_version == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let maximum = MAX_VIDEO_PACKET_PAYLOAD_BYTES * usize::from(MAX_VIDEO_CHUNKS);
+    let Some(bytes) = copy_payload(bytes, bytes_len, maximum) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_host_command_for_generation(
+        handle,
+        media_generation,
+        HostCommand::SendVideoAccessUnit {
+            stream_id,
+            frame_id,
+            config_version,
+            bytes,
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+///
+/// # Safety
+/// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
+/// that many readable bytes.
 pub unsafe extern "C" fn desklink_host_send_cursor(
     handle: *mut DesklinkHostHandle,
     stream_id: u64,
@@ -1568,6 +1899,37 @@ pub unsafe extern "C" fn desklink_host_send_cursor(
         return DesklinkResult::InvalidArgument;
     }
     send_host_command(handle, HostCommand::SendCursor { stream_id, bytes })
+}
+
+#[unsafe(no_mangle)]
+///
+/// # Safety
+/// `handle` must be live. When `bytes_len` is nonzero, `bytes` must point to
+/// that many readable bytes.
+pub unsafe extern "C" fn desklink_host_send_cursor_for_generation(
+    handle: *mut DesklinkHostHandle,
+    media_generation: u64,
+    stream_id: u64,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    let Some(handle) = host_handle_ref(handle) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if stream_id == 0 {
+        return DesklinkResult::InvalidArgument;
+    }
+    let Some(bytes) = copy_payload(bytes, bytes_len, MAX_CURSOR_MESSAGE_BYTES) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    if bytes.is_empty() {
+        return DesklinkResult::InvalidArgument;
+    }
+    send_host_command_for_generation(
+        handle,
+        media_generation,
+        HostCommand::SendCursor { stream_id, bytes },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1721,6 +2083,14 @@ fn clear_saved_material(material: &Arc<Mutex<Option<SavedHostMaterialOwned>>>) {
     }
 }
 
+fn saved_authorization_valid(kind: u32, expires_at: u64, now: u64) -> bool {
+    match kind {
+        1 => expires_at > now,
+        2 => expires_at == 0,
+        _ => false,
+    }
+}
+
 fn reserve_host_start(handle: &DesklinkHostHandle) -> Result<(), DesklinkResult> {
     let Ok(mut lifecycle) = handle.lifecycle.lock() else {
         return Err(DesklinkResult::InternalError);
@@ -1849,6 +2219,7 @@ fn dispatch_host_events(runtime: Arc<HostRuntime>, callback: Arc<HostCallbackSta
                 }
             }
             Ok(event @ HostEvent::Error(_)) => callback.emit(event, runtime.state()),
+            Ok(event @ HostEvent::Connected { .. }) => callback.emit(event, HostState::Connected),
             Ok(event @ HostEvent::ApprovalRequested { .. }) => {
                 callback.emit(event, HostState::WaitingForApproval)
             }
@@ -1871,8 +2242,22 @@ fn send_host_command(handle: &DesklinkHostHandle, command: HostCommand) -> Deskl
         .map_or_else(map_host_error, |_| DesklinkResult::Ok)
 }
 
+fn send_host_command_for_generation(
+    handle: &DesklinkHostHandle,
+    media_generation: u64,
+    command: HostCommand,
+) -> DesklinkResult {
+    let Some(runtime) = host_runtime(handle) else {
+        return DesklinkResult::StaleGeneration;
+    };
+    runtime
+        .send_for_generation(media_generation, command)
+        .map_or_else(map_host_error, |_| DesklinkResult::Ok)
+}
+
 fn map_host_error(error: HostError) -> DesklinkResult {
     match error {
+        HostError::StaleMediaGeneration => DesklinkResult::StaleGeneration,
         HostError::InvalidState
         | HostError::ControllerIdentityMismatch
         | HostError::InvalidControllerCapabilities
@@ -2103,8 +2488,164 @@ fn now_micros() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn connected_callback_preserves_the_queued_grant_and_zeroes_other_events() {
+        extern "C" fn record(context: *mut c_void, event: *const DesklinkHostEvent) {
+            let received = unsafe {
+                &mut *context.cast::<Vec<(DesklinkHostEventKind, DesklinkHostState, u64)>>()
+            };
+            let event = unsafe { &*event };
+            received.push((event.kind, event.state, event.media_generation));
+        }
+        let mut received = Vec::new();
+        let callback = HostCallbackState::new(
+            Some(record),
+            (&mut received as *mut Vec<(DesklinkHostEventKind, DesklinkHostState, u64)>).cast(),
+        );
+        // Dispatch can be delayed past a successor connection. The immutable
+        // event carries its original grant, irrespective of the current state.
+        callback.emit(
+            HostEvent::Connected {
+                media_generation: 43,
+            },
+            HostState::Closed,
+        );
+        callback.emit(
+            HostEvent::Connected {
+                media_generation: 44,
+            },
+            HostState::Connected,
+        );
+        callback.emit(HostEvent::ReleaseAll, HostState::Connecting);
+        assert_eq!(
+            received,
+            vec![
+                (
+                    DesklinkHostEventKind::State,
+                    DesklinkHostState::Connected,
+                    43_u64
+                ),
+                (
+                    DesklinkHostEventKind::State,
+                    DesklinkHostState::Connected,
+                    44_u64
+                ),
+                (
+                    DesklinkHostEventKind::ReleaseAll,
+                    DesklinkHostState::Connecting,
+                    0_u64
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn context_specific_release_cannot_clear_a_successor_epochs_identical_key() {
+        let relay = std::ffi::CString::new("quic://127.0.0.1:9").unwrap();
+        let config = DesklinkConfig {
+            relay_url: relay.as_ptr(),
+            log_level: 0,
+        };
+        let mut handle = null_mut();
+        unsafe {
+            assert_eq!(
+                desklink_create(&config, None, null_mut(), &mut handle),
+                DesklinkResult::Ok
+            );
+            let mut key = input(DesklinkInputKind::Key);
+            key.key_code = 1;
+            key.pressed = 1;
+            key.input_epoch = 0;
+            assert_eq!(
+                desklink_send_input(handle, &key),
+                DesklinkResult::InvalidArgument
+            );
+            key.input_epoch = 10;
+            assert_eq!(desklink_send_input(handle, &key), DesklinkResult::Ok);
+            key.input_epoch = 20;
+            assert_eq!(desklink_send_input(handle, &key), DesklinkResult::Ok);
+            assert_eq!((*handle).runtime.pressed.len(), 2);
+            assert_eq!(
+                desklink_release_all_for_context(handle, 1, 10),
+                DesklinkResult::Ok
+            );
+            let next = InputContext {
+                stream_id: 1,
+                input_epoch: 20,
+            };
+            assert_eq!(
+                (*handle)
+                    .runtime
+                    .pressed
+                    .get(&next)
+                    .unwrap()
+                    .release_events()
+                    .len(),
+                1
+            );
+            key.input_epoch = 10;
+            key.pressed = 0;
+            assert_eq!(desklink_send_input(handle, &key), DesklinkResult::Ok);
+            assert_eq!((*handle).runtime.pressed.len(), 1);
+            assert_eq!(desklink_release_all(handle), DesklinkResult::Ok);
+            assert!((*handle).runtime.pressed.is_empty());
+            desklink_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn saved_authorization_never_upgrades_unknown_or_expired_material() {
+        assert!(!saved_authorization_valid(0, 0, 100));
+        assert!(!saved_authorization_valid(1, 0, 100));
+        assert!(!saved_authorization_valid(1, 100, 100));
+        assert!(saved_authorization_valid(1, 101, 100));
+        assert!(saved_authorization_valid(2, 0, 100));
+        assert!(!saved_authorization_valid(2, 101, 100));
+        assert!(!saved_authorization_valid(3, 0, 100));
+    }
+
+    #[test]
+    fn controller_commands_validate_values_and_preserve_typed_intent() {
+        assert_eq!(
+            controller_control_message(1, 42),
+            Some(ControlMessage::SelectDisplay { display_id: 42 })
+        );
+        assert_eq!(
+            controller_control_message(2, 0),
+            Some(ControlMessage::SetAudioEnabled { enabled: false })
+        );
+        assert_eq!(
+            controller_control_message(2, 1),
+            Some(ControlMessage::SetAudioEnabled { enabled: true })
+        );
+        assert!(controller_control_message(2, 2).is_none());
+        for value in 0..4 {
+            assert!(controller_control_message(3, value).is_some());
+        }
+        assert!(controller_control_message(3, 4).is_none());
+        assert!(controller_control_message(4, 2).is_none());
+        assert!(controller_control_message(0, 0).is_none());
+        assert!(controller_control_message(u32::MAX, u32::MAX).is_none());
+        unsafe {
+            assert_eq!(
+                desklink_controller_command(null_mut(), 1, 0),
+                DesklinkResult::InvalidArgument
+            );
+            assert_eq!(
+                desklink_controller_send_transfer(null_mut(), null(), 0),
+                DesklinkResult::InvalidArgument
+            );
+            assert_eq!(
+                desklink_controller_send_transfer(null_mut(), null(), usize::MAX),
+                DesklinkResult::InvalidArgument
+            );
+        }
+    }
+
     fn input(kind: DesklinkInputKind) -> DesklinkInput {
         DesklinkInput {
+            stream_id: 1,
+            input_epoch: 1,
             kind,
             x: 0.0,
             y: 0.0,

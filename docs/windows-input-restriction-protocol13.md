@@ -34,10 +34,10 @@
 
 此流程不自动请求提权、不重启会话，也不把输入受限推断为网络断线。实际平台权限覆盖需要对应设备与授权条件单独验收。
 
-实际本地验证（`CARGO_TARGET_DIR=E:/desk-link/.worktrees/dl2-targets/windows-product`，均经 `python scripts/run-windows-cargo.py`）：
+共享契约切片的历史本地验证（`CARGO_TARGET_DIR=E:/desk-link/.worktrees/dl2-targets/windows-product`，均经 `python scripts/run-windows-cargo.py`；不是本次合并后的联合复跑）：
 
 - `test -p desklink-protocol -p desklink-ffi --lib --tests --locked`：77 项通过。
 - `test -p desklink-relay --test session directory --locked`：6 项通过，包括 12 ↔ 13 双向版本拒绝与错误密码优先隐藏版本信息。
 - `test -p desklink-windows-ui --lib protocol_decode_failure_stops_retrying_with_an_upgrade_action --locked`：1 项通过，收到旧 Noise 版本后提供终态升级提示。
 
-直连 / 已保存连接测试直接加入本地 relay 会话，绕过目录，验证 Controller 收到协议 12 的 `ResponderHello` 时立即返回 `UnsupportedVersion(12)`。这不证明旧 Windows 12 Host 会回应协议 13 的主动握手：旧实现可能把版本错误当作过期消息静默丢弃。新 Host 的明确版本拒绝响应，以及控制端针对无回应握手的有界恢复策略，仍需后续独立验收，不能以这项测试宣称已消除全部旧端重试路径。
+上述直连 / 已保存连接测试直接加入本地 relay 会话，绕过目录，验证 Controller 收到协议 12 的 `ResponderHello` 时立即返回 `UnsupportedVersion(12)`。这不证明旧 Windows 12 Host 会回应协议 13 的主动握手：旧实现可能把版本错误当作过期消息静默丢弃。后续 Windows 切片已为新 Host 增加明确版本拒绝响应，并为控制端无回应握手增加独立有界预算，相关本地合成和 relay 回归见 TODO 的 DL2-009 子项；FFI 保留其自身重试预算。真实新旧直接 / 保存连接、已安装旧二进制与各平台权限场景仍须独立验收，目录版本拒绝或选中用例通过不能宣称已消除全部旧端重试路径。

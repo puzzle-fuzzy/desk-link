@@ -76,13 +76,15 @@ struct DeskLinkShell: View {
                 .help("共享此设备")
 
                 Menu {
-                    if case let .signedIn(user) = account.state {
-                        Text(user.email)
+                    if account.state.hasAccountSession {
+                        Text(account.state.cachedUser?.email ?? "已保存的账号会话")
                         Button("退出登录", systemImage: "rectangle.portrait.and.arrow.right") {
                             Task { @MainActor in
                                 controller.clearRemoteLinksForLogout()
-                                await host.shutdownAndWait()
+                                let stoppingHost = host
+                                async let stopped: Void = stoppingHost.shutdownAndWait()
                                 await account.logout()
+                                await stopped
                             }
                         }
                     } else if case .skipped = account.state {

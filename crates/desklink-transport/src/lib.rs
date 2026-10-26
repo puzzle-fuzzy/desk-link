@@ -148,6 +148,46 @@ pub const DIRECTORY_LOOKUP_RATE_LIMITED: u8 = 2;
 pub const DIRECTORY_LOOKUP_MALFORMED: u8 = 3;
 pub const DIRECTORY_LOOKUP_PROTOCOL_MISMATCH: u8 = 4;
 
+/// Explicit flow-control tuning for callers that need bounded reliable I/O.
+/// Defaults stay unchanged unless limits are supplied. Window sizes are bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuicFlowControlLimits {
+    send_window: u32,
+    receive_window: u32,
+    stream_receive_window: u32,
+}
+
+impl QuicFlowControlLimits {
+    pub const MAX_WINDOW_BYTES: u32 = 512 * 1_024 * 1_024;
+
+    pub fn new(
+        send_window: u32,
+        receive_window: u32,
+        stream_receive_window: u32,
+    ) -> Result<Self, TransportError> {
+        if [send_window, receive_window, stream_receive_window]
+            .into_iter()
+            .any(|window| window == 0 || window > Self::MAX_WINDOW_BYTES)
+            || stream_receive_window > receive_window
+        {
+            return Err(TransportError::InvalidConfig("flow-control windows must be nonzero, at most 512 MiB, and stream receive must fit connection receive".into()));
+        }
+        Ok(Self {
+            send_window,
+            receive_window,
+            stream_receive_window,
+        })
+    }
+
+    /// Applies only flow control. Relay/client lifecycle policy still supplies
+    /// authoritative keepalive and dead timeouts after this step.
+    pub fn apply_to(self, transport: &mut quinn::TransportConfig) {
+        transport.send_window(u64::from(self.send_window));
+        transport.receive_window(self.receive_window.into());
+        transport.stream_receive_window(self.stream_receive_window.into());
+    }
+}
+
 #[derive(Clone)]
 pub struct QuicClientConfig {
     pub relay_addr: SocketAddr,
@@ -155,6 +195,7 @@ pub struct QuicClientConfig {
     pub client_config: quinn::ClientConfig,
     pub keep_alive: Duration,
     pub dead_timeout: Duration,
+    pub flow_control_limits: Option<QuicFlowControlLimits>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -919,7 +960,13 @@ impl QuicClientConfig {
             client_config,
             keep_alive: KEEPALIVE_INTERVAL,
             dead_timeout: DEAD_TIMEOUT,
+            flow_control_limits: None,
         }
+    }
+
+    pub fn with_flow_control_limits(mut self, limits: QuicFlowControlLimits) -> Self {
+        self.flow_control_limits = Some(limits);
+        self
     }
 
     pub fn with_timeouts(mut self, keep_alive: Duration, dead_timeout: Duration) -> Self {
@@ -998,5 +1045,26 @@ impl rustls::client::danger::ServerCertVerifier for LanRelayCertificateVerifier 
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod flow_control_limit_tests {
+    use super::*;
+
+    #[test]
+    fn flow_windows_require_explicit_finite_nonzero_limits() {
+        for limits in [
+            (0, 4096, 256),
+            (128, 0, 256),
+            (128, 4096, 0),
+            (128, 256, 512),
+            (QuicFlowControlLimits::MAX_WINDOW_BYTES + 1, 4096, 256),
+        ] {
+            assert!(QuicFlowControlLimits::new(limits.0, limits.1, limits.2).is_err());
+        }
+        assert!(QuicFlowControlLimits::new(128, 4096, 256).is_ok());
+        let maximum = QuicFlowControlLimits::MAX_WINDOW_BYTES;
+        assert!(QuicFlowControlLimits::new(maximum, maximum, maximum).is_ok());
     }
 }

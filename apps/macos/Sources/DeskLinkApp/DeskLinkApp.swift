@@ -29,7 +29,6 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        controller?.releaseAll()
         controller?.disconnect()
     }
 
@@ -37,7 +36,6 @@ private final class DeskLinkLifecycleDelegate: NSObject, NSApplicationDelegate {
         guard !terminationStarted else { return .terminateNow }
         terminationStarted = true
         Task { @MainActor [weak self] in
-            self?.controller?.releaseAll()
             self?.controller?.disconnect()
             await self?.host?.shutdownAndWait()
             sender.reply(toApplicationShouldTerminate: true)
@@ -69,10 +67,11 @@ struct DeskLinkApp: App {
                     ProgressView("正在准备 DeskLink…")
                 case .signedOut:
                     AccountLoginView(account: account, allowsSkipLogin: true)
-                case .signedIn:
-                    workspaceContent
-                case .skipped:
-                    workspaceContent
+                case .signedIn, .skipped, .offline:
+                    VStack(spacing: 0) {
+                        AccountRecoveryNotice(account: account)
+                        workspaceContent
+                    }
                 }
             }
             .sheet(item: pendingApproval) { approval in
@@ -84,7 +83,6 @@ struct DeskLinkApp: App {
             .onAppear { lifecycle.configure(controller: controller, host: host) }
             .onDisappear {
                 host.shutdown()
-                controller.releaseAll()
                 controller.disconnect()
             }
             .task { await account.restore() }

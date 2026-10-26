@@ -1,17 +1,20 @@
 use std::{
+    future::Future,
     net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
+    task::{Context, Poll},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
 use desklink_protocol::{
-    InputEvent, Platform, encode_audio_packet, encode_control, encode_cursor_update,
-    encode_transfer,
+    ControlMessage, InputContext, InputEvent, Platform, TransferMessage, encode_audio_packet,
+    encode_control, encode_cursor_update, encode_transfer,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -28,13 +31,21 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 1_024;
 const RELEASE_RESERVE: usize = 1;
+const MAX_RELEASE_EVENTS: usize = COMMAND_CAPACITY;
 const PHASE_CONNECTING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SEND_TIMEOUT: Duration = crate::controller::CONTROLLER_SEND_TIMEOUT;
 
 type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CapturedInput {
+    pub context: InputContext,
+    pub event: InputEvent,
+}
 
 pub(crate) struct SecureConnectionConfigOwned {
     pub server_name: String,
@@ -44,6 +55,7 @@ pub(crate) struct SecureConnectionConfigOwned {
     pub controller_secret_key: [u8; 32],
     pub host_verify_key: [u8; 32],
     pub expires_at_unix_s: Option<u64>,
+    pub authorization_type: u32,
     pub directory: Option<DirectoryConnectionConfigOwned>,
 }
 
@@ -55,6 +67,7 @@ impl Drop for SecureConnectionConfigOwned {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DirectoryConnectionConfigOwned {
     pub device_id: u64,
     pub access_code: [u8; 8],
@@ -68,9 +81,11 @@ impl Drop for DirectoryConnectionConfigOwned {
 
 #[derive(Debug)]
 pub(crate) enum ControllerCommand {
-    SendInput(InputEvent),
+    SendInput(CapturedInput),
     ReleaseAll,
     RequestKeyframe,
+    Control(ControlMessage),
+    Transfer(TransferMessage),
     Shutdown,
 }
 
@@ -99,6 +114,9 @@ impl CallbackTarget {
             width: meta.width,
             height: meta.height,
             state,
+            error_code: error_metadata(kind, state).0,
+            recoverable: error_metadata(kind, state).1,
+            input_epoch: meta.input_epoch,
         };
         callback(self.context as *mut std::ffi::c_void, &event);
     }
@@ -126,10 +144,22 @@ impl CallbackTarget {
     }
 }
 
+// This contract is independent of error message wording and localization.
+fn error_metadata(kind: DesklinkEventKind, state: DesklinkState) -> (u32, u8) {
+    if kind != DesklinkEventKind::Error {
+        return (0, 0);
+    }
+    match state {
+        DesklinkState::Reconnecting => (1, 1),
+        DesklinkState::StartingVideo | DesklinkState::RecoveringVideo => (2, 1),
+        _ => (3, 0),
+    }
+}
+
 pub(crate) struct ControllerWorker {
     commands: mpsc::Sender<ControllerCommand>,
     cancellation: watch::Sender<bool>,
-    release_events: Arc<Mutex<Vec<InputEvent>>>,
+    release_events: Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: Arc<AtomicU8>,
     phase: Arc<AtomicU8>,
     thread: Option<thread::JoinHandle<()>>,
@@ -203,13 +233,19 @@ impl ControllerWorker {
         self.commands.try_send(command).map_err(|_| ())
     }
 
-    pub(crate) fn release_all(&self, events: Vec<InputEvent>) -> Result<(), ()> {
-        enqueue_release_all(
+    pub(crate) fn release_all(&self, events: Vec<CapturedInput>) -> Result<(), ()> {
+        let result = enqueue_release_all(
             &self.commands,
             &self.release_events,
             &self.release_pending,
             events,
-        )
+        );
+        if result.is_err() {
+            // A release batch may not be silently truncated. Retire the session
+            // so the host releases held input through its disconnect boundary.
+            let _ = self.cancellation.send(true);
+        }
+        result
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -245,14 +281,14 @@ struct WorkerContext {
     callback: CallbackTarget,
     material_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
     material_publisher: Option<MaterialPublisher>,
-    release_events: Arc<Mutex<Vec<InputEvent>>>,
+    release_events: Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: Arc<AtomicU8>,
 }
 
 async fn run_worker(
     relay_url: String,
     platform: Platform,
-    config: SecureConnectionConfigOwned,
+    mut config: SecureConnectionConfigOwned,
     context: WorkerContext,
 ) {
     let WorkerContext {
@@ -267,7 +303,7 @@ async fn run_worker(
     } = context;
     let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), config.expires_at_unix_s);
     let mut first_attempt = true;
-    let mut pending_release: Option<Vec<InputEvent>> = None;
+    let mut pending_release: Option<Vec<CapturedInput>> = None;
     loop {
         if !first_attempt && let Some(invalidate) = &material_invalidator {
             invalidate();
@@ -281,19 +317,15 @@ async fn run_worker(
             },
             0,
         );
-        let connection = connect_controller(
-            &relay_url,
-            platform,
-            &config,
-            callback,
-            material_publisher.clone(),
-        );
+        let connection = connect_controller(&relay_url, platform, &config, callback);
         let controller = tokio::select! {
             result = connection => match result {
                 Ok(connection) => {
-                    if let Some(expires_at_unix_s) = connection.expires_at_unix_s {
-                        schedule.set_expiry(Some(expires_at_unix_s));
-                    }
+                    schedule.set_expiry(connection.expires_at_unix_s);
+                    config.host_verify_key = connection.material.host_verify_key;
+                    config.authorization_type = connection.material.authorization_type;
+                    config.expires_at_unix_s = connection.expires_at_unix_s;
+                    if let Some(publish) = &material_publisher { publish(connection.material); }
                     connection.controller
                 },
                 Err(failure) => {
@@ -308,6 +340,7 @@ async fn run_worker(
                             callback,
                             release_events: &release_events,
                             release_pending: &release_pending,
+                            persistent: config.authorization_type == 2,
                         },
                     )
                     .await
@@ -324,6 +357,31 @@ async fn run_worker(
             }
         };
         phase.store(PHASE_RUNNING, Ordering::Release);
+        // Fixed, versioned ABI payload: version, platform (1 Windows, 2 Mac,
+        // 3 iOS), width/height little-endian, supported H264 profile bitmask.
+        let caps = controller.host_capabilities();
+        let mut payload = vec![
+            1,
+            match caps.platform {
+                Platform::Windows => 1,
+                Platform::MacOS => 2,
+                Platform::IOS => 3,
+            },
+        ];
+        payload.extend_from_slice(&caps.width.to_le_bytes());
+        payload.extend_from_slice(&caps.height.to_le_bytes());
+        payload.push(caps.h264_profiles.iter().fold(0, |bits, profile| {
+            bits | match profile {
+                desklink_protocol::H264Profile::Main => 1,
+                desklink_protocol::H264Profile::High => 2,
+            }
+        }));
+        callback.emit(
+            DesklinkEventKind::Capabilities,
+            &payload,
+            EventMeta::for_stream(0),
+            DesklinkState::NegotiatingCapabilities,
+        );
         callback.emit_state(DesklinkState::StartingVideo, 0);
         match run_connected(
             controller,
@@ -356,6 +414,7 @@ async fn run_worker(
                         callback,
                         release_events: &release_events,
                         release_pending: &release_pending,
+                        persistent: config.authorization_type == 2,
                     },
                 )
                 .await
@@ -424,104 +483,292 @@ enum ConnectedOutcome {
     },
 }
 
+struct ConnectedSenders {
+    input: crate::controller::ControllerInputSender,
+    control: crate::controller::ControllerControlSender,
+    transfer: crate::controller::ControllerTransferSender,
+}
+
+enum ConnectedSend {
+    Input(CapturedInput),
+    Control(ControlMessage),
+    Transfer(TransferMessage),
+}
+
+struct OwnedConnectedSend {
+    context: Option<InputContext>,
+    started: bool,
+    future: Pin<Box<dyn Future<Output = Result<(), ControllerError>> + Send>>,
+}
+
+impl Future for OwnedConnectedSend {
+    type Output = Result<(), ControllerError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        // Start means entering the owned send, even if it must first wait for
+        // its sequence lock. It does not claim that bytes already hit the wire.
+        this.started = true;
+        this.future.as_mut().poll(cx)
+    }
+}
+
+fn discard_unstarted_input(sending: &mut Option<OwnedConnectedSend>, current: InputContext) {
+    if sending
+        .as_ref()
+        .is_some_and(|send| !send.started && send.context.is_some_and(|context| context != current))
+    {
+        *sending = None;
+    }
+}
+
+fn start_connected_send(
+    senders: Arc<ConnectedSenders>,
+    mut cancellation: watch::Receiver<bool>,
+    command: ConnectedSend,
+) -> OwnedConnectedSend {
+    let context = match &command {
+        ConnectedSend::Input(input) => Some(input.context),
+        _ => None,
+    };
+    OwnedConnectedSend {
+        context,
+        started: false,
+        future: Box::pin(async move {
+            send_cancellable(&mut cancellation, async move {
+                match command {
+                    ConnectedSend::Input(input) => {
+                        senders
+                            .input
+                            .send_input_with_context(input.context, input.event)
+                            .await
+                    }
+                    ConnectedSend::Control(message) => senders.control.send(message).await,
+                    ConnectedSend::Transfer(message) => senders.transfer.send(message).await,
+                }
+            })
+            .await
+        }),
+    }
+}
+
+enum ConnectedWork {
+    Event(Result<ControllerEvent, ControllerError>),
+    Sent(Result<(), ControllerError>),
+    Command(Option<ControllerCommand>),
+}
+
+fn fail_connected(
+    senders: &ConnectedSenders,
+    error: ControllerError,
+    context: Option<InputContext>,
+    stable: bool,
+) -> ConnectedOutcome {
+    senders.control.close();
+    ConnectedOutcome::Failed {
+        failure: ConnectFailure::from_controller(error),
+        stream_id: context.map_or(0, |context| context.stream_id),
+        stable,
+    }
+}
+
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &mut Option<Vec<InputEvent>>,
+    pending_release: &mut Option<Vec<CapturedInput>>,
     cancellation: &mut watch::Receiver<bool>,
     callback: CallbackTarget,
-    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_events: &Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &Arc<AtomicU8>,
 ) -> ConnectedOutcome {
+    let senders = Arc::new(ConnectedSenders {
+        input: controller.input_sender(),
+        control: controller.control_sender(),
+        transfer: controller.transfer_sender(),
+    });
     let mut stable = false;
-    if let Some(events) = pending_release.take() {
-        for event in events {
-            if let Err(error) = controller.send_input(event).await {
-                return ConnectedOutcome::Failed {
-                    failure: ConnectFailure::from_controller(error),
-                    stream_id: controller.active_stream_id().unwrap_or(0),
-                    stable,
+    // Input geometry is established only by an actually received VideoConfig.
+    let mut input_context: Option<InputContext> = None;
+    let initial = pending_release.take().unwrap_or_default();
+    if initial.len() > MAX_RELEASE_EVENTS {
+        return fail_connected(
+            &senders,
+            TransportError::Connection("controller release batch exceeded capacity".into()).into(),
+            input_context,
+            stable,
+        );
+    }
+    let mut releases = initial.into_iter();
+    let mut sending: Option<OwnedConnectedSend> = None;
+    loop {
+        // This stack-pinned reader survives every send completion and command.
+        // Dropping next_event after it dequeued a reliable message but before
+        // acquiring crypto would irretrievably lose that message.
+        let next_event = controller.next_event();
+        tokio::pin!(next_event);
+        let event = loop {
+            if *cancellation.borrow() {
+                senders.control.close();
+                return ConnectedOutcome::Shutdown {
+                    stream_id: input_context.map_or(0, |context| context.stream_id),
                 };
             }
-        }
-    }
-    loop {
-        tokio::select! {
-            biased;
-            command = commands.recv() => match command {
-                Some(ControllerCommand::ReleaseAll) => {
-                    release_pending.store(0, Ordering::Release);
-                    let events = take_release_events(release_events);
-                    for event in events {
-                        if let Err(error) = controller.send_input(event).await {
-                            return ConnectedOutcome::Failed {
-                                failure: ConnectFailure::from_controller(error),
-                                stream_id: controller.active_stream_id().unwrap_or(0),
-                                stable,
-                            };
+            if sending.is_none() && input_context.is_some() {
+                for input in releases.by_ref() {
+                    if Some(input.context) == input_context {
+                        sending = Some(start_connected_send(
+                            senders.clone(),
+                            cancellation.clone(),
+                            ConnectedSend::Input(input),
+                        ));
+                        break;
+                    }
+                }
+            }
+            let has_send = sending.is_some();
+            let receive_command = !has_send && releases.len() == 0;
+            let work = tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    let _ = changed;
+                    senders.control.close();
+                    return ConnectedOutcome::Shutdown { stream_id: input_context.map_or(0, |context| context.stream_id) };
+                }
+                work = async {
+                    // Fairness below the session cancellation boundary prevents
+                    // an always-ready input batch or video stream starving peers.
+                    tokio::select! {
+                        event = &mut next_event => ConnectedWork::Event(event),
+                        result = async { Pin::new(sending.as_mut().expect("send enabled")).await }, if has_send => ConnectedWork::Sent(result),
+                        command = commands.recv(), if receive_command => ConnectedWork::Command(command),
+                    }
+                } => work,
+            };
+            // A sender clone may observe the watch update after the outer
+            // cancellation branch was already polled Pending in this tick.
+            // User cancellation wins over its resulting Closed/error outcome.
+            if *cancellation.borrow() {
+                senders.control.close();
+                return ConnectedOutcome::Shutdown {
+                    stream_id: input_context.map_or(0, |context| context.stream_id),
+                };
+            }
+            match work {
+                ConnectedWork::Event(event) => break event,
+                ConnectedWork::Sent(result) => {
+                    sending = None;
+                    if let Err(error) = result {
+                        return fail_connected(&senders, error, input_context, stable);
+                    }
+                }
+                ConnectedWork::Command(command) => match command {
+                    Some(ControllerCommand::SendInput(input)) => {
+                        // Only unstarted events are filtered. A running reliable
+                        // write keeps its original epoch until completion.
+                        if Some(input.context) == input_context {
+                            sending = Some(start_connected_send(
+                                senders.clone(),
+                                cancellation.clone(),
+                                ConnectedSend::Input(input),
+                            ));
                         }
                     }
-                }
-                Some(ControllerCommand::SendInput(event)) => {
-                    if let Err(error) = controller.send_input(event).await {
-                        return ConnectedOutcome::Failed {
-                            failure: ConnectFailure::from_controller(error),
-                            stream_id: controller.active_stream_id().unwrap_or(0),
-                            stable,
-                        };
+                    Some(ControllerCommand::ReleaseAll) => {
+                        release_pending.store(0, Ordering::Release);
+                        let events = take_release_events(release_events);
+                        if events.len() > MAX_RELEASE_EVENTS {
+                            return fail_connected(
+                                &senders,
+                                TransportError::Connection(
+                                    "controller release batch exceeded capacity".into(),
+                                )
+                                .into(),
+                                input_context,
+                                stable,
+                            );
+                        }
+                        releases = events.into_iter();
                     }
-                }
-                Some(ControllerCommand::RequestKeyframe) => {
-                    if let Err(error) = controller.request_keyframe().await {
-                        if matches!(error, ControllerError::NoActiveStream) {
+                    Some(ControllerCommand::RequestKeyframe) => {
+                        if let Some(context) = input_context {
+                            sending = Some(start_connected_send(
+                                senders.clone(),
+                                cancellation.clone(),
+                                ConnectedSend::Control(ControlMessage::RequestKeyframe {
+                                    stream_id: context.stream_id,
+                                }),
+                            ));
+                        } else {
                             callback.emit_error_with_state(
-                                &error.to_string(),
+                                "no active video stream is available",
                                 0,
                                 DesklinkState::StartingVideo,
                             );
-                            continue;
                         }
-                        return ConnectedOutcome::Failed {
-                            failure: ConnectFailure::from_controller(error),
-                            stream_id: controller.active_stream_id().unwrap_or(0),
-                            stable,
+                    }
+                    Some(ControllerCommand::Control(message)) => {
+                        sending = Some(start_connected_send(
+                            senders.clone(),
+                            cancellation.clone(),
+                            ConnectedSend::Control(message),
+                        ));
+                    }
+                    Some(ControllerCommand::Transfer(message)) => {
+                        sending = Some(start_connected_send(
+                            senders.clone(),
+                            cancellation.clone(),
+                            ConnectedSend::Transfer(message),
+                        ));
+                    }
+                    Some(ControllerCommand::Shutdown) | None => {
+                        senders.control.close();
+                        return ConnectedOutcome::Shutdown {
+                            stream_id: input_context.map_or(0, |context| context.stream_id),
                         };
                     }
-                }
-                Some(ControllerCommand::Shutdown) | None => {
-                    return ConnectedOutcome::Shutdown {
-                        stream_id: controller.active_stream_id().unwrap_or(0),
-                    };
-                }
-            },
-            changed = cancellation.changed() => {
-                let _ = changed;
-                return ConnectedOutcome::Shutdown {
-                    stream_id: controller.active_stream_id().unwrap_or(0),
-                };
+                },
             }
-            event = controller.next_event() => match event {
-                Ok(ControllerEvent::Closed { reason }) => {
-                    return ConnectedOutcome::Failed {
-                        failure: ConnectFailure::retryable(format!("transport closed: {reason}")),
-                        stream_id: controller.active_stream_id().unwrap_or(0),
-                        stable,
-                    };
-                }
-                Ok(event) => {
-                    if matches!(event, ControllerEvent::VideoConfig(_)) {
-                        stable = true;
-                    }
-                    let _ = emit_controller_event(callback, event);
-                }
-                Err(error) => {
-                    return ConnectedOutcome::Failed {
-                        failure: ConnectFailure::from_controller(error),
-                        stream_id: controller.active_stream_id().unwrap_or(0),
-                        stable,
-                    };
-                }
+        };
+        match event {
+            Ok(ControllerEvent::Closed { reason }) => {
+                return fail_connected(
+                    &senders,
+                    TransportError::Connection(format!("transport closed: {reason}")).into(),
+                    input_context,
+                    stable,
+                );
             }
+            Ok(event) => {
+                if let ControllerEvent::VideoConfig(config) = &event {
+                    stable = true;
+                    let current = InputContext {
+                        stream_id: config.stream_id,
+                        input_epoch: config.input_epoch,
+                    };
+                    discard_unstarted_input(&mut sending, current);
+                    input_context = Some(current);
+                }
+                let _ = emit_controller_event(callback, event);
+            }
+            Err(error) => return fail_connected(&senders, error, input_context, stable),
+        }
+    }
+}
+
+/// Every owned reliable operation has a session-wide cancellation/deadline.
+/// Timeout/cancellation retires the connection; an ordinary epoch change never
+/// interrupts an operation that has entered this send boundary.
+async fn send_cancellable<T>(
+    cancellation: &mut watch::Receiver<bool>,
+    send: impl std::future::Future<Output = Result<T, ControllerError>>,
+) -> Result<T, ControllerError> {
+    if *cancellation.borrow() {
+        return Err(TransportError::Closed.into());
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.changed() => Err(TransportError::Closed.into()),
+        result = tokio::time::timeout(SEND_TIMEOUT, send) => {
+            result.unwrap_or_else(|_| Err(TransportError::Connection("controller send deadline exceeded".into()).into()))
         }
     }
 }
@@ -529,11 +776,12 @@ async fn run_connected(
 struct RetryContext<'a> {
     schedule: &'a mut ReconnectSchedule,
     commands: &'a mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &'a mut Option<Vec<InputEvent>>,
+    pending_release: &'a mut Option<Vec<CapturedInput>>,
     cancellation: &'a mut watch::Receiver<bool>,
     callback: CallbackTarget,
-    release_events: &'a Arc<Mutex<Vec<InputEvent>>>,
+    release_events: &'a Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &'a Arc<AtomicU8>,
+    persistent: bool,
 }
 
 async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryContext<'_>) -> bool {
@@ -545,9 +793,13 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
         callback,
         release_events,
         release_pending,
+        persistent,
     } = context;
     if !failure.retryable {
         callback.emit_error(&failure.message, 0);
+        return false;
+    }
+    if *cancellation.borrow() {
         return false;
     }
     if stable {
@@ -577,6 +829,23 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
             .await
         }
         ReconnectDecision::Exhausted => {
+            if persistent {
+                callback.emit_state(DesklinkState::Reconnecting, 0);
+                callback.emit_error_with_state(
+                    "waiting for the approved persistent host",
+                    0,
+                    DesklinkState::Reconnecting,
+                );
+                return wait_for_retry(
+                    schedule.max_delay(),
+                    commands,
+                    pending_release,
+                    cancellation,
+                    release_events,
+                    release_pending,
+                )
+                .await;
+            }
             callback.emit_error(
                 &format!(
                     "reconnect retry budget exhausted after {} attempts: {}",
@@ -597,9 +866,9 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
 async fn wait_for_retry(
     delay: Duration,
     commands: &mut mpsc::Receiver<ControllerCommand>,
-    pending_release: &mut Option<Vec<InputEvent>>,
+    pending_release: &mut Option<Vec<CapturedInput>>,
     cancellation: &mut watch::Receiver<bool>,
-    release_events: &Arc<Mutex<Vec<InputEvent>>>,
+    release_events: &Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &Arc<AtomicU8>,
 ) -> bool {
     if *cancellation.borrow() {
@@ -615,13 +884,17 @@ async fn wait_for_retry(
                     release_pending.store(0, Ordering::Release);
                     let events = take_release_events(release_events);
                     if let Some(pending) = pending_release {
+                        if pending.len().saturating_add(events.len()) > MAX_RELEASE_EVENTS { return false; }
                         pending.extend(events);
                     } else {
+                        if events.len() > MAX_RELEASE_EVENTS { return false; }
                         *pending_release = Some(events);
                     }
                 }
                 Some(ControllerCommand::SendInput(_))
-                | Some(ControllerCommand::RequestKeyframe) => {}
+                | Some(ControllerCommand::RequestKeyframe)
+                | Some(ControllerCommand::Control(_))
+                | Some(ControllerCommand::Transfer(_)) => {}
                 Some(ControllerCommand::Shutdown) | None => return false,
             },
             changed = cancellation.changed() => {
@@ -685,8 +958,15 @@ async fn connect_controller(
     platform: Platform,
     config: &SecureConnectionConfigOwned,
     callback: CallbackTarget,
-    material_publisher: Option<MaterialPublisher>,
 ) -> Result<ResolvedControllerConnection, ConnectFailure> {
+    if config
+        .expires_at_unix_s
+        .is_some_and(|expiry| now_unix_s() >= expiry)
+    {
+        return Err(ConnectFailure::permanent(
+            "saved temporary authorization expired".into(),
+        ));
+    }
     let relay_addr = resolve_relay(relay_url).map_err(ConnectFailure::permanent)?;
     let transport_config = QuicClientConfig::new(relay_addr, config.server_name.clone())
         .map_err(ConnectFailure::from_transport)?;
@@ -705,30 +985,23 @@ async fn connect_controller(
             .map_err(|_| ConnectFailure::retryable("relay directory lookup timed out".into()))?
             .map_err(ConnectFailure::from_transport)?;
             let result = PairingInvite::decode(&invitation, now_unix_s())
-                .map(|invite| {
-                    let session_id = *invite.session_id().as_bytes();
-                    let relay_authentication = *invite.relay_authentication();
-                    let host_verify_key = *invite.host_verify_key().as_bytes();
-                    if let Some(publish) = &material_publisher {
-                        publish(SavedHostMaterialOwned {
-                            session_id,
-                            relay_authentication: Zeroizing::new(relay_authentication),
-                            host_verify_key,
-                            server_name: config.server_name.clone(),
-                        });
-                    }
-                    (
-                        session_id,
-                        relay_authentication,
-                        host_verify_key,
-                        Some(invite.expires_at_unix_s()).filter(|expires| *expires != 0),
-                    )
-                })
                 .map_err(|_| {
                     ConnectFailure::permanent(
                         "the device returned an invalid or expired connection invitation"
                             .to_owned(),
                     )
+                })
+                .and_then(|invite| {
+                    let session_id = *invite.session_id().as_bytes();
+                    let relay_authentication = *invite.relay_authentication();
+                    let host_verify_key = *invite.host_verify_key().as_bytes();
+                    validate_expected_host(config.host_verify_key, host_verify_key)?;
+                    Ok((
+                        session_id,
+                        relay_authentication,
+                        host_verify_key,
+                        Some(invite.expires_at_unix_s()).filter(|expires| *expires != 0),
+                    ))
                 });
             invitation.zeroize();
             result?
@@ -765,6 +1038,15 @@ async fn connect_controller(
         .map(|controller| ResolvedControllerConnection {
             controller,
             expires_at_unix_s,
+            material: SavedHostMaterialOwned {
+                session_id,
+                relay_authentication: Zeroizing::new(relay_authentication),
+                host_verify_key,
+                server_name: config.server_name.clone(),
+                expires_at_unix_s: expires_at_unix_s.unwrap_or(0),
+                authorization_type: if expires_at_unix_s.is_some() { 1 } else { 2 },
+                directory: config.directory.clone(),
+            },
         })
         .map_err(ConnectFailure::from_controller)
 }
@@ -784,18 +1066,31 @@ async fn join_relay(client: &QuicClient, join: RelayJoin) -> Result<(), Transpor
 struct ResolvedControllerConnection {
     controller: ControllerRuntime,
     expires_at_unix_s: Option<u64>,
+    material: SavedHostMaterialOwned,
+}
+
+fn validate_expected_host(expected: [u8; 32], actual: [u8; 32]) -> Result<(), ConnectFailure> {
+    if expected != [0; 32] && expected != actual {
+        return Err(ConnectFailure::permanent(
+            "approved host identity changed; pair again".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn enqueue_release_all(
     commands: &mpsc::Sender<ControllerCommand>,
-    release_events: &Mutex<Vec<InputEvent>>,
+    release_events: &Mutex<Vec<CapturedInput>>,
     release_pending: &AtomicU8,
-    events: Vec<InputEvent>,
+    events: Vec<CapturedInput>,
 ) -> Result<(), ()> {
     if !events.is_empty() {
         let mut pending = release_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.len().saturating_add(events.len()) > MAX_RELEASE_EVENTS {
+            return Err(());
+        }
         pending.extend(events);
     }
     if release_pending.swap(1, Ordering::AcqRel) == 1 {
@@ -812,7 +1107,7 @@ fn enqueue_release_all(
     Ok(())
 }
 
-fn take_release_events(release_events: &Mutex<Vec<InputEvent>>) -> Vec<InputEvent> {
+fn take_release_events(release_events: &Mutex<Vec<CapturedInput>>) -> Vec<CapturedInput> {
     let mut pending = release_events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -838,6 +1133,7 @@ fn emit_controller_event(callback: CallbackTarget, event: ControllerEvent) -> bo
                 config_version: config.config_version,
                 width: config.width,
                 height: config.height,
+                input_epoch: config.input_epoch,
             };
             callback.emit_state(DesklinkState::Connected, config.stream_id);
             callback.emit(
@@ -857,6 +1153,7 @@ fn emit_controller_event(callback: CallbackTarget, event: ControllerEvent) -> bo
                     config_version: frame.config_version,
                     width: frame.width,
                     height: frame.height,
+                    input_epoch: 0,
                 },
                 DesklinkState::Connected,
             );
@@ -913,6 +1210,119 @@ fn resolve_relay(relay_url: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_relookup_cannot_replace_an_approved_host_identity() {
+        assert!(validate_expected_host([0; 32], [1; 32]).is_ok());
+        assert!(validate_expected_host([1; 32], [1; 32]).is_ok());
+        let changed = validate_expected_host([1; 32], [2; 32]).unwrap_err();
+        assert!(!changed.retryable);
+        assert!(changed.message.contains("identity changed"));
+    }
+
+    #[tokio::test]
+    async fn persistent_host_keeps_waiting_after_budget_and_is_still_cancellable() {
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_secs(8), 1).unwrap();
+        let mut schedule = ReconnectSchedule::new(policy, None);
+        let _ = schedule.next(now_unix_s());
+        let (_sender, mut commands) = mpsc::channel(1);
+        let (sender, mut cancellation) = watch::channel(false);
+        let mut pending = None;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let release_pending = Arc::new(AtomicU8::new(0));
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            sender.send(true).unwrap();
+        };
+        let retry = schedule_retry(
+            ConnectFailure::retryable("offline".into()),
+            false,
+            RetryContext {
+                schedule: &mut schedule,
+                commands: &mut commands,
+                pending_release: &mut pending,
+                cancellation: &mut cancellation,
+                callback: CallbackTarget {
+                    callback: None,
+                    context: 0,
+                },
+                release_events: &events,
+                release_pending: &release_pending,
+                persistent: true,
+            },
+        );
+        let (result, ()) = tokio::join!(retry, cancel);
+        assert!(!result);
+        assert!(*cancellation.borrow());
+        assert!(matches!(
+            schedule.next(now_unix_s()),
+            ReconnectDecision::Exhausted
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_connected_send_is_cancelled_even_with_queued_commands() {
+        // A full channel models an established reliable stream with no credit;
+        // unlike connection-time cancellation this future has already started.
+        let (queue, _peer) = mpsc::channel(1);
+        queue.send(()).await.unwrap();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let send = async {
+            queue.send(()).await.unwrap();
+            Ok::<_, ControllerError>(())
+        };
+        let task = async {
+            tokio::task::yield_now().await;
+            cancel.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(send_cancellable(&mut cancelled, send), task);
+        assert!(matches!(
+            result,
+            Err(ControllerError::Transport(TransportError::Closed))
+        ));
+        // A new session's cancellation token is independent of the old one.
+        let (_new_cancel, mut new_receiver) = watch::channel(false);
+        assert!(
+            send_cancellable(&mut new_receiver, async { Ok::<_, ControllerError>(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_send_has_a_deadline_without_user_cancellation() {
+        let (_sender, mut cancellation) = watch::channel(false);
+        let result = send_cancellable(
+            &mut cancellation,
+            std::future::pending::<Result<(), ControllerError>>(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ControllerError::Transport(TransportError::Connection(_)))
+        ));
+    }
+
+    #[test]
+    fn recovery_errors_are_structured_and_terminal_errors_are_not_retryable() {
+        assert_eq!(
+            error_metadata(DesklinkEventKind::Error, DesklinkState::Reconnecting),
+            (1, 1)
+        );
+        assert_eq!(
+            error_metadata(DesklinkEventKind::Error, DesklinkState::StartingVideo),
+            (2, 1)
+        );
+        assert_eq!(
+            error_metadata(DesklinkEventKind::Error, DesklinkState::Closed),
+            (3, 0)
+        );
+        assert_eq!(
+            error_metadata(DesklinkEventKind::VideoConfig, DesklinkState::Connected),
+            (0, 0)
+        );
+    }
 
     #[test]
     fn retry_classification_keeps_authentication_failures_permanent() {
@@ -979,8 +1389,20 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let release_events = Mutex::new(Vec::new());
         let release_pending = AtomicU8::new(0);
-        let first_event = InputEvent::MouseMove { x: 1, y: 2 };
-        let second_event = InputEvent::MouseMove { x: 3, y: 4 };
+        let first_event = CapturedInput {
+            context: InputContext {
+                stream_id: 1,
+                input_epoch: 11,
+            },
+            event: InputEvent::MouseMove { x: 1, y: 2 },
+        };
+        let second_event = CapturedInput {
+            context: InputContext {
+                stream_id: 2,
+                input_epoch: 22,
+            },
+            event: InputEvent::MouseMove { x: 3, y: 4 },
+        };
 
         assert!(
             enqueue_release_all(
@@ -1011,3 +1433,7 @@ mod tests {
         assert_eq!(release_pending.load(Ordering::Acquire), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "worker/concurrent_send_tests.rs"]
+mod concurrent_send_tests;

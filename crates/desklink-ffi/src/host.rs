@@ -92,6 +92,15 @@ pub enum HostCommand {
 }
 
 impl HostCommand {
+    pub(crate) const fn is_media(&self) -> bool {
+        matches!(
+            self,
+            Self::SendVideoConfig { .. }
+                | Self::SendVideoAccessUnit { .. }
+                | Self::SendCursor { .. }
+        )
+    }
+
     pub(crate) const fn requires_connection(&self) -> bool {
         matches!(
             self,
@@ -106,6 +115,8 @@ impl HostCommand {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HostError {
+    #[error("media producer belongs to a retired host session")]
+    StaleMediaGeneration,
     #[error("host runtime is not in a state that accepts this command")]
     InvalidState,
     #[error("host command queue is full or closed")]
@@ -137,6 +148,9 @@ pub struct HostMetrics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostEvent {
     State(HostState),
+    Connected {
+        media_generation: u64,
+    },
     ApprovalRequested {
         device_id: [u8; 16],
         verify_key: [u8; 32],
@@ -156,6 +170,9 @@ pub struct HostRuntime {
 }
 
 impl HostRuntime {
+    /// Bounded application event capacity, including reserved shutdown events.
+    pub const EVENT_CAPACITY: usize = HOST_EVENT_CAPACITY;
+
     pub fn start(
         client: QuicClient,
         identity: HostIdentity,
@@ -225,6 +242,16 @@ impl HostRuntime {
 
     pub fn send(&self, command: HostCommand) -> Result<(), HostError> {
         self.worker.send(command)
+    }
+
+    /// Async media producers must retain the generation from Connected and use
+    /// this method; the unscoped convenience method stamps synchronous admission.
+    pub fn send_for_generation(
+        &self,
+        media_generation: u64,
+        command: HostCommand,
+    ) -> Result<(), HostError> {
+        self.worker.send_for_generation(media_generation, command)
     }
 
     pub fn stop(&self) {

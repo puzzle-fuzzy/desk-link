@@ -284,6 +284,9 @@ impl QuicClient {
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
         let mut transport = quinn::TransportConfig::default();
+        if let Some(limits) = config.flow_control_limits {
+            limits.apply_to(&mut transport);
+        }
         transport
             .keep_alive_interval(Some(config.keep_alive))
             .max_idle_timeout(Some(idle_timeout));
