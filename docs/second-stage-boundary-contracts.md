@@ -54,13 +54,13 @@ Windows 的 persistent 会话、临时邀请、host 服务和单次 controller a
 
 ### 追加所有权：输入 epoch 与探测 lane
 
-2026-10-26 的协调决定：**Apple/FFI 组是严格输入上下文的唯一共享契约 owner**，在尚未发布的协议 13 开发线追加 `VideoConfig.input_epoch` 与 `InputEnvelope { stream_id, input_epoch }`，同步 codec/ABI/Apple 声明；媒体 host 与 Windows 产品组随后分别接线。本文核对时尚无该契约独立提交，本工程源码仍无这些字段，不能自行分配另一套字段或版本。已有媒体拓扑协调切片 `631cb3258d1cc3b53977611a0603f17d685b850c` 不等于端到端绑定完成。
+2026-10-26 的协调决定：**Apple/FFI 组是严格输入上下文的唯一共享契约 owner**，在尚未发布的协议 13 开发线追加字段并同步 codec/ABI/Apple 声明；媒体 host 与 Windows 产品组随后分别接线。`VideoConfig` 在 `stream_id` 后增加非零 `input_epoch: u64`；`InputEnvelope` 在 `timestamp_us` 后增加非零 `stream_id: u64`、`input_epoch: u64`；Rust 的 `InputContext { stream_id, input_epoch }` 显式传给发送，禁止发送时补当前值。input codec 由 protocol `encode_input` / `decode_session_input` 统一处理保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]`，不在平台/transport 拼前缀或 fallback 无 context 格式；旧合法 Function(1) 包不应被新布局误读为 MouseButton。本文核对时尚无该契约独立提交，本工程源码仍无这些字段或前缀，不能自行分配另一套字段或版本。已有媒体拓扑协调切片 `631cb3258d1cc3b53977611a0603f17d685b850c` 不等于端到端绑定完成。
 
 | 唯一 owner | 必须交付的边界 | 不能替代它的近似 |
 | --- | --- | --- |
 | Apple/FFI：共享 wire/ABI | 视频配置和每个输入/远端 release 都带同一明确 stream/epoch 上下文；跨层传递保留该值 | sequence、wallclock、仅 config_version、源码中出现字段名 |
 | 媒体：host 注入/映射 | 原子清键、推进 epoch 与映射发布；在同一映射锁语义内核对当前 stream/epoch 再注入，避免检查到使用间切屏；拒绝旧输入和旧 release | 仅稳定显示器 ID、本机拓扑代数、切换期间短暂停输入，或无条件保留旧 release |
-| 产品：实际呈现与入队 | 匹配新上下文的首帧实际呈现后再启用坐标输入；事件入队即固定 context，不能出队时贴成新 epoch | 仅收到 VideoConfig、解码完成但未呈现、把排队旧事件重新标成当前上下文 |
+| 产品：实际呈现与入队 | 匹配新上下文的首帧实际呈现后再启用该 context 的远端输入；事件入队即固定 context，不能出队时贴成新 epoch | 仅收到 VideoConfig、解码完成但未呈现、把排队旧事件重新标成当前上下文 |
 | runtime：取消与本机收回 | 用户取消/Host 本地收回独立于远端输入上下文和普通队列容量生效 | 用输入 epoch 过期或输入队列满阻止取消/本机清键 |
 
 合同、host 和呈现/入队三段尚未全部接通并在同一 revision 通过前，DL2-013 的严格绑定保持 `[ ]`；特别验证新 epoch 持键后收到旧 key-up/ReleaseAll 不影响新持键，而当前用户取消仍能清理退出。工程组只维护这些门禁，不提前重写活跃的 runtime/controller/FFI。
