@@ -440,6 +440,8 @@
 - **新增审查证据分类（`docs(DL2-042): record disputed review evidence without endorsing root draft`）：** `docs/second-stage-review-evidence.md` 记录主目录156增/16删稿非工程主会话或两个子agent所写，作者未确认，保持未代stage/覆盖。只读核对045原实现已continue Some(Err)、046取消树已由3277修复而仲裁待验、048未直接入Ed签名不构成已确认P1（Noise payload先认证解密），列防御纵深与篡改/拼接验证范围。不沿用“新增全部确认”，其余新项待owner核实后再更新最终矩阵；未改crypto或新增条目状态。
 - **有序Sender证据（`docs(DL2-042): separate sender success from failed host integration`）：** 来源3ea72dc→本工程d6f153e仅bc6+b473前置，保留单一Runtime/Sender实现；干净源码本地报告fmt/编译/protocol47/独立loopback6通过，完整FFI含lib12等选中项通过但旧Host8通过2失败，Windows host9通过1失败，整体failed。32并发clone/原context/连续seq与零ctx不耗seq是发送原语证据，不是生产迁移/新Noise随机epoch/IPC完整u64或呈现验收；来源与具体报告在能力矩阵分开记录。
 
+- **044反证与逐条归因（`docs(DL2-042): correct cursor congestion evidence and observer limits`）：** 按Cargo.lock核对quinn0.11.11/proto0.11.16缓存与版本化API：send_datagram拥塞可淘汰旧包并Ok，公开错误无QueueFull，wait内部Blocked为Pending；原拥塞P1路径不成立。保留cursor真实错误?传播/可选通道分类降级的待验范围，observer只计尝试/返回错误不是真实丢包。能力矩阵逐条区分044/045反证、046取消树已修与仲裁待验、048P1证据不足；不延续全部确认。主目录草稿仍非本组写入、作者未知、保持未stage/覆盖；未改crypto/transport或其他编号状态。
+
 ## 8. 扩展角色
 
 ### DL2-043 · P3 · 被控 Mac 的能力协商与实际编码一致
