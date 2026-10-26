@@ -1,3 +1,8 @@
+mod configuration_queue;
+use configuration_queue::{
+    ConfigurationAction, ConfigurationKind, ConfigurationOperation, ConfigurationQueue,
+};
+
 use std::{
     sync::{
         Arc, Mutex, MutexGuard,
@@ -1082,6 +1087,7 @@ impl HostRuntime {
             display_id: 0,
             desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
             topology: None,
+            selection_pending: false,
         }));
         let release_input = Arc::new(Notify::new());
         let input_suspended = Arc::new(AtomicBool::new(false));
@@ -1395,6 +1401,7 @@ struct SelectedDesktop {
     display_id: u32,
     desktop: VirtualDesktop,
     topology: Option<DisplayTopologySnapshot>,
+    selection_pending: bool,
 }
 
 impl SelectedDesktop {
@@ -1406,6 +1413,7 @@ impl SelectedDesktop {
                 topology.virtual_desktop(),
             ),
             topology: Some(topology),
+            selection_pending: false,
         }
     }
 
@@ -1484,7 +1492,9 @@ impl CaptureDesktopCoordinator<'_> {
     fn publish(&self, topology: DisplayTopologySnapshot) {
         let generation = topology.generation();
         let mut selected = lock_unpoisoned(self.selected);
+        let selection_pending = selected.selection_pending;
         *selected = SelectedDesktop::from_snapshot(topology);
+        selected.selection_pending = selection_pending;
         self.release_input.notify_one();
         self.input_suspended.store(false, Ordering::Release);
         self.updates.send_replace(generation);
@@ -2831,6 +2841,54 @@ async fn apply_video_profile(
         .unwrap_or(H264Profile::Main))
 }
 
+enum ConfigurationApplied {
+    Display,
+    Quality(Option<VideoQualityPreset>),
+    Profile(H264Profile),
+}
+
+type PendingConfiguration = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(ConfigurationOperation, ConfigurationApplied), HostRuntimeError>,
+            > + Send,
+    >,
+>;
+
+fn start_configuration(
+    commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
+    operation: ConfigurationOperation,
+) -> PendingConfiguration {
+    Box::pin(async move {
+        let applied = match operation.action {
+            ConfigurationAction::SelectDisplay(display_id) => {
+                let (reply, switched) = oneshot::channel();
+                commands
+                    .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
+                    .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                let _ = tokio::time::timeout(Duration::from_secs(5), switched).await;
+                ConfigurationApplied::Display
+            }
+            ConfigurationAction::SetVideoQuality(preset) => {
+                ConfigurationApplied::Quality(apply_video_quality(&commands, preset).await?)
+            }
+            ConfigurationAction::SetVideoProfile(profile) => {
+                ConfigurationApplied::Profile(apply_video_profile(&commands, profile).await?)
+            }
+        };
+        Ok((operation, applied))
+    })
+}
+
+async fn next_configuration(
+    pending: &mut Option<PendingConfiguration>,
+) -> Result<(ConfigurationOperation, ConfigurationApplied), HostRuntimeError> {
+    match pending {
+        Some(operation) => operation.await,
+        None => std::future::pending().await,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receive_input_and_control(
     client: Arc<QuicClient>,
@@ -2940,7 +2998,11 @@ fn inject_desktop_input<B: crate::input::InputBackend>(
         event,
         InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }
     );
-    if !release && (input_suspended.load(Ordering::Acquire) || wait_generation != generation) {
+    if !release
+        && (input_suspended.load(Ordering::Acquire)
+            || selected.selection_pending
+            || wait_generation != generation)
+    {
         return Ok(false);
     }
     input.set_desktop(selected.desktop);
@@ -2960,7 +3022,7 @@ async fn receive_host_control(
     let HostInboundContext {
         capture_commands,
         selected_desktop,
-        release_input: _,
+        release_input,
         input_suspended: _,
         mut topology_updates,
         audio_enabled,
@@ -2974,8 +3036,41 @@ async fn receive_host_control(
     let mut video_quality = AdaptiveVideoQuality::new();
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
     let mut direct_probes = tokio::task::JoinSet::new();
+    let mut configurations = ConfigurationQueue::default();
+    let mut pending_configuration = None;
     loop {
+        if pending_configuration.is_none()
+            && let Some(operation) = configurations.pop_next()
+        {
+            pending_configuration = Some(start_configuration(capture_commands.clone(), operation));
+        }
         tokio::select! {
+            completed = next_configuration(&mut pending_configuration) => {
+                let (operation, applied) = completed?;
+                pending_configuration = None;
+                if configurations.is_current(&operation) {
+                    match applied {
+                        ConfigurationApplied::Display => {
+                            if !configurations.has_pending_display() {
+                                lock_unpoisoned(&selected_desktop).selection_pending = false;
+                                release_input.notify_one();
+                            }
+                            let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
+                            send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+                        }
+                        ConfigurationApplied::Quality(Some(actual)) => {
+                            video_quality.record_applied(actual);
+                            send_video_quality_state(&client, &secure, peer_generation, video_quality.preference, actual).await?;
+                        }
+                        ConfigurationApplied::Profile(actual) => {
+                            if operation.action != ConfigurationAction::SetVideoProfile(actual) {
+                                force_keyframe.store(true, Ordering::Release);
+                            }
+                        }
+                        ConfigurationApplied::Quality(None) => {}
+                    }
+                }
+            }
             updated = topology_updates.changed() => {
                 updated.map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
                 let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
@@ -3002,16 +3097,13 @@ async fn receive_host_control(
                                 topology.displays().iter().any(|display| display.id == display_id)
                             });
                         if known_display {
-                            let (reply, switched) = oneshot::channel();
-                            capture_commands
-                                .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
-                                .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-                            let _ = tokio::time::timeout(Duration::from_secs(5), switched).await;
+                            lock_unpoisoned(&selected_desktop).selection_pending = true;
+                            release_input.notify_one();
+                            configurations.request(ConfigurationAction::SelectDisplay(display_id));
+                        } else {
+                            let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
+                            send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
                         }
-                        let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
-                        send_display_list(
-                            &client, &secure, peer_generation, &displays, active_display_id,
-                        ).await?;
                     }
                     ControlMessage::SetAudioEnabled { enabled } => {
                         audio_enabled.store(enabled, Ordering::Release);
@@ -3023,53 +3115,21 @@ async fn receive_host_control(
                     }
                     ControlMessage::SetVideoQuality { preference } => {
                         let requested = video_quality.set_preference(preference);
-                        let actual = match requested {
-                            Some(preset) => apply_video_quality(&capture_commands, preset).await?,
-                            None => Some(video_quality.preset),
-                        };
-                        if let Some(actual) = actual {
-                            video_quality.record_applied(actual);
-                            send_video_quality_state(
-                                &client,
-                                &secure,
-                                peer_generation,
-                                video_quality.preference,
-                                actual,
-                            )
-                            .await?;
-                        }
+                        // Reassert the applied tier even for Automatic/same-tier
+                        // choices: a previous slow native operation may be in flight.
+                        configurations.invalidate_kind(ConfigurationKind::Quality);
+                        configurations.request(ConfigurationAction::SetVideoQuality(requested.unwrap_or(video_quality.preset)));
                     }
                     ControlMessage::SetVideoProfile { profile } => {
-                        let actual = apply_video_profile(&capture_commands, profile).await?;
-                        if actual != profile {
-                            force_keyframe.store(true, Ordering::Release);
-                        }
+                        configurations.request(ConfigurationAction::SetVideoProfile(profile));
                     }
                     ControlMessage::VideoNetworkFeedback {
-                        received_packets,
-                        dropped_packets,
-                        decode_queue_peak,
-                        freshness_recoveries,
+                        received_packets, dropped_packets, decode_queue_peak, freshness_recoveries,
                     } => {
-                        if let Some(preset) =
-                            video_quality.observe(
-                                received_packets,
-                                dropped_packets,
-                                decode_queue_peak,
-                                freshness_recoveries,
-                            )
-                            && let Some(actual) =
-                                apply_video_quality(&capture_commands, preset).await?
-                        {
-                            video_quality.record_applied(actual);
-                            send_video_quality_state(
-                                &client,
-                                &secure,
-                                peer_generation,
-                                video_quality.preference,
-                                actual,
-                            )
-                            .await?;
+                        if let Some(preset) = video_quality.observe(
+                            received_packets, dropped_packets, decode_queue_peak, freshness_recoveries,
+                        ) {
+                            configurations.request(ConfigurationAction::SetVideoQuality(preset));
                         }
                     }
                     ControlMessage::VideoPathCandidateOffer { candidate } => {
@@ -4052,6 +4112,54 @@ mod retry_policy_tests {
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn slow_configuration_coalesces_new_requests_without_restarting_in_flight_work() {
+        use super::{ConfigurationAction as Action, ConfigurationQueue};
+        let (commands, received) = std::sync::mpsc::sync_channel(4);
+        let mut queue = ConfigurationQueue::default();
+        queue.request(Action::SelectDisplay(1));
+        let first = queue.pop_next().unwrap();
+        let mut pending = Some(super::start_configuration(commands.clone(), first));
+        // Poll the actual production future until it has queued its native
+        // command and is waiting for the slow worker's response.
+        tokio::select! {
+            result = super::next_configuration(&mut pending) => panic!("unexpected completion: {}", result.is_ok()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+        }
+        let super::CaptureWorkerCommand::SelectDisplay { display_id, reply } =
+            received.try_recv().unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(display_id, 1);
+        for id in 2..=1000 {
+            queue.request(Action::SelectDisplay(id));
+        }
+        assert!(received.try_recv().is_err());
+        reply.send(true).unwrap();
+        let (completed, _) = super::next_configuration(&mut pending).await.unwrap();
+        assert!(!queue.is_current(&completed));
+        let latest = queue.pop_next().unwrap();
+        assert_eq!(latest.action, Action::SelectDisplay(1000));
+        assert!(queue.pop_next().is_none());
+        pending = Some(super::start_configuration(commands, latest));
+        tokio::select! {
+            _ = super::next_configuration(&mut pending) => panic!("must await worker"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+        }
+        let super::CaptureWorkerCommand::SelectDisplay { display_id, reply } =
+            received.try_recv().unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(display_id, 1000);
+        drop(pending);
+        assert!(
+            reply.send(true).is_err(),
+            "cancelled peer must discard late configuration completion"
+        );
     }
 
     #[tokio::test]

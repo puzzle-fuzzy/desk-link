@@ -185,7 +185,10 @@
 
 - [x] **已实现并自动验证（`fix(DL2-012): consume input independently from slow host controls`）：** peer内输入与控制改为两个并行且共同取消的future；重配5秒等待不再阻止输入解密/消费。显示切换独立通知释放，过渡期间丢弃坐标/按下事件而允许按键/鼠标释放；断开取消两条路径，不派生迟到输入任务。
 - **验证：** `test -p desklink-windows --lib slow_configuration --locked` 1通过，合成5秒控制等待期间输入/释放队列在250ms预算内完成；`clippy -p desklink-windows --lib --locked -- -D warnings`通过（均经scripts/run-windows-cargo.py）。
-- [ ] **仍待后续切片/实机：** 配置请求的独立代数/过时请求合并与原生延迟重配下键鼠p95/p99及旧配置覆盖回归；本提交关闭输入快路径隔离，不冒称完整控制编排已完成。
+- [ ] **仍待实机：** 原生延迟重配下键鼠p95/p99、无积压回放及显示切换/配置完成的双机回归。
+
+- [x] **控制编排切片（`fix(DL2-012): coalesce configuration work beside control consumption`）：** 控制select独立轮询单个配置future，Display/Quality/Profile各保留最新1项、最多3待执行+1进行中；serial过滤旧完成，跨类别保序。快速新请求、关键帧及断开不再等5秒配置应答。显示选择的独立gate跨拓扑发布保留，直到最新选择完成，防止旧完成提前恢复输入。
+- **验证：** `--lib configuration --locked` 9通过，含实际生产future被慢worker挂起时1000次选择只下发首项+最终项、旧完成失效、取消后迟到oneshot拒绝，以及5个固定队列/代数回归；lib+tests严格Clippy通过。此前完整lib 138通过/2忽略。
 
 ### DL2-013 · P1 · 连接中刷新显示拓扑并稳定识别屏幕
 
