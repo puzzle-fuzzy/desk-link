@@ -474,6 +474,7 @@ fn invalid_capabilities_are_rejected() {
         h264_profiles: vec![H264Profile::Main],
         width: 2561,
         height: 1080,
+        lan_data: None,
     };
     assert!(matches!(
         value.validate(),
@@ -656,6 +657,7 @@ fn capabilities_require_nonempty_h264_list() {
             h264_profiles: vec![H264Profile::Main],
             width: 1920,
             height: 1080,
+            lan_data: None,
         };
         if value.codecs.is_empty() {
             assert!(matches!(
@@ -680,6 +682,7 @@ fn h264_capabilities_require_main_and_expose_high_support() {
         h264_profiles: vec![H264Profile::High],
         width: 1920,
         height: 1080,
+        lan_data: None,
     };
     assert!(matches!(
         capabilities.validate(),
