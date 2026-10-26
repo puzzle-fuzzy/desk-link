@@ -404,6 +404,7 @@
 - [x] **追加协调合同（`docs(DL2-040): record input epoch ownership and probe lane gates`）：** 明确 Apple/FFI 单一 owner 发布 `VideoConfig.input_epoch` / `InputEnvelope{stream_id,input_epoch}`，媒体 host 原子清键/推进/映射锁校验，产品实际首帧呈现后启用并在入队固定 context；旧输入/旧 release 必须隔离，取消与本机收回独立有效，不以 seq/wallclock/config_version 替代。013 严格绑定仍未完成。已核对媒体独立 probe lane 提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`；合同、调用方及接入验证须分别交付。文档链接、固定提交身份与 diff 检查通过，未改活跃模块。
 - **合同导入前的字段记录（`docs(DL2-040): clarify pending framed input context contract`）：** 记录 owner 明确的字段顺序、非零 stream/epoch、显式 InputContext 和 `[0, PROTOCOL_VERSION:u16 little-endian]` 前缀，由 encode_input/decode_session_input 唯一处理；禁止旧合法 Function(1) 的布局歧义、无context fallback和发送时补当前值。当时字段/前缀尚未落本分支；首帧门禁适用于该context远端输入，取消/本机收回独立。
 - **合同导入后的实际边界（`docs(DL2-040): separate landed wire contract from zero-context producers`）：** 来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`，只有wire/codec合同落地。HostVideoPipeline、FFI host配置以及两处controller输入生产者仍显式零；显式发送API/host映射/两平台生产者待接线。真实host runtime在prepare生成配置处被拒绝InvalidVideoConfig，非夹具缺字段；当前不可交付，不默认1、不在发送时取当前epoch、不跳过业务失败。
+- **会话新鲜度与u64合同（`docs(DL2-040): require fresh Noise epochs and lossless IPC identities`）：** 只读确认HostConnectionSettings.stream_id持久化、supervisor仅run内推进，撤回“新stream可固定1”假设。每次新认证会话/Noise用OsRng非零随机起点（同进程也重新分配），仅几何/活动输出/有效性边界checked推进，纯编码不变；RNG/零/溢出明确失败或重建，无默认1/wrap/round/clamp。Windows身份IPC规范十进制字符串+BigInt完整u64，C/Swift UInt64；epoch不作key/nonce。记录为待接线合同，不冒称当前sender或host已实现这些规则。
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 

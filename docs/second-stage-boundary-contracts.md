@@ -67,6 +67,16 @@ Windows 的 persistent 会话、临时邀请、host 服务和单次 controller a
 
 合同、host 和呈现/入队三段尚未全部接通并在同一 revision 通过前，DL2-013 的严格绑定保持 `[ ]`；特别验证新 epoch 持键后收到旧 key-up/ReleaseAll 不影响新持键，而当前用户取消仍能清理退出。工程组只维护这些门禁，不提前重写活跃的 runtime/controller/FFI。
 
+### 新认证会话的新鲜度与完整u64合同
+
+源码反证：`HostConnectionSettings.stream_id` 随 `configuration.rs::encode/decode` 保存并恢复；`create_managed_connection` 创建时用字符串 `"1"`，`prepare_host/prepare_pairing` 将持久值传给HostSupervisor；supervisor只在本次run内checked推进。因此“新Noise/进程自然有新stream，epoch可从固定1重新开始”只能视为已撤回的历史假设，不能作为验收条件。
+
+当前协调规则是：每个新认证会话/Noise重新用 **OsRng分配非零随机epoch起点**，同进程新会话也不能复用缓存的base+初值；会话内仅在有效几何、活动输出或输入有效性边界改变时checked单调推进，并与清键/映射更新原子协调。纯码率/profile/GOP等不改变有效输入映射的编码调整保持epoch。新会话的随机epoch可以小于旧会话值，核对的是当前上下文，不靠跨会话数值大小判断新旧。
+
+RNG失败、零值和checked推进溢出必须有明确失败或上下文重建结果；不能默认1、wrap、round/clamp或悄悄沿用旧上下文。旧plaintext即便被重新用新Noise加密，也必须保留事件入队捕获的旧context并被拒绝；不能因为认证会话更新就给旧事件贴新epoch。该随机epoch只做输入新旧绑定，不作为密钥、随机nonce或Noise安全修复。
+
+Windows的context与VideoConfig身份IPC使用规范十进制字符串与BigInt，保存完整u64；C/Swift继续使用uint64_t/UInt64。需覆盖超过2^53的真实JSON/IPC往返、非规范文本/number/溢出拒绝与原context入队保持，不能用Number、round或clamp“修复”精度。这些是待owner接线规则，当前sender原语通过不表示随机起点、host映射、IPC或实际呈现已实现。
+
 DL2-011 的独立 lane 已有提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`，经源码核对仅追加 `SecureLane::DirectProbe = 8` 并同步 COUNT/ALL，所有 Exclusive/Shared probe 的 seal/open 迁移；现有 lane 0～7、JOIN 版本与 QUIC 事件槽数量保持原义。慢 probe 必须不被视频重放窗推进挤出，同时继续拒绝重放和跨 lane 解密；复用该独立提交及所需 shared-probe 前置，不另造探测加密路径。分支提交和其报告的 79 项测试不是本工程接入或 main 整合证明，接入验证须另记源码身份；双机/候选黑洞性能条件继续未完成。
 
 合并后用[统一入口](local-verification.md)验证共享 unit/contract、transport/FFI localhost、媒体恢复和平台 native；特别补背压中停止、迟到回调/代数、持续输入受限与恢复、普通 shell 更新存活、慢盘/网络黑洞。Apple Swift/Xcode、真实权限和设备缺条件时明确 skipped；代码移动或模块行数下降不能作为性能收益。
