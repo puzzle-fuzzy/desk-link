@@ -2,6 +2,7 @@ import "./styles/layout.css";
 import "./styles/base.css";
 import "./styles/interaction.css";
 import "./styles/file-queue.css";
+import "./styles/session-surface.css";
 
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -54,7 +55,10 @@ import {
   initializeController,
   prepareControllerRender,
   renderControllerView,
+  controllerSurfaceIdentity,
+  updatePersistentControllerRegions,
 } from "./controller";
+import { retainSessionSurface } from "./session-surface";
 import {
   MANAGED_RELAY_ADDRESS,
   MANAGED_RELAY_SERVER_NAME,
@@ -105,6 +109,7 @@ const renderScheduler = new RenderScheduler(
 let snapshot: HostSnapshot | null = null;
 let activeView: View = "controller";
 let renderedView: View | null = null;
+let renderedControllerSurface: string | null = null;
 let loading = true;
 let saving = false;
 let managedSetupBusy = false;
@@ -163,16 +168,25 @@ let workspaceRecoveryBound = false;
 let snapshotReadFeedback: Feedback = null;
 
 function render(): void {
-  prepareControllerRender();
   if (accountLoading) {
+    prepareControllerRender();
+    renderedControllerSurface = null;
     app.innerHTML = renderAccountLoading();
     return;
   }
   if (!account.signedIn && !accountLocalMode) {
+    prepareControllerRender();
+    renderedControllerSurface = null;
     app.innerHTML = renderAccountGate();
     bindAccountInteractions();
     return;
   }
+  const nextSurface = activeView === "controller" && !loading ? controllerSurfaceIdentity() : null;
+  if (retainSessionSurface(renderedControllerSurface, nextSurface, renderedView === activeView, Boolean(app.querySelector("[data-remote-viewport]")))) {
+    patchPersistentSessionShell();
+    return;
+  }
+  prepareControllerRender();
   const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
   const preservedScrollTop = renderedView === activeView ? (previousWorkspace?.scrollTop ?? 0) : 0;
   const animateSurface = renderedView !== activeView;
@@ -182,12 +196,12 @@ function render(): void {
       <div class="app-main">
         ${renderWorkspaceTopbar()}
         <main class="workspace ${activeView === "controller" ? "workspace--controller" : ""}" aria-busy="${loading}" data-surface-transition="${animateSurface}">
-          ${feedback ? renderFeedback(feedback) : ""}
+          <div data-shell-feedback>${feedback ? renderFeedback(feedback) : ""}</div>
           ${loading ? renderLoading() : renderCurrentView()}
         </main>
       </div>
     </div>
-    ${renderHostApproval()}
+    <div data-host-approval-region>${renderHostApproval()}</div>
   `;
   renderLucideIcons(app);
   const currentWorkspace = document.querySelector<HTMLElement>(".workspace");
@@ -195,7 +209,29 @@ function render(): void {
     currentWorkspace.scrollTop = preservedScrollTop;
   }
   renderedView = activeView;
+  renderedControllerSurface = nextSurface;
   bindInteractions();
+  bindUtilityMenuDismiss();
+  focusNewApproval();
+  updateWindowsUpdateRegions();
+}
+
+function patchPersistentSessionShell(): void {
+  const regions: Array<[string, string]> = [
+    [".sidebar", renderSidebar()],
+    [".workspace-topbar", renderWorkspaceTopbar()],
+  ];
+  for (const [selector, markup] of regions) {
+    const previous = app.querySelector<HTMLElement>(selector);
+    if (previous) previous.outerHTML = markup;
+  }
+  const feedbackRegion = app.querySelector<HTMLElement>("[data-shell-feedback]");
+  if (feedbackRegion) feedbackRegion.innerHTML = feedback ? renderFeedback(feedback) : "";
+  const approvalRegion = app.querySelector<HTMLElement>("[data-host-approval-region]");
+  if (approvalRegion) approvalRegion.innerHTML = renderHostApproval();
+  updatePersistentControllerRegions();
+  renderLucideIcons(app);
+  bindInteractions(true);
   bindUtilityMenuDismiss();
   focusNewApproval();
   updateWindowsUpdateRegions();
@@ -1655,7 +1691,7 @@ async function exitDeskLink(): Promise<void> {
   }
 }
 
-function bindInteractions(): void {
+function bindInteractions(preservedController = false): void {
   document.querySelector<HTMLButtonElement>("[data-account-logout]")?.addEventListener("click", () => void logoutAccount());
   document.querySelector<HTMLButtonElement>("[data-account-login]")?.addEventListener("click", () => enterAccountLogin());
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
@@ -1675,7 +1711,7 @@ function bindInteractions(): void {
     }
   });
   document.querySelector<HTMLElement>(".utility-menu")?.addEventListener("keydown", handleUtilityMenuKeyboard);
-  if (activeView === "controller") {
+  if (activeView === "controller" && !preservedController) {
     bindControllerInteractions();
   }
   document.querySelector<HTMLButtonElement>("[data-reject-host-approval]")?.addEventListener("click", () => {

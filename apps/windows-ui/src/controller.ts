@@ -425,7 +425,7 @@ export function renderControllerView(): string {
   const remoteSurfaceVisible = connected || remoteSurfaceState === "retaining";
   return `
     <div class="controller-stack${remoteSurfaceVisible ? " controller-stack--remote" : ""}">
-      ${feedback ? renderFeedback(feedback) : ""}
+      <div data-controller-feedback>${feedback ? renderFeedback(feedback) : ""}</div>
       <div class="controller-heading${remoteSurfaceVisible ? " sr-only" : ""}">
         <div class="controller-heading-copy">
           <h1>连接设备</h1>
@@ -435,6 +435,26 @@ export function renderControllerView(): string {
       ${remoteSurfaceVisible ? renderRemoteDesktop() : renderConnectionPanel()}
     </div>
   `;
+}
+
+export function controllerSurfaceIdentity(): string | null {
+  if (loading || (snapshot?.runtime.state !== "connected" && remoteSurfaceState !== "retaining")) return null;
+  const key = videoConfig ? videoConfigKey(videoConfig) : `${snapshot?.runtime.streamId}:waiting`;
+  return `${key}:${failedVideoConfig ?? "ready"}`;
+}
+
+export function updatePersistentControllerRegions(): void {
+  const region = document.querySelector<HTMLElement>("[data-controller-feedback]");
+  if (region) {
+    region.innerHTML = feedback ? renderFeedback(feedback) : "";
+    region.querySelector<HTMLButtonElement>("[data-controller-dismiss]")?.addEventListener("click", () => {
+      feedback = null;
+      requestRender();
+    });
+  }
+  updateRemoteSessionStatus();
+  updateAudioControl();
+  updateTransferPanel();
 }
 
 export function bindControllerInteractions(): void {

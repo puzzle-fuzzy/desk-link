@@ -1,0 +1,4 @@
+[data-controller-feedback]:empty,
+[data-shell-feedback]:empty {
+  display: none;
+}
