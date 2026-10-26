@@ -122,15 +122,49 @@ export class AccountStore {
   constructor(path = ":memory:") {
     this.database = new Database(path, { create: true, strict: true });
     this.database.exec("PRAGMA foreign_keys = ON");
+    // SQLite calls are synchronous. Bound lock waiting inside SQLite rather
+    // than a Promise timeout, which cannot interrupt a blocked SQLite call.
+    this.database.exec("PRAGMA busy_timeout = 25");
     if (path !== ":memory:") {
       this.database.exec("PRAGMA journal_mode = WAL");
       this.database.exec("PRAGMA synchronous = NORMAL");
     }
-    this.database.exec(readFileSync(new URL("./migrations/001_account.sql", import.meta.url), "utf8"));
+    this.database.transaction(() => {
+      this.database.exec(readFileSync(new URL("./migrations/001_account.sql", import.meta.url), "utf8"));
+      this.database.exec(readFileSync(new URL("./migrations/002_readiness.sql", import.meta.url), "utf8"));
+    })();
   }
 
   close(): void {
     this.database.close(false);
+  }
+
+  readiness(): { database: "ready" | "unavailable" | "schema_mismatch"; mail: "ready" | "degraded" } {
+    let begun = false;
+    try {
+      if ((this.database.query("PRAGMA user_version").get() as { user_version: number }).user_version !== 2) {
+        return { database: "schema_mismatch", mail: "degraded" };
+      }
+      // Prepare against the current schema, including all request-critical columns.
+      for (const sql of [
+        "SELECT id, email, password_hash, email_verified_at, status, created_at, updated_at, password_changed_at FROM users LIMIT 0",
+        "SELECT id, user_id, platform, name, created_at, last_seen_at, revoked_at FROM account_devices LIMIT 0",
+        "SELECT id, user_id, device_id, family_id, access_token_hash, access_expires_at, refresh_token_hash, created_at, last_seen_at, expires_at, rotated_at, revoked_at FROM account_sessions LIMIT 0",
+        "SELECT id, user_id, purpose, token_hash, created_at, expires_at, consumed_at FROM action_tokens LIMIT 0",
+        "SELECT id, user_id, device_id, action, created_at, metadata_json FROM audit_events LIMIT 0",
+        "SELECT id, user_id, recipient, template, action_token_id, created_at, available_at, attempts, sent_at, last_error FROM email_outbox LIMIT 0",
+      ]) this.database.query(sql).all();
+      this.database.exec("BEGIN IMMEDIATE");
+      begun = true;
+      const written = this.database.query("UPDATE readiness_probe SET id = 1 WHERE id = 1").run();
+      if (written.changes !== 1) return { database: "schema_mismatch", mail: "degraded" };
+      const failed = this.database.query("SELECT 1 FROM email_outbox WHERE sent_at IS NULL AND attempts > 0 LIMIT 1").get();
+      return { database: "ready", mail: failed ? "degraded" : "ready" };
+    } catch {
+      return { database: "unavailable", mail: "degraded" };
+    } finally {
+      if (begun) this.database.exec("ROLLBACK");
+    }
   }
 
   createUser(input: CreateUserInput): UserRecord {

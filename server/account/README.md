@@ -45,7 +45,7 @@ DESKLINK_ACCOUNT_PORT=3412 bun run start
 ## HTTP 检查
 
 - `GET /health`：进程存活检查，返回 `status: ok`。
-- `GET /ready`：数据库迁移已加载并可以接受请求时返回 `status: ready`。
+- `GET /ready`：校验 schema 版本和请求所需列，并通过回滚的短写事务验证数据库可写；SQLite 锁等待预算为 25ms，失败返回 503 / `not_ready`。输出仅含固定依赖状态，不返回路径、SQL、凭据或堆栈。`dependencies.mail: degraded` 表示存在邮件失败待处理，数据库仍健康时保持 200；探测不访问邮件 provider。
 
 生产环境只应通过反向代理暴露 HTTPS。反向代理需要正确传递 `X-Forwarded-For`，并且只能由可信代理写入该头；服务端会使用它进行账号接口限流。
 

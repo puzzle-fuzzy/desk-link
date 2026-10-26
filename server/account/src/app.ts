@@ -43,11 +43,17 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
           return new Response(null, { status: 204, headers: { ...cors, "x-request-id": id } });
         }
         const url = new URL(request.url);
-        if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/ready")) {
+        if (request.method === "GET" && url.pathname === "/ready") {
+          const dependencies = store.readiness();
+          const ready = dependencies.database === "ready";
+          return jsonResponse({ schema: 1, status: ready ? "ready" : "not_ready", service: "desklink-account", dependencies },
+            ready ? 200 : 503, id, cors);
+        }
+        if (request.method === "GET" && url.pathname === "/health") {
           return jsonResponse(
             {
               schema: 1,
-              status: url.pathname === "/ready" ? "ready" : "ok",
+              status: "ok",
               service: "desklink-account",
             },
             200,
