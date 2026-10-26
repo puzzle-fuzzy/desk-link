@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { DiagnosticStore } from "./store";
+import { DiagnosticMaintenance } from "./maintenance";
 import { BatchValidationError, MAX_BATCH_BYTES, verifyBatch } from "./validation";
 
 class SlidingWindowLimiter {
@@ -37,6 +38,8 @@ const port = parsePort(process.env.DESKLINK_DIAGNOSTICS_PORT ?? "3411");
 const databasePath = process.env.DESKLINK_DIAGNOSTICS_DATABASE ?? "/var/lib/desklink-diagnostics/diagnostics.sqlite";
 mkdirSync(dirname(databasePath), { recursive: true });
 const store = new DiagnosticStore(databasePath);
+const maintenance = new DiagnosticMaintenance(store);
+maintenance.start();
 const limiter = new SlidingWindowLimiter(12, 60_000);
 
 const server = Bun.serve({
@@ -46,7 +49,7 @@ const server = Bun.serve({
   async fetch(request, serverInstance) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ schema: 1, status: "ok", service: "desklink-diagnostics" });
+      return json({ schema: 1, status: "ok", service: "desklink-diagnostics", retention: maintenance.snapshot() });
     }
     if (request.method !== "POST" || url.pathname !== "/v1/batches") {
       return json({ error: "not_found" }, 404);
@@ -84,6 +87,17 @@ const server = Bun.serve({
 });
 
 console.log(`DeskLink diagnostics listening on http://${server.hostname}:${server.port}`);
+
+let stopping = false;
+async function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  maintenance.stop();
+  await server.stop();
+  store.close();
+}
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);
 
 function parsePort(value: string): number {
   const parsed = Number(value);

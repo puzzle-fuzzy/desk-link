@@ -9,6 +9,7 @@
     "probe:managed": "bun run src/probe.ts",
     "analyze": "bun run src/analyze.ts",
     "health-report": "bun run src/write-health-report.ts",
+    "benchmark:retention": "bun run src/retention-benchmark.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check": "bun test && tsc --noEmit"

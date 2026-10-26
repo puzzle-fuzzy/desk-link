@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { Database } from "bun:sqlite";
 
-import { DiagnosticStore } from "./store";
+import { DiagnosticStore, RETENTION_SECONDS } from "./store";
+import { DiagnosticMaintenance } from "./maintenance";
 import {
   BatchValidationError,
   SIGNATURE_DOMAIN,
@@ -73,6 +75,92 @@ describe("signed diagnostic ingestion", () => {
     } finally {
       store.close();
     }
+  });
+
+  test("retention uses indexes, stays bounded and preserves the exact 14 day boundary", () => {
+    const now = 2_000_000_000;
+    const cutoff = now - RETENTION_SECONDS;
+    const store = new DiagnosticStore(":memory:");
+    try {
+      const fixture = signedFixture();
+      const { batch } = verifyBatch(fixture.body, fixture.headers, fixture.now);
+      // Unique events are needed because deduplication intentionally spans batches.
+      for (let i = 0; i < 8; i++) {
+        store.insert(`expired-${i}`, { ...batch, events: [{ ...batch.events[0]!, timestamp_unix_ms: i }] }, "synthetic", cutoff - 1);
+      }
+      store.insert("boundary", { ...batch, events: [{ ...batch.events[0]!, timestamp_unix_ms: 10 }] }, "synthetic", cutoff);
+      store.insert("current", { ...batch, events: [{ ...batch.events[0]!, timestamp_unix_ms: 11 }] }, "synthetic", now);
+      for (const table of ["events", "batches"]) {
+        const plan = store.database.query(`EXPLAIN QUERY PLAN SELECT rowid FROM ${table}
+          WHERE received_at_unix_s < ? ORDER BY received_at_unix_s LIMIT ?`).all(cutoff, 3);
+        expect(JSON.stringify(plan)).toContain(`${table}_by_received_at`);
+        expect(JSON.stringify(plan)).not.toContain(`SCAN ${table}`);
+      }
+      const assertNoOrphans = () => expect(store.database.query(`SELECT COUNT(*) AS count FROM events e
+        LEFT JOIN batches b ON b.batch_id = e.batch_id WHERE b.batch_id IS NULL`).get()).toEqual({ count: 0 });
+      expect(store.purge(cutoff, 3)).toEqual({ events: 3, batches: 0, more: true });
+      assertNoOrphans();
+      expect(store.purge(cutoff, 3)).toEqual({ events: 3, batches: 0, more: true });
+      assertNoOrphans();
+      expect(store.purge(cutoff, 3)).toEqual({ events: 2, batches: 3, more: true });
+      assertNoOrphans();
+      expect(store.purge(cutoff, 3)).toEqual({ events: 0, batches: 3, more: true });
+      expect(store.purge(cutoff, 3)).toEqual({ events: 0, batches: 2, more: false });
+      expect(store.database.query("SELECT batch_id FROM batches ORDER BY batch_id").all()).toEqual([
+        { batch_id: "boundary" }, { batch_id: "current" },
+      ]);
+      expect(store.database.query("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 2 });
+      expect(() => store.purge(cutoff, 0)).toThrow(RangeError);
+    } finally { store.close(); }
+  });
+
+  test("ingestion does not delete history or depend on maintenance succeeding", () => {
+    const store = new DiagnosticStore(":memory:");
+    const maintenance = new DiagnosticMaintenance(store, () => 2_000_000_000);
+    try {
+      const fixture = signedFixture();
+      const { batch } = verifyBatch(fixture.body, fixture.headers, fixture.now);
+      store.insert("expired", batch, "synthetic", 1);
+      store.database.exec(`CREATE TRIGGER synthetic_purge_failure BEFORE DELETE ON events
+        BEGIN SELECT RAISE(ABORT, 'synthetic purge failure'); END;`);
+      expect(store.insert("new", { ...batch, events: [{ ...batch.events[0]!, timestamp_unix_ms: 1 }] }, "synthetic", 2_000_000_000))
+        .toEqual({ duplicate: false, acceptedEvents: 1 });
+      expect(maintenance.runOnce()).toBeUndefined();
+      expect(maintenance.snapshot()).toMatchObject({ state: "degraded", failures: 1 });
+      expect(JSON.stringify(maintenance.snapshot())).not.toContain("synthetic purge failure");
+      expect(store.database.query("SELECT COUNT(*) AS count FROM batches").get()).toEqual({ count: 2 });
+      store.database.exec("DROP TRIGGER synthetic_purge_failure");
+      expect(maintenance.runOnce()).toEqual({ events: 1, batches: 1, more: false });
+      expect(maintenance.snapshot()).toMatchObject({ state: "ok", failures: 1 });
+      maintenance.start();
+      maintenance.stop();
+      expect(maintenance.runOnce()).toBeUndefined();
+    } finally { maintenance.stop(); store.close(); }
+  });
+
+  test("file maintenance recovers from another writer and releases metric/checkpoint reads", () => {
+    const directory = mkdtempSync(join(tmpdir(), "desklink-retention-"));
+    directories.push(directory);
+    const path = join(directory, "events.sqlite");
+    let store = new DiagnosticStore(path);
+    // Exercise the startup upgrade path from an existing schema without indexes.
+    store.database.exec("DROP INDEX events_by_received_at; DROP INDEX batches_by_received_at");
+    store.close();
+    store = new DiagnosticStore(path);
+    const writer = new Database(path);
+    const maintenance = new DiagnosticMaintenance(store);
+    try {
+      expect(store.database.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE '%_by_received_at'").all())
+        .toHaveLength(2);
+      writer.exec("BEGIN IMMEDIATE");
+      expect(maintenance.runOnce()).toBeUndefined();
+      expect(maintenance.snapshot()).toMatchObject({ state: "degraded", failures: 1 });
+      writer.exec("ROLLBACK");
+      expect(maintenance.runOnce()).toEqual({ events: 0, batches: 0, more: false });
+      expect(maintenance.runOnce()).toEqual({ events: 0, batches: 0, more: false });
+      expect(maintenance.snapshot()).toMatchObject({ state: "ok", failures: 1 });
+      expect(maintenance.snapshot().databaseBytes).toBeGreaterThan(0);
+    } finally { maintenance.stop(); writer.close(); store.close(); }
   });
 
   test("rejects tampering, identities that do not match and secret-shaped text", () => {

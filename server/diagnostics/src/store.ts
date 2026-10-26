@@ -1,9 +1,17 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
 
 import type { DiagnosticBatch, DiagnosticEvent } from "./validation";
 
-const RETENTION_SECONDS = 14 * 24 * 60 * 60;
+export const RETENTION_SECONDS = 14 * 24 * 60 * 60;
+export const PURGE_BATCH_SIZE = 1_000;
+
+export interface PurgeResult {
+  events: number;
+  batches: number;
+  more: boolean;
+}
 
 export interface StoredBatchResult {
   duplicate: boolean;
@@ -13,10 +21,12 @@ export interface StoredBatchResult {
 export class DiagnosticStore {
   readonly database: Database;
 
-  constructor(path: string) {
+  constructor(private readonly path: string) {
     this.database = new Database(path, { create: true, strict: true });
     this.database.exec("PRAGMA journal_mode = WAL");
     this.database.exec("PRAGMA synchronous = NORMAL");
+    // Never wait on another writer from the ingestion event loop.
+    this.database.exec("PRAGMA busy_timeout = 0");
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS batches (
         batch_id TEXT PRIMARY KEY,
@@ -45,6 +55,10 @@ export class DiagnosticStore {
         ON events(correlation_id, timestamp_unix_ms);
       CREATE INDEX IF NOT EXISTS events_by_installation
         ON events(installation_id, timestamp_unix_ms);
+      CREATE INDEX IF NOT EXISTS events_by_received_at
+        ON events(received_at_unix_s);
+      CREATE INDEX IF NOT EXISTS batches_by_received_at
+        ON batches(received_at_unix_s);
     `);
   }
 
@@ -101,19 +115,62 @@ export class DiagnosticStore {
         acceptedEvents += Number(inserted.changes > 0);
       }
 
-      this.purge(receivedAtUnixS - RETENTION_SECONDS);
       return { duplicate: false, acceptedEvents };
     })();
   }
 
-  purge(beforeUnixS: number): void {
-    this.database.query("DELETE FROM events WHERE received_at_unix_s < ?").run(beforeUnixS);
-    this.database.query("DELETE FROM batches WHERE received_at_unix_s < ?").run(beforeUnixS);
+  // Each call holds the writer lock for at most two bounded deletes. Backlog is
+  // drained by independent maintenance ticks, never by an ingestion transaction.
+  purge(beforeUnixS: number, limit = PURGE_BATCH_SIZE): PurgeResult {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 5_000) {
+      throw new RangeError("diagnostic purge limit must be between 1 and 5000");
+    }
+    return this.database.transaction(() => {
+      const events = this.database.query(`DELETE FROM events WHERE rowid IN (
+        SELECT rowid FROM events WHERE received_at_unix_s < ?
+        ORDER BY received_at_unix_s LIMIT ?
+      )`).run(beforeUnixS, limit).changes;
+      // All events of a batch have its receipt timestamp. Keep deduplication
+      // markers until expired events have drained, so a bounded slice cannot
+      // leave events pointing at an already-deleted batch. This also avoids a
+      // correlated scan of every not-yet-drained batch on each maintenance tick.
+      const batches = events === limit ? 0 : this.database.query(`DELETE FROM batches WHERE rowid IN (
+        SELECT rowid FROM batches WHERE received_at_unix_s < ?
+        ORDER BY received_at_unix_s LIMIT ?
+      )`).run(beforeUnixS, limit).changes;
+      return { events, batches, more: events === limit || batches === limit };
+    })();
+  }
+
+  storageMetrics() {
+    // Read all rows to finish PRAGMA statements before a later checkpoint.
+    const scalar = (pragma: string) => {
+      const statement = this.database.prepare(pragma);
+      try { return Object.values(statement.all()[0]!)[0] as number; }
+      finally { statement.finalize(); }
+    };
+    const pageSize = scalar("PRAGMA page_size");
+    return {
+      databaseBytes: scalar("PRAGMA page_count") * pageSize,
+      reusableBytes: scalar("PRAGMA freelist_count") * pageSize,
+      walBytes: this.path === ":memory:" ? 0 : fileSize(`${this.path}-wal`),
+    };
+  }
+
+  checkpoint(): void {
+    // PASSIVE never waits for readers or writers. Free database pages are reused;
+    // shrinking the main file requires a separately scheduled offline VACUUM.
+    const statement = this.database.prepare("PRAGMA wal_checkpoint(PASSIVE)");
+    try { statement.all(); } finally { statement.finalize(); }
   }
 
   close(): void {
     this.database.close(false);
   }
+}
+
+function fileSize(path: string): number {
+  try { return statSync(path).size; } catch { return 0; }
 }
 
 function eventIdentifier(batch: DiagnosticBatch, event: DiagnosticEvent, payload: string): string {

@@ -1,0 +1,217 @@
+{
+  "schema": 1,
+  "date": "2026-10-26T05:45:32.001Z",
+  "bun": "1.3.14",
+  "platform": "win32",
+  "cpu": "13th Gen Intel(R) Core(TM) i7-13700KF",
+  "seedEventsPerPhase": 250000,
+  "seedBatchesPerPhase": 50000,
+  "payloadBytes": 401,
+  "retentionDays": 14,
+  "purgeBatchSize": 1000,
+  "note": "Local synthetic SQLite file test. Purge call wall time bounds writer-lock time, includes commit. Ingest timing excludes HTTP/signature verification. Fixed workload observed high-water is not an arbitrary-input disk cap. Main-file free pages are reused; no VACUUM was run.",
+  "runs": [
+    {
+      "kind": "prior-unindexed-full-delete",
+      "plans": [
+        {
+          "table": "events",
+          "plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 216,
+              "detail": "SCAN events"
+            },
+            {
+              "id": 18,
+              "parent": 0,
+              "notused": 0,
+              "detail": "USE TEMP B-TREE FOR ORDER BY"
+            }
+          ]
+        },
+        {
+          "table": "batches",
+          "plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 216,
+              "detail": "SCAN batches"
+            },
+            {
+              "id": 18,
+              "parent": 0,
+              "notused": 0,
+              "detail": "USE TEMP B-TREE FOR ORDER BY"
+            }
+          ]
+        }
+      ],
+      "ingestCallMs": {
+        "samples": 180,
+        "p50": 267.99060000000463,
+        "p95": 341.4357999999993,
+        "max": 457.3470000000016
+      },
+      "deletion": [
+        {
+          "cycle": 0,
+          "deletedEvents": 250000,
+          "deletedBatches": 50000,
+          "transactionCallMs": {
+            "samples": 1,
+            "p50": 2727.607100000001,
+            "p95": 2727.607100000001,
+            "max": 2727.607100000001
+          }
+        },
+        {
+          "cycle": 1,
+          "deletedEvents": 250000,
+          "deletedBatches": 50000,
+          "transactionCallMs": {
+            "samples": 1,
+            "p50": 2555.675199999998,
+            "p95": 2555.675199999998,
+            "max": 2555.675199999998
+          }
+        }
+      ],
+      "storage": [
+        {
+          "phase": "retained",
+          "databaseBytes": 168755200,
+          "reusableBytes": 0,
+          "walBytes": 7102912
+        },
+        {
+          "phase": "seed-0",
+          "databaseBytes": 337575936,
+          "reusableBytes": 0,
+          "walBytes": 7556112
+        },
+        {
+          "phase": "purged-0",
+          "databaseBytes": 337575936,
+          "reusableBytes": 158924800,
+          "walBytes": 176303072
+        },
+        {
+          "phase": "seed-1",
+          "databaseBytes": 337580032,
+          "reusableBytes": 0,
+          "walBytes": 176303072
+        },
+        {
+          "phase": "purged-1",
+          "databaseBytes": 337580032,
+          "reusableBytes": 158920704,
+          "walBytes": 176303072
+        }
+      ],
+      "finalEvents": {
+        "count": 251000
+      },
+      "finalBatches": {
+        "count": 50200
+      }
+    },
+    {
+      "kind": "indexed-bounded-maintenance",
+      "plans": [
+        {
+          "table": "events",
+          "plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 186,
+              "detail": "SEARCH events USING COVERING INDEX events_by_received_at (received_at_unix_s<?)"
+            }
+          ]
+        },
+        {
+          "table": "batches",
+          "plan": [
+            {
+              "id": 4,
+              "parent": 0,
+              "notused": 187,
+              "detail": "SEARCH batches USING COVERING INDEX batches_by_received_at (received_at_unix_s<?)"
+            }
+          ]
+        }
+      ],
+      "ingestCallMs": {
+        "samples": 180,
+        "p50": 0.15269999999873107,
+        "p95": 0.3312000000005355,
+        "max": 7.530799999993178
+      },
+      "deletion": [
+        {
+          "cycle": 0,
+          "deletedEvents": 250000,
+          "deletedBatches": 50000,
+          "transactionCallMs": {
+            "samples": 301,
+            "p50": 4.681199999991804,
+            "p95": 29.236200000006647,
+            "max": 112.47769999999582
+          }
+        },
+        {
+          "cycle": 1,
+          "deletedEvents": 250000,
+          "deletedBatches": 50000,
+          "transactionCallMs": {
+            "samples": 301,
+            "p50": 4.982700000007753,
+            "p95": 34.204899999997,
+            "max": 137.6872000000003
+          }
+        }
+      ],
+      "storage": [
+        {
+          "phase": "retained",
+          "databaseBytes": 173174784,
+          "reusableBytes": 0,
+          "walBytes": 7362472
+        },
+        {
+          "phase": "seed-0",
+          "databaseBytes": 346492928,
+          "reusableBytes": 0,
+          "walBytes": 7815672
+        },
+        {
+          "phase": "purged-0",
+          "databaseBytes": 346492928,
+          "reusableBytes": 163405824,
+          "walBytes": 7815672
+        },
+        {
+          "phase": "seed-1",
+          "databaseBytes": 346497024,
+          "reusableBytes": 0,
+          "walBytes": 7815672
+        },
+        {
+          "phase": "purged-1",
+          "databaseBytes": 346497024,
+          "reusableBytes": 163401728,
+          "walBytes": 7815672
+        }
+      ],
+      "finalEvents": {
+        "count": 251000
+      },
+      "finalBatches": {
+        "count": 50200
+      }
+    }
+  ]
+}
