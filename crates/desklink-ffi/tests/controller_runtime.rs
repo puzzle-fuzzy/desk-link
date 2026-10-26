@@ -6,11 +6,12 @@ use desklink_crypto::{
 use desklink_ffi::{ControllerEvent, ControllerRuntime};
 use desklink_protocol::{
     AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AudioCodec, AudioPacket, Codec, ControlMessage,
-    CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent,
-    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, TransferMessage,
-    TransferResult, VideoConfig, decode_control, decode_input, decode_noise_handshake,
-    decode_transfer, encode_audio_packet, encode_control, encode_cursor_update,
-    encode_noise_handshake, encode_transfer, encode_video_config, encode_video_packet,
+    CursorUpdate, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputContext,
+    InputEvent, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError,
+    TransferMessage, TransferResult, VideoConfig, decode_control, decode_input,
+    decode_noise_handshake, decode_transfer, encode_audio_packet, encode_control,
+    encode_cursor_update, encode_noise_handshake, encode_transfer, encode_video_config,
+    encode_video_packet,
 };
 use desklink_relay::{RelayConfig, RelayServer};
 use desklink_transport::{
@@ -87,6 +88,198 @@ async fn saved_direct_join_without_directory_still_rejects_protocol_12_noise() {
         ))
     ));
     let _host = host_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_sender_and_runtime_share_encrypted_sequence_without_adopting_a_new_context() {
+    let relay = spawn_test_relay().await;
+    let config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+    let host = QuicClient::connect(config()).await.unwrap();
+    let controller = QuicClient::connect(config()).await.unwrap();
+    let session = SessionId::from_bytes([121; 16]);
+    host.join(RelayJoin::host_with_participant(
+        session, [122; 32], [123; 16],
+    ))
+    .await
+    .unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session, [122; 32], [124; 16],
+        ))
+        .await
+        .unwrap();
+    let host_secret = [125; 32];
+    let host_key = DeviceIdentity::from_secret_key([103; 16], &host_secret).verify_key();
+    let identity = DeviceIdentity::from_secret_key([126; 16], &[127; 32]);
+    let controller_key = identity.verify_key();
+    let host_task = tokio::spawn(async move {
+        let mut secure = accept_reconnect_controller(&host, host_secret, controller_key).await;
+        for (stream_id, input_epoch) in [(9, 11), (10, 22)] {
+            let video = VideoConfig {
+                protocol_version: PROTOCOL_VERSION,
+                stream_id,
+                input_epoch,
+                config_version: 1,
+                codec: Codec::H264,
+                width: 1280,
+                height: 720,
+                sequence_header: vec![
+                    0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
+                ],
+            };
+            host.send_video_config(
+                secure
+                    .seal(
+                        SecureLane::VideoConfig,
+                        &encode_video_config(&video).unwrap(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut received = Vec::new();
+        for _ in 0..36 {
+            let ciphertext = tokio::time::timeout(Duration::from_secs(3), host.next_input())
+                .await
+                .unwrap()
+                .unwrap();
+            let plaintext = secure.open(SecureLane::Input, &ciphertext).unwrap();
+            received.push(decode_input(&plaintext, now_micros()).unwrap());
+        }
+        received
+    });
+    let mut runtime = ControllerRuntime::connect(controller, identity, host_key)
+        .await
+        .unwrap();
+    let sender = runtime.input_sender();
+    let event = InputEvent::MouseMove { x: 1, y: 1 };
+    // Invalid contexts fail before allocating a sequence or writing any frame.
+    for context in [
+        InputContext {
+            stream_id: 0,
+            input_epoch: 0,
+        },
+        InputContext {
+            stream_id: 9,
+            input_epoch: 0,
+        },
+        InputContext {
+            stream_id: 0,
+            input_epoch: 11,
+        },
+    ] {
+        assert!(matches!(
+            sender.send_input_with_context(context, event.clone()).await,
+            Err(desklink_ffi::ControllerError::Protocol(
+                ProtocolError::InvalidInput
+            ))
+        ));
+    }
+    assert!(matches!(
+        runtime.send_input(event.clone()).await,
+        Err(desklink_ffi::ControllerError::Protocol(
+            ProtocolError::InvalidInput
+        ))
+    ));
+    let original = match runtime.next_event().await.unwrap() {
+        ControllerEvent::VideoConfig(video) => InputContext {
+            stream_id: video.stream_id,
+            input_epoch: video.input_epoch,
+        },
+        event => panic!("expected initial config: {event:?}"),
+    };
+    runtime
+        .send_input_with_context(original, event)
+        .await
+        .unwrap();
+    // The owned sender can finish a captured input while Runtime mutably awaits
+    // a configuration update. No sender fetches that later context at send time.
+    let owned_sender = sender.clone();
+    let sending = async move {
+        owned_sender
+            .send_input_with_context(original, InputEvent::MouseMove { x: 2, y: 2 })
+            .await
+    };
+    let (sent, updated) = tokio::join!(sending, runtime.next_event());
+    sent.unwrap();
+    let updated = match updated.unwrap() {
+        ControllerEvent::VideoConfig(video) => InputContext {
+            stream_id: video.stream_id,
+            input_epoch: video.input_epoch,
+        },
+        event => panic!("expected updated config: {event:?}"),
+    };
+    assert_ne!(updated, original);
+    assert_eq!(runtime.active_stream_id(), Some(updated.stream_id));
+    sender
+        .send_input_with_context(updated, InputEvent::MouseMove { x: 3, y: 3 })
+        .await
+        .unwrap();
+    runtime
+        .send_input_with_context(original, InputEvent::MouseMove { x: 4, y: 4 })
+        .await
+        .unwrap();
+    let mut concurrent = tokio::task::JoinSet::new();
+    for index in 0..32 {
+        let sender = sender.clone();
+        let context = if index % 2 == 0 { original } else { updated };
+        concurrent.spawn(async move {
+            sender
+                .send_input_with_context(
+                    context,
+                    InputEvent::MouseMove {
+                        x: 100 + index,
+                        y: index,
+                    },
+                )
+                .await
+        });
+    }
+    while let Some(result) = concurrent.join_next().await {
+        result.unwrap().unwrap();
+    }
+    let received = host_task.await.unwrap();
+    assert_eq!(
+        received
+            .iter()
+            .map(|packet| packet.sequence)
+            .collect::<Vec<_>>(),
+        (1..=36).collect::<Vec<_>>()
+    );
+    for (index, context) in [original, original, updated, original]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(received[index].context(), context);
+        assert_eq!(
+            received[index].event,
+            InputEvent::MouseMove {
+                x: index as i32 + 1,
+                y: index as i32 + 1
+            }
+        );
+    }
+    let mut concurrent_positions = std::collections::BTreeSet::new();
+    for packet in &received[4..] {
+        let InputEvent::MouseMove { x, y } = packet.event else {
+            panic!("unexpected input")
+        };
+        let index = x - 100;
+        assert_eq!(y, index);
+        assert_eq!(
+            packet.context(),
+            if index % 2 == 0 { original } else { updated }
+        );
+        assert!(concurrent_positions.insert(index));
+    }
+    assert_eq!(concurrent_positions, (0..32).collect());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -262,10 +455,16 @@ async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypt
     );
 
     runtime
-        .send_input(InputEvent::MouseWheel {
-            delta_x: -120,
-            delta_y: 240,
-        })
+        .send_input_with_context(
+            desklink_protocol::InputContext {
+                stream_id: config.stream_id,
+                input_epoch: config.input_epoch,
+            },
+            InputEvent::MouseWheel {
+                delta_x: -120,
+                delta_y: 240,
+            },
+        )
         .await
         .unwrap();
     runtime.request_keyframe().await.unwrap();
@@ -346,7 +545,10 @@ async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(event, ControllerEvent::VideoConfig(_)));
+    let config = match event {
+        ControllerEvent::VideoConfig(config) => config,
+        event => panic!("expected config, got {event:?}"),
+    };
     continue_sender.send(()).unwrap();
     for _ in 0..8 {
         if runtime.video_path_fallback_reason().is_some() {
@@ -367,10 +569,16 @@ async fn controller_runtime_keeps_relay_video_after_direct_path_rejection() {
     );
 
     runtime
-        .send_input(InputEvent::MouseWheel {
-            delta_x: -30,
-            delta_y: 60,
-        })
+        .send_input_with_context(
+            desklink_protocol::InputContext {
+                stream_id: config.stream_id,
+                input_epoch: config.input_epoch,
+            },
+            InputEvent::MouseWheel {
+                delta_x: -30,
+                delta_y: 60,
+            },
+        )
         .await
         .unwrap();
     runtime.request_keyframe().await.unwrap();

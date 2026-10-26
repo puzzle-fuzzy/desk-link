@@ -25,15 +25,24 @@ impl Drop for MockRelay {
 }
 
 async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
+    spawn_mock_relay_with_transport(reject_join, quinn::TransportConfig::default(), true).await
+}
+
+async fn spawn_mock_relay_with_transport(
+    reject_join: bool,
+    transport: quinn::TransportConfig,
+    read_datagrams: bool,
+) -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
     let key_der = certificate.key_pair.serialize_der();
-    let server_config = ServerConfig::with_single_cert(
+    let mut server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
     )
     .unwrap();
+    server_config.transport_config(Arc::new(transport));
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(certificate_der)).unwrap();
     let client_tls = rustls::ClientConfig::builder()
@@ -91,37 +100,37 @@ async fn spawn_mock_relay(reject_join: bool) -> MockRelay {
                         if recv.read_exact(&mut header).await.is_err() {
                             return;
                         }
+                        let Ok((mut send, _recv)) = connection.open_bi().await else {
+                            return;
+                        };
+                        if send.write_all(&header[..1]).await.is_err()
+                            || send.write_all(&MOCK_PEER_GENERATION.to_be_bytes()).await.is_err()
+                        {
+                            return;
+                        }
                         loop {
                             let mut length = [0; 4];
                             if recv.read_exact(&mut length).await.is_err() {
-                                return;
+                                break;
                             }
                             let length = u32::from_be_bytes(length) as usize;
                             if length > MAX_RELIABLE_MESSAGE_BYTES {
-                                return;
+                                break;
                             }
                             let mut message = vec![0; length];
                             if recv.read_exact(&mut message).await.is_err() {
-                                return;
+                                break;
                             }
-                            let Ok((mut send, _recv)) = connection.open_bi().await else {
-                                return;
-                            };
-                            if send.write_all(&header[..1]).await.is_err()
-                                || send
-                                    .write_all(&MOCK_PEER_GENERATION.to_be_bytes())
-                                    .await
-                                    .is_err()
-                                || send.write_all(&(length as u32).to_be_bytes()).await.is_err()
+                            if send.write_all(&(length as u32).to_be_bytes()).await.is_err()
                                 || send.write_all(&message).await.is_err()
                             {
                                 return;
                             }
-                            let _ = send.finish();
                         }
+                        let _ = send.finish();
                     });
                 }
-                datagram = connection.read_datagram() => {
+                datagram = connection.read_datagram(), if read_datagrams => {
                     let Ok(datagram) = datagram else { return; };
                     if datagram.len() < 9 {
                         return;
@@ -573,6 +582,190 @@ async fn localhost_client_keeps_reliable_channels_separate_and_forwards_datagram
     assert!(events.contains(&TransportEvent::AudioDatagram(vec![18, 19, 20, 249])));
 }
 
+async fn establish_mock_peer_generation(client: &QuicClient) {
+    client.send_control(vec![0x44]).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_control_with_generation()
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        (MOCK_PEER_GENERATION, vec![0x44]),
+    );
+}
+
+async fn assert_mock_reliable_lanes_work(client: &QuicClient) {
+    client
+        .send_control_for_generation(MOCK_PEER_GENERATION, vec![0xc0])
+        .await
+        .unwrap();
+    client.send_input(vec![0x12]).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_control_for_generation(MOCK_PEER_GENERATION)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        vec![0xc0],
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_input_for_generation(MOCK_PEER_GENERATION)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        vec![0x12],
+    );
+}
+
+#[tokio::test]
+async fn cursor_datagram_unsupported_by_peer_does_not_disable_reliable_input_or_control() {
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(None);
+    let relay = spawn_mock_relay_with_transport(false, transport, false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    establish_mock_peer_generation(&client).await;
+    let error = client
+        .send_cursor_datagram_for_generation(MOCK_PEER_GENERATION, vec![1])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        TransportError::Datagram(quinn::SendDatagramError::UnsupportedByPeer.to_string())
+    );
+    assert_mock_reliable_lanes_work(&client).await;
+}
+
+#[tokio::test]
+async fn cursor_datagram_peer_size_limit_is_a_datagram_error_below_preflight_maximum() {
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(64));
+    let relay = spawn_mock_relay_with_transport(false, transport, true).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    establish_mock_peer_generation(&client).await;
+    // This payload passes DeskLink's 1200-byte preflight, but its framed QUIC
+    // DATAGRAM exceeds the peer's real advertised 64-byte receive limit.
+    let error = client
+        .send_cursor_datagram_for_generation(MOCK_PEER_GENERATION, vec![0; 64])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        TransportError::Datagram(quinn::SendDatagramError::TooLarge.to_string())
+    );
+    assert_mock_reliable_lanes_work(&client).await;
+}
+
+#[tokio::test]
+async fn cursor_send_preflight_and_connection_errors_are_not_optional_datagram_failures() {
+    let relay = spawn_mock_relay(false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        client
+            .send_cursor_datagram_for_generation(MOCK_PEER_GENERATION, vec![1])
+            .await,
+        Err(TransportError::NotJoined)
+    );
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    establish_mock_peer_generation(&client).await;
+    assert_eq!(
+        client
+            .send_cursor_datagram_for_generation(MOCK_PEER_GENERATION + 1, vec![1])
+            .await,
+        Err(TransportError::PeerReplaced)
+    );
+    assert!(matches!(
+        client
+            .send_cursor_datagram_for_generation(
+                MOCK_PEER_GENERATION,
+                vec![0; MAX_DATAGRAM_BYTES + 1]
+            )
+            .await,
+        Err(TransportError::MessageTooLarge { .. })
+    ));
+    client.close(b"cursor error category test");
+    assert!(matches!(
+        client
+            .send_cursor_datagram_for_generation(MOCK_PEER_GENERATION, vec![1])
+            .await,
+        Err(TransportError::Connection(_))
+    ));
+}
+
+#[tokio::test]
+async fn tiny_real_quinn_send_buffer_accepts_cursor_pressure_and_reliable_lanes_still_work() {
+    let relay = spawn_mock_relay(false).await;
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_send_buffer_size(1);
+    let mut client_config = relay.client_config.clone();
+    client_config.transport_config(Arc::new(transport));
+    // QuicClient::connect currently installs its own transport configuration.
+    // Use raw Quinn here to verify the pinned dependency's actual send-buffer
+    // semantics without claiming a configurable QuicClient buffer or wire loss.
+    let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let connection = endpoint
+        .connect_with(client_config, relay.address, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut receive) = connection.open_bi().await.unwrap();
+    let envelope = join(DeviceRole::Host).encode();
+    send.write_all(&(envelope.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    send.write_all(&envelope).await.unwrap();
+    send.finish().unwrap();
+    let mut acknowledgement = [0xff];
+    receive.read_exact(&mut acknowledgement).await.unwrap();
+    assert_eq!(acknowledgement, [0]);
+    // No await occurs in this burst, so the single-thread runtime cannot drain
+    // the outgoing queue between sends. Pressure still returns Ok, not QueueFull.
+    for sequence in 0_u16..1000 {
+        let mut frame = vec![5];
+        frame.extend_from_slice(&MOCK_PEER_GENERATION.to_be_bytes());
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        connection.send_datagram(frame.into()).unwrap();
+        assert_eq!(connection.datagram_send_buffer_space(), 0);
+    }
+    for channel in [1_u8, 2] {
+        let payload = [channel, 0x44];
+        let (mut send, _receive) = connection.open_bi().await.unwrap();
+        send.write_all(&[channel]).await.unwrap();
+        send.write_all(&MOCK_PEER_GENERATION.to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+        let (_send, mut receive) =
+            tokio::time::timeout(Duration::from_secs(2), connection.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut header = [0; 9];
+        receive.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], channel);
+        assert_eq!(&header[1..], MOCK_PEER_GENERATION.to_be_bytes());
+        let mut length = [0; 4];
+        receive.read_exact(&mut length).await.unwrap();
+        assert_eq!(u32::from_be_bytes(length), payload.len() as u32);
+        let mut received = [0; 2];
+        receive.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+    }
+    connection.close(0_u32.into(), b"tiny send buffer test complete");
+}
+
 #[tokio::test]
 async fn stalled_control_channel_does_not_block_input_channel() {
     let relay = spawn_stalled_reliable_relay(1).await;
@@ -850,6 +1043,85 @@ async fn input_flood_does_not_starve_control_delivery() {
         }
     }
     assert!(saw_control, "control was starved by the input flood");
+}
+
+#[tokio::test]
+async fn pausing_transfer_ingress_keeps_media_and_control_live_then_restores_transfer_order() {
+    let relay = spawn_mock_relay(false).await;
+    let client = QuicClient::connect(config(&relay)).await.unwrap();
+    client.join(join(DeviceRole::Host)).await.unwrap();
+    client.send_transfer(vec![0xa1]).await.unwrap();
+    // Exercise the awaiting receive path as well as the already-buffered scan:
+    // an arriving transfer must remain unread while that lane is paused.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            client.next_event_with_transfer(false)
+        )
+        .await
+        .is_err()
+    );
+    client.send_transfer(vec![0xa2]).await.unwrap();
+    client.send_control(vec![0xc1]).await.unwrap();
+    client.send_input(vec![0x11]).await.unwrap();
+    client.send_video_datagram(vec![0x71]).await.unwrap();
+    client.send_audio_datagram(vec![0x81]).await.unwrap();
+    let mut control = false;
+    let mut input = false;
+    let mut video = false;
+    let mut audio = false;
+    for _ in 0..12 {
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_event_with_transfer(false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match event {
+            TransportEvent::Control(bytes) => {
+                assert_eq!(bytes, [0xc1]);
+                control = true;
+            }
+            TransportEvent::Input(bytes) => {
+                assert_eq!(bytes, [0x11]);
+                input = true;
+            }
+            TransportEvent::VideoDatagram(bytes) => {
+                assert_eq!(bytes, [0x71]);
+                video = true;
+            }
+            TransportEvent::AudioDatagram(bytes) => {
+                assert_eq!(bytes, [0x81]);
+                audio = true;
+            }
+            TransportEvent::PeerDisconnected { .. } => {} // This echo fixture finishes each message stream.
+            other => panic!("paused transfer displaced a live media/control lane: {other:?}"),
+        }
+        if control && input && video && audio {
+            break;
+        }
+    }
+    assert!(control && input && video && audio);
+    let mut transfers = Vec::new();
+    for _ in 0..12 {
+        let event = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.next_event_with_transfer(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match event {
+            TransportEvent::Transfer(bytes) => transfers.push(bytes),
+            TransportEvent::PeerDisconnected { .. } => {}
+            other => panic!("unexpected event while resuming transfer: {other:?}"),
+        }
+        if transfers.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(transfers, [vec![0xa1], vec![0xa2]]);
 }
 
 #[tokio::test]

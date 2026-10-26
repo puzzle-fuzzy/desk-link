@@ -1,4 +1,5 @@
 @import "./remote.css";
+@import "./remote-shortcuts.css";
 
 /* Structure and spacing. Theme lives in base.css. */
 * { box-sizing: border-box; }

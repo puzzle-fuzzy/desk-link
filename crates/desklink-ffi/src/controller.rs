@@ -12,12 +12,12 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioPacket, Codec, ControlMessage, CursorUpdate, DeviceCapabilities,
-    DeviceRole, DirectLanCandidate, H264Profile, InputEnvelope, InputEvent, NoiseHandshake,
-    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage, VideoConfig,
-    VideoPacket, VideoQualityPreference, decode_audio_packet, decode_control, decode_cursor_update,
-    decode_noise_handshake, decode_transfer, decode_video_config, decode_video_packet,
-    decode_video_reliable_batch, encode_control, encode_input, encode_noise_handshake,
-    encode_transfer,
+    DeviceRole, DirectLanCandidate, H264Profile, InputContext, InputEnvelope, InputEvent,
+    NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, TransferMessage,
+    VideoConfig, VideoPacket, VideoQualityPreference, decode_audio_packet, decode_control,
+    decode_cursor_update, decode_noise_handshake, decode_transfer, decode_video_config,
+    decode_video_packet, decode_video_reliable_batch, encode_control, encode_input,
+    encode_noise_handshake, encode_transfer,
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{
@@ -138,7 +138,7 @@ impl AtomicControllerMetrics {
 pub struct ControllerRuntime {
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
-    input_sequence: Mutex<InputSequencer>,
+    input_sequence: Arc<Mutex<InputSequencer>>,
     assembler: FrameAssembler,
     reliable_assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
@@ -154,6 +154,33 @@ pub struct ControllerRuntime {
     video_path: DirectVideoPathMachine,
     direct_session: Option<DirectLanSession>,
     direct_connection: Option<Arc<DirectLanConnection>>,
+}
+
+#[derive(Clone)]
+pub struct ControllerInputSender {
+    client: Arc<QuicClient>,
+    secure: Arc<Mutex<SecureSession>>,
+    input_sequence: Arc<Mutex<InputSequencer>>,
+}
+
+impl ControllerInputSender {
+    /// Sends exactly the context captured when input was admitted. The sender
+    /// does not adopt a newer presentation epoch or cancel an in-flight frame
+    /// when that epoch changes; the owning session controls cancellation.
+    pub async fn send_input_with_context(
+        &self,
+        context: InputContext,
+        event: InputEvent,
+    ) -> Result<(), ControllerError> {
+        send_session_input(
+            &self.client,
+            &self.secure,
+            &self.input_sequence,
+            context,
+            event,
+        )
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -244,7 +271,7 @@ impl ControllerRuntime {
         Ok(Self {
             client,
             secure,
-            input_sequence: Mutex::new(InputSequencer::new()),
+            input_sequence: Arc::new(Mutex::new(InputSequencer::new())),
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
             reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, RELIABLE_ASSEMBLY_MAX_AGE),
             video_config: None,
@@ -309,18 +336,41 @@ impl ControllerRuntime {
     }
 
     pub async fn send_input(&self, event: InputEvent) -> Result<(), ControllerError> {
-        let sequence = self.input_sequence.lock().await.next_sequence();
-        let plaintext = encode_input(&InputEnvelope {
-            sequence,
-            timestamp_us: now_micros(),
-            // Fail closed until callers supply the captured presentation context.
-            stream_id: 0,
-            input_epoch: 0,
+        // Legacy callers are deliberately fail-closed until they capture a
+        // presentation context. No network command acquires a current epoch.
+        self.send_input_with_context(
+            InputContext {
+                stream_id: 0,
+                input_epoch: 0,
+            },
             event,
-        })?;
-        let ciphertext = seal(&self.secure, SecureLane::Input, &plaintext).await?;
-        self.client.send_input(ciphertext).await?;
-        Ok(())
+        )
+        .await
+    }
+
+    pub async fn send_input_with_context(
+        &self,
+        context: InputContext,
+        event: InputEvent,
+    ) -> Result<(), ControllerError> {
+        send_session_input(
+            &self.client,
+            &self.secure,
+            &self.input_sequence,
+            context,
+            event,
+        )
+        .await
+    }
+
+    /// Clone the input lane once for a session-owned send future that can run
+    /// alongside `next_event`. Runtime and all clones share one wire sequence.
+    pub fn input_sender(&self) -> ControllerInputSender {
+        ControllerInputSender {
+            client: self.client.clone(),
+            secure: self.secure.clone(),
+            input_sequence: self.input_sequence.clone(),
+        }
     }
 
     pub async fn request_keyframe(&self) -> Result<(), ControllerError> {
@@ -391,6 +441,13 @@ impl ControllerRuntime {
     }
 
     pub async fn next_event(&mut self) -> Result<ControllerEvent, ControllerError> {
+        self.next_event_with_transfer(true).await
+    }
+
+    pub async fn next_event_with_transfer(
+        &mut self,
+        include_transfer: bool,
+    ) -> Result<ControllerEvent, ControllerError> {
         loop {
             if self.video_config.is_some()
                 && let Some(ciphertext) = self.pending_video_reliable.pop_front()
@@ -411,7 +468,7 @@ impl ControllerRuntime {
             let transport_event = if let Some(deadline) = self.keyframe_fallback_deadline {
                 match tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
-                    self.next_transport_event(),
+                    self.next_transport_event(include_transfer),
                 )
                 .await
                 {
@@ -430,7 +487,7 @@ impl ControllerRuntime {
                     }
                 }
             } else {
-                self.next_transport_event().await?
+                self.next_transport_event(include_transfer).await?
             };
             match transport_event {
                 TransportEvent::Control(ciphertext) => {
@@ -758,13 +815,16 @@ impl ControllerRuntime {
         }
     }
 
-    async fn next_transport_event(&mut self) -> Result<TransportEvent, ControllerError> {
+    async fn next_transport_event(
+        &mut self,
+        include_transfer: bool,
+    ) -> Result<TransportEvent, ControllerError> {
         loop {
             if let Some(connection) = self.direct_connection.clone() {
                 let silence_timeout = tokio::time::sleep(DIRECT_VIDEO_SILENCE_TIMEOUT);
                 tokio::pin!(silence_timeout);
                 tokio::select! {
-                    relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                    relay = self.client.next_event_with_transfer(include_transfer) => return relay.map_err(ControllerError::from),
                         direct = connection.recv_datagram() => match direct {
                             Ok(bytes) => return Ok(TransportEvent::VideoDatagram(bytes)),
                             Err(_) => {
@@ -786,7 +846,7 @@ impl ControllerRuntime {
             let Some(session) = self.direct_session.as_ref() else {
                 return self
                     .client
-                    .next_event()
+                    .next_event_with_transfer(include_transfer)
                     .await
                     .map_err(ControllerError::from);
             };
@@ -794,7 +854,7 @@ impl ControllerRuntime {
             let expected_candidate_id = session.candidate().candidate_id();
             let expected_binding = *session.session_binding();
             tokio::select! {
-                relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                relay = self.client.next_event_with_transfer(include_transfer) => return relay.map_err(ControllerError::from),
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else {
                         self.direct_session = None;
@@ -1106,6 +1166,30 @@ async fn send_control(
     client
         .send_control(seal(secure, SecureLane::Control, &plaintext).await?)
         .await?;
+    Ok(())
+}
+
+async fn send_session_input(
+    client: &QuicClient,
+    secure: &Arc<Mutex<SecureSession>>,
+    input_sequence: &Mutex<InputSequencer>,
+    context: InputContext,
+    event: InputEvent,
+) -> Result<(), ControllerError> {
+    context.validate()?;
+    // This input-only guard preserves allocation and wire order across Runtime
+    // and cloned senders. The crypto guard inside seal is released before I/O.
+    let mut sequence = input_sequence.lock().await;
+    let plaintext = encode_input(&InputEnvelope {
+        sequence: sequence.next_sequence(),
+        timestamp_us: now_micros(),
+        stream_id: context.stream_id,
+        input_epoch: context.input_epoch,
+        event,
+    })?;
+    let ciphertext = seal(secure, SecureLane::Input, &plaintext).await?;
+    client.send_input(ciphertext).await?;
+    drop(sequence);
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 export interface VideoPullKey {
-  streamId: number;
+  streamId: string;
   configVersion: number;
 }
 

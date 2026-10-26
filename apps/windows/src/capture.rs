@@ -1,6 +1,16 @@
+#[cfg(any(windows, test))]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use desklink_session::DesktopRect;
+
+#[cfg(windows)]
+mod readback;
+#[cfg(windows)]
+use readback::TextureReadback;
+
+mod topology;
+pub use topology::DisplayTopologySnapshot;
 
 #[derive(Clone, Debug)]
 pub struct CapturedFrame {
@@ -34,12 +44,71 @@ pub struct DxgiDesktopCapturer {
     /// Desktop Duplication only reports changed frames. Keep a one-shot
     /// fallback so a static desktop still produces the first remote frame.
     initial_snapshot_pending: bool,
+    dxgi_recovery: DxgiRecoverySchedule,
+    readback: TextureReadback,
 }
 
 #[cfg(windows)]
 enum WindowsCaptureBackend {
     Dxgi(windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication),
     Gdi,
+}
+
+/// Limit expensive device recreation to a small burst, then leave the working
+/// GDI path alone for a cooldown. A successful constructor is not recovery:
+/// only a real acquired DXGI frame is enough to switch back.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct DxgiRecoverySchedule {
+    not_before: Instant,
+    failed_attempts: u32,
+    restored_at: Option<Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl DxgiRecoverySchedule {
+    const FAILURE_BUDGET: u32 = 6;
+    const COOLDOWN: Duration = Duration::from_secs(60);
+    const STABILITY_WINDOW: Duration = Duration::from_secs(30);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            not_before: now + Duration::from_secs(1),
+            failed_attempts: 0,
+            restored_at: None,
+        }
+    }
+
+    fn probe_due(&self, now: Instant) -> bool {
+        now >= self.not_before
+    }
+
+    fn failed_probe(&mut self, now: Instant) {
+        self.failed_attempts += 1;
+        let delay = if self.failed_attempts >= Self::FAILURE_BUDGET {
+            self.failed_attempts = 0;
+            Self::COOLDOWN
+        } else {
+            Duration::from_secs(1_u64 << self.failed_attempts)
+        };
+        self.not_before = now + delay;
+    }
+
+    fn restored(&mut self, now: Instant) {
+        self.restored_at = Some(now);
+    }
+
+    fn fell_back(&mut self, now: Instant) {
+        self.not_before = now
+            + if self.restored_at.is_some_and(|restored| {
+                now.saturating_duration_since(restored) < Self::STABILITY_WINDOW
+            }) {
+                Self::COOLDOWN
+            } else {
+                Duration::from_secs(1)
+            };
+        self.restored_at = None;
+    }
 }
 
 #[cfg(not(windows))]
@@ -57,6 +126,98 @@ pub struct DisplayDescriptor {
     pub name: String,
     pub rect: DesktopRect,
     pub primary: bool,
+}
+
+/// A display ID belongs to a monitor interface for the lifetime of this process,
+/// including periods when that monitor is unplugged. Never recycle an ID for a
+/// different monitor: a delayed SelectDisplay must fail rather than select a
+/// newly attached output which inherited an enumeration position.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct DisplayIdentityRegistry {
+    identities: Vec<Vec<u16>>,
+}
+
+#[cfg(any(windows, test))]
+impl DisplayIdentityRegistry {
+    const CAPACITY: usize = 1024;
+
+    fn id_for(&mut self, identity: &[u16]) -> Result<u32, CaptureError> {
+        let end = identity
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(identity.len());
+        if end == 0 {
+            return Err(CaptureError::Native(
+                "monitor interface identity is empty".into(),
+            ));
+        }
+        let identity = identity[..end]
+            .iter()
+            .map(|unit| {
+                if (u16::from(b'a')..=u16::from(b'z')).contains(unit) {
+                    *unit - u16::from(b'a' - b'A')
+                } else {
+                    *unit
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = self.identities.iter().position(|known| *known == identity) {
+            return Ok(index as u32 + 1);
+        }
+        if self.identities.len() == Self::CAPACITY {
+            return Err(CaptureError::Native(
+                "monitor interface identity capacity exhausted".into(),
+            ));
+        }
+        self.identities.push(identity);
+        Ok(self.identities.len() as u32)
+    }
+}
+
+#[cfg(windows)]
+fn display_id_for_output(
+    description: &windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC,
+) -> Result<u32, CaptureError> {
+    use std::{
+        mem::size_of,
+        sync::{Mutex, OnceLock},
+    };
+    use windows::{
+        Win32::{
+            Graphics::Gdi::{DISPLAY_DEVICEW, EnumDisplayDevicesW},
+            UI::WindowsAndMessaging::EDD_GET_DEVICE_INTERFACE_NAME,
+        },
+        core::PCWSTR,
+    };
+
+    static IDENTITIES: OnceLock<Mutex<DisplayIdentityRegistry>> = OnceLock::new();
+    let mut monitor = DISPLAY_DEVICEW {
+        cb: size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    // EDD_GET_DEVICE_INTERFACE_NAME gives the per-monitor OS interface path;
+    // DeviceName by itself is a temporary desktop source such as DISPLAY1.
+    // https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-enumdisplaydevicesw
+    if !unsafe {
+        EnumDisplayDevicesW(
+            PCWSTR(description.DeviceName.as_ptr()),
+            0,
+            &mut monitor,
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+    }
+    .as_bool()
+    {
+        return Err(CaptureError::Native(
+            "monitor interface identity is unavailable".into(),
+        ));
+    }
+    IDENTITIES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .id_for(&monitor.DeviceID)
 }
 
 impl DxgiDesktopCapturer {
@@ -115,6 +276,19 @@ impl DxgiDesktopCapturer {
         self.display_id
     }
 
+    /// Capture an owned image only when recovery needs a frame on an otherwise
+    /// idle desktop. Normal frame production remains driven by DXGI changes.
+    pub fn snapshot_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        #[cfg(windows)]
+        {
+            capture_gdi_frame(self.desktop_rect)
+        }
+        #[cfg(not(windows))]
+        {
+            self.next_frame(Duration::from_millis(1))
+        }
+    }
+
     #[cfg(windows)]
     fn new_dxgi_primary() -> Result<Self, CaptureError> {
         use windows::Win32::Foundation::HMODULE;
@@ -170,6 +344,8 @@ impl DxgiDesktopCapturer {
             ),
             display_id,
             initial_snapshot_pending: true,
+            dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
+            readback: TextureReadback::default(),
         })
     }
 
@@ -221,19 +397,20 @@ impl DxgiDesktopCapturer {
             ),
             display_id,
             initial_snapshot_pending: true,
+            dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
+            readback: TextureReadback::default(),
         })
     }
 
     #[cfg(windows)]
     fn new_gdi_primary() -> Result<Self, CaptureError> {
-        let topology = display_topology()?;
-        Ok(Self {
-            backend: WindowsCaptureBackend::Gdi,
-            dimensions: (topology.primary.width, topology.primary.height),
-            desktop_rect: topology.primary,
-            display_id: 0,
-            initial_snapshot_pending: false,
-        })
+        let displays = available_displays()?;
+        let primary = displays
+            .iter()
+            .find(|display| display.primary)
+            .or_else(|| displays.first())
+            .ok_or(CaptureError::NoDisplay)?;
+        Self::new_gdi_display(primary.id)
     }
 
     #[cfg(windows)]
@@ -248,12 +425,48 @@ impl DxgiDesktopCapturer {
             desktop_rect: display.rect,
             display_id,
             initial_snapshot_pending: false,
+            dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
+            readback: TextureReadback::default(),
         })
     }
 
     #[cfg(not(windows))]
     pub fn mark_access_lost(&mut self) {
         self.access_lost = true;
+    }
+
+    #[cfg(windows)]
+    fn try_restore_dxgi(&mut self) -> Option<CapturedFrame> {
+        let now = Instant::now();
+        if !self.dxgi_recovery.probe_due(now) {
+            return None;
+        }
+        let recovered = Self::new_dxgi_display(self.display_id).and_then(|mut candidate| {
+            if candidate.desktop_rect != self.desktop_rect {
+                // Topology changes need the runtime's coordinated encoder/input
+                // reconfiguration. A backend probe must not change coordinates
+                // behind that owner, even when it finds a usable duplication.
+                return Err(CaptureError::Native(
+                    "DXGI recovery awaits coordinated display topology refresh".into(),
+                ));
+            }
+            // Do not mistake the initial GDI snapshot for a successful DXGI probe.
+            candidate.initial_snapshot_pending = false;
+            let frame = candidate.next_frame(Duration::from_millis(1))?;
+            Ok((candidate, frame))
+        });
+        match recovered {
+            Ok((mut candidate, frame)) => {
+                candidate.dxgi_recovery = self.dxgi_recovery;
+                candidate.dxgi_recovery.restored(Instant::now());
+                *self = candidate;
+                Some(frame)
+            }
+            Err(_) => {
+                self.dxgi_recovery.failed_probe(Instant::now());
+                None
+            }
+        }
     }
 }
 
@@ -273,7 +486,6 @@ unsafe fn find_primary_output() -> Result<
 
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(native_error)?;
     let mut fallback: Option<(u32, IDXGIAdapter1, IDXGIOutput, _)> = None;
-    let mut display_id = 0;
     let mut adapter_index = 0;
     loop {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
@@ -290,6 +502,7 @@ unsafe fn find_primary_output() -> Result<
             };
             let description = unsafe { output.GetDesc() }.map_err(native_error)?;
             if description.AttachedToDesktop.as_bool() {
+                let display_id = display_id_for_output(&description)?;
                 let coordinates = description.DesktopCoordinates;
                 let contains_primary_origin = coordinates.left <= 0
                     && coordinates.top <= 0
@@ -301,7 +514,6 @@ unsafe fn find_primary_output() -> Result<
                 if fallback.is_none() {
                     fallback = Some((display_id, adapter.clone(), output, description));
                 }
-                display_id = display_id.saturating_add(1);
             }
             output_index += 1;
         }
@@ -324,7 +536,6 @@ unsafe fn find_display_output(
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1};
 
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(native_error)?;
-    let mut display_id = 0;
     let mut adapter_index = 0;
     loop {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
@@ -341,10 +552,10 @@ unsafe fn find_display_output(
             };
             let description = unsafe { output.GetDesc() }.map_err(native_error)?;
             if description.AttachedToDesktop.as_bool() {
+                let display_id = display_id_for_output(&description)?;
                 if display_id == requested_id {
                     return Ok((adapter, output, description));
                 }
-                display_id = display_id.saturating_add(1);
             }
             output_index += 1;
         }
@@ -379,13 +590,22 @@ pub fn available_displays() -> Result<Vec<DisplayDescriptor>, CaptureError> {
                 let width = (coordinates.right - coordinates.left) as u32;
                 let height = (coordinates.bottom - coordinates.top) as u32;
                 if width > 0 && height > 0 {
+                    let display_id = display_id_for_output(&description)?;
+                    if displays
+                        .iter()
+                        .any(|display: &DisplayDescriptor| display.id == display_id)
+                    {
+                        return Err(CaptureError::Native(
+                            "multiple outputs share a monitor interface identity".into(),
+                        ));
+                    }
                     let end = description
                         .DeviceName
                         .iter()
                         .position(|character| *character == 0)
                         .unwrap_or(description.DeviceName.len());
                     displays.push(DisplayDescriptor {
-                        id: displays.len() as u32,
+                        id: display_id,
                         name: String::from_utf16_lossy(&description.DeviceName[..end]),
                         rect: DesktopRect::new(coordinates.left, coordinates.top, width, height),
                         primary: coordinates.left <= 0
@@ -480,9 +700,15 @@ impl DesktopCapturer for DxgiDesktopCapturer {
                 return Err(CaptureError::Timeout);
             }
             let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-            let WindowsCaptureBackend::Dxgi(duplication) = &self.backend else {
+            if matches!(&self.backend, WindowsCaptureBackend::Gdi) {
+                if let Some(frame) = self.try_restore_dxgi() {
+                    return Ok(frame);
+                }
                 std::thread::sleep(timeout.min(Duration::from_millis(33)));
                 return capture_gdi_frame(self.desktop_rect);
+            }
+            let WindowsCaptureBackend::Dxgi(duplication) = &self.backend else {
+                unreachable!()
             };
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
@@ -509,7 +735,8 @@ impl DesktopCapturer for DxgiDesktopCapturer {
                 .ok_or_else(|| CaptureError::Native("DXGI returned no desktop resource".into()))
                 .and_then(|resource| resource.cast::<ID3D11Texture2D>().map_err(native_error))
                 .and_then(|texture| {
-                    copy_texture_pixels(&texture, self.dimensions.0, self.dimensions.1)
+                    self.readback
+                        .copy_pixels(&texture, self.dimensions.0, self.dimensions.1)
                 });
             let release_result = unsafe { duplication.ReleaseFrame() };
             let pixels = pixels?;
@@ -553,11 +780,14 @@ impl DesktopCapturer for DxgiDesktopCapturer {
         {
             // A DXGI duplication object can be created successfully and still fail on the
             // first acquired frame on hybrid-GPU, locked, RDP, or recently resumed desktops.
-            // Retrying `new_primary` would select DXGI again and loop forever. Once a live DXGI
-            // backend fails, deliberately downgrade this runtime to the slower but much more
-            // compatible GDI path. A failing GDI backend is terminal for this controller attempt.
+            // Retain reliable GDI capture while bounded, backed-off probes try a real DXGI
+            // frame. A constructor alone is insufficient evidence that a driver recovered.
+            // A failing GDI backend remains terminal for this controller attempt.
             if matches!(&self.backend, WindowsCaptureBackend::Dxgi(_)) {
-                *self = Self::new_gdi_display(self.display_id)?;
+                let mut fallback = Self::new_gdi_display(self.display_id)?;
+                fallback.dxgi_recovery = self.dxgi_recovery;
+                fallback.dxgi_recovery.fell_back(Instant::now());
+                *self = fallback;
             } else {
                 return Err(CaptureError::Native(
                     "GDI desktop capture failed after DXGI fallback".into(),
@@ -681,90 +911,6 @@ fn capture_gdi_frame(desktop: DesktopRect) -> Result<CapturedFrame, CaptureError
 }
 
 #[cfg(windows)]
-fn copy_texture_pixels(
-    texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, CaptureError> {
-    use std::slice;
-
-    use windows::Win32::Graphics::{
-        Direct3D11::{
-            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
-            D3D11_USAGE_STAGING, ID3D11Texture2D,
-        },
-        Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
-    };
-
-    let mut description = D3D11_TEXTURE2D_DESC::default();
-    unsafe { texture.GetDesc(&mut description) };
-    if description.Width != width || description.Height != height {
-        return Err(CaptureError::Native(
-            "DXGI desktop texture dimensions changed unexpectedly".into(),
-        ));
-    }
-    if !matches!(
-        description.Format,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-    ) {
-        return Err(CaptureError::Native(format!(
-            "unsupported DXGI desktop texture format: {:?}",
-            description.Format
-        )));
-    }
-
-    let device = unsafe { texture.GetDevice() }.map_err(native_error)?;
-    let context = unsafe { device.GetImmediateContext() }.map_err(native_error)?;
-    description.Usage = D3D11_USAGE_STAGING;
-    description.BindFlags = 0;
-    description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-    description.MiscFlags = 0;
-    let mut staging: Option<ID3D11Texture2D> = None;
-    unsafe { device.CreateTexture2D(&description, None, Some(&mut staging)) }
-        .map_err(native_error)?;
-    let staging = staging
-        .ok_or_else(|| CaptureError::Native("D3D11 did not return a staging texture".into()))?;
-    unsafe { context.CopyResource(&staging, texture) };
-
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-        .map_err(native_error)?;
-    let copied = (|| {
-        if mapped.pData.is_null() {
-            return Err(CaptureError::Native(
-                "D3D11 returned an empty desktop surface".into(),
-            ));
-        }
-        let row_bytes = usize::try_from(width)
-            .ok()
-            .and_then(|width| width.checked_mul(4))
-            .ok_or_else(|| CaptureError::Native("desktop row size overflow".into()))?;
-        let height = usize::try_from(height)
-            .map_err(|_| CaptureError::Native("desktop height overflow".into()))?;
-        let source_pitch = mapped.RowPitch as usize;
-        if source_pitch < row_bytes {
-            return Err(CaptureError::Native(
-                "D3D11 desktop row pitch is smaller than the active image".into(),
-            ));
-        }
-        let total_bytes = row_bytes
-            .checked_mul(height)
-            .ok_or_else(|| CaptureError::Native("desktop frame size overflow".into()))?;
-        let mut pixels = vec![0_u8; total_bytes];
-        for row in 0..height {
-            let source = unsafe {
-                slice::from_raw_parts(mapped.pData.cast::<u8>().add(row * source_pitch), row_bytes)
-            };
-            let destination = &mut pixels[row * row_bytes..(row + 1) * row_bytes];
-            destination.copy_from_slice(source);
-        }
-        Ok(pixels)
-    })();
-    unsafe { context.Unmap(&staging, 0) };
-    copied
-}
-
-#[cfg(windows)]
 fn native_error(error: windows::core::Error) -> CaptureError {
     CaptureError::Native(error.to_string())
 }
@@ -795,6 +941,102 @@ fn now_micros() -> u64 {
                 .saturating_mul(1_000_000)
                 .saturating_add(u64::from(duration.subsec_micros()))
         })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn identity(name: &str) -> Vec<u16> {
+        name.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[test]
+    fn output_ids_survive_enumeration_reordering_and_primary_changes() {
+        let mut registry = DisplayIdentityRegistry::default();
+        let a = identity("monitor-interface-a");
+        let b = identity("monitor-interface-b");
+        let initial = [registry.id_for(&a).unwrap(), registry.id_for(&b).unwrap()];
+        let reordered = [registry.id_for(&b).unwrap(), registry.id_for(&a).unwrap()];
+        assert_eq!(reordered, [initial[1], initial[0]]);
+        assert_ne!(initial[0], initial[1]);
+        assert_ne!(initial[0], 0);
+    }
+
+    #[test]
+    fn detached_output_id_is_not_reused_and_reinsert_keeps_its_identity() {
+        let mut registry = DisplayIdentityRegistry::default();
+        let a = registry.id_for(&identity("monitor-a")).unwrap();
+        // A disappears while B is enumerated on its former source/position.
+        let b = registry.id_for(&identity("monitor-b")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(registry.id_for(&identity("MONITOR-A")).unwrap(), a);
+        assert_eq!(registry.identities.len(), 2);
+    }
+
+    #[test]
+    fn identity_exhaustion_rejects_new_outputs_without_reassigning_known_ones() {
+        let mut registry = DisplayIdentityRegistry::default();
+        assert!(registry.id_for(&[0]).is_err());
+        for index in 0..DisplayIdentityRegistry::CAPACITY {
+            assert_eq!(
+                registry
+                    .id_for(&identity(&format!("monitor-{index}")))
+                    .unwrap(),
+                index as u32 + 1
+            );
+        }
+        assert!(registry.id_for(&identity("another-monitor")).is_err());
+        assert_eq!(registry.id_for(&identity("monitor-0")).unwrap(), 1);
+        assert_eq!(registry.identities.len(), DisplayIdentityRegistry::CAPACITY);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn dxgi_probe_failures_back_off_and_enter_a_bounded_burst_cooldown() {
+        let start = Instant::now();
+        let mut schedule = DxgiRecoverySchedule::new(start);
+        assert!(!schedule.probe_due(start));
+        let mut now = start + Duration::from_secs(1);
+        for delay in [2, 4, 8, 16, 32, 60] {
+            assert!(schedule.probe_due(now));
+            schedule.failed_probe(now);
+            assert!(!schedule.probe_due(now + Duration::from_secs(delay - 1)));
+            now += Duration::from_secs(delay);
+        }
+        // The next bounded retry burst is available after the quiet cooldown;
+        // a desktop restored much later need not start a new remote session.
+        assert!(schedule.probe_due(now));
+        schedule.failed_probe(now);
+        assert!(!schedule.probe_due(now + Duration::from_secs(1)));
+        assert!(schedule.probe_due(now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn unstable_restoration_cannot_oscillate_at_the_normal_probe_rate() {
+        let start = Instant::now();
+        let mut schedule = DxgiRecoverySchedule::new(start);
+        schedule.restored(start);
+        let failed_at = start + Duration::from_secs(2);
+        schedule.fell_back(failed_at);
+        assert!(!schedule.probe_due(failed_at + Duration::from_secs(59)));
+        assert!(schedule.probe_due(failed_at + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn stable_backend_failure_can_begin_a_new_probe_burst() {
+        let start = Instant::now();
+        let mut schedule = DxgiRecoverySchedule::new(start);
+        schedule.restored(start);
+        let failed_at = start + DxgiRecoverySchedule::STABILITY_WINDOW;
+        schedule.fell_back(failed_at);
+        assert!(!schedule.probe_due(failed_at));
+        assert!(schedule.probe_due(failed_at + Duration::from_secs(1)));
+    }
 }
 
 #[cfg(all(test, windows))]

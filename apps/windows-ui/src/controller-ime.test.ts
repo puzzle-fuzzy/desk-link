@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { keyboardKey, keyboardModifierMask, keyboardModifiers, mouseButton } from "./remote-input";
 import { RemoteKeyboardState } from "./remote-keyboard-state";
 import { isCompositionKey, RemoteTextInput } from "./remote-text-input";
-import type { ControllerInput } from "./types";
+import type { ControllerInput, RemoteInputContext } from "./types";
 
 const source = readFileSync(resolve(import.meta.dir, "controller.ts"), "utf8");
 const start = source.indexOf("function bindRemoteInput(");
@@ -58,10 +58,17 @@ function inputHost() {
   const sent: ControllerInput[] = [];
   const texts: string[] = [];
   const fullscreenChanges: boolean[] = [];
+  const contexts: RemoteInputContext[] = [];
+  const moves: RemoteInputContext[] = [];
+  let inputContext: RemoteInputContext | null = Object.freeze({ streamId: "9", inputEpoch: "1" });
+  let nextFrame = 0;
+  const frames = new Map<number, () => void>();
   const environment = {
     remotePanMode: false, remoteScaleMode: "actual", smartPasteBusy: false, pointerFrame: null,
     syncRemoteInteractionControls: () => {},
     pressedKeys: new RemoteKeyboardState(), pressedButtons: new Set(),
+    heldKeyboardContext: null, heldButtonContext: null,
+    currentInputContext: () => inputContext,
     keyboardKey, keyboardModifierMask, keyboardModifiers, mouseButton,
     remoteCanvasBounds: null, remoteViewportBounds: null,
     pointerInsideViewport: false,
@@ -69,15 +76,16 @@ function inputHost() {
     writePointerPosition: (_event: unknown, _canvas: unknown, point: { x: number; y: number }) => {
       point.x = 1; point.y = 1; return true;
     },
-    fireMouseMove: () => {},
+    fireMouseMove: (_x: number, _y: number, context: RemoteInputContext) => { moves.push(context); },
     document: { querySelector: () => null },
-    window: { cancelAnimationFrame: () => {} },
-    fireInput: (input: ControllerInput) => sent.push(input),
+    window: { cancelAnimationFrame: (id: number) => { frames.delete(id); }, requestAnimationFrame: (callback: () => void) => { const id = ++nextFrame; frames.set(id, callback); return id; } },
+    fireInput: (input: ControllerInput, context: RemoteInputContext) => { sent.push(input); contexts.push(context); },
     RemoteTextInput, isCompositionKey,
-    snapshot: { runtime: { state: "connected", streamId: 9 } },
+    snapshot: { runtime: { state: "connected", streamId: "9" } },
     inputDispatcher: {
       enqueueText: (text: string) => { texts.push(text); return Promise.resolve(); },
       discardPendingMoves: () => {},
+      cancelShortcuts: () => {},
     },
     isRemoteClipboardPasteShortcut: () => false,
     remoteTextInput: null,
@@ -86,10 +94,13 @@ function inputHost() {
   };
   const create = new Function(...Object.keys(environment), `${operations};
     bindRemoteInput(arguments[arguments.length - 2], arguments[arguments.length - 1]);
-    return { handleRemoteFullscreenEscape, setRemotePanMode };
+    return { handleRemoteFullscreenEscape, setRemotePanMode, resetRemoteInputState };
   `);
   const methods = create(...Object.values(environment), viewport, {});
-  return { viewport, carrier, sent, texts, fullscreenChanges,
+  return { viewport, carrier, sent, texts, fullscreenChanges, contexts, moves,
+    setContext: (context: RemoteInputContext | null) => { inputContext = context; },
+    flushFrames: () => { const pending = [...frames.values()]; frames.clear(); pending.forEach((callback) => callback()); },
+    reset: methods.resetRemoteInputState as () => void,
     escape: methods.handleRemoteFullscreenEscape as (event: unknown) => void,
     setPan: methods.setRemotePanMode as (active: boolean) => void,
   };
@@ -177,5 +188,44 @@ describe("remote desktop local IME integration", () => {
       preventDefault: () => { prevented = true; }, stopImmediatePropagation: () => {} });
     expect(host.fullscreenChanges).toEqual([false]);
     expect(prevented).toBe(true);
+  });
+
+  test("new input is paused until presentation while releases keep their original context", () => {
+    const host = inputHost();
+    host.viewport.emit("keydown", { key: "Control", code: "ControlLeft", ctrlKey: true });
+    host.viewport.emit("pointerdown", { button: 0, pointerId: 1, clientX: 30, clientY: 40 });
+    host.setContext(null);
+    host.viewport.emit("keyup", { key: "Control", code: "ControlLeft" });
+    host.viewport.emit("pointerup", { button: 0, pointerId: 1 });
+    host.viewport.emit("keydown", { key: "Enter", code: "Enter" });
+    host.viewport.emit("pointerdown", { button: 0, pointerId: 2, clientX: 30, clientY: 40 });
+    host.viewport.emit("wheel", { deltaX: 0, deltaY: 100 });
+    expect(host.sent.map((input) => [input.key ?? input.button, input.pressed])).toEqual([
+      ["control", true], ["left", true], ["control", false], ["left", false],
+    ]);
+    expect(host.contexts).toEqual(Array.from({ length: 4 }, () => ({ streamId: "9", inputEpoch: "1" })));
+  });
+
+  test("pointer rAF cannot retag a captured old-frame position after a new epoch", () => {
+    const host = inputHost();
+    host.viewport.emit("pointermove", { clientX: 30, clientY: 40 });
+    host.setContext(Object.freeze({ streamId: "9", inputEpoch: "2" }));
+    host.flushFrames();
+    expect(host.moves).toEqual([]);
+    host.viewport.emit("pointermove", { clientX: 30, clientY: 40 });
+    host.flushFrames();
+    expect(host.moves).toEqual([{ streamId: "9", inputEpoch: "2" }]);
+  });
+
+  test("synthetic ReleaseAll uses the old context before new epoch input is admitted", () => {
+    const host = inputHost();
+    host.viewport.emit("keydown", { key: "Control", code: "ControlLeft", ctrlKey: true });
+    host.setContext(null);
+    host.reset();
+    host.setContext(Object.freeze({ streamId: "9", inputEpoch: "2" }));
+    host.viewport.emit("keyup", { key: "Control", code: "ControlLeft" });
+    host.viewport.emit("keydown", { key: "Enter", code: "Enter" });
+    expect(host.sent.map((input) => [input.key, input.pressed])).toEqual([["control", true], ["control", false], ["enter", true]]);
+    expect(host.contexts.map((context) => context.inputEpoch)).toEqual(["1", "1", "2"]);
   });
 });

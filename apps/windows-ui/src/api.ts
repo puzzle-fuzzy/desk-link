@@ -9,6 +9,7 @@ import type {
   ControllerRenderMetrics,
   ControllerSignal,
   ControllerSnapshot,
+  RemoteInputContext,
   DiagnosticExportResult,
   DiagnosticUploadResult,
   FixedAccessSummary,
@@ -23,6 +24,8 @@ import type {
 } from "./types";
 import type { H264Profile, VideoQualityPreference } from "./types";
 import type { WindowsReleaseSource, WindowsUpdateProgress } from "./windows-update";
+import { validInputContext } from "./remote-input-context";
+import { isU64Identity } from "./u64-identity";
 
 export interface AccountUser {
   id: string;
@@ -36,28 +39,40 @@ export interface AccountSnapshot {
   deviceId: string | null;
 }
 
-export function accountRestore(): Promise<AccountSnapshot> {
-  return invoke<AccountSnapshot>("account_restore");
+export function accountRestore(operationGeneration: number): Promise<AccountSnapshot> {
+  return invoke<AccountSnapshot>("account_restore", { operationGeneration });
 }
 
-export function accountRegister(email: string, password: string): Promise<void> {
-  return invoke<void>("account_register", { email, password });
+export function accountRegister(email: string, password: string, operationGeneration: number): Promise<void> {
+  return invoke<void>("account_register", { email, password, operationGeneration });
 }
 
 export function accountVerifyEmail(token: string): Promise<void> {
   return invoke<void>("account_verify_email", { token });
 }
 
-export function accountResendVerification(email: string): Promise<void> {
-  return invoke<void>("account_resend_verification", { email });
+export function accountResendVerification(email: string, operationGeneration: number): Promise<void> {
+  return invoke<void>("account_resend_verification", { email, operationGeneration });
 }
 
-export function accountLogin(email: string, password: string): Promise<AccountSnapshot> {
-  return invoke<AccountSnapshot>("account_login", { email, password });
+export function accountLogin(email: string, password: string, operationGeneration: number): Promise<AccountSnapshot> {
+  return invoke<AccountSnapshot>("account_login", { email, password, operationGeneration });
 }
 
-export function accountForgotPassword(email: string): Promise<void> {
-  return invoke<void>("account_forgot_password", { email });
+export function accountForgotPassword(email: string, operationGeneration: number): Promise<void> {
+  return invoke<void>("account_forgot_password", { email, operationGeneration });
+}
+
+export function accountCancelOperation(operationGeneration: number): Promise<void> {
+  return invoke<void>("account_cancel_operation", { operationGeneration });
+}
+
+export function accountAcceptOperation(operationGeneration: number): Promise<void> {
+  return invoke<void>("account_accept_operation", { operationGeneration });
+}
+
+export function accountFinishOperation(operationGeneration: number): Promise<void> {
+  return invoke<void>("account_finish_operation", { operationGeneration });
 }
 
 export function accountLogout(): Promise<void> {
@@ -111,6 +126,18 @@ export function quitDeskLink(): Promise<void> {
 
 export function restartHost(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("restart_host");
+}
+
+export function pauseHostSharing(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("pause_host_sharing");
+}
+
+export function endHostControl(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("end_host_control");
+}
+
+export function resumeHostSharing(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("resume_host_sharing");
 }
 
 export function respondHostApproval(requestId: number, allow: boolean): Promise<void> {
@@ -187,6 +214,7 @@ export function createControllerChannels(
 export function nextControllerVideoFrame(
   input: ControllerVideoPullInput,
 ): Promise<ControllerVideoPayload> {
+  if (!isU64Identity(input.streamId)) return Promise.reject(new Error("远程画面的会话标识无效。"));
   return invoke<ControllerVideoPayload>("next_controller_video_frame", { input });
 }
 
@@ -211,15 +239,18 @@ export function reconnectController(
 }
 
 export function sendControllerInput(input: StreamBoundControllerInput): Promise<void> {
+  if (!validInputContext(input)) return Promise.reject(new Error("远程输入缺少有效的画面标识。"));
   return invoke<void>("send_controller_input", { input });
 }
 
-export function sendControllerText(text: string, streamId?: number): Promise<void> {
-  return invoke<void>("send_controller_text", { text, streamId });
+export function sendControllerText(text: string, context: RemoteInputContext): Promise<void> {
+  if (!validInputContext(context)) return Promise.reject(new Error("远程文字缺少有效的画面标识。"));
+  return invoke<void>("send_controller_text", { text, ...context });
 }
 
-export function pasteControllerClipboardText(): Promise<void> {
-  return invoke<void>("paste_controller_clipboard_text");
+export function pasteControllerClipboardText(context: RemoteInputContext): Promise<void> {
+  if (!validInputContext(context)) return Promise.reject(new Error("远程粘贴缺少有效的画面标识。"));
+  return invoke<void>("paste_controller_clipboard_text", { ...context });
 }
 
 export function setControllerAudioEnabled(enabled: boolean): Promise<void> {
@@ -246,8 +277,9 @@ export function chooseAndSendControllerFile(): Promise<void> {
   return invoke<void>("choose_and_send_controller_file");
 }
 
-export function queueControllerFiles(paths: string[]): Promise<void> {
-  return invoke<void>("queue_controller_files", { paths });
+export function queueControllerFiles(paths: string[], streamId: string, deviceId: string): Promise<void> {
+  if (!isU64Identity(streamId)) return Promise.reject(new Error("文件接收会话标识无效。"));
+  return invoke<void>("queue_controller_files", { paths, streamId, deviceId });
 }
 
 export function removeControllerQueuedFile(transferId: string): Promise<void> {
@@ -295,10 +327,12 @@ export function requestControllerKeyframe(): Promise<void> {
 }
 
 export function reportControllerRenderMetrics(metrics: ControllerRenderMetrics): Promise<void> {
+  if (!isU64Identity(metrics.streamId)) return Promise.reject(new Error("画面测量的会话标识无效。"));
   return invoke<void>("report_controller_render_metrics", { metrics });
 }
 
 export function reportControllerPlaybackPressure(pressure: ControllerPlaybackPressure): Promise<void> {
+  if (!isU64Identity(pressure.streamId)) return Promise.reject(new Error("画面背压的会话标识无效。"));
   return invoke<void>("report_controller_playback_pressure", { pressure });
 }
 

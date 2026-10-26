@@ -72,7 +72,7 @@ function snapshot(state: "connecting" | "available", refreshedAtUnixS = 1): Host
   return {
     readiness: "configured", title: "host", detail: "host",
     runtime: { state, title: state, detail: state, tooltip: state },
-    connection: { relayAddress: "relay.example:4433", serverName: "relay.example", sessionId: "test", streamId: 1, hasSavedKey: true },
+    connection: { relayAddress: "relay.example:4433", serverName: "relay.example", sessionId: "test", streamId: "1", hasSavedKey: true },
     connectionError: null, trustedControllers: [], trustedError: null,
     relayStatus: { mode: "external", state: "ready", title: "relay", detail: "relay" },
     diagnosticChecks: [], pairingActive: false, pendingApproval: null,

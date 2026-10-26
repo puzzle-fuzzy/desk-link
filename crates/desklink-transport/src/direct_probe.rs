@@ -722,6 +722,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_tls_handshake_is_one_accept_error_and_next_authenticated_probe_succeeds() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let responder = Arc::new(DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let initiator = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Unlike the production LAN verifier, this client trusts no certificate.
+        // A real TLS alert must produce Some(Err), not terminate the endpoint.
+        let rejected_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let rejected_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(rejected_tls).unwrap(),
+        ));
+        let rejected = initiator
+            .endpoint
+            .connect_with(
+                rejected_config,
+                responder.local_addr().unwrap(),
+                "desklink-lan",
+            )
+            .unwrap();
+        let (accepted, rejected) = tokio::time::timeout(Duration::from_secs(6), async {
+            tokio::join!(responder.accept(), rejected)
+        })
+        .await
+        .expect("failed TLS handshake must finish within its accept budget");
+        assert!(matches!(accepted, Some(Err(TransportError::Connection(_)))));
+        assert!(rejected.is_err());
+
+        // Use the same still-listening endpoint, with fresh authenticated Noise
+        // sessions. Production callers already continue on the first Some(Err).
+        let binding = [0x45; 16];
+        let candidate =
+            DirectLanCandidate::new(45, responder.local_addr().unwrap(), 110, binding, 100)
+                .unwrap();
+        let (mut initiator_secure, mut responder_secure) = connected_secure_sessions();
+        let responder_task = tokio::spawn({
+            let responder = responder.clone();
+            async move {
+                let connection = responder.accept().await.unwrap().unwrap();
+                responder
+                    .accept_probe_connection(connection, 45, &binding, &mut responder_secure, 100)
+                    .await
+            }
+        });
+        let (initiator_path, initiator_probe) = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            initiator.connect(&candidate, &binding, &mut initiator_secure, 100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (responder_path, responder_probe) = responder_task.await.unwrap().unwrap();
+        assert_eq!(initiator_probe.candidate_id, 45);
+        assert_eq!(responder_probe.candidate_id, 45);
+        initiator_path
+            .send_datagram(b"after failed handshake".to_vec())
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), responder_path.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"after failed handshake");
+        initiator_path.close(b"handshake recovery test complete");
+        responder_path.close(b"handshake recovery test complete");
+    }
+
+    #[tokio::test]
+    async fn explicitly_closed_endpoint_returns_terminal_none_from_accept() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let endpoint = DirectLanEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint
+            .endpoint
+            .close(0_u32.into(), b"test endpoint shutdown");
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), endpoint.accept())
+                    .await
+                    .expect("local endpoint close must wake accept")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delayed_probe_survives_video_window_and_still_rejects_replays() {
         let (mut initiator, mut responder) = connected_secure_sessions();
         let outbound_probe = ProbeCrypto::Exclusive(&mut initiator)

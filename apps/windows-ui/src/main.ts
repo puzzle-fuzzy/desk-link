@@ -1,12 +1,17 @@
 import "./styles/layout.css";
 import "./styles/base.css";
 import "./styles/interaction.css";
+import "./styles/file-queue.css";
+import "./styles/session-surface.css";
 
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 
 import {
   accountForgotPassword,
+  accountCancelOperation,
+  accountAcceptOperation,
+  accountFinishOperation,
   accountLogin,
   accountLogout,
   accountRegister,
@@ -26,6 +31,9 @@ import {
   regenerateFixedAccessPassword,
   respondHostApproval,
   restartHost,
+  pauseHostSharing,
+  endHostControl,
+  resumeHostSharing,
   revokeTrustedController,
   saveConnectionSettings,
   setupManagedConnection,
@@ -50,7 +58,10 @@ import {
   initializeController,
   prepareControllerRender,
   renderControllerView,
+  controllerSurfaceIdentity,
+  updatePersistentControllerRegions,
 } from "./controller";
+import { retainSessionSurface } from "./session-surface";
 import {
   MANAGED_RELAY_ADDRESS,
   MANAGED_RELAY_SERVER_NAME,
@@ -76,6 +87,8 @@ import { hostStatusSummary } from "./host-status";
 import { hostSnapshotPresentationChanged } from "./host-snapshot-presentation";
 import { approvalNeedsFocus, approvalTabFocusIndex } from "./approval-focus";
 import { WindowsUpdater, windowsUpdateProgressLabel } from "./windows-update";
+import { AccountFormDraft } from "./account-form-draft";
+import { AccountOperations } from "./account-operation";
 
 type View = "controller" | "connection" | "devices" | "pairing" | "fixedAccess" | "settings" | "about";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -99,10 +112,12 @@ const renderScheduler = new RenderScheduler(
 let snapshot: HostSnapshot | null = null;
 let activeView: View = "controller";
 let renderedView: View | null = null;
+let renderedControllerSurface: string | null = null;
 let loading = true;
 let saving = false;
 let managedSetupBusy = false;
 let hostRestartBusy = false;
+let hostSharingBusy = false;
 let approvalBusy = false;
 let focusedApprovalId: number | null = null;
 let expiredApprovalId: number | null = null;
@@ -146,6 +161,9 @@ let accountMode: "login" | "register" | "forgot" = "login";
 let accountBusy = false;
 let accountNotice: string | null = null;
 let accountCanResendVerification = false;
+const accountDraft = new AccountFormDraft();
+const accountOperations = new AccountOperations();
+let accountErrorField: "email" | "password" | "confirmation" | null = null;
 let snapshotRecoveryTimer: number | null = null;
 const workspaceHostEvents = ["host-runtime-changed", "host-approval-changed"] as const;
 const workspaceHostListeners = new Set<string>();
@@ -154,16 +172,25 @@ let workspaceRecoveryBound = false;
 let snapshotReadFeedback: Feedback = null;
 
 function render(): void {
-  prepareControllerRender();
   if (accountLoading) {
+    prepareControllerRender();
+    renderedControllerSurface = null;
     app.innerHTML = renderAccountLoading();
     return;
   }
   if (!account.signedIn && !accountLocalMode) {
+    prepareControllerRender();
+    renderedControllerSurface = null;
     app.innerHTML = renderAccountGate();
     bindAccountInteractions();
     return;
   }
+  const nextSurface = activeView === "controller" && !loading ? controllerSurfaceIdentity() : null;
+  if (retainSessionSurface(renderedControllerSurface, nextSurface, renderedView === activeView, Boolean(app.querySelector("[data-remote-viewport]")))) {
+    patchPersistentSessionShell();
+    return;
+  }
+  prepareControllerRender();
   const previousWorkspace = document.querySelector<HTMLElement>(".workspace");
   const preservedScrollTop = renderedView === activeView ? (previousWorkspace?.scrollTop ?? 0) : 0;
   const animateSurface = renderedView !== activeView;
@@ -173,12 +200,12 @@ function render(): void {
       <div class="app-main">
         ${renderWorkspaceTopbar()}
         <main class="workspace ${activeView === "controller" ? "workspace--controller" : ""}" aria-busy="${loading}" data-surface-transition="${animateSurface}">
-          ${feedback ? renderFeedback(feedback) : ""}
+          <div data-shell-feedback>${feedback ? renderFeedback(feedback) : ""}</div>
           ${loading ? renderLoading() : renderCurrentView()}
         </main>
       </div>
     </div>
-    ${renderHostApproval()}
+    <div data-host-approval-region>${renderHostApproval()}</div>
   `;
   renderLucideIcons(app);
   const currentWorkspace = document.querySelector<HTMLElement>(".workspace");
@@ -186,7 +213,29 @@ function render(): void {
     currentWorkspace.scrollTop = preservedScrollTop;
   }
   renderedView = activeView;
+  renderedControllerSurface = nextSurface;
   bindInteractions();
+  bindUtilityMenuDismiss();
+  focusNewApproval();
+  updateWindowsUpdateRegions();
+}
+
+function patchPersistentSessionShell(): void {
+  const regions: Array<[string, string]> = [
+    [".sidebar", renderSidebar()],
+    [".workspace-topbar", renderWorkspaceTopbar()],
+  ];
+  for (const [selector, markup] of regions) {
+    const previous = app.querySelector<HTMLElement>(selector);
+    if (previous) previous.outerHTML = markup;
+  }
+  const feedbackRegion = app.querySelector<HTMLElement>("[data-shell-feedback]");
+  if (feedbackRegion) feedbackRegion.innerHTML = feedback ? renderFeedback(feedback) : "";
+  const approvalRegion = app.querySelector<HTMLElement>("[data-host-approval-region]");
+  if (approvalRegion) approvalRegion.innerHTML = renderHostApproval();
+  updatePersistentControllerRegions();
+  renderLucideIcons(app);
+  bindInteractions(true);
   bindUtilityMenuDismiss();
   focusNewApproval();
   updateWindowsUpdateRegions();
@@ -227,13 +276,32 @@ function renderAccountGate(): string {
 }
 
 function bindAccountInteractions(): void {
+  const accountForm = document.querySelector<HTMLFormElement>("[data-account-form]");
+  if (accountForm) {
+    accountDraft.restore(accountForm);
+    accountForm.addEventListener("input", () => accountDraft.capture(new FormData(accountForm)));
+    if (accountErrorField) {
+      const input = accountForm.querySelector<HTMLInputElement>(`input[name="${accountErrorField}"]`);
+      input?.setAttribute("aria-invalid", "true");
+      input?.focus();
+      accountErrorField = null;
+    }
+  }
   const accountTabs = Array.from(
     document.querySelectorAll<HTMLButtonElement>('[role="tab"][data-account-mode]'),
   );
   const selectAccountMode = (button: HTMLButtonElement): void => {
     const mode = button.dataset.accountMode;
     if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
+    const cancelled = invalidateAccountOperation();
+    const selection = accountOperations.begin("account-view");
+    void cancelled.catch((error) => {
+      if (!accountOperations.current(selection)) return;
+      accountError = `未能完成账号切换，请重试：${normalizeError(error)}`;
+      render();
+    });
     accountMode = mode;
+    accountDraft.clearSecrets();
     accountError = null;
     accountNotice = null;
     accountCanResendVerification = false;
@@ -267,92 +335,133 @@ function bindAccountInteractions(): void {
 }
 
 async function enterAccountLocalMode(): Promise<void> {
-  accountLocalMode = true;
+  const cancelled = invalidateAccountOperation();
+  const operation = accountOperations.begin("local");
+  accountDraft.clearSecrets();
+  accountBusy = true;
   accountError = null;
   accountNotice = null;
-  setAccountLocalModeEnabled(true);
   render();
   try {
+    await cancelled;
+    if (!accountOperations.current(operation)) return;
     await restartHost();
+    if (!accountOperations.current(operation)) return;
+    accountDraft.leave();
+    accountLocalMode = true;
+    setAccountLocalModeEnabled(true);
     await startWorkspace();
   } catch (error) {
-    feedback = { tone: "error", message: normalizeError(error) };
-    render();
+    if (!accountOperations.current(operation)) return;
+    if (accountLocalMode) {
+      feedback = { tone: "error", message: normalizeError(error) };
+    } else {
+      accountError = `未能切换到本机模式，请重试：${normalizeError(error)}`;
+    }
+  } finally {
+    if (accountOperations.current(operation)) {
+      accountBusy = false;
+      render();
+    }
   }
 }
 
 async function resendVerification(): Promise<void> {
   if (accountBusy) return;
-  const email = document.querySelector<HTMLInputElement>('[data-account-form] input[name="email"]')?.value.trim() ?? "";
+  const email = accountDraft.pendingVerificationEmail;
   if (!email) {
     accountError = "请先填写注册邮箱。";
     render();
     return;
   }
   accountBusy = true;
+  const operation = accountOperations.begin("resend");
   accountError = null;
   render();
   try {
-    await accountResendVerification(email);
+    await accountResendVerification(email, operation.generation);
+    if (!accountOperations.current(operation)) return;
     accountNotice = "验证邮件已重新发送，请检查收件箱。";
   } catch (error) {
+    if (!accountOperations.current(operation)) return;
     accountError = normalizeError(error);
   } finally {
-    accountBusy = false;
-    render();
+    if (accountOperations.current(operation)) {
+      accountBusy = false;
+      render();
+    }
   }
+}
+
+function invalidateAccountOperation(): Promise<void> {
+  accountBusy = false;
+  const generation = accountOperations.invalidate();
+  return accountCancelOperation(generation);
 }
 
 async function submitAccount(form: HTMLFormElement): Promise<void> {
   if (accountBusy) return;
   const data = new FormData(form);
+  accountDraft.capture(data);
   const email = String(data.get("email") ?? "").trim();
   const password = String(data.get("password") ?? "");
-  const confirmation = String(data.get("confirmation") ?? "");
-  if (!email || (accountMode !== "forgot" && password.length < 12)) {
-    accountError = "请填写有效邮箱和至少 12 个字符的密码。";
-    render();
-    return;
-  }
-  if (accountMode === "register" && password !== confirmation) {
-    accountError = "两次输入的密码不一致。";
+  const validation = accountDraft.validate(accountMode);
+  if (validation) {
+    accountError = validation.message;
+    accountErrorField = validation.field;
     render();
     return;
   }
   accountBusy = true;
+  const operation = accountOperations.begin(accountMode);
   accountError = null;
   accountNotice = null;
   render();
   try {
-    if (accountMode === "login") {
-      account = await accountLogin(email, password);
-      if (account.signedIn) {
+    if (operation.action === "login") {
+      const result = await accountLogin(email, password, operation.generation);
+      if (!accountOperations.current(operation)) return;
+      if (result.signedIn) {
+        await accountAcceptOperation(operation.generation);
+        if (!accountOperations.current(operation)) return;
+        await accountFinishOperation(operation.generation);
+        if (!accountOperations.current(operation)) return;
+        account = result;
+        accountDraft.leave();
         accountLocalMode = false;
         setAccountLocalModeEnabled(false);
         await startWorkspace();
       }
-    } else if (accountMode === "register") {
-      await accountRegister(email, password);
+    } else if (operation.action === "register") {
+      await accountRegister(email, password, operation.generation);
+      if (!accountOperations.current(operation)) return;
+      accountDraft.registered(email);
       accountMode = "login";
       accountNotice = "验证邮件已发送，请完成邮箱验证后再登录。";
       accountCanResendVerification = true;
     } else {
-      await accountForgotPassword(email);
+      await accountForgotPassword(email, operation.generation);
+      if (!accountOperations.current(operation)) return;
+      accountDraft.clearSecrets();
       accountMode = "login";
       accountNotice = "如果邮箱已注册，重置密码邮件会很快送达。";
       accountCanResendVerification = false;
     }
   } catch (error) {
+    if (!accountOperations.current(operation)) return;
     accountError = normalizeError(error);
   } finally {
-    accountBusy = false;
-    render();
+    if (accountOperations.current(operation)) {
+      accountBusy = false;
+      render();
+    }
   }
 }
 
 async function logoutAccount(): Promise<void> {
   if (accountBusy) return;
   accountBusy = true;
+  accountDraft.leave();
   clearFixedAccessSecrets();
   clearPairingSecrets();
   pairingSession = null;
@@ -560,12 +669,19 @@ function renderWorkspaceTopbar(): string {
         ${snapshot ? renderHostStatusChip(snapshot) : ""}
       </div>
       <div class="workspace-topbar-actions">
+        ${snapshot ? renderHostSharingActions(snapshot) : ""}
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
         <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-haspopup="menu" aria-expanded="${utilityMenuOpen}" aria-controls="utility-menu" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
         ${renderUtilityMenu()}
       </div>
     </header>
   `;
+}
+
+function renderHostSharingActions(state: HostSnapshot): string {
+  const paused = state.runtime.state === "paused";
+  if (!state.connection && !paused) return "";
+  return `${state.runtime.state === "connected" ? `<button class="button button--secondary button--compact" type="button" data-host-end-control ${hostSharingBusy ? "disabled" : ""}>结束当前控制</button>` : ""}<button class="button button--secondary button--compact" type="button" data-host-sharing="${paused ? "resume" : "pause"}" ${hostSharingBusy ? 'disabled aria-busy="true"' : ""} title="${paused ? "恢复本机共享，保留信任和固定密码" : "停止本机共享，保留信任；当前连接其他设备的会话继续"}">${hostSharingBusy ? "正在处理…" : paused ? "恢复共享" : "暂停共享"}</button>`;
 }
 
 function renderUtilityMenu(): string {
@@ -787,6 +903,7 @@ function renderConnection(state: HostSnapshot): string {
         ${state.connection
           ? `<div class="pairing-credential share-device-identity"><span>本机 ID</span><strong id="host-access-heading">${escapeHtml(state.deviceId ? formatDeviceId(state.deviceId) : "暂时无法读取")}</strong>${state.deviceId ? '<button class="button button--secondary button--compact" type="button" data-copy-host-id>复制 ID</button>' : ""}</div>
              <div class="page-actions share-device-actions">
+               ${renderHostSharingActions(state)}
                ${renderPairingAction(state, "primary")}
                <button class="button button--secondary" type="button" data-open-fixed-access>${state.fixedPasswordEnabled ? "查看固定密码" : "设置固定密码"}</button>
              </div>`
@@ -1601,7 +1718,13 @@ async function exitDeskLink(): Promise<void> {
   }
 }
 
-function bindInteractions(): void {
+function bindInteractions(preservedController = false): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-host-end-control]").forEach((button) => {
+    button.addEventListener("click", () => { void endCurrentHostControl(); });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-host-sharing]").forEach((button) => {
+    button.addEventListener("click", () => { void changeHostSharing(button.dataset.hostSharing === "resume"); });
+  });
   document.querySelector<HTMLButtonElement>("[data-account-logout]")?.addEventListener("click", () => void logoutAccount());
   document.querySelector<HTMLButtonElement>("[data-account-login]")?.addEventListener("click", () => enterAccountLogin());
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
@@ -1621,7 +1744,7 @@ function bindInteractions(): void {
     }
   });
   document.querySelector<HTMLElement>(".utility-menu")?.addEventListener("keydown", handleUtilityMenuKeyboard);
-  if (activeView === "controller") {
+  if (activeView === "controller" && !preservedController) {
     bindControllerInteractions();
   }
   document.querySelector<HTMLButtonElement>("[data-reject-host-approval]")?.addEventListener("click", () => {
@@ -2029,6 +2152,40 @@ async function restartStoppedHost(): Promise<void> {
   }
 }
 
+async function changeHostSharing(resume: boolean): Promise<void> {
+  if (hostSharingBusy) return;
+  hostSharingBusy = true;
+  render();
+  try {
+    await (resume ? resumeHostSharing() : pauseHostSharing());
+    clearPairingSecrets();
+    pairingSession = null;
+    feedback = { tone: "info", message: resume ? "本机共享已恢复，已保留信任与固定密码。" : "本机共享已暂停，信任与固定密码已保留。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    await refreshSnapshot(false);
+    hostSharingBusy = false;
+    render();
+  }
+}
+
+async function endCurrentHostControl(): Promise<void> {
+  if (hostSharingBusy || snapshot?.runtime.state !== "connected") return;
+  hostSharingBusy = true;
+  render();
+  try {
+    await endHostControl();
+    feedback = { tone: "info", message: "当前控制已结束。信任仍保留，对方需要重新发起连接。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    await refreshSnapshot(false);
+    hostSharingBusy = false;
+    render();
+  }
+}
+
 async function enableManagedConnection(): Promise<void> {
   if (managedSetupBusy || snapshot?.connection) {
     return;
@@ -2245,8 +2402,15 @@ function randomHex(byteLength: number): string {
 
 async function bootstrap(): Promise<void> {
   startWindowsUpdateChecks();
+  const operation = accountOperations.begin("restore");
   try {
-    account = await accountRestore();
+    const result = await accountRestore(operation.generation);
+    if (!accountOperations.current(operation)) return;
+    if (result.signedIn) await accountAcceptOperation(operation.generation);
+    if (!accountOperations.current(operation)) return;
+    await accountFinishOperation(operation.generation);
+    if (!accountOperations.current(operation)) return;
+    account = result;
     accountLocalMode = shouldStartInLocalMode(account.signedIn);
   } catch (error) {
     accountError = normalizeError(error);

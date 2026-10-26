@@ -1,7 +1,10 @@
 use std::{
+    fs::{self, OpenOptions},
+    io,
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +15,10 @@ use apps_windows::{
     diagnostics::{DiagnosticEvent, DiagnosticLog},
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
-    runtime::{ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver, HostSupervisor},
+    runtime::{
+        ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver, HostSessionControl,
+        HostSupervisor,
+    },
     tray::HostStatusViewModel,
     trusted::{
         LocalControllerApproval, WindowsControllerAuthorizer, WindowsPairingAuthorizer,
@@ -250,6 +256,15 @@ impl HostRuntimeSummary {
         }
     }
 
+    fn sharing_paused() -> Self {
+        Self {
+            state: "paused",
+            title: "共享已暂停".to_owned(),
+            detail: "已停止本机画面和输入共享，新的控制连接会被拒绝。已保存的信任保留；恢复共享后可再次连接。一次性配对密码已失效。".to_owned(),
+            tooltip: "DeskLink：共享已暂停".to_owned(),
+        }
+    }
+
     fn pairing() -> Self {
         Self {
             state: "pairing",
@@ -306,6 +321,54 @@ impl Drop for PairingSessionSummary {
 struct HostWorker {
     shutdown: oneshot::Sender<()>,
     task: tauri::async_runtime::JoinHandle<()>,
+    session_control: Option<HostSessionControl>,
+}
+
+#[derive(Clone)]
+enum SharingPauseStore {
+    Volatile,
+    File(PathBuf),
+    Unavailable,
+}
+
+impl SharingPauseStore {
+    fn load(&self) -> io::Result<bool> {
+        match self {
+            Self::Volatile => Ok(false),
+            Self::Unavailable => Err(io::Error::other("本机共享偏好存储不可用")),
+            Self::File(path) => match fs::metadata(path) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    fn save(&self, paused: bool) -> io::Result<()> {
+        let path = match self {
+            Self::Volatile => return Ok(()),
+            Self::Unavailable => return Err(io::Error::other("本机共享偏好存储不可用")),
+            Self::File(path) => path,
+        };
+        if paused {
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("共享偏好目录不可用"))?;
+            fs::create_dir_all(parent)?;
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?
+                .sync_all()
+        } else {
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -317,6 +380,8 @@ pub struct HostManager {
     restart_lock: Arc<AsyncMutex<()>>,
     lifecycle_generation: Arc<AtomicU64>,
     lifecycle_guard: Arc<Mutex<()>>,
+    sharing_paused: Arc<AtomicBool>,
+    sharing_pause_store: SharingPauseStore,
 }
 
 impl Default for HostManager {
@@ -329,11 +394,157 @@ impl Default for HostManager {
             restart_lock: Arc::new(AsyncMutex::new(())),
             lifecycle_generation: Arc::new(AtomicU64::new(0)),
             lifecycle_guard: Arc::new(Mutex::new(())),
+            sharing_paused: Arc::new(AtomicBool::new(false)),
+            sharing_pause_store: SharingPauseStore::Volatile,
         }
     }
 }
 
 impl HostManager {
+    pub fn for_current_user() -> Self {
+        let store = WindowsConnectionSettingsStore::for_current_user()
+            .ok()
+            .and_then(|store| {
+                store
+                    .path()
+                    .parent()
+                    .map(|parent| parent.join("sharing-paused"))
+            })
+            .map(SharingPauseStore::File)
+            .unwrap_or(SharingPauseStore::Unavailable);
+        Self::with_sharing_pause_store(store)
+    }
+
+    fn with_sharing_pause_store(store: SharingPauseStore) -> Self {
+        // An unreadable preference fails closed. Resuming must successfully
+        // clear the marker before sharing can be enabled again.
+        let paused = store.load().unwrap_or(true);
+        let manager = Self {
+            sharing_paused: Arc::new(AtomicBool::new(paused)),
+            sharing_pause_store: store,
+            ..Self::default()
+        };
+        if paused {
+            *manager
+                .status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = HostRuntimeSummary::sharing_paused();
+        }
+        manager
+    }
+
+    pub fn is_sharing_paused(&self) -> bool {
+        self.sharing_paused.load(Ordering::Acquire)
+    }
+
+    fn may_start_worker(&self, generation: u64) -> bool {
+        !self.is_sharing_paused() && self.is_lifecycle_generation_current(generation)
+    }
+
+    async fn pause_sharing_without_app(&self) -> Result<(), String> {
+        // Prevent an already queued account/power restart from spawning while
+        // this local safety action waits for the lifecycle lock.
+        self.sharing_paused.store(true, Ordering::Release);
+        let _restart = self.restart_lock.lock().await;
+        self.pause_sharing_locked().await
+    }
+
+    async fn pause_sharing_locked(&self) -> Result<(), String> {
+        self.sharing_paused.store(true, Ordering::Release);
+        self.next_lifecycle_generation();
+        self.stop_current().await;
+        self.set_pairing_active(false);
+        let save_result = self.sharing_pause_store.save(true);
+        let mut summary = HostRuntimeSummary::sharing_paused();
+        if save_result.is_err() {
+            summary.detail = "共享已在本次运行中暂停，但未能保存暂停设置。请保持应用打开，修复本机存储权限后再次暂停。".to_owned();
+        }
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = summary;
+        save_result.map_err(|_| "共享已暂停，但暂停设置未能保存；请检查本机存储权限。".to_owned())
+    }
+
+    pub async fn pause_sharing(&self, app: AppHandle) -> Result<(), String> {
+        let result = self.pause_sharing_without_app().await;
+        self.publish(&app, self.snapshot());
+        result
+    }
+
+    fn resume_sharing_state(&self) -> Result<bool, String> {
+        if !self.is_sharing_paused() {
+            return Ok(false);
+        }
+        self.sharing_pause_store
+            .save(false)
+            .map_err(|_| "无法保存恢复共享设置。共享仍保持暂停，请检查本机存储权限。".to_owned())?;
+        self.sharing_paused.store(false, Ordering::Release);
+        Ok(true)
+    }
+
+    pub async fn resume_sharing(&self, app: AppHandle) -> Result<(), String> {
+        let _restart = self.restart_lock.lock().await;
+        if !self.resume_sharing_state()? {
+            return Ok(());
+        }
+        self.restart_current(app).await;
+        Ok(())
+    }
+
+    pub async fn end_current_control(&self, app: AppHandle) -> Result<(), String> {
+        let _restart = self.restart_lock.lock().await;
+        let control = self
+            .worker
+            .lock()
+            .map_err(|_| "无法读取本机控制状态。".to_owned())?
+            .as_ref()
+            .and_then(|worker| worker.session_control.clone())
+            .ok_or_else(|| "当前没有正在控制本机的连接。".to_owned())?;
+        let completion = control.request_end().map_err(str::to_owned)?;
+        // Runtime first drops input/media, then sends an authenticated terminal
+        // denial and waits for the Controller's disconnect. No Controller role
+        // belonging to this application is affected by this Host-only command.
+        let result = self.complete_end_locked(completion).await;
+        if result.is_err() {
+            self.publish(&app, self.snapshot());
+        }
+        result
+    }
+
+    async fn complete_end_locked(&self, completion: oneshot::Receiver<bool>) -> Result<(), String> {
+        if tokio::time::timeout(Duration::from_secs(3), completion)
+            .await
+            .is_ok_and(|result| result.is_ok_and(|notified| notified))
+        {
+            return Ok(());
+        }
+        // Without terminal confirmation an automatic remote retry could regain
+        // control. Keep the Host closed until an explicit local resume instead.
+        let saved = self.pause_sharing_locked().await;
+        if saved.is_err() {
+            Err("未收到对方退出确认，已暂停本次运行的共享，但暂停设置未能保存。请检查本机存储权限。".to_owned())
+        } else {
+            Err(
+                "未收到对方退出确认，已暂停本机共享以阻止自动重新接入。确认后可手动恢复共享。"
+                    .to_owned(),
+            )
+        }
+    }
+
+    fn set_session_control_if_current(&self, generation: u64, control: HostSessionControl) {
+        let _guard = self
+            .lifecycle_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.may_start_worker(generation)
+            && let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.as_mut()
+        {
+            worker.session_control = Some(control);
+        }
+    }
+
     pub fn snapshot(&self) -> HostRuntimeSummary {
         self.status
             .lock()
@@ -353,6 +564,14 @@ impl HostManager {
 
     pub async fn restart(&self, app: AppHandle) {
         let _restart = self.restart_lock.lock().await;
+        if self.is_sharing_paused() {
+            self.publish(&app, self.snapshot());
+            return;
+        }
+        self.restart_current(app).await;
+    }
+
+    async fn restart_current(&self, app: AppHandle) {
         let generation = self.next_lifecycle_generation();
         self.stop_current().await;
         self.set_pairing_active(false);
@@ -361,12 +580,44 @@ impl HostManager {
         self.start_normal_worker(app, generation);
     }
 
+    /// Account IPC may wait for a previous Host shutdown. Recheck ownership
+    /// after that wait and serialize the final spawn with view cancellation.
+    pub async fn restart_if_account_current(
+        &self,
+        app: AppHandle,
+        owner: crate::account::AccountOperationOwner,
+        operation_generation: u64,
+    ) -> Result<(), String> {
+        let _restart = self.restart_lock.lock().await;
+        owner.with_current(operation_generation, || Ok(()))?;
+        if self.is_sharing_paused() {
+            self.publish(&app, self.snapshot());
+            return Ok(());
+        }
+        let generation =
+            owner.with_current(
+                operation_generation,
+                || Ok(self.next_lifecycle_generation()),
+            )?;
+        owner
+            .after_wait(operation_generation, self.stop_current(), || {
+                self.set_pairing_active(false);
+                self.publish_if_current(&app, generation, HostRuntimeSummary::starting());
+                self.start_normal_worker(app, generation);
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn start_pairing(&self, app: AppHandle) -> Result<PairingSessionSummary, String> {
         let _restart = self.restart_lock.lock().await;
+        if self.is_sharing_paused() {
+            return Err("共享已暂停。请先恢复共享，再生成一次性配对密码。".to_owned());
+        }
         let generation = self.next_lifecycle_generation();
         self.stop_current().await;
         self.set_pairing_active(false);
-        if !self.is_lifecycle_generation_current(generation) {
+        if !self.may_start_worker(generation) {
             return Err("配对任务已取消。".to_owned());
         }
         self.publish_if_current(&app, generation, HostRuntimeSummary::pairing());
@@ -386,14 +637,14 @@ impl HostManager {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(failure)) => {
                 let message = failure.pairing_message().to_owned();
-                if self.is_lifecycle_generation_current(generation) {
+                if self.may_start_worker(generation) {
                     self.publish_if_current(&app, generation, failure.summary());
                     self.start_normal_worker(app, generation);
                 }
                 return Err(message);
             }
             Err(message) => {
-                if self.is_lifecycle_generation_current(generation) {
+                if self.may_start_worker(generation) {
                     self.publish_if_current(
                         &app,
                         generation,
@@ -405,7 +656,7 @@ impl HostManager {
             }
         };
 
-        if !self.is_lifecycle_generation_current(generation) {
+        if !self.may_start_worker(generation) {
             return Err("配对任务已取消。".to_owned());
         }
 
@@ -433,7 +684,7 @@ impl HostManager {
             .lifecycle_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.is_lifecycle_generation_current(expected_generation) {
+        if !self.may_start_worker(expected_generation) {
             return;
         }
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -446,7 +697,11 @@ impl HostManager {
                 .await;
         });
         if let Ok(mut worker) = self.worker.lock() {
-            *worker = Some(HostWorker { shutdown, task });
+            *worker = Some(HostWorker {
+                shutdown,
+                task,
+                session_control: None,
+            });
         } else {
             let _ = shutdown.send(());
             task.abort();
@@ -465,12 +720,13 @@ impl HostManager {
             .lifecycle_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.is_lifecycle_generation_current(generation) {
+        if !self.may_start_worker(generation) {
             return false;
         }
         self.set_pairing_active(true);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let manager = self.clone();
+        let session_control = supervisor.session_control();
         let task = tauri::async_runtime::spawn(async move {
             // The correlation marker must follow the worker, not the prepared
             // object. If preparation is cancelled, no stale marker remains.
@@ -489,7 +745,11 @@ impl HostManager {
             }
         });
         if let Ok(mut worker) = self.worker.lock() {
-            *worker = Some(HostWorker { shutdown, task });
+            *worker = Some(HostWorker {
+                shutdown,
+                task,
+                session_control: Some(session_control),
+            });
             true
         } else {
             let _ = shutdown.send(());
@@ -537,7 +797,7 @@ impl HostManager {
 
     async fn start_normal_worker_after_pairing(&self, app: AppHandle, generation: u64) {
         let _restart = self.restart_lock.lock().await;
-        if self.lifecycle_generation.load(Ordering::Acquire) != generation {
+        if !self.may_start_worker(generation) {
             return;
         }
         self.publish_if_current(&app, generation, HostRuntimeSummary::pairing_finished());
@@ -602,6 +862,7 @@ impl HostManager {
                 diagnostics,
                 session_id,
             })) => {
+                self.set_session_control_if_current(generation, supervisor.session_control());
                 let _session_correlation =
                     set_session_correlation(DiagnosticSource::Host, session_id).ok();
                 tokio::select! {
@@ -943,7 +1204,8 @@ pub fn tray_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostApprovalBroker, HostApprovalSummary, HostManager, HostRuntimeSummary, PendingApproval,
+        HostApprovalBroker, HostApprovalSummary, HostManager, HostRuntimeSummary, HostWorker,
+        PendingApproval, SharingPauseStore,
     };
     use apps_windows::runtime::HostLifecycleEvent;
 
@@ -1058,5 +1320,170 @@ mod tests {
         manager.stop().await;
 
         assert!(!manager.is_pairing_active());
+    }
+    struct SharingFixture {
+        directory: std::path::PathBuf,
+    }
+
+    impl SharingFixture {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "desklink-sharing-pause-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            Self { directory }
+        }
+
+        fn manager(&self) -> HostManager {
+            HostManager::with_sharing_pause_store(SharingPauseStore::File(
+                self.directory.join("sharing-paused"),
+            ))
+        }
+    }
+
+    impl Drop for SharingFixture {
+        fn drop(&mut self) {
+            // Cleanup is restricted to this fixture's resolved temp directory.
+            if let (Ok(target), Ok(temp)) = (
+                self.directory.canonicalize(),
+                std::env::temp_dir().canonicalize(),
+            ) {
+                assert!(target.starts_with(&temp) && target != temp);
+                let _ = std::fs::remove_dir_all(target);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pausing_stops_only_the_host_worker_and_invalidates_pairing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        let lifecycle = manager.next_lifecycle_generation();
+        manager.set_pairing_active(true);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let observed = stopped.clone();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tauri::async_runtime::spawn(async move {
+            shutdown_rx.await.unwrap();
+            observed.store(true, Ordering::Release);
+        });
+        *manager.worker.lock().unwrap() = Some(HostWorker {
+            shutdown,
+            task,
+            session_control: None,
+        });
+        // These records represent independent retained identities, not a live
+        // remote session or real device input.
+        std::fs::write(fixture.directory.join("saved-trust"), b"synthetic-trust").unwrap();
+        std::fs::write(
+            fixture.directory.join("controller-session"),
+            b"synthetic-controller",
+        )
+        .unwrap();
+        manager.pause_sharing_without_app().await.unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(manager.worker.lock().unwrap().is_none());
+        assert!(!manager.is_pairing_active());
+        assert!(manager.is_sharing_paused());
+        assert!(!manager.may_start_worker(lifecycle));
+        assert!(!manager.may_start_worker(manager.current_lifecycle_generation()));
+        assert_eq!(manager.snapshot().state, "paused");
+        assert_eq!(
+            std::fs::read(fixture.directory.join("saved-trust")).unwrap(),
+            b"synthetic-trust"
+        );
+        assert_eq!(
+            std::fs::read(fixture.directory.join("controller-session")).unwrap(),
+            b"synthetic-controller"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_survives_manager_restart_until_explicit_resume() {
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        manager.pause_sharing_without_app().await.unwrap();
+        // Repeated local pause is safe and does not erase retained state.
+        manager.pause_sharing_without_app().await.unwrap();
+        let restored = fixture.manager();
+        assert!(restored.is_sharing_paused());
+        assert_eq!(restored.snapshot().state, "paused");
+        let generation = restored.next_lifecycle_generation();
+        assert!(!restored.may_start_worker(generation));
+        assert!(restored.resume_sharing_state().unwrap());
+        assert!(restored.may_start_worker(generation));
+        assert!(!restored.resume_sharing_state().unwrap());
+        assert!(!fixture.manager().is_sharing_paused());
+    }
+
+    #[tokio::test]
+    async fn failing_to_persist_pause_still_stops_sharing_for_this_run() {
+        let fixture = SharingFixture::new();
+        let parent_file = fixture.directory.join("not-a-directory");
+        std::fs::write(&parent_file, b"synthetic").unwrap();
+        let manager = HostManager::with_sharing_pause_store(SharingPauseStore::File(
+            parent_file.join("sharing-paused"),
+        ));
+        assert!(manager.pause_sharing_without_app().await.is_err());
+        assert!(manager.is_sharing_paused());
+        assert_eq!(manager.snapshot().state, "paused");
+        assert!(manager.snapshot().detail.contains("未能保存"));
+        assert!(!manager.may_start_worker(manager.current_lifecycle_generation()));
+    }
+
+    #[test]
+    fn unreadable_preference_and_failed_resume_keep_sharing_closed() {
+        let manager = HostManager::with_sharing_pause_store(SharingPauseStore::Unavailable);
+        assert!(manager.is_sharing_paused());
+        assert!(manager.resume_sharing_state().is_err());
+        assert!(manager.is_sharing_paused());
+        assert!(!manager.may_start_worker(manager.current_lifecycle_generation()));
+    }
+    #[tokio::test]
+    async fn queued_pause_closes_worker_admission_before_lifecycle_lock_is_available() {
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        let generation = manager.next_lifecycle_generation();
+        let held = manager.restart_lock.lock().await;
+        let paused_manager = manager.clone();
+        let pause = tokio::spawn(async move { paused_manager.pause_sharing_without_app().await });
+        tokio::task::yield_now().await;
+        assert!(manager.is_sharing_paused());
+        assert!(!manager.may_start_worker(generation));
+        assert!(!pause.is_finished());
+        drop(held);
+        pause.await.unwrap().unwrap();
+        assert!(fixture.manager().is_sharing_paused());
+    }
+    #[tokio::test]
+    async fn unconfirmed_control_end_persists_a_pause_instead_of_reporting_success() {
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        let (sender, completion) = tokio::sync::oneshot::channel();
+        sender.send(false).unwrap();
+        let result = manager.complete_end_locked(completion).await;
+        assert!(result.unwrap_err().contains("未收到对方退出确认"));
+        assert!(manager.is_sharing_paused());
+        assert_eq!(manager.snapshot().state, "paused");
+        assert!(fixture.manager().is_sharing_paused());
+    }
+
+    #[tokio::test]
+    async fn confirmed_control_end_does_not_pause_or_rewrite_retained_sharing_state() {
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        let (sender, completion) = tokio::sync::oneshot::channel();
+        sender.send(true).unwrap();
+        manager.complete_end_locked(completion).await.unwrap();
+        assert!(!manager.is_sharing_paused());
+        assert!(!fixture.manager().is_sharing_paused());
     }
 }

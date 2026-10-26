@@ -5,6 +5,8 @@ mod controller;
 mod device_directory;
 mod file_picker;
 mod host;
+#[path = "ipc-identity.rs"]
+mod ipc_identity;
 mod local_relay;
 mod updates;
 mod video_mailbox;
@@ -95,6 +97,7 @@ struct ConnectionSummary {
     relay_address: String,
     server_name: String,
     session_id: String,
+    #[serde(serialize_with = "ipc_identity::serialize")]
     stream_id: u64,
     has_saved_key: bool,
 }
@@ -162,18 +165,46 @@ async fn account_restore(
     app: AppHandle,
     manager: State<'_, AccountManager>,
     host_manager: State<'_, HostManager>,
+    operation_generation: u64,
 ) -> Result<AccountSnapshot, String> {
-    let snapshot = match manager.restore().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            host_manager.restart(app).await;
-            return Err(error);
-        }
-    };
-    // Account login is optional. The host must be available for local-mode
-    // users and for inbound control before the account screen is completed.
-    host_manager.restart(app).await;
-    Ok(snapshot)
+    let result = manager.restore(operation_generation).await;
+    if !matches!(&result, Ok(snapshot) if snapshot.signed_in) {
+        // Local sharing does not require an account. Preserve startup when
+        // signed out/offline, while a newer view can still cancel this restart.
+        host_manager
+            .restart_if_account_current(app, manager.operation_owner(), operation_generation)
+            .await?;
+    }
+    result
+}
+
+#[tauri::command]
+async fn account_cancel_operation(
+    manager: State<'_, AccountManager>,
+    operation_generation: u64,
+) -> Result<(), String> {
+    manager.cancel_operation(operation_generation)
+}
+
+#[tauri::command]
+async fn account_accept_operation(
+    app: AppHandle,
+    manager: State<'_, AccountManager>,
+    host_manager: State<'_, HostManager>,
+    operation_generation: u64,
+) -> Result<(), String> {
+    manager.accept_operation(operation_generation)?;
+    host_manager
+        .restart_if_account_current(app, manager.operation_owner(), operation_generation)
+        .await
+}
+
+#[tauri::command]
+async fn account_finish_operation(
+    manager: State<'_, AccountManager>,
+    operation_generation: u64,
+) -> Result<(), String> {
+    manager.finish_operation(operation_generation)
 }
 
 #[tauri::command]
@@ -181,8 +212,11 @@ async fn account_register(
     manager: State<'_, AccountManager>,
     email: String,
     password: String,
+    operation_generation: u64,
 ) -> Result<(), String> {
-    manager.register(email, password).await
+    manager
+        .register(email, password, operation_generation)
+        .await
 }
 
 #[tauri::command]
@@ -197,29 +231,30 @@ async fn account_verify_email(
 async fn account_resend_verification(
     manager: State<'_, AccountManager>,
     email: String,
+    operation_generation: u64,
 ) -> Result<(), String> {
-    manager.resend_verification(email).await
+    manager
+        .resend_verification(email, operation_generation)
+        .await
 }
 
 #[tauri::command]
 async fn account_login(
-    app: AppHandle,
     manager: State<'_, AccountManager>,
-    host_manager: State<'_, HostManager>,
     email: String,
     password: String,
+    operation_generation: u64,
 ) -> Result<AccountSnapshot, String> {
-    let snapshot = manager.login(email, password).await?;
-    host_manager.restart(app).await;
-    Ok(snapshot)
+    manager.login(email, password, operation_generation).await
 }
 
 #[tauri::command]
 async fn account_forgot_password(
     manager: State<'_, AccountManager>,
     email: String,
+    operation_generation: u64,
 ) -> Result<(), String> {
-    manager.forgot_password(email).await
+    manager.forgot_password(email, operation_generation).await
 }
 
 #[tauri::command]
@@ -389,6 +424,33 @@ async fn restart_host(
 }
 
 #[tauri::command]
+async fn end_host_control(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.end_current_control(app).await?;
+    get_host_snapshot(manager).await
+}
+
+#[tauri::command]
+async fn pause_host_sharing(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.pause_sharing(app).await?;
+    get_host_snapshot(manager).await
+}
+
+#[tauri::command]
+async fn resume_host_sharing(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.resume_sharing(app).await?;
+    get_host_snapshot(manager).await
+}
+
+#[tauri::command]
 fn respond_host_approval(
     manager: State<'_, HostManager>,
     request_id: u64,
@@ -505,9 +567,20 @@ async fn send_controller_input(
 async fn send_controller_text(
     manager: State<'_, ControllerManager>,
     text: String,
-    stream_id: Option<u64>,
+    stream_id: String,
+    input_epoch: String,
 ) -> Result<(), String> {
-    manager.send_text(text, stream_id).await
+    let stream_id = ipc_identity::parse(&stream_id)?;
+    let input_epoch = ipc_identity::parse(&input_epoch)?;
+    manager
+        .send_text(
+            text,
+            desklink_protocol::InputContext {
+                stream_id,
+                input_epoch,
+            },
+        )
+        .await
 }
 
 fn local_clipboard_error(result: desklink_protocol::TransferResult) -> String {
@@ -532,9 +605,20 @@ async fn read_local_clipboard_text() -> Result<String, String> {
 #[tauri::command]
 async fn paste_controller_clipboard_text(
     manager: State<'_, ControllerManager>,
+    stream_id: String,
+    input_epoch: String,
 ) -> Result<(), String> {
+    let stream_id = ipc_identity::parse(&stream_id)?;
+    let input_epoch = ipc_identity::parse(&input_epoch)?;
+    let context = desklink_protocol::InputContext {
+        stream_id,
+        input_epoch,
+    };
+    if !context.is_valid() {
+        return Err("远程输入缺少有效的画面上下文，请等待当前画面显示后重试。".to_owned());
+    }
     let text = read_local_clipboard_text().await?;
-    manager.paste_clipboard(text).await
+    manager.paste_clipboard(text, context).await
 }
 
 #[tauri::command]
@@ -576,19 +660,24 @@ async fn request_controller_clipboard(manager: State<'_, ControllerManager>) -> 
 async fn choose_and_send_controller_file(
     manager: State<'_, ControllerManager>,
 ) -> Result<(), String> {
+    let target = manager.capture_file_target()?;
     let paths = tauri::async_runtime::spawn_blocking(file_picker::pick_files)
         .await
         .map_err(|_| "DeskLink 无法打开 Windows 文件选择器。".to_owned())??;
-    manager.send_files(paths).await
+    manager.send_files(paths, target).await
 }
 
 #[tauri::command]
 async fn queue_controller_files(
     manager: State<'_, ControllerManager>,
     paths: Vec<String>,
+    stream_id: String,
+    device_id: String,
 ) -> Result<(), String> {
+    let stream_id = ipc_identity::parse(&stream_id)?;
+    let target = manager.file_drop_target(stream_id, &device_id)?;
     manager
-        .send_files(paths.into_iter().map(PathBuf::from).collect())
+        .send_files(paths.into_iter().map(PathBuf::from).collect(), target)
         .await
 }
 
@@ -1069,6 +1158,12 @@ fn build_diagnostic_checks(
         )
     };
     let relay_check = match (connection.is_some(), runtime.state) {
+        (_, "paused") => diagnostic_check(
+            "DL-NET-201",
+            "passed",
+            "中继连接状态",
+            "本机共享已由用户暂停，恢复共享后再建立入站连接。",
+        ),
         (false, _) => diagnostic_check(
             "DL-NET-201",
             "warning",
@@ -1107,7 +1202,7 @@ fn build_diagnostic_checks(
         ),
     };
     let host_check = match runtime.state {
-        "available" | "connected" => {
+        "available" | "connected" | "paused" => {
             diagnostic_check("DL-HOST-301", "passed", "主机运行状态", &runtime.detail)
         }
         "stopped" => diagnostic_check("DL-HOST-301", "failed", "主机运行状态", &runtime.detail),
@@ -1631,7 +1726,7 @@ pub fn run() {
                 show_main_window(app);
             }
         }))
-        .manage(HostManager::default())
+        .manage(HostManager::for_current_user())
         .manage(ControllerManager::for_current_user())
         .manage(AccountManager::for_current_user())
         .manage(updates::UpdateManager::default());
@@ -1676,6 +1771,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             account_restore,
+            account_cancel_operation,
+            account_accept_operation,
+            account_finish_operation,
             account_register,
             account_verify_email,
             account_resend_verification,
@@ -1693,6 +1791,9 @@ pub fn run() {
             quit_desklink,
             respond_host_approval,
             restart_host,
+            end_host_control,
+            pause_host_sharing,
+            resume_host_sharing,
             save_connection_settings,
             setup_managed_connection,
             start_pairing_session,
@@ -1751,15 +1852,45 @@ pub fn run() {
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 DeskLink", true, None::<&str>)?;
+    let end = MenuItem::with_id(app, "end-host-control", "结束当前控制", true, None::<&str>)?;
+    let pause = MenuItem::with_id(
+        app,
+        "pause-host-sharing",
+        "暂停本机共享",
+        true,
+        None::<&str>,
+    )?;
+    let resume = MenuItem::with_id(
+        app,
+        "resume-host-sharing",
+        "恢复本机共享",
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出 DeskLink", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &end, &pause, &resume, &separator, &quit])?;
     let mut tray = TrayIconBuilder::with_id(tray_id())
         .tooltip("DeskLink：正在启动")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
+            "end-host-control" | "pause-host-sharing" | "resume-host-sharing" => {
+                let action = event.id().as_ref().to_owned();
+                let manager = app.state::<HostManager>().inner().clone();
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = match action.as_str() {
+                        "end-host-control" => manager.end_current_control(app.clone()).await,
+                        "pause-host-sharing" => manager.pause_sharing(app.clone()).await,
+                        _ => manager.resume_sharing(app.clone()).await,
+                    };
+                    if result.is_err() {
+                        show_main_window(&app);
+                    }
+                });
+            }
             "quit" => {
                 let manager = app.state::<HostManager>().inner().clone();
                 app.state::<ControllerManager>().request_stop();
@@ -1844,6 +1975,22 @@ mod tests {
         };
         let checks = build_diagnostic_checks(&runtime, Some(&connection), None, None, None);
         assert!(checks.iter().all(|check| check.status == "passed"));
+    }
+
+    #[test]
+    fn user_paused_sharing_is_not_reported_as_a_host_or_network_failure() {
+        let runtime = HostRuntimeSummary {
+            state: "paused",
+            title: "共享已暂停".to_owned(),
+            detail: "本机共享已由用户暂停。".to_owned(),
+            tooltip: "DeskLink".to_owned(),
+        };
+        let checks = build_diagnostic_checks(&runtime, None, None, None, None);
+        for code in ["DL-NET-201", "DL-HOST-301"] {
+            let check = checks.iter().find(|check| check.code == code).unwrap();
+            assert_eq!(check.status, "passed");
+            assert!(check.detail.contains("暂停"));
+        }
     }
 
     #[test]

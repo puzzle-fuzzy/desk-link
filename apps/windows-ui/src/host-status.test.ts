@@ -7,7 +7,7 @@ const configuredConnection = {
   relayAddress: "relay.example.com:4433",
   serverName: "relay.example.com",
   sessionId: "session",
-  streamId: 1,
+  streamId: "1",
   hasSavedKey: true,
 };
 
@@ -47,6 +47,9 @@ function hostSnapshot(
 }
 
 describe("Windows host status summary", () => {
+  test("persisted sharing pause is explicit and never presented as an available host", () => {
+    expect(hostStatusSummary(hostSnapshot("paused"))).toMatchObject({ title: "共享已暂停", tone: "quiet" });
+  });
   test("gives protected-data errors first priority", () => {
     for (const error of ["connectionError", "trustedError", "fixedPasswordError"] as const) {
       const summary = hostStatusSummary(hostSnapshot("available", { [error]: "无法读取" }));

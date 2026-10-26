@@ -7,6 +7,11 @@ export interface HostStatusSummary {
 }
 
 export function hostStatusSummary(snapshot: HostSnapshot): HostStatusSummary {
+  if (snapshot.runtime.state === "paused") return {
+    title: "共享已暂停",
+    detail: "本机不接受远程控制；恢复共享后可继续使用已信任设备",
+    tone: "quiet",
+  };
   if (snapshot.connectionError || snapshot.trustedError || snapshot.fixedPasswordError) {
     return {
       title: "需要处理",

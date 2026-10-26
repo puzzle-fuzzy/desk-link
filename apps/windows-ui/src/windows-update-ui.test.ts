@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { AccountOperations } from "./account-operation";
 import { resolve } from "node:path";
 import { escapeHtml } from "./html";
 import { windowsUpdateProgressLabel, type WindowsUpdateState } from "./windows-update";
@@ -120,6 +121,7 @@ describe("isolated Windows update presentation", () => {
       checkForWindowsUpdate: (force: boolean) => { expect(force).toBe(false); actions.push("check"); return Promise.resolve(); },
       window: { addEventListener: (name: string, callback: () => void) => events.set(name, callback) }, document,
       accountRestore: () => { actions.push("restore"); return new Promise((resolve) => { restore = resolve; }); },
+      accountOperations: new AccountOperations(1), accountFinishOperation: async () => {}, accountAcceptOperation: async () => {},
       account: { signedIn: false }, accountLocalMode: false, accountLoading: true, accountError: null,
       shouldStartInLocalMode: () => false, render: () => {}, normalizeError: () => "",
       startWorkspace: () => { throw new Error("No workspace should be required for an update check"); },

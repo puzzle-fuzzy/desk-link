@@ -1,6 +1,6 @@
 export interface ControllerRuntimeIdentity {
   state: string;
-  streamId: number | null;
+  streamId: string | null;
 }
 
 export type ControllerRemoteSurfaceState = "empty" | "live" | "retaining";
