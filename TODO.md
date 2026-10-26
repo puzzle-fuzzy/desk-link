@@ -384,6 +384,9 @@
 - **方案：** Rust 共享 session/transport/policy 持有恢复、能力和背压规则；平台 adapter 只做捕获、注入、存储、权限；前端分为 session store、media presenter、input、transfer、shell。统一错误 code/状态/命令结果，减少依靠字符串和裸整数分支。
 - **实施方式：** 随真实修复完成纵向切片迁移，删除被替代路径；允许直接调整内部 API/协议，但不把重命名目录或更换框架当作性能收益。用 CodeGraph 确认调用方，再以编译和测试验证。
 - **验收：** 一项策略只有一个所有者，生产调用与测试调用相同；Windows 和 Apple 使用同一语义；每个新边界具有资源/取消/错误合同；通过 DL2-014 的前后性能比较。
+- [x] **不冲突的公共合同整理（`docs(DL2-040): define boundary ownership and integration gates`）：** 新增 `docs/second-stage-boundary-contracts.md`，经 CodeGraph 查询/调用影响和本 worktree 源码逐项确认 SessionMachine、ReconnectSchedule、三处 transport 分类、两套 controller ConnectFailure、同步 join 和 ABI/Swift 映射。保留 persistent/临时邀请、host 服务/单次 controller 的语义差异，明确命令接纳/完成/终态、取消/资源/callback 所有权和稳定错误类别，记录已提交跨组接口与固定 SHA。
+- **本切片验证：** 文档本地链接、10 处相关源码路径和 12 个完整提交身份可解析，独立只读复核无阻塞事实错误，`git diff --check` 通过；未修改 crates/apps/server 业务源码。既有 Windows 全栈验证保留原始源码身份，不冒称各组集成验证或新增性能结果。
+- [ ] **仍依赖集成：** 009 协议13、Apple 003/004/025、网络024、媒体011/012/021与产品002等提交须在统一 revision 收口，再逐切片消除重复 owner；DL2-014 同硬件前后比较、Swift/Xcode、真实资源/取消/权限场景仍缺。当前只完成整理，主项继续未完成，不在本分支提前重写 controller/runtime/FFI。
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 

@@ -68,6 +68,8 @@ Rust 共享层拥有协议、设备身份、配对邀请、Noise 会话、业务
 | `relay` | 会话目录与密文转发 | 保存或解析业务明文 |
 | `account` | 账号生命周期和实例登记 | 默认为远程授权或 relay 健康证明 |
 
+第二阶段的现状差异、公共错误/资源合同和集成前置见[所有权与边界合同](second-stage-boundary-contracts.md)。该文档是 DL2-040 的整理切片，不表示巨型模块已经拆分或性能已经改善。
+
 ## 6. 发布门禁
 
 本地验证统一使用 `scripts/verify.py` 的 fast/integration/native/perf，覆盖 Rust、三个 Bun 项目和 Python；工具、源码、命令和 skipped 语义见[本地验证说明](local-verification.md)。Windows 发布另有版本/清单哈希与安装器负载门禁；Apple 构建/测试及 managed relay 双向探针是独立显式入口，不因本地通过而视为已执行。它们均不能替代真实设备验收。
