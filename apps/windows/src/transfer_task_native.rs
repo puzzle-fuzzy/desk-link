@@ -79,6 +79,11 @@ fn confirm_source_resume(_: &Path, _: bool, _: FileTaskCancellation) -> bool {
 /// The owner aborts this pump on connection teardown. It never consumes video,
 /// audio or input, and prioritizes the latest user control over file blocks.
 pub struct FileTaskPump(tokio::task::JoinHandle<()>);
+impl FileTaskPump {
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+}
 impl Drop for FileTaskPump {
     fn drop(&mut self) {
         self.0.abort();

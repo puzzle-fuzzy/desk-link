@@ -28,6 +28,9 @@ const MAGIC: &[u8; 4] = b"DLD1";
 const VERSION: u8 = 1;
 const HEADER_BYTES: usize = 6;
 const RELIABLE_PAYLOAD_MAGIC: &[u8; 4] = b"DLB1";
+const FENCE_MAGIC: &[u8; 4] = b"DLF1";
+const FENCE_QUERY: u8 = 0x80;
+const FENCE_PAYLOAD_BYTES: usize = 4 + 8 + RECEIPT_BYTES;
 const RECEIPT_BYTES: usize = 16;
 const RELIABLE_PAYLOAD_OVERHEAD: usize = 4 + RECEIPT_BYTES;
 // Business ChannelKind values 1..=8 only. Crypto-only lanes such as
@@ -62,7 +65,7 @@ pub enum LanDataRoute {
     Relay,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Eq, PartialEq)]
 pub enum LanDataError {
     #[error("LAN data plane is closed or this reliable lane was interrupted")]
     Closed,
@@ -88,13 +91,16 @@ pub trait LanRelayBackend: Send + Sync {
     ) -> impl Future<Output = Result<(), TransportError>> + Send + 'a;
 }
 
-struct Ingress {
-    secure: Arc<Mutex<SecureSession>>,
+pub(crate) struct Ingress {
+    pub(crate) secure: Arc<Mutex<SecureSession>>,
+    wrapped_channels: u16,
     senders: [mpsc::Sender<Bytes>; CHANNEL_COUNT],
     // A reliable retry is acknowledged only if these exact authenticated
     // bytes were already admitted. ReplayRejected alone is insufficient:
     // it also describes unseen packets older than the crypto replay window.
     last_reliable: [Mutex<Option<AdmittedReliable>>; CHANNEL_COUNT],
+    fences: [Mutex<Option<AdmittedFence>>; CHANNEL_COUNT],
+    fence_changed: [watch::Sender<u64>; CHANNEL_COUNT],
 }
 
 struct AdmittedReliable {
@@ -102,11 +108,51 @@ struct AdmittedReliable {
     receipt: [u8; RECEIPT_BYTES],
 }
 
+struct AdmittedFence {
+    ciphertext: Bytes,
+    receipt: [u8; RECEIPT_BYTES],
+    generation: u64,
+}
+
 impl Ingress {
-    async fn admit(
+    pub(crate) fn new_channels(
+        secure: Arc<Mutex<SecureSession>>,
+        wrapped_channels: u16,
+    ) -> (Arc<Self>, [Mutex<mpsc::Receiver<Bytes>>; CHANNEL_COUNT]) {
+        let channels: [_; CHANNEL_COUNT] =
+            std::array::from_fn(|i| mpsc::channel(queue_capacity(i)));
+        let mut senders = Vec::with_capacity(CHANNEL_COUNT);
+        let mut receivers = Vec::with_capacity(CHANNEL_COUNT);
+        for (sender, receiver) in channels {
+            senders.push(sender);
+            receivers.push(Mutex::new(receiver));
+        }
+        (
+            Arc::new(Self {
+                secure,
+                wrapped_channels,
+                senders: senders.try_into().expect("eight channel senders"),
+                last_reliable: std::array::from_fn(|_| Mutex::new(None)),
+                fences: std::array::from_fn(|_| Mutex::new(None)),
+                fence_changed: std::array::from_fn(|_| watch::channel(0).0),
+            }),
+            receivers.try_into().expect("eight channel receivers"),
+        )
+    }
+
+    pub(crate) async fn admit(
         &self,
         channel: ChannelKind,
         ciphertext: Bytes,
+    ) -> Result<Option<[u8; RECEIPT_BYTES]>, LanDataError> {
+        self.admit_from(channel, ciphertext, true).await
+    }
+
+    async fn admit_from(
+        &self,
+        channel: ChannelKind,
+        ciphertext: Bytes,
+        from_relay: bool,
     ) -> Result<Option<[u8; RECEIPT_BYTES]>, LanDataError> {
         let index = index(channel);
         if channel.is_reliable() {
@@ -123,6 +169,28 @@ impl Ingress {
                 .await
                 .map_err(|_| LanDataError::Closed)?;
             let plaintext = self.secure.lock().await.open(lane(channel), &ciphertext)?;
+            if self.wrapped_channels & (1 << index) == 0 {
+                permit.send(Bytes::from(plaintext));
+                return Ok(None);
+            }
+            if plaintext.len() == FENCE_PAYLOAD_BYTES && &plaintext[..4] == FENCE_MAGIC {
+                if !from_relay {
+                    return Err(LanDataError::Malformed);
+                }
+                let generation = u64::from_be_bytes(plaintext[4..12].try_into().unwrap());
+                if generation == 0 {
+                    return Err(LanDataError::Malformed);
+                }
+                let receipt = plaintext[12..].try_into().unwrap();
+                *self.fences[index].lock().await = Some(AdmittedFence {
+                    ciphertext,
+                    receipt,
+                    generation,
+                });
+                self.fence_changed[index]
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+                return Ok(Some(receipt));
+            }
             if plaintext.len() < RELIABLE_PAYLOAD_OVERHEAD
                 || &plaintext[..4] != RELIABLE_PAYLOAD_MAGIC
             {
@@ -140,6 +208,24 @@ impl Ingress {
             permit.send(Bytes::from(plaintext));
         }
         Ok(None)
+    }
+
+    async fn fence_receipt(
+        &self,
+        channel: ChannelKind,
+        ciphertext: &Bytes,
+        expected_generation: u64,
+    ) -> Result<[u8; RECEIPT_BYTES], LanDataError> {
+        let mut changed = self.fence_changed[index(channel)].subscribe();
+        loop {
+            if let Some(admitted) = self.fences[index(channel)].lock().await.as_ref()
+                && admitted.ciphertext == *ciphertext
+                && admitted.generation == expected_generation
+            {
+                return Ok(admitted.receipt);
+            }
+            changed.changed().await.map_err(|_| LanDataError::Closed)?;
+        }
     }
 }
 
@@ -172,19 +258,7 @@ impl LanDataPlane {
             );
         }
         let connection = authenticated.authenticated_quic_connection();
-        let channels: [_; CHANNEL_COUNT] =
-            std::array::from_fn(|i| mpsc::channel(queue_capacity(i)));
-        let mut senders = Vec::with_capacity(CHANNEL_COUNT);
-        let mut receivers = Vec::with_capacity(CHANNEL_COUNT);
-        for (sender, receiver) in channels {
-            senders.push(sender);
-            receivers.push(Mutex::new(receiver));
-        }
-        let ingress = Arc::new(Ingress {
-            secure,
-            senders: senders.try_into().expect("eight channel senders"),
-            last_reliable: std::array::from_fn(|_| Mutex::new(None)),
-        });
+        let (ingress, receivers) = Ingress::new_channels(secure, 0xff);
         let (stopped, _) = watch::channel(false);
         let tasks = vec![
             tokio::spawn(read_streams(
@@ -202,7 +276,7 @@ impl LanDataPlane {
         Ok(Self {
             connection,
             ingress,
-            receivers: receivers.try_into().expect("eight channel receivers"),
+            receivers,
             outbound: std::array::from_fn(|_| Mutex::new(())),
             routes: std::array::from_fn(|_| AtomicU8::new(DIRECT)),
             stopped,
@@ -378,18 +452,37 @@ impl Drop for PendingSend<'_> {
     }
 }
 
-async fn send_reliable(
+pub(crate) async fn send_reliable(
     connection: &quinn::Connection,
     channel: ChannelKind,
     ciphertext: &[u8],
     expected_receipt: &[u8; RECEIPT_BYTES],
+) -> Result<(), LanDataError> {
+    send_reliable_kind(connection, channel, ciphertext, expected_receipt, false).await
+}
+
+pub(crate) async fn send_fence_query(
+    connection: &quinn::Connection,
+    channel: ChannelKind,
+    ciphertext: &[u8],
+    expected_receipt: &[u8; RECEIPT_BYTES],
+) -> Result<(), LanDataError> {
+    send_reliable_kind(connection, channel, ciphertext, expected_receipt, true).await
+}
+
+async fn send_reliable_kind(
+    connection: &quinn::Connection,
+    channel: ChannelKind,
+    ciphertext: &[u8],
+    expected_receipt: &[u8; RECEIPT_BYTES],
+    fence_query: bool,
 ) -> Result<(), LanDataError> {
     let (mut send, mut receive) = connection.open_bi().await.map_err(stream_error)?;
     send.set_priority(priority(channel)).map_err(stream_error)?;
     let mut header = [0_u8; HEADER_BYTES + 4];
     header[..4].copy_from_slice(MAGIC);
     header[4] = VERSION;
-    header[5] = channel as u8;
+    header[5] = channel as u8 | if fence_query { FENCE_QUERY } else { 0 };
     header[HEADER_BYTES..].copy_from_slice(&(ciphertext.len() as u32).to_be_bytes());
     send.write_all(&header).await.map_err(stream_error)?;
     send.write_all(ciphertext).await.map_err(stream_error)?;
@@ -405,7 +498,7 @@ async fn send_reliable(
     Ok(())
 }
 
-fn send_datagram(
+pub(crate) fn send_datagram(
     connection: &quinn::Connection,
     channel: ChannelKind,
     ciphertext: &[u8],
@@ -419,11 +512,41 @@ fn send_datagram(
         .map_err(stream_error)
 }
 
-async fn read_streams(
+pub(crate) async fn read_streams(
+    connection: quinn::Connection,
+    ingress: Arc<Ingress>,
+    stopped: watch::Receiver<bool>,
+    config: LanDataConfig,
+) {
+    read_streams_with_fences(
+        connection,
+        ingress,
+        stopped,
+        config,
+        Arc::new(std::sync::atomic::AtomicU16::new(0xff)),
+        DirectStreamAuthority {
+            channels: 0xff,
+            generation: 1,
+        },
+        None,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DirectStreamAuthority {
+    pub(crate) channels: u16,
+    pub(crate) generation: u64,
+}
+
+pub(crate) async fn read_streams_with_fences(
     connection: quinn::Connection,
     ingress: Arc<Ingress>,
     mut stopped: watch::Receiver<bool>,
     config: LanDataConfig,
+    allowed: Arc<std::sync::atomic::AtomicU16>,
+    authority: DirectStreamAuthority,
+    task_counter: Option<Arc<crate::business_transport::TaskCounter>>,
 ) {
     let mut readers = JoinSet::new();
     loop {
@@ -439,19 +562,34 @@ async fn read_streams(
                     continue;
                 }
                 let ingress = ingress.clone();
+                let allowed = allowed.clone();
+                let lease = task_counter.as_ref().map(|counter| counter.lease());
                 readers.spawn(async move {
+                    let _lease = lease;
                     let _ = tokio::time::timeout(config.operation_timeout, async {
                         let mut header = [0; HEADER_BYTES + 4];
                         receive.read_exact(&mut header).await.map_err(stream_error)?;
+                        let query = header[5] & FENCE_QUERY != 0;
+                        header[5] &= !FENCE_QUERY;
                         let channel = decode_header(&header)?;
-                        if !channel.is_reliable() { return Err(LanDataError::Malformed); }
+                        if !channel.is_reliable() || authority.channels & (1 << index(channel)) == 0 || ingress.wrapped_channels & (1 << index(channel)) == 0 { return Err(LanDataError::Malformed); }
                         let length = u32::from_be_bytes(header[HEADER_BYTES..].try_into().unwrap()) as usize;
                         if !(PACKET_OVERHEAD..=MAX_ENCRYPTED_MESSAGE_BYTES).contains(&length) {
                             return Err(LanDataError::Malformed);
                         }
                         let mut ciphertext = vec![0; length];
                         receive.read_exact(&mut ciphertext).await.map_err(stream_error)?;
-                        let receipt = ingress.admit(channel, ciphertext.into()).await?.ok_or(LanDataError::Malformed)?;
+                        let ciphertext: Bytes = ciphertext.into();
+                        let receipt = if query {
+                            // Exact relay-admitted ciphertext only: a query
+                            // never opens/burns a new sequence ahead of backlog.
+                            let receipt = ingress.fence_receipt(channel, &ciphertext, authority.generation).await?;
+                            allowed.fetch_or(1 << index(channel), std::sync::atomic::Ordering::AcqRel);
+                            receipt
+                        } else {
+                            if allowed.load(std::sync::atomic::Ordering::Acquire) & (1 << index(channel)) == 0 { return Err(LanDataError::Malformed); }
+                            ingress.admit_from(channel, ciphertext, false).await?.ok_or(LanDataError::Malformed)?
+                        };
                         send.write_all(&receipt).await.map_err(stream_error)?;
                         send.finish().map_err(stream_error)
                     }).await;
@@ -461,10 +599,19 @@ async fn read_streams(
     }
 }
 
-async fn read_datagrams(
+pub(crate) async fn read_datagrams(
+    connection: quinn::Connection,
+    ingress: Arc<Ingress>,
+    stopped: watch::Receiver<bool>,
+) {
+    read_datagrams_for_channels(connection, ingress, stopped, 0xff).await;
+}
+
+pub(crate) async fn read_datagrams_for_channels(
     connection: quinn::Connection,
     ingress: Arc<Ingress>,
     mut stopped: watch::Receiver<bool>,
+    channels: u16,
 ) {
     loop {
         tokio::select! {
@@ -474,7 +621,7 @@ async fn read_datagrams(
                 let Ok(bytes) = received else { break };
                 if bytes.len() > MAX_DATAGRAM_BYTES { continue; }
                 let Ok(channel) = decode_header(&bytes) else { continue };
-                if channel.is_reliable() { continue; }
+                if channel.is_reliable() || channels & (1 << index(channel)) == 0 || ingress.wrapped_channels & (1 << index(channel)) == 0 { continue; }
                 let _ = ingress.admit(channel, bytes.slice(HEADER_BYTES..)).await;
             }
         }
@@ -492,7 +639,7 @@ fn stream_error(error: impl std::fmt::Display) -> LanDataError {
     TransportError::Stream(error.to_string()).into()
 }
 
-fn seal_payload(
+pub(crate) fn seal_payload(
     secure: &mut SecureSession,
     channel: ChannelKind,
     plaintext: &[u8],
@@ -512,6 +659,23 @@ fn seal_payload(
     } else {
         Ok((secure.seal(lane(channel), plaintext)?.into(), None))
     }
+}
+
+pub(crate) fn seal_fence(
+    secure: &mut SecureSession,
+    channel: ChannelKind,
+    generation: u64,
+) -> Result<(Bytes, [u8; RECEIPT_BYTES]), LanDataError> {
+    if generation == 0 {
+        return Err(LanDataError::Malformed);
+    }
+    let mut receipt = [0; RECEIPT_BYTES];
+    OsRng.fill_bytes(&mut receipt);
+    let mut plaintext = Vec::with_capacity(FENCE_PAYLOAD_BYTES);
+    plaintext.extend_from_slice(FENCE_MAGIC);
+    plaintext.extend_from_slice(&generation.to_be_bytes());
+    plaintext.extend_from_slice(&receipt);
+    Ok((secure.seal(lane(channel), &plaintext)?.into(), receipt))
 }
 
 fn index(channel: ChannelKind) -> usize {
@@ -541,7 +705,7 @@ fn priority(channel: ChannelKind) -> i32 {
     }
 }
 
-fn lane(channel: ChannelKind) -> SecureLane {
+pub(crate) fn lane(channel: ChannelKind) -> SecureLane {
     match channel {
         ChannelKind::Control => SecureLane::Control,
         ChannelKind::Input => SecureLane::Input,
@@ -1099,6 +1263,222 @@ mod tests {
         .await
         .expect("close must reclaim readers without waiting for the crypto lock");
         drop(crypto_guard);
+    }
+
+    #[tokio::test]
+    async fn an_early_fence_query_never_opens_new_crypto_or_acknowledges_unseen_relay_data() {
+        let f = Fixture::new().await;
+        let (older, _) = seal_payload(
+            &mut *f.a.ingress.secure.lock().await,
+            ChannelKind::Input,
+            b"older relay input",
+        )
+        .unwrap();
+        for _ in 0..128 {
+            let _ = seal_payload(
+                &mut *f.a.ingress.secure.lock().await,
+                ChannelKind::Input,
+                b"queued ahead of fence",
+            )
+            .unwrap();
+        }
+        let (fence, receipt) =
+            seal_fence(&mut *f.a.ingress.secure.lock().await, ChannelKind::Input, 1).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                send_fence_query(&f.a.connection, ChannelKind::Input, &fence, &receipt)
+            )
+            .await
+            .is_err()
+        );
+        // If the query had opened sequence 130, this unseen sequence one would
+        // now be outside the 128-packet replay window and could not be read.
+        f.b.accept_relay_ciphertext(ChannelKind::Input, older)
+            .await
+            .unwrap();
+        assert_eq!(
+            receive(&f.b, ChannelKind::Input).await.as_ref(),
+            b"older relay input"
+        );
+        f.b.accept_relay_ciphertext(ChannelKind::Input, fence.clone())
+            .await
+            .unwrap();
+        send_fence_query(&f.a.connection, ChannelKind::Input, &fence, &receipt)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), f.b.recv(ChannelKind::Input))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_committed_subset_cannot_query_or_deliver_an_unselected_reliable_lane() {
+        let f = Fixture::new().await;
+        f.b.tasks[0].abort();
+        while !f.b.tasks[0].is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let (stopped, receiver) = watch::channel(false);
+        let reader = tokio::spawn(read_streams_with_fences(
+            f.b.connection.clone(),
+            f.b.ingress.clone(),
+            receiver,
+            f.b.config,
+            Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            DirectStreamAuthority {
+                channels: 0x03,
+                generation: 1,
+            },
+            None,
+        ));
+        let (fence, token) = seal_fence(
+            &mut *f.a.ingress.secure.lock().await,
+            ChannelKind::Transfer,
+            1,
+        )
+        .unwrap();
+        // Transfer is negotiated in the capability intersection, so relay
+        // admission is valid. This connection only committed Input/Control.
+        f.b.accept_relay_ciphertext(ChannelKind::Transfer, fence.clone())
+            .await
+            .unwrap();
+        let queried = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_fence_query(&f.a.connection, ChannelKind::Transfer, &fence, &token),
+        )
+        .await
+        .unwrap();
+        assert!(
+            queried.is_err(),
+            "a real cached fence must not authorize a lane outside the committed subset"
+        );
+        let (payload, receipt) = seal_payload(
+            &mut *f.a.ingress.secure.lock().await,
+            ChannelKind::Transfer,
+            b"relay-only transfer",
+        )
+        .unwrap();
+        let sent = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_reliable(
+                &f.a.connection,
+                ChannelKind::Transfer,
+                &payload,
+                &receipt.unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(sent.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), f.b.recv(ChannelKind::Transfer))
+                .await
+                .is_err()
+        );
+        // Header rejection also must not open/burn this ciphertext's sequence.
+        f.b.accept_relay_ciphertext(ChannelKind::Transfer, payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            receive(&f.b, ChannelKind::Transfer).await.as_ref(),
+            b"relay-only transfer"
+        );
+        stopped.send_replace(true);
+        reader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_switch_generation_cannot_reuse_a_previously_admitted_fence() {
+        let f = Fixture::new().await;
+        let (old_fence, old_token) =
+            seal_fence(&mut *f.a.ingress.secure.lock().await, ChannelKind::Input, 1).unwrap();
+        f.b.accept_relay_ciphertext(ChannelKind::Input, old_fence.clone())
+            .await
+            .unwrap();
+        f.b.tasks[0].abort();
+        while !f.b.tasks[0].is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let (stopped, receiver) = watch::channel(false);
+        let reader = tokio::spawn(read_streams_with_fences(
+            f.b.connection.clone(),
+            f.b.ingress.clone(),
+            receiver,
+            f.b.config,
+            Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            DirectStreamAuthority {
+                channels: 0x03,
+                generation: 2,
+            },
+            None,
+        ));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                send_fence_query(&f.a.connection, ChannelKind::Input, &old_fence, &old_token)
+            )
+            .await
+            .is_err()
+        );
+        let (before_fence, token) = seal_payload(
+            &mut *f.a.ingress.secure.lock().await,
+            ChannelKind::Input,
+            b"still on relay",
+        )
+        .unwrap();
+        assert!(
+            send_reliable(
+                &f.a.connection,
+                ChannelKind::Input,
+                &before_fence,
+                &token.unwrap()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), f.b.recv(ChannelKind::Input))
+                .await
+                .is_err()
+        );
+        f.b.accept_relay_ciphertext(ChannelKind::Input, before_fence)
+            .await
+            .unwrap();
+        assert_eq!(
+            receive(&f.b, ChannelKind::Input).await.as_ref(),
+            b"still on relay"
+        );
+        let (new_fence, new_token) =
+            seal_fence(&mut *f.a.ingress.secure.lock().await, ChannelKind::Input, 2).unwrap();
+        f.b.accept_relay_ciphertext(ChannelKind::Input, new_fence.clone())
+            .await
+            .unwrap();
+        send_fence_query(&f.a.connection, ChannelKind::Input, &new_fence, &new_token)
+            .await
+            .unwrap();
+        let (after_fence, token) = seal_payload(
+            &mut *f.a.ingress.secure.lock().await,
+            ChannelKind::Input,
+            b"generation two direct",
+        )
+        .unwrap();
+        send_reliable(
+            &f.a.connection,
+            ChannelKind::Input,
+            &after_fence,
+            &token.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            receive(&f.b, ChannelKind::Input).await.as_ref(),
+            b"generation two direct"
+        );
+        stopped.send_replace(true);
+        reader.await.unwrap();
     }
 
     #[tokio::test]

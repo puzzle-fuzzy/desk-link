@@ -199,6 +199,231 @@ pub(crate) async fn connected_flow_control_fixture() -> DirectFixture {
     connected_fixture(true).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_task_sender_and_ingress_preserve_new_variants_on_the_negotiated_direct_business_lane()
+{
+    use desklink_protocol::{FileTaskMessage, FileTaskPhase, FileTransferCapabilities};
+    use desklink_transport::{LanSwitchAction, LanSwitchNegotiator};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut fixture = connected_fixture(false).await;
+        let local = super::lan_runtime::controller_capabilities(Platform::Windows);
+        let mut remote = fixture.runtime.host_capabilities.clone();
+        remote.lan_data = local.lan_data;
+        send_control(
+            &fixture.host,
+            &fixture.host_secure,
+            &ControlMessage::Capabilities(remote.clone()),
+        )
+        .await
+        .unwrap();
+        let wire = fixture.runtime.client.next_control().await.unwrap();
+        assert_eq!(
+            decode_control(
+                &open(&fixture.runtime.secure, SecureLane::Control, &wire)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            ControlMessage::Capabilities(remote.clone())
+        );
+        send_control(
+            &fixture.runtime.client,
+            &fixture.runtime.secure,
+            &ControlMessage::Capabilities(local.clone()),
+        )
+        .await
+        .unwrap();
+        let wire = fixture.host.next_control().await.unwrap();
+        assert_eq!(
+            decode_control(
+                &open(&fixture.host_secure, SecureLane::Control, &wire)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            ControlMessage::Capabilities(local.clone())
+        );
+        let binding = fixture.runtime.secure.lock().await.video_path_binding();
+        let agreement = NegotiatedLanData::from_authenticated_caps(
+            &local,
+            &remote,
+            binding,
+            fixture.runtime.client.peer_generation(),
+        )
+        .unwrap()
+        .unwrap();
+        let host_agreement = NegotiatedLanData::from_authenticated_caps(
+            &remote,
+            &local,
+            binding,
+            fixture.host.peer_generation(),
+        )
+        .unwrap()
+        .unwrap();
+        let plane = SessionDataPlane::relay_only(
+            agreement,
+            fixture.runtime.secure.clone(),
+            Arc::new(
+                QuicRelayBackend::new(
+                    fixture.runtime.client.clone(),
+                    fixture.runtime.client.peer_generation(),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let host = SessionDataPlane::relay_only(
+            host_agreement,
+            fixture.host_secure.clone(),
+            Arc::new(
+                QuicRelayBackend::new(fixture.host.clone(), fixture.host.peer_generation())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let direct = fixture
+            .runtime
+            .direct_connection
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .clone();
+        let now = now_unix_s();
+        let candidate = DirectLanCandidate::new(
+            direct.candidate_id(),
+            fixture._peer_endpoint.local_addr().unwrap(),
+            now + u64::from(desklink_protocol::MAX_DIRECT_LAN_CANDIDATE_TTL_S),
+            binding,
+            now,
+        )
+        .unwrap();
+        let channels = 1_u16 << (ChannelKind::Transfer as u8 - 1);
+        let mut host_switch = LanSwitchNegotiator::new(host_agreement);
+        let mut controller_switch = LanSwitchNegotiator::new(agreement);
+        let offer = host_switch
+            .offer(&candidate, channels, now_unix_s())
+            .unwrap();
+        host.send(ChannelKind::Control, encode_control(&offer).unwrap().into())
+            .await
+            .unwrap();
+        let offer = decode_control(&plane.recv(ChannelKind::Control).await.unwrap()).unwrap();
+        let LanSwitchAction::SendReady(ready) = controller_switch
+            .receive(&offer, &candidate, now_unix_s())
+            .unwrap()
+        else {
+            panic!("expected authenticated Ready")
+        };
+        plane
+            .send(ChannelKind::Control, encode_control(&ready).unwrap().into())
+            .await
+            .unwrap();
+        let ready = decode_control(&host.recv(ChannelKind::Control).await.unwrap()).unwrap();
+        let LanSwitchAction::SendCommit(commit) = host_switch
+            .receive(&ready, &candidate, now_unix_s())
+            .unwrap()
+        else {
+            panic!("expected authenticated Commit")
+        };
+        host.send(
+            ChannelKind::Control,
+            encode_control(&commit).unwrap().into(),
+        )
+        .await
+        .unwrap();
+        let host_authority = host_switch.commit_sent().unwrap();
+        let commit = decode_control(&plane.recv(ChannelKind::Control).await.unwrap()).unwrap();
+        let LanSwitchAction::Attach(controller_authority) = controller_switch
+            .receive(&commit, &candidate, now_unix_s())
+            .unwrap()
+        else {
+            panic!("expected authenticated attachment")
+        };
+        let (controller_attach, host_attach) = tokio::join!(
+            plane.attach_direct(controller_authority, direct),
+            host.attach_direct(host_authority, fixture.direct_peer.as_ref().clone())
+        );
+        controller_attach.unwrap();
+        host_attach.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    plane.health().borrow().lanes[ChannelKind::Transfer as usize - 1],
+                    SessionLaneHealth::Direct(_)
+                ) && matches!(
+                    host.health().borrow().lanes[ChannelKind::Transfer as usize - 1],
+                    SessionLaneHealth::Direct(_)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.runtime.data_plane = Some(plane.clone());
+        let sender = fixture.runtime.transfer_sender();
+        let task_id = [0x51; 16];
+        for message in [
+            FileTaskMessage::Capabilities(FileTransferCapabilities::WINDOWS),
+            FileTaskMessage::Activity {
+                task_id,
+                item_id: Some(1),
+                phase: FileTaskPhase::Indexing,
+                completed: 2,
+                total: 3,
+            },
+            FileTaskMessage::EntrySkipped {
+                task_id,
+                item_id: 1,
+                relative_path: "blocked/file.bin".into(),
+                size: 0,
+                result: desklink_protocol::TransferResult::SourceChanged,
+            },
+            FileTaskMessage::RetryRequest {
+                task_id,
+                item_id: Some(1),
+            },
+            FileTaskMessage::SelectionCancel { request_id: 91 },
+        ] {
+            let transfer = TransferMessage::FileTask(message);
+            sender.send(transfer.clone()).await.unwrap();
+            assert_eq!(
+                decode_transfer(&host.recv(ChannelKind::Transfer).await.unwrap()).unwrap(),
+                transfer
+            );
+            host.send(
+                ChannelKind::Transfer,
+                encode_transfer(&transfer).unwrap().into(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fixture.runtime.next_event().await.unwrap(),
+                ControllerEvent::Transfer(transfer)
+            );
+        }
+        let context = InputContext {
+            stream_id: 7,
+            input_epoch: 9,
+        };
+        fixture
+            .runtime
+            .input_sender()
+            .send_input_with_context(context, InputEvent::MouseMove { x: 1, y: 2 })
+            .await
+            .unwrap();
+        let input =
+            desklink_protocol::decode_input(&host.recv(ChannelKind::Input).await.unwrap()).unwrap();
+        assert_eq!((input.stream_id, input.input_epoch), (7, 9));
+        assert_eq!(input.event, InputEvent::MouseMove { x: 1, y: 2 });
+        tokio::join!(plane.close_and_wait(), host.close_and_wait());
+    })
+    .await
+    .expect("file-task LAN business transport regression must remain bounded");
+}
+
 fn fixture_flow_control_limits() -> QuicFlowControlLimits {
     // A 2 KiB flight fills the peer's 128-message receive queue promptly on
     // loopback, while retaining finite buffers on both relay hops. A 128-byte
@@ -307,6 +532,8 @@ async fn connected_fixture(backpressure: bool) -> DirectFixture {
         direct_peer: peer.clone(),
     };
     let runtime = ControllerRuntime {
+        data_plane: None,
+        lan: None,
         host_capabilities: DeviceCapabilities {
             platform: Platform::Windows,
             role: DeviceRole::Host,
@@ -391,16 +618,24 @@ async fn spawn_relay(backpressure: bool) -> TestRelay {
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
     ));
-    let relay = Arc::new(
+    let relay = if backpressure {
         RelayServer::bind_with_flow_control_limits(
             "127.0.0.1:0".parse().unwrap(),
             server_config,
             RelayConfig::default(),
-            backpressure.then(fixture_flow_control_limits),
+            Some(fixture_flow_control_limits()),
         )
         .await
-        .unwrap(),
-    );
+    } else {
+        RelayServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config,
+            RelayConfig::default(),
+        )
+        .await
+    }
+    .unwrap();
+    let relay = Arc::new(relay);
     let address = relay.local_addr().unwrap();
     let task = TestTask(tokio::spawn(async move {
         let _ = relay.run().await;

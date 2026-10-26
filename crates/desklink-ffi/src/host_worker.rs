@@ -13,7 +13,7 @@ use desklink_crypto::{
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputContext,
     InputEnvelope, MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep,
-    PROTOCOL_VERSION, Platform, VideoConfig, decode_control, decode_cursor_update,
+    PROTOCOL_VERSION, Platform, TransferMessage, VideoConfig, decode_control, decode_cursor_update,
     decode_noise_handshake, decode_session_input, decode_transfer, encode_control,
     encode_noise_handshake, encode_transfer, encode_video_config,
 };
@@ -955,7 +955,7 @@ async fn negotiate_controller(
                 }
                 ControlMessage::LanDataSwitch { .. } => {
                     return Err(HostError::Protocol(
-                        "LAN data switching was not negotiated".into(),
+                        "LAN data switching is unsupported by the FFI host".into(),
                     ));
                 }
                 ControlMessage::Hello { .. }
@@ -1025,7 +1025,7 @@ async fn run_connected(
                         let plaintext = secure.open(SecureLane::Control, &ciphertext).map_err(crypto_error)?;
                         let message = decode_control(&plaintext).map_err(protocol_error)?;
                         if matches!(message, ControlMessage::LanDataSwitch { .. }) {
-                            return Err(HostError::Protocol("LAN data switching was not negotiated".into()));
+                            return Err(HostError::Protocol("LAN data switching is unsupported by the FFI host".into()));
                         }
                         if matches!(message, ControlMessage::RequestKeyframe { .. }) {
                             metrics.keyframe_requests = metrics.keyframe_requests.saturating_add(1);
@@ -1044,6 +1044,11 @@ async fn run_connected(
                     TransportEvent::Transfer(ciphertext) => {
                         let plaintext = secure.open(SecureLane::Transfer, &ciphertext).map_err(crypto_error)?;
                         let message = decode_transfer(&plaintext).map_err(protocol_error)?;
+                        if matches!(message, TransferMessage::FileTask(_)) {
+                            return Err(HostError::Protocol(
+                                "file task service is unsupported by the FFI host".into(),
+                            ));
+                        }
                         emit_nonterminal(events, HostEvent::Transfer(message));
                     }
             TransportEvent::Closed { reason } => return Err(HostError::Transport(format!("transport closed: {reason}"))),
@@ -1322,6 +1327,9 @@ async fn handle_command(
                 .map_err(transport_error)?;
             Ok(true)
         }
+        HostCommand::SendTransfer(TransferMessage::FileTask(_)) => Err(HostError::Protocol(
+            "file task service is unsupported by the FFI host".into(),
+        )),
         HostCommand::SendTransfer(message) => {
             let plaintext = encode_transfer(&message).map_err(protocol_error)?;
             let ciphertext = secure

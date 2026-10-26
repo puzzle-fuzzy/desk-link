@@ -4,6 +4,7 @@ use desklink_crypto::SessionId;
 use desklink_protocol::{DeviceRole, PROTOCOL_VERSION};
 use thiserror::Error;
 
+mod business_transport;
 mod direct_probe;
 mod lan_candidate;
 mod lan_data;
@@ -12,6 +13,10 @@ mod retry_policy;
 mod video_egress;
 mod video_path;
 
+pub use business_transport::{
+    DirectPathId, LanAttachAuthority, LanSwitchAction, LanSwitchNegotiator, NegotiatedLanData,
+    QuicRelayBackend, SessionDataError, SessionDataHealth, SessionDataPlane, SessionLaneHealth,
+};
 pub use direct_probe::{
     DirectLanConnection, DirectLanEndpoint, DirectLanProbeError, DirectLanProbeResult,
     DirectLanSession,
@@ -201,6 +206,13 @@ impl QuicFlowControlLimits {
         transport.send_window(u64::from(self.send_window));
         transport.receive_window(self.receive_window.into());
         transport.stream_receive_window(self.stream_receive_window.into());
+    }
+
+    /// Whether this tuning only lowers the supplied payload-buffer ceilings.
+    pub const fn fits_within(self, maximum: Self) -> bool {
+        self.send_window <= maximum.send_window
+            && self.receive_window <= maximum.receive_window
+            && self.stream_receive_window <= maximum.stream_receive_window
     }
 }
 

@@ -35,7 +35,13 @@ impl Drop for TestRelay {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn saved_direct_join_without_directory_still_rejects_protocol_12_noise() {
+async fn saved_direct_join_without_directory_still_rejects_protocol_12_and_13_noise() {
+    for rejected_version in [12, 13] {
+        saved_direct_join_rejects_noise_version(rejected_version).await;
+    }
+}
+
+async fn saved_direct_join_rejects_noise_version(rejected_version: u8) {
     let relay = spawn_test_relay().await;
     let config = || {
         QuicClientConfig::with_client_config(
@@ -70,7 +76,7 @@ async fn saved_direct_join_without_directory_still_rejects_protocol_12_noise() {
         })
         .unwrap();
         assert_eq!(legacy_response[0], PROTOCOL_VERSION as u8);
-        legacy_response[0] = 12;
+        legacy_response[0] = rejected_version;
         host.send_control(legacy_response).await.unwrap();
         host
     });
@@ -84,8 +90,8 @@ async fn saved_direct_join_without_directory_still_rejects_protocol_12_noise() {
     assert!(matches!(
         result,
         Err(desklink_ffi::ControllerError::Protocol(
-            desklink_protocol::ProtocolError::UnsupportedVersion(12)
-        ))
+            desklink_protocol::ProtocolError::UnsupportedVersion(version)
+        )) if version == u16::from(rejected_version)
     ));
     let _host = host_task.await.unwrap();
 }

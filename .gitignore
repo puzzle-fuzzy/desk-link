@@ -12,3 +12,6 @@ __pycache__/
 *.py[cod]
 node_modules/
 apps/windows-ui/src-tauri/gen/
+
+# Machine-local code navigation indexes.
+.codegraph/

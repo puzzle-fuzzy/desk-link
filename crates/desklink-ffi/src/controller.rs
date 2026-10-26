@@ -21,9 +21,10 @@ use desklink_protocol::{
 };
 use desklink_session::InputSequencer;
 use desklink_transport::{
-    DirectLanConnection, DirectLanEndpoint, DirectLanProbeResult, DirectLanSession,
+    ChannelKind, DirectLanConnection, DirectLanEndpoint, DirectLanProbeResult, DirectLanSession,
     DirectVideoPathAction, DirectVideoPathEvent, DirectVideoPathFallbackReason,
-    DirectVideoPathMachine, DirectVideoPathState, QuicClient, TransportError, TransportEvent,
+    DirectVideoPathMachine, DirectVideoPathState, NegotiatedLanData, QuicClient, QuicRelayBackend,
+    SessionDataError, SessionDataPlane, SessionLaneHealth, TransportError, TransportEvent,
     VideoPathKind, VideoPathQuality,
 };
 use desklink_video::{
@@ -40,6 +41,9 @@ fn supported_h264_profiles(platform: Platform) -> Vec<H264Profile> {
 }
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+mod lan_runtime;
+use lan_runtime::{ControllerInboundEvent, ControllerLanRuntime, ControllerPayload};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 // The host opens its local approval dialog after the Noise handshake. The
@@ -74,6 +78,8 @@ enum VideoPacketSource {
 pub enum ControllerError {
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
+    #[error("session data transport error: {0}")]
+    SessionData(#[from] SessionDataError),
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
     #[error("cryptographic session error: {0}")]
@@ -137,6 +143,7 @@ impl AtomicControllerMetrics {
 }
 
 pub struct ControllerRuntime {
+    data_plane: Option<Arc<SessionDataPlane>>,
     host_capabilities: DeviceCapabilities,
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
@@ -149,8 +156,8 @@ pub struct ControllerRuntime {
     assembler: FrameAssembler,
     reliable_assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
-    pending_video_datagrams: VecDeque<Vec<u8>>,
-    pending_video_reliable: VecDeque<Vec<u8>>,
+    pending_video_datagrams: VecDeque<ControllerPayload>,
+    pending_video_reliable: VecDeque<ControllerPayload>,
     active_stream: AtomicU64,
     metrics: AtomicControllerMetrics,
     keyframe_needed_after_config: bool,
@@ -162,6 +169,7 @@ pub struct ControllerRuntime {
     direct_session: Option<DirectLanSession>,
     direct_connection: Option<Arc<DirectLanConnection>>,
     last_direct_datagram_at: Option<Instant>,
+    lan: Option<ControllerLanRuntime>,
 }
 
 #[cfg(test)]
@@ -175,6 +183,7 @@ pub(crate) struct ControllerReceiveTestState {
 
 #[derive(Clone)]
 pub struct ControllerInputSender {
+    data_plane: Option<Arc<SessionDataPlane>>,
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
     input_sequence: Arc<Mutex<InputSequencer>>,
@@ -195,6 +204,7 @@ impl ControllerInputSender {
             &self.client,
             &self.secure,
             &self.input_sequence,
+            self.data_plane.as_deref(),
             context,
             event,
             #[cfg(test)]
@@ -206,6 +216,7 @@ impl ControllerInputSender {
 
 #[derive(Clone)]
 pub(crate) struct ControllerControlSender {
+    data_plane: Option<Arc<SessionDataPlane>>,
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
     order: Arc<Mutex<()>>,
@@ -217,7 +228,14 @@ impl ControllerControlSender {
         // reliable lane. Preserve seal/wire order without holding crypto at I/O.
         match tokio::time::timeout(CONTROLLER_SEND_TIMEOUT, async {
             let _order = self.order.lock().await;
-            send_control(&self.client, &self.secure, &message).await
+            if let Some(plane) = &self.data_plane {
+                plane
+                    .send(ChannelKind::Control, encode_control(&message)?.into())
+                    .await?;
+                Ok(())
+            } else {
+                send_control(&self.client, &self.secure, &message).await
+            }
         })
         .await
         {
@@ -235,12 +253,16 @@ impl ControllerControlSender {
     }
 
     pub(crate) fn close(&self) {
+        if let Some(plane) = &self.data_plane {
+            plane.close();
+        }
         self.client.close(b"desklink controller session retired");
     }
 }
 
 #[derive(Clone)]
 pub struct ControllerTransferSender {
+    data_plane: Option<Arc<SessionDataPlane>>,
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
 }
@@ -248,8 +270,12 @@ pub struct ControllerTransferSender {
 impl ControllerTransferSender {
     pub async fn send(&self, message: TransferMessage) -> Result<(), ControllerError> {
         let plaintext = encode_transfer(&message)?;
-        let ciphertext = seal(&self.secure, SecureLane::Transfer, &plaintext).await?;
-        self.client.send_transfer(ciphertext).await?;
+        if let Some(plane) = &self.data_plane {
+            plane.send(ChannelKind::Transfer, plaintext.into()).await?;
+        } else {
+            let ciphertext = seal(&self.secure, SecureLane::Transfer, &plaintext).await?;
+            self.client.send_transfer(ciphertext).await?;
+        }
         Ok(())
     }
 }
@@ -287,8 +313,24 @@ impl ControllerRuntime {
         on_encrypted();
         let host_capabilities = negotiate_host(&client, &secure, platform).await?;
         let video_path_binding = secure.lock().await.video_path_binding();
+        let agreement = NegotiatedLanData::from_authenticated_caps(
+            &lan_runtime::controller_capabilities(platform),
+            &host_capabilities,
+            video_path_binding,
+            client.peer_generation(),
+        )?;
+        let data_plane = if let Some(agreement) = agreement {
+            let relay = Arc::new(QuicRelayBackend::new(
+                client.clone(),
+                client.peer_generation(),
+            )?);
+            Some(SessionDataPlane::relay_only(agreement, secure.clone(), relay).await?)
+        } else {
+            None
+        };
+        let lan = agreement.map(ControllerLanRuntime::new);
         let mut video_path = DirectVideoPathMachine::new(video_path_binding);
-        let direct_session = if platform == Platform::Windows {
+        let direct_session = if platform == Platform::Windows && data_plane.is_none() {
             video_path = video_path.with_direct_probe();
             let candidate_id = next_direct_candidate_id();
             match DirectLanSession::bind_for_client(
@@ -325,6 +367,8 @@ impl ControllerRuntime {
             None
         };
         Ok(Self {
+            data_plane,
+            lan,
             host_capabilities,
             client,
             secure,
@@ -365,6 +409,20 @@ impl ControllerRuntime {
     }
 
     pub fn video_path_state(&self) -> DirectVideoPathState {
+        if self.data_plane.is_some() {
+            return if self.video_path_kind() == VideoPathKind::DirectLan {
+                DirectVideoPathState::Direct {
+                    candidate_id: self
+                        .lan
+                        .as_ref()
+                        .and_then(|lan| lan.candidate.as_ref())
+                        .map_or(0, DirectLanCandidate::candidate_id),
+                    allows_experimental_4k: false,
+                }
+            } else {
+                DirectVideoPathState::Relay
+            };
+        }
         self.video_path.state().clone()
     }
 
@@ -381,6 +439,7 @@ impl ControllerRuntime {
 
     pub(crate) fn control_sender(&self) -> ControllerControlSender {
         ControllerControlSender {
+            data_plane: self.data_plane.clone(),
             client: self.client.clone(),
             secure: self.secure.clone(),
             order: self.control_order.clone(),
@@ -391,6 +450,18 @@ impl ControllerRuntime {
     /// direct connection wins over the negotiation state because the responder
     /// may establish the QUIC data path before the control answer is observed.
     pub fn video_path_kind(&self) -> VideoPathKind {
+        if let Some(health) = self.session_data_health() {
+            return if !health.closed
+                && health.direct_path.is_some()
+                && matches!(
+                    health.lanes[ChannelKind::VideoDatagram as usize - 1],
+                    SessionLaneHealth::Direct(_)
+                ) {
+                VideoPathKind::DirectLan
+            } else {
+                VideoPathKind::Relay
+            };
+        }
         if self.direct_connection.is_some()
             || matches!(self.video_path.state(), DirectVideoPathState::Direct { .. })
         {
@@ -404,6 +475,9 @@ impl ControllerRuntime {
     /// value remains available after fallback so diagnostics can explain why
     /// a session is currently relayed without reporting relay as direct.
     pub fn video_path_quality(&self) -> Option<VideoPathQuality> {
+        if let Some(lan) = &self.lan {
+            return lan.quality;
+        }
         self.video_path.last_quality()
     }
 
@@ -450,6 +524,7 @@ impl ControllerRuntime {
             &self.client,
             &self.secure,
             &self.input_sequence,
+            self.data_plane.as_deref(),
             context,
             event,
             #[cfg(test)]
@@ -462,6 +537,7 @@ impl ControllerRuntime {
     /// alongside `next_event`. Runtime and all clones share one wire sequence.
     pub fn input_sender(&self) -> ControllerInputSender {
         ControllerInputSender {
+            data_plane: self.data_plane.clone(),
             client: self.client.clone(),
             secure: self.secure.clone(),
             input_sequence: self.input_sequence.clone(),
@@ -522,6 +598,7 @@ impl ControllerRuntime {
 
     pub fn transfer_sender(&self) -> ControllerTransferSender {
         ControllerTransferSender {
+            data_plane: self.data_plane.clone(),
             client: self.client.clone(),
             secure: self.secure.clone(),
         }
@@ -555,7 +632,7 @@ impl ControllerRuntime {
             let transport_event = if let Some(deadline) = self.keyframe_fallback_deadline {
                 match tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
-                    self.next_transport_event(include_transfer),
+                    self.next_inbound_event(include_transfer),
                 )
                 .await
                 {
@@ -574,22 +651,23 @@ impl ControllerRuntime {
                     }
                 }
             } else {
-                self.next_transport_event(include_transfer).await?
+                self.next_inbound_event(include_transfer).await?
             };
             #[cfg(test)]
             self.received_transport_events
                 .fetch_add(1, Ordering::SeqCst);
             match transport_event {
-                TransportEvent::Control(ciphertext) => {
-                    let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
+                ControllerInboundEvent::Data(ChannelKind::Control, ciphertext) => {
+                    let plaintext = ciphertext.open(&self.secure, SecureLane::Control).await?;
                     let message = decode_control(&plaintext)?;
-                    if matches!(message, ControlMessage::LanDataSwitch { .. }) {
-                        return Err(ControllerError::Protocol(
-                            ProtocolError::InvalidLanDataMessage,
-                        ));
-                    }
                     if let ControlMessage::AccessDenied { reason } = message {
                         return Err(ControllerError::AccessDenied(reason));
+                    }
+                    if self.data_plane.is_some() && self.handle_lan_control(&message).await? {
+                        continue;
+                    }
+                    if let ControlMessage::LanDataSwitch { .. } = message {
+                        return Err(SessionDataError::InvalidSwitch.into());
                     }
                     if let ControlMessage::VideoPathCandidateOffer { candidate } = message {
                         let local_candidate = self.direct_candidate().cloned();
@@ -618,12 +696,13 @@ impl ControllerRuntime {
                     }
                     return Ok(ControllerEvent::Control(message));
                 }
-                TransportEvent::Input(_) => {
+                ControllerInboundEvent::Data(ChannelKind::Input, _) => {
                     return Err(ControllerError::UnexpectedTransportLane);
                 }
-                TransportEvent::VideoConfig(ciphertext) => {
-                    let plaintext =
-                        open(&self.secure, SecureLane::VideoConfig, &ciphertext).await?;
+                ControllerInboundEvent::Data(ChannelKind::VideoConfig, ciphertext) => {
+                    let plaintext = ciphertext
+                        .open(&self.secure, SecureLane::VideoConfig)
+                        .await?;
                     let config = decode_video_config(&plaintext)?;
                     let config_changed = self.video_config.as_ref() != Some(&config);
                     if let Some(current) = &self.video_config {
@@ -669,7 +748,7 @@ impl ControllerRuntime {
                     self.keyframe_needed_after_config = false;
                     return Ok(ControllerEvent::VideoConfig(config));
                 }
-                TransportEvent::VideoReliable(ciphertext) => {
+                ControllerInboundEvent::Data(ChannelKind::VideoReliable, ciphertext) => {
                     if self.video_config.is_none() {
                         if self.pending_video_reliable.len() >= PENDING_VIDEO_DATAGRAM_CAPACITY {
                             self.pending_video_reliable.pop_front();
@@ -683,7 +762,7 @@ impl ControllerRuntime {
                         return Ok(event);
                     }
                 }
-                TransportEvent::VideoDatagram(ciphertext) => {
+                ControllerInboundEvent::Data(ChannelKind::VideoDatagram, ciphertext) => {
                     self.metrics
                         .received_video_packets
                         .fetch_add(1, Ordering::Relaxed);
@@ -700,10 +779,10 @@ impl ControllerRuntime {
                         return Ok(event);
                     }
                 }
-                TransportEvent::CursorDatagram(ciphertext) => {
-                    let Some(plaintext) =
-                        open_datagram(&self.secure, SecureLane::CursorDatagram, &ciphertext)
-                            .await?
+                ControllerInboundEvent::Data(ChannelKind::CursorDatagram, ciphertext) => {
+                    let Some(plaintext) = ciphertext
+                        .open_datagram(&self.secure, SecureLane::CursorDatagram)
+                        .await?
                     else {
                         continue;
                     };
@@ -724,9 +803,10 @@ impl ControllerRuntime {
                     self.last_cursor_sequence = cursor.sequence;
                     return Ok(ControllerEvent::Cursor(cursor));
                 }
-                TransportEvent::AudioDatagram(ciphertext) => {
-                    let Some(plaintext) =
-                        open_datagram(&self.secure, SecureLane::AudioDatagram, &ciphertext).await?
+                ControllerInboundEvent::Data(ChannelKind::AudioDatagram, ciphertext) => {
+                    let Some(plaintext) = ciphertext
+                        .open_datagram(&self.secure, SecureLane::AudioDatagram)
+                        .await?
                     else {
                         continue;
                     };
@@ -739,16 +819,16 @@ impl ControllerRuntime {
                     }
                     return Ok(ControllerEvent::Audio(packet));
                 }
-                TransportEvent::Transfer(ciphertext) => {
-                    let plaintext = open(&self.secure, SecureLane::Transfer, &ciphertext).await?;
+                ControllerInboundEvent::Data(ChannelKind::Transfer, ciphertext) => {
+                    let plaintext = ciphertext.open(&self.secure, SecureLane::Transfer).await?;
                     return Ok(ControllerEvent::Transfer(decode_transfer(&plaintext)?));
                 }
-                TransportEvent::PeerDisconnected { channel } => {
+                ControllerInboundEvent::PeerDisconnected { channel } => {
                     return Ok(ControllerEvent::Closed {
                         reason: format!("远端会话已断开（{channel:?}）"),
                     });
                 }
-                TransportEvent::Closed { reason } => {
+                ControllerInboundEvent::Closed { reason } => {
                     return Ok(ControllerEvent::Closed { reason });
                 }
             }
@@ -757,10 +837,11 @@ impl ControllerRuntime {
 
     async fn handle_video_datagram(
         &mut self,
-        ciphertext: Vec<u8>,
+        ciphertext: ControllerPayload,
     ) -> Result<Option<ControllerEvent>, ControllerError> {
-        let Some(plaintext) =
-            open_datagram(&self.secure, SecureLane::VideoDatagram, &ciphertext).await?
+        let Some(plaintext) = ciphertext
+            .open_datagram(&self.secure, SecureLane::VideoDatagram)
+            .await?
         else {
             // QUIC datagrams may be duplicated by the network or by a relay
             // retry. The packet is authenticated and the replay window has
@@ -778,9 +859,11 @@ impl ControllerRuntime {
 
     async fn handle_video_reliable(
         &mut self,
-        ciphertext: Vec<u8>,
+        ciphertext: ControllerPayload,
     ) -> Result<Option<ControllerEvent>, ControllerError> {
-        let plaintext = open(&self.secure, SecureLane::VideoReliable, &ciphertext).await?;
+        let plaintext = ciphertext
+            .open(&self.secure, SecureLane::VideoReliable)
+            .await?;
         let packets = match decode_video_reliable_batch(&plaintext) {
             Ok(packets) => packets,
             Err(_) => vec![decode_video_packet(&plaintext)?],
@@ -1212,15 +1295,7 @@ async fn negotiate_host(
     send_control(
         client,
         secure,
-        &ControlMessage::Capabilities(DeviceCapabilities {
-            platform,
-            role: DeviceRole::Controller,
-            codecs: vec![Codec::H264],
-            h264_profiles: supported_h264_profiles(platform),
-            width: 1920,
-            height: 1080,
-            lan_data: None,
-        }),
+        &ControlMessage::Capabilities(lan_runtime::controller_capabilities(platform)),
     )
     .await?;
 
@@ -1244,11 +1319,6 @@ async fn negotiate_host(
                 ControlMessage::Capabilities(_) => {
                     return Err(ControllerError::InvalidHostCapabilities);
                 }
-                ControlMessage::LanDataSwitch { .. } => {
-                    return Err(ControllerError::Protocol(
-                        ProtocolError::InvalidLanDataMessage,
-                    ));
-                }
                 ControlMessage::AccessDenied { reason } => {
                     return Err(ControllerError::AccessDenied(reason));
                 }
@@ -1265,6 +1335,9 @@ async fn negotiate_host(
                 | ControlMessage::VideoNetworkFeedback { .. }
                 | ControlMessage::VideoPathCandidateOffer { .. }
                 | ControlMessage::VideoPathCandidateAnswer { .. } => {}
+                ControlMessage::LanDataSwitch { .. } => {
+                    return Err(SessionDataError::InvalidSwitch.into());
+                }
             }
         }
     };
@@ -1289,6 +1362,7 @@ async fn send_session_input(
     client: &QuicClient,
     secure: &Arc<Mutex<SecureSession>>,
     input_sequence: &Mutex<InputSequencer>,
+    data_plane: Option<&SessionDataPlane>,
     context: InputContext,
     event: InputEvent,
     #[cfg(test)] writes_started: &AtomicU64,
@@ -1304,12 +1378,42 @@ async fn send_session_input(
         input_epoch: context.input_epoch,
         event,
     })?;
-    let ciphertext = seal(secure, SecureLane::Input, &plaintext).await?;
-    #[cfg(test)]
-    writes_started.fetch_add(1, Ordering::SeqCst);
-    client.send_input(ciphertext).await?;
+    if let Some(plane) = data_plane {
+        let mut pending = PendingPlaneInput {
+            plane,
+            client,
+            completed: false,
+        };
+        #[cfg(test)]
+        writes_started.fetch_add(1, Ordering::SeqCst);
+        plane.send(ChannelKind::Input, plaintext.into()).await?;
+        pending.completed = true;
+    } else {
+        let ciphertext = seal(secure, SecureLane::Input, &plaintext).await?;
+        #[cfg(test)]
+        writes_started.fetch_add(1, Ordering::SeqCst);
+        client.send_input(ciphertext).await?;
+    }
     drop(sequence);
     Ok(())
+}
+
+struct PendingPlaneInput<'a> {
+    plane: &'a SessionDataPlane,
+    client: &'a QuicClient,
+    completed: bool,
+}
+
+impl Drop for PendingPlaneInput<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // An uncertain keyDown must not leave a healthy-looking session
+            // accepting later keyUp on another path. Closing both transports
+            // lets the Host's existing input exit guard release held input.
+            self.plane.close();
+            self.client.close(b"controller input write interrupted");
+        }
+    }
 }
 
 async fn seal(

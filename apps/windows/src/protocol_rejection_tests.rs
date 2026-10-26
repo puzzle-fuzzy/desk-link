@@ -97,11 +97,11 @@ async fn joined_controller(relay: &TestRelay, session: u8, participant: u8) -> Q
 }
 
 /// The common wire layout is decoded with the current codec, then the exact
-/// protocol-13 version guard is applied. This is an explicitly synthetic legacy
+/// protocol-12/13 version guard is applied. This is an explicitly synthetic legacy
 /// peer, not execution of an installed old Windows application.
-fn legacy_13_version_guard(bytes: &[u8]) -> Result<(), ProtocolError> {
+fn legacy_version_guard(bytes: &[u8], expected_version: u16) -> Result<(), ProtocolError> {
     let response = decode_noise_handshake(bytes)?;
-    if response.protocol_version != 13 {
+    if response.protocol_version != expected_version {
         return Err(ProtocolError::UnsupportedVersion(response.protocol_version));
     }
     Ok(())
@@ -126,6 +126,12 @@ impl ControllerAuthorizer for ExpectedController {
 /// capability negotiation. No capture, audio, clipboard, or input injection runs.
 #[tokio::test]
 async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenticated_peer() {
+    for rejected_version in [12, 13] {
+        reject_old_noise_and_admit_current_peer(rejected_version).await;
+    }
+}
+
+async fn reject_old_noise_and_admit_current_peer(rejected_version: u8) {
     let relay = relay().await;
     let (host, legacy) = joined_host_and_controller(&relay, 71).await;
     let mut old_hello = encode_noise_handshake(&NoiseHandshake {
@@ -135,7 +141,7 @@ async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenti
     })
     .unwrap();
     assert_eq!(old_hello[0], PROTOCOL_VERSION as u8);
-    old_hello[0] = 13;
+    old_hello[0] = rejected_version;
     legacy.send_control(old_hello).await.unwrap();
     let reject_and_rearm = async {
         let result = next_initiator_hello(&host).await;
@@ -151,7 +157,8 @@ async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenti
     let error = host_result.unwrap().unwrap_err();
     assert!(matches!(
         &error,
-        HostRuntimeError::Protocol(ProtocolError::UnsupportedVersion(13))
+        HostRuntimeError::Protocol(ProtocolError::UnsupportedVersion(version))
+            if *version == u16::from(rejected_version)
     ));
     assert!(host_error_rearms_on_connected_relay(&error));
     let response = response.unwrap().unwrap();
@@ -160,7 +167,7 @@ async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenti
     assert_eq!(reply.step, NoiseHandshakeStep::ResponderHello);
     assert_eq!(reply.payload, [0]);
     assert_eq!(
-        legacy_13_version_guard(&response),
+        legacy_version_guard(&response, u16::from(rejected_version)),
         Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION))
     );
     // The synthetic legacy peer stops on this version error. The Host has

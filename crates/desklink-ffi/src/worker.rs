@@ -18,7 +18,8 @@ use desklink_protocol::{
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayJoin, TransportError,
+    ChannelKind, LanDataError, QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayJoin,
+    SessionDataError, TransportError,
 };
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
@@ -497,6 +498,7 @@ enum ConnectedSend {
 
 struct OwnedConnectedSend {
     context: Option<InputContext>,
+    transfer: bool,
     started: bool,
     future: Pin<Box<dyn Future<Output = Result<(), ControllerError>> + Send>>,
 }
@@ -532,6 +534,7 @@ fn start_connected_send(
     };
     OwnedConnectedSend {
         context,
+        transfer: matches!(&command, ConnectedSend::Transfer(_)),
         started: false,
         future: Box::pin(async move {
             send_cancellable(&mut cancellation, async move {
@@ -599,11 +602,12 @@ async fn run_connected(
     }
     let mut releases = initial.into_iter();
     let mut sending: Option<OwnedConnectedSend> = None;
+    let mut transfer_available = true;
     loop {
         // This stack-pinned reader survives every send completion and command.
         // Dropping next_event after it dequeued a reliable message but before
         // acquiring crypto would irretrievably lose that message.
-        let next_event = controller.next_event();
+        let next_event = controller.next_event_with_transfer(transfer_available);
         tokio::pin!(next_event);
         let event = loop {
             if *cancellation.borrow() {
@@ -655,8 +659,17 @@ async fn run_connected(
             match work {
                 ConnectedWork::Event(event) => break event,
                 ConnectedWork::Sent(result) => {
-                    sending = None;
+                    let transfer = sending.take().expect("completed owned send").transfer;
                     if let Err(error) = result {
+                        if transfer && optional_transfer_unavailable(&error) {
+                            transfer_available = false;
+                            callback.emit_error_with_state(
+                                "transfer channel unavailable; current operation stopped until reconnect",
+                                input_context.map_or(0, |context| context.stream_id),
+                                if stable { DesklinkState::Connected } else { DesklinkState::StartingVideo },
+                            );
+                            continue;
+                        }
                         return fail_connected(&senders, error, input_context, stable);
                     }
                 }
@@ -713,6 +726,14 @@ async fn run_connected(
                         ));
                     }
                     Some(ControllerCommand::Transfer(message)) => {
+                        if !transfer_available {
+                            callback.emit_error_with_state(
+                                "transfer channel unavailable; reconnect before starting another operation",
+                                input_context.map_or(0, |context| context.stream_id),
+                                if stable { DesklinkState::Connected } else { DesklinkState::StartingVideo },
+                            );
+                            continue;
+                        }
                         sending = Some(start_connected_send(
                             senders.clone(),
                             cancellation.clone(),
@@ -738,6 +759,9 @@ async fn run_connected(
                 );
             }
             Ok(event) => {
+                if !transfer_available && matches!(&event, ControllerEvent::Transfer(_)) {
+                    continue;
+                }
                 if let ControllerEvent::VideoConfig(config) = &event {
                     stable = true;
                     let current = InputContext {
@@ -752,6 +776,16 @@ async fn run_connected(
             Err(error) => return fail_connected(&senders, error, input_context, stable),
         }
     }
+}
+
+fn optional_transfer_unavailable(error: &ControllerError) -> bool {
+    matches!(
+        error,
+        ControllerError::SessionData(
+            SessionDataError::NoPath(ChannelKind::Transfer)
+                | SessionDataError::Interrupted(ChannelKind::Transfer)
+        )
+    )
 }
 
 /// Every owned reliable operation has a session-wide cancellation/deadline.
@@ -909,6 +943,23 @@ async fn wait_for_retry(
 fn controller_error_is_retryable(error: &ControllerError) -> bool {
     match error {
         ControllerError::Transport(error) => transport_error_is_retryable(error),
+        ControllerError::SessionData(error) => match error {
+            SessionDataError::Transport(error)
+            | SessionDataError::Lan(LanDataError::Transport(error)) => {
+                transport_error_is_retryable(error)
+            }
+            SessionDataError::Closed
+            | SessionDataError::Timeout
+            | SessionDataError::Lan(LanDataError::Closed | LanDataError::Timeout) => true,
+            SessionDataError::NoPath(channel) | SessionDataError::Interrupted(channel) => {
+                matches!(channel, ChannelKind::Input | ChannelKind::Control)
+            }
+            SessionDataError::InvalidNegotiation
+            | SessionDataError::InvalidSwitch
+            | SessionDataError::AlreadyAttached
+            | SessionDataError::Crypto(_)
+            | SessionDataError::Lan(LanDataError::Malformed | LanDataError::Crypto(_)) => false,
+        },
         ControllerError::HandshakeTimeout | ControllerError::NegotiationTimeout => true,
         ControllerError::Protocol(_)
         | ControllerError::Crypto(_)
@@ -1332,6 +1383,82 @@ mod tests {
             ConnectFailure::from_transport(TransportError::Stream("synthetic interruption".into()))
                 .retryable
         );
+        assert!(!controller_error_is_retryable(
+            &ControllerError::AccessDenied(desklink_protocol::AccessDenialReason::ApprovalRejected)
+        ));
+        assert!(!controller_error_is_retryable(
+            &ControllerError::AccessDenied(desklink_protocol::AccessDenialReason::ApprovalExpired)
+        ));
+    }
+
+    #[test]
+    fn session_data_retry_classification_requires_a_new_noise_session_for_core_path_loss() {
+        for (error, retryable) in [
+            (
+                SessionDataError::Transport(TransportError::Connection("offline".into())),
+                true,
+            ),
+            (
+                SessionDataError::Transport(TransportError::JoinRejected(
+                    JoinRejectCode::AuthenticationMismatch,
+                )),
+                false,
+            ),
+            (
+                SessionDataError::Lan(LanDataError::Transport(TransportError::Closed)),
+                true,
+            ),
+            (SessionDataError::NoPath(ChannelKind::Control), true),
+            (SessionDataError::Interrupted(ChannelKind::Input), true),
+            (SessionDataError::NoPath(ChannelKind::Transfer), false),
+            (
+                SessionDataError::Interrupted(ChannelKind::VideoReliable),
+                false,
+            ),
+            (SessionDataError::Timeout, true),
+            (SessionDataError::Closed, true),
+            (SessionDataError::Lan(LanDataError::Timeout), true),
+            (SessionDataError::InvalidNegotiation, false),
+            (SessionDataError::InvalidSwitch, false),
+            (SessionDataError::AlreadyAttached, false),
+            (
+                SessionDataError::Crypto(desklink_crypto::CryptoError::AuthenticationFailed),
+                false,
+            ),
+            (
+                SessionDataError::Lan(LanDataError::Crypto(
+                    desklink_crypto::CryptoError::AuthenticationFailed,
+                )),
+                false,
+            ),
+            (SessionDataError::Lan(LanDataError::Malformed), false),
+        ] {
+            let error = ControllerError::SessionData(error);
+            assert_eq!(controller_error_is_retryable(&error), retryable, "{error}");
+        }
+    }
+
+    #[test]
+    fn optional_transfer_retirement_does_not_swallow_core_or_authentication_errors() {
+        for (error, optional) in [
+            (SessionDataError::NoPath(ChannelKind::Transfer), true),
+            (SessionDataError::Interrupted(ChannelKind::Transfer), true),
+            (SessionDataError::NoPath(ChannelKind::Control), false),
+            (SessionDataError::Interrupted(ChannelKind::Input), false),
+            (SessionDataError::Timeout, false),
+            (SessionDataError::Closed, false),
+            (
+                SessionDataError::Crypto(desklink_crypto::CryptoError::AuthenticationFailed),
+                false,
+            ),
+            (SessionDataError::InvalidSwitch, false),
+        ] {
+            let error = ControllerError::SessionData(error);
+            assert_eq!(optional_transfer_unavailable(&error), optional, "{error}");
+        }
+        assert!(!optional_transfer_unavailable(&ControllerError::Protocol(
+            desklink_protocol::ProtocolError::UnsupportedVersion(13)
+        )));
     }
 
     #[tokio::test]

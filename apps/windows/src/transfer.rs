@@ -147,6 +147,24 @@ impl IncomingFileWorker {
         .await
     }
 
+    /// Explicitly authorized temporary storage for transport integration tests.
+    /// The production public constructor continues to choose Downloads.
+    #[cfg(test)]
+    pub(crate) async fn create_in_for_test(
+        transfer_id: TransferId,
+        name: String,
+        expected_size: u64,
+        staging: PathBuf,
+        destination: PathBuf,
+        before_write: impl Fn() + Send + 'static,
+    ) -> Result<Self, TransferResult> {
+        Self::spawn_with(
+            move || IncomingFile::create_in(transfer_id, name, expected_size, staging, destination),
+            before_write,
+        )
+        .await
+    }
+
     async fn spawn_with(
         create: impl FnOnce() -> Result<IncomingFile, TransferResult> + Send + 'static,
         before_write: impl Fn() + Send + 'static,
@@ -1276,6 +1294,11 @@ fn human_size(bytes: u64) -> String {
 }
 
 #[cfg(test)]
+pub(crate) async fn lock_disk_worker_tests() -> tokio::sync::MutexGuard<'static, ()> {
+    tests::DISK_WORKER_TEST_GATE.lock().await
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         INCOMING_DISK_QUEUE_CAPACITY, IncomingDiskCommand, IncomingFile, IncomingFileWorker,
@@ -1295,7 +1318,8 @@ mod tests {
     // Worker tests share the production process-wide eight-thread admission
     // budget. Serialize these fixtures while unrelated library tests stay
     // parallel, so resource contention is not mistaken for an IO failure.
-    static DISK_WORKER_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static DISK_WORKER_TEST_GATE: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     fn roots(test: &str) -> (PathBuf, PathBuf, PathBuf) {
         let nonce = SystemTime::now()
