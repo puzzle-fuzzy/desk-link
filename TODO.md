@@ -289,6 +289,9 @@
 - **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 16通过；后续静态检查收口取消分支（`style(DL2-021): simplify incoming transfer cancellation`）；覆盖人工阻塞磁盘时current-thread Tokio定时器仍执行、队列预算、取消清理、保留续传、错hash、完成后发布。Windows删除前先关闭staging文件句柄。
 - [ ] **跨组及实机未完成：** Windows控制端接入由产品组负责；慢盘/云盘/杀毒/空间耗尽时媒体与输入预算需双机测量。取消不能中断已进入OS的磁盘syscall，线程总量有界，不宣称立即物理清理。
 
+- [x] **暂存所有权跟进（`fix(DL2-021): hold exclusive staging ownership through disk cleanup`）：** 异步Drop/保留期间，以规范化暂存路径RAII许可持有至文件关闭和清理结束；同文件重连先返回Busy，避免旧新worker并写/旧取消删除新文件。Windows写句柄只共享读取，续传先独占打开同一handle再扫描前缀；丢弃/陈旧清理同样遵守许可。
+- **验证：** transfer单测23通过、lib严格Clippy通过；3个新增回归覆盖旧写阻塞→Drop→别名路径重连Busy→释放后精确续传、旧cancel不删新文件、Windows绕过API的写/删除也被拒绝。未把不能中断的OS写线程视为已经退出。
+
 ### DL2-022 · P2 · 从 GDI 兜底恢复到高性能捕获后端
 
 - [ ] 增加有退避、有限失败预算的 DXGI 恢复探测。
