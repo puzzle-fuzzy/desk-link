@@ -19,6 +19,7 @@ fn protocol_12_is_rejected_by_every_versioned_payload_boundary() {
     let config = VideoConfig {
         protocol_version: 12,
         stream_id: 1,
+        input_epoch: 1,
         config_version: 1,
         codec: Codec::H264,
         width: 1920,

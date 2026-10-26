@@ -491,6 +491,8 @@ mod native {
                     let envelope = InputEnvelope {
                         sequence: index as u64 + 1,
                         timestamp_us: 1_000,
+                        stream_id: 1,
+                        input_epoch: 1,
                         event: InputEvent::Key {
                             code: KeyCode::Character(character),
                             pressed,
