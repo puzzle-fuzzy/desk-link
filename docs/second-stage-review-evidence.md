@@ -33,7 +33,9 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 
 `IncomingFileWorker::spawn_with` 的磁盘线程在create/open成功后取得metadata，约175～177行的 `ready.send(Ok(metadata)).is_err()` 直接return。若调用方future在 `opened.await` 期间因断连被drop，receiver已关闭；已有resume partial打开后仍带 `remove_on_drop=true`，线程return会触发IncomingFile::drop删除partial。约212～214行的正常commands关闭路径会preserve，但初始化早退没有进入该路径。IncomingFile::preserve关闭文件并置remove_on_drop=false；Drop在true时remove_file，形成完整源码因果链。
 
-该项分类为**源码确定的初始化保留缺口，修复/确定性回归待媒体owner交付**，不是已经跑失败的本工程测试。须用真实临时partial和可控初始化barrier覆盖“文件已打开、ready未交付→drop create future→释放磁盘线程”；断言原prefix内容/长度/hash与后续resume仍可用。正常handle-drop保留和显式cancel清理分别回归，不把两种语义合并。媒体独立021修复及结果必须先复用到joint，再取得最终revision与报告；不靠一次旧suite通过代替这个未覆盖窗口。
+旧89源码上的初始化保留缺口已有媒体独立修复 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`**，当前分类为**源分支修复已验证、joint待复验**。本工程只读Git确认其parent `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`，只改TODO+transfer；ready发送失败改为同磁盘线程file.preserve后退出。来源TODO和协调方报告transfer28、lib/tests严格Clippy通过，本工程未复跑，也未导入媒体整包。
+
+新增回归源码使用真实spawn_with/create和open后、读取/哈希前barrier，poll Pending后drop创建future，释放磁盘线程并等实际退出；9次取消后原4字节prefix、offset/hash/元数据不变，随后完整续传校验通过。另覆盖空part保留、显式cancel清理、初始化TooLarge不删旧prefix、Windows真实sync_data失败不发布。正常drop与显式cancel语义分开，未提高生产8线程上限；保留失败不发布完成或宣称成功保留。源码核对与来源实跑报告不能替代joint实际执行；最终joint须复用65c并重跑对应回归及所有适用测试，交付最终revision与原始报告。
 
 此前协调方另报告joint未提交、索引有UU、测试文件未跟踪，这是当时的审查快照，不能当stable或直接当作后续当前状态；本工程未自行检查该WIP。其shared日志汇总更正为174通过/1忽略，先前274是撤回的笔误；这些都是协调方日志信息，尚未绑定最终joint提交，不是本工程复跑结果，也不是联合验收已完成。
 
@@ -45,4 +47,4 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 
 协调方报告Apple最新源分支完整FFI71项、Python186项与双头检查实跑通过，013 worker owned future仍在进行；本次未给该报告的完整源码SHA，本工程不擅自绑定所见动态branch head。工程 `d6f153e` 的旧FFI Host8通过/2失败、旧joint的两个MacHost失败均属于未整合完整Apple ABI/Host链的快照，不能外推到Apple当前源分支。等待Apple最终稳定SHA和完整依赖一起整合，保留已有等价API/Sender扩展并去重，不单独flat-pick9ad；来源通过仍不能替代joint实际复跑、Swift/Xcode或真实Mac presented。
 
-最终joint计划以27fec为第一parent，以媒体021初始化取消修复后的稳定SHA为另一parent；旧89bd仍是已核对缺陷来源，不是修复完成证据。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验这些备份，也未操作joint WIP。最终revision须实际包含所需resolution/测试，重跑跨包严格检查与所有适用测试，并交付源码身份和原始报告，才能更新联合验收状态。
+最终joint计划以27fec为第一parent，以媒体65c70fd为另一parent；协调方报告产品已开始真实remerge，保留完整原问题历史、审计resolution和新联合测试。旧89bd仍是已核对缺陷来源，65c才是已交付修复来源。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验这些备份，也未操作joint WIP。最终revision须实际包含所需resolution/测试，重跑跨包严格检查与所有适用测试，并交付源码身份和原始报告，才能更新联合验收状态。

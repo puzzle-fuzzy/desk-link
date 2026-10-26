@@ -91,9 +91,9 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 
 上述分类没有新增真实远控/性能证明，也没有修改其他编号完成状态；其他新项继续按owner复核当前分支后逐项记录。
 
-## joint收口前仍有确定保留缺陷
+## 初始化保留缺口：源分支已修、joint待复验
 
-协调方joint只读审查与本工程固定媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a` 源码核对确认DL2-021初始化缺口：打开已有resume partial后，ready发送失败直接return，未走preserve，IncomingFile的remove_on_drop=true导致partial被删。正常handle-drop的preserve分支不覆盖这个窗口。媒体owner负责独立021修复，joint最终提交前须复用并补确定性回归；本工程这里只做源码复核，未运行新回归，详细链路见[证据记录](second-stage-review-evidence.md)。
+协调方joint只读审查与本工程固定媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a` 源码核对确认过DL2-021初始化缺口：打开已有resume partial后，ready发送失败直接return，未走preserve，IncomingFile的remove_on_drop=true导致partial被删。媒体已独立提交 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`** 修复，在同一磁盘线程先preserve后退出；本工程只读Git确认parent为 `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`，仅TODO+transfer变更。源TODO及协调方报告transfer28项、lib/tests严格Clippy通过，包含真实open barrier/drop future、9次prefix保留及完整续传等回归；本工程未复跑。当前为**源分支修复已验证、joint待复验**，不能继续将65c视为未修源码，也不能提前标joint通过；详细链路见[证据记录](second-stage-review-evidence.md)。
 
 此前协调方报告的joint未提交/索引UU/测试未跟踪，是当时的审查快照；本工程未检查其WIP，不能将该快照当作当前状态。其日志计数已更正为shared174通过/1忽略（原274笔误撤回），不是本工程实际测试，也不能替代最终jointSHA/报告。除此项之外“暂未见新确定缺陷”的只读review表述不等于测试通过。FFI Mac Host/Swift、实际WebView和双机仍独立；本工程原始失败报告继续按各自源码身份保留。
 
@@ -103,6 +103,6 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 | --- | --- | --- |
 | 产品 `27fec756ba97ee6f67228dc9530c7b0578a49ff3` | 本工程只读Git对象确认其parent为 `16594c4f8780cd565afd57695f88e29277ec5939`；代码仅将既有owned future提取为 `InputSendFuture<Writer>` 类型别名，发送语义不变。提交TODO报告UI库135通过/1项签名资产忽略、本包 `--lib --tests --no-deps` Clippy通过 | 本工程未复跑、未复用整包；本包Clippy不代表跨包严格检查。最终joint第一parent采用27fec，保留既有历史 |
 | Apple最新源分支 | 协调方报告完整FFI71项、Python186项、双头检查实际通过；013 worker owned future仍在进行 | 本次报告未附对应完整测试SHA，不把所见branch head擅自绑定到该结果；等待最终稳定SHA与完整依赖一起合并，不能单独flat-pick9ad。旧joint两个MacHost失败来自尚缺完整Apple ABI/Host链，不能写成Apple当前分支失败；源分支通过不等于最终joint或Swift/真机呈现通过 |
-| 媒体021修复及最终joint | 媒体初始化取消修复后的稳定SHA将作为另一parent；协调方报告10份人工resolution/新增联合测试已备份并有SHA256清单 | 修复后稳定SHA与最终jointSHA/完整报告仍待交付。本工程未读取备份清单或joint WIP；备份不等于文件已纳入最终提交，合并后须重跑跨包严格检查及所有适用测试 |
+| 媒体021修复及最终joint | 另一parent已固定为 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，源TODO及协调方报告transfer28与严格Clippy通过；协调方报告已开始27fec+65c真实remerge，10份人工resolution/新增联合测试已备份并有SHA256清单 | 最终jointSHA/完整报告仍待交付。本工程未复跑来源测试、未读取备份清单或joint WIP；备份不等于文件已纳入最终提交，合并后须重跑跨包严格检查及所有适用测试 |
 
-原产品16594与媒体89bd的合并安排、旧joint审查和工程d6f153e失败报告均保留其历史身份。上述来源进展不关闭021初始化回归、041联合验收、013完整生产接线或真实设备门禁。
+原产品16594与媒体89bd的合并安排、旧joint审查和工程d6f153e失败报告均保留其历史身份。021来源层已有修复及28项通过报告，联合层仍待复验；上述来源进展不关闭041联合验收、013完整生产接线或真实设备门禁。
