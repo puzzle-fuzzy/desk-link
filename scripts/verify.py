@@ -55,6 +55,7 @@ def catalog(target: Path, soak_seconds: int) -> list[Task]:
         Task("rust-clippy", "integration", ("cargo", "clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"), requires=("frontend-build",)),
         Task("rust-contracts", "integration", ("cargo", "test", "--locked", "-p", "desklink-protocol", "-p", "desklink-video", "-p", "desklink-session", "-p", "desklink-crypto", "--tests")),
         Task("transport-localhost", "integration", ("cargo", "test", "--locked", "-p", "desklink-transport", "--test", "localhost")),
+        Task("direct-probe", "integration", ("cargo", "test", "--locked", "-p", "desklink-crypto", "-p", "desklink-transport", "--lib", "--tests"), scope="local crypto/transport tests, including shared-probe cancellation, DirectProbe replay-window isolation and lane rejection; no WAN/hardware performance acceptance"),
         Task("relay-localhost", "integration", ("cargo", "test", "--locked", "-p", "desklink-relay", "--test", "session")),
         Task("ffi-runtime", "integration", ("cargo", "test", "--locked", "-p", "desklink-ffi", "--tests")),
         Task("media-recovery", "integration", ("cargo", "test", "--locked", "-p", "desklink-end-to-end", "--test", "recovery")),

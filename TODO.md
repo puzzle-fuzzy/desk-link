@@ -411,6 +411,8 @@
 - [x] **跳过语义：** `python scripts/verify.py native perf --report dist/verify/verified-device-skips.json` 实际记录 Apple/交互设备缺条件与 DL2-014 未集成，`passed=false` / incomplete；固定错误 Bun 与零匹配测试分别验证为 failed。
 - [ ] **仍需验收：** macOS/Xcode 实际运行、原生权限/硬件/双机/长稳与 DL2-014 同条件性能对照；离线媒体基线入口待媒体分支独立提交 `254f8be` 集成后执行。跨层新增关键覆盖仍随对应 DL2 修复补齐，主项保持未完成，不以本地入口成功代替用户流程验收。
 - [x] **ABI 检查入口增量（`feat(DL2-041): register read-only ABI header verification`）：** 检查 Apple 已提交的 `5691aba` 后注册跨平台 `--task ffi-header-sync`，只调用生成器 `--check`，不自动改头；源码未集成时 skipped。新增两项合成回归验证未集成不执行、同步检查不改头、漂移失败；统一入口 Python 全套 134 项通过（入口回归合计 27 项），证据 `dist/verify/abi-gate-python.json`。真实本基线 `--task ffi-header-sync` 记录 incomplete / passed=false（`abi-gate-unintegrated.json`），实际 ABI layout / Swift 仍待集成后验证，未复制其他分支 WIP。
+- [x] **跨层门禁与 probe 接入（`feat(DL2-041): gate probe integration and pending input context acceptance`）：** 新增 `--task direct-probe` 执行 crypto/transport `--lib --tests --locked`；按授权只复用协议13契约9979、shared-probe3277和独立lane0836，精确来源→本分支SHA见能力矩阵。实际统一入口在源码 `4c3648a` 加本切片（dirty=true）通过 crypto/transport79、workspace lib259、契约109、relay27、FFI39、媒体恢复2、Windows契约131、Python134与fmt；另一报告的前端frozen安装/生产构建、全workspace Clippy通过。原始证据 `dist/verify/probe-integration.json` / `probe-clippy.json`；计数有重叠，不推导独立覆盖总量或双机性能。
+- [ ] **严格 epoch 门禁仍待合同和接线：** owner尚未交付非零context/字段顺序/InputContext/保留前缀的真实SHA；先拒绝零值与旧包误读，再在生产边界验证旧事件不重贴、旧release不影响新epoch、首帧实际呈现前禁用、host原子清键/推进/映射锁与取消独立生效。Windows合成/实际WebView和Apple presented真机分别记录；013严格绑定仍 `[ ]`，不能用seq/wallclock/config_version或字段正则替代。当前为不可交付过渡状态，不改其他任务完成标记。
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 
