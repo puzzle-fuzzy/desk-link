@@ -5,7 +5,7 @@
 | 层 | 默认任务 | 证明范围 |
 | --- | --- | --- |
 | `fast`（默认） | 三个 Bun 项目 frozen 安装、类型检查、测试；Python 脚本测试；Rust fmt 与 workspace lib 测试 | 本地领域规则、现有契约和脚本行为；首次 Rust 编译仍可能较慢 |
-| `integration` | 前端生产构建、Rust Clippy、protocol/video/session/crypto 契约、localhost transport/relay、direct-probe 的 crypto/transport 检查、FFI runtime、媒体恢复、Windows runtime 契约 | 本地进程/流/ABI 的已有自动覆盖；Windows 专有任务在其他平台 skipped |
+| `integration` | 前端生产构建、Rust check/Clippy、独立 protocol-wire、protocol/video/session/crypto 契约、localhost transport/relay、direct-probe、FFI runtime、媒体恢复、Windows 全套/独立 host runtime 契约 | 编译、codec、实际runtime分别记录；Windows 专有任务在其他平台 skipped；编译通过不能覆盖业务失败 |
 | `native` | DL2-025 生成 ABI 头只读同步检查、Apple Silicon FFI build、AppleCore Swift 测试、macOS 应用 Swift 测试；Windows 交互桌面捕获/编码 | 头检查跨平台可跑，依赖 Apple 分支 `5691aba` 的生成器；其余依赖平台、SDK、权限、设备，捕获与可能访问原生输入 API 的任务须显式 `--allow-device` |
 | `perf` | 本机加密媒体 hardware soak；DL2-014 离线合成基线入口与完整性能验收缺口 | 离线基线依赖 `codex/dl2-windows-media` 的 `254f8be`，源文件未集成时 skipped；soak 只检查本机持续媒体与光标，完整同硬件前后比较仍 skipped |
 
@@ -39,6 +39,8 @@ Rust 版本必须匹配 `rust-toolchain.toml`，Cargo test/build/clippy 都使�
 python scripts/verify.py all --list
 python scripts/verify.py --task transport-localhost --task ffi-runtime
 python scripts/verify.py --task direct-probe
+python scripts/verify.py --task rust-check --task protocol-wire --task host-runtime-contract
+python scripts/verify.py --task controller-loopback
 python scripts/verify.py --task ffi-header-sync
 python scripts/verify.py native perf --report dist/verify/device-status.json
 ```
@@ -60,7 +62,7 @@ python scripts/verify.py native perf --report dist/verify/device-status.json
 
 ## 追加跨层门禁：input epoch 与独立 probe
 
-严格几何绑定的共享契约由 Apple/FFI 单一 owner 交付，仍属未发布协议 13 开发线。已协调的字段顺序是 `VideoConfig` 在 `stream_id` 后增加非零 `input_epoch: u64`；`InputEnvelope` 在 `timestamp_us` 后增加非零 `stream_id: u64`、`input_epoch: u64`。Rust 提供 `InputContext { stream_id, input_epoch }`，发送接口显式接收它；**不得在发送时补当前值**。input codec 统一使用保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]` 再序列化 envelope，通过 protocol 的 `encode_input` / `decode_session_input` 进入；平台/transport 不手工拼前缀，也不 fallback 到无 context 格式。本工程尚未取得该契约 SHA，未引入这些字段或前缀；以下是待运行验收条件，不是已通过记录。
+严格几何绑定的共享契约由 Apple/FFI 单一 owner 交付，仍属未发布协议 13 开发线。来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`：`VideoConfig` 在 `stream_id` 后有非零 `input_epoch: u64`；`InputEnvelope` 在 `timestamp_us` 后有非零 `stream_id: u64`、`input_epoch: u64`，并有共享 `InputContext` 类型。input codec 已统一保留前缀 `[0, PROTOCOL_VERSION:u16 little-endian]` 和 exact 解码；平台/transport 不手工拼前缀、不 fallback 无context格式。**显式 InputContext 发送 API 与生产接线仍待复用后续切片；不得在发送时补当前值。** 以下包含仍待执行的生产门禁，不是整体已通过记录。
 
 | 门禁 | 必须从生产边界观察到的结果 | 执行层/证据边界 |
 | --- | --- | --- |
@@ -69,10 +71,31 @@ python scripts/verify.py native perf --report dist/verify/device-status.json
 | 首帧实际呈现前禁用 | 仅收到 VideoConfig、解码完成但 presented 尚未发生都不能启用输入；旧 stream/epoch 的迟到呈现不能启用当前 context；事件在入队时已固定 context | Windows 合成宿主、实际 WebView2 分别记录；Apple 原生 presented handler 必须另有真机回调结果 |
 | host 原子清键/推进/映射 | 在受控 injector 中阻塞切换竞争，观察清键、epoch 推进、映射发布和锁内核对形成同一边界；旧坐标不能落到新屏 | Windows host 本地集成与真实切屏分开；不以锁字段存在或 config_version 相同推导正确 |
 | 取消独立生效 | 普通输入队列满/发送背压、旧输入待丢弃、新首帧未呈现时，用户取消与 host 本机收回仍可停止/清理；不能先要求有效远端 context 或等待普通队列空位 | 合成背压/取消/迟到回调；实际权限/设备另记 |
+| 发送调用完整迁移 | 清点 ControllerRuntime 旧 send_input(event) 的所有生产调用，不只鼠标：普通键盘/指针/滚轮、Text、粘贴组合键、排队release、断开与丢包释放；context/pressed ledger和C/Swift布局来自同一owner声明 | Rust生产调用清单、context队列/加密loopback与ABI/C布局；底层QuicClient::send_input(bytes)不是同一个待迁移API，不能按函数名盲改 |
 | probe 重放窗隔离 | 双向慢 probe 经 256 个视频包后仍能认证；probe 重放和跨 lane 解密仍拒绝；真实 shared endpoint 等待可取消且不持媒体 crypto 锁 | 已复用的独立提交 `0836a8b` 与 shared-probe 前置；`--task direct-probe` 跑 crypto/transport 的 `--lib --tests --locked`，不证明双机/WAN p95/p99 |
 
-前五项必须在真实契约及 host/UI 接线位于**同一 revision** 后执行。当前仅为 probe 开发接入；epoch 合同和两端未全部接通前属于不可交付的过渡状态。当前不会注册一个仅 grep 字段或永远退出 0 的“epoch 检查”冒充覆盖；现有全套任务通过也不关闭这些门禁。DL2-013 严格绑定继续保持 `[ ]`，seq、wallclock、仅 config_version 都不能替代它。
+生产语义和调用迁移必须在真实契约及 host/UI 接线位于**同一 revision** 后执行。目前 HostVideoPipeline、FFI host 配置和两处controller输入生产者仍显式零；codec会拒绝，当前不可交付。不得默认1、跳过业务失败或在发送时补当前epoch。现有codec或probe任务通过不关闭其他门禁；DL2-013 严格绑定继续保持 `[ ]`，seq、wallclock、仅 config_version 都不能替代它。
 
 probe 复用链与工程源码快照见[能力/版本记录](current-capabilities.md)：原 lane 0～7 不重排，仅追加 `SecureLane::DirectProbe = 8` 并更新 COUNT/ALL；未改 JOIN 版本或 QUIC 事件槽数量。本分支协议 13 与 main 基线协议 12 分别记录，来源分支的 79 项报告不代替本工程接入测试。双机黑洞、慢候选、半包下输入/画面 p95/p99 和锁持有分布仍须另验。
 
-本工程实际接入报告 `dist/verify/probe-integration.json` 为 passed：crypto/transport 79、workspace lib 259、protocol/video/session/crypto 109、relay 27、FFI runtime 39、媒体恢复 2、Windows 契约 131、Python 134 项通过，fmt 通过；计数有重叠，不能相加为独立覆盖率。`probe-clippy.json` 的 frozen 前端准备/生产构建及 workspace 全 target/feature Clippy 通过。两份报告记录源码 `4c3648a`、dirty=true（增加本任务注册/说明），未运行真实远控、注入、Apple presented 回调或双机性能；没有以来源分支结果冒充本次执行。
+此前 probe 接入报告 `dist/verify/probe-integration.json` 为 passed：crypto/transport 79、workspace lib 259、protocol/video/session/crypto 109、relay 27、FFI runtime 39、媒体恢复 2、Windows 契约 131、Python 134 项通过，fmt 通过；计数有重叠，不能相加为独立覆盖率。`probe-clippy.json` 的 frozen 前端准备/生产构建及 workspace 全 target/feature Clippy 通过。两份报告记录旧源码 `4c3648a`、dirty=true，不能证明下述过渡源码可用。
+
+合同导入后的实际报告 `dist/verify/input-context-transition.json` 记录源码 `5501aad`、dirty=true：`rust-check` 编译通过；`protocol-wire` **47项**通过（来源owner报告49，本次执行数不能照搬）；`direct-probe`79项通过；`host-runtime-contract`9通过/1失败，真实生产 `HostVideoPipeline::prepare` 构造epoch=0，codec返回 `Protocol(InvalidVideoConfig)`。整体 **failed / passed=false**，未skip或改断言；这是尚未接线的业务失败。`rust-check` 只证明编译，codec正反例也不替代host/UI生产路径。没有真实远控、注入、Apple presented或双机结果。
+
+### 显式发送 API 的生产迁移清单
+
+以 `5501aad` 及随后仅文档的修订为源码快照，CodeGraph 发现入口后逐项核对实际 receiver 类型；旧 `ControllerRuntime::send_input(event)` 的生产直接调用共七处，当前都通向零 context 的失败关闭方法。不能把重名的底层 `QuicClient::send_input(bytes)` 作为同一个API盲改。
+
+| 生产路径 | 当前直接调用/上游 | 迁移必须覆盖 |
+| --- | --- | --- |
+| Windows 普通输入 | `apps/windows-ui/src-tauri/src/controller.rs:2594`；Manager.send_input→ControllerCommand::Input | 键盘、鼠标移动/按键、滚轮与前端合成释放；入队即固定 context |
+| Windows Text/IME | 同文件 `send_text_input:4583,4590`，由 Text 命令调用 | 字符/换行/Tab的 down/up 两处都带原 context，不能只迁鼠标 |
+| Windows 粘贴 | 同文件 `send_remote_paste_shortcut:4617`，剪贴板成功回执 `:3139` 后触发 | 粘贴意图、等待回执、Ctrl+V down/up 使用捕获的同一 context，不在回执到达时取最新值 |
+| FFI 普通输入 | `crates/desklink-ffi/src/worker.rs:466` | Apple键鼠/Unicode队列保留context |
+| FFI 优先/延迟释放 | 同文件 `:439,456` | 重连待释放与ReleaseAll队列均保留按下时context，旧release不影响新epoch |
+
+ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释放展开及 `fireInput`，Apple `ControllerBridge.releaseAll`→C release API→FFI pressed ledger，以及 reject/destroy 的本机清理路径；远端过期release与用户取消/本机收回分开验证。`controller-loopback` 单独跑加密localhost controller测试，使其他FFI unit失败不会掩盖该二进制的实际结果；它不替代上表生产接线、ABI/C布局或真机呈现。
+
+该原语测试本次已独立运行，`controller-context-transition.json` 为 failed / passed=false（源码 `f6ff20b`、dirty=true）：3通过/2失败，两处旧 send_input 调用返回 `Protocol(InvalidInput)`；后台 Closed 是其后关闭的结果，不能把它误报成外部服务不可用。`transition-runner-python.json` 的入口/脚本134项通过只证明验证工具工作，不替代这两项业务失败。
+
+完整 FFI 切片 `9ad7154b365de875d725188cfa091f5c21da0b5a` 依赖 Apple 003/004/025 的错误ABI、send_cancellable、生成头和布局测试，本工程未pick整笔。按协调改为等产品组交付独立Rust显式API+encrypted-loopback桥接提交，复用后按等价patch去重；完整C/Swift/FFI以Apple源分支为准，不复制整份文件覆盖其他改动。新增C字段与Swift初始化/布局必须分别实测，来源报告34项不算本工程已验证。
