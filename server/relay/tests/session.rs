@@ -1,5 +1,9 @@
 use std::{
-    sync::Arc,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -110,10 +114,18 @@ async fn next_event(client: &QuicClient) -> TransportEvent {
 }
 
 async fn raw_join(relay: &TestRelay, join: RelayJoin) -> (Endpoint, quinn::Connection) {
+    raw_join_at(relay, relay.address, join).await
+}
+
+async fn raw_join_at(
+    relay: &TestRelay,
+    address: SocketAddr,
+    join: RelayJoin,
+) -> (Endpoint, quinn::Connection) {
     let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(relay.client_config.clone());
     let connection = endpoint
-        .connect(relay.address, "localhost")
+        .connect(address, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -128,6 +140,350 @@ async fn raw_join(relay: &TestRelay, join: RelayJoin) -> (Endpoint, quinn::Conne
     receive.read_exact(&mut response).await.unwrap();
     assert_eq!(response, [0]);
     (endpoint, connection)
+}
+
+/// The client QUIC driver still acknowledges datagrams when its application
+/// stops reading. Drop the client's UDP packets *after* joining instead, so the
+/// relay's congestion window and outgoing datagram buffer actually fill.
+struct UdpAckBlackhole {
+    address: SocketAddr,
+    drop_client_packets: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UdpAckBlackhole {
+    async fn new(relay_address: SocketAddr) -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let drop_client_packets = Arc::new(AtomicBool::new(false));
+        let packet_gate = drop_client_packets.clone();
+        let task = tokio::spawn(async move {
+            let mut client_address = None;
+            let mut packet = vec![0; 65_536];
+            loop {
+                let Ok((length, source)) = socket.recv_from(&mut packet).await else {
+                    break;
+                };
+                let destination = if source == relay_address {
+                    let Some(client_address) = client_address else {
+                        continue;
+                    };
+                    client_address
+                } else {
+                    client_address = Some(source);
+                    if packet_gate.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    relay_address
+                };
+                if socket
+                    .send_to(&packet[..length], destination)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            address,
+            drop_client_packets,
+            task,
+        }
+    }
+}
+
+impl Drop for UdpAckBlackhole {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn bounded_video_flood(source: &quinn::Connection) -> tokio::task::JoinSet<()> {
+    let mut flood = tokio::task::JoinSet::new();
+    let source = source.clone();
+    flood.spawn(async move {
+        let mut video = vec![0; 1_009];
+        video[0] = 4; // VideoDatagram, generation zero addresses the current peer.
+        let video = bytes::Bytes::from(video);
+        for packet_index in 0..100_000 {
+            if source.send_datagram_wait(video.clone()).await.is_err() {
+                return;
+            }
+            if packet_index % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    flood
+}
+
+fn percentile_millis(samples: &[Duration], percentile: usize) -> f64 {
+    assert!(!samples.is_empty());
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    let index = (ordered.len() * percentile).div_ceil(100) - 1;
+    ordered[index].as_secs_f64() * 1_000.0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn congested_media_keeps_audio_admission_new_streams_and_other_sessions_live() {
+    let relay = spawn_test_relay().await;
+    let blackhole = UdpAckBlackhole::new(relay.address).await;
+    let (_source_endpoint, source) = raw_join(&relay, host(session(90), [90; 32])).await;
+    let (_slow_endpoint, slow) =
+        raw_join_at(&relay, blackhole.address, controller(session(90), [90; 32])).await;
+    blackhole.drop_client_packets.store(true, Ordering::Release);
+
+    let healthy_host = QuicClient::connect(config(&relay)).await.unwrap();
+    let healthy_controller = QuicClient::connect(config(&relay)).await.unwrap();
+    healthy_host
+        .join(host(session(91), [91; 32]))
+        .await
+        .unwrap();
+    healthy_controller
+        .join(controller(session(91), [91; 32]))
+        .await
+        .unwrap();
+
+    let mut flood = bounded_video_flood(&source);
+
+    let congestion_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let media = relay.server.media_snapshot();
+        if media.video.send_timeouts > 0 {
+            // A queue-full counter alone could describe a transient producer
+            // burst. This timeout proves actual QUIC send-capacity backpressure.
+            assert_eq!(media.active_workers, 12);
+            break;
+        }
+        assert!(
+            Instant::now() < congestion_deadline,
+            "the UDP ACK blackhole did not congest relay egress: {media:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let audio_before = relay.server.media_snapshot().audio.enqueued;
+    source
+        .send_datagram_wait(bytes::Bytes::from_static(&[7, 0, 0, 0, 0, 0, 0, 0, 0, 42]))
+        .await
+        .unwrap();
+    let audio_deadline = Instant::now() + Duration::from_secs(2);
+    while relay.server.media_snapshot().audio.enqueued == audio_before {
+        assert!(
+            Instant::now() < audio_deadline,
+            "congested video prevented independent audio admission"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    healthy_controller.send_input(vec![1, 2, 3]).await.unwrap();
+    assert_eq!(
+        next_event(&healthy_host).await,
+        TransportEvent::Input(vec![1, 2, 3])
+    );
+    healthy_host.send_control(vec![4, 5, 6]).await.unwrap();
+    assert_eq!(
+        next_event(&healthy_controller).await,
+        TransportEvent::Control(vec![4, 5, 6])
+    );
+
+    // The source's connection reader must continue accepting new streams even
+    // while its media sender is blocked on the slow destination. The malformed
+    // channel makes acceptance externally observable without requiring delivery
+    // through the deliberately blackholed path.
+    let (mut send, _receive) = source.open_bi().await.unwrap();
+    send.write_all(&[99, 0, 0, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    send.finish().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), source.closed())
+        .await
+        .expect("media congestion prevented accepting the new reliable stream");
+
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let media = relay.server.media_snapshot();
+        let capacity = relay.server.capacity_snapshot();
+        if media.active_workers == 9 && capacity.accepted_connections == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "closed source retained its three sender workers: {media:?}, {capacity:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    flood.abort_all();
+
+    blackhole
+        .drop_client_packets
+        .store(false, Ordering::Release);
+    slow.close(0u32.into(), b"media scheduling regression complete");
+    healthy_host.close(b"media scheduling regression complete");
+    healthy_controller.close(b"media scheduling regression complete");
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let media = relay.server.media_snapshot();
+        let capacity = relay.server.capacity_snapshot();
+        if media.active_workers == 0 && capacity.accepted_connections == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "closed sessions retained sender workers: {media:?}, {capacity:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual local scheduling measurements; no portable latency or capacity threshold"]
+async fn local_multi_session_media_scheduling_probe() {
+    const HEALTHY_SESSIONS: usize = 4;
+    const SAMPLES_PER_SESSION: usize = 75;
+
+    let relay = spawn_test_relay().await;
+    let blackhole = UdpAckBlackhole::new(relay.address).await;
+    let (_source_endpoint, source) = raw_join(&relay, host(session(100), [100; 32])).await;
+    let (_slow_endpoint, slow) = raw_join_at(
+        &relay,
+        blackhole.address,
+        controller(session(100), [100; 32]),
+    )
+    .await;
+    blackhole.drop_client_packets.store(true, Ordering::Release);
+
+    let mut healthy = Vec::with_capacity(HEALTHY_SESSIONS);
+    for number in 0..HEALTHY_SESSIONS {
+        let session_number = 101 + number as u8;
+        let host_client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
+        let controller_client = Arc::new(QuicClient::connect(config(&relay)).await.unwrap());
+        host_client
+            .join(host(session(session_number), [session_number; 32]))
+            .await
+            .unwrap();
+        controller_client
+            .join(controller(session(session_number), [session_number; 32]))
+            .await
+            .unwrap();
+        healthy.push((host_client, controller_client));
+    }
+
+    let mut flood = bounded_video_flood(&source);
+    let congestion_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let snapshot = relay.server.media_snapshot();
+        if snapshot.video.send_timeouts > 0 {
+            assert_eq!(snapshot.active_workers, 3 * 2 * (HEALTHY_SESSIONS + 1));
+            break;
+        }
+        assert!(
+            Instant::now() < congestion_deadline,
+            "probe never established real slow-path congestion: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    println!(
+        "DL2-019 local probe before measurement: {:?}",
+        relay.server.media_snapshot()
+    );
+
+    // Four independent synthetic sessions run concurrently. Input timing is
+    // an Input -> Control echo roundtrip; no OS input is injected. Audio
+    // timing ends when the healthy remote transport yields its audio event,
+    // using the same host's monotonic clock. It excludes capture/playback.
+    let measurement_started = Instant::now();
+    let mut probes = tokio::task::JoinSet::new();
+    for (number, (host_client, controller_client)) in healthy.iter().enumerate() {
+        let host_client = host_client.clone();
+        let controller_client = controller_client.clone();
+        probes.spawn(async move {
+            let mut input_roundtrips = Vec::with_capacity(SAMPLES_PER_SESSION);
+            let mut audio_arrivals = Vec::with_capacity(SAMPLES_PER_SESSION);
+            for sample in 0..SAMPLES_PER_SESSION {
+                let input = vec![number as u8, sample as u8, 1];
+                let started = Instant::now();
+                controller_client.send_input(input.clone()).await.unwrap();
+                assert_eq!(
+                    next_event(&host_client).await,
+                    TransportEvent::Input(input.clone())
+                );
+                host_client.send_control(input.clone()).await.unwrap();
+                assert_eq!(
+                    next_event(&controller_client).await,
+                    TransportEvent::Control(input)
+                );
+                input_roundtrips.push(started.elapsed());
+
+                let audio = vec![number as u8, sample as u8, 7];
+                let started = Instant::now();
+                host_client
+                    .send_audio_datagram(audio.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    next_event(&controller_client).await,
+                    TransportEvent::AudioDatagram(audio)
+                );
+                audio_arrivals.push(started.elapsed());
+            }
+            (input_roundtrips, audio_arrivals)
+        });
+    }
+    let mut input_roundtrips = Vec::with_capacity(HEALTHY_SESSIONS * SAMPLES_PER_SESSION);
+    let mut audio_arrivals = Vec::with_capacity(HEALTHY_SESSIONS * SAMPLES_PER_SESSION);
+    while let Some(result) = probes.join_next().await {
+        let (input, audio) = result.unwrap();
+        input_roundtrips.extend(input);
+        audio_arrivals.extend(audio);
+    }
+    let elapsed = measurement_started.elapsed();
+    assert_eq!(
+        input_roundtrips.len(),
+        HEALTHY_SESSIONS * SAMPLES_PER_SESSION
+    );
+    assert_eq!(audio_arrivals.len(), HEALTHY_SESSIONS * SAMPLES_PER_SESSION);
+    println!(
+        "DL2-019 local probe healthy_sessions={HEALTHY_SESSIONS} slow_ack_blackhole_sessions=1 \
+         input_roundtrip_samples={} input_p95_ms={:.4} input_p99_ms={:.4} \
+         audio_one_way_event_samples={} audio_p95_ms={:.4} audio_p99_ms={:.4} elapsed_ms={:.4}",
+        input_roundtrips.len(),
+        percentile_millis(&input_roundtrips, 95),
+        percentile_millis(&input_roundtrips, 99),
+        audio_arrivals.len(),
+        percentile_millis(&audio_arrivals, 95),
+        percentile_millis(&audio_arrivals, 99),
+        elapsed.as_secs_f64() * 1_000.0,
+    );
+    println!(
+        "DL2-019 local probe after measurement: {:?}",
+        relay.server.media_snapshot()
+    );
+
+    flood.abort_all();
+    source.close(0u32.into(), b"local scheduling probe complete");
+    blackhole
+        .drop_client_packets
+        .store(false, Ordering::Release);
+    slow.close(0u32.into(), b"local scheduling probe complete");
+    for (host_client, controller_client) in healthy {
+        host_client.close(b"local scheduling probe complete");
+        controller_client.close(b"local scheduling probe complete");
+    }
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let media = relay.server.media_snapshot();
+        let capacity = relay.server.capacity_snapshot();
+        if media.active_workers == 0 && capacity.accepted_connections == 0 {
+            println!("DL2-019 local probe cleanup: active_workers=0 accepted_connections=0");
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "probe cleanup retained workers or connections: {media:?}, {capacity:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]

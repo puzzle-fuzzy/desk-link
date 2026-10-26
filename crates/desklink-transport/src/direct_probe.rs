@@ -219,6 +219,10 @@ impl DirectLanConnection {
         self.candidate_id
     }
 
+    pub(crate) fn authenticated_quic_connection(&self) -> quinn::Connection {
+        self.connection.clone()
+    }
+
     pub fn send_datagram(&self, bytes: Vec<u8>) -> Result<(), TransportError> {
         if bytes.len() > crate::MAX_DATAGRAM_BYTES {
             return Err(TransportError::MessageTooLarge {

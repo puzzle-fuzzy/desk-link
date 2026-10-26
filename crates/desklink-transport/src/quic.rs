@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -293,10 +293,14 @@ impl QuicClient {
         let mut client_config = config.client_config.clone();
         client_config.transport_config(Arc::new(transport));
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(|error| {
-            TransportError::InvalidConfig(format!("client bind address: {error}"))
-        })?)
-        .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
+        let bind_address = if config.relay_addr.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_address).map_err(|error| {
+            TransportError::InvalidConfig(format!("client bind address {bind_address}: {error}"))
+        })?;
         endpoint.set_default_client_config(client_config);
         let connection = endpoint
             .connect(config.relay_addr, &config.server_name)

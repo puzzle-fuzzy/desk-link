@@ -390,16 +390,12 @@ async fn spawn_relay(backpressure: bool) -> TestRelay {
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
     ));
-    let mut transport = quinn::TransportConfig::default();
-    if backpressure {
-        fixture_flow_control_limits().apply_to(&mut transport);
-    }
     let relay = Arc::new(
-        RelayServer::bind_with_transport(
+        RelayServer::bind_with_flow_control_limits(
             "127.0.0.1:0".parse().unwrap(),
             server_config,
             RelayConfig::default(),
-            transport,
+            backpressure.then(fixture_flow_control_limits),
         )
         .await
         .unwrap(),

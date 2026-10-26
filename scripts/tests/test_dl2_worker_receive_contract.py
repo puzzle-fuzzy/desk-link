@@ -46,7 +46,7 @@ class WorkerReceiveContracts(unittest.TestCase):
         self.assertIn("self.cancellation.send(true)", release)
         self.assertIn("senders.control.close()", worker)
 
-    def test_real_flow_limits_reach_endpoints_and_default_constructors_remain_default(self):
+    def test_real_flow_limits_reach_endpoints_and_relay_resource_caps_remain_authoritative(self):
         transport = source("crates/desklink-transport/src/lib.rs")
         self.assertIn("flow_control_limits: None", transport)
         self.assertIn("stream_receive_window > receive_window", transport)
@@ -55,17 +55,21 @@ class WorkerReceiveContracts(unittest.TestCase):
         self.assertLess(client.index("limits.apply_to(&mut transport)"), client.index(".keep_alive_interval("))
         self.assertLess(client.index("limits.apply_to(&mut transport)"), client.index("endpoint.set_default_client_config(client_config)"))
         relay = source("server/relay/src/lib.rs")
-        ordinary = relay.split("pub async fn bind(", 1)[1].split("pub async fn bind_with_transport", 1)[0]
-        self.assertIn("quinn::TransportConfig::default()", ordinary)
-        explicit = relay.split("pub async fn bind_with_transport", 1)[1].split("pub fn local_addr", 1)[0]
-        self.assertNotIn("TransportConfig::default()", explicit)
-        self.assertIn("server_config.transport_config(Arc::new(transport))", explicit)
+        ordinary = relay.split("pub async fn bind(", 1)[1].split("pub async fn bind_with_flow_control_limits", 1)[0]
+        self.assertIn("config, None", ordinary)
+        helper = relay.split("fn configure_relay_transport(", 1)[1].split("pub struct RelayServer", 1)[0]
+        self.assertIn("requested > maximum", helper)
+        self.assertIn("return Err(RelayError::InvalidConfig", helper)
+        self.assertLess(helper.index("budget.configure(&mut transport)"), helper.index("limits.apply_to(&mut transport)"))
+        explicit = relay.split("pub async fn bind_with_flow_control_limits", 1)[1].split("pub fn local_addr", 1)[0]
+        self.assertIn("configure_relay_transport(&config, flow_control_limits)?", explicit)
+        self.assertIn("transport_config(Arc::new(transport))", explicit)
         self.assertIn("quinn::Endpoint::server(server_config, bind_addr)", explicit)
         fixture = source("crates/desklink-ffi/src/controller/direct_silence_tests.rs")
         self.assertIn("with_flow_control_limits(fixture_flow_control_limits())", fixture)
-        self.assertIn("fixture_flow_control_limits().apply_to(&mut transport)", fixture)
+        self.assertIn("backpressure.then(fixture_flow_control_limits)", fixture)
         self.assertIn("QuicFlowControlLimits::new(2048, 16384, 2048)", fixture)
-        self.assertIn("RelayServer::bind_with_transport", fixture)
+        self.assertIn("RelayServer::bind_with_flow_control_limits", fixture)
 
     def test_owned_control_and_runtime_recovery_share_wire_order_without_crypto_io_lock(self):
         controller = source("crates/desklink-ffi/src/controller.rs")

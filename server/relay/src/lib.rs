@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,7 +15,7 @@ use desklink_transport::{
     ChannelKind, DEAD_TIMEOUT, DIRECTORY_ACCESS_CODE_BYTES, DIRECTORY_LOOKUP_ENVELOPE_BYTES,
     DIRECTORY_LOOKUP_FOUND, DIRECTORY_LOOKUP_MALFORMED, DIRECTORY_LOOKUP_NOT_FOUND,
     DIRECTORY_LOOKUP_PROTOCOL_MISMATCH, DIRECTORY_LOOKUP_RATE_LIMITED, JoinRejectCode,
-    KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES, MAX_RELIABLE_MESSAGE_BYTES,
+    KEEPALIVE_INTERVAL, MAX_DATAGRAM_BYTES, MAX_JOIN_ENVELOPE_BYTES, QuicFlowControlLimits,
     RELAY_CONNECTION_LIMIT_CLOSE_CODE, RelayDirectoryLookup, RelayDirectoryRegistration, RelayJoin,
     decode_directory_lookup, decode_relay_join,
 };
@@ -23,14 +23,33 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+mod media_scheduler;
+mod read_deadline;
+mod resource_limits;
+
+use media_scheduler::{MediaIngress, media_queues};
+pub use media_scheduler::{RelayMediaLaneSnapshot, RelayMediaSnapshot};
+use read_deadline::{ReadDeadlineError, next_reliable_frame, read_exact_until};
+pub use resource_limits::{
+    DEFAULT_RELAY_BUFFER_BUDGET_BYTES, DEFAULT_RELAY_MAX_CONNECTIONS, DEFAULT_RELAY_MAX_SESSIONS,
+    RelayMemoryObservation, RelayResourceBudget,
+};
+
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub session_ttl: Duration,
     pub sweep_interval: Duration,
     pub keep_alive: Duration,
     pub dead_timeout: Duration,
+    /// Absolute application admission budget, including TLS, join and reply.
+    pub join_timeout: Duration,
+    /// Completion budget once a reliable header/frame has actually started.
+    pub partial_frame_timeout: Duration,
+    /// Total graceful and forced cleanup budget after stop is requested.
+    pub shutdown_timeout: Duration,
     pub max_connections: usize,
     pub max_sessions: usize,
+    pub buffer_budget_bytes: u64,
 }
 
 impl Default for RelayConfig {
@@ -40,9 +59,19 @@ impl Default for RelayConfig {
             sweep_interval: Duration::from_secs(1),
             keep_alive: KEEPALIVE_INTERVAL,
             dead_timeout: DEAD_TIMEOUT,
-            max_connections: 1024,
-            max_sessions: 1024,
+            join_timeout: Duration::from_secs(8),
+            partial_frame_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(7),
+            max_connections: DEFAULT_RELAY_MAX_CONNECTIONS,
+            max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            buffer_budget_bytes: DEFAULT_RELAY_BUFFER_BUDGET_BYTES,
         }
+    }
+}
+
+impl RelayConfig {
+    pub fn resource_budget(&self) -> Result<RelayResourceBudget, RelayError> {
+        RelayResourceBudget::for_config(self)
     }
 }
 
@@ -78,23 +107,15 @@ pub enum RelayError {
     SessionLimitReached,
     #[error("device directory ID is already registered by another host")]
     DirectoryConflict,
+    #[error("relay shutdown did not finish gracefully within its budget")]
+    ShutdownTimeout,
 }
 
 const DIRECTORY_LOOKUP_WINDOW: Duration = Duration::from_secs(60);
 const DIRECTORY_LOOKUP_FAILURE_LIMIT: u8 = 5;
 const MAX_DIRECTORY_LOOKUP_ATTEMPTS: usize = 8_192;
 const MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION: usize = 16;
-// Video keyframes are packetized into many QUIC datagrams. Forward each
-// packet independently so one paced `send_datagram_wait` cannot serialize a
-// whole keyframe behind the relay's read loop. The bound keeps a peer from
-// creating an unbounded task backlog while still covering the largest normal
-// keyframe burst (MAX_VIDEO_CHUNKS is currently below this limit).
-const MAX_DATAGRAM_FORWARD_TASKS_PER_CONNECTION: usize = 256;
 const MAX_ADMISSION_REJECTION_TASKS: usize = 64;
-// A relay must not silently evict older video datagrams while a keyframe is
-// being forwarded. Wait briefly for QUIC send capacity, but keep a bounded
-// timeout so a dead/blocked peer cannot pin the participant read loop forever.
-const DATAGRAM_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 static DATAGRAM_FORWARD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static DATAGRAM_FORWARD_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 
@@ -111,6 +132,16 @@ pub struct RelayCapacitySnapshot {
     pub accepted_connections: usize,
     pub max_sessions: usize,
     pub max_connections: usize,
+}
+
+/// Resource counts only; useful after awaiting `run()` during shutdown.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RelayShutdownSnapshot {
+    pub accepted_connections: usize,
+    pub attached_participants: usize,
+    pub media_workers: usize,
+    pub reliable_workers: usize,
+    pub rejection_tasks: usize,
 }
 
 struct SessionRecord {
@@ -466,6 +497,7 @@ struct Participant {
 }
 
 struct RelayState {
+    media_statistics: Arc<media_scheduler::MediaStatistics>,
     sessions: RelaySessionTable,
     membership: Mutex<()>,
     participants: Mutex<HashMap<u64, Participant>>,
@@ -474,6 +506,7 @@ struct RelayState {
     admission_rejection_slots: Arc<Semaphore>,
     next_connection_id: AtomicU64,
     active_connections: std::sync::atomic::AtomicUsize,
+    active_reliable_workers: AtomicUsize,
 }
 
 struct DirectoryRecord {
@@ -768,7 +801,10 @@ impl RelayState {
 
 #[cfg(test)]
 mod tests {
-    use super::{LookupAttempt, prune_lookup_attempts};
+    use super::{
+        LookupAttempt, QuicFlowControlLimits, RelayConfig, RelayError, configure_relay_transport,
+        prune_lookup_attempts,
+    };
     use std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr},
@@ -834,12 +870,103 @@ mod tests {
         assert!(!attempts.contains_key(&expired_key));
         assert!(attempts.contains_key(&active_key));
     }
+
+    #[test]
+    fn relay_flow_control_overrides_reject_each_over_budget_window() {
+        let config = RelayConfig::default();
+        let budget = config.resource_budget().unwrap();
+        let send = u32::try_from(budget.send_window_bytes).unwrap();
+        let receive = u32::try_from(budget.connection_receive_window_bytes).unwrap();
+        let stream = u32::try_from(budget.stream_receive_window_bytes).unwrap();
+        for (name, limits) in [
+            (
+                "send window",
+                QuicFlowControlLimits::new(send + 1, receive, stream).unwrap(),
+            ),
+            (
+                "connection receive window",
+                QuicFlowControlLimits::new(send, receive + 1, stream).unwrap(),
+            ),
+            (
+                "stream receive window",
+                QuicFlowControlLimits::new(send, receive, stream + 1).unwrap(),
+            ),
+        ] {
+            assert!(matches!(
+                configure_relay_transport(&config, Some(limits)),
+                Err(RelayError::InvalidConfig(reason)) if reason.contains(name)
+            ));
+        }
+    }
+
+    #[test]
+    fn relay_flow_control_override_preserves_resource_budget_validation() {
+        let config = RelayConfig::default();
+        let budget = config.resource_budget().unwrap();
+        let maximum = QuicFlowControlLimits::new(
+            u32::try_from(budget.send_window_bytes).unwrap(),
+            u32::try_from(budget.connection_receive_window_bytes).unwrap(),
+            u32::try_from(budget.stream_receive_window_bytes).unwrap(),
+        )
+        .unwrap();
+        let small = QuicFlowControlLimits::new(2048, 16384, 2048).unwrap();
+        assert!(configure_relay_transport(&config, None).is_ok());
+        assert!(configure_relay_transport(&config, Some(maximum)).is_ok());
+        assert!(configure_relay_transport(&config, Some(small)).is_ok());
+        let invalid_budget = RelayConfig {
+            buffer_budget_bytes: 0,
+            ..config
+        };
+        assert!(matches!(
+            configure_relay_transport(&invalid_budget, Some(small)),
+            Err(RelayError::InvalidConfig(_))
+        ));
+    }
+}
+
+fn configure_relay_transport(
+    config: &RelayConfig,
+    flow_control_limits: Option<QuicFlowControlLimits>,
+) -> Result<quinn::TransportConfig, RelayError> {
+    let budget = config.resource_budget()?;
+    if let Some(limits) = flow_control_limits {
+        for (name, requested, maximum) in [
+            (
+                "send window",
+                u64::from(limits.send_window_bytes()),
+                budget.send_window_bytes,
+            ),
+            (
+                "connection receive window",
+                u64::from(limits.receive_window_bytes()),
+                budget.connection_receive_window_bytes,
+            ),
+            (
+                "stream receive window",
+                u64::from(limits.stream_receive_window_bytes()),
+                budget.stream_receive_window_bytes,
+            ),
+        ] {
+            if requested > maximum {
+                return Err(RelayError::InvalidConfig(format!(
+                    "{name} of {requested} bytes exceeds relay resource budget of {maximum} bytes"
+                )));
+            }
+        }
+    }
+    let mut transport = quinn::TransportConfig::default();
+    budget.configure(&mut transport);
+    if let Some(limits) = flow_control_limits {
+        limits.apply_to(&mut transport);
+    }
+    Ok(transport)
 }
 
 pub struct RelayServer {
     endpoint: quinn::Endpoint,
     state: Arc<RelayState>,
     config: RelayConfig,
+    stopping: AtomicBool,
 }
 
 impl RelayServer {
@@ -848,22 +975,17 @@ impl RelayServer {
         server_config: quinn::ServerConfig,
         config: RelayConfig,
     ) -> Result<Self, RelayError> {
-        Self::bind_with_transport(
-            bind_addr,
-            server_config,
-            config,
-            quinn::TransportConfig::default(),
-        )
-        .await
+        Self::bind_with_flow_control_limits(bind_addr, server_config, config, None).await
     }
 
-    /// Uses explicit transport tuning while retaining relay-owned lifecycle
-    /// timeouts. The ordinary bind constructor keeps its existing defaults.
-    pub async fn bind_with_transport(
+    /// Uses the relay resource budget unless smaller flow-control windows are
+    /// supplied. Overrides may not exceed any budgeted window; stream counts,
+    /// datagram/crypto buffers and lifecycle policy remain relay-owned.
+    pub async fn bind_with_flow_control_limits(
         bind_addr: SocketAddr,
         mut server_config: quinn::ServerConfig,
         config: RelayConfig,
-        mut transport: quinn::TransportConfig,
+        flow_control_limits: Option<QuicFlowControlLimits>,
     ) -> Result<Self, RelayError> {
         if config.keep_alive.is_zero() || config.dead_timeout.is_zero() {
             return Err(RelayError::InvalidConfig(
@@ -875,6 +997,17 @@ impl RelayServer {
                 "keepalive must be shorter than dead timeout".to_owned(),
             ));
         }
+        for (name, timeout) in [
+            ("join timeout", config.join_timeout),
+            ("partial frame timeout", config.partial_frame_timeout),
+            ("shutdown timeout", config.shutdown_timeout),
+        ] {
+            if timeout.is_zero() || tokio::time::Instant::now().checked_add(timeout).is_none() {
+                return Err(RelayError::InvalidConfig(format!(
+                    "{name} must be nonzero and fit a monotonic deadline"
+                )));
+            }
+        }
         if config.max_connections == 0 || config.max_sessions == 0 {
             return Err(RelayError::InvalidConfig(
                 "admission limits must be nonzero".to_owned(),
@@ -882,13 +1015,19 @@ impl RelayServer {
         }
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
+        let mut transport = configure_relay_transport(&config, flow_control_limits)?;
         transport
             .keep_alive_interval(Some(config.keep_alive))
             .max_idle_timeout(Some(idle_timeout));
-        server_config.transport_config(Arc::new(transport));
+        server_config
+            .transport_config(Arc::new(transport))
+            .max_incoming(resource_limits::MAX_PENDING_INCOMING)
+            .incoming_buffer_size(resource_limits::INCOMING_BUFFER_BYTES)
+            .incoming_buffer_size_total(resource_limits::TOTAL_INCOMING_BUFFER_BYTES);
         let endpoint = quinn::Endpoint::server(server_config, bind_addr)
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         let state = Arc::new(RelayState {
+            media_statistics: Arc::default(),
             sessions: RelaySessionTable::new(config.clone()),
             membership: Mutex::new(()),
             participants: Mutex::new(HashMap::new()),
@@ -897,11 +1036,13 @@ impl RelayServer {
             admission_rejection_slots: Arc::new(Semaphore::new(MAX_ADMISSION_REJECTION_TASKS)),
             next_connection_id: AtomicU64::new(1),
             active_connections: std::sync::atomic::AtomicUsize::new(0),
+            active_reliable_workers: AtomicUsize::new(0),
         });
         Ok(Self {
             endpoint,
             state,
             config,
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -923,12 +1064,39 @@ impl RelayServer {
         )
     }
 
+    pub fn media_snapshot(&self) -> RelayMediaSnapshot {
+        self.state.media_statistics.snapshot()
+    }
+
+    pub fn resource_budget(&self) -> RelayResourceBudget {
+        self.config
+            .resource_budget()
+            .expect("validated relay resource budget")
+    }
+
+    pub fn shutdown_snapshot(&self) -> RelayShutdownSnapshot {
+        let capacity = self.capacity_snapshot();
+        RelayShutdownSnapshot {
+            accepted_connections: capacity.accepted_connections,
+            attached_participants: capacity.attached_participants,
+            media_workers: self.media_snapshot().active_workers,
+            reliable_workers: self.state.active_reliable_workers.load(Ordering::Acquire),
+            rejection_tasks: MAX_ADMISSION_REJECTION_TASKS
+                - self.state.admission_rejection_slots.available_permits(),
+        }
+    }
+
     pub fn close(&self) {
+        self.stopping.store(true, Ordering::Release);
         self.endpoint
             .close(quinn::VarInt::from_u32(0), b"relay shutdown");
     }
 
     pub async fn run(&self) -> Result<(), RelayError> {
+        // If the owner cancels run(), still close the endpoint and cancel every
+        // tracked child. Awaiting run() is required for a completed drain.
+        let _close_on_drop = RunGuard(self);
+        let mut connections = tokio::task::JoinSet::new();
         let sweep_period = if self.config.sweep_interval.is_zero() {
             Duration::from_millis(1)
         } else {
@@ -936,10 +1104,19 @@ impl RelayServer {
         };
         let mut sweep = tokio::time::interval(sweep_period);
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
+        while !self.stopping.load(Ordering::Acquire) {
             tokio::select! {
                 incoming = self.endpoint.accept() => {
-                    let Some(incoming) = incoming else { return Ok(()); };
+                    let Some(incoming) = incoming else { break; };
+                    // Quinn may return queued incoming before reporting that
+                    // endpoint.close() stopped acceptance. Never admit it.
+                    if self.stopping.load(Ordering::Acquire) {
+                        incoming.refuse();
+                        break;
+                    }
+                    // One absolute application budget starts at admission,
+                    // not again after TLS or each subsequent partial read.
+                    let join_deadline = tokio::time::Instant::now() + self.config.join_timeout;
                     let state = self.state.clone();
                     if !state.try_reserve_connection() {
                         // Keep the stable connection-limit error for a bounded number of peers,
@@ -947,9 +1124,11 @@ impl RelayServer {
                         // is waiting for its QUIC handshake. Excess peers are refused directly.
                         if let Ok(permit) = state.admission_rejection_slots.clone().try_acquire_owned()
                         {
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 let _permit = permit;
-                                if let Ok(connection) = incoming.await {
+                                if let Ok(Ok(connection)) = tokio::time::timeout_at(
+                                    join_deadline, async { incoming.await },
+                                ).await {
                                     connection.close(
                                         quinn::VarInt::from_u32(RELAY_CONNECTION_LIMIT_CLOSE_CODE),
                                         b"connection admission limit reached",
@@ -963,28 +1142,151 @@ impl RelayServer {
                         continue;
                     }
                     let connection_id = state.next_connection_id();
-                    tokio::spawn(async move {
-                        if let Ok(connection) = incoming.await {
-                            handle_connection(connection, state.clone(), connection_id).await;
+                    // Capture the reservation before spawning, so dropping an
+                    // unpolled future also releases admission during shutdown.
+                    let admission = AdmissionGuard(state.clone());
+                    connections.spawn(async move {
+                        let _admission = admission;
+                        match tokio::time::timeout_at(join_deadline, async { incoming.await }).await {
+                            Ok(Ok(connection)) => handle_connection(
+                                connection, state.clone(), connection_id, join_deadline,
+                            ).await,
+                            Ok(Err(_)) => {},
+                            Err(_) => log_connection_event(
+                                "join_rejected", connection_id, "handshake_timeout",
+                            ),
                         }
-                        state.release_connection();
                     });
                 }
                 _ = sweep.tick() => {
                     self.state.sweep_expired(Instant::now());
                 }
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if completed.is_some_and(|result| result.is_err()) {
+                        eprintln!("relay_task_failed category=connection_task");
+                    }
+                }
             }
+        }
+        self.finish_shutdown(&mut connections).await
+    }
+
+    async fn finish_shutdown(
+        &self,
+        connections: &mut tokio::task::JoinSet<()>,
+    ) -> Result<(), RelayError> {
+        self.close();
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.config.shutdown_timeout;
+        // Keep at most the last second for forced cancellation and guard
+        // cleanup. Both phases and QUIC draining share this total budget.
+        let forced_reserve = (self.config.shutdown_timeout / 4).min(Duration::from_secs(1));
+        let graceful_deadline = deadline - forced_reserve;
+        let graceful = tokio::time::timeout_at(graceful_deadline, async {
+            // close() rejects newly arriving Initial packets. Explicitly
+            // refuse the finite queue that was already pending beforehand.
+            while let Some(incoming) = self.endpoint.accept().await {
+                incoming.refuse();
+            }
+            while connections.join_next().await.is_some() {}
+            self.endpoint.wait_idle().await;
+        })
+        .await
+        .is_ok();
+        let forced_tasks = if graceful { 0 } else { connections.len() };
+        let completed = if graceful {
+            true
+        } else {
+            connections.abort_all();
+            tokio::time::timeout_at(deadline, async {
+                while connections.join_next().await.is_some() {}
+                self.endpoint.wait_idle().await;
+            })
+            .await
+            .is_ok()
+        };
+        let snapshot = self.shutdown_snapshot();
+        let drained = snapshot == RelayShutdownSnapshot::default();
+        let outcome = if completed && drained && forced_tasks == 0 {
+            "graceful"
+        } else if completed && drained {
+            "forced"
+        } else {
+            "timed_out"
+        };
+        eprintln!(
+            "relay_shutdown outcome={outcome} accepted_connections={} attached_participants={} \
+             media_workers={} reliable_workers={} rejection_tasks={} forced_tasks={} endpoint_idle_confirmed={} elapsed_ms={}",
+            snapshot.accepted_connections,
+            snapshot.attached_participants,
+            snapshot.media_workers,
+            snapshot.reliable_workers,
+            snapshot.rejection_tasks,
+            forced_tasks,
+            completed,
+            started.elapsed().as_millis(),
+        );
+        if outcome == "graceful" {
+            Ok(())
+        } else {
+            Err(RelayError::ShutdownTimeout)
         }
     }
 }
 
-async fn handle_connection(
-    connection: quinn::Connection,
+struct RunGuard<'a>(&'a RelayServer);
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+struct AdmissionGuard(Arc<RelayState>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0.release_connection();
+    }
+}
+
+struct ParticipantGuard {
+    state: Arc<RelayState>,
+    session_id: SessionId,
+    connection_id: u64,
+}
+
+impl Drop for ParticipantGuard {
+    fn drop(&mut self) {
+        self.state
+            .remove_connection(self.session_id, self.connection_id);
+    }
+}
+
+struct ReliableWorkerGuard(Arc<RelayState>);
+
+impl ReliableWorkerGuard {
+    fn new(state: Arc<RelayState>) -> Self {
+        state.active_reliable_workers.fetch_add(1, Ordering::AcqRel);
+        Self(state)
+    }
+}
+
+impl Drop for ReliableWorkerGuard {
+    fn drop(&mut self) {
+        self.0
+            .active_reliable_workers
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn accept_join(
+    connection: &quinn::Connection,
     state: Arc<RelayState>,
     connection_id: u64,
-) {
+) -> Option<(RelayJoin, ParticipantGuard)> {
     let Ok((mut join_send, mut join_receive)) = connection.accept_bi().await else {
-        return;
+        return None;
     };
     let request = match read_request(&mut join_receive).await {
         Ok(request) => request,
@@ -998,7 +1300,7 @@ async fn handle_connection(
                 let _ = join_send.finish();
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            return;
+            return None;
         }
     };
     let join = match request {
@@ -1037,7 +1339,7 @@ async fn handle_connection(
             // Keep the QUIC connection alive briefly so the peer can consume the completed
             // response stream before this handler releases its final connection handle.
             tokio::time::sleep(Duration::from_millis(20)).await;
-            return;
+            return None;
         }
     };
     let replaced = match state.attach_participant(&join, connection_id, connection.clone()) {
@@ -1060,8 +1362,15 @@ async fn handle_connection(
                 let _ = join_send.finish();
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            return;
+            return None;
         }
+    };
+    // This guard also removes a participant if the single join deadline
+    // cancels a blocked response write after attachment has already happened.
+    let participant = ParticipantGuard {
+        state,
+        session_id: join.session_id(),
+        connection_id,
     };
     log_session_event(
         "participant_joined",
@@ -1082,16 +1391,86 @@ async fn handle_connection(
             b"participant resumed on a new connection",
         );
     }
+    if join_send.write_all(&[0]).await.is_err() || join_send.finish().is_err() {
+        return None;
+    }
+    Some((join, participant))
+}
+
+async fn handle_connection(
+    connection: quinn::Connection,
+    state: Arc<RelayState>,
+    connection_id: u64,
+    join_deadline: tokio::time::Instant,
+) {
+    // Byte-only QUIC datagram buffering does not charge empty datagrams for
+    // queue metadata. No application datagram is legal before join completes,
+    // so actively consume this phase's first datagram and reject the peer.
+    // Dropping accept_join also drops a participant registered before a
+    // blocked join response, rather than leaving its admission behind.
+    let joined = tokio::select! {
+        biased;
+        result = tokio::time::timeout_at(
+            join_deadline,
+            accept_join(&connection, state.clone(), connection_id),
+        ) => result,
+        datagram = connection.read_datagram() => {
+            if datagram.is_ok() {
+                log_connection_event("join_rejected", connection_id, "datagram_before_join");
+                close_connection(&connection, b"datagram before join");
+            }
+            return;
+        }
+    };
+    let (join, _participant) = match joined {
+        Ok(Some(joined)) => joined,
+        Ok(None) => return,
+        Err(_) => {
+            log_connection_event("join_rejected", connection_id, "join_timeout");
+            close_connection(&connection, b"join deadline exceeded");
+            return;
+        }
+    };
     let session_id = join.session_id();
     let role = join.role();
-    if join_send.write_all(&[0]).await.is_err() || join_send.finish().is_err() {
-        state.remove_connection(session_id, connection_id);
-        return;
-    }
     let reliable_forward_slots =
         Arc::new(Semaphore::new(MAX_RELIABLE_FORWARD_TASKS_PER_CONNECTION));
-    let datagram_forward_slots =
-        Arc::new(Semaphore::new(MAX_DATAGRAM_FORWARD_TASKS_PER_CONNECTION));
+    let (media_ingress, media_receivers) = media_queues();
+    // Fixed workers, independent queues and age budgets. JoinSet aborts all
+    // workers on every exit path, including cancellation of this connection task.
+    let mut media_workers = tokio::task::JoinSet::new();
+    let mut reliable_workers = tokio::task::JoinSet::new();
+    for (budget, mut receiver) in media_scheduler::MEDIA_BUDGETS
+        .into_iter()
+        .zip(media_receivers)
+    {
+        let state = state.clone();
+        let source = connection.clone();
+        let worker = state.media_statistics.worker();
+        media_workers.spawn(async move {
+            let _worker = worker;
+            loop {
+                let queued = tokio::select! {
+                    biased;
+                    _ = source.closed() => break,
+                    queued = receiver.recv() => {
+                        let Some(queued) = queued else { break; };
+                        queued
+                    }
+                };
+                forward_queued_datagram(
+                    &state,
+                    &source,
+                    connection_id,
+                    session_id,
+                    role,
+                    budget.channel,
+                    queued,
+                )
+                .await;
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -1112,8 +1491,12 @@ async fn handle_connection(
                 };
                 let state = state.clone();
                 let source = connection.clone();
-                tokio::spawn(async move {
+                let header_deadline = tokio::time::Instant::now()
+                    + state.sessions.config.partial_frame_timeout;
+                let worker = ReliableWorkerGuard::new(state.clone());
+                reliable_workers.spawn(async move {
                     let _permit = permit;
+                    let _worker = worker;
                     forward_reliable(
                         state,
                         source,
@@ -1121,53 +1504,25 @@ async fn handle_connection(
                         session_id,
                         role,
                         receive,
+                        header_deadline,
                     )
                     .await;
                 });
             }
             datagram = connection.read_datagram() => {
                 let Ok(datagram) = datagram else { break; };
-                let Ok(permit) = datagram_forward_slots.clone().try_acquire_owned() else {
-                    // Bounded backpressure: once the in-flight forwarding
-                    // window is full, wait for one permit instead of dropping
-                    // a video chunk or spawning unbounded tasks.
-                    let Ok(permit) = datagram_forward_slots.clone().acquire_owned().await else {
-                        break;
-                    };
-                    let state = state.clone();
-                    let source = connection.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let _ = forward_datagram(
-                            &state,
-                            &source,
-                            connection_id,
-                            session_id,
-                            role,
-                            datagram,
-                        )
-                        .await;
-                    });
-                    continue;
-                };
-                let state = state.clone();
-                let source = connection.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = forward_datagram(
-                        &state,
-                        &source,
-                        connection_id,
-                        session_id,
-                        role,
-                        datagram,
-                    )
-                    .await;
-                });
+                if !enqueue_datagram(
+                    &state, &connection, connection_id, session_id, role, datagram, &media_ingress,
+                ) { break; }
             }
             _ = connection.closed() => break,
+            _ = reliable_workers.join_next(), if !reliable_workers.is_empty() => {},
         }
     }
+    // The participant/admission owner does not complete while nested senders
+    // still hold source streams, peer connections or resource guards.
+    reliable_workers.shutdown().await;
+    media_workers.shutdown().await;
     log_session_event(
         "participant_disconnected",
         connection_id,
@@ -1177,7 +1532,6 @@ async fn handle_connection(
         None,
         "transport_ended",
     );
-    state.remove_connection(session_id, connection_id);
 }
 
 async fn forward_reliable(
@@ -1187,9 +1541,11 @@ async fn forward_reliable(
     session_id: SessionId,
     role: DeviceRole,
     mut receive: quinn::RecvStream,
+    header_deadline: tokio::time::Instant,
 ) {
     let mut header = [0; 9];
-    if receive.read_exact(&mut header).await.is_err() {
+    if let Err(error) = read_exact_until(&mut receive, &mut header, header_deadline).await {
+        reject_reliable_read(&source, connection_id, session_id, role, None, error);
         return;
     }
     let Ok(channel) = ChannelKind::try_from(header[0]) else {
@@ -1207,25 +1563,28 @@ async fn forward_reliable(
     );
     let mut destination: Option<(u64, quinn::SendStream)> = None;
     loop {
-        let mut length = [0; 4];
-        if receive.read_exact(&mut length).await.is_err() {
-            if let Some((_, mut send)) = destination.take() {
-                let _ = send.finish();
-            }
-            return;
-        }
-        let length = u32::from_be_bytes(length) as usize;
-        if length > MAX_RELIABLE_MESSAGE_BYTES {
-            close_connection(&source, b"reliable message too large");
-            return;
-        }
-        let mut message = vec![0; length];
-        if receive.read_exact(&mut message).await.is_err() {
-            if let Some((_, mut send)) = destination.take() {
-                let _ = send.finish();
-            }
-            return;
-        }
+        let message =
+            match next_reliable_frame(&mut receive, state.sessions.config.partial_frame_timeout)
+                .await
+            {
+                Ok(Some(message)) => message,
+                result => {
+                    if let Err(error) = result {
+                        reject_reliable_read(
+                            &source,
+                            connection_id,
+                            session_id,
+                            role,
+                            Some(channel),
+                            error,
+                        );
+                    }
+                    if let Some((_, mut send)) = destination.take() {
+                        let _ = send.finish();
+                    }
+                    return;
+                }
+            };
         if !forward_reliable_message(
             &state,
             &source,
@@ -1244,6 +1603,36 @@ async fn forward_reliable(
             return;
         }
     }
+}
+
+fn reject_reliable_read(
+    source: &quinn::Connection,
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    channel: Option<ChannelKind>,
+    error: ReadDeadlineError,
+) {
+    let (outcome, reason): (&str, &[u8]) = match error {
+        ReadDeadlineError::Timeout => {
+            ("partial_frame_timeout", b"reliable frame deadline exceeded")
+        }
+        ReadDeadlineError::Truncated => ("truncated_frame", b"reliable frame truncated"),
+        ReadDeadlineError::TooLarge => ("message_too_large", b"reliable message too large"),
+        // Peer resets and a closed transport are already visible to the
+        // lifecycle owner. They do not turn one lane reset into a new error.
+        ReadDeadlineError::Read(_) => return,
+    };
+    log_session_event(
+        "reliable_stream_rejected",
+        connection_id,
+        session_id,
+        role,
+        None,
+        channel,
+        outcome,
+    );
+    close_connection(source, reason);
 }
 
 #[derive(Clone, Copy)]
@@ -1389,13 +1778,20 @@ async fn forward_reliable_message(
     }
 }
 
-async fn forward_datagram(
+struct PendingDatagram {
+    peer_id: u64,
+    peer: quinn::Connection,
+    bytes: bytes::Bytes,
+}
+
+fn enqueue_datagram(
     state: &RelayState,
     source: &quinn::Connection,
     connection_id: u64,
     session_id: SessionId,
     role: DeviceRole,
     datagram: bytes::Bytes,
+    ingress: &MediaIngress<PendingDatagram>,
 ) -> bool {
     if datagram.len() < 9 || datagram.len() - 9 > MAX_DATAGRAM_BYTES {
         close_connection(source, b"datagram too large");
@@ -1417,58 +1813,98 @@ async fn forward_datagram(
             .try_into()
             .expect("datagram target generation header has a fixed length"),
     );
-    if let Some((peer_id, peer)) = state.peer_with_id(session_id, role, connection_id) {
-        if target_generation != 0 && target_generation != peer_id {
-            return true;
-        }
-        let mut forwarded = Vec::with_capacity(datagram.len());
-        forwarded.push(channel as u8);
-        forwarded.extend_from_slice(&connection_id.to_be_bytes());
-        forwarded.extend_from_slice(&datagram[9..]);
-        match tokio::time::timeout(
-            DATAGRAM_FORWARD_TIMEOUT,
-            peer.send_datagram_wait(forwarded.into()),
-        )
-        .await
-        {
-            Ok(Ok(())) => log_datagram_forward_success(
-                connection_id,
-                session_id,
-                role,
-                peer_id,
-                channel,
-                datagram.len(),
-                peer.max_datagram_size(),
-            ),
-            Ok(Err(_)) => {
-                log_datagram_forward_failure(
-                    connection_id,
-                    session_id,
-                    role,
-                    peer_id,
-                    channel,
-                    datagram.len(),
-                    peer.max_datagram_size(),
-                    "peer_send_failed",
-                );
-            }
-            Err(_) => {
-                log_datagram_forward_failure(
-                    connection_id,
-                    session_id,
-                    role,
-                    peer_id,
-                    channel,
-                    datagram.len(),
-                    peer.max_datagram_size(),
-                    "peer_send_timeout",
-                );
-            }
-        }
+    let Some((peer_id, peer)) = state.peer_with_id(session_id, role, connection_id) else {
+        return true;
+    };
+    if target_generation != 0 && target_generation != peer_id {
+        return true;
+    }
+    // Bind generation-zero packets at ingress too: queued ciphertext must
+    // never be re-addressed to a replacement controller or host.
+    let mut forwarded = datagram
+        .try_into_mut()
+        .unwrap_or_else(|bytes| bytes::BytesMut::from(bytes.as_ref()));
+    forwarded[1..9].copy_from_slice(&connection_id.to_be_bytes());
+    if let Err(packet) = ingress.enqueue(
+        channel,
+        PendingDatagram {
+            peer_id,
+            peer,
+            bytes: forwarded.freeze(),
+        },
+    ) {
+        state.media_statistics.record(channel, "queue_full");
+        log_datagram_forward_failure(
+            connection_id,
+            session_id,
+            role,
+            peer_id,
+            channel,
+            packet.bytes.len(),
+            packet.peer.max_datagram_size(),
+            "queue_full",
+        );
+    } else {
+        state.media_statistics.record(channel, "enqueued");
     }
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn forward_queued_datagram(
+    state: &RelayState,
+    source: &quinn::Connection,
+    connection_id: u64,
+    session_id: SessionId,
+    role: DeviceRole,
+    channel: ChannelKind,
+    queued: media_scheduler::QueuedMedia<PendingDatagram>,
+) {
+    state
+        .media_statistics
+        .record_queue_age(channel, queued.enqueued_at.elapsed());
+    let packet = queued.value;
+    let outcome = if tokio::time::Instant::now() >= queued.deadline {
+        "queue_expired"
+    } else if state
+        .peer_with_id(session_id, role, connection_id)
+        .is_none_or(|(peer_id, _)| peer_id != packet.peer_id)
+    {
+        "peer_replaced"
+    } else {
+        let send = tokio::time::timeout_at(
+            queued.deadline,
+            packet.peer.send_datagram_wait(packet.bytes.clone()),
+        );
+        tokio::select! {
+            biased;
+            _ = source.closed() => "source_closed",
+            result = send => match result {
+                Ok(Ok(())) => {
+                    state.media_statistics.record(channel, "forwarded");
+                    log_datagram_forward_success(
+                        connection_id, session_id, role, packet.peer_id, channel,
+                        packet.bytes.len(), packet.peer.max_datagram_size(),
+                    );
+                    return;
+                }
+                Ok(Err(_)) => "peer_send_failed",
+                Err(_) => "peer_send_timeout",
+            }
+        }
+    };
+    state.media_statistics.record(channel, outcome);
+    log_datagram_forward_failure(
+        connection_id,
+        session_id,
+        role,
+        packet.peer_id,
+        channel,
+        packet.bytes.len(),
+        packet.peer.max_datagram_size(),
+        outcome,
+    );
+}
 #[allow(clippy::too_many_arguments)]
 fn log_datagram_forward_success(
     connection_id: u64,
@@ -1647,6 +2083,7 @@ const fn relay_error_label(error: &RelayError) -> &'static str {
         RelayError::ConnectionLimitReached => "connection_limit",
         RelayError::SessionLimitReached => "session_limit",
         RelayError::DirectoryConflict => "directory_conflict",
+        RelayError::ShutdownTimeout => "shutdown_timeout",
     }
 }
 

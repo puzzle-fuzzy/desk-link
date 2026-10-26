@@ -15,7 +15,7 @@ quinn.workspace = true
 rustls.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 rcgen.workspace = true

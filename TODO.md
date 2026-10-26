@@ -383,6 +383,10 @@
 ### DL2-019 · P1 · 中继媒体拥塞不能阻塞连接控制与音频
 
 - [ ] 分离读取与发送调度，为各类数据设置独立预算和时效。
+- [x] 调度隔离切片：每连接固定 3 个媒体 sender，音频/光标/视频独立有界 FIFO（32/8/256 包；60/40/250ms 总年龄），入队不等待；去掉逐包 task，关闭时取消 sender；入队绑定目标代数并在发送前复核，独占 `Bytes` 可原地改路由头。
+- [x] 自动回归：媒体队列 3 项测试；真实 loopback QUIC 通过 UDP ACK 黑洞触发 `send_datagram_wait` 超时后，验证音频仍可入队、另一会话输入/控制正常、新可靠流仍被接受及全部 sender/容量回收。协议 13 整合后 relay 合计 34 项常规测试（5 lib + 1 bin + 28 session）及 Clippy `--all-targets --locked -- -D warnings`、rustfmt 通过。
+- [x] 可重复本机测量切片：1 条已确认 ACK 黑洞拥塞会话 + 4 条健康会话并发，各取得 300 个合成输入往返/音频 event 到达样本；协议 13 基线上 p95/p99 分别为 0.9534/1.5978ms 与 0.5286/0.6031ms，30 个媒体 sender 最终全部回收。debug loopback、非真实注入/播放/双机容量；测量用例默认 ignored，本轮已显式执行通过。提交主题：`test(DL2-019): measure local scheduling under media backpressure`，完整环境、命令与结果见调度记录。
+- [ ] 帧/依赖级丢弃及真实多会话性能验收：中继当前只见密文，本切片仅实施逐通道包预算，仍共享 QUIC 拥塞窗口/发送缓存；输入/音频 p95/p99、CPU/吞吐、容量及长稳未测。实现和验证边界见 [中继调度记录](docs/phase-two-relay-scheduling.md)。提交主题：`fix(DL2-019): isolate relay media queues from connection reads`。
 - **证据 / 类型：性能结构。** `server/relay/src/lib.rs:92,1112-1135` 共用 256 个 datagram 转发槽，耗尽时在连接 select 分支内 await permit，暂停同循环 accept_bi/closed；`1392-1415` 视频、音频、光标共用路径，每包建任务/Vec，单包等待上限 250ms。
 - **现有保护：** `server/relay/src/lib.rs:1080-1109` 已把建立的可靠通道放入独立 forward_reliable 任务，它们仍能继续转发；直接受阻的是新可靠流的接受、同循环关闭处理和后续 datagram 读取，不能据此断言所有现有键鼠/控制都被槽位直接阻塞。
 - **方案：** 按连接常驻 sender 与有界队列，按音频、光标、视频的时效调度；视频以帧/依赖为单位丢弃过期数据；可靠控制/输入有独立预算，单个慢接收端不占满其他会话资源。
@@ -450,9 +454,19 @@
 ### DL2-024 · P2 · 将低延迟直连从视频优化扩展为完整数据路径
 
 - [ ] 设计认证后的多通道 LAN 数据面，再按测量决定公网 NAT 穿透方案。
+- [x] 传输层独立切片：新增 opt-in DLD1/DLB1 数据面，复用既有认证 probe 与 Noise 会话，提供八通道有界队列、可靠流优先级、逐通道回退、同密文去重、截止时间与取消；收讫使用 AEAD 内随机 128bit token，拒绝伪造/旧 ACK，不推进反向业务 replay window。提交主题：`feat(DL2-024): add authenticated multi-lane LAN transport slice`。
+- [x] 本地自动验证：固定 Rust 工具链通过 transport **35 项单元测试（其中新增 LAN 数据面 11 项）+16 项 localhost 集成测试**，Clippy `--all-targets --locked -- -D warnings`、包级 fmt 与 `git diff --check` 通过。覆盖 relay backend 离线时八通道双向传输、慢文件消费者与输入/音频隔离、LAN/relay 去重、伪收讫、错会话/错 lane、双向 >128 包及持锁取消；不涉及公网或真实输入注入。
+- [x] 共享探测接入复核：复用 DL2-011 的 `3277c2a` 与 `0836a8b` 独立提交，保留 LAN 八个业务通道，探测统一使用独立 `DirectProbe=8`；crypto 36、transport 38+16、relay 34、FFI 39、Windows DirectLan 2 项测试通过，相关 Clippy/fmt 通过。仅透传输入业务正文，DL2-013 的 `stream_id/input_epoch` 编解码及校验等待 Apple/FFI 单一契约，不另造格式；主任务仍未完成。提交主题：`docs(DL2-024): verify shared probe integration boundaries`。
+- [x] DL2-013 合同传输回归：复用 `bc6c0a6`，Host 夹具先通过正式 VideoConfig codec 公布非零上下文，Controller 从收到配置取上下文再用 `encode_input`；LAN 直传、缺收讫后的原密文 relay 重试及去重均保留 `stream_id/input_epoch`、u64 边界与开头零字节，仅用 `decode_session_input` 解码。本分支 protocol 47、transport 43+16、relay 34 项通过，protocol/transport Clippy 与 fmt 通过。该合同是生产零值占位会被拒绝的不可交付过渡，不代表 Host epoch 校验或业务链路通过。提交主题：`test(DL2-024): preserve protocol input contexts across LAN fallback`。
+- [ ] 生产接线与验收：capability/代数/切换边界接入 DL2-009 统一 v13 契约，适配媒体 packetizer 与 relay readers，接通 Windows/FFI 的输入/控制/音频/文件；定义断开公网后的 LAN 授权与存活、发现/本地配对，进行双机延迟/吞吐/长稳及公网 NAT 实验。当前生产 runtime 仍仅视频直连，不能用上述传输夹具勾选主项；接线契约、wire 预算与未验证条件见 [LAN 数据面记录](docs/lan-data-plane.md)。
 - **证据 / 类型：架构能力限制。** `crates/desklink-transport/src/video_egress.rs:5-8` 明确只优化视频；`apps/windows/src/runtime.rs:2424-2428` 音频仍通过 relay QuicClient；可靠通道位于 `crates/desklink-transport/src/quic.rs:925-930`。因此同网视频直连不代表键鼠/文件也在 LAN 内传输。
 - **方案：** 同一已认证路径承载独立优先级的输入、控制、音频和文件，并支持逐通道切换、回退和去重；完善局域网发现/本地配对与 relay 不可达时的行为。公网打洞作为独立实验，不把“换 WebRTC”本身当性能结论。
 - **验收：** 同网输入延迟符合实际 LAN 路径；断开公网后按定义保持本地连接；切换不重放按键、不串会话、不中断授权。公网方案另测不同 NAT/IPv6/UDP 限制与回退时间。
+
+### DL2-049 · P3 · QuicClient 按 relay 地址族绑定本地 socket
+
+- [x] `QuicClient::connect` 对 IPv4 relay 绑定 `0.0.0.0:0`，对 IPv6 relay 绑定 `[::]:0`；绑定失败仍通过带具体地址的 InvalidConfig 返回，不改协议/输入格式。修复前本地 `::1` 实证失败 `invalid remote address`，修复后真实 RelayServer 的 v4/v6 连接、join、目录发布/查询、可靠 VideoConfig/Input 与视频/音频 datagram 回环及容量回收均通过。
+- **验证：** 2 项地址族回归及 transport 43 单元 +16 localhost 测试通过，相关 Clippy、rustfmt、diff 检查通过；仅 loopback 合成传输，未声称公网 IPv6 路由、NAT、双栈 socket 混用或真实输入注入。主题 `fix(DL2-049): bind relay clients to the matching address family`。
 
 ### DL2-050 · P3 · FrameAssembler 重复分片先覆盖后判重
 
@@ -610,6 +624,30 @@
 - **证据 / 类型：复现性能结构。** `server/diagnostics/src/store.ts:17-47` 的事件索引只有 correlation/installation；`103-111` 每次 insert 事务内按 received_at_unix_s 删除 events/batches。本次真实 schema 的 EXPLAIN 返回 SCAN events。
 - **方案：** 以 received_at 建索引，按时间/数量分批回收，独立低频维护；保留接收原子性和去重；监测 WAL、磁盘及清理耗时。SQLite 文件是否缩小需实际维护策略，删除行不等于空间立刻归还 OS。
 - **验收：** 用真实规模合成历史记录验证 query plan、接收 p95、清理锁时间和磁盘上界；14 天保留语义不变，不为性能丢失批次原子性。
+
+### DL2-052 · P0 · 收紧 relay 未使用流与资源预算
+
+- [x] **第一波合并接口适配：** Apple真实小窗口背压夹具与网络资源预算统一为typed flow-control入口，只允许三窗口逐项不超过预算，普通bind保留默认；uni/bidi/datagram/crypto与生命周期限额继续由relay唯一执行，超预算拒绝。实际目标回归relay边界2、transport flow2、真实direct静默/持续收包2及Python worker合同5通过；完整候选门禁继续待实跑，不以局部通过关闭整个集成。
+
+- [x] 在精确源码 `020c5b3` 的本地候选容器完成负载实测：256MiB /0.75CPU /PIDs64、64 live connections、480 started writers，cgroup 峰值 34402304B（32.81MiB）、OOM kill=0；四种 join 前 datagram 均及时关闭，独立健康会话保持可达。只证明已记录负载，不把载荷模型或客户端写完成数当 RSS 保证/服务端完整收帧数。主题 `test(DL2-052): verify candidate container resource limits`，完整 JSON/镜像 ID/日志 hash 见资源记录。
+- [x] 核实锁定 quinn-proto 0.11.16 的 uni=100、单流 1250000 字节、连接 VarInt::MAX 等默认；代码禁用 uni，显式限制 bidi/stream/connection/datagram/crypto/incoming 额度。默认连接/session 改为 64，声明 160MiB 缓冲预算，包含 accepted/rejection/incoming 的默认模型为 152MiB；超预算配置启动拒绝，候选 Compose/Dockerfile 与 256MiB 容器限制对应。未部署。
+- [x] 核心提交的本地真实 QUIC 资源夹具、最大可靠帧、慢接收端隔离通过；当时 relay 共 38 项常规测试，Clippy all-targets `--locked -- -D warnings`、fmt/diff 检查通过。Linux RSS/cgroup 只读观测和 CLI 已加入；后续容器实测见首项。主题 `fix(DL2-052): bound relay QUIC buffers and validate admission budgets`，细节见 [relay 资源边界](docs/relay-resource-bounds.md)。
+- [x] Join 前 datagram 防护：依赖按载荷长度计队列字节，空 datagram 的元数据不能靠字节窗口限制；整个 join 阶段现拒绝首个任何 datagram，并取消未完成 join/登记。空/非空×未join/partial join 四种真实 QUIC 回归修复前均红、修复后全绿；relay 62 常规用例及 Clippy/fmt/diff 通过。最新候选 `020c5b3` 已复测，未用初轮 e0 镜像替代本防护证明。主题 `fix(DL2-052): reject datagrams before relay join completes`。
+
+### DL2-053 · P1 · 为 join 与已开始的可靠帧建立应用层截止时间
+
+- [x] 默认 8 秒绝对 join 预算覆盖 admission 后 TLS、accept、请求与回复；超时关闭并回收名额，已 attach 但回复被零窗口阻塞的 participant 也由 guard 清理。新增可配置、非零验证的 join/partial-frame deadline。
+- [x] 默认 30 秒限制不完整 routing header；后续每帧在首个 length 字节后才启动共享 length/body 的绝对截止时间，滴字节不续期、超长在分配前拒绝；认证可靠 lane 正常帧间空闲和完整帧后的 EOF 不断开连接。
+- [x] 新增 6 个 helper 单元及 7 组真实 QUIC deadline 回归；relay lib/bin/deadline/resource/session 共 51 项常规测试、对应 Clippy `--locked -- -D warnings`、fmt/diff 检查通过。512 静默连接本机 probe 已运行，全部有 keepalive PING、最终 admission/worker 为 0；client-connect→应用关闭 p95/p99 为 8020.018/8024.498ms，整个批次至清零 8577.337ms。512 夹具显式声明 2GiB 缓冲预算，未修改生产 64 连接默认或容器配置。
+- **修复主题：** `fix(DL2-053): expire incomplete relay joins and reliable frames`。本机合成验证范围与测量口径见 [relay 读取截止时间](docs/relay-read-deadlines.md)；未做公网探针、部署或真实输入注入。
+
+### DL2-057 · P2 · relay 受控停机与任务收尾（Rust 切片）
+
+- [ ] 汇总 Bun 服务关闭与实际 Windows Ctrl+C 验收后，再关闭整个 057；Rust relay、Linux 真实 child 与候选容器 SIGTERM 已验证。
+- [x] relay 注册 Unix TERM/INT 或 Windows Ctrl+C，close 停止新 admission 并主动关闭 QUIC；JoinSet 管理连接、拒绝、可靠子任务与媒体，总收尾预算默认 7 秒并等待 endpoint idle，超时明确报告 forced/timed_out，metrics task 取消等待。两个 CLI 检查在注册信号前直接返回。
+- [x] 真实 loopback 覆盖两条可靠流背压时只关闭源、目标仍活/健康会话继续、混合认证/未 join/媒体/TLS 拒绝任务、重复 close、ApplicationClosed、新 admission 不可用和超时分类；58 项常规回归、对应 Clippy `--locked -- -D warnings`、fmt/diff 检查通过。Tokio 只启 signal，锁文件只补已有包依赖边，无版本升级。
+- [x] Linux 同源 `020c5b3` 真实 child SIGTERM 用例 1 通过；同源静态候选容器完成资源负载后，实际 docker stop 触发 SIGTERM，正常 peer 收到 relay shutdown、退出码 0、graceful 各计数归零、endpoint idle。日志 85ms 仅为服务端收尾阶段，不是 Docker 命令端到端耗时；镜像 ID 与原始日志 hash 见关停记录。
+- **修复主题：** `fix(DL2-057): drain relay tasks and notify peers on shutdown`。任务生命周期与 052 缓冲预算的关系、实际验证和 Linux 执行命令见 [relay 受控停机](docs/relay-graceful-shutdown.md)。未部署。
 
 ## 7. 代码整理与验证体系
 

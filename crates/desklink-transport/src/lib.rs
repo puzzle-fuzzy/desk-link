@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod direct_probe;
 mod lan_candidate;
+mod lan_data;
 mod quic;
 mod video_egress;
 mod video_path;
@@ -15,6 +16,7 @@ pub use direct_probe::{
     DirectLanSession,
 };
 pub use lan_candidate::{discover_local_private_address, make_local_candidate};
+pub use lan_data::{LanDataConfig, LanDataError, LanDataPlane, LanDataRoute, LanRelayBackend};
 pub use quic::QuicClient;
 pub use video_egress::{
     DirectLanVideoPath, RelayVideoPath, VideoDatagramBackend, VideoDatagramRoute,
@@ -177,6 +179,18 @@ impl QuicFlowControlLimits {
             receive_window,
             stream_receive_window,
         })
+    }
+
+    pub const fn send_window_bytes(self) -> u32 {
+        self.send_window
+    }
+
+    pub const fn receive_window_bytes(self) -> u32 {
+        self.receive_window
+    }
+
+    pub const fn stream_receive_window_bytes(self) -> u32 {
+        self.stream_receive_window
     }
 
     /// Applies only flow control. Relay/client lifecycle policy still supplies
@@ -1066,5 +1080,13 @@ mod flow_control_limit_tests {
         assert!(QuicFlowControlLimits::new(128, 4096, 256).is_ok());
         let maximum = QuicFlowControlLimits::MAX_WINDOW_BYTES;
         assert!(QuicFlowControlLimits::new(maximum, maximum, maximum).is_ok());
+    }
+
+    #[test]
+    fn flow_window_queries_preserve_the_requested_byte_limits() {
+        let limits = QuicFlowControlLimits::new(2048, 16384, 2048).unwrap();
+        assert_eq!(limits.send_window_bytes(), 2048);
+        assert_eq!(limits.receive_window_bytes(), 16384);
+        assert_eq!(limits.stream_receive_window_bytes(), 2048);
     }
 }
