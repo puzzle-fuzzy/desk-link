@@ -39,15 +39,20 @@ def main() -> int:
     parser.add_argument("--frames", type=int, default=120)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--encode", action="store_true", help="opt in to local synthetic MFT encoding")
+    parser.add_argument("--software", action="store_true", help="with --encode, explicitly select Microsoft software MFT")
     parser.add_argument("--motion", action="store_true")
     parser.add_argument("--profile", choices=["release", "dev"], default="release")
     parser.add_argument("--label", default="unspecified", help="non-sensitive hardware/test-condition label")
     parser.add_argument("--output", type=Path, default=ROOT / "dist/windows/media-baseline.json")
     args = parser.parse_args()
+    if args.software and not args.encode:
+        parser.error("--software requires --encode")
     prepare_windows_native_build_environment()
     command = ["cargo", "run", "--locked", "--profile", args.profile, "-p", "desklink-windows", "--example", "media_baseline", "--", "--width", str(args.width), "--height", str(args.height), "--frames", str(args.frames), "--warmup", str(args.warmup)]
     if args.encode:
         command.append("--encode")
+    if args.software:
+        command.append("--software")
     if args.motion:
         command.append("--motion")
     identity_before = source_identity(ROOT)

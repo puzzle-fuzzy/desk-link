@@ -3,7 +3,10 @@ use std::{hint::black_box, time::Instant};
 
 use apps_windows::{
     capture::CapturedFrame,
-    encoder::{EncoderError, H264Encoder, H264EncoderSettings, PixelOrder, convert_to_nv12},
+    encoder::{
+        EncoderBackendPreference, EncoderError, H264Encoder, H264EncoderSettings, PixelOrder,
+        convert_to_nv12,
+    },
 };
 use serde_json::{Value, json};
 
@@ -42,6 +45,8 @@ fn main() {
     assert!((2..=2160).contains(&height) && height.is_multiple_of(2));
     assert!((1..=10_000).contains(&frames) && warmup <= 1_000);
     let encode = args.iter().any(|arg| arg == "--encode");
+    let software = args.iter().any(|arg| arg == "--software");
+    assert!(!software || encode, "--software requires --encode");
     let motion = args.iter().any(|arg| arg == "--motion");
     let mut pixels = vec![0_u8; width as usize * height as usize * 4];
     // Deterministic high-contrast glyph-like edges plus colour gradients.
@@ -54,13 +59,18 @@ fn main() {
         }
     }
     let mut encoder = encode.then(|| {
-        H264Encoder::new_with_settings(
+        H264Encoder::new_with_settings_and_backend(
             width,
             height,
             H264EncoderSettings {
                 max_width: width,
                 max_height: height,
                 ..H264EncoderSettings::default()
+            },
+            if software {
+                EncoderBackendPreference::SoftwareOnly
+            } else {
+                EncoderBackendPreference::PreferHardware
             },
         )
         .expect("synthetic Media Foundation encoder initialization")
@@ -137,6 +147,7 @@ fn main() {
             "workload": if motion { "synthetic_changed_pixel" } else { "synthetic_static_edges" },
             "encode_enabled": encode,
             "profile": encoder.as_ref().map(|encoder| format!("{:?}", encoder.profile())),
+        "backend": encoder.as_ref().and_then(|encoder| encoder.backend_info()),
             "total_elapsed_with_warmup_us": micros(started),
             "convert_us": percentiles(&convert_us), "mft_us": percentiles(&mft_us),
             "encoder_output_residence_us": percentiles(&residence_us),

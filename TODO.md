@@ -226,6 +226,10 @@
 - **方案：** 枚举并选择合适的异步硬件 MFT，查询实际能力/低延迟参数，处理设备丢失及软件回退；记录真正使用的后端、profile、分辨率、帧率与原因。[MFTEnumEx 官方说明](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mftenumex)区分了同步、异步和硬件类别。
 - **验收：** Intel/AMD/NVIDIA 与无可用硬件编码器矩阵；同画质对照 CPU、GPU、帧龄和恢复时间，驱动拒绝参数时能够快速选择可用配置。与 DL2-015 联合实现。
 
+- [x] **已实现并自动验证（`feat(DL2-016): select hardware MFTs with bounded software fallback`）：** 显式MFTEnumEx枚举NV12→H264硬件候选（最多尝试16），async unlock/事件credit授权/100ms进展预算；失败以相同帧在新config_version强制IDR重试软件，后续重配保持软件避免振荡。backend_info及基线报告记录实际后端/候选/稳定原因；见 `docs/windows-encoder-backends.md`。
+- **验证：** 2个新增credit/合成硬件故障用例通过，encoder_contract 11通过/1人工项忽略，基线percentile 1通过；lib+example严格Clippy通过。64×64合成软件及prefer-hardware各3帧烟测通过；后者真实枚举1候选、拒绝该配置后软件完成，报告source_unchanged=true。
+- [ ] **仍待硬件验收：** 本机未实际成功激活硬件异步编码；Intel/AMD/NVIDIA/混合GPU、真实device-loss与参数拒绝矩阵、CPU/GPU/帧龄恢复测量及GPU surface输入联合DL2-015验证。当前硬件输入仍为CPU NV12，不宣称零复制；进展预算不能中断驱动内部阻塞COM调用。
+
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
 - [ ] 用 AudioWorklet 或经测量更合适的原生播放路径，替代逐包节点创建。
