@@ -103,7 +103,7 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 
 桥接前原语测试 `controller-context-transition.json` 为 failed / passed=false（源码 `f6ff20b`、dirty=true）：3通过/2失败，两处旧 send_input 调用返回 `Protocol(InvalidInput)`；后台 Closed 是其后关闭的结果，不能误报外部服务不可用。保留原始失败记录，不用后续结果覆盖旧源码身份。
 
-完整 FFI 切片 `9ad7154b365de875d725188cfa091f5c21da0b5a` 依赖 Apple 003/004/025 的错误ABI、send_cancellable、生成头和布局测试，本工程未pick整笔。已复用产品独立桥接 `b473498382bd163f6085c019521105741264707c` → `56f53b4a17347714a91a2cb269bc5addc5777916`，唯一新增前置是已复用的bc6合同。controller.rs/test两文件增量与9ad的稳定patch-id均为 `2f004b5c19baaa5f3df4360b605818df1f40f9b4`，后续Apple整合只保留一份等价API/测试，不重复pick或覆盖整文件。其余C/FFI ledger/worker/Swift仍以Apple源分支为准；新增C字段与Swift布局必须独立验证，来源报告34项不算本工程结果。
+完整 FFI 切片 `9ad7154b365de875d725188cfa091f5c21da0b5a` 依赖 Apple 003/004/025 的错误ABI、send_cancellable、生成头和布局测试，本工程未pick整笔。已复用产品独立桥接 `b473498382bd163f6085c019521105741264707c` → `56f53b4a17347714a91a2cb269bc5addc5777916`，唯一新增前置是已复用的bc6合同。controller.rs/test两文件增量与9ad的稳定patch-id均为 `2f004b5c19baaa5f3df4360b605818df1f40f9b4`，后续Apple整合只保留一份等价API/测试，不重复pick或覆盖整文件。其余C/FFI ledger/worker/Swift仍以Apple源分支为准；新增C字段与Swift布局必须独立验证，此前来源报告34项只属于当时快照，不算本工程结果或Apple最新结果。
 
 桥接后实际 `captured-context-bridge.json` 来自干净源码 `56f53b4`、dirty=false：编译、protocol47和 controller加密loopback5项通过、0忽略；host-runtime-contract仍9通过/1失败（零epoch配置），整体failed / passed=false。该API原语成功不能关闭七处生产调用、Text/粘贴/ReleaseAll、host映射或呈现门禁。`captured-context-bridge-tooling.json` 在干净源码 `31e9fb0` 的Python134项与fmt通过，证明工具/格式，不替代业务失败。
 
@@ -113,19 +113,23 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 
 本工程 `ordered-input-sender.json` 记录干净源码d6f153e、dirty=false：fmt/编译/protocol47通过，独立controller-loopback **6通过、0忽略**。新增真实加密回归收到32并发clone加Runtime共36帧，seq严格1..36、原context保留；零context/旧无context入口不发包也不消耗序号。它证明“不把旧context补成最新值”，不证明host会拒绝旧context或新Noise已分配新epoch。
 
-同次完整 `ffi-runtime` 中lib12、ABI7、platform1、controller6、directory4通过，旧Host **8通过/2失败**；Windows host-runtime-contract **9通过/1失败**，仍为零epoch配置未接通。整体 **failed / passed=false**。选择lib或loopback的通过不能改写完整FFI失败，不能跳过这两个Host测试后宣称全通过；新鲜度、config配对、IPC、Text/粘贴/release生产路径与真实presented继续按上表验收。
+同次完整 `ffi-runtime` 中lib12、ABI7、platform1、controller6、directory4通过，旧Host **8通过/2失败**；Windows host-runtime-contract **9通过/1失败**，仍为零epoch配置未接通。整体 **failed / passed=false**。这些是本工程旧源码d6f153e未整合完整Apple ABI/Host依赖时的实际结果，不能外推为Apple当前源分支失败。选择lib或loopback的通过不能改写这份完整FFI失败，不能跳过这两个Host测试后宣称该源码全通过；新鲜度、config配对、IPC、Text/粘贴/release生产路径与真实presented继续按上表验收。
 
 ### Windows joint证据入口（尚待交付）
 
-产品组已被安排在独立 `codex/dl2-windows-joint` 从产品固定快照 `16594c4f8780cd565afd57695f88e29277ec5939` 整合媒体固定快照 **`89bd1e5161653dd668d290a417bd5f6cc146290a`**。媒体先前快照为 `fb9734499fc560af79b11709aae185eb4ddcc81a`；若joint已整合旧快照，追加89并保留已解冲突，不重置或覆盖原WIP。本工程未操作该joint worktree。
+产品组在独立 `codex/dl2-windows-joint` 的原始安排为产品 `16594c4f8780cd565afd57695f88e29277ec5939` 整合媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a`（媒体更早为 `fb9734499fc560af79b11709aae185eb4ddcc81a`）。最新第一parent改用产品 **`27fec756ba97ee6f67228dc9530c7b0578a49ff3`**，本工程只读Git确认它直接接续16594，代码仅提取InputSendFuture类型别名；另一parent已固定为媒体021初始化取消修复 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`**，直接parent为 `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`。协调方报告产品已开始按这两个parents真实remerge；保留已解冲突、审计resolution、联合测试与逐问题历史，不重置或覆盖原WIP。本工程未操作该joint worktree。
 
-产品源交接路径 `E:/desk-link/.worktrees/dl2-targets/windows-product/evidence/handoff-16594c4.json` 与媒体源分支测试都只证明各自快照，不等于联合通过。当前尚未收到joint最终SHA/报告，因此不据安排、merge完成或源分支各自通过更新041/042为联合通过。
+产品源交接路径 `E:/desk-link/.worktrees/dl2-targets/windows-product/evidence/handoff-16594c4.json` 只证明旧16594快照；27fec提交TODO报告UI库135通过/1项签名资产忽略、本包 `--lib --tests --no-deps` Clippy通过，本工程未复跑。跨包严格检查仍须在新parents整合后执行，不能用本包检查或媒体源分支结果替代。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验备份；最终提交须实际纳入所需resolution和测试，并核对备份清单、最终tree与去重结果。
 
-收口须同时取得：joint最终完整SHA及dirty/来源记录、逐问题历史/等价patch去重说明、实际Bun/原生/跨层命令和原始报告，以及上表各epoch/config/IPC/呈现/取消门禁对应的运行结果。失败、忽略与缺设备条件分别保留，不能把选中用例通过扩大成全部通过。FFI Mac Host、Swift/真实Mac presented、实际WebView与双机验收继续单列；Windows joint不能代替这些证据，也不会使本工程旧源码上的失败报告失效。
+Apple最新来源由协调方报告完整FFI71项、Python186项、双头检查实跑通过，013 worker owned future仍在进行；本次没有附对应完整测试SHA，本工程不擅自绑定动态branch head。旧joint的两个MacHost失败来自尚缺完整Apple ABI/Host链，不能写成Apple当前分支也失败。等待Apple最终稳定SHA与完整依赖一起合并，不单独flat-pick9ad；整合时保留已有等价桥接与Sender扩展。来源通过不替代joint重跑，也不替代Swift/Xcode、真实Mac presented或设备验收。
+
+收口须同时取得：joint最终完整SHA及dirty/parents/来源记录、所需resolution和新增联合测试已提交的证据、逐问题历史/等价patch去重说明、新parents整合后的实际跨包严格检查与所有适用测试命令和原始报告，以及上表各epoch/config/IPC/呈现/取消门禁对应的运行结果。当前尚未收到joint最终SHA/完整报告，不能据安排、merge完成或来源各自通过更新041/042为联合通过。失败、忽略与缺设备条件分别保留，不能把选中用例通过扩大成全部通过。FFI Mac Host、Swift/真实Mac presented、实际WebView与双机验收继续单列；Windows joint不能代替这些证据，也不会使本工程旧源码上的失败报告失效。
 
 ### joint新增前置：接收文件初始化时保留已有partial
 
-独立只读review及固定媒体89bd1e5源码核对发现DL2-021缺口：worker已成功create/open已有resume partial，但caller的create future在opened.await期间因断连被drop，ready发送失败直接return；IncomingFile的remove_on_drop=true随后删除partial。正常handle-drop的preserve在这个初始化窗口未执行。媒体owner负责独立修复，joint最终提交前须复用修复并运行新增回归；本工程没有代修或运行该未交付回归。
+独立只读review及固定媒体89bd1e5源码核对发现的DL2-021缺口已由媒体 `65c70fd658d0526a8a27b75fdbf120ae065222bf` 修复：旧实现ready发送失败直接return会删除已有resume partial；新实现在同一磁盘线程先调用file.preserve再退出。本工程只读Git核对其直接parent6dbe53d及仅TODO+transfer变更，没有改runtime，也没有代修或复跑来源测试。当前状态为**源分支修复已验证、joint待复验**，旧89源码因果链保留为历史缺陷记录。
+
+65c提交TODO及协调方报告transfer28通过、lib/tests严格Clippy与定向rustfmt/diff检查通过。新增源码回归通过真实spawn_with/create路径，在已取得独占句柄、读取/哈希前用barrier停住，poll Pending后drop创建future，再放行并等待磁盘线程退出；9次取消均断言原4字节prefix、offset/hash/元数据不变，最终续传通过完整哈希。还覆盖空part保留、显式cancel删除、初始化TooLarge不删旧prefix、Windows真实sync_data失败返回IoFailed且未发布；资源型测试串行化而未放大生产8线程上限。这些是已核对的回归源码与来源实跑报告，不等于本工程或joint已执行。
 
 | 必须取得的实际证据 | 不能用来替代的结果 |
 | --- | --- |
@@ -133,4 +137,6 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 | 正常handle-drop仍保留；明确cancel/校验失败仍按原政策清理，资源与并发permit收尾 | 把断连和显式cancel都改成永久保留，或只证明future返回 |
 | 独立修复来源/本地复用SHA、最终joint revision和该窗口对应测试/相关套件原始结果 | 两个源分支各自通过、旧suite通过、没有复现新缺陷的只读review结论 |
 
-协调方报告joint当前仍未提交、索引UU、测试未跟踪，本工程没有读取或操作这些WIP；在最终状态证据到达前继续待验。协调方的shared日志汇总是174通过/1忽略，原274为已撤回笔误；该计数尚不等于可整合revision，更不是本工程执行数。初始化缺口的源码确认、未来实际回归和最终联合验收保持三层记录。
+上表来源层已有65c修复、对应回归源码和28项来源结果；剩余待交付的是实际最终joint复用与复跑证据。不能继续把65c描述为未修代码，也不能提前标joint已通过。
+
+此前协调方报告joint未提交、索引UU、测试未跟踪，是当时审查快照；本工程没有读取或操作这些WIP，不将其直接视为后续当前状态，在最终状态证据到达前继续待验。协调方的shared日志汇总是174通过/1忽略，原274为已撤回笔误；该计数尚不等于可整合revision，更不是本工程执行数。初始化缺口的源码确认、未来实际回归和最终联合验收保持三层记录。
