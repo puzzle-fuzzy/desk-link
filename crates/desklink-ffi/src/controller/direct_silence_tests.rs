@@ -281,7 +281,7 @@ async fn connected_direct_fixture() -> DirectFixture {
         },
         client,
         secure,
-        input_sequence: Mutex::new(InputSequencer::new()),
+        input_sequence: Arc::new(Mutex::new(InputSequencer::new())),
         assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
         reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, RELIABLE_ASSEMBLY_MAX_AGE),
         video_config: None,
