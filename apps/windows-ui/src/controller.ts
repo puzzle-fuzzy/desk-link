@@ -2,6 +2,11 @@ import {
   cancelControllerFile,
   clearControllerFileQueue,
   chooseAndSendControllerFile,
+  chooseAndSendControllerDirectory,
+  pauseControllerFileTask,
+  resumeControllerFileTask,
+  cancelControllerFileTask,
+  retryControllerFileTask,
   clearSavedDevices,
   connectDevice,
   connectSavedDevice,
@@ -22,6 +27,7 @@ import {
   requestControllerKeyframe,
   requestControllerClipboard,
   requestControllerRemoteFile,
+  requestControllerRemoteDirectory,
   queueControllerFiles,
   resumeControllerFileQueue,
   retryControllerFileQueueProtection,
@@ -118,6 +124,11 @@ import {
 } from "./file-transfer-recovery";
 import { fileQueueProtectionPresentation } from "./file-queue-protection";
 import { FileQueueView } from "./file-queue-view";
+import {
+  FileTaskStore, NO_FILE_CAPABILITIES, fileTaskActions, fileTaskStateLabel, isFileTaskTerminal,
+  renderFileTask, updateFileTaskRegion,
+  type FileCapabilitiesSignal, type FileTaskAction,
+} from "./file-transfer-task";
 import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
 import { REMOTE_SHORTCUTS, remoteShortcutInput } from "./remote-shortcuts";
 import { RemoteInputPresentation, sameInputContext, type PaintedInputFrame } from "./remote-input-context";
@@ -244,6 +255,12 @@ let renameBusy = false;
 let transferPanelOpen = false;
 let clipboardTransfer: ClipboardTransferStatus | null = null;
 let fileTransfer: FileTransferStatus | null = null;
+const fileTaskStore = new FileTaskStore();
+let fileCapabilities: FileCapabilitiesSignal = { ...NO_FILE_CAPABILITIES };
+let fileTaskOperation: { taskId: string; action: FileTaskAction; itemId?: string } | null = null;
+let fileTaskError = "";
+let fileTaskPaintTimer: number | null = null;
+let lastFileTaskPaintAtMs = 0;
 let fileRecoveryAvailable = false;
 let fileQueue: FileQueueStatus = {
   queued: [],
@@ -431,6 +448,7 @@ export function prepareControllerRender(): void {
   pointerInsideViewport = false;
   clearRemoteToolbarTimer();
   cancelScheduledTransferPanelUpdate();
+  cancelScheduledFileTaskUpdate();
 }
 
 export function renderControllerView(): string {
@@ -603,6 +621,7 @@ export function bindControllerInteractions(): void {
       transferActivity = markTransferResultsRead(transferActivity);
     } else {
       cancelScheduledTransferPanelUpdate();
+      cancelScheduledFileTaskUpdate();
     }
     updateTransferPanel({ ledger: true });
     revealRemoteToolbar();
@@ -615,6 +634,12 @@ export function bindControllerInteractions(): void {
   });
   document.querySelector<HTMLButtonElement>("[data-controller-file-send]")?.addEventListener("click", () => {
     void chooseFileForTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-directory-send]")?.addEventListener("click", () => {
+    void chooseDirectoryForTransfer();
+  });
+  document.querySelector<HTMLButtonElement>("[data-controller-directory-receive]")?.addEventListener("click", () => {
+    void requestRemoteDirectoryTransfer();
   });
   document.querySelector<HTMLButtonElement>("[data-controller-file-receive]")?.addEventListener("click", () => {
     void requestRemoteFileTransfer();
@@ -965,16 +990,21 @@ function transferToolbarActivityView(): {
   title: string;
   ariaLabel: string;
 } {
-  const active = isFileTransferActive(fileTransfer?.state);
+  const active = isFileTransferActive(fileTransfer?.state)
+    || (fileTaskStore.current !== null && !isFileTaskTerminal(fileTaskStore.current.state));
   const unread = transferActivity.unreadResults;
   if (active) {
     const resultText = unread > 0 ? `，另有 ${unread} 条未查看结果` : "";
+    const taskState = fileTaskStore.current?.state;
+    const title = taskState && !isFileTaskTerminal(taskState)
+      ? `文件任务：${fileTaskStateLabel(taskState)}${resultText}`
+      : `文件正在传输${resultText}`;
     return {
       visible: true,
       tone: "active",
       badge: unread > 0 ? String(unread) : "",
-      title: `文件正在传输${resultText}`,
-      ariaLabel: `文件正在传输${resultText}`,
+      title,
+      ariaLabel: title,
     };
   }
   if (unread > 0) {
@@ -1117,6 +1147,7 @@ function updateInputRestriction(): void {
 }
 
 function renderTransferPanel(): string {
+  const filesAvailable = fileTransferAvailable();
   const fileActive = isFileTransferActive(fileTransfer?.state);
   const clipboardActive = isClipboardTransferActive(clipboardTransfer?.state);
   const fileRetryable = fileRecoveryAvailable && isFileTransferRetryable(fileTransfer?.state);
@@ -1130,11 +1161,14 @@ function renderTransferPanel(): string {
         <div class="remote-transfer-actions">
           <button class="toolbar-button" type="button" data-controller-clipboard-send ${clipboardActive ? "disabled" : ""}>${icon("clipboard-copy")}发送本机剪贴板</button>
           <button class="toolbar-button" type="button" data-controller-clipboard-request ${clipboardActive ? "disabled" : ""}>${icon("clipboard-paste")}读取远端剪贴板</button>
-          <button class="toolbar-button" type="button" data-controller-file-send ${filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy ? "disabled" : ""}>${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}</button>
-          <button class="toolbar-button" type="button" data-controller-file-receive ${fileActive || fileQueue.queued.length > 0 || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy ? "disabled" : ""}>${icon("file-down")}获取远端文件</button>
+          <button class="toolbar-button" type="button" data-controller-file-send ${!filesAvailable || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy ? "disabled" : ""}>${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}</button>
+          <button class="toolbar-button" type="button" data-controller-directory-send ${fileCapabilities.directories ? "" : "hidden"} ${!fileCapabilities.directories || filePickerBusy ? "disabled" : ""}>${icon("folder-open")}添加发送文件夹</button>
+          <button class="toolbar-button" type="button" data-controller-file-receive ${!filesAvailable || fileActive || fileQueue.queued.length > 0 || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy ? "disabled" : ""}>${icon("file-down")}获取远端文件</button>
+          <button class="toolbar-button" type="button" data-controller-directory-receive ${fileCapabilities.directories ? "" : "hidden"} ${!fileCapabilities.directories || fileActive || fileQueue.queued.length > 0 ? "disabled" : ""}>${icon("folder-open")}获取远端文件夹</button>
         </div>
       </div>
       <div class="remote-file-drop-hint">
+        <span data-controller-file-capability ${filesAvailable ? "hidden" : ""} role="status">${fileCapabilityMessage()}</span>
         <span>${icon("file-up")}也可以把一个或多个文件拖到远程画面，最多排队 20 个。</span>
         <span class="remote-downloads-action" ${receivedFile ? "" : "hidden"}>
           <button class="toolbar-button toolbar-button--quiet" type="button" data-controller-downloads-open ${downloadsFolderBusy ? "disabled" : ""}>${icon("folder-open")}${downloadsFolderBusy ? "正在打开…" : "打开下载文件夹"}</button>
@@ -1155,6 +1189,7 @@ function renderTransferPanel(): string {
           </div>
         </div>
       </div>
+      <section class="remote-file-task" data-controller-file-task ${fileTaskStore.current ? "" : "hidden"} aria-label="文件与目录任务">${renderFileTask(fileTaskStore.current, fileTaskViewOptions())}</section>
       ${renderFileQueueRecovery()}
       <div class="remote-transfer-ledger">
         <section class="remote-transfer-list" data-controller-file-queue ${fileQueue.queued.length > 0 ? "" : "hidden"} aria-label="等待发送的文件">
@@ -1169,6 +1204,9 @@ function renderTransferPanel(): string {
 }
 
 function renderFileQueueRecovery(): string {
+  if (fileQueue.queued.length === 0 && fileQueue.recoveryState === "protecting") {
+    return `<section class="remote-queue-recovery" data-controller-file-queue-recovery aria-label="正在保存队列状态" role="status"><span class="remote-queue-recovery__icon">${icon("loader-circle", "button-spinner")}</span><span class="remote-queue-recovery__copy"><strong>正在保存队列状态</strong><small>${escapeHtml(fileQueue.recoveryMessage?.trim() || "等待加密保存完成；请稍候。")}</small></span></section>`;
+  }
   const recovery = snapshot?.fileQueueRecovery;
   const protectionFailure = fileQueue.queued.length === 0
     && fileQueue.recoveryState === "memoryOnly"
@@ -1226,6 +1264,9 @@ function renderFileQueueProtection(): string {
     retrying,
   );
   if (!protection) return "";
+  if (protection.tone === "protecting") {
+    return `<div class="remote-file-queue-protection" data-state="protecting" role="status">${icon("loader-circle", "button-spinner")}<span>${escapeHtml(protection.message)}</span></div>`;
+  }
   if (protection.tone === "protected") {
     return `<div class="remote-file-queue-protection" data-state="protected">${icon("shield-check")}<span>${protection.message}</span></div>`;
   }
@@ -1580,6 +1621,10 @@ function handleSignal(signal: ControllerSignal): void {
       }
       remoteSurfaceState = nextSurfaceState;
       if (signal.runtime.state !== "connected") {
+        fileCapabilities = { ...NO_FILE_CAPABILITIES };
+        fileTaskOperation = null;
+        fileTaskError = "";
+        cancelScheduledFileTaskUpdate();
         inputPresentation.clear();
         inputSurfaceConfirmedVisible = false;
         fileDropTargetGate.clear();
@@ -1626,6 +1671,9 @@ function handleSignal(signal: ControllerSignal): void {
         }
       }
       if (signal.runtime.state === "connected") {
+        if (previousRuntime?.state !== "connected" || previousRuntime.streamId !== signal.runtime.streamId) {
+          fileTaskStore.beginConnection();
+        }
         temporaryPasswordDraft = "";
       }
       if (["idle", "connected", "stopped"].includes(signal.runtime.state)) {
@@ -1738,6 +1786,41 @@ function handleSignal(signal: ControllerSignal): void {
       }
       updateTransferPanel({ ledger: false });
       break;
+    case "fileCapabilities": {
+      if (signal.peerId !== undefined) {
+        const previousPeer = fileTaskStore.peerId;
+        if (!fileTaskStore.beginPeer(signal.peerId)) break;
+        if (previousPeer !== fileTaskStore.peerId) {
+          fileTaskOperation = null;
+          fileTaskError = "";
+        }
+        if (!signal.largeFiles && !signal.directories && !signal.blockResume) fileTaskStore.beginConnection();
+      }
+      fileCapabilities = {
+        kind: "fileCapabilities", peerId: signal.peerId, state: signal.state, largeFiles: signal.largeFiles === true,
+        directories: signal.directories === true, blockResume: signal.blockResume === true,
+      };
+      updateTransferPanel({ ledger: false });
+      break;
+    }
+    case "fileTask": {
+      const previous = fileTaskStore.current;
+      if (!fileTaskStore.accept(signal)) break;
+      if (signal.direction === "download" && fileTransfer?.direction === "download" && fileTransfer.state === "waiting") {
+        fileTransfer = null;
+      }
+      fileTaskError = "";
+      if (isFileTaskTerminal(signal.state)
+        && (previous?.taskId !== signal.taskId || previous.state !== signal.state)) {
+        transferActivity = {
+          unreadResults: transferPanelOpen ? 0 : Math.min(99, transferActivity.unreadResults + 1),
+          tone: signal.state === "completed" ? "success" : "error",
+        };
+      }
+      scheduleFileTaskPanelUpdate(previous?.taskId !== signal.taskId || previous.state !== signal.state);
+      if (isFileTaskTerminal(signal.state)) updateDownloadsFolderAction();
+      break;
+    }
     case "fileTransfer": {
       const previous = fileTransfer;
       fileTransfer = signal;
@@ -1845,6 +1928,12 @@ function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void
   if (!transferPanelOpen) {
     return;
   }
+  updateFileTaskPanel();
+  const capability = document.querySelector<HTMLElement>("[data-controller-file-capability]");
+  if (capability) {
+    capability.hidden = fileTransferAvailable();
+    capability.textContent = fileCapabilityMessage();
+  }
 
   const clipboardStatus = document.querySelector<HTMLElement>("[data-controller-clipboard-status]");
   if (clipboardStatus) {
@@ -1891,17 +1980,31 @@ function updateTransferPanel({ ledger = true }: { ledger?: boolean } = {}): void
   }
   const sendFile = document.querySelector<HTMLButtonElement>("[data-controller-file-send]");
   if (sendFile) {
-    sendFile.disabled = filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy;
+    sendFile.disabled = !fileTransferAvailable() || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy;
     sendFile.innerHTML = `${icon("file-up")}${filePickerBusy ? "正在选择…" : "添加发送文件"}`;
     renderLucideIcons(sendFile);
   }
   const receiveFile = document.querySelector<HTMLButtonElement>("[data-controller-file-receive]");
   if (receiveFile) {
-    receiveFile.disabled = isFileTransferActive(fileTransfer?.state)
+    receiveFile.disabled = !fileTransferAvailable() || isFileTransferActive(fileTransfer?.state)
+      || (fileTaskStore.current !== null && !isFileTaskTerminal(fileTaskStore.current.state))
       || fileQueue.queued.length > 0
       || discardFileRecoveryBusy
       || discardFileQueueRecoveryBusy
       || fileQueueActions.busy;
+  }
+  const sendDirectory = document.querySelector<HTMLButtonElement>("[data-controller-directory-send]");
+  if (sendDirectory) {
+    sendDirectory.hidden = !fileCapabilities.directories;
+    sendDirectory.disabled = !fileTransferAvailable() || !fileCapabilities.directories || filePickerBusy
+      || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy;
+  }
+  const receiveDirectory = document.querySelector<HTMLButtonElement>("[data-controller-directory-receive]");
+  if (receiveDirectory) {
+    receiveDirectory.hidden = !fileCapabilities.directories;
+    receiveDirectory.disabled = !fileTransferAvailable() || !fileCapabilities.directories || filePickerBusy
+      || isFileTransferActive(fileTransfer?.state) || fileQueue.queued.length > 0
+      || (fileTaskStore.current !== null && !isFileTaskTerminal(fileTaskStore.current.state));
   }
   if (ledger) {
     const recovery = document.querySelector<HTMLElement>("[data-controller-file-queue-recovery]");
@@ -2026,6 +2129,9 @@ function transferIdentity(status: FileTransferStatus): string {
 
 function hasCompletedDownload(): boolean {
   return (fileTransfer?.direction === "download" && fileTransfer.state === "completed")
+    || (fileTaskStore.current?.direction === "download"
+      && (fileTaskStore.current.state === "completed"
+        || (fileTaskStore.current.state === "partial" && fileTaskStore.current.completedItems > 0)))
     || transferHistory.some((entry) => entry.direction === "download" && entry.state === "completed");
 }
 
@@ -2059,6 +2165,7 @@ async function openDownloadsFolder(): Promise<void> {
 }
 
 function bindTransferLedgerActions(): void {
+  updateFileTaskPanel();
   const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
   if (queue) fileQueueView.restore(queue);
   document.querySelector<HTMLButtonElement>("[data-controller-file-queue-recovery-discard]")
@@ -2130,7 +2237,7 @@ async function receiveRemoteClipboard(): Promise<void> {
 }
 
 async function chooseFileForTransfer(): Promise<void> {
-  if (filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
+  if (!fileTransferAvailable() || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
   openTransferPanel();
   filePickerBusy = true;
   updateTransferPanel();
@@ -2152,7 +2259,98 @@ async function chooseFileForTransfer(): Promise<void> {
   }
 }
 
+async function chooseDirectoryForTransfer(): Promise<void> {
+  if (!fileTransferAvailable() || !fileCapabilities.directories || filePickerBusy || discardFileRecoveryBusy
+    || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
+  openTransferPanel();
+  filePickerBusy = true;
+  fileTaskError = "";
+  updateTransferPanel({ ledger: false });
+  try {
+    await chooseAndSendControllerDirectory();
+  } catch (error) {
+    fileTaskError = normalizeError(error);
+    if (!fileTaskStore.current) showFileQueueError(error);
+  } finally {
+    filePickerBusy = false;
+    updateTransferPanel({ ledger: false });
+  }
+}
+
+function fileTaskViewOptions() {
+  return { busy: fileTaskOperation !== null, error: fileTaskError,
+    connected: snapshot?.runtime.state === "connected" && fileCapabilities.largeFiles && fileCapabilities.blockResume };
+}
+
+function updateFileTaskPanel(): void {
+  const region = document.querySelector<HTMLElement>("[data-controller-file-task]");
+  if (!region) return;
+  updateFileTaskRegion(region, fileTaskStore.current, fileTaskViewOptions());
+  region.querySelectorAll<HTMLButtonElement>("[data-controller-file-task-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.controllerFileTaskAction as FileTaskAction;
+      void runFileTaskAction(action);
+    });
+  });
+  region.querySelectorAll<HTMLButtonElement>("[data-controller-file-task-retry-item]").forEach((button) => {
+    button.addEventListener("click", () => void runFileTaskAction("retry", button.dataset.controllerFileTaskRetryItem));
+  });
+}
+
+function scheduleFileTaskPanelUpdate(immediate: boolean): void {
+  updateTransferToolbarActivity();
+  if (!transferPanelOpen) return;
+  const remaining = Math.max(0, 100 - (performance.now() - lastFileTaskPaintAtMs));
+  if (immediate || remaining === 0) {
+    cancelScheduledFileTaskUpdate();
+    lastFileTaskPaintAtMs = performance.now();
+    updateFileTaskPanel();
+  } else if (fileTaskPaintTimer === null) {
+    fileTaskPaintTimer = window.setTimeout(() => {
+      fileTaskPaintTimer = null;
+      if (!transferPanelOpen) return;
+      lastFileTaskPaintAtMs = performance.now();
+      updateFileTaskPanel();
+    }, remaining);
+  }
+}
+
+function cancelScheduledFileTaskUpdate(): void {
+  if (fileTaskPaintTimer !== null) window.clearTimeout(fileTaskPaintTimer);
+  fileTaskPaintTimer = null;
+}
+
+async function runFileTaskAction(action: FileTaskAction, itemId?: string): Promise<void> {
+  const task = fileTaskStore.current;
+  if (!task || fileTaskOperation || snapshot?.runtime.state !== "connected"
+    || !fileCapabilities.largeFiles || !fileCapabilities.blockResume) return;
+  const itemRetry = action === "retry" && itemId !== undefined
+    && task.items.some((item) => item.id === itemId && item.state === "failed");
+  if (itemId !== undefined && !itemRetry) return;
+  if (!itemRetry && !fileTaskActions(task.state).includes(action)) return;
+  const operation = { taskId: task.taskId, action, itemId };
+  fileTaskOperation = operation;
+  fileTaskError = "";
+  updateFileTaskPanel();
+  try {
+    switch (action) {
+      case "pause": await pauseControllerFileTask(task.taskId); break;
+      case "resume": await resumeControllerFileTask(task.taskId); break;
+      case "cancel": await cancelControllerFileTask(task.taskId); break;
+      case "retry": await retryControllerFileTask(task.taskId, itemId); break;
+    }
+  } catch (error) {
+    if (fileTaskOperation === operation && fileTaskStore.current?.taskId === operation.taskId) {
+      fileTaskError = normalizeError(error);
+    }
+  } finally {
+    if (fileTaskOperation === operation) fileTaskOperation = null;
+    updateFileTaskPanel();
+  }
+}
+
 async function enqueueDroppedFiles(paths: string[], target: FileDropTarget): Promise<void> {
+  if (!fileTransferAvailable()) return;
   if (paths.length === 0 || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
   openTransferPanel();
   updateTransferPanel();
@@ -2255,6 +2453,11 @@ async function initializeNativeFileDrop(): Promise<void> {
         setFileDragActive(false);
         return;
       }
+      if (!fileTransferAvailable()) {
+        fileDropTargetGate.clear();
+        setFileDragActive(false);
+        return;
+      }
       const runtime = snapshot?.runtime;
       const target = runtime?.state === "connected" && runtime.streamId !== null
         ? { streamId: runtime.streamId, deviceId: attemptTarget || deviceIdDraft, generation: channelGeneration }
@@ -2285,7 +2488,8 @@ function setFileDragActive(active: boolean): void {
 
 async function requestRemoteFileTransfer(): Promise<void> {
   if (
-    isFileTransferActive(fileTransfer?.state)
+    !fileTransferAvailable() || isFileTransferActive(fileTransfer?.state)
+    || (fileTaskStore.current !== null && !isFileTaskTerminal(fileTaskStore.current.state))
     || fileQueue.queued.length > 0
     || discardFileRecoveryBusy
   ) return;
@@ -2308,10 +2512,35 @@ async function requestRemoteFileTransfer(): Promise<void> {
   }
 }
 
+async function requestRemoteDirectoryTransfer(): Promise<void> {
+  if (!fileTransferAvailable() || !fileCapabilities.directories || isFileTransferActive(fileTransfer?.state)
+    || fileQueue.queued.length > 0
+    || (fileTaskStore.current !== null && !isFileTaskTerminal(fileTaskStore.current.state))) return;
+  openTransferPanel();
+  const pending: FileTransferStatus = {
+    kind: "fileTransfer", state: "waiting", direction: "download",
+    name: "等待远端选择文件夹", transferred: 0, total: 0,
+    message: "请在远端电脑选择并确认要发送的文件夹。",
+  };
+  fileTransfer = pending;
+  updateTransferPanel({ ledger: false });
+  try {
+    await requestControllerRemoteDirectory();
+  } catch (error) {
+    if (fileTransfer === pending) fileTransfer = { ...pending, state: "failed", message: normalizeError(error) };
+    updateTransferPanel({ ledger: false });
+  }
+}
+
 async function cancelFileTransfer(): Promise<void> {
   if (!isFileTransferActive(fileTransfer?.state)) return;
+  const pending = fileTransfer;
   try {
     await cancelControllerFile();
+    if (fileTransfer === pending && fileTransfer?.state === "waiting") {
+      fileTransfer = { ...fileTransfer, state: "cancelled", message: "已取消等待远端选择。" };
+      updateTransferPanel({ ledger: false });
+    }
   } catch (error) {
     fileTransfer = fileTransfer
       ? { ...fileTransfer, state: "failed", message: normalizeError(error) }
@@ -2372,6 +2601,17 @@ async function discardFileRecovery(): Promise<void> {
     discardFileRecoveryBusy = false;
     updateTransferPanel();
   }
+}
+
+function fileTransferAvailable(): boolean {
+  return fileCapabilities.largeFiles && fileCapabilities.blockResume;
+}
+
+function fileCapabilityMessage(): string {
+  if (fileTransferAvailable()) return "";
+  return fileCapabilities.state === "unsupported"
+    ? "此连接暂不支持文件传输。"
+    : "正在准备文件传输，请稍候。";
 }
 
 function isFileTransferActive(state: FileTransferStatus["state"] | undefined): boolean {

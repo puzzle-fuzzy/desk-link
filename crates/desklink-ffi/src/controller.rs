@@ -583,6 +583,11 @@ impl ControllerRuntime {
                 TransportEvent::Control(ciphertext) => {
                     let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
                     let message = decode_control(&plaintext)?;
+                    if matches!(message, ControlMessage::LanDataSwitch { .. }) {
+                        return Err(ControllerError::Protocol(
+                            ProtocolError::InvalidLanDataMessage,
+                        ));
+                    }
                     if let ControlMessage::AccessDenied { reason } = message {
                         return Err(ControllerError::AccessDenied(reason));
                     }
@@ -1214,6 +1219,7 @@ async fn negotiate_host(
             h264_profiles: supported_h264_profiles(platform),
             width: 1920,
             height: 1080,
+            lan_data: None,
         }),
     )
     .await?;
@@ -1237,6 +1243,11 @@ async fn negotiate_host(
                 }
                 ControlMessage::Capabilities(_) => {
                     return Err(ControllerError::InvalidHostCapabilities);
+                }
+                ControlMessage::LanDataSwitch { .. } => {
+                    return Err(ControllerError::Protocol(
+                        ProtocolError::InvalidLanDataMessage,
+                    ));
                 }
                 ControlMessage::AccessDenied { reason } => {
                     return Err(ControllerError::AccessDenied(reason));

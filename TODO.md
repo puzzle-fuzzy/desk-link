@@ -699,10 +699,20 @@
 
 - [x] **已实现并自动验证（`perf(DL2-030): verify resumed sources with one streaming hash`）：** 新 `OutgoingFileReader` 在同一已打开句柄/hasher上只扫描一次已收前缀，再从精确u64 offset发送后缀及完整hash；Host出站接入，保留mpsc(2)背压。首尾验证size/mtime，Windows只读共享禁止发送期间写入/删除源文件；不改变既有确认和身份约束。
 - **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 20通过；新增中块续传/最终hash、源变化先拒绝、取消/未读完不允许完成、Windows源写入删除排斥4项。此切片消除单次重试的重复扫描，仍有每次重试O(prefix)校验。
-- [ ] **仍待功能/真机：** >256MiB与>4GiB全链边界、目录manifest/冲突/符号链接、持久分块证明及空间预估、控制端复用reader、深目录/稀疏/慢盘实测；未仅调大上限或新增不兼容wire字段。
+- [ ] **仍待跨平台/真机：** macOS 文件落盘/确认适配、真实双机 >4GiB/目录、真实 OS 重启与慢盘硬件、极限规模目录验收。Windows 本地实现及自动夹具证据见后续子项，不替代这些设备证据。
 
 - [x] **会话退出切片（`fix(DL2-030): cancel file producers when host peers disconnect`）：** 出站任务由HostOutgoingTransfer RAII持有，peer退出/错误/取消均置取消并abort异步sender，释放receiver唤醒堵在有界队列的磁盘producer；已取消reader在打开源/取得Windows共享锁前退出。取消仍不声称能中断已进入OS的read。
 - **验证：** `--lib outgoing_peer_drop --locked` 1通过，确认满队列producer原先受背压、peer Drop后250ms内退出；transfer 24通过，新增取消不打开不存在源文件回归；lib+tests严格Clippy通过。
+
+- [x] **协议14独立来源切片（非整链过渡）：** 新增有界FileTask合同：能力交集、单文件1TiB/聚合16TiB/100万项资源上限、逐项manifest、块摘要/持久确认/恢复证明、暂停/恢复/取消；旧FileOffer仍限制256MiB，输入上下文与Noise算法不变、relay JOIN版本不变。协议13在所有已有带版本载荷边界明确拒绝。`test -p desklink-protocol --locked` 54通过、1个既有benchmark ignored；新增3项行为测试覆盖>4GiB精确数值、截断/尾字节、恶意路径/预算/溢出。此提交只证明共享合同，不代表Windows/Mac功能已接通，主验收保留[ ]。
+
+- [x] **持久块证明与目录磁盘原语切片：** SourceIndex按48KiB块持久化摘要/前缀证明，恢复O(1)定位；CheckpointLedger先sync数据与日志再确认，重启截断未确认尾部，发布前重新校验实际所有块。目录按深度栈流式枚举、队列2/扫描worker8；逐项本地JSONL可保留源身份。Windows固定祖先句柄、拒绝重解析点/ADS/路径越界，暂存独占与create-only发布，保留空目录、中文和长路径。`test -p desklink-windows --lib transfer --locked -- --test-threads=1` 65通过/0ignored（旧传输28、checkpoint10、目录20、恢复7）。涵盖真实>4GiB稀疏偏移、源同长/恢复mtime变化、撕裂日志、离线篡改、满队列取消、旧writer Busy、junction和重名竞态。此切片尚未代表新任务端到端/UI/Mac接线完成。
+
+- [x] **Windows前端独立切片（原生接线另片验证）：** 协商前/不支持时禁用文件与目录入口；按已认证peer scope隔离任务，u64字节/修订号十进制字符串+BigInt，扫描/已发送/已落盘确认/最终校验分别展示。任务窗口最多64项、100ms合并更新、逐项/整任务重试与暂停/恢复/取消；不重建远控canvas。等待队列新增“正在加密保存”而非提前声称已保护；空目录成功/部分成功可打开下载目录。固定Bun1.3.14全套508通过/0失败（73文件、2052断言），输入合同检查/TypeScript/Vite构建通过。此为前端行为夹具（模拟native桥）与构建证据，不替代原生窗口/真机验收。
+
+- [x] **Windows原生任务接线切片：** 双向文件/目录actor接入认证peer和协商预算；持久块确认、暂停/取消/断线与进程重建、显式源重试确认、逐项冲突重试。原生窗口精确取消，队列DPAPI保存移出媒体/输入循环并以代数防止旧任务复活。真实NT句柄相对操作覆盖junction替换和create-only发布竞态，可靠NTFS USN恢复免源数据重读，无令牌则安全重验。原生管理库146通过/1需显式签名资产ignored；协议与Windows详细复跑记录见[验证记录](docs/verification/dl2-030-v14.md)。此提交时扫描失败/发布索引优化尚待后续切片；当前结果见下一项，跨平台主项保留[ ]。
+
+- [x] **扫描失败、恢复与发布索引闭环切片：** 持久失败范围及有界完整键去重，成功项编号保持；失败子树/重解析点修复、精确条目预算和重叠范围重试保留有效兄弟项、避免重发成功内容。原清单读句柄贯穿复制、新清单持原writer发布，源根/子目录和接收叶在握手期间固定；错配/混合缓存、种类替换拒绝。已验证账本在可靠NTFS关闭变化记录下导出索引，固定128KiB缓冲，不重读payload；无可靠令牌仍全文复验。清单六遍实际工作/索引记录分别报告进展，不伪造字节或百分比，分卷检查空间。全workspace 904通过/19显式ignored/0失败，fmt/零警告Clippy、Bun508与构建、Python208和C ABI编译检查通过。最终>4GiB重建续传由干净提交的独立入口及外部指纹证据建立；不宣称真实OS重启、双机或Mac接线完成。详见[验证记录](docs/verification/dl2-030-v14.md)。
 
 ### DL2-031 · P2 · 让等待队列中所有文件都能管理
 

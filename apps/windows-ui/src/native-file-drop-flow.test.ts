@@ -6,7 +6,7 @@ const source = readFileSync(new URL("./controller.ts", import.meta.url), "utf8")
 const initialize = source.slice(source.indexOf("async function initializeNativeFileDrop("), source.indexOf("\nfunction setFileDragActive("));
 const enqueue = source.slice(source.indexOf("async function enqueueDroppedFiles("), source.indexOf("\nasync function removeQueuedFile("));
 
-async function host() {
+async function host(supported = true) {
   const calls: unknown[][] = [];
   const content = { closest: () => null };
   const outside = { closest: () => null };
@@ -19,7 +19,7 @@ async function host() {
       getBoundingClientRect: () => ({ left: 100, top: 50, right: 500, bottom: 350 }),
     }],
   };
-  const create = new Function("FileDropTargetGate", "nativeFileDropHitsSurface", "document", "queueControllerFiles", `
+  const create = new Function("FileDropTargetGate", "nativeFileDropHitsSurface", "document", "queueControllerFiles", "supported", `
     let listener, fileDropInitialized = false, dragActive = false;
     const fileDropTargetGate = new FileDropTargetGate();
     let snapshot = {runtime: {state: 'connected', streamId: "9"}};
@@ -30,11 +30,12 @@ async function host() {
     const openTransferPanel = () => {}, updateTransferPanel = () => {}, showFileQueueError = () => {};
     let filePickerBusy = false, discardFileRecoveryBusy = false, discardFileQueueRecoveryBusy = false;
     const fileQueueActions = {busy:false};
+    const fileTransferAvailable = () => supported;
     ${new Bun.Transpiler({ loader: "ts" }).transformSync(initialize + enqueue)}
     return {initialize: initializeNativeFileDrop, emit: payload => listener({payload}),
       active: () => dragActive, switchStream: () => {snapshot.runtime.streamId = "10"; channelGeneration += 1;}};
   `);
-  const flow = create(FileDropTargetGate, nativeFileDropHitsSurface, document, async (...args: unknown[]) => { calls.push(args); });
+  const flow = create(FileDropTargetGate, nativeFileDropHitsSurface, document, async (...args: unknown[]) => { calls.push(args); }, supported);
   await flow.initialize();
   return { flow, calls, setInSurface: (value: boolean) => { inSurface = value; } };
 }
@@ -66,6 +67,15 @@ test("actual native callback rejects a drop after stream replacement and clears 
   flow.emit({ type: "enter", position, paths: ["synthetic.txt"] });
   expect(flow.active()).toBe(true);
   flow.emit({ type: "leave" });
+  expect(flow.active()).toBe(false);
+  flow.emit({ type: "drop", position, paths: ["synthetic.txt"] });
+  expect(calls).toEqual([]);
+});
+
+test("actual native callback neither highlights nor sends files before negotiated support", async () => {
+  const { flow, calls } = await host(false);
+  const position = { x: 225, y: 150 };
+  flow.emit({ type: "enter", position, paths: ["synthetic.txt"] });
   expect(flow.active()).toBe(false);
   flow.emit({ type: "drop", position, paths: ["synthetic.txt"] });
   expect(calls).toEqual([]);

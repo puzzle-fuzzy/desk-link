@@ -123,7 +123,7 @@ mod tests {
         use std::time::Duration;
 
         media_diagnostics::initialize();
-        let (reported, mut received) = tokio::sync::mpsc::channel(1);
+        let (reported, mut received) = tokio::sync::mpsc::channel(64);
         let observer: HostMediaDiagnosticsObserver = Arc::new(move |event| {
             reported.try_send(event).unwrap();
         });

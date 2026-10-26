@@ -344,7 +344,7 @@ async fn terminal_listener_cleanup_reports_once_and_late_real_probe_cannot_reins
         .unwrap(),
     ));
     media_diagnostics::initialize();
-    let (reported, mut received) = tokio::sync::mpsc::channel(1);
+    let (reported, mut received) = tokio::sync::mpsc::channel(64);
     let observer: Option<HostMediaDiagnosticsObserver> = Some(Arc::new(move |event| {
         reported.try_send(event).unwrap();
     }));

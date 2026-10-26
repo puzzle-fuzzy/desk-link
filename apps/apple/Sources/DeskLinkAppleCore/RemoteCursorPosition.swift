@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-/// Position metadata carried by protocol v13. shapeID is an opaque host handle;
+/// Position metadata carried by the current wire protocol. shapeID is an opaque host handle;
 /// this protocol does not carry bitmap, dimensions, or hotspot information.
 public struct RemoteCursorPosition: Equatable, Sendable {
     public static let wireProtocolVersion: UInt16 = deskLinkWireProtocolVersion

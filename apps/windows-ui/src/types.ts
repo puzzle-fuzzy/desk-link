@@ -1,3 +1,5 @@
+import type { FileCapabilitiesSignal, FileTaskSignal } from "./file-transfer-task";
+
 export type Readiness = "configured" | "setup" | "attention";
 
 export interface ConnectionSummary {
@@ -293,6 +295,8 @@ export type VideoPathKind = "relay" | "directLan";
 export type InputRestrictionReason = "blocked" | "unsupportedKey" | "invalidInput";
 
 export type ControllerSignal =
+  | FileCapabilitiesSignal
+  | FileTaskSignal
   | { kind: "inputRestriction"; reason: InputRestrictionReason | null }
   | { kind: "status"; runtime: ControllerRuntimeSummary }
   | ControllerVideoConfigSignal
@@ -334,7 +338,7 @@ export type ControllerSignal =
   | {
       kind: "fileQueue";
       paused: boolean;
-      recoveryState: "empty" | "protected" | "memoryOnly";
+      recoveryState: "empty" | "protecting" | "protected" | "memoryOnly";
       recoveryMessage: string | null;
       queued: Array<{
         id: string;

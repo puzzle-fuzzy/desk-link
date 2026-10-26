@@ -397,6 +397,7 @@ impl RawController {
                 h264_profiles: vec![H264Profile::Main],
                 width: 1920,
                 height: 1080,
+                lan_data: None,
             }))
             .await;
         })

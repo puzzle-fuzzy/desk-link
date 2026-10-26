@@ -89,10 +89,10 @@ fn incoming_open_error(error: std::io::Error) -> TransferResult {
     TransferResult::IoFailed
 }
 
-struct IncomingDiskWorkerPermit;
+pub(crate) struct IncomingDiskWorkerPermit;
 
 impl IncomingDiskWorkerPermit {
-    fn acquire() -> Result<Self, TransferResult> {
+    pub(crate) fn acquire() -> Result<Self, TransferResult> {
         ACTIVE_INCOMING_DISK_WORKERS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_INCOMING_DISK_WORKERS).then_some(active + 1)
@@ -447,17 +447,48 @@ fn modified_at_unix_ns(metadata: &fs::Metadata) -> u64 {
 }
 
 pub fn prepare_outgoing_file(path: PathBuf) -> Result<OutgoingFile, TransferResult> {
-    let metadata = fs::metadata(&path).map_err(|_| TransferResult::IoFailed)?;
+    prepare_outgoing_file_with_budget(path, MAX_TRANSFER_FILE_BYTES)
+}
+
+/// Metadata preparation only; the negotiated file actor opens and holds the
+/// source snapshot before scanning/sending. This function is blocking IO.
+pub fn prepare_outgoing_file_with_budget(
+    path: PathBuf,
+    maximum: u64,
+) -> Result<OutgoingFile, TransferResult> {
+    if maximum == 0 || maximum > desklink_protocol::MAX_LARGE_FILE_BYTES {
+        return Err(TransferResult::InvalidData);
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|_| TransferResult::IoFailed)?;
+    if metadata.file_type().is_symlink() {
+        return Err(TransferResult::PermissionDenied);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+            != 0
+        {
+            return Err(TransferResult::PermissionDenied);
+        }
+    }
     if !metadata.is_file() {
         return Err(TransferResult::InvalidData);
     }
-    if metadata.len() > MAX_TRANSFER_FILE_BYTES {
+    if metadata.len() > maximum {
         return Err(TransferResult::TooLarge);
     }
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .filter(|value| is_valid_transfer_file_name(value))
+        .filter(|value| {
+            if maximum <= MAX_TRANSFER_FILE_BYTES {
+                is_valid_transfer_file_name(value)
+            } else {
+                desklink_protocol::is_valid_transfer_path_segment(value)
+            }
+        })
         .ok_or(TransferResult::InvalidData)?
         .to_owned();
     let mut transfer_id = [0_u8; 16];
@@ -543,6 +574,25 @@ pub fn pick_outgoing_files(
     title: &str,
     allow_multiple: bool,
 ) -> Result<Vec<PathBuf>, TransferResult> {
+    pick_paths(title, allow_multiple, false)
+}
+
+#[cfg(windows)]
+pub fn pick_outgoing_directory(title: &str) -> Result<Option<PathBuf>, TransferResult> {
+    pick_paths(title, false, true).map(|mut paths| paths.pop())
+}
+
+#[cfg(not(windows))]
+pub fn pick_outgoing_directory(_: &str) -> Result<Option<PathBuf>, TransferResult> {
+    Err(TransferResult::Unsupported)
+}
+
+#[cfg(windows)]
+fn pick_paths(
+    title: &str,
+    allow_multiple: bool,
+    directory: bool,
+) -> Result<Vec<PathBuf>, TransferResult> {
     use windows::{
         Win32::{
             System::Com::{
@@ -551,7 +601,8 @@ pub fn pick_outgoing_files(
             },
             UI::Shell::{
                 FOS_ALLOWMULTISELECT, FOS_DONTADDTORECENT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
-                FOS_PATHMUSTEXIST, FileOpenDialog, IFileOpenDialog, IShellItem, SIGDN_FILESYSPATH,
+                FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem,
+                SIGDN_FILESYSPATH,
             },
         },
         core::HSTRING,
@@ -576,6 +627,8 @@ pub fn pick_outgoing_files(
         dialog
             .SetOptions(if allow_multiple {
                 options | FOS_ALLOWMULTISELECT
+            } else if directory {
+                options | FOS_PICKFOLDERS
             } else {
                 options
             })
@@ -846,7 +899,10 @@ fn receive_capacity_is_sufficient(available: u64, remaining: u64) -> bool {
 }
 
 #[cfg(windows)]
-fn ensure_receive_capacity(directory: &Path, remaining: u64) -> Result<(), TransferResult> {
+pub(crate) fn ensure_receive_capacity(
+    directory: &Path,
+    remaining: u64,
+) -> Result<(), TransferResult> {
     use windows::{Win32::Storage::FileSystem::GetDiskFreeSpaceExW, core::HSTRING};
 
     if remaining == 0 {
@@ -864,7 +920,10 @@ fn ensure_receive_capacity(directory: &Path, remaining: u64) -> Result<(), Trans
 }
 
 #[cfg(not(windows))]
-fn ensure_receive_capacity(_directory: &Path, _remaining: u64) -> Result<(), TransferResult> {
+pub(crate) fn ensure_receive_capacity(
+    _directory: &Path,
+    _remaining: u64,
+) -> Result<(), TransferResult> {
     Ok(())
 }
 

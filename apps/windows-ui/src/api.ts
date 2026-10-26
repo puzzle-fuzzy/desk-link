@@ -26,6 +26,7 @@ import type { H264Profile, VideoQualityPreference } from "./types";
 import type { WindowsReleaseSource, WindowsUpdateProgress } from "./windows-update";
 import { validInputContext } from "./remote-input-context";
 import { isU64Identity } from "./u64-identity";
+import { isFileTaskId, isFileTaskItemId } from "./file-transfer-task";
 
 export interface AccountUser {
   id: string;
@@ -277,6 +278,32 @@ export function chooseAndSendControllerFile(): Promise<void> {
   return invoke<void>("choose_and_send_controller_file");
 }
 
+export function chooseAndSendControllerDirectory(): Promise<void> {
+  return invoke<void>("choose_and_send_controller_directory");
+}
+
+export function pauseControllerFileTask(taskId: string): Promise<void> {
+  if (!isFileTaskId(taskId)) return Promise.reject(new Error("文件任务标识无效。"));
+  return invoke<void>("pause_controller_file_task", { taskId });
+}
+
+export function resumeControllerFileTask(taskId: string): Promise<void> {
+  if (!isFileTaskId(taskId)) return Promise.reject(new Error("文件任务标识无效。"));
+  return invoke<void>("resume_controller_file_task", { taskId });
+}
+
+export function cancelControllerFileTask(taskId: string): Promise<void> {
+  if (!isFileTaskId(taskId)) return Promise.reject(new Error("文件任务标识无效。"));
+  return invoke<void>("cancel_controller_file_task", { taskId });
+}
+
+export function retryControllerFileTask(taskId: string, itemId?: string): Promise<void> {
+  if (!isFileTaskId(taskId) || (itemId !== undefined && !isFileTaskItemId(itemId))) {
+    return Promise.reject(new Error("文件任务或失败项标识无效。"));
+  }
+  return invoke<void>("retry_controller_file_task", { taskId, itemId });
+}
+
 export function queueControllerFiles(paths: string[], streamId: string, deviceId: string): Promise<void> {
   if (!isU64Identity(streamId)) return Promise.reject(new Error("文件接收会话标识无效。"));
   return invoke<void>("queue_controller_files", { paths, streamId, deviceId });
@@ -300,6 +327,10 @@ export function retryControllerFileQueueProtection(): Promise<void> {
 
 export function requestControllerRemoteFile(): Promise<void> {
   return invoke<void>("request_controller_remote_file");
+}
+
+export function requestControllerRemoteDirectory(): Promise<void> {
+  return invoke<void>("request_controller_remote_directory");
 }
 
 export function retryControllerFile(): Promise<void> {

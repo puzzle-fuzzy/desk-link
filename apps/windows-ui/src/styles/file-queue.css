@@ -19,3 +19,58 @@
 .remote-file-queue-items button {
   flex: none;
 }
+
+.remote-file-task {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.remote-file-task-heading,
+.remote-file-task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.remote-file-task p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-file-task progress {
+  width: 100%;
+}
+
+.remote-file-task-items {
+  max-height: min(280px, 35vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.remote-file-task-items li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+}
+
+.remote-file-task-items li > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.remote-file-task-items strong,
+.remote-file-task-items small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.remote-file-task-items button {
+  flex: none;
+}

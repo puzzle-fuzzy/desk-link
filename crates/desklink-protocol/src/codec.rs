@@ -42,6 +42,8 @@ pub enum ProtocolError {
     InvalidTransfer,
     #[error("invalid direct video message")]
     InvalidDirectVideoMessage,
+    #[error("invalid LAN data coordination message")]
+    InvalidLanDataMessage,
 }
 
 /// Protocol lanes carry one complete value. Postcard's `from_bytes` silently
@@ -68,6 +70,7 @@ pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>, ProtocolError
         validate_display_list(displays, *active_display_id)?;
     }
     validate_direct_video_control(message)?;
+    validate_lan_data_control(message)?;
     let bytes = postcard::to_allocvec(message).map_err(|_| ProtocolError::Malformed)?;
     bounded(bytes, MAX_CONTROL_MESSAGE_BYTES)
 }
@@ -85,7 +88,22 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlMessage, ProtocolError> {
         validate_display_list(displays, *active_display_id)?;
     }
     validate_direct_video_control(&message)?;
+    validate_lan_data_control(&message)?;
     Ok(message)
+}
+
+fn validate_lan_data_control(message: &ControlMessage) -> Result<(), ProtocolError> {
+    if let ControlMessage::LanDataSwitch {
+        candidate_id,
+        generation,
+        channels,
+        ..
+    } = message
+        && (*candidate_id == 0 || *generation == 0 || !crate::is_valid_lan_data_channels(*channels))
+    {
+        return Err(ProtocolError::InvalidLanDataMessage);
+    }
+    Ok(())
 }
 
 fn validate_direct_video_control(message: &ControlMessage) -> Result<(), ProtocolError> {
@@ -143,6 +161,7 @@ fn validate_transfer(message: &TransferMessage) -> Result<(), ProtocolError> {
 
     let valid_id = |id: &[u8; 16]| id.iter().any(|byte| *byte != 0);
     let valid = match message {
+        FileTask(message) => message.is_valid(),
         ClipboardSet { request_id, text } | ClipboardData { request_id, text } => {
             *request_id != 0 && text.len() <= crate::MAX_CLIPBOARD_TEXT_BYTES
         }

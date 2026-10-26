@@ -88,8 +88,8 @@ fn video_quality_commands_round_trip() {
 }
 
 #[test]
-fn input_state_requires_protocol_13() {
-    assert_eq!(PROTOCOL_VERSION, 13);
+fn input_state_requires_current_protocol() {
+    assert_eq!(PROTOCOL_VERSION, 14);
 }
 
 #[test]
@@ -474,6 +474,7 @@ fn invalid_capabilities_are_rejected() {
         h264_profiles: vec![H264Profile::Main],
         width: 2561,
         height: 1080,
+        lan_data: None,
     };
     assert!(matches!(
         value.validate(),
@@ -656,6 +657,7 @@ fn capabilities_require_nonempty_h264_list() {
             h264_profiles: vec![H264Profile::Main],
             width: 1920,
             height: 1080,
+            lan_data: None,
         };
         if value.codecs.is_empty() {
             assert!(matches!(
@@ -680,6 +682,7 @@ fn h264_capabilities_require_main_and_expose_high_support() {
         h264_profiles: vec![H264Profile::High],
         width: 1920,
         height: 1080,
+        lan_data: None,
     };
     assert!(matches!(
         capabilities.validate(),

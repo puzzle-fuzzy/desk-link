@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -61,8 +61,17 @@ use crate::video_mailbox::{
     VideoMailboxOffer,
 };
 
+#[path = "controller-file-task.rs"]
+mod file_task;
 #[path = "controller-incoming-file.rs"]
 mod incoming_file;
+use file_task::FileTaskBinding;
+#[path = "controller-queue-worker.rs"]
+mod queue_worker;
+use apps_windows::transfer_task::{FileTaskHandle, FileTaskProgress};
+use desklink_protocol::{FileTaskAction, FileTaskMessage, FileTransferCapabilities};
+use queue_worker::{QueuePersistence, QueuePersistenceUpdate};
+
 use incoming_file::{
     INCOMING_EVENT_CAPACITY, IncomingFileEvent, IncomingFileEventKind, IncomingFilePipeline,
 };
@@ -537,6 +546,18 @@ pub enum ControllerSignal {
         transferred: u64,
         total: u64,
         message: String,
+    },
+    FileTask {
+        peer_id: String,
+        #[serde(flatten)]
+        progress: Box<FileTaskProgress>,
+    },
+    FileCapabilities {
+        peer_id: String,
+        state: &'static str,
+        large_files: bool,
+        directories: bool,
+        block_resume: bool,
     },
     FileQueue {
         queued: Vec<QueuedFileSummary>,
@@ -1022,11 +1043,29 @@ struct ControllerOutputChannels {
 }
 
 #[derive(Clone)]
+struct FileTaskEndpoint {
+    generation: u64,
+    host_id: [u8; 16],
+    binding: FileTaskBinding,
+    capabilities: Option<FileTransferCapabilities>,
+    capabilities_negotiated: bool,
+}
+
+type FileTaskQueueAdmission = Arc<Mutex<Option<(u64, [u8; 16], OutgoingFile)>>>;
+
+#[derive(Clone)]
 pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
     input_context: Arc<Mutex<Option<InputContext>>>,
     worker: Arc<Mutex<Option<ControllerWorker>>>,
     last_file_action: Arc<Mutex<Option<LastFileAction>>>,
+    file_task_endpoint: Arc<Mutex<Option<FileTaskEndpoint>>>,
+    next_file_task_request: Arc<AtomicU64>,
+    local_file_picker_active: Arc<AtomicBool>,
+    file_task_queue_admission: FileTaskQueueAdmission,
+    file_queue_persistence: Arc<Mutex<Option<Arc<QueuePersistence>>>>,
+    file_queue_persistence_epoch: Arc<AtomicU64>,
+    file_queue_submission_revision: Arc<AtomicU64>,
     file_recovery_store: Option<WindowsTransferRecoveryStore>,
     file_recovery_error: Arc<Mutex<Option<String>>>,
     file_recovery_operation: Arc<Mutex<()>>,
@@ -1052,6 +1091,13 @@ impl Default for ControllerManager {
             input_context: Arc::new(Mutex::new(None)),
             worker: Arc::new(Mutex::new(None)),
             last_file_action: Arc::new(Mutex::new(None)),
+            file_task_endpoint: Arc::new(Mutex::new(None)),
+            next_file_task_request: Arc::new(AtomicU64::new(1)),
+            local_file_picker_active: Arc::new(AtomicBool::new(false)),
+            file_task_queue_admission: Arc::new(Mutex::new(None)),
+            file_queue_persistence: Arc::new(Mutex::new(None)),
+            file_queue_persistence_epoch: Arc::new(AtomicU64::new(1)),
+            file_queue_submission_revision: Arc::new(AtomicU64::new(0)),
             file_recovery_store: None,
             file_recovery_error: Arc::new(Mutex::new(None)),
             file_recovery_operation: Arc::new(Mutex::new(())),
@@ -1249,6 +1295,7 @@ impl ControllerManager {
         }
     }
 
+    #[cfg(test)]
     fn remember_file_queue(
         &self,
         host_device_id: [u8; 16],
@@ -1259,6 +1306,54 @@ impl ControllerManager {
             .file_queue_recovery_operation
             .lock()
             .map_err(|_| "DeskLink 无法更新等待队列恢复记录。".to_owned())?;
+        self.remember_file_queue_locked(host_device_id, queued_files, paused)
+    }
+    fn remember_file_queue_if_epoch(
+        &self,
+        epoch: u64,
+        host_device_id: [u8; 16],
+        queued_files: &VecDeque<OutgoingFile>,
+        paused: bool,
+    ) -> Result<bool, String> {
+        let _operation = self
+            .file_queue_recovery_operation
+            .lock()
+            .map_err(|_| "DeskLink 无法更新等待队列恢复记录。".to_owned())?;
+        if self.file_queue_persistence_epoch.load(Ordering::Acquire) != epoch {
+            return Err("等待队列记录已被用户放弃，旧保存请求已失效。".to_owned());
+        }
+        self.remember_file_queue_locked(host_device_id, queued_files, paused)
+    }
+    fn file_queue_worker(&self) -> Result<Arc<QueuePersistence>, String> {
+        let mut worker = self
+            .file_queue_persistence
+            .lock()
+            .map_err(|_| "等待队列保存状态不可用。".to_owned())?;
+        if worker.is_none() {
+            *worker = Some(Arc::new(QueuePersistence::spawn()?));
+        }
+        Ok(worker.as_ref().expect("initialized worker").clone())
+    }
+    fn remember_file_queue_locked(
+        &self,
+        host_device_id: [u8; 16],
+        queued_files: &VecDeque<OutgoingFile>,
+        paused: bool,
+    ) -> Result<bool, String> {
+        let mut durable_files = queued_files.clone();
+        if let Some((_, target, file)) = self
+            .file_task_queue_admission
+            .lock()
+            .map_err(|_| "文件任务交接状态不可用。".to_owned())?
+            .as_ref()
+            && *target == host_device_id
+            && !durable_files
+                .iter()
+                .any(|f| f.transfer_id == file.transfer_id)
+        {
+            durable_files.push_front(file.clone());
+        }
+        let queued_files = &durable_files;
         let existing = self
             .file_queue_recovery
             .lock()
@@ -1375,6 +1470,8 @@ impl ControllerManager {
         {
             return Err("等待队列已经载入当前会话，请使用“清空等待”安全移除。".to_owned());
         }
+        self.file_queue_persistence_epoch
+            .fetch_add(1, Ordering::AcqRel);
         self.clear_file_queue_recovery_locked()
     }
 
@@ -1893,6 +1990,66 @@ impl ControllerManager {
         }
     }
 
+    fn file_task_binding(
+        &self,
+        target: ControllerFileTarget,
+        directory: bool,
+    ) -> Result<FileTaskBinding, String> {
+        self.ensure_file_target(target)?;
+        let endpoint = self
+            .file_task_endpoint
+            .lock()
+            .map_err(|_| "文件任务状态不可用。".to_owned())?;
+        let endpoint = endpoint
+            .as_ref()
+            .filter(|e| e.generation == target.generation && e.host_id == target.host_device_id)
+            .ok_or_else(|| "当前连接尚未启用文件夹和大文件传输。".to_owned())?;
+        let capabilities = endpoint
+            .capabilities
+            .ok_or_else(|| "正在确认远端文件传输能力，请稍后重试。".to_owned())?;
+        if !capabilities.large_files || (directory && !capabilities.directories) {
+            return Err("远端尚不支持此项文件传输能力。".to_owned());
+        }
+        Ok(endpoint.binding.clone())
+    }
+    pub fn claim_file_picker(
+        &self,
+        target: ControllerFileTarget,
+        directory: bool,
+    ) -> Result<Arc<AtomicBool>, String> {
+        self.file_task_binding(target, directory)?;
+        self.local_file_picker_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "文件选择器正在使用，请先完成或取消当前选择。".to_owned())?;
+        Ok(self.local_file_picker_active.clone())
+    }
+    pub fn start_file_task(
+        &self,
+        path: PathBuf,
+        target: ControllerFileTarget,
+        directory: bool,
+    ) -> Result<(), String> {
+        self.file_task_binding(target, directory)?
+            .start(path)
+            .map(|_| ())
+    }
+    pub fn file_task_action(&self, task_id: &str, action: FileTaskAction) -> Result<(), String> {
+        self.file_task_binding(self.capture_file_target()?, false)?
+            .action(task_id, action)
+    }
+    pub fn retry_file_task(&self, task_id: &str, item_id: Option<&str>) -> Result<(), String> {
+        self.file_task_binding(self.capture_file_target()?, false)?
+            .retry(task_id, item_id)
+    }
+    pub fn request_remote_directory(&self) -> Result<(), String> {
+        let binding = self.file_task_binding(self.capture_file_target()?, true)?;
+        let id = self
+            .next_file_task_request
+            .fetch_add(1, Ordering::AcqRel)
+            .max(1);
+        binding.request_remote(id, true)
+    }
+
     pub async fn send_files(
         &self,
         paths: Vec<PathBuf>,
@@ -1904,6 +2061,18 @@ impl ControllerManager {
         if paths.len() > MAX_FILE_QUEUE_ITEMS {
             return Err(format!("一次最多添加 {MAX_FILE_QUEUE_ITEMS} 个文件。"));
         }
+        self.file_task_binding(target, false)?;
+        let maximum = self
+            .file_task_endpoint
+            .lock()
+            .map_err(|_| "文件传输状态不可用。".to_owned())?
+            .as_ref()
+            .filter(|e| e.generation == target.generation && e.host_id == target.host_device_id)
+            .and_then(|e| e.capabilities)
+            .filter(|c| c.large_files)
+            .map_or(desklink_protocol::MAX_TRANSFER_FILE_BYTES, |c| {
+                c.max_file_bytes
+            });
         let preparation = async {
             tauri::async_runtime::spawn_blocking(move || {
                 let mut files = Vec::with_capacity(paths.len());
@@ -1911,7 +2080,9 @@ impl ControllerManager {
                     if files.iter().any(|file: &OutgoingFile| file.path == path) {
                         continue;
                     }
-                    files.push(prepare_outgoing_file(path)?);
+                    files.push(apps_windows::transfer::prepare_outgoing_file_with_budget(
+                        path, maximum,
+                    )?);
                 }
                 Ok::<_, TransferResult>(files)
             })
@@ -1935,7 +2106,12 @@ impl ControllerManager {
     }
 
     pub async fn request_remote_file(&self) -> Result<(), String> {
-        self.send(ControllerCommand::RequestRemoteFile(None)).await
+        let binding = self.file_task_binding(self.capture_file_target()?, false)?;
+        let id = self
+            .next_file_task_request
+            .fetch_add(1, Ordering::AcqRel)
+            .max(1);
+        binding.request_remote(id, false)
     }
 
     pub async fn retry_file(&self) -> Result<(), String> {
@@ -1986,6 +2162,12 @@ impl ControllerManager {
     }
 
     pub async fn cancel_file(&self) -> Result<(), String> {
+        if let Ok(target) = self.capture_file_target()
+            && let Ok(binding) = self.file_task_binding(target, false)
+            && binding.cancel_remote()?
+        {
+            return Ok(());
+        }
         self.send(ControllerCommand::CancelFile).await
     }
 
@@ -2004,6 +2186,7 @@ impl ControllerManager {
     }
 
     pub async fn resume_file_queue(&self) -> Result<(), String> {
+        self.file_task_binding(self.capture_file_target()?, false)?;
         self.send_file_queue_command(|reply| ControllerCommand::ResumeFileQueue { reply })
             .await
     }
@@ -2744,8 +2927,69 @@ async fn run_controller(
         let mut last_diagnostic_metrics = Instant::now()
             .checked_sub(Duration::from_secs(10))
             .unwrap_or_else(Instant::now);
+        if !manager.is_current(generation) {
+            return;
+        }
+        let file_peer_id = format!(
+            "{}{}",
+            hex(&host_device_id),
+            hex(settings.host_verify_key().as_bytes())
+        );
+        let _ = signals.send(ControllerSignal::FileCapabilities {
+            peer_id: file_peer_id.clone(),
+            state: "pending",
+            large_files: false,
+            directories: false,
+            block_resume: false,
+        });
+        let file_service =
+            apps_windows::transfer_task_native::current_user_service(file_peer_id.clone()).ok();
+        let file_task_handle: Option<FileTaskHandle> =
+            file_service.as_ref().map(|s| s.handle.clone());
+        let mut file_task_progress = file_service.as_ref().map(|s| s.progress.clone());
+        if let Some(handle) = file_task_handle.as_ref() {
+            *manager
+                .file_task_endpoint
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(FileTaskEndpoint {
+                generation,
+                host_id: host_device_id,
+                binding: FileTaskBinding::new(handle.clone()),
+                capabilities: None,
+                capabilities_negotiated: false,
+            });
+        }
+        let _file_task_pump = file_service.map(|service| {
+            let sender = runtime.transfer_sender();
+            apps_windows::transfer_task_native::spawn_pump(
+                service.outgoing,
+                service.controls,
+                move |message| {
+                    let sender = sender.clone();
+                    async move {
+                        sender
+                            .send(TransferMessage::FileTask(message))
+                            .await
+                            .map_err(|_| TransferResult::IoFailed)
+                    }
+                },
+            )
+        });
+        let _file_task_registration = FileTaskRegistration {
+            endpoint: manager.file_task_endpoint.clone(),
+            admission: manager.file_task_queue_admission.clone(),
+            generation,
+        };
         let mut next_transfer_request_id = 1_u64;
+        let mut queue_persistence_updates = manager
+            .file_queue_worker()
+            .ok()
+            .map(|worker| worker.updates());
         let mut outgoing: Option<OutgoingTransfer> = None;
+        let mut queued_task_source: Option<OutgoingFile> = None;
+        let mut queued_task_active: Option<TransferId> = None;
+        let file_capability_deadline = Instant::now() + Duration::from_secs(5);
+        let mut file_capability_timeout_reported = false;
         let mut incoming: Option<IncomingTransfer> = None;
         let mut next_incoming_ticket = 1_u64;
         let (incoming_file_events, mut pending_incoming_file_events) =
@@ -2790,67 +3034,152 @@ async fn run_controller(
                 && incoming.is_none()
                 && pending_remote_file_request.is_none()
                 && !file_queue_paused
+                && queued_task_active.is_none()
+                && file_task_handle.as_ref().is_none_or(|h| !h.is_busy())
+                && (Instant::now() >= file_capability_deadline
+                    || manager
+                        .file_task_endpoint
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_ref()
+                        .is_some_and(|e| e.capabilities.is_some()))
                 && let Some(file) = queued_files.pop_front()
             {
-                let failed_name = file.name.clone();
-                let failed_size = file.size;
-                let file = match revalidate_queued_file(file) {
-                    Ok(file) => file,
-                    Err(message) => {
-                        let _ = signals.send(ControllerSignal::FileTransfer {
-                            state: "failed",
-                            direction: "upload",
-                            name: failed_name,
-                            transferred: 0,
-                            total: failed_size,
-                            message,
-                        });
-                        file_queue_paused = !queued_files.is_empty();
-                        publish_file_queue(
-                            &manager,
-                            host_device_id,
-                            &signals,
-                            &queued_files,
-                            file_queue_paused,
-                        );
-                        continue;
-                    }
-                };
-                let _ = manager.remember_last_file_action(LastFileAction::upload(
-                    host_device_id,
-                    file.clone(),
-                ));
-                let offer = TransferMessage::FileOffer {
-                    transfer_id: file.transfer_id,
-                    request_id: None,
-                    name: file.name.clone(),
-                    size: file.size,
-                };
-                if let Err(error) = runtime.send_transfer(offer).await {
+                let use_task = manager
+                    .file_task_endpoint
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .filter(|e| e.generation == generation)
+                    .and_then(|e| e.capabilities)
+                    .is_some_and(|c| c.large_files);
+                if !use_task {
                     queued_files.push_front(file);
-                    break ConnectFailure::from_controller(error);
+                    file_queue_paused = true;
+                    let _ = signals.send(ControllerSignal::FileTransfer {
+                        state: "failed",
+                        direction: "upload",
+                        name: "等待队列".to_owned(),
+                        transferred: 0,
+                        total: 0,
+                        message: "远端的文件传输能力尚未就绪；等待项已保留，可在功能就绪后继续。"
+                            .to_owned(),
+                    });
+                    publish_file_queue(
+                        &manager,
+                        host_device_id,
+                        &signals,
+                        &queued_files,
+                        file_queue_paused,
+                    );
+                    continue;
                 }
-                let _ = signals.send(ControllerSignal::FileTransfer {
-                    state: "waiting",
-                    direction: "upload",
-                    name: file.name.clone(),
-                    transferred: 0,
-                    total: file.size,
-                    message: "等待远端确认接收…".to_owned(),
-                });
-                outgoing = Some(OutgoingTransfer {
-                    file,
-                    cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    phase: OutgoingTransferPhase::AwaitingDecision,
-                    deadline: Some(Instant::now() + FILE_DECISION_TIMEOUT),
-                });
-                publish_file_queue(
-                    &manager,
-                    host_device_id,
-                    &signals,
-                    &queued_files,
-                    file_queue_paused,
-                );
+                if use_task {
+                    let handle = file_task_handle
+                        .as_ref()
+                        .expect("capabilities require task service");
+                    *manager
+                        .file_task_queue_admission
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) =
+                        Some((generation, host_device_id, file.clone()));
+                    match handle.start_queued(file.clone()) {
+                        Ok(()) => {
+                            queued_task_active = Some(file.transfer_id);
+                            queued_task_source = Some(file);
+                            publish_file_queue(
+                                &manager,
+                                host_device_id,
+                                &signals,
+                                &queued_files,
+                                file_queue_paused,
+                            );
+                        }
+                        Err(error) => {
+                            *manager
+                                .file_task_queue_admission
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) = None;
+                            queued_files.push_front(file);
+                            file_queue_paused = true;
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: "等待队列".to_owned(),
+                                transferred: 0,
+                                total: 0,
+                                message: format!("无法启动文件任务：{error:?}。请恢复队列重试。"),
+                            });
+                            publish_file_queue(
+                                &manager,
+                                host_device_id,
+                                &signals,
+                                &queued_files,
+                                file_queue_paused,
+                            );
+                        }
+                    }
+                } else {
+                    let failed_name = file.name.clone();
+                    let failed_size = file.size;
+                    let file = match revalidate_queued_file(file) {
+                        Ok(file) => file,
+                        Err(message) => {
+                            let _ = signals.send(ControllerSignal::FileTransfer {
+                                state: "failed",
+                                direction: "upload",
+                                name: failed_name,
+                                transferred: 0,
+                                total: failed_size,
+                                message,
+                            });
+                            file_queue_paused = !queued_files.is_empty();
+                            publish_file_queue(
+                                &manager,
+                                host_device_id,
+                                &signals,
+                                &queued_files,
+                                file_queue_paused,
+                            );
+                            continue;
+                        }
+                    };
+                    let _ = manager.remember_last_file_action(LastFileAction::upload(
+                        host_device_id,
+                        file.clone(),
+                    ));
+                    let offer = TransferMessage::FileOffer {
+                        transfer_id: file.transfer_id,
+                        request_id: None,
+                        name: file.name.clone(),
+                        size: file.size,
+                    };
+                    if let Err(error) = runtime.send_transfer(offer).await {
+                        queued_files.push_front(file);
+                        break ConnectFailure::from_controller(error);
+                    }
+                    let _ = signals.send(ControllerSignal::FileTransfer {
+                        state: "waiting",
+                        direction: "upload",
+                        name: file.name.clone(),
+                        transferred: 0,
+                        total: file.size,
+                        message: "等待远端确认接收…".to_owned(),
+                    });
+                    outgoing = Some(OutgoingTransfer {
+                        file,
+                        cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        phase: OutgoingTransferPhase::AwaitingDecision,
+                        deadline: Some(Instant::now() + FILE_DECISION_TIMEOUT),
+                    });
+                    publish_file_queue(
+                        &manager,
+                        host_device_id,
+                        &signals,
+                        &queued_files,
+                        file_queue_paused,
+                    );
+                }
             }
             tokio::select! {
                 changed = cancellation.changed() => {
@@ -2884,6 +3213,40 @@ async fn run_controller(
                     } else if let Err(error) = result {
                         break ConnectFailure::from_controller(error);
                     }
+                }
+                update = next_queue_persistence_update(&mut queue_persistence_updates), if queue_persistence_updates.is_some() => {
+                    if let Some(update)=update {
+                        if update.epoch==manager.file_queue_persistence_epoch.load(Ordering::Acquire)
+                            && update.revision==manager.file_queue_submission_revision.load(Ordering::Acquire)
+                            && update.host_id==host_device_id && manager.is_current(generation) {
+                            let (state,message)=if let Err(error)=update.result {("memoryOnly",Some(error))} else {manager.file_queue_protection_status(!queued_files.is_empty())};
+                            publish_file_queue_view(&signals,&queued_files,file_queue_paused,state,message);
+                        }
+                    } else {queue_persistence_updates=None;}
+                }
+                update = next_file_task_progress(&mut file_task_progress), if file_task_progress.is_some() => {
+                    if let Some(progress)=update {
+                        if !manager.is_current(generation) {continue;}
+                        let progress_id=file_task::parse_task_id(&progress.task_id).ok();
+                        if progress_id==queued_task_active {
+                            if progress.source_admitted {
+                                *manager.file_task_queue_admission.lock().unwrap_or_else(|p|p.into_inner())=None;
+                                if queued_task_source.take().is_some() {publish_file_queue(&manager,host_device_id,&signals,&queued_files,file_queue_paused);}
+                            }
+                            if matches!(progress.state,"completed"|"partial"|"failed"|"cancelled") {
+                                *manager.file_task_queue_admission.lock().unwrap_or_else(|p|p.into_inner())=None;
+                                if let Some(file)=queued_task_source.take() {queued_files.push_front(file);}
+                                if progress.state!="completed" {file_queue_paused = !queued_files.is_empty();}
+                                queued_task_active=None;
+                                publish_file_queue(&manager,host_device_id,&signals,&queued_files,file_queue_paused);
+                            }
+                        }
+                        if progress.source_admitted && progress.direction=="upload" && let Some(id)=progress_id {
+                            let count=queued_files.len();queued_files.retain(|file|file.transfer_id!=id);
+                            if queued_files.len()!=count {publish_file_queue(&manager,host_device_id,&signals,&queued_files,file_queue_paused);}
+                        }
+                        let _=signals.send(ControllerSignal::FileTask {peer_id:file_peer_id.clone(),progress:Box::new(progress)});
+                    } else {file_task_progress=None;}
                 }
                 command = commands.recv(), if active_input.is_none() => match command {
                     Some(ControllerCommand::Input { context, event }) => {
@@ -3016,7 +3379,7 @@ async fn run_controller(
                         {
                             continue;
                         }
-                        let occupied = queued_files.len() + usize::from(outgoing.is_some());
+                        let occupied = queued_files.len() + usize::from(outgoing.is_some()) + usize::from(queued_task_active.is_some());
                         if files.is_empty() {
                             continue;
                         }
@@ -3063,7 +3426,7 @@ async fn run_controller(
                             });
                             continue;
                         }
-                        if queued_files.len() + usize::from(outgoing.is_some())
+                        if queued_files.len() + usize::from(outgoing.is_some()) + usize::from(queued_task_active.is_some())
                             >= MAX_FILE_QUEUE_ITEMS
                         {
                             let _ = signals.send(ControllerSignal::FileTransfer {
@@ -3480,6 +3843,19 @@ async fn run_controller(
                     }
                     Ok(ControllerEvent::Control(_)) => {}
                     Ok(ControllerEvent::Transfer(message)) => match message {
+                        TransferMessage::FileTask(message) => {
+                            if !manager.is_current(generation) {continue;}
+                            if let FileTaskMessage::Capabilities(c)=&message {
+                                let capabilities=FileTransferCapabilities::WINDOWS.intersect(*c);
+                                let first=if let Some(endpoint)=manager.file_task_endpoint.lock().unwrap_or_else(|p|p.into_inner()).as_mut().filter(|e|e.generation==generation) {if !endpoint.capabilities_negotiated {endpoint.capabilities=capabilities;endpoint.capabilities_negotiated=true;true} else {false}} else {false};
+                                if first {file_capability_timeout_reported=true;let _=signals.send(ControllerSignal::FileCapabilities {peer_id:file_peer_id.clone(),state:if capabilities.is_some_and(|c|c.large_files&&c.block_resume) {"ready"} else {"unsupported"},large_files:capabilities.is_some_and(|c|c.large_files),directories:capabilities.is_some_and(|c|c.directories),block_resume:capabilities.is_some_and(|c|c.block_resume)});}
+                            }
+                            if let FileTaskMessage::SelectionResult {result,..}=&message {
+                                let _=signals.send(ControllerSignal::FileTransfer {state:if *result==TransferResult::Cancelled {"cancelled"} else {"failed"},direction:"download",name:"远端文件选择".to_owned(),transferred:0,total:0,message:if *result==TransferResult::Cancelled {"远端已取消选择。".to_owned()} else {format!("远端无法继续选择：{result:?}")}});
+                            }
+                            if let Some(handle)=file_task_handle.as_ref() {let _=handle.ingest(message);}
+                        }
+
                         TransferMessage::ClipboardData { request_id, text } => {
                             if !pending_clipboard.is_some_and(|pending| {
                                 pending.matches(request_id, ClipboardOperation::Receive)
@@ -3865,6 +4241,13 @@ async fn run_controller(
                 }
                 _ = transfer_watchdog.tick() => {
                     let now = Instant::now();
+                    if !file_capability_timeout_reported && now>=file_capability_deadline {
+                        file_capability_timeout_reported=true;
+                        if let Some(endpoint)=manager.file_task_endpoint.lock().unwrap_or_else(|p|p.into_inner()).as_mut().filter(|e|e.generation==generation&&!e.capabilities_negotiated) {
+                            let mut unavailable=FileTransferCapabilities::WINDOWS;unavailable.large_files=false;unavailable.directories=false;unavailable.block_resume=false;endpoint.capabilities=Some(unavailable);
+                        }
+                        let _=signals.send(ControllerSignal::FileCapabilities {peer_id:file_peer_id.clone(),state:"unsupported",large_files:false,directories:false,block_resume:false});
+                    }
                     if pending_clipboard
                         .is_some_and(|pending| !pending.shortcut_pending && deadline_expired(pending.deadline, now))
                     {
@@ -4009,6 +4392,30 @@ async fn run_controller(
             }
         };
         drop(active_input.take());
+        *manager
+            .file_task_queue_admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        if let Some(file) = queued_task_source.take()
+            && !queued_files
+                .iter()
+                .any(|f| f.transfer_id == file.transfer_id)
+        {
+            queued_files.push_front(file);
+        }
+        if queued_task_active.is_some() {
+            file_queue_paused = !queued_files.is_empty();
+            publish_file_queue(
+                &manager,
+                host_device_id,
+                &signals,
+                &queued_files,
+                file_queue_paused,
+            );
+        }
+        drop(_file_task_registration);
+        drop(file_task_handle);
+        drop(_file_task_pump);
         record_controller_video_metrics(
             diagnostics.as_ref(),
             attempt,
@@ -4276,7 +4683,7 @@ fn transfer_result_state(result: TransferResult) -> &'static str {
 
 fn prepare_file_error_message(result: TransferResult) -> &'static str {
     match result {
-        TransferResult::TooLarge => "单个文件不能超过 256 MB。",
+        TransferResult::TooLarge => "文件大小超过当前连接允许的单文件上限。",
         TransferResult::InvalidData => "请选择文件名有效的普通文件，而不是文件夹。",
         _ => "无法读取所选文件，请检查文件权限后重试。",
     }
@@ -5110,14 +5517,47 @@ fn publish_file_queue_with_result(
     queued_files: &VecDeque<OutgoingFile>,
     paused: bool,
 ) -> Result<(), String> {
-    let persistence_error = manager
-        .remember_file_queue(host_device_id, queued_files, paused)
-        .err();
-    let (recovery_state, recovery_message) = if let Some(error) = persistence_error {
-        ("memoryOnly", Some(error))
-    } else {
-        manager.file_queue_protection_status(!queued_files.is_empty())
+    let revision = manager
+        .file_queue_submission_revision
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+        .max(1);
+    let mut durable_files = queued_files.clone();
+    if let Some((_, target, file)) = manager
+        .file_task_queue_admission
+        .lock()
+        .map_err(|_| "文件任务交接状态不可用。".to_owned())?
+        .as_ref()
+        && *target == host_device_id
+        && !durable_files
+            .iter()
+            .any(|f| f.transfer_id == file.transfer_id)
+    {
+        durable_files.push_front(file.clone());
+    }
+    let result = manager.file_queue_worker().and_then(|worker| {
+        worker.submit(
+            manager.clone(),
+            host_device_id,
+            durable_files,
+            paused,
+            revision,
+        )
+    });
+    let (state, message) = match &result {
+        Ok(()) => ("protecting", Some("正在加密保存等待队列…".to_owned())),
+        Err(error) => ("memoryOnly", Some(error.clone())),
     };
+    publish_file_queue_view(signals, queued_files, paused, state, message);
+    result
+}
+fn publish_file_queue_view(
+    signals: &Channel<ControllerSignal>,
+    queued_files: &VecDeque<OutgoingFile>,
+    paused: bool,
+    recovery_state: &'static str,
+    recovery_message: Option<String>,
+) {
     let _ = signals.send(ControllerSignal::FileQueue {
         queued: queued_files
             .iter()
@@ -5129,13 +5569,8 @@ fn publish_file_queue_with_result(
             .collect(),
         paused,
         recovery_state,
-        recovery_message: recovery_message.clone(),
+        recovery_message,
     });
-    if recovery_state == "memoryOnly" {
-        return Err(recovery_message
-            .unwrap_or_else(|| "无法加密保存等待发送队列；队列仅保留到本次运行结束。".to_owned()));
-    }
-    Ok(())
 }
 
 fn parse_transfer_id(value: &str) -> Result<TransferId, String> {
@@ -7020,3 +7455,51 @@ mod tests {
         }
     }
 }
+
+async fn next_file_task_progress(
+    receiver: &mut Option<watch::Receiver<Option<FileTaskProgress>>>,
+) -> Option<FileTaskProgress> {
+    let Some(receiver) = receiver else {
+        return std::future::pending().await;
+    };
+    receiver.changed().await.ok()?;
+    receiver.borrow_and_update().clone()
+}
+
+struct FileTaskRegistration {
+    endpoint: Arc<Mutex<Option<FileTaskEndpoint>>>,
+    admission: FileTaskQueueAdmission,
+    generation: u64,
+}
+impl Drop for FileTaskRegistration {
+    fn drop(&mut self) {
+        let mut endpoint = self.endpoint.lock().unwrap_or_else(|p| p.into_inner());
+        if endpoint
+            .as_ref()
+            .is_some_and(|e| e.generation == self.generation)
+        {
+            *endpoint = None;
+        }
+        let mut admission = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        if admission
+            .as_ref()
+            .is_some_and(|(generation, _, _)| *generation == self.generation)
+        {
+            *admission = None;
+        }
+    }
+}
+
+async fn next_queue_persistence_update(
+    receiver: &mut Option<watch::Receiver<Option<QueuePersistenceUpdate>>>,
+) -> Option<QueuePersistenceUpdate> {
+    let Some(receiver) = receiver else {
+        return std::future::pending().await;
+    };
+    receiver.changed().await.ok()?;
+    receiver.borrow_and_update().clone()
+}
+
+#[cfg(test)]
+#[path = "controller-queue-integration-tests.rs"]
+mod queue_integration_tests;

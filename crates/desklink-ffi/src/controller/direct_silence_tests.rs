@@ -314,6 +314,7 @@ async fn connected_fixture(backpressure: bool) -> DirectFixture {
             h264_profiles: vec![H264Profile::Main],
             width: 16,
             height: 16,
+            lan_data: None,
         },
         client,
         secure,

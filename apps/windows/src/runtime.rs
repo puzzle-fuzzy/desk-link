@@ -2272,6 +2272,11 @@ async fn receive_controller_capabilities(
                 ControlMessage::Capabilities(_) => {
                     return Err(HostRuntimeError::InvalidControllerCapabilities);
                 }
+                ControlMessage::LanDataSwitch { .. } => {
+                    return Err(HostRuntimeError::Protocol(
+                        ProtocolError::InvalidLanDataMessage,
+                    ));
+                }
                 ControlMessage::RequestKeyframe {
                     stream_id: requested_stream,
                 } if requested_stream == stream_id => {
@@ -2335,6 +2340,7 @@ async fn send_host_capabilities(
         },
         width,
         height,
+        lan_data: None,
     }))?;
     client
         .send_control_for_generation(
@@ -3707,6 +3713,9 @@ async fn receive_host_control(
                     force_keyframe.store(true, Ordering::Release);
                 }
                 match decode_control(&plaintext)? {
+                    ControlMessage::LanDataSwitch { .. } => {
+                        return Err(HostRuntimeError::Protocol(ProtocolError::InvalidLanDataMessage));
+                    }
                     ControlMessage::SelectDisplay { display_id } => {
                         let known_display = lock_unpoisoned(&selected_desktop)
                             .topology.as_ref().is_some_and(|topology| {
@@ -3976,6 +3985,42 @@ async fn receive_transfer_loop_inner(
     incoming: &mut Option<IncomingFileWorker>,
 ) -> Result<(), HostRuntimeError> {
     let mut outgoing: Option<HostOutgoingTransfer> = None;
+    let peer_key = {
+        let peer = secure.lock().await.peer_identity();
+        let mut key = crate::transfer_task::id_text(peer.device_id());
+        for byte in peer.verify_key().as_bytes() {
+            key.push_str(&format!("{byte:02x}"));
+        }
+        key
+    };
+    let service = if cfg!(windows) {
+        crate::transfer_task_native::current_user_service(peer_key).ok()
+    } else {
+        None
+    };
+    let file_tasks = service.as_ref().map(|service| service.handle.clone());
+    let _file_task_pump = service.map(|service| {
+        let client = client.clone();
+        let secure = secure.clone();
+        crate::transfer_task_native::spawn_pump(
+            service.outgoing,
+            service.controls,
+            move |message| {
+                let client = client.clone();
+                let secure = secure.clone();
+                async move {
+                    send_transfer_response(
+                        &client,
+                        &secure,
+                        peer_generation,
+                        TransferMessage::FileTask(message),
+                    )
+                    .await
+                    .map_err(|_| TransferResult::IoFailed)
+                }
+            },
+        )
+    });
     let (outgoing_events, mut pending_outgoing_events) =
         mpsc::channel::<HostOutgoingEvent>(HOST_OUTGOING_EVENT_QUEUE_CAPACITY);
     loop {
@@ -4008,6 +4053,27 @@ async fn receive_transfer_loop_inner(
         };
         let plaintext = open(&secure, SecureLane::Transfer, &encrypted).await?;
         match decode_transfer(&plaintext)? {
+            TransferMessage::FileTask(message) => {
+                if let Some(service) = file_tasks.as_ref() {
+                    if service.ingest(message.clone()).is_err()
+                        && let Some(task_id) = message.task_id()
+                    {
+                        let _ = service.action(task_id, desklink_protocol::FileTaskAction::Cancel);
+                    }
+                } else if let desklink_protocol::FileTaskMessage::Offer { task_id, .. } = message {
+                    send_transfer_response(
+                        &client,
+                        &secure,
+                        peer_generation,
+                        TransferMessage::FileTask(desklink_protocol::FileTaskMessage::Decision {
+                            task_id,
+                            result: TransferResult::Unsupported,
+                            budget: desklink_protocol::FileTransferCapabilities::WINDOWS,
+                        }),
+                    )
+                    .await?;
+                }
+            }
             TransferMessage::ClipboardSet { request_id, text } => {
                 let result = tokio::task::spawn_blocking(move || write_clipboard_text(&text))
                     .await
