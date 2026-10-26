@@ -82,6 +82,6 @@ python -m unittest discover -s scripts/tests -p test_*.py
 
 七包 **762 passed / 0 failed / 23 ignored**：protocol63、crypto36、transport72、relay73、FFI93、Windows286、UI139。另显式17秒专项1 passed；其余 ignored 条件未运行且不计通过。Python **207 passed**，双头/生成版本、Clippy all-targets `-D warnings`、fmt/diff 检查通过。C ABI 实际使用已安装 MSVC/SDK；环境与来源见前文。Python 校验同步新 pin/bounded-flow API，production queue scanner 只排除精确 cfg(test) 条件区域/真实 test-only 模块；新增六个夹具确保生产邻居、未知 cfg、只有 `_tests` 文件名的生产代码仍拒绝 unbounded channel，不靠放行测试掩盖真实生产队列。
 
-正式日志位于 `E:\desk-link\.worktrees\dl2-targets\`：`lan-runtime-full-final-04.log`、`lan-runtime-all-clippy-final-03.log`、`lan-runtime-python-final-02.log`；更早各轮仍保留失败和中间证据。资源/保活/背压详细日志见会话 transport 记录，完整来源与文件指纹在最终交接附录绑定。
+正式日志位于 `E:\desk-link\.worktrees\dl2-targets\`：`lan-runtime-full-final-04.log`、`lan-runtime-all-clippy-final-03.log`、`lan-runtime-python-final-02.log`；更早各轮仍保留失败和中间证据。资源/保活/背压详细日志见会话 transport 记录，完整来源与文件指纹见 [最终交接附录](lan-runtime-handoff.md)。
 
 未运行/未交付：Swift6/macOS/iOS 原生编译和设备 LAN、真正双机捕获/呈现/注入/音频、NAT/UDP受限网络、长稳/吞吐/分位延迟、LAN发现/本地配对。Mac/iOS LAN 能力未启用。未构建新安装包、推送、部署或发布；DL2-024 主项仍保留未完成。DL2-019 的帧依赖丢弃及真实性能仍独立未验，不在 relay 解密或伪称密文可识别帧。

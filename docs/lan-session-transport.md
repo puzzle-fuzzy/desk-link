@@ -36,10 +36,10 @@ DirectLan 双端使用现有 5 秒 QUIC keepalive、15 秒 dead timeout，静态
 Rust 1.97.1，仓库 `scripts/run-windows-cargo.py`，`--locked`，独立 target `E:\desk-link\.worktrees\dl2-targets\lan-runtime`：
 
 - transport 49 单元 + 23 localhost 通过；包含 early-query 不 burn 序号、committed-mask 越权拒绝、同 Noise 的 gen1 fence 不得放开 gen2。
-- `business_transport` 十项常规覆盖真实 relay、实际不同 peer generations、Noise/probe、256 条旧 Input 的屏障顺序、逐 lane 回退/同密文去重、可选 Transfer 超时、替换 peer、新旧任务回收。
-- 独立 17 秒静默用例实际 `--ignored` 执行，1 passed，测试阶段 17.04 秒。先断测试独占 relay，静默超过配置的 15 秒，再验证 Input/Control 仍可达；默认 ignored 不计作常规通过。
+- `business_transport` 十项常规（主文件8项及 raw-sink 子模块2项）覆盖真实 relay、实际不同 peer generations、Noise/probe、256 条旧 Input 的屏障顺序、逐 lane 回退/同密文去重、可选 Transfer 超时、替换 peer、新旧任务回收。下项 raw-sink 是这十项的一部分，不重复累计。
+- 独立 17 秒静默用例实际 `--ignored` 执行；生产提交封存后再跑为1 passed，测试阶段17.05秒。先断测试独占 relay，静默超过配置的15秒，再验证 Input/Control 仍可达；默认 ignored 不计作常规通过。
 - 两项 raw-sink 背压负例实际通过：MAX 帧 caller 取消后完整 drain，排队取消请求跳过；另一项 source send 7B、stream receive 48B（48+7<实际 fence 56B），保持 300ms 操作预算，证明 fence 超时不取消原帧、同 relay 核心加密收发仍可用。该回归不是 Host 输入注入或文件落盘证明。
 
-原始日志在同一 target 父目录：`lan-runtime-transport-final-01.log`、`lan-runtime-business-final-01.log`、`lan-runtime-silent-final-01.log`、`lan-runtime-owned-backpressure-final-03.log`。`owned-backpressure-final-02` 的 source send 4B 设计令 Input 超过其 300ms 夹具预算，已保留失败；正式第三轮使用仍严格小于完整 fence 的 7B，不增加 deadline。初轮 2048B send buffer 不能仅凭 receive window 推断 fence write 被卡，未用作该证明。
+原始日志在同一 target 父目录：`lan-runtime-transport-final-01.log`、`lan-runtime-business-final-01.log`、`lan-runtime-silent-final-02.log`、`lan-runtime-owned-backpressure-final-03.log`；源码提交及正式日志指纹见 [最终交接附录](lan-runtime-handoff.md)。`owned-backpressure-final-02` 的 source send 4B 设计令 Input 超过其 300ms 夹具预算，已保留失败；正式第三轮使用仍严格小于完整 fence 的 7B，不增加 deadline。初轮 2048B send buffer 不能仅凭 receive window 推断 fence write 被卡，未用作该证明。
 
 以上是 loopback/合成业务与真实协议/流控的边界回归；不是双机吞吐、音频播放/屏幕呈现、真实 OS 注入、NAT 穿透、容器或线上容量结论。
