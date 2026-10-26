@@ -36,28 +36,40 @@ export interface AccountSnapshot {
   deviceId: string | null;
 }
 
-export function accountRestore(): Promise<AccountSnapshot> {
-  return invoke<AccountSnapshot>("account_restore");
+export function accountRestore(operationGeneration: number): Promise<AccountSnapshot> {
+  return invoke<AccountSnapshot>("account_restore", { operationGeneration });
 }
 
-export function accountRegister(email: string, password: string): Promise<void> {
-  return invoke<void>("account_register", { email, password });
+export function accountRegister(email: string, password: string, operationGeneration: number): Promise<void> {
+  return invoke<void>("account_register", { email, password, operationGeneration });
 }
 
 export function accountVerifyEmail(token: string): Promise<void> {
   return invoke<void>("account_verify_email", { token });
 }
 
-export function accountResendVerification(email: string): Promise<void> {
-  return invoke<void>("account_resend_verification", { email });
+export function accountResendVerification(email: string, operationGeneration: number): Promise<void> {
+  return invoke<void>("account_resend_verification", { email, operationGeneration });
 }
 
-export function accountLogin(email: string, password: string): Promise<AccountSnapshot> {
-  return invoke<AccountSnapshot>("account_login", { email, password });
+export function accountLogin(email: string, password: string, operationGeneration: number): Promise<AccountSnapshot> {
+  return invoke<AccountSnapshot>("account_login", { email, password, operationGeneration });
 }
 
-export function accountForgotPassword(email: string): Promise<void> {
-  return invoke<void>("account_forgot_password", { email });
+export function accountForgotPassword(email: string, operationGeneration: number): Promise<void> {
+  return invoke<void>("account_forgot_password", { email, operationGeneration });
+}
+
+export function accountCancelOperation(operationGeneration: number): Promise<void> {
+  return invoke<void>("account_cancel_operation", { operationGeneration });
+}
+
+export function accountAcceptOperation(operationGeneration: number): Promise<void> {
+  return invoke<void>("account_accept_operation", { operationGeneration });
+}
+
+export function accountFinishOperation(operationGeneration: number): Promise<void> {
+  return invoke<void>("account_finish_operation", { operationGeneration });
 }
 
 export function accountLogout(): Promise<void> {
