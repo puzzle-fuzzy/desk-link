@@ -43,7 +43,7 @@ mod windows {
             let certificate =
                 rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
             let certificate_der = certificate.cert.der().to_vec();
-            let key_der = certificate.key_pair.serialize_der();
+            let key_der = certificate.signing_key.serialize_der();
             let mut roots = rustls::RootCertStore::empty();
             roots
                 .add(CertificateDer::from(certificate_der.clone()))

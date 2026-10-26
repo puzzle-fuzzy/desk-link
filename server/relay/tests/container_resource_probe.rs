@@ -168,7 +168,7 @@ impl DockerProbe {
         std::fs::write(probe.directory.join("cert.pem"), certificate.cert.pem()).unwrap();
         std::fs::write(
             probe.directory.join("key.pem"),
-            certificate.key_pair.serialize_pem(),
+            certificate.signing_key.serialize_pem(),
         )
         .unwrap();
         let mount = format!(

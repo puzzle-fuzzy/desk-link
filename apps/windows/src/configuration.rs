@@ -270,7 +270,7 @@ impl WindowsConnectionSettingsDialog {
             )
         };
         if result == -1 {
-            return Err(WindowsError::from_win32().into());
+            return Err(WindowsError::from_thread().into());
         }
         Ok(state.saved)
     }

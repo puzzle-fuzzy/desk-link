@@ -22,7 +22,7 @@ fn development_server_config() -> Result<ServerConfig, Box<dyn Error + Send + Sy
         env::var("DESKLINK_RELAY_DEV_SERVER_NAME").unwrap_or_else(|_| "localhost".to_owned());
     let certificate = rcgen::generate_simple_self_signed(vec![server_name])?;
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     Ok(ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der)],
         PrivateKeyDer::Pkcs8(key_der.into()),

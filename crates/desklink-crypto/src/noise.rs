@@ -3,7 +3,7 @@ use std::{fmt, ops::Deref};
 use blake2::{Blake2s256, Digest};
 use chacha20poly1305::{
     ChaCha20Poly1305,
-    aead::{Aead, AeadInPlace, Buffer, KeyInit, Payload},
+    aead::{Aead, AeadInOut, Buffer, KeyInit, Payload},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};

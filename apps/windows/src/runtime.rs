@@ -47,9 +47,9 @@ use desklink_protocol::{
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    ChannelKind, DirectLanConnection, DirectLanSession, JoinRejectCode, NegotiatedLanData,
-    QuicClient, QuicClientConfig, QuicRelayBackend, RelayDirectoryRegistration, RelayJoin,
-    SessionDataError, SessionDataPlane, TransportError,
+    ChannelKind, DirectLanConnection, DirectLanSession, NegotiatedLanData, QuicClient,
+    QuicClientConfig, QuicRelayBackend, RelayDirectoryRegistration, RelayJoin, SessionDataError,
+    SessionDataPlane, TransportError,
 };
 #[cfg(test)]
 use desklink_transport::{VideoDatagramBackend, VideoDatagramRoute};
@@ -3967,7 +3967,7 @@ async fn receive_transfer_loop_inner(
                     // A typed send failure takes priority over the pump's
                     // outer timeout/abort fallback. Both retire this actor
                     // scope while leaving Input/Control service futures alive.
-                    return Err(pending_file_task_failures.try_recv().unwrap_or_else(|_|{
+                    return Err(pending_file_task_failures.try_recv().unwrap_or({
                         HostRuntimeError::SessionData(SessionDataError::Interrupted(ChannelKind::Transfer))
                     }));
                 }

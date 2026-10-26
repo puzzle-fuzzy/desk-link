@@ -39,7 +39,7 @@ async fn spawn_test_relay_with_config(config: RelayConfig) -> TestRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     let server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
@@ -74,7 +74,7 @@ fn server_config_for_bind_test() -> ServerConfig {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der)],
         PrivateKeyDer::Pkcs8(key_der.into()),

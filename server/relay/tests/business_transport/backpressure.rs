@@ -62,7 +62,7 @@ impl RawSinkFixture {
         let der = certificate.cert.der().to_vec();
         let server = ServerConfig::with_single_cert(
             vec![CertificateDer::from(der.clone())],
-            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
         )
         .unwrap();
         let mut roots = rustls::RootCertStore::empty();

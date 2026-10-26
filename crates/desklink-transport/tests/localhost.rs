@@ -36,7 +36,7 @@ async fn spawn_mock_relay_with_transport(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     let mut server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
@@ -156,7 +156,7 @@ async fn spawn_stalled_reliable_relay(held_channel: u8) -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     let mut server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
@@ -265,7 +265,7 @@ async fn spawn_peer_relay_with_reliable_prefix(prefix: Vec<u8>) -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     let server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
@@ -324,7 +324,7 @@ async fn spawn_video_flood_relay() -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     let server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
@@ -411,7 +411,7 @@ async fn spawn_input_flood_with_control_relay() -> MockRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
-    let key_der = certificate.key_pair.serialize_der();
+    let key_der = certificate.signing_key.serialize_der();
     let server_config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
         PrivateKeyDer::Pkcs8(key_der.into()),
@@ -901,7 +901,7 @@ async fn interrupted_reliable_send_closes_connection_with_unconsumed_complete_me
         let certificate_der = certificate.cert.der().to_vec();
         let mut server_config = ServerConfig::with_single_cert(
             vec![CertificateDer::from(certificate_der.clone())],
-            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
         )
         .unwrap();
         let mut transport = quinn::TransportConfig::default();

@@ -116,7 +116,7 @@ async fn local_relay() -> (Arc<RelayServer>, quinn::ClientConfig, Abort) {
     let der = cert.cert.der().to_vec();
     let server = quinn::ServerConfig::with_single_cert(
         vec![CertificateDer::from(der.clone())],
-        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+        PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
     )
     .unwrap();
     let mut roots = rustls::RootCertStore::empty();

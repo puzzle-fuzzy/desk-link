@@ -5,10 +5,7 @@ use blake2::{
         core_api::{Buffer, UpdateCore, VariableOutputCore},
     },
 };
-use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit,
-    aead::{AeadInPlace, generic_array::GenericArray},
-};
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use rand_core::{CryptoRng, OsRng, RngCore};
 use snow::{
     Error,
@@ -194,14 +191,10 @@ impl Cipher for ZeroizingChaChaPoly {
     fn encrypt(&self, nonce: u64, authtext: &[u8], plaintext: &[u8], output: &mut [u8]) -> usize {
         assert!(output.len() >= plaintext.len() + TAG_BYTES);
         output[..plaintext.len()].copy_from_slice(plaintext);
-        let nonce = Self::nonce(nonce);
+        let nonce: Nonce = Self::nonce(nonce).into();
         let tag = self
             .cipher()
-            .encrypt_in_place_detached(
-                GenericArray::from_slice(&nonce),
-                authtext,
-                &mut output[..plaintext.len()],
-            )
+            .encrypt_inout_detached(&nonce, authtext, (&mut output[..plaintext.len()]).into())
             .expect("Noise validates ChaChaPoly encryption lengths");
         output[plaintext.len()..plaintext.len() + TAG_BYTES].copy_from_slice(&tag);
         plaintext.len() + TAG_BYTES
@@ -219,12 +212,15 @@ impl Cipher for ZeroizingChaChaPoly {
         }
         let plaintext_len = ciphertext.len() - TAG_BYTES;
         output[..plaintext_len].copy_from_slice(&ciphertext[..plaintext_len]);
-        let nonce = Self::nonce(nonce);
-        let result = self.cipher().decrypt_in_place_detached(
-            GenericArray::from_slice(&nonce),
+        let nonce: Nonce = Self::nonce(nonce).into();
+        let tag: &Tag = (&ciphertext[plaintext_len..])
+            .try_into()
+            .map_err(|_| Error::Decrypt)?;
+        let result = self.cipher().decrypt_inout_detached(
+            &nonce,
             authtext,
-            &mut output[..plaintext_len],
-            GenericArray::from_slice(&ciphertext[plaintext_len..]),
+            (&mut output[..plaintext_len]).into(),
+            tag,
         );
         if result.is_err() {
             output[..plaintext_len].zeroize();
@@ -384,8 +380,8 @@ mod tests {
     use zeroize::ZeroizeOnDrop;
 
     use super::{
-        BLAKE2S_HASH_BYTES, DesklinkResolver, MAX_HASH_INPUT_BYTES, ZeroizingBlake2s,
-        ZeroizingChaChaPoly, ZeroizingDh25519,
+        BLAKE2S_HASH_BYTES, ChaCha20Poly1305, DesklinkResolver, MAX_HASH_INPUT_BYTES,
+        ZeroizingBlake2s, ZeroizingChaChaPoly, ZeroizingDh25519,
     };
 
     #[test]
@@ -394,6 +390,7 @@ mod tests {
 
         assert_zeroize_on_drop::<ZeroizingDh25519>();
         assert_zeroize_on_drop::<ZeroizingChaChaPoly>();
+        assert_zeroize_on_drop::<ChaCha20Poly1305>();
         assert_zeroize_on_drop::<ZeroizingBlake2s>();
     }
 

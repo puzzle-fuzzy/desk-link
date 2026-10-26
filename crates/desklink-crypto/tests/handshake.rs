@@ -6,8 +6,35 @@ use desklink_crypto::{
     NoiseResponder, PAIRING_INVITE_BYTES, PairingError, PairingInvite, PairingOffer, SecureLane,
     SecureRole, SessionId,
 };
-use rand_chacha::ChaCha20Rng;
 use rand_core::{CryptoRng, RngCore, SeedableRng};
+
+#[path = "../test-support/rng_compat.rs"]
+mod rng_compat;
+use rng_compat::ChaCha20Rng;
+
+#[test]
+fn identity_generation_preserves_the_legacy_entropy_schedule() {
+    // Public all-zero ChaCha20 fixture: the original API consumes 16 bytes for
+    // the device ID followed by exactly 32 bytes for the Ed25519 secret seed.
+    let expected = DeviceIdentity::from_secret_key(
+        [
+            0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86,
+            0xbd, 0x28,
+        ],
+        &[
+            0xbd, 0xd2, 0x19, 0xb8, 0xa0, 0x8d, 0xed, 0x1a, 0xa8, 0x36, 0xef, 0xcc, 0x8b, 0x77,
+            0x0d, 0xc7, 0xda, 0x41, 0x59, 0x7c, 0x51, 0x57, 0x48, 0x8d, 0x77, 0x24, 0xe0, 0x3f,
+            0xb8, 0xd8, 0x4a, 0x37,
+        ],
+    );
+    let actual = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([0; 32]));
+    assert_eq!(actual.device_id, expected.device_id);
+    assert_eq!(actual.verify_key(), expected.verify_key());
+    assert_eq!(
+        actual.sign(b"legacy identity entropy schedule"),
+        expected.sign(b"legacy identity entropy schedule")
+    );
+}
 
 #[test]
 fn identity_signature_verifies_only_for_original_payload() {

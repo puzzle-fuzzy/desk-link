@@ -414,8 +414,8 @@ async fn file_task_sender_and_ingress_preserve_new_variants_on_the_negotiated_di
             .send_input_with_context(context, InputEvent::MouseMove { x: 1, y: 2 })
             .await
             .unwrap();
-        let input =
-            desklink_protocol::decode_input(&host.recv(ChannelKind::Input).await.unwrap()).unwrap();
+        let input_payload = host.recv(ChannelKind::Input).await.unwrap();
+        let input = desklink_protocol::decode_input(&input_payload, now_micros()).unwrap();
         assert_eq!((input.stream_id, input.input_epoch), (7, 9));
         assert_eq!(input.event, InputEvent::MouseMove { x: 1, y: 2 });
         tokio::join!(plane.close_and_wait(), host.close_and_wait());
@@ -607,7 +607,7 @@ async fn spawn_relay(backpressure: bool) -> TestRelay {
     let certificate_der = certificate.cert.der().to_vec();
     let server_config = quinn::ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate_der.clone())],
-        PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+        PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
     )
     .unwrap();
     let mut roots = rustls::RootCertStore::empty();

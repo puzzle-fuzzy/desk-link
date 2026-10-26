@@ -722,6 +722,7 @@ pub(crate) fn lane(channel: ChannelKind) -> SecureLane {
 mod tests {
     use super::*;
     use crate::DirectLanEndpoint;
+    use crate::rng_compat::ChaCha20Rng;
     use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
     use desklink_protocol::{
         Codec, DirectLanCandidate, InputContext, InputEnvelope, InputEvent, PROTOCOL_VERSION,
@@ -851,8 +852,8 @@ mod tests {
     }
 
     fn secure_pair(seed: u8) -> (SecureSession, SecureSession) {
-        let a = DeviceIdentity::generate(&mut rand_chacha::ChaCha20Rng::from_seed([seed; 32]));
-        let b = DeviceIdentity::generate(&mut rand_chacha::ChaCha20Rng::from_seed([seed + 1; 32]));
+        let a = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([seed; 32]));
+        let b = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([seed + 1; 32]));
         let a_key = a.verify_key();
         let b_key = b.verify_key();
         let (mut initiator, first) = NoiseInitiator::start(a, b_key).unwrap();

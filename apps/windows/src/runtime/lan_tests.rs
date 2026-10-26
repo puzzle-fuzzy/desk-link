@@ -65,7 +65,7 @@ impl Fixture {
         let der = certificate.cert.der().to_vec();
         let server_tls = quinn::ServerConfig::with_single_cert(
             vec![CertificateDer::from(der.clone())],
-            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
         )
         .unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -650,6 +650,25 @@ impl TemporaryFiles {
         assert!(root.starts_with(&base));
         Self(root)
     }
+
+    async fn wait_released(&self) {
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(self.0.parent(), Some(base.as_path()));
+        let moved = self.0.with_extension("released");
+        assert_eq!(moved.parent(), Some(base.as_path()));
+        assert!(!moved.exists());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if std::fs::rename(&self.0, &moved).is_ok() {
+                    std::fs::rename(&moved, &self.0).unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("native file actor retained a fixture ancestor pin after teardown");
+    }
 }
 impl Drop for TemporaryFiles {
     fn drop(&mut self) {
@@ -665,7 +684,7 @@ impl Drop for TemporaryFiles {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-struct DiskRelease(Option<std::sync::mpsc::Sender<()>>);
+struct DiskRelease(Option<std::sync::mpsc::SyncSender<()>>);
 impl DiskRelease {
     fn release(&mut self) {
         if let Some(release) = self.0.take() {
@@ -683,7 +702,7 @@ fn blocked_disk() -> (
     oneshot::Receiver<()>,
     impl Fn() + Send + 'static,
 ) {
-    let (release, wait) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
     let (entered, waiting) = oneshot::channel();
     let entered = Mutex::new(Some(entered));
     let first = AtomicBool::new(true);
@@ -1037,4 +1056,357 @@ async fn cancelling_a_full_owned_input_lane_closes_clones_and_releases_host_keys
         assert_eq!(*recorded.lock().unwrap(), vec![key(true), key(false)],
             "only the real exit guard may release the held key; queued motion and the cancelled release never inject");
     }).await.expect("owned Input cancellation did not close and release the original LAN session");
+}
+
+fn file_task_options(
+    temporary: &TemporaryFiles,
+    label: &str,
+) -> crate::transfer_task::FileTaskOptions {
+    let root = temporary.0.join(label);
+    let receive_parent = root.join("received");
+    std::fs::create_dir_all(&receive_parent).unwrap();
+    let authorized_source = temporary.0.clone();
+    crate::transfer_task::FileTaskOptions {
+        // Synthetic disk namespace only; the real Noise/DLD session above
+        // authenticates every message. Production derives this from the peer.
+        peer_key: if label == "host" {
+            "51".repeat(32)
+        } else {
+            "61".repeat(32)
+        },
+        cache_root: root.join("cache"),
+        receive_parent,
+        authorize: Arc::new(|_, _, token| !token.is_cancelled()),
+        select: None,
+        authorize_source_resume: Some(Arc::new(move |path, directory, token| {
+            !token.is_cancelled()
+                && path.starts_with(&authorized_source)
+                && path.is_dir() == directory
+        })),
+    }
+}
+
+async fn start_file_task(
+    handle: &crate::transfer_task::FileTaskHandle,
+    path: PathBuf,
+    id: TransferId,
+) {
+    tokio::time::timeout(LIMIT, async {
+        loop {
+            match handle.start(path.clone(), id) {
+                Ok(()) => return,
+                Err(TransferResult::Busy) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(error) => panic!("actual LAN file-task admission failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("file-task admission stayed busy");
+}
+
+async fn file_task_progress(
+    progress: &mut watch::Receiver<Option<crate::transfer_task::FileTaskProgress>>,
+    id: TransferId,
+    waiting: bool,
+) -> crate::transfer_task::FileTaskProgress {
+    tokio::time::timeout(LIMIT, async {
+        loop {
+            if let Some(value) = progress.borrow_and_update().clone()
+                && value.task_id == crate::transfer_task::id_text(id)
+                && (matches!(
+                    value.state,
+                    "completed" | "partial" | "failed" | "paused" | "cancelled"
+                ) || waiting && value.state == "waiting")
+            {
+                return value;
+            }
+            progress
+                .changed()
+                .await
+                .expect("file actor exited before progress");
+        }
+    })
+    .await
+    .expect("real LAN file task did not reach expected phase")
+}
+
+async fn file_actor_stopped(
+    progress: &mut watch::Receiver<Option<crate::transfer_task::FileTaskProgress>>,
+) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while progress.changed().await.is_ok() {}
+    })
+    .await
+    .expect("file actor retained its generated fixture handles after owner teardown");
+}
+
+#[tokio::test]
+async fn native_file_tasks_use_lan_for_directory_and_large_offset_after_eight_lane_barrier() {
+    let _disk_gate = crate::transfer::lock_disk_worker_tests().await;
+    tokio::time::timeout(LIMIT, async {
+        let mut fixture = Fixture::new().await;
+        let (_, sender, mut events, drive) = connect_lan(&mut fixture).await;
+        assert!(all_direct(*fixture.host.health().borrow()));
+        assert!(drive.peer_health.borrow().is_some_and(all_direct));
+        remove_owned_relay(&fixture).await;
+
+        // This offset is intentionally synthetic: it proves full-width wire
+        // transport, not a new 4-GiB disk/throughput acceptance measurement.
+        let block_bytes = desklink_protocol::MAX_TRANSFER_CHUNK_BYTES as u64;
+        let offset = (u64::from(u32::MAX) / block_bytes + 1) * block_bytes;
+        let payload = vec![0x72; desklink_protocol::MAX_TRANSFER_CHUNK_BYTES];
+        let large = TransferMessage::FileTask(desklink_protocol::FileTaskMessage::Block {
+            task_id: [0x70; 16],
+            item_id: 7,
+            offset,
+            digest: crate::transfer_checkpoint::block_digest(&payload),
+            bytes: payload,
+        });
+        sender.send(large.clone()).await.unwrap();
+        assert_eq!(
+            decode_transfer(&fixture.host.recv(ChannelKind::Transfer).await.unwrap()).unwrap(),
+            large
+        );
+        send_transfer_response(&fixture.host, large.clone())
+            .await
+            .unwrap();
+        assert_eq!(next_file_event(&mut events).await, large);
+
+        let temporary = TemporaryFiles::new();
+        let source = temporary.0.join("源目录");
+        std::fs::create_dir_all(source.join("资料/空目录")).unwrap();
+        let bytes: Vec<u8> = (0..desklink_protocol::MAX_TRANSFER_CHUNK_BYTES * 2 + 19)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        std::fs::write(source.join("资料/文件.bin"), &bytes).unwrap();
+        let host_service =
+            crate::transfer_task::FileTaskService::spawn(file_task_options(&temporary, "host"))
+                .unwrap();
+        let host_handle = host_service.handle.clone();
+        let mut host_progress = host_service.progress.clone();
+        let host = fixture.host.clone();
+        let host_loop = Task(tokio::spawn(async move {
+            let _ = receive_transfer_loop_with_service(host, Some(host_service)).await;
+        }));
+        let controller_service = crate::transfer_task::FileTaskService::spawn(file_task_options(
+            &temporary,
+            "controller",
+        ))
+        .unwrap();
+        let controller_handle = controller_service.handle;
+        let mut controller_progress = controller_service.progress.clone();
+        let outgoing_sender = sender.clone();
+        let controller_pump = crate::transfer_task_native::spawn_pump(
+            controller_service.outgoing,
+            controller_service.controls,
+            move |message| {
+                let sender = outgoing_sender.clone();
+                async move {
+                    sender
+                        .send(TransferMessage::FileTask(message))
+                        .await
+                        .map_err(|_| TransferResult::IoFailed)
+                }
+            },
+        );
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_bridge = ready.clone();
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let blocks_bridge = blocks.clone();
+        let inbound = controller_handle.clone();
+        let controller_bridge = Task(tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let ControllerEvent::Transfer(message) = event {
+                    let TransferMessage::FileTask(message) = message else {
+                        panic!("new file task used legacy transfer variant")
+                    };
+                    let capabilities =
+                        matches!(message, desklink_protocol::FileTaskMessage::Capabilities(_));
+                    if matches!(message, desklink_protocol::FileTaskMessage::Block { .. }) {
+                        blocks_bridge.fetch_add(1, Ordering::AcqRel);
+                    }
+                    inbound.ingest(message).unwrap();
+                    if capabilities {
+                        ready_bridge.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }));
+        while !ready.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let upload = [0x71; 16];
+        start_file_task(&controller_handle, source, upload).await;
+        assert_eq!(
+            file_task_progress(&mut controller_progress, upload, false)
+                .await
+                .state,
+            "completed"
+        );
+        assert_eq!(
+            file_task_progress(&mut host_progress, upload, false)
+                .await
+                .state,
+            "completed"
+        );
+        let host_received = temporary.0.join("host/received").join(format!(
+            "DeskLink-{}",
+            crate::transfer_task::id_text(upload)
+        ));
+        assert_eq!(
+            std::fs::read(host_received.join("资料/文件.bin")).unwrap(),
+            bytes
+        );
+        assert!(host_received.join("资料/空目录").is_dir());
+
+        let returning = temporary.0.join("回传.bin");
+        std::fs::write(&returning, &bytes).unwrap();
+        let download = [0x73; 16];
+        start_file_task(&host_handle, returning, download).await;
+        assert_eq!(
+            file_task_progress(&mut host_progress, download, false)
+                .await
+                .state,
+            "completed"
+        );
+        assert_eq!(
+            file_task_progress(&mut controller_progress, download, false)
+                .await
+                .state,
+            "completed"
+        );
+        let received = temporary
+            .0
+            .join("controller/received")
+            .join(format!(
+                "DeskLink-{}",
+                crate::transfer_task::id_text(download)
+            ))
+            .join("回传.bin");
+        assert_eq!(std::fs::read(received).unwrap(), bytes);
+        assert!(
+            blocks.load(Ordering::Acquire) >= 3,
+            "actual new FileTask blocks were not observed"
+        );
+        assert!(all_direct(*fixture.host.health().borrow()));
+        assert!(!fixture.host.health().borrow().relay_connected);
+        drive.stopping.store(true, Ordering::Release);
+        drop(host_handle);
+        drop(controller_handle);
+        drop(controller_bridge);
+        drop(controller_pump);
+        drop(host_loop);
+        fixture.host.close();
+        file_actor_stopped(&mut host_progress).await;
+        file_actor_stopped(&mut controller_progress).await;
+        temporary.wait_released().await;
+    })
+    .await
+    .expect("actual LAN native directory/file-task fixture timed out");
+}
+
+#[tokio::test]
+async fn optional_transfer_loss_stops_native_actor_and_persists_real_pause_while_input_control_work()
+ {
+    let _disk_gate = crate::transfer::lock_disk_worker_tests().await;
+    tokio::time::timeout(LIMIT, async {
+        // Transfer deliberately stays on relay; the other seven negotiated
+        // business lanes complete real LAN admission. No format changes later.
+        let channels = desklink_protocol::LAN_DATA_KNOWN_CHANNELS
+            & !(1_u16 << (ChannelKind::Transfer as u16 - 1));
+        let mut fixture = Fixture::with_channels(channels).await;
+        let (input, _, mut events, drive) = connect_lan(&mut fixture).await;
+        let temporary = TemporaryFiles::new();
+        let source = temporary.0.join("等待接收确认.bin");
+        std::fs::write(&source, b"generated fixture data").unwrap();
+        let service =
+            crate::transfer_task::FileTaskService::spawn(file_task_options(&temporary, "host"))
+                .unwrap();
+        let mut progress = service.progress.clone();
+        // Explicit synthetic peer file capability, used only to hold an actual
+        // task at its Offer/Decision boundary without showing a native dialog.
+        service
+            .handle
+            .ingest(desklink_protocol::FileTaskMessage::Capabilities(
+                desklink_protocol::FileTransferCapabilities::WINDOWS,
+            ))
+            .unwrap();
+        let id = [0x74; 16];
+        start_file_task(&service.handle, source, id).await;
+        let host = fixture.host.clone();
+        let mut owning = tokio::spawn(async move {
+            lan_session::optional_lane(
+                host.clone(),
+                receive_transfer_loop_with_service(host, Some(service)),
+            )
+            .await
+        });
+        loop {
+            match next_file_event(&mut events).await {
+                TransferMessage::FileTask(desklink_protocol::FileTaskMessage::Offer {
+                    task_id,
+                    ..
+                }) if task_id == id => break,
+                TransferMessage::FileTask(_) => {}
+                other => panic!("expected actual new FileTask offer, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            file_task_progress(&mut progress, id, true).await.state,
+            "waiting"
+        );
+        remove_owned_relay(&fixture).await;
+        assert_eq!(
+            file_task_progress(&mut progress, id, false).await.state,
+            "paused"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut owning)
+                .await
+                .is_err(),
+            "optional transfer service must remain parked until session close"
+        );
+        let context = InputContext {
+            stream_id: STREAM,
+            input_epoch: 0xfedc_ba98_1234_5678,
+        };
+        input
+            .send_input_with_context(context, key(true))
+            .await
+            .unwrap();
+        let delivered =
+            decode_session_input(&fixture.host.recv(ChannelKind::Input).await.unwrap()).unwrap();
+        assert_eq!(delivered.context(), context);
+        assert_eq!(delivered.event, key(true));
+        send_control_data(
+            &fixture.host,
+            &ControlMessage::InputState {
+                reason: Some(InputRestrictionReason::UnsupportedKey),
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            if matches!(
+                events.recv().await.unwrap(),
+                ControllerEvent::Control(ControlMessage::InputState {
+                    reason: Some(InputRestrictionReason::UnsupportedKey)
+                })
+            ) {
+                break;
+            }
+        }
+        assert!(!fixture.host.health().borrow().closed);
+        assert!(all_negotiated_direct(
+            *fixture.host.health().borrow(),
+            channels
+        ));
+        drive.stopping.store(true, Ordering::Release);
+        fixture.host.close();
+        assert!(owning.await.unwrap().is_err());
+        file_actor_stopped(&mut progress).await;
+        temporary.wait_released().await;
+    })
+    .await
+    .expect("optional native file lane did not retire without closing Input/Control");
 }

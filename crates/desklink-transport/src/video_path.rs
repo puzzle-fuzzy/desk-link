@@ -660,8 +660,8 @@ mod tests {
         desklink_crypto::SecureSession,
         desklink_crypto::SecureSession,
     ) {
+        use crate::rng_compat::ChaCha20Rng;
         use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
-        use rand_chacha::ChaCha20Rng;
         use rand_core::SeedableRng;
 
         let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([1; 32]));

@@ -28,7 +28,7 @@ impl IMFAsyncCallback_Impl for ReleaseLease_Impl {
         Err(E_NOTIMPL.into())
     }
 
-    fn Invoke(&self, _result: Ref<'_, IMFAsyncResult>) -> windows::core::Result<()> {
+    fn Invoke(&self, _result: Ref<IMFAsyncResult>) -> windows::core::Result<()> {
         let lease = self
             .lease
             .lock()

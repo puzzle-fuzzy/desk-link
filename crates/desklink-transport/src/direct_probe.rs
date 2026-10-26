@@ -376,7 +376,7 @@ impl DirectLanEndpoint {
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
         let mut server_config = quinn::ServerConfig::with_single_cert(
             vec![CertificateDer::from(certificate.cert.der().to_vec())],
-            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
         )
         .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
         let mut transport = quinn::TransportConfig::default();
@@ -665,6 +665,7 @@ async fn read_probe(receive: &mut quinn::RecvStream) -> Result<Vec<u8>, DirectLa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rng_compat::ChaCha20Rng;
     use rand_core::SeedableRng;
 
     #[test]
@@ -1264,10 +1265,8 @@ mod tests {
     fn connected_secure_sessions() -> (SecureSession, SecureSession) {
         use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
 
-        let initiator_identity =
-            DeviceIdentity::generate(&mut rand_chacha::ChaCha20Rng::from_seed([1; 32]));
-        let responder_identity =
-            DeviceIdentity::generate(&mut rand_chacha::ChaCha20Rng::from_seed([2; 32]));
+        let initiator_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([1; 32]));
+        let responder_identity = DeviceIdentity::generate(&mut ChaCha20Rng::from_seed([2; 32]));
         let initiator_verify_key = initiator_identity.verify_key();
         let responder_verify_key = responder_identity.verify_key();
         let (mut initiator, message_1) =

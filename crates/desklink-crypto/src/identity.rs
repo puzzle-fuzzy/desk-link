@@ -2,6 +2,7 @@ use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::CryptoRngCore;
+use zeroize::Zeroizing;
 
 pub trait IdentityStore {
     type Error;
@@ -21,7 +22,12 @@ impl DeviceIdentity {
     pub fn generate(rng: &mut impl CryptoRngCore) -> Self {
         let mut device_id = [0; 16];
         rng.fill_bytes(&mut device_id);
-        let signing_key = SigningKey::generate(rng);
+        // Keep the public rand_core 0.6 boundary and its exact entropy schedule
+        // while dalek uses a newer RNG trait internally. The temporary secret
+        // is cleared on every exit after the signing key copies its bytes.
+        let mut secret = Zeroizing::new([0_u8; 32]);
+        rng.fill_bytes(secret.as_mut());
+        let signing_key = SigningKey::from_bytes(&secret);
         Self {
             device_id,
             signing_key,

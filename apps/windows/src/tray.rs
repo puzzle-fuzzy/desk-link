@@ -797,7 +797,7 @@ mod windows_ui {
             let mut data = self.notification_data(hwnd);
             data.szTip = wide_array(&self.status.tooltip);
             if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-                return Err(WindowsError::from_win32());
+                return Err(WindowsError::from_thread());
             }
             self.tray_added = true;
             Ok(())
@@ -807,7 +807,7 @@ mod windows_ui {
             let mut data = self.notification_data(hwnd);
             data.szTip = wide_array(&self.status.tooltip);
             if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
-                return Err(WindowsError::from_win32());
+                return Err(WindowsError::from_thread());
             }
             Ok(())
         }
@@ -894,7 +894,7 @@ mod windows_ui {
             ..WNDCLASSW::default()
         };
         if unsafe { RegisterClassW(&class) } == 0 {
-            return Err(WindowsError::from_win32().into());
+            return Err(WindowsError::from_thread().into());
         }
         let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         let installer_shutdown = unsafe { RegisterWindowMessageW(w!("DeskLinkInstallerShutdown")) };
@@ -943,7 +943,7 @@ mod windows_ui {
         loop {
             let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
             if result.0 == -1 {
-                return Err(WindowsError::from_win32().into());
+                return Err(WindowsError::from_thread().into());
             }
             if !result.as_bool() {
                 break;
@@ -1158,7 +1158,7 @@ mod windows_ui {
             )
         };
         if font.0.is_null() {
-            return Err(WindowsError::from_win32());
+            return Err(WindowsError::from_thread());
         }
         Ok(font)
     }

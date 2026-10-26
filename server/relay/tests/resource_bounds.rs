@@ -27,25 +27,40 @@ async fn explicit_flow_tuning_cannot_raise_relay_resource_ceilings() {
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let config = ServerConfig::with_single_cert(
         vec![CertificateDer::from(certificate.cert.der().to_vec())],
-        PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+        PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
     )
     .unwrap();
-    for (send, receive, stream) in [
-        (131_073, 131_072, 65_549),
-        (131_072, 131_073, 65_549),
-        (131_072, 131_072, 65_550),
+    for (send, receive, stream, reason) in [
+        (
+            131_073,
+            131_072,
+            65_549,
+            "send window of 131073 bytes exceeds relay resource budget of 131072 bytes",
+        ),
+        (
+            131_072,
+            131_073,
+            65_549,
+            "connection receive window of 131073 bytes exceeds relay resource budget of 131072 bytes",
+        ),
+        (
+            131_072,
+            131_072,
+            65_550,
+            "stream receive window of 65550 bytes exceeds relay resource budget of 65549 bytes",
+        ),
     ] {
         let limits = desklink_transport::QuicFlowControlLimits::new(send, receive, stream).unwrap();
         let result = RelayServer::bind_with_flow_control_limits(
             "127.0.0.1:0".parse().unwrap(),
             config.clone(),
             RelayConfig::default(),
-            limits,
+            Some(limits),
         )
         .await;
         assert!(
-            matches!(result, Err(desklink_relay::RelayError::InvalidConfig(reason))
-            if reason == "flow-control tuning exceeds relay resource budget")
+            matches!(result, Err(desklink_relay::RelayError::InvalidConfig(actual))
+            if actual == reason)
         );
     }
 }
@@ -70,7 +85,7 @@ impl TestRelay {
         let certificate_der = certificate.cert.der().to_vec();
         let server_config = ServerConfig::with_single_cert(
             vec![CertificateDer::from(certificate_der.clone())],
-            PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
+            PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
         )
         .unwrap();
         let mut roots = rustls::RootCertStore::empty();

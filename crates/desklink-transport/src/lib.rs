@@ -10,6 +10,11 @@ mod lan_candidate;
 mod lan_data;
 mod quic;
 mod retry_policy;
+
+#[cfg(test)]
+#[path = "../../desklink-crypto/test-support/rng_compat.rs"]
+mod rng_compat;
+
 mod video_egress;
 mod video_path;
 
