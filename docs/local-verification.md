@@ -69,6 +69,11 @@ python scripts/verify.py native perf --report dist/verify/device-status.json
 | context 非零、前缀与完整传递 | codec/ABI/Swift/TS 真实往返保留 stream/epoch；任一值为零、缺失或错代不得默认补当前上下文；验证 seq/timestamp 有效但 context 过期的输入，并拒绝旧合法 Function(1) 等包误解为新 MouseButton、错误/截断前缀和无 context fallback | protocol/FFI/平台桥的实际调用回归；由 owner 的 codec 合同证明新前缀与旧合法非零 sequence 不相交；字段名正则匹配不提供证明 |
 | 排队旧事件与旧 release | 冻结发送器，在旧 epoch 入队后切换；正常输入、key-up/ReleaseAll 均保留原 context 并被 host 拒绝；新 epoch 按下的同一键不会被旧 release 释放 | 发送队列与记录型 host injector；仅本机 topology 代数或丢普通 press、保留所有 release 不满足门禁 |
 | 首帧实际呈现前禁用 | 仅收到 VideoConfig、解码完成但 presented 尚未发生都不能启用输入；旧 stream/epoch 的迟到呈现不能启用当前 context；事件在入队时已固定 context | Windows 合成宿主、实际 WebView2 分别记录；Apple 原生 presented handler 必须另有真机回调结果 |
+| 持久stream与新Noise/重启 | 同一持久stream下重连、重启、新审批与同进程新会话都重新OsRng非零起点；旧plaintext即便被新Noise重加密也不匹配，旧release/呈现回调不生效；新随机epoch可更小，不能跨会话按大小判断 | HostConnectionSettings确实持久化stream；待host/生产者实际接线，不能用新Noise本身或固定1作新鲜度证明 |
+| RNG与推进边界 | 注入RNG失败、零值、重复base与u64溢出，观察明确失败/上下文重建，不默认1、wrap、round/clamp；仅几何/活动输出/有效性边界checked推进，纯编码保持epoch/持键 | 可控随机源/映射竞争回归；随机epoch只绑输入新旧，不是key/nonce；这些尚未由sender原语实现 |
+| config_version与epoch配对 | 同尺寸换屏、虚拟原点/映射改变或有效性变化也推进真实config_version、发布配置/恢复关键帧；纯编码可只变version并保持epoch/不清键；旧buffered输出不重贴身份 | 当前帧/mailbox无独立epoch。已有同stream+同version但任意配置字段变化→InconsistentVideoConfig，须保留并回归；旧帧误激活是绕过该拒绝后的风险，不是当前复现结果 |
+| 对应帧才确认新epoch | 旧version变epoch明确拒绝，正确新version配置与该帧实际呈现后才放行；迟到旧缓冲/解码帧、同尺寸帧或旧token不能借新配置启用输入 | token来自帧真实配置和会话代数；不只测尺寸变化，也不放宽一致性校验来接通 |
+| Windows完整u64 IPC | 实际JSON/IPC→TS队列→Rust往返2^53−1、2^53、2^53+1、u64::MAX的规范十进制字符串，以BigInt保持/比较身份；拒绝number、零context、负值、前导零、空白、指数和越界 | 当前为产品接线规则；C/Swift以uint64_t/UInt64做相同边界回归，不把double或round/clamp当修复 |
 | host 原子清键/推进/映射 | 在受控 injector 中阻塞切换竞争，观察清键、epoch 推进、映射发布和锁内核对形成同一边界；旧坐标不能落到新屏 | Windows host 本地集成与真实切屏分开；不以锁字段存在或 config_version 相同推导正确 |
 | 取消独立生效 | 普通输入队列满/发送背压、旧输入待丢弃、新首帧未呈现时，用户取消与 host 本机收回仍可停止/清理；不能先要求有效远端 context 或等待普通队列空位 | 合成背压/取消/迟到回调；实际权限/设备另记 |
 | 发送调用完整迁移 | 清点 ControllerRuntime 旧 send_input(event) 的所有生产调用，不只鼠标：普通键盘/指针/滚轮、Text、粘贴组合键、排队release、断开与丢包释放；context/pressed ledger和C/Swift布局来自同一owner声明 | Rust生产调用清单、context队列/加密loopback与ABI/C布局；底层QuicClient::send_input(bytes)不是同一个待迁移API，不能按函数名盲改 |
@@ -101,3 +106,11 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 完整 FFI 切片 `9ad7154b365de875d725188cfa091f5c21da0b5a` 依赖 Apple 003/004/025 的错误ABI、send_cancellable、生成头和布局测试，本工程未pick整笔。已复用产品独立桥接 `b473498382bd163f6085c019521105741264707c` → `56f53b4a17347714a91a2cb269bc5addc5777916`，唯一新增前置是已复用的bc6合同。controller.rs/test两文件增量与9ad的稳定patch-id均为 `2f004b5c19baaa5f3df4360b605818df1f40f9b4`，后续Apple整合只保留一份等价API/测试，不重复pick或覆盖整文件。其余C/FFI ledger/worker/Swift仍以Apple源分支为准；新增C字段与Swift布局必须独立验证，来源报告34项不算本工程结果。
 
 桥接后实际 `captured-context-bridge.json` 来自干净源码 `56f53b4`、dirty=false：编译、protocol47和 controller加密loopback5项通过、0忽略；host-runtime-contract仍9通过/1失败（零epoch配置），整体failed / passed=false。该API原语成功不能关闭七处生产调用、Text/粘贴/ReleaseAll、host映射或呈现门禁。`captured-context-bridge-tooling.json` 在干净源码 `31e9fb0` 的Python134项与fmt通过，证明工具/格式，不替代业务失败。
+
+### 有序InputSender的局部通过与完整失败
+
+最小独立来源 `3ea72dc7f5a66d4cd96c197c0aadb7603cee2436` 已复用为 `d6f153ed59c6d91b7cfa7337dd1b1a9fbeae9cf6`，前置仅bc6+b473。Runtime.input_sender返回可clone的ControllerInputSender，二者共用send_session_input及唯一序号；输入专用序号锁持完整wire写，共享crypto锁在网络等待前释放。它不是新的C/Swift/worker接线，后续保留一份Runtime实现并去重b473/9ad等价来源，不能整文件覆盖Sender扩展。
+
+本工程 `ordered-input-sender.json` 记录干净源码d6f153e、dirty=false：fmt/编译/protocol47通过，独立controller-loopback **6通过、0忽略**。新增真实加密回归收到32并发clone加Runtime共36帧，seq严格1..36、原context保留；零context/旧无context入口不发包也不消耗序号。它证明“不把旧context补成最新值”，不证明host会拒绝旧context或新Noise已分配新epoch。
+
+同次完整 `ffi-runtime` 中lib12、ABI7、platform1、controller6、directory4通过，旧Host **8通过/2失败**；Windows host-runtime-contract **9通过/1失败**，仍为零epoch配置未接通。整体 **failed / passed=false**。选择lib或loopback的通过不能改写完整FFI失败，不能跳过这两个Host测试后宣称全通过；新鲜度、config配对、IPC、Text/粘贴/release生产路径与真实presented继续按上表验收。
