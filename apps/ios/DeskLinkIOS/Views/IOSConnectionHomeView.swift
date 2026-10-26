@@ -61,6 +61,7 @@ struct IOSConnectionHomeView: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .disabled(isBusy)
 
                                 Button(role: .destructive) {
                                     removeSavedHost(host)
@@ -80,6 +81,7 @@ struct IOSConnectionHomeView: View {
                         .autocorrectionDisabled()
                         .focused($isInviteFieldFocused)
                         .font(.footnote.monospaced())
+                        .disabled(isBusy)
                     HStack(spacing: 18) {
                         Button("从剪贴板粘贴") { pasteInvite() }
                             .buttonStyle(.borderless)
@@ -90,8 +92,9 @@ struct IOSConnectionHomeView: View {
                         .buttonStyle(.borderless)
                         .accessibilityIdentifier("scan-invite")
                     }
+                    .disabled(isBusy)
                     Button("开始连接") { connectInviteText() }
-                        .disabled(inviteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(isBusy || inviteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     if isBusy {
                         HStack(spacing: 8) {
                             ProgressView()
@@ -101,8 +104,11 @@ struct IOSConnectionHomeView: View {
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel(statusText)
                     }
-                    Button("断开连接", role: .destructive) { controller.disconnect() }
+                    Button(isBusy ? "取消连接" : "断开连接", role: .destructive) {
+                        controller.disconnect()
+                    }
                         .disabled(!isConnectedOrConnecting)
+                        .accessibilityIdentifier("cancel-controller-connection")
                 }
 
                 Section("状态") {
@@ -193,6 +199,7 @@ struct IOSConnectionHomeView: View {
     }
 
     private func connect(invite: Data) {
+        guard !isBusy else { return }
         inputError = nil
         controller.connect(invite: invite)
     }

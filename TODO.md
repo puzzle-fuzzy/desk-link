@@ -296,6 +296,8 @@
 ### DL2-029 · P1 · macOS 连接和等待批准期间提供取消
 
 - [ ] 统一连接进度页，所有非终态等待均可取消或更换目标。
+- [x] 代码与静态合同：Mac 连接表单的连接/审批等待区提供直接取消和 Escape，保留设备 ID/密码；会话恢复期提供直接取消。iOS 等待区明确取消动作并阻止重复提交/扫描。取消复用 generation 隔离的 `disconnect()`。`python -m unittest discover -s scripts/tests -p test_dl2_apple_cancel_contract.py -v`：5 项通过；`git diff --check` 通过。提交主题：`fix(DL2-029): expose cancellation throughout Apple connection waits`。
+- [ ] Mac/iOS 编译与真实逐阶段取消、取消后更换目标、迟到批准/错误/视频不复活验收；本 Windows 环境无法运行 SwiftUI/Xcode。DL2-004 的异步停止与 ≤2 秒主线程响应实测仍是依赖，不以静态合同代替。
 - **证据 / 类型：能力缺口。** `apps/macos/Sources/DeskLinkApp/Views/ConnectView.swift:63-71` 及 `apps/macos/Sources/DeskLinkApp/Views/ControllerHomeView.swift:108-119` busy 时只禁用连接；`apps/macos/Sources/DeskLinkApp/DeskLinkApp.swift:118-121` connecting/pairing 尚未进入有断开按钮的会话页；`crates/desklink-ffi/src/controller.rs:44-47` 握手可等待 150 秒，等待批准/能力协商可等待 120 秒。
 - **方案：** 展示查找、建立连接、等待批准、恢复等状态，始终提供取消；保留可重试的用户输入；generation 隔离迟到批准、错误及视频。
 - **验收：** 每个阶段立即取消，再连另一台设备，旧结果不复活；取消本身满足 DL2-004 的时间和主线程响应预算。

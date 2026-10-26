@@ -122,10 +122,7 @@ struct ControllerHomeView: View {
     }
 
     private var isBusy: Bool {
-        switch bridge.state {
-        case .pairing, .connecting, .reconnecting, .recovering: true
-        default: false
-        }
+        deskLinkConnectionIsWaiting(bridge.state)
     }
 
     private func pageHeading(_ title: String, detail: String) -> some View {

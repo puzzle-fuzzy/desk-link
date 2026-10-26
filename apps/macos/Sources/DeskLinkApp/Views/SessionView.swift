@@ -67,8 +67,11 @@ struct SessionView: View {
                     .buttonStyle(.bordered)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button("断开连接") { bridge.disconnect() }
+                Button(deskLinkConnectionIsWaiting(bridge.state) ? "取消连接" : "断开连接") {
+                    bridge.disconnect()
+                }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("cancel-controller-session")
             }
             if case .signedIn = account.state {
                 ToolbarItem(placement: .primaryAction) {
