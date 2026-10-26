@@ -421,6 +421,24 @@ async fn restart_host(
 }
 
 #[tauri::command]
+async fn pause_host_sharing(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.pause_sharing(app).await?;
+    get_host_snapshot(manager).await
+}
+
+#[tauri::command]
+async fn resume_host_sharing(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.resume_sharing(app).await?;
+    get_host_snapshot(manager).await
+}
+
+#[tauri::command]
 fn respond_host_approval(
     manager: State<'_, HostManager>,
     request_id: u64,
@@ -1105,6 +1123,12 @@ fn build_diagnostic_checks(
         )
     };
     let relay_check = match (connection.is_some(), runtime.state) {
+        (_, "paused") => diagnostic_check(
+            "DL-NET-201",
+            "passed",
+            "中继连接状态",
+            "本机共享已由用户暂停，恢复共享后再建立入站连接。",
+        ),
         (false, _) => diagnostic_check(
             "DL-NET-201",
             "warning",
@@ -1143,7 +1167,7 @@ fn build_diagnostic_checks(
         ),
     };
     let host_check = match runtime.state {
-        "available" | "connected" => {
+        "available" | "connected" | "paused" => {
             diagnostic_check("DL-HOST-301", "passed", "主机运行状态", &runtime.detail)
         }
         "stopped" => diagnostic_check("DL-HOST-301", "failed", "主机运行状态", &runtime.detail),
@@ -1667,7 +1691,7 @@ pub fn run() {
                 show_main_window(app);
             }
         }))
-        .manage(HostManager::default())
+        .manage(HostManager::for_current_user())
         .manage(ControllerManager::for_current_user())
         .manage(AccountManager::for_current_user())
         .manage(updates::UpdateManager::default());
@@ -1732,6 +1756,8 @@ pub fn run() {
             quit_desklink,
             respond_host_approval,
             restart_host,
+            pause_host_sharing,
+            resume_host_sharing,
             save_connection_settings,
             setup_managed_connection,
             start_pairing_session,
@@ -1790,15 +1816,44 @@ pub fn run() {
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 DeskLink", true, None::<&str>)?;
+    let pause = MenuItem::with_id(
+        app,
+        "pause-host-sharing",
+        "暂停本机共享",
+        true,
+        None::<&str>,
+    )?;
+    let resume = MenuItem::with_id(
+        app,
+        "resume-host-sharing",
+        "恢复本机共享",
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出 DeskLink", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &pause, &resume, &separator, &quit])?;
     let mut tray = TrayIconBuilder::with_id(tray_id())
         .tooltip("DeskLink：正在启动")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
+            "pause-host-sharing" | "resume-host-sharing" => {
+                let pause = event.id().as_ref() == "pause-host-sharing";
+                let manager = app.state::<HostManager>().inner().clone();
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = if pause {
+                        manager.pause_sharing(app.clone()).await
+                    } else {
+                        manager.resume_sharing(app.clone()).await
+                    };
+                    if result.is_err() {
+                        show_main_window(&app);
+                    }
+                });
+            }
             "quit" => {
                 let manager = app.state::<HostManager>().inner().clone();
                 app.state::<ControllerManager>().request_stop();
@@ -1883,6 +1938,22 @@ mod tests {
         };
         let checks = build_diagnostic_checks(&runtime, Some(&connection), None, None, None);
         assert!(checks.iter().all(|check| check.status == "passed"));
+    }
+
+    #[test]
+    fn user_paused_sharing_is_not_reported_as_a_host_or_network_failure() {
+        let runtime = HostRuntimeSummary {
+            state: "paused",
+            title: "共享已暂停".to_owned(),
+            detail: "本机共享已由用户暂停。".to_owned(),
+            tooltip: "DeskLink".to_owned(),
+        };
+        let checks = build_diagnostic_checks(&runtime, None, None, None, None);
+        for code in ["DL-NET-201", "DL-HOST-301"] {
+            let check = checks.iter().find(|check| check.code == code).unwrap();
+            assert_eq!(check.status, "passed");
+            assert!(check.detail.contains("暂停"));
+        }
     }
 
     #[test]

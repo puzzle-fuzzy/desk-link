@@ -125,6 +125,14 @@ export function restartHost(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("restart_host");
 }
 
+export function pauseHostSharing(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("pause_host_sharing");
+}
+
+export function resumeHostSharing(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("resume_host_sharing");
+}
+
 export function respondHostApproval(requestId: number, allow: boolean): Promise<void> {
   return invoke<void>("respond_host_approval", { requestId, allow });
 }

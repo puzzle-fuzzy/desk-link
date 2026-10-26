@@ -31,6 +31,8 @@ import {
   regenerateFixedAccessPassword,
   respondHostApproval,
   restartHost,
+  pauseHostSharing,
+  resumeHostSharing,
   revokeTrustedController,
   saveConnectionSettings,
   setupManagedConnection,
@@ -114,6 +116,7 @@ let loading = true;
 let saving = false;
 let managedSetupBusy = false;
 let hostRestartBusy = false;
+let hostSharingBusy = false;
 let approvalBusy = false;
 let focusedApprovalId: number | null = null;
 let expiredApprovalId: number | null = null;
@@ -650,12 +653,19 @@ function renderWorkspaceTopbar(): string {
         ${snapshot ? renderHostStatusChip(snapshot) : ""}
       </div>
       <div class="workspace-topbar-actions">
+        ${snapshot ? renderHostSharingActions(snapshot) : ""}
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
         <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-haspopup="menu" aria-expanded="${utilityMenuOpen}" aria-controls="utility-menu" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
         ${renderUtilityMenu()}
       </div>
     </header>
   `;
+}
+
+function renderHostSharingActions(state: HostSnapshot): string {
+  const paused = state.runtime.state === "paused";
+  if (!state.connection && !paused) return "";
+  return `<button class="button button--secondary button--compact" type="button" data-host-sharing="${paused ? "resume" : "pause"}" ${hostSharingBusy ? 'disabled aria-busy="true"' : ""} title="${paused ? "恢复本机共享，保留信任和固定密码" : "停止本机共享，保留信任；当前连接其他设备的会话继续"}">${hostSharingBusy ? "正在处理…" : paused ? "恢复共享" : "暂停共享"}</button>`;
 }
 
 function renderUtilityMenu(): string {
@@ -877,6 +887,7 @@ function renderConnection(state: HostSnapshot): string {
         ${state.connection
           ? `<div class="pairing-credential share-device-identity"><span>本机 ID</span><strong id="host-access-heading">${escapeHtml(state.deviceId ? formatDeviceId(state.deviceId) : "暂时无法读取")}</strong>${state.deviceId ? '<button class="button button--secondary button--compact" type="button" data-copy-host-id>复制 ID</button>' : ""}</div>
              <div class="page-actions share-device-actions">
+               ${renderHostSharingActions(state)}
                ${renderPairingAction(state, "primary")}
                <button class="button button--secondary" type="button" data-open-fixed-access>${state.fixedPasswordEnabled ? "查看固定密码" : "设置固定密码"}</button>
              </div>`
@@ -1692,6 +1703,9 @@ async function exitDeskLink(): Promise<void> {
 }
 
 function bindInteractions(preservedController = false): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-host-sharing]").forEach((button) => {
+    button.addEventListener("click", () => { void changeHostSharing(button.dataset.hostSharing === "resume"); });
+  });
   document.querySelector<HTMLButtonElement>("[data-account-logout]")?.addEventListener("click", () => void logoutAccount());
   document.querySelector<HTMLButtonElement>("[data-account-login]")?.addEventListener("click", () => enterAccountLogin());
   document.querySelectorAll<HTMLButtonElement>("[data-open-github]").forEach((button) => {
@@ -2115,6 +2129,24 @@ async function restartStoppedHost(): Promise<void> {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {
     hostRestartBusy = false;
+    render();
+  }
+}
+
+async function changeHostSharing(resume: boolean): Promise<void> {
+  if (hostSharingBusy) return;
+  hostSharingBusy = true;
+  render();
+  try {
+    await (resume ? resumeHostSharing() : pauseHostSharing());
+    clearPairingSecrets();
+    pairingSession = null;
+    feedback = { tone: "info", message: resume ? "本机共享已恢复，已保留信任与固定密码。" : "本机共享已暂停，信任与固定密码已保留。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    await refreshSnapshot(false);
+    hostSharingBusy = false;
     render();
   }
 }

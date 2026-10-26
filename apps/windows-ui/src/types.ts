@@ -35,6 +35,7 @@ export interface DiagnosticCheckSummary {
 }
 
 export type HostRuntimeState =
+  | "paused"
   | "starting"
   | "pairing"
   | "connecting"
