@@ -5,7 +5,7 @@ use super::*;
 use desklink_crypto::{NoiseResponder, SessionId};
 use desklink_protocol::{CursorUpdate, FrameFlags, encode_cursor_update, encode_video_packet};
 use desklink_relay::{RelayConfig, RelayServer};
-use desklink_transport::{QuicClientConfig, RelayJoin};
+use desklink_transport::{QuicClientConfig, QuicFlowControlLimits, RelayJoin};
 use desklink_video::packetize_frame;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -23,23 +23,29 @@ struct TestRelay {
     _task: TestTask,
 }
 
-struct DirectFixture {
-    runtime: ControllerRuntime,
-    host: Arc<QuicClient>,
-    host_secure: Arc<Mutex<SecureSession>>,
+pub(crate) struct DirectFixture {
+    pub(crate) runtime: ControllerRuntime,
+    pub(crate) host: Arc<QuicClient>,
+    pub(crate) host_secure: Arc<Mutex<SecureSession>>,
     direct_peer: Arc<DirectLanConnection>,
     _controller_endpoint: Arc<DirectLanEndpoint>,
     _peer_endpoint: Arc<DirectLanEndpoint>,
     _relay: TestRelay,
+    _cleanup: ConnectionCleanup,
 }
 
-impl Drop for DirectFixture {
+struct ConnectionCleanup {
+    client: Arc<QuicClient>,
+    host: Arc<QuicClient>,
+    direct: Arc<DirectLanConnection>,
+    direct_peer: Arc<DirectLanConnection>,
+}
+
+impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
-        self.runtime.client.close(b"direct silence test complete");
+        self.client.close(b"direct silence test complete");
         self.host.close(b"direct silence test complete");
-        if let Some(direct) = &self.runtime.direct_connection {
-            direct.close(b"direct silence test complete");
-        }
+        self.direct.close(b"direct silence test complete");
         self.direct_peer.close(b"direct silence test complete");
     }
 }
@@ -184,13 +190,33 @@ fn direct_video_flood(
 }
 
 async fn connected_direct_fixture() -> DirectFixture {
-    let relay = spawn_relay().await;
+    connected_fixture(false).await
+}
+
+pub(crate) async fn connected_flow_control_fixture() -> DirectFixture {
+    connected_fixture(true).await
+}
+
+fn fixture_flow_control_limits() -> QuicFlowControlLimits {
+    // A 2 KiB flight fills the peer's 128-message receive queue promptly on
+    // loopback, while retaining finite buffers on both relay hops. A 128-byte
+    // flight instead tested ACK pacing before the receive queue became full.
+    QuicFlowControlLimits::new(2048, 16384, 2048).unwrap()
+}
+
+async fn connected_fixture(backpressure: bool) -> DirectFixture {
+    let relay = spawn_relay(backpressure).await;
     let config = || {
-        QuicClientConfig::with_client_config(
+        let config = QuicClientConfig::with_client_config(
             relay.address,
             "localhost",
             relay.client_config.clone(),
-        )
+        );
+        if backpressure {
+            config.with_flow_control_limits(fixture_flow_control_limits())
+        } else {
+            config
+        }
     };
     let host = Arc::new(QuicClient::connect(config()).await.unwrap());
     let client = Arc::new(QuicClient::connect(config()).await.unwrap());
@@ -270,6 +296,14 @@ async fn connected_direct_fixture() -> DirectFixture {
         video_path.state(),
         DirectVideoPathState::Direct { .. }
     ));
+    let direct = Arc::new(direct);
+    let peer = Arc::new(peer);
+    let cleanup = ConnectionCleanup {
+        client: client.clone(),
+        host: host.clone(),
+        direct: direct.clone(),
+        direct_peer: peer.clone(),
+    };
     let runtime = ControllerRuntime {
         host_capabilities: DeviceCapabilities {
             platform: Platform::Windows,
@@ -282,6 +316,9 @@ async fn connected_direct_fixture() -> DirectFixture {
         client,
         secure,
         input_sequence: Arc::new(Mutex::new(InputSequencer::new())),
+        control_order: Arc::new(Mutex::new(())),
+        received_transport_events: Arc::new(AtomicU64::new(0)),
+        input_writes_started: Arc::new(AtomicU64::new(0)),
         assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
         reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, RELIABLE_ASSEMBLY_MAX_AGE),
         video_config: None,
@@ -296,17 +333,18 @@ async fn connected_direct_fixture() -> DirectFixture {
         reliable_trace_started: None,
         video_path,
         direct_session: None,
-        direct_connection: Some(Arc::new(direct)),
+        direct_connection: Some(direct),
         last_direct_datagram_at: Some(Instant::now()),
     };
     DirectFixture {
         runtime,
         host,
         host_secure,
-        direct_peer: Arc::new(peer),
+        direct_peer: peer,
         _controller_endpoint: controller_endpoint,
         _peer_endpoint: peer_endpoint,
         _relay: relay,
+        _cleanup: cleanup,
     }
 }
 
@@ -333,7 +371,7 @@ fn secure_sessions() -> (SecureSession, SecureSession) {
     )
 }
 
-async fn spawn_relay() -> TestRelay {
+async fn spawn_relay(backpressure: bool) -> TestRelay {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let certificate_der = certificate.cert.der().to_vec();
@@ -350,11 +388,16 @@ async fn spawn_relay() -> TestRelay {
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
     ));
+    let mut transport = quinn::TransportConfig::default();
+    if backpressure {
+        fixture_flow_control_limits().apply_to(&mut transport);
+    }
     let relay = Arc::new(
-        RelayServer::bind(
+        RelayServer::bind_with_transport(
             "127.0.0.1:0".parse().unwrap(),
             server_config,
             RelayConfig::default(),
+            transport,
         )
         .await
         .unwrap(),

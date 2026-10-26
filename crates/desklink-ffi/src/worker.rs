@@ -1,9 +1,12 @@
 use std::{
+    future::Future,
     net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
+    task::{Context, Poll},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,12 +31,13 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 1_024;
 const RELEASE_RESERVE: usize = 1;
+const MAX_RELEASE_EVENTS: usize = COMMAND_CAPACITY;
 const PHASE_CONNECTING: u8 = 0;
 const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const SEND_TIMEOUT: Duration = crate::controller::CONTROLLER_SEND_TIMEOUT;
 
 type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
 
@@ -230,12 +234,18 @@ impl ControllerWorker {
     }
 
     pub(crate) fn release_all(&self, events: Vec<CapturedInput>) -> Result<(), ()> {
-        enqueue_release_all(
+        let result = enqueue_release_all(
             &self.commands,
             &self.release_events,
             &self.release_pending,
             events,
-        )
+        );
+        if result.is_err() {
+            // A release batch may not be silently truncated. Retire the session
+            // so the host releases held input through its disconnect boundary.
+            let _ = self.cancellation.send(true);
+        }
+        result
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -473,6 +483,94 @@ enum ConnectedOutcome {
     },
 }
 
+struct ConnectedSenders {
+    input: crate::controller::ControllerInputSender,
+    control: crate::controller::ControllerControlSender,
+    transfer: crate::controller::ControllerTransferSender,
+}
+
+enum ConnectedSend {
+    Input(CapturedInput),
+    Control(ControlMessage),
+    Transfer(TransferMessage),
+}
+
+struct OwnedConnectedSend {
+    context: Option<InputContext>,
+    started: bool,
+    future: Pin<Box<dyn Future<Output = Result<(), ControllerError>> + Send>>,
+}
+
+impl Future for OwnedConnectedSend {
+    type Output = Result<(), ControllerError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        // Start means entering the owned send, even if it must first wait for
+        // its sequence lock. It does not claim that bytes already hit the wire.
+        this.started = true;
+        this.future.as_mut().poll(cx)
+    }
+}
+
+fn discard_unstarted_input(sending: &mut Option<OwnedConnectedSend>, current: InputContext) {
+    if sending
+        .as_ref()
+        .is_some_and(|send| !send.started && send.context.is_some_and(|context| context != current))
+    {
+        *sending = None;
+    }
+}
+
+fn start_connected_send(
+    senders: Arc<ConnectedSenders>,
+    mut cancellation: watch::Receiver<bool>,
+    command: ConnectedSend,
+) -> OwnedConnectedSend {
+    let context = match &command {
+        ConnectedSend::Input(input) => Some(input.context),
+        _ => None,
+    };
+    OwnedConnectedSend {
+        context,
+        started: false,
+        future: Box::pin(async move {
+            send_cancellable(&mut cancellation, async move {
+                match command {
+                    ConnectedSend::Input(input) => {
+                        senders
+                            .input
+                            .send_input_with_context(input.context, input.event)
+                            .await
+                    }
+                    ConnectedSend::Control(message) => senders.control.send(message).await,
+                    ConnectedSend::Transfer(message) => senders.transfer.send(message).await,
+                }
+            })
+            .await
+        }),
+    }
+}
+
+enum ConnectedWork {
+    Event(Result<ControllerEvent, ControllerError>),
+    Sent(Result<(), ControllerError>),
+    Command(Option<ControllerCommand>),
+}
+
+fn fail_connected(
+    senders: &ConnectedSenders,
+    error: ControllerError,
+    context: Option<InputContext>,
+    stable: bool,
+) -> ConnectedOutcome {
+    senders.control.close();
+    ConnectedOutcome::Failed {
+        failure: ConnectFailure::from_controller(error),
+        stream_id: context.map_or(0, |context| context.stream_id),
+        stable,
+    }
+}
+
 async fn run_connected(
     mut controller: ControllerRuntime,
     commands: &mut mpsc::Receiver<ControllerCommand>,
@@ -482,116 +580,183 @@ async fn run_connected(
     release_events: &Arc<Mutex<Vec<CapturedInput>>>,
     release_pending: &Arc<AtomicU8>,
 ) -> ConnectedOutcome {
+    let senders = Arc::new(ConnectedSenders {
+        input: controller.input_sender(),
+        control: controller.control_sender(),
+        transfer: controller.transfer_sender(),
+    });
     let mut stable = false;
-    if let Some(events) = pending_release.take() {
-        for event in events {
-            if let Err(error) = send_cancellable(
-                cancellation,
-                controller.send_input_with_context(event.context, event.event),
-            )
-            .await
-            {
-                return ConnectedOutcome::Failed {
-                    failure: ConnectFailure::from_controller(error),
-                    stream_id: controller.active_stream_id().unwrap_or(0),
-                    stable,
+    // Input geometry is established only by an actually received VideoConfig.
+    let mut input_context: Option<InputContext> = None;
+    let initial = pending_release.take().unwrap_or_default();
+    if initial.len() > MAX_RELEASE_EVENTS {
+        return fail_connected(
+            &senders,
+            TransportError::Connection("controller release batch exceeded capacity".into()).into(),
+            input_context,
+            stable,
+        );
+    }
+    let mut releases = initial.into_iter();
+    let mut sending: Option<OwnedConnectedSend> = None;
+    loop {
+        // This stack-pinned reader survives every send completion and command.
+        // Dropping next_event after it dequeued a reliable message but before
+        // acquiring crypto would irretrievably lose that message.
+        let next_event = controller.next_event();
+        tokio::pin!(next_event);
+        let event = loop {
+            if *cancellation.borrow() {
+                senders.control.close();
+                return ConnectedOutcome::Shutdown {
+                    stream_id: input_context.map_or(0, |context| context.stream_id),
                 };
             }
-        }
-    }
-    loop {
-        tokio::select! {
-            biased;
-            command = commands.recv() => match command {
-                Some(ControllerCommand::ReleaseAll) => {
-                    release_pending.store(0, Ordering::Release);
-                    let events = take_release_events(release_events);
-                    for event in events {
-                        if let Err(error) = send_cancellable(cancellation, controller.send_input_with_context(event.context, event.event)).await {
-                            return ConnectedOutcome::Failed {
-                                failure: ConnectFailure::from_controller(error),
-                                stream_id: controller.active_stream_id().unwrap_or(0),
-                                stable,
-                            };
+            if sending.is_none() && input_context.is_some() {
+                for input in releases.by_ref() {
+                    if Some(input.context) == input_context {
+                        sending = Some(start_connected_send(
+                            senders.clone(),
+                            cancellation.clone(),
+                            ConnectedSend::Input(input),
+                        ));
+                        break;
+                    }
+                }
+            }
+            let has_send = sending.is_some();
+            let receive_command = !has_send && releases.len() == 0;
+            let work = tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    let _ = changed;
+                    senders.control.close();
+                    return ConnectedOutcome::Shutdown { stream_id: input_context.map_or(0, |context| context.stream_id) };
+                }
+                work = async {
+                    // Fairness below the session cancellation boundary prevents
+                    // an always-ready input batch or video stream starving peers.
+                    tokio::select! {
+                        event = &mut next_event => ConnectedWork::Event(event),
+                        result = async { Pin::new(sending.as_mut().expect("send enabled")).await }, if has_send => ConnectedWork::Sent(result),
+                        command = commands.recv(), if receive_command => ConnectedWork::Command(command),
+                    }
+                } => work,
+            };
+            // A sender clone may observe the watch update after the outer
+            // cancellation branch was already polled Pending in this tick.
+            // User cancellation wins over its resulting Closed/error outcome.
+            if *cancellation.borrow() {
+                senders.control.close();
+                return ConnectedOutcome::Shutdown {
+                    stream_id: input_context.map_or(0, |context| context.stream_id),
+                };
+            }
+            match work {
+                ConnectedWork::Event(event) => break event,
+                ConnectedWork::Sent(result) => {
+                    sending = None;
+                    if let Err(error) = result {
+                        return fail_connected(&senders, error, input_context, stable);
+                    }
+                }
+                ConnectedWork::Command(command) => match command {
+                    Some(ControllerCommand::SendInput(input)) => {
+                        // Only unstarted events are filtered. A running reliable
+                        // write keeps its original epoch until completion.
+                        if Some(input.context) == input_context {
+                            sending = Some(start_connected_send(
+                                senders.clone(),
+                                cancellation.clone(),
+                                ConnectedSend::Input(input),
+                            ));
                         }
                     }
-                }
-                Some(ControllerCommand::SendInput(event)) => {
-                    if let Err(error) = send_cancellable(cancellation, controller.send_input_with_context(event.context, event.event)).await {
-                        return ConnectedOutcome::Failed {
-                            failure: ConnectFailure::from_controller(error),
-                            stream_id: controller.active_stream_id().unwrap_or(0),
-                            stable,
-                        };
+                    Some(ControllerCommand::ReleaseAll) => {
+                        release_pending.store(0, Ordering::Release);
+                        let events = take_release_events(release_events);
+                        if events.len() > MAX_RELEASE_EVENTS {
+                            return fail_connected(
+                                &senders,
+                                TransportError::Connection(
+                                    "controller release batch exceeded capacity".into(),
+                                )
+                                .into(),
+                                input_context,
+                                stable,
+                            );
+                        }
+                        releases = events.into_iter();
                     }
-                }
-                Some(ControllerCommand::RequestKeyframe) => {
-                    if let Err(error) = send_cancellable(cancellation, controller.request_keyframe()).await {
-                        if matches!(error, ControllerError::NoActiveStream) {
+                    Some(ControllerCommand::RequestKeyframe) => {
+                        if let Some(context) = input_context {
+                            sending = Some(start_connected_send(
+                                senders.clone(),
+                                cancellation.clone(),
+                                ConnectedSend::Control(ControlMessage::RequestKeyframe {
+                                    stream_id: context.stream_id,
+                                }),
+                            ));
+                        } else {
                             callback.emit_error_with_state(
-                                &error.to_string(),
+                                "no active video stream is available",
                                 0,
                                 DesklinkState::StartingVideo,
                             );
-                            continue;
                         }
-                        return ConnectedOutcome::Failed {
-                            failure: ConnectFailure::from_controller(error),
-                            stream_id: controller.active_stream_id().unwrap_or(0),
-                            stable,
+                    }
+                    Some(ControllerCommand::Control(message)) => {
+                        sending = Some(start_connected_send(
+                            senders.clone(),
+                            cancellation.clone(),
+                            ConnectedSend::Control(message),
+                        ));
+                    }
+                    Some(ControllerCommand::Transfer(message)) => {
+                        sending = Some(start_connected_send(
+                            senders.clone(),
+                            cancellation.clone(),
+                            ConnectedSend::Transfer(message),
+                        ));
+                    }
+                    Some(ControllerCommand::Shutdown) | None => {
+                        senders.control.close();
+                        return ConnectedOutcome::Shutdown {
+                            stream_id: input_context.map_or(0, |context| context.stream_id),
                         };
                     }
-                }
-                Some(command @ (ControllerCommand::Control(_) | ControllerCommand::Transfer(_))) => {
-                    let result = match command {
-                        ControllerCommand::Control(message) => send_cancellable(cancellation, controller.send_controller_control(message)).await,
-                        ControllerCommand::Transfer(message) => send_cancellable(cancellation, controller.send_transfer(message)).await,
-                        _ => unreachable!(),
-                    };
-                    if let Err(error) = result {
-                        return ConnectedOutcome::Failed { failure: ConnectFailure::from_controller(error), stream_id: controller.active_stream_id().unwrap_or(0), stable };
-                    }
-                }
-                Some(ControllerCommand::Shutdown) | None => {
-                    return ConnectedOutcome::Shutdown {
-                        stream_id: controller.active_stream_id().unwrap_or(0),
-                    };
-                }
-            },
-            changed = cancellation.changed() => {
-                let _ = changed;
-                return ConnectedOutcome::Shutdown {
-                    stream_id: controller.active_stream_id().unwrap_or(0),
-                };
+                },
             }
-            event = controller.next_event() => match event {
-                Ok(ControllerEvent::Closed { reason }) => {
-                    return ConnectedOutcome::Failed {
-                        failure: ConnectFailure::retryable(format!("transport closed: {reason}")),
-                        stream_id: controller.active_stream_id().unwrap_or(0),
-                        stable,
-                    };
-                }
-                Ok(event) => {
-                    if matches!(event, ControllerEvent::VideoConfig(_)) {
-                        stable = true;
-                    }
-                    let _ = emit_controller_event(callback, event);
-                }
-                Err(error) => {
-                    return ConnectedOutcome::Failed {
-                        failure: ConnectFailure::from_controller(error),
-                        stream_id: controller.active_stream_id().unwrap_or(0),
-                        stable,
-                    };
-                }
+        };
+        match event {
+            Ok(ControllerEvent::Closed { reason }) => {
+                return fail_connected(
+                    &senders,
+                    TransportError::Connection(format!("transport closed: {reason}")).into(),
+                    input_context,
+                    stable,
+                );
             }
+            Ok(event) => {
+                if let ControllerEvent::VideoConfig(config) = &event {
+                    stable = true;
+                    let current = InputContext {
+                        stream_id: config.stream_id,
+                        input_epoch: config.input_epoch,
+                    };
+                    discard_unstarted_input(&mut sending, current);
+                    input_context = Some(current);
+                }
+                let _ = emit_controller_event(callback, event);
+            }
+            Err(error) => return fail_connected(&senders, error, input_context, stable),
         }
     }
 }
 
-/// Cancellation must cover the send itself: the outer event select is not
-/// polled while one of its branches is awaiting QUIC flow-control credit.
+/// Every owned reliable operation has a session-wide cancellation/deadline.
+/// Timeout/cancellation retires the connection; an ordinary epoch change never
+/// interrupts an operation that has entered this send boundary.
 async fn send_cancellable<T>(
     cancellation: &mut watch::Receiver<bool>,
     send: impl std::future::Future<Output = Result<T, ControllerError>>,
@@ -719,8 +884,10 @@ async fn wait_for_retry(
                     release_pending.store(0, Ordering::Release);
                     let events = take_release_events(release_events);
                     if let Some(pending) = pending_release {
+                        if pending.len().saturating_add(events.len()) > MAX_RELEASE_EVENTS { return false; }
                         pending.extend(events);
                     } else {
+                        if events.len() > MAX_RELEASE_EVENTS { return false; }
                         *pending_release = Some(events);
                     }
                 }
@@ -921,6 +1088,9 @@ fn enqueue_release_all(
         let mut pending = release_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.len().saturating_add(events.len()) > MAX_RELEASE_EVENTS {
+            return Err(());
+        }
         pending.extend(events);
     }
     if release_pending.swap(1, Ordering::AcqRel) == 1 {
@@ -1263,3 +1433,7 @@ mod tests {
         assert_eq!(release_pending.load(Ordering::Acquire), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "worker/concurrent_send_tests.rs"]
+mod concurrent_send_tests;

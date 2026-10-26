@@ -62,6 +62,7 @@ const INITIAL_KEYFRAME_GRACE: Duration = Duration::from_millis(1500);
 // datagram socket. If a firewall silently drops the subsequent video packets,
 // do not leave the controller on a permanently black direct surface.
 const DIRECT_VIDEO_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONTROLLER_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum VideoPacketSource {
@@ -140,6 +141,11 @@ pub struct ControllerRuntime {
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
     input_sequence: Arc<Mutex<InputSequencer>>,
+    control_order: Arc<Mutex<()>>,
+    #[cfg(test)]
+    received_transport_events: Arc<AtomicU64>,
+    #[cfg(test)]
+    input_writes_started: Arc<AtomicU64>,
     assembler: FrameAssembler,
     reliable_assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
@@ -158,11 +164,22 @@ pub struct ControllerRuntime {
     last_direct_datagram_at: Option<Instant>,
 }
 
+#[cfg(test)]
+pub(crate) struct ControllerReceiveTestState {
+    pub(crate) client: Arc<QuicClient>,
+    pub(crate) dequeued: Arc<AtomicU64>,
+    pub(crate) secure: Arc<Mutex<SecureSession>>,
+    pub(crate) input_order: Arc<Mutex<InputSequencer>>,
+    pub(crate) writes_started: Arc<AtomicU64>,
+}
+
 #[derive(Clone)]
 pub struct ControllerInputSender {
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
     input_sequence: Arc<Mutex<InputSequencer>>,
+    #[cfg(test)]
+    input_writes_started: Arc<AtomicU64>,
 }
 
 impl ControllerInputSender {
@@ -180,8 +197,45 @@ impl ControllerInputSender {
             &self.input_sequence,
             context,
             event,
+            #[cfg(test)]
+            &self.input_writes_started,
         )
         .await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ControllerControlSender {
+    client: Arc<QuicClient>,
+    secure: Arc<Mutex<SecureSession>>,
+    order: Arc<Mutex<()>>,
+}
+
+impl ControllerControlSender {
+    pub(crate) async fn send(&self, message: ControlMessage) -> Result<(), ControllerError> {
+        // Runtime-generated recovery requests and worker commands share one
+        // reliable lane. Preserve seal/wire order without holding crypto at I/O.
+        match tokio::time::timeout(CONTROLLER_SEND_TIMEOUT, async {
+            let _order = self.order.lock().await;
+            send_control(&self.client, &self.secure, &message).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // A partial reliable write may not be reused by the next
+                // sender. Retire the entire session before exposing timeout.
+                self.close();
+                Err(
+                    TransportError::Connection("controller control send deadline exceeded".into())
+                        .into(),
+                )
+            }
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.client.close(b"desklink controller session retired");
     }
 }
 
@@ -275,6 +329,11 @@ impl ControllerRuntime {
             client,
             secure,
             input_sequence: Arc::new(Mutex::new(InputSequencer::new())),
+            control_order: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            received_transport_events: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            input_writes_started: Arc::new(AtomicU64::new(0)),
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
             reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, RELIABLE_ASSEMBLY_MAX_AGE),
             video_config: None,
@@ -294,6 +353,17 @@ impl ControllerRuntime {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn receive_test_state(&self) -> ControllerReceiveTestState {
+        ControllerReceiveTestState {
+            client: self.client.clone(),
+            dequeued: self.received_transport_events.clone(),
+            secure: self.secure.clone(),
+            input_order: self.input_sequence.clone(),
+            writes_started: self.input_writes_started.clone(),
+        }
+    }
+
     pub fn video_path_state(&self) -> DirectVideoPathState {
         self.video_path.state().clone()
     }
@@ -306,7 +376,15 @@ impl ControllerRuntime {
         &self,
         message: ControlMessage,
     ) -> Result<(), ControllerError> {
-        send_control(&self.client, &self.secure, &message).await
+        self.control_sender().send(message).await
+    }
+
+    pub(crate) fn control_sender(&self) -> ControllerControlSender {
+        ControllerControlSender {
+            client: self.client.clone(),
+            secure: self.secure.clone(),
+            order: self.control_order.clone(),
+        }
     }
 
     /// Reports the path currently carrying video datagrams. The authenticated
@@ -374,6 +452,8 @@ impl ControllerRuntime {
             &self.input_sequence,
             context,
             event,
+            #[cfg(test)]
+            &self.input_writes_started,
         )
         .await
     }
@@ -385,6 +465,8 @@ impl ControllerRuntime {
             client: self.client.clone(),
             secure: self.secure.clone(),
             input_sequence: self.input_sequence.clone(),
+            #[cfg(test)]
+            input_writes_started: self.input_writes_started.clone(),
         }
     }
 
@@ -396,34 +478,26 @@ impl ControllerRuntime {
     }
 
     pub async fn select_display(&self, display_id: u32) -> Result<(), ControllerError> {
-        let plaintext = encode_control(&ControlMessage::SelectDisplay { display_id })?;
-        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
-        self.client.send_control(ciphertext).await?;
-        Ok(())
+        self.send_controller_control(ControlMessage::SelectDisplay { display_id })
+            .await
     }
 
     pub async fn set_audio_enabled(&self, enabled: bool) -> Result<(), ControllerError> {
-        let plaintext = encode_control(&ControlMessage::SetAudioEnabled { enabled })?;
-        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
-        self.client.send_control(ciphertext).await?;
-        Ok(())
+        self.send_controller_control(ControlMessage::SetAudioEnabled { enabled })
+            .await
     }
 
     pub async fn set_video_quality(
         &self,
         preference: VideoQualityPreference,
     ) -> Result<(), ControllerError> {
-        let plaintext = encode_control(&ControlMessage::SetVideoQuality { preference })?;
-        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
-        self.client.send_control(ciphertext).await?;
-        Ok(())
+        self.send_controller_control(ControlMessage::SetVideoQuality { preference })
+            .await
     }
 
     pub async fn set_video_profile(&self, profile: H264Profile) -> Result<(), ControllerError> {
-        let plaintext = encode_control(&ControlMessage::SetVideoProfile { profile })?;
-        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
-        self.client.send_control(ciphertext).await?;
-        Ok(())
+        self.send_controller_control(ControlMessage::SetVideoProfile { profile })
+            .await
     }
 
     pub async fn report_video_network_feedback(
@@ -433,15 +507,13 @@ impl ControllerRuntime {
         decode_queue_peak: u16,
         freshness_recoveries: u16,
     ) -> Result<(), ControllerError> {
-        let plaintext = encode_control(&ControlMessage::VideoNetworkFeedback {
+        self.send_controller_control(ControlMessage::VideoNetworkFeedback {
             received_packets,
             dropped_packets,
             decode_queue_peak,
             freshness_recoveries,
-        })?;
-        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
-        self.client.send_control(ciphertext).await?;
-        Ok(())
+        })
+        .await
     }
 
     pub async fn send_transfer(&self, message: TransferMessage) -> Result<(), ControllerError> {
@@ -497,6 +569,9 @@ impl ControllerRuntime {
             } else {
                 self.next_transport_event().await?
             };
+            #[cfg(test)]
+            self.received_transport_events
+                .fetch_add(1, Ordering::SeqCst);
             match transport_event {
                 TransportEvent::Control(ciphertext) => {
                     let plaintext = open(&self.secure, SecureLane::Control, &ciphertext).await?;
@@ -931,11 +1006,9 @@ impl ControllerRuntime {
         while let Some(action) = pending.pop() {
             match action {
                 DirectVideoPathAction::SendOffer(candidate) => {
-                    send_control(
-                        &self.client,
-                        &self.secure,
-                        &ControlMessage::VideoPathCandidateOffer { candidate },
-                    )
+                    self.send_controller_control(ControlMessage::VideoPathCandidateOffer {
+                        candidate,
+                    })
                     .await?;
                 }
                 DirectVideoPathAction::SendAnswer {
@@ -943,15 +1016,11 @@ impl ControllerRuntime {
                     accepted,
                     candidate,
                 } => {
-                    send_control(
-                        &self.client,
-                        &self.secure,
-                        &ControlMessage::VideoPathCandidateAnswer {
-                            candidate_id,
-                            accepted,
-                            candidate,
-                        },
-                    )
+                    self.send_controller_control(ControlMessage::VideoPathCandidateAnswer {
+                        candidate_id,
+                        accepted,
+                        candidate,
+                    })
                     .await?;
                 }
                 DirectVideoPathAction::StartProbe { candidate, .. } => {
@@ -1020,10 +1089,8 @@ impl ControllerRuntime {
     }
 
     async fn request_keyframe_for(&self, stream_id: u64) -> Result<(), ControllerError> {
-        let plaintext = encode_control(&ControlMessage::RequestKeyframe { stream_id })?;
-        let ciphertext = seal(&self.secure, SecureLane::Control, &plaintext).await?;
-        self.client.send_control(ciphertext).await?;
-        Ok(())
+        self.send_controller_control(ControlMessage::RequestKeyframe { stream_id })
+            .await
     }
 
     fn drop_video_packet(&self) {
@@ -1203,6 +1270,7 @@ async fn send_session_input(
     input_sequence: &Mutex<InputSequencer>,
     context: InputContext,
     event: InputEvent,
+    #[cfg(test)] writes_started: &AtomicU64,
 ) -> Result<(), ControllerError> {
     context.validate()?;
     // This input-only guard preserves allocation and wire order across Runtime
@@ -1216,6 +1284,8 @@ async fn send_session_input(
         event,
     })?;
     let ciphertext = seal(secure, SecureLane::Input, &plaintext).await?;
+    #[cfg(test)]
+    writes_started.fetch_add(1, Ordering::SeqCst);
     client.send_input(ciphertext).await?;
     drop(sequence);
     Ok(())
@@ -1411,4 +1481,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "controller/direct_silence_tests.rs"]
-mod direct_silence_tests;
+pub(crate) mod direct_silence_tests;

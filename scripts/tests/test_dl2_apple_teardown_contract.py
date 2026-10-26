@@ -25,7 +25,14 @@ class TeardownContractTests(unittest.TestCase):
         connected = worker.split("async fn run_connected(", 1)[1].split("async fn send_cancellable", 1)[0]
         self.assertNotIn("controller.send_input(event).await", connected)
         self.assertNotIn("controller.request_keyframe().await", connected)
-        self.assertEqual(connected.count("send_cancellable("), 6)
+        self.assertNotIn("controller.send_input_with_context(", connected)
+        self.assertIn("let next_event = controller.next_event();", connected)
+        self.assertIn("tokio::pin!(next_event)", connected)
+        sender = worker.split("fn start_connected_send(", 1)[1].split("enum ConnectedWork", 1)[0]
+        self.assertIn("send_cancellable(&mut cancellation", sender)
+        self.assertIn("ConnectedSend::Input(input)", sender)
+        self.assertIn("ConnectedSend::Control(message)", sender)
+        self.assertIn("ConnectedSend::Transfer(message)", sender)
 
 
 if __name__ == "__main__":

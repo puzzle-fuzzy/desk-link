@@ -233,6 +233,8 @@
 
 - [x] Host 原生生产者归属：每次认证 Noise 的 Connected 固定生成非零、全局随机起点后 checked 推进的 media_generation；Connected 先保留 required event 槽、发布 owner / state，再投递原始令牌，断会话立即退役。scoped config / access-unit / cursor C 入口在入队和所有实际出队阶段校验原 owner，旧 producer 或已入队旧媒体只拒绝 / 丢弃，不关闭后继会话；StaleGeneration=5，事件尾字段与双头、C ABI 布局同步。Rust legacy 同步媒体入队也保留当时 owner，异步 producer 必须使用 scoped 入口。Host runtime 26 项、Host ABI 5 项、双头与全部 public struct 布局 2 项通过；另实际首连→换 Noise→审批 / 协商 / Connected 注入旧队列的 lib 回环及不可改写 Connected callback 快照通过。完整 source display / topology 仍未覆盖。主题 `fix(DL2-013): bind host media producers to their authenticated Noise session`。
 
+- [x] Controller worker 并发：clone sender 的 owned future 与持久栈 pin next_event 同时轮询，命令 / send 完成不会重建已取可靠消息且等待 crypto 的 reader；输入保持原 context，epoch 只过滤未首次 poll 的发送 / 未出队旧输入，已开始可靠写不截帧。ReleaseAll 有界 1024，溢出 fail-closed；取消独立于满队列，结果分支再检查用户取消，避免错误重连。Control 专用锁保证 seal / write 顺序，secure 锁不跨网络；包括自动关键帧 / Direct 回答在内的控制发送共用一秒预算，截止关闭原会话。6 项并发回归实跑通过（4 项真实 QUIC / Noise，2 项边界策略）：真实双跳背压时配置 / 帧继续、旧输入过滤且原在途帧完整、长 release 仍收媒体且取消有界、已 dequeue 可靠消息不丢、控制背压截止与连接关闭。测试端点使用明确 2 KiB flight 窗口，不靠无效 TLS config 参数或 mock 背压。主题 `fix(DL2-013): keep receiving media while ordered input writes are pending`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

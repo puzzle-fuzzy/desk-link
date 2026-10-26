@@ -47,7 +47,11 @@ class FFIContractTests(unittest.TestCase):
 
     def test_ffi_direct_probes_never_use_the_exclusive_crypto_api(self):
         controller = (ROOT / "crates/desklink-ffi/src/controller.rs").read_text(encoding="utf-8")
-        production = controller.split("#[cfg(test)]", 1)[0]
+        # Production structs may contain cfg(test) instrumentation fields. Only
+        # the standalone test module marks the end of the implementation.
+        test_module = "\n#[cfg(test)]\nmod tests {"
+        self.assertIn(test_module, controller)
+        production = controller.split(test_module, 1)[0]
         self.assertNotIn(".accept_probe_connection(", production)
         self.assertIn(".accept_probe_connection_shared(", production)
         self.assertIn(".connect_shared(&candidate, &binding, &secure, now_unix_s())", production)
