@@ -55,6 +55,31 @@ class MacInputSourceContractTests(unittest.TestCase):
         self.assertTrue(any("recordInputsForTesting = false" in block for block in debug_blocks))
         self.assertTrue(any("if recordInputsForTesting { sentInputsForTesting.append(input) }" in block for block in debug_blocks))
 
+    def test_native_text_input_is_connected_to_production_keydown(self) -> None:
+        view = source("apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift")
+        self.assertIn("final class InputView: NSView, NSTextInputClient", view)
+        self.assertIn("interpretKeyEvents([event])", view)
+        for method in ["hasMarkedText()", "markedRange()", "selectedRange()", "setMarkedText(_ value:", "unmarkText()", "insertText(_ value:", "doCommand(by selector:", "attributedSubstring(forProposedRange", "firstRect(forCharacterRange", "characterIndex(for point:"]:
+            self.assertIn(method, view)
+        keydown = view.split("override func keyDown(with event: NSEvent)", 1)[1].split("override func keyUp", 1)[0]
+        self.assertIn("compositionAtKeyDown = hasMarkedText()", keydown)
+
+    def test_composition_and_cancel_never_forward_raw_candidate_commands(self) -> None:
+        view = source("apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift")
+        marked = view.split("func setMarkedText(", 1)[1].split("func unmarkText", 1)[0]
+        self.assertNotIn("bridge?.send(", marked)
+        command = view.split("override func doCommand(by selector:", 1)[1].split("func attributedSubstring", 1)[0]
+        self.assertRegex(command, r"(?s)if hasMarkedText\(\).*cancelOperation.*discardComposition\(\).*return.*sendKeyboard")
+        release = view.split("func releaseAll()", 1)[1].split("func synchronizeSession", 1)[0]
+        self.assertIn("discardComposition()", release)
+
+    def test_candidate_coordinates_are_screen_coordinates_from_remote_click_anchor(self) -> None:
+        view = source("apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift")
+        self.assertIn("textFocusAnchor = point", view)
+        self.assertIn("window.convertToScreen(convert(anchor, to: nil))", view)
+        self.assertIn("textFocusAnchor.x * videoRect.width", view)
+        self.assertIn("textFocusAnchor.y * videoRect.height", view)
+
 
 if __name__ == "__main__":
     unittest.main()

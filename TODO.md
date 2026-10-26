@@ -125,6 +125,9 @@
 ### DL2-006 · P1 · 为 macOS 接入真实本地输入法
 
 - [ ] 接通 AppKit 组合文本、候选、最终提交和文本发送链。
+- [x] 代码接线：生产 InputView 实现 `NSTextInputClient`，`keyDown → interpretKeyEvents → setMarkedText / insertText / doCommand` 接入系统输入上下文；组合文本及 UTF-16 选区留本地，最终提交按文本发送；候选取消、失焦和会话切换丢弃组合，避免透传 Escape / 空格。修复主题：`fix(DL2-006): connect AppKit composition to remote text commits`。
+- [x] Windows 静态验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract -v`，9 项源码合同通过；`git diff --check` 通过。新增 5 项 Swift 输入上下文回调与最终 FFI 编码回归，尚未在 Mac 运行；这些回调合同不代表真实拼音验收。
+- [ ] Mac 自动与真机：拼音、中文标点、选词、中英切换、Emoji、死键、多行和候选取消仍需 Swift/Xcode 与真 Mac；候选坐标目前随最后一次远端点击及视频布局变化，协议尚未提供远端 caret 几何，远端用方向键移动插入点后的精确候选跟随仍未完成。
 - **证据 / 类型：能力缺口。** `apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift:27,66-67,97-105` 是直接读取 event.characters 的 NSView，没有 NSTextInputClient、interpretKeyEvents、insertText 或 marked-text 管理。现有人工传入“中”的 mapper 测试不覆盖真实输入法。
 - **方案：** 使用原生文本承载或实现 NSTextInputClient；组合期间不转发拼音和选词键，提交后有序发送最终文本；候选窗口定位跟随远程输入焦点；与 DL2-005 共用清晰的文本/按键契约。[Apple 文本输入接口](https://developer.apple.com/documentation/appkit/nstextinputclient?language=objc)规定了自定义视图需要接入的组合文本方法。
 - **验收：** 真 Mac 拼音、中文标点、中英切换、退格、回车/空格选词、Emoji、死键及多行输入；取消候选不向远端多发 Escape/空格。

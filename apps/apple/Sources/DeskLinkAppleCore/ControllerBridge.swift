@@ -287,8 +287,12 @@ public final class ControllerBridge: ObservableObject {
         case let .character(scalar, pressed, modifiers):
             input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: scalar, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
         case let .unicode(text, modifiers):
+            var previousWasCR = false
             for scalar in text.unicodeScalars {
-                var characterInput = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: scalar.value, pressed: 1, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
+                if scalar.value == 10 && previousWasCR { previousWasCR = false; continue }
+                previousWasCR = scalar.value == 13
+                let specialKey: UInt32 = scalar.value == 10 || scalar.value == 13 ? 1 : (scalar.value == 9 ? 4 : 0)
+                var characterInput = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: specialKey, character: specialKey == 0 ? scalar.value : 0, pressed: 1, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
                 sendInput(&characterInput)
                 characterInput.pressed = 0
                 sendInput(&characterInput)

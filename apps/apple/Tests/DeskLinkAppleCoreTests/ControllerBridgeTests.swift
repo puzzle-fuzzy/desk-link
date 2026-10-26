@@ -5,6 +5,14 @@ import XCTest
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
+    func testMultilineCommittedTextMapsCRLFAndTabToBalancedSpecialKeys() {
+        let bridge = ControllerBridge.testing()
+        bridge.recordInputsForTesting = true
+        bridge.send(input: .unicode("中\r\n\t😀\n", modifiers: []))
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.pressed), [1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.key_code), [0, 0, 1, 1, 4, 4, 0, 0, 1, 1])
+    }
+
     func testPhysicalCharacterEncodesPressedStateAndModifierMaskIntoFFIInput() {
         let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
         bridge.recordInputsForTesting = true
