@@ -194,6 +194,10 @@
 - **验收：** 输出可复跑的硬件/网络/画面矩阵与 p50/p95/p99，记录分配率、copy bytes、功耗/温度、队列年龄、音画延迟和长稳斜率；每次性能变更附同机对照，禁止只报平均 FPS。
 - **依赖：** 为 DL2-015～024 提供量化依据；不能为了追求单项 FPS 牺牲输入、文字清晰度或恢复正确性。
 
+- [x] **已实现并自动验证（`perf(DL2-014): add reproducible offline media stage baseline`）：** 编码器固定单样本记录本机单调时钟convert/MFT/输出驻留与显式复制字节；离线合成基线命令见 `docs/windows-media-baseline.md`，输出p50/p95/p99、运行前后源码指纹，未测GPU/网络/端到端字段为null。
+- **验证：** 经 `scripts/run-windows-cargo.py` 执行 `test -p desklink-windows --test encoder_contract --example media_baseline --locked`（11+1通过，1个既有人工基准忽略）；`clippy -p desklink-windows --lib --example media_baseline --locked -- -D warnings`通过；Python编译与64×64/3帧工具烟测通过。并行编辑期间报告正确标记源码变化，烟测不是稳定性能结论。
+- [ ] **仍待完整基线：** GPU/双机、队列及端到端、分配/功耗/温度/长稳矩阵与同条件前后实测；本切片不宣称性能收益。
+
 ### DL2-015 · P1 · 将 Windows 捕获与颜色转换尽量留在 GPU
 
 - [ ] 重构 texture 生命周期，减少每帧 CPU 回读、逐像素转换与临时分配。

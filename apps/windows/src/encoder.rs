@@ -71,6 +71,25 @@ pub struct EncodedFrame {
     pub sequence_header: Option<Vec<u8>>,
 }
 
+/// Local, monotonic measurements for the most recent encoder submission.
+/// Byte counters cover the explicit NV12 write and MF input copy only; they
+/// are not allocator telemetry or a count of driver/GPU transfers.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct EncoderPerformanceSample {
+    pub frame_id: u64,
+    pub config_version: u32,
+    pub convert_us: u64,
+    pub mft_us: u64,
+    pub output_residence_us: Option<u64>,
+    pub pending_frames: usize,
+    pub nv12_written_bytes: usize,
+    pub mf_input_copy_bytes: usize,
+}
+
+fn elapsed_us(started: std::time::Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EncoderError {
     InvalidDimensions,
@@ -390,6 +409,7 @@ pub struct H264Encoder {
     frame_id: u64,
     config_version: u32,
     profile: H264Profile,
+    last_performance_sample: Option<EncoderPerformanceSample>,
     #[cfg(windows)]
     pending_frames: std::collections::VecDeque<PendingFrame>,
     #[cfg(windows)]
@@ -402,6 +422,7 @@ struct PendingFrame {
     frame_id: u64,
     config_version: u32,
     timestamp_us: u64,
+    submitted_at: std::time::Instant,
 }
 
 impl H264Encoder {
@@ -464,6 +485,7 @@ impl H264Encoder {
                 frame_id: 0,
                 config_version: 1,
                 profile,
+                last_performance_sample: None,
                 pending_frames: std::collections::VecDeque::new(),
                 backend,
             })
@@ -481,6 +503,7 @@ impl H264Encoder {
         frame: CapturedFrame,
         force_keyframe: bool,
     ) -> Result<EncodedFrame, EncoderError> {
+        self.last_performance_sample = None;
         let target_dimensions = fit_h264_dimensions_with_limit(
             frame.width,
             frame.height,
@@ -493,21 +516,38 @@ impl H264Encoder {
 
         #[cfg(windows)]
         {
+            let submitted_at = std::time::Instant::now();
             let nv12 = native::frame_to_nv12(&frame, self.width, self.height)?;
+            let convert_us = elapsed_us(submitted_at);
             let next_frame_id = self.frame_id.wrapping_add(1).max(1);
             let request_keyframe = force_keyframe || next_frame_id == 1;
+            let mft_started = std::time::Instant::now();
             let output = self
                 .backend
                 .encode(&nv12, frame.timestamp_us, request_keyframe)?;
+            self.last_performance_sample = Some(EncoderPerformanceSample {
+                frame_id: next_frame_id,
+                config_version: self.config_version,
+                convert_us,
+                mft_us: elapsed_us(mft_started),
+                output_residence_us: None,
+                pending_frames: 0,
+                nv12_written_bytes: nv12.len(),
+                mf_input_copy_bytes: nv12.len(),
+            });
             self.frame_id = next_frame_id;
             self.pending_frames.push_back(PendingFrame {
                 frame_id: next_frame_id,
                 config_version: self.config_version,
                 timestamp_us: frame.timestamp_us,
+                submitted_at,
             });
             let Some(output) = output else {
                 while self.pending_frames.len() > MAX_PENDING_FRAMES {
                     self.pending_frames.pop_front();
+                }
+                if let Some(sample) = &mut self.last_performance_sample {
+                    sample.pending_frames = self.pending_frames.len();
                 }
                 return Err(EncoderError::NeedMoreInput);
             };
@@ -525,6 +565,10 @@ impl H264Encoder {
             let Some(pending) = pending else {
                 return Err(EncoderError::NeedMoreInput);
             };
+            if let Some(sample) = &mut self.last_performance_sample {
+                sample.pending_frames = self.pending_frames.len();
+                sample.output_residence_us = Some(elapsed_us(pending.submitted_at));
+            }
             Ok(EncodedFrame {
                 frame_id: pending.frame_id,
                 config_version: pending.config_version,
@@ -573,6 +617,7 @@ impl H264Encoder {
             self.backend = backend;
             self.profile = profile;
             self.pending_frames.clear();
+            self.last_performance_sample = None;
         }
         self.width = width;
         self.height = height;
@@ -618,6 +663,7 @@ impl H264Encoder {
             self.backend = backend;
             self.profile = profile;
             self.pending_frames.clear();
+            self.last_performance_sample = None;
         }
         self.width = width;
         self.height = height;
@@ -635,6 +681,10 @@ impl H264Encoder {
 
     pub fn profile(&self) -> H264Profile {
         self.profile
+    }
+
+    pub fn last_performance_sample(&self) -> Option<EncoderPerformanceSample> {
+        self.last_performance_sample
     }
 }
 
