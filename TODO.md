@@ -335,6 +335,10 @@
 - **方案：** 保留协议已有的 u64 尺寸/偏移（`crates/desklink-protocol/src/lib.rs:463,473,481`），贯通大文件上限、UI/FFI 计数与空间预估；增加文件树 manifest、分块校验和可复用断点证明。重名冲突、符号链接/路径边界、部分成功、失败项重试与取消组成同一工作流，不能仅调大上限，把慢扫描转移给用户等待。
 - **验收：** >4 GiB 文件、深层目录、中文/长名称、同名、稀疏文件和慢盘；断网/重启后仅在身份及源内容匹配时恢复；完整校验后才显示完成。保留现有双向传输和确认机制，不能误当它们未实现。
 
+- [x] **已实现并自动验证（`perf(DL2-030): verify resumed sources with one streaming hash`）：** 新 `OutgoingFileReader` 在同一已打开句柄/hasher上只扫描一次已收前缀，再从精确u64 offset发送后缀及完整hash；Host出站接入，保留mpsc(2)背压。首尾验证size/mtime，Windows只读共享禁止发送期间写入/删除源文件；不改变既有确认和身份约束。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 20通过；新增中块续传/最终hash、源变化先拒绝、取消/未读完不允许完成、Windows源写入删除排斥4项。此切片消除单次重试的重复扫描，仍有每次重试O(prefix)校验。
+- [ ] **仍待功能/真机：** >256MiB与>4GiB全链边界、目录manifest/冲突/符号链接、持久分块证明及空间预估、控制端复用reader、深目录/稀疏/慢盘实测；未仅调大上限或新增不兼容wire字段。
+
 ### DL2-031 · P2 · 让等待队列中所有文件都能管理
 
 - [ ] 保留紧凑摘要，并允许展开完整队列、逐项移除。

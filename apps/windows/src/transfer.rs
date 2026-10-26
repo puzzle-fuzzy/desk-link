@@ -251,6 +251,138 @@ pub struct OutgoingFile {
     pub modified_at_unix_ns: u64,
 }
 
+/// One opened source and one incremental hash for both resume proof and final
+/// integrity. The already verified prefix is never read a second time.
+/// All methods perform blocking IO and must run on a file producer thread.
+pub struct OutgoingFileReader {
+    file: File,
+    hasher: Blake2s256,
+    offset: u64,
+    expected_size: u64,
+    modified_at_unix_ns: u64,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl OutgoingFileReader {
+    pub fn open(
+        source: &OutgoingFile,
+        resume_offset: u64,
+        expected_prefix_hash: Option<[u8; 32]>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, TransferResult> {
+        if resume_offset > source.size || (resume_offset == 0) != expected_prefix_hash.is_none() {
+            return Err(TransferResult::InvalidData);
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Hold a stable source snapshot: another Windows handle cannot
+            // modify, replace, or truncate this file while it is being sent.
+            options.share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0);
+        }
+        let file = options
+            .open(&source.path)
+            .map_err(|_| TransferResult::IoFailed)?;
+        let mut reader = Self {
+            file,
+            hasher: Blake2s256::new(),
+            offset: 0,
+            expected_size: source.size,
+            modified_at_unix_ns: source.modified_at_unix_ns,
+            cancellation,
+        };
+        reader.check_source()?;
+        let mut buffer = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
+        while reader.offset < resume_offset {
+            reader.check_cancelled()?;
+            let limit = usize::try_from((resume_offset - reader.offset).min(buffer.len() as u64))
+                .map_err(|_| TransferResult::InvalidData)?;
+            let read = reader
+                .file
+                .read(&mut buffer[..limit])
+                .map_err(|_| TransferResult::IoFailed)?;
+            if read == 0 {
+                return Err(TransferResult::SourceChanged);
+            }
+            reader.hasher.update(&buffer[..read]);
+            reader.offset += read as u64;
+        }
+        if let Some(expected) = expected_prefix_hash {
+            let actual: [u8; 32] = reader.hasher.clone().finalize().into();
+            if expected != actual {
+                return Err(TransferResult::SourceChanged);
+            }
+        }
+        reader.check_cancelled()?;
+        Ok(reader)
+    }
+
+    pub fn read_chunk(&mut self) -> Result<Option<(u64, Vec<u8>)>, TransferResult> {
+        self.check_cancelled()?;
+        if self.offset == self.expected_size {
+            return Ok(None);
+        }
+        let limit = usize::try_from(
+            (self.expected_size - self.offset).min(MAX_TRANSFER_CHUNK_BYTES as u64),
+        )
+        .map_err(|_| TransferResult::InvalidData)?;
+        let mut bytes = vec![0_u8; limit];
+        let read = self
+            .file
+            .read(&mut bytes)
+            .map_err(|_| TransferResult::IoFailed)?;
+        if read == 0 {
+            return Err(TransferResult::SourceChanged);
+        }
+        bytes.truncate(read);
+        let offset = self.offset;
+        self.offset += read as u64;
+        self.hasher.update(&bytes);
+        Ok(Some((offset, bytes)))
+    }
+
+    pub fn finish(self) -> Result<[u8; 32], TransferResult> {
+        self.check_cancelled()?;
+        if self.offset != self.expected_size {
+            return Err(TransferResult::InvalidData);
+        }
+        self.check_source()?;
+        Ok(self.hasher.finalize().into())
+    }
+
+    fn check_cancelled(&self) -> Result<(), TransferResult> {
+        if self.cancellation.load(Ordering::Acquire) {
+            Err(TransferResult::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_source(&self) -> Result<(), TransferResult> {
+        let metadata = self.file.metadata().map_err(|_| TransferResult::IoFailed)?;
+        if !metadata.is_file()
+            || metadata.len() != self.expected_size
+            || (self.modified_at_unix_ns != 0
+                && modified_at_unix_ns(&metadata) != self.modified_at_unix_ns)
+        {
+            Err(TransferResult::SourceChanged)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn modified_at_unix_ns(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
 pub fn prepare_outgoing_file(path: PathBuf) -> Result<OutgoingFile, TransferResult> {
     let metadata = fs::metadata(&path).map_err(|_| TransferResult::IoFailed)?;
     if !metadata.is_file() {
@@ -275,12 +407,7 @@ pub fn prepare_outgoing_file(path: PathBuf) -> Result<OutgoingFile, TransferResu
         path,
         name,
         size: metadata.len(),
-        modified_at_unix_ns: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
-            .unwrap_or(0),
+        modified_at_unix_ns: modified_at_unix_ns(&metadata),
     })
 }
 
@@ -1002,10 +1129,10 @@ fn human_size(bytes: u64) -> String {
 mod tests {
     use super::{
         INCOMING_DISK_QUEUE_CAPACITY, IncomingDiskCommand, IncomingFile, IncomingFileWorker,
-        MIN_FREE_SPACE_AFTER_RECEIVE, STALE_INCOMING_FILE_AGE, chunk_after_resume,
-        cleanup_stale_incoming_files, discard_incoming_resume_in, incoming_staging_directory,
-        incoming_temporary_path, prepare_outgoing_file, receive_capacity_is_sufficient,
-        verify_resume_prefix,
+        MIN_FREE_SPACE_AFTER_RECEIVE, OutgoingFileReader, STALE_INCOMING_FILE_AGE,
+        chunk_after_resume, cleanup_stale_incoming_files, discard_incoming_resume_in,
+        incoming_staging_directory, incoming_temporary_path, prepare_outgoing_file,
+        receive_capacity_is_sufficient, verify_resume_prefix,
     };
     use blake2::{Blake2s256, Digest};
     use desklink_protocol::{MAX_TRANSFER_FILE_BYTES, TransferResult};
@@ -1027,6 +1154,119 @@ mod tests {
         let staging = root.join("staging");
         let downloads = root.join("downloads");
         (root, staging, downloads)
+    }
+
+    #[test]
+    fn one_pass_source_reader_resumes_at_exact_chunk_boundaries_and_keeps_final_hash() {
+        use std::{
+            io::Seek,
+            sync::{Arc, atomic::AtomicBool},
+        };
+        let (root, _, _) = roots("reader-boundaries");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        let chunk = desklink_protocol::MAX_TRANSFER_CHUNK_BYTES;
+        let payload: Vec<u8> = (0..chunk * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&path, &payload).unwrap();
+        let source = prepare_outgoing_file(path).unwrap();
+        let expected: [u8; 32] = Blake2s256::digest(&payload).into();
+        for resumed in [0, 1, chunk - 1, chunk, chunk + 3, payload.len()] {
+            let proof = (resumed > 0).then(|| Blake2s256::digest(&payload[..resumed]).into());
+            let mut reader = OutgoingFileReader::open(
+                &source,
+                resumed as u64,
+                proof,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(reader.file.stream_position().unwrap(), resumed as u64);
+            let mut sent = Vec::new();
+            let mut next_offset = resumed as u64;
+            while let Some((offset, bytes)) = reader.read_chunk().unwrap() {
+                assert_eq!(offset, next_offset);
+                assert!(bytes.len() <= chunk);
+                next_offset += bytes.len() as u64;
+                sent.extend(bytes);
+            }
+            assert_eq!(reader.file.stream_position().unwrap(), payload.len() as u64);
+            assert_eq!(sent, payload[resumed..]);
+            assert_eq!(reader.finish().unwrap(), expected);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_reader_checks_proof_and_metadata_before_sending_any_suffix() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let (root, _, _) = roots("reader-changed");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        fs::write(&path, b"desklink").unwrap();
+        let source = prepare_outgoing_file(path.clone()).unwrap();
+        assert!(matches!(
+            OutgoingFileReader::open(&source, 4, Some([0; 32]), Arc::new(AtomicBool::new(false))),
+            Err(TransferResult::SourceChanged)
+        ));
+        assert!(matches!(
+            OutgoingFileReader::open(&source, 0, Some([0; 32]), Arc::new(AtomicBool::new(false))),
+            Err(TransferResult::InvalidData)
+        ));
+        fs::write(&path, b"replaced").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(matches!(
+            OutgoingFileReader::open(&source, 0, None, Arc::new(AtomicBool::new(false))),
+            Err(TransferResult::SourceChanged)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_reader_stops_on_cancel_and_never_finalizes_a_partial_read() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (root, _, _) = roots("reader-cancel");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        fs::write(&path, b"desklink").unwrap();
+        let source = prepare_outgoing_file(path).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let reader = OutgoingFileReader::open(&source, 0, None, cancelled.clone()).unwrap();
+        assert_eq!(reader.finish(), Err(TransferResult::InvalidData));
+        let mut reader = OutgoingFileReader::open(&source, 0, None, cancelled.clone()).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(reader.read_chunk(), Err(TransferResult::Cancelled));
+        assert_eq!(reader.finish(), Err(TransferResult::Cancelled));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_reader_holds_a_read_only_windows_snapshot_until_finished() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let (root, _, _) = roots("reader-snapshot");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("source.bin");
+        fs::write(&path, b"desklink").unwrap();
+        let source = prepare_outgoing_file(path.clone()).unwrap();
+        let mut reader =
+            OutgoingFileReader::open(&source, 0, None, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(File::options().write(true).open(&path).is_err());
+        assert!(fs::remove_file(&path).is_err());
+        assert_eq!(reader.read_chunk().unwrap().unwrap().1, b"desklink");
+        reader.finish().unwrap();
+        fs::write(&path, b"changed!").unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "current_thread")]

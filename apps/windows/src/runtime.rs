@@ -1,6 +1,4 @@
 use std::{
-    fs::File,
-    io::Read,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -8,7 +6,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use blake2::{Blake2s256, Digest};
 use desklink_crypto::{
     CryptoError, DeviceIdentity, NoiseResponder, PeerIdentity, SecureLane, SecureRole,
     SecureSession,
@@ -16,12 +13,12 @@ use desklink_crypto::{
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, Codec, ControlMessage, CursorUpdate,
     DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, MAX_INPUT_AGE_US,
-    MAX_INPUT_FUTURE_SKEW_US, MAX_TRANSFER_CHUNK_BYTES, NoiseHandshake, NoiseHandshakeStep,
-    PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId, TransferMessage,
-    TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset, decode_control,
-    decode_noise_handshake, decode_session_input, decode_transfer, encode_audio_packet,
-    encode_control, encode_cursor_update, encode_noise_handshake, encode_transfer,
-    encode_video_config, encode_video_reliable_batch,
+    MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform,
+    ProtocolError, RemoteDisplay, TransferId, TransferMessage, TransferResult, VideoConfig,
+    VideoQualityPreference, VideoQualityPreset, decode_control, decode_noise_handshake,
+    decode_session_input, decode_transfer, encode_audio_packet, encode_control,
+    encode_cursor_update, encode_noise_handshake, encode_transfer, encode_video_config,
+    encode_video_reliable_batch,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -48,9 +45,9 @@ use crate::{
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
     transfer::{
-        IncomingFileWorker, OutgoingFile, chunk_after_resume, confirm_file_offer,
+        IncomingFileWorker, OutgoingFile, OutgoingFileReader, confirm_file_offer,
         notify_file_received, pick_outgoing_file, prepare_outgoing_file, read_clipboard_text,
-        verify_resume_prefix, write_clipboard_text,
+        write_clipboard_text,
     },
     window::ApprovalState,
 };
@@ -3251,7 +3248,7 @@ struct HostOutgoingEvent {
 enum HostFileReadEvent {
     Chunk { offset: u64, bytes: Vec<u8> },
     Complete([u8; 32]),
-    Failed,
+    Failed(TransferResult),
 }
 
 async fn stream_host_outgoing_file(
@@ -3266,55 +3263,31 @@ async fn stream_host_outgoing_file(
     if resume_offset > file.size {
         return Err(TransferResult::InvalidData);
     }
-    let proof_path = file.path.clone();
-    tokio::task::spawn_blocking(move || {
-        verify_resume_prefix(&proof_path, resume_offset, resume_prefix_hash)
-    })
-    .await
-    .unwrap_or(Err(TransferResult::IoFailed))?;
     let (events, mut receiver) = mpsc::channel(2);
     let producer_cancellation = cancellation.clone();
-    let path = file.path.clone();
-    let size = file.size;
+    let source = file.clone();
     tokio::task::spawn_blocking(move || {
         let result = (|| {
-            let mut file = File::open(path).map_err(|_| ())?;
-            let mut hasher = Blake2s256::new();
-            let mut offset = 0_u64;
-            loop {
-                if producer_cancellation.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let mut bytes = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
-                let read = file.read(&mut bytes).map_err(|_| ())?;
-                if read == 0 {
-                    break;
-                }
-                bytes.truncate(read);
-                hasher.update(&bytes);
-                let end = offset.checked_add(read as u64).ok_or(())?;
-                if let Some((chunk_offset, bytes)) =
-                    chunk_after_resume(offset, bytes, resume_offset).map_err(|_| ())?
-                {
-                    events
-                        .blocking_send(HostFileReadEvent::Chunk {
-                            offset: chunk_offset,
-                            bytes,
-                        })
-                        .map_err(|_| ())?;
-                }
-                offset = end;
-            }
-            if offset != size {
-                return Err(());
+            // Prefix proof and complete-content hashing share one opened source
+            // and hasher. A retry no longer reads the prefix twice.
+            let mut reader = OutgoingFileReader::open(
+                &source,
+                resume_offset,
+                resume_prefix_hash,
+                producer_cancellation,
+            )?;
+            while let Some((offset, bytes)) = reader.read_chunk()? {
+                events
+                    .blocking_send(HostFileReadEvent::Chunk { offset, bytes })
+                    .map_err(|_| TransferResult::IoFailed)?;
             }
             events
-                .blocking_send(HostFileReadEvent::Complete(hasher.finalize().into()))
-                .map_err(|_| ())?;
-            Ok(())
+                .blocking_send(HostFileReadEvent::Complete(reader.finish()?))
+                .map_err(|_| TransferResult::IoFailed)?;
+            Ok::<(), TransferResult>(())
         })();
-        if result.is_err() {
-            let _ = events.blocking_send(HostFileReadEvent::Failed);
+        if let Err(error) = result {
+            let _ = events.blocking_send(HostFileReadEvent::Failed(error));
         }
     });
 
@@ -3332,7 +3305,7 @@ async fn stream_host_outgoing_file(
                 transfer_id: file.transfer_id,
                 content_hash,
             },
-            HostFileReadEvent::Failed => return Err(TransferResult::IoFailed),
+            HostFileReadEvent::Failed(error) => return Err(error),
         };
         let complete = matches!(message, TransferMessage::FileComplete { .. });
         tokio::time::timeout(
