@@ -38,10 +38,10 @@ use desklink_ffi::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FileResumeHint, FrameFlags,
-    H264Profile, InputEvent, KeyCode, MAX_CLIPBOARD_TEXT_BYTES, MAX_EXPERIMENTAL_4K_HEIGHT,
-    MAX_EXPERIMENTAL_4K_WIDTH, MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA,
-    Modifiers, MouseButton, Platform, ProtocolError, TransferId, TransferMessage, TransferResult,
-    VideoQualityPreference, VideoQualityPreset,
+    H264Profile, InputEvent, InputRestrictionReason, KeyCode, MAX_CLIPBOARD_TEXT_BYTES,
+    MAX_EXPERIMENTAL_4K_HEIGHT, MAX_EXPERIMENTAL_4K_WIDTH, MAX_POINTER_COORDINATE,
+    MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, ProtocolError,
+    TransferId, TransferMessage, TransferResult, VideoQualityPreference, VideoQualityPreset,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -529,6 +529,9 @@ pub enum ControllerSignal {
         state: &'static str,
         enabled: bool,
         message: String,
+    },
+    InputRestriction {
+        reason: Option<InputRestrictionReason>,
     },
     VideoQuality {
         preference: VideoQualityPreference,
@@ -3163,6 +3166,9 @@ async fn run_controller(
                                 .collect(),
                             active_display_id,
                         });
+                    }
+                    Ok(ControllerEvent::Control(ControlMessage::InputState { reason })) => {
+                        let _ = signals.send(ControllerSignal::InputRestriction { reason });
                     }
                     Ok(ControllerEvent::Control(ControlMessage::AudioState {
                         available,
@@ -6208,5 +6214,29 @@ mod tests {
         );
 
         assert!(decoder.decode(packets[2].clone()).is_empty());
+    }
+    #[test]
+    fn input_restriction_signal_uses_stable_categories_and_explicit_recovery() {
+        use desklink_protocol::InputRestrictionReason;
+        for (reason, expected) in [
+            (
+                Some(InputRestrictionReason::Blocked),
+                serde_json::json!("blocked"),
+            ),
+            (
+                Some(InputRestrictionReason::UnsupportedKey),
+                serde_json::json!("unsupportedKey"),
+            ),
+            (
+                Some(InputRestrictionReason::InvalidInput),
+                serde_json::json!("invalidInput"),
+            ),
+            (None, serde_json::Value::Null),
+        ] {
+            assert_eq!(
+                serde_json::to_value(super::ControllerSignal::InputRestriction { reason }).unwrap(),
+                serde_json::json!({ "kind": "inputRestriction", "reason": expected }),
+            );
+        }
     }
 }

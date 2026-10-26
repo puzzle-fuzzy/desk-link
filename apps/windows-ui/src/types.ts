@@ -286,8 +286,10 @@ export type H264Profile = "main" | "high";
 export type H264ProfileProbe = "notChecked" | "supported" | "unsupported" | "unavailable";
 export type H264ProfileFallbackReason = "decoderUnsupported" | "decoderError" | "decoderStall";
 export type VideoPathKind = "relay" | "directLan";
+export type InputRestrictionReason = "blocked" | "unsupportedKey" | "invalidInput";
 
 export type ControllerSignal =
+  | { kind: "inputRestriction"; reason: InputRestrictionReason | null }
   | { kind: "status"; runtime: ControllerRuntimeSummary }
   | ControllerVideoConfigSignal
   | {

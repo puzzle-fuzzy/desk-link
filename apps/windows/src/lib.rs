@@ -21,6 +21,7 @@ pub mod fixed_access;
 #[cfg(windows)]
 pub mod identity;
 pub mod input;
+mod input_restriction;
 #[cfg(windows)]
 pub mod recent_access;
 pub mod runtime;

@@ -120,6 +120,8 @@ import { FileQueueView } from "./file-queue-view";
 import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
 import { REMOTE_SHORTCUTS, remoteShortcutInput } from "./remote-shortcuts";
 import { remoteAudioControl } from "./remote-audio-control";
+import { inputRestrictionPresentation, restrictionAfterRuntime } from "./input-restriction";
+import type { InputRestrictionReason } from "./types";
 import {
   FileQueueActionGate,
   type FileQueueActionKind,
@@ -279,6 +281,7 @@ let h264ProfileProbe: H264ProfileProbe = "notChecked";
 let h264ProfileProbeMs: number | null = null;
 let h264ProfileFallbackReason: H264ProfileFallbackReason | null = null;
 let remoteSurfaceState: ControllerRemoteSurfaceState = "empty";
+let inputRestrictionReason: InputRestrictionReason | null = null;
 const inputDispatcher = new RemoteInputDispatcher(
   (input, streamId) => sendControllerInput({ ...input, streamId }),
   undefined,
@@ -461,6 +464,7 @@ export function updatePersistentControllerRegions(): void {
     });
   }
   updateRemoteSessionStatus();
+  updateInputRestriction();
   updateAudioControl();
   updateTransferPanel();
 }
@@ -1038,6 +1042,7 @@ function renderRemoteDesktop(): string {
         </div>
       </div>
       <div class="remote-fullscreen-guide" aria-hidden="true">鼠标移到顶部显示工具栏 · Esc 退出全屏 · 快捷键菜单可发送远端 Esc</div>
+      ${renderInputRestriction()}
       ${renderTransferPanel()}
       <form class="remote-text-entry" data-controller-text-form data-controller-text-panel hidden>
         <label for="remote-text-input">发送文字到远程电脑</label>
@@ -1079,6 +1084,22 @@ function renderAudioControl(): string {
     + '<span data-controller-audio-label>'
     + label
     + "</span></button>";
+}
+
+function renderInputRestriction(): string {
+  const state = inputRestrictionPresentation(inputRestrictionReason);
+  return `<aside class="feedback feedback--info" data-controller-input-restriction role="status" aria-live="polite" ${state ? "" : "hidden"}><strong>${escapeHtml(state?.title ?? "")}</strong><span>${escapeHtml(state?.detail ?? "")}</span></aside>`;
+}
+
+function updateInputRestriction(): void {
+  const region = document.querySelector<HTMLElement>("[data-controller-input-restriction]");
+  if (!region) return;
+  const state = inputRestrictionPresentation(inputRestrictionReason);
+  region.hidden = state === null;
+  const title = region.querySelector<HTMLElement>("strong");
+  const detail = region.querySelector<HTMLElement>("span");
+  if (title) title.textContent = state?.title ?? "";
+  if (detail) detail.textContent = state?.detail ?? "";
 }
 
 function renderTransferPanel(): string {
@@ -1506,9 +1527,15 @@ async function clearStoredDevices(): Promise<void> {
 
 function handleSignal(signal: ControllerSignal): void {
   switch (signal.kind) {
+    case "inputRestriction":
+      inputRestrictionReason = signal.reason;
+      updateInputRestriction();
+      break;
     case "status": {
       runtimeSignalRevision += 1;
       const previousRuntime = snapshot?.runtime;
+      inputRestrictionReason = restrictionAfterRuntime(inputRestrictionReason, previousRuntime, signal.runtime);
+      updateInputRestriction();
       const previousSurfaceState = remoteSurfaceState;
       const nextSurfaceState = advanceControllerRemoteSurfaceState(
         previousSurfaceState,

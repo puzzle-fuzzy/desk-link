@@ -15,13 +15,13 @@ use desklink_crypto::{
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, Codec, ControlMessage, CursorUpdate,
-    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, MAX_INPUT_AGE_US,
-    MAX_INPUT_FUTURE_SKEW_US, MAX_TRANSFER_CHUNK_BYTES, NoiseHandshake, NoiseHandshakeStep,
-    PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId, TransferMessage,
-    TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset, decode_control,
-    decode_noise_handshake, decode_session_input, decode_transfer, encode_audio_packet,
-    encode_control, encode_cursor_update, encode_noise_handshake, encode_transfer,
-    encode_video_config, encode_video_reliable_batch,
+    DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, InputRestrictionReason,
+    MAX_INPUT_AGE_US, MAX_INPUT_FUTURE_SKEW_US, MAX_TRANSFER_CHUNK_BYTES, NoiseHandshake,
+    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, ProtocolError, RemoteDisplay, TransferId,
+    TransferMessage, TransferResult, VideoConfig, VideoQualityPreference, VideoQualityPreset,
+    decode_control, decode_noise_handshake, decode_session_input, decode_transfer,
+    encode_audio_packet, encode_control, encode_cursor_update, encode_noise_handshake,
+    encode_transfer, encode_video_config, encode_video_reliable_batch,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -47,6 +47,7 @@ use crate::{
     },
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
+    input_restriction::{InputRestrictionTracker, forward_latest_input_state},
     transfer::{
         IncomingFileWorker, OutgoingFile, chunk_after_resume, confirm_file_offer, notify_file_received,
         pick_outgoing_file, prepare_outgoing_file, read_clipboard_text, verify_resume_prefix,
@@ -1194,6 +1195,13 @@ impl HostRuntime {
             force_keyframe.clone(),
             direct_connection.clone(),
         ));
+        let (input_state_updates, input_state_receiver) = watch::channel(None);
+        let mut input_feedback = Box::pin(send_input_state_loop(
+            client.clone(),
+            secure.clone(),
+            peer_generation,
+            input_state_receiver,
+        ));
         let mut inbound = Box::pin(receive_input_and_control(
             client.clone(),
             secure.clone(),
@@ -1202,6 +1210,7 @@ impl HostRuntime {
             input,
             force_keyframe,
             HostInboundContext {
+                input_state_updates,
                 capture_commands: capture_command_sender,
                 selected_desktop: selected_desktop.clone(),
                 displays: Arc::new(ready.displays),
@@ -1240,6 +1249,7 @@ impl HostRuntime {
         let outcome = tokio::select! {
             result = &mut video => result,
             result = &mut inbound => result,
+            result = &mut input_feedback => result,
             result = &mut cursor => result,
             result = &mut transfer => result,
             result = &mut audio => result,
@@ -1247,6 +1257,7 @@ impl HostRuntime {
         };
         drop(video);
         drop(inbound);
+        drop(input_feedback);
         drop(cursor);
         drop(transfer);
         drop(audio);
@@ -1412,6 +1423,7 @@ struct CaptureWorkerContext {
 }
 
 struct HostInboundContext {
+    input_state_updates: watch::Sender<Option<InputRestrictionReason>>,
     capture_commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
     displays: Arc<Vec<RemoteDisplay>>,
@@ -2513,6 +2525,7 @@ async fn receive_input_and_control(
     context: HostInboundContext,
 ) -> Result<(), HostRuntimeError> {
     let HostInboundContext {
+        input_state_updates,
         capture_commands,
         selected_desktop,
         displays,
@@ -2524,6 +2537,7 @@ async fn receive_input_and_control(
         direct_connection,
     } = context;
     let mut policy = HostInboundPolicy::new(stream_id);
+    let mut input_restriction = InputRestrictionTracker::default();
     let mut video_quality = AdaptiveVideoQuality::new();
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
     loop {
@@ -2698,7 +2712,10 @@ async fn receive_input_and_control(
                 let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
                 if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
                     input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
-                    apply_input_event(&mut input, event)?;
+                    let failure = apply_input_event(&mut input, event.clone());
+                    if let Some(reason) = input_restriction.observe(&event, failure) {
+                        input_state_updates.send_replace(reason);
+                    }
                 }
             }
             reason = client.next_closed_reason() => {
@@ -2710,18 +2727,41 @@ async fn receive_input_and_control(
 
 /// Input is a lossy edge of a remote session. A single sample can become
 /// invalid while the controller is resizing, switching displays, or crossing
-/// a stale WebView event boundary. It must never tear down the host worker or
-/// make the host appear stopped; the next valid sample will continue normally.
+/// a stale WebView event boundary. Report a stable reason without tearing down
+/// the host worker; the session tracker handles persistence and real recovery.
 fn apply_input_event<B: crate::input::InputBackend>(
     input: &mut InputInjector<B>,
     event: InputEvent,
-) -> Result<(), HostRuntimeError> {
+) -> Option<InputRestrictionReason> {
     match input.apply(event) {
-        Ok(())
-        | Err(InputInjectionError::Blocked)
-        | Err(InputInjectionError::UnsupportedKey)
-        | Err(InputInjectionError::InvalidInput) => Ok(()),
+        Ok(()) => None,
+        Err(InputInjectionError::Blocked) => Some(InputRestrictionReason::Blocked),
+        Err(InputInjectionError::UnsupportedKey) => Some(InputRestrictionReason::UnsupportedKey),
+        Err(InputInjectionError::InvalidInput) => Some(InputRestrictionReason::InvalidInput),
     }
+}
+
+async fn send_input_state_loop(
+    client: Arc<QuicClient>,
+    secure: SharedSecureSession,
+    peer_generation: u64,
+    states: watch::Receiver<Option<InputRestrictionReason>>,
+) -> Result<(), HostRuntimeError> {
+    forward_latest_input_state(states, |reason| {
+        let client = client.clone();
+        let secure = secure.clone();
+        async move {
+            let plaintext = encode_control(&ControlMessage::InputState { reason })?;
+            client
+                .send_control_for_generation(
+                    peer_generation,
+                    seal(&secure, SecureLane::Control, &plaintext).await?,
+                )
+                .await?;
+            Ok(())
+        }
+    })
+    .await
 }
 
 async fn accept_host_direct_connection(
@@ -3413,19 +3453,19 @@ mod retry_policy_tests {
             VirtualDesktop::single(desktop),
             RejectingInputBackend(InputInjectionError::Blocked),
         );
-        assert!(
+        assert_eq!(
             super::apply_input_event(
                 &mut blocked,
                 desklink_protocol::InputEvent::MouseMove { x: 1, y: 1 },
-            )
-            .is_ok()
+            ),
+            Some(desklink_protocol::InputRestrictionReason::Blocked),
         );
 
         let mut unsupported = InputInjector::with_backend(
             VirtualDesktop::single(desktop),
             RejectingInputBackend(InputInjectionError::UnsupportedKey),
         );
-        assert!(
+        assert_eq!(
             super::apply_input_event(
                 &mut unsupported,
                 desklink_protocol::InputEvent::Key {
@@ -3433,23 +3473,23 @@ mod retry_policy_tests {
                     pressed: true,
                     modifiers: Modifiers(0),
                 },
-            )
-            .is_ok()
+            ),
+            Some(desklink_protocol::InputRestrictionReason::UnsupportedKey),
         );
 
         let mut invalid = InputInjector::with_backend(
             VirtualDesktop::single(desktop),
             RejectingInputBackend(InputInjectionError::Blocked),
         );
-        assert!(
+        assert_eq!(
             super::apply_input_event(
                 &mut invalid,
                 desklink_protocol::InputEvent::MouseMove {
                     x: desklink_protocol::MAX_POINTER_COORDINATE + 1,
                     y: 1,
                 },
-            )
-            .is_ok()
+            ),
+            Some(desklink_protocol::InputRestrictionReason::InvalidInput),
         );
     }
 

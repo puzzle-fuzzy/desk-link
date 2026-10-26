@@ -145,6 +145,7 @@
 
 - [ ] 将持续输入受限转为独立会话状态，并补齐权限场景指引。
 - [x] 共享契约切片 `feat(DL2-009): add protocol 13 input restriction state`：唯一业务协议升至 13，末尾追加 InputState，三个稳定原因及 None 恢复；保留 relay JOIN 信封版本。协议/FFI 77 项、目录 6 项、Windows 原生升级提示 1 项测试通过，覆盖非法原因/截断、旧 tag、目录 12↔13 与密码先验、收到旧版 Noise/媒体拒绝。当前仅契约，未宣称输入反馈已接通。
+- [x] 输入反馈切片 `feat(DL2-009): report sustained input restrictions without disconnecting`：当前认证会话内按输入类别累计三次同因失败，去重发送有界最新状态；释放/零输入和其他类别成功不误清警，真实同类恢复后自动清除。发送等待独立于输入处理；控制端仅更新提示，不改连接状态，断开/新 stream 清旧提示。Windows 库 102 通过、1 交互桌面测试忽略；管理库 113 通过、1 签名资产忽略（含稳定 signal 回归）；前端 312 项全过，构建通过。权限边界见 `docs/windows-input-restriction-protocol13.md`，均未冒称真实 UAC/锁屏可控。
 - [ ] 新旧直接/保存连接静默握手的有界退出与提示、持续输入失败汇总/恢复、前端提示及真实权限场景验收。
 - **证据 / 类型：源码缺陷、能力边界。** `apps/windows/src/input.rs:306-326` 返回 Blocked；`apps/windows/src/runtime.rs:2714-2723` 把 Blocked / UnsupportedKey / InvalidInput 都转为 Ok。`apps/windows/assets/desklink.manifest:8` 为 asInvoker、uiAccess=false。
 - **用户影响：** 输入持续失败时，控制端仍只看到已连接；无法区分权限限制、不支持的键或远端没有响应。
