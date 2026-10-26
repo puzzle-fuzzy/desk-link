@@ -1,13 +1,15 @@
 use crate::capture::CapturedFrame;
 use desklink_protocol::H264Profile;
 
+#[cfg(any(windows, test))]
+mod async_mft;
 mod bitrate;
 
 const MAX_ENCODE_WIDTH: u32 = 2560;
 const MAX_ENCODE_HEIGHT: u32 = 1440;
 pub const EXPERIMENTAL_4K_WIDTH: u32 = 3840;
 pub const EXPERIMENTAL_4K_HEIGHT: u32 = 2160;
-const MAX_PENDING_FRAMES: usize = 2;
+const MAX_PENDING_FRAMES: usize = 16;
 // Desktop text is much less forgiving than camera video: even 12 Mbps can
 // flatten small glyphs and fine UI lines when a high-DPI display is resized
 // for the wire. Keep the existing frame-rate contract, but give the sharp
@@ -841,10 +843,13 @@ impl H264Encoder {
                 timestamp_us: frame.timestamp_us,
                 submitted_at,
             });
+            if self.pending_frames.len() > MAX_PENDING_FRAMES {
+                self.pending_frames.clear();
+                return Err(EncoderError::Native(
+                    "encoder pending metadata budget exceeded".into(),
+                ));
+            }
             let Some(output) = output else {
-                while self.pending_frames.len() > MAX_PENDING_FRAMES {
-                    self.pending_frames.pop_front();
-                }
                 if let Some(sample) = &mut self.last_performance_sample {
                     sample.pending_frames = self.pending_frames.len();
                 }
@@ -858,9 +863,6 @@ impl H264Encoder {
             } else {
                 self.pending_frames.pop_front()
             };
-            while self.pending_frames.len() > MAX_PENDING_FRAMES {
-                self.pending_frames.pop_front();
-            }
             let Some(pending) = pending else {
                 return Err(EncoderError::NeedMoreInput);
             };
@@ -1076,11 +1078,10 @@ mod native {
     };
 
     use super::{
-        AsyncMftCredits, CapturedFrame, DEFAULT_VIDEO_BITRATE, EncoderBackendInfo,
-        EncoderBackendPreference, EncoderError, PixelOrder, convert_to_nv12_into,
+        CapturedFrame, DEFAULT_VIDEO_BITRATE, EncoderBackendInfo, EncoderBackendPreference,
+        EncoderError, PixelOrder, convert_to_nv12_into,
     };
 
-    const ASYNC_FRAME_BUDGET: Duration = Duration::from_millis(100);
     const MAX_HARDWARE_CANDIDATES: usize = 16;
 
     struct NativeBitrateProperties<'a>(&'a ICodecAPI);
@@ -1236,7 +1237,10 @@ mod native {
         fps: u32,
         info: EncoderBackendInfo,
         events: Option<IMFMediaEventGenerator>,
-        credits: AsyncMftCredits,
+        scheduler: super::async_mft::Scheduler,
+        async_outputs: std::collections::VecDeque<EncodedOutput>,
+        async_output_bytes: usize,
+        async_clock: Instant,
         last_input_copy_bytes: usize,
         #[cfg(test)]
         simulated_hardware_failure: bool,
@@ -1417,7 +1421,10 @@ mod native {
                 fps,
                 info,
                 events,
-                credits: AsyncMftCredits::default(),
+                scheduler: super::async_mft::Scheduler::default(),
+                async_outputs: std::collections::VecDeque::new(),
+                async_output_bytes: 0,
+                async_clock: Instant::now(),
                 last_input_copy_bytes: 0,
                 #[cfg(test)]
                 simulated_hardware_failure: false,
@@ -1530,9 +1537,9 @@ mod native {
                 let event_type = unsafe { event.GetType() }
                     .map_err(|error| native_error("hardware MFT event type", error))?;
                 if event_type == METransformNeedInput.0 as u32 {
-                    self.credits.notify_input()?;
+                    self.scheduler.need_input()?;
                 } else if event_type == METransformHaveOutput.0 as u32 {
-                    self.credits.notify_output()?;
+                    self.scheduler.have_output()?;
                 }
             }
             Ok(())
@@ -1543,55 +1550,68 @@ mod native {
             sample: &IMFSample,
         ) -> Result<Option<EncodedOutput>, EncoderError> {
             let started = Instant::now();
+            let mut submitted = false;
             loop {
                 self.pump_events()?;
-                if self.credits.take_input() {
-                    break;
-                }
-                Self::wait_for_async_progress(started)?;
-            }
-            unsafe { self.transform.ProcessInput(0, sample, 0) }
-                .map_err(|error| native_error("submit hardware NV12 sample", error))?;
-            let mut access_unit = Vec::new();
-            let mut keyframe = false;
-            let mut timestamp_us = None;
-            loop {
-                self.pump_events()?;
-                if !self.credits.take_output() {
-                    Self::wait_for_async_progress(started)?;
-                    continue;
-                }
-                // An async ProcessOutput call is permitted only after a
-                // matching HaveOutput event, including incomplete fragments.
-                let part = self.take_output_part()?.ok_or_else(|| {
-                    EncoderError::Native("hardware MFT signalled output without a sample".into())
-                })?;
-                access_unit.extend_from_slice(&part.bytes);
-                keyframe |= part.keyframe;
-                timestamp_us = timestamp_us.or(part.timestamp_us);
-                if !part.incomplete {
-                    if access_unit.is_empty() {
-                        return Err(EncoderError::Native(
-                            "hardware MFT produced an empty access unit".into(),
-                        ));
+                let now_us = super::elapsed_us(self.async_clock);
+                match self
+                    .scheduler
+                    .next(submitted, self.async_outputs.len(), now_us)?
+                {
+                    super::async_mft::Action::ReadOutput => {
+                        // One HaveOutput permits one ProcessOutput call.
+                        // INCOMPLETE means more samples are queued, not that
+                        // separately timestamped frames should be concatenated.
+                        let part = self.take_output_part()?.ok_or_else(|| {
+                            EncoderError::Native(
+                                "hardware MFT signalled output without a sample".into(),
+                            )
+                        })?;
+                        if part.bytes.is_empty() {
+                            return Err(EncoderError::Native(
+                                "hardware MFT produced an empty access unit".into(),
+                            ));
+                        }
+                        let queued_bytes = super::async_mft::queued_bytes_after(
+                            self.async_output_bytes,
+                            part.bytes.len(),
+                        )?;
+                        if self.async_outputs.len() >= super::async_mft::MAX_PENDING_INPUTS {
+                            return Err(EncoderError::Native(
+                                "hardware MFT output queue budget exceeded".into(),
+                            ));
+                        }
+                        self.async_outputs.push_back(EncodedOutput {
+                            keyframe: part.keyframe || contains_idr_nal(&part.bytes),
+                            access_unit: part.bytes,
+                            sequence_header: self.sequence_header(),
+                            timestamp_us: part.timestamp_us,
+                        });
+                        self.async_output_bytes = queued_bytes;
+                        self.scheduler.completed(now_us);
                     }
-                    return Ok(Some(EncodedOutput {
-                        keyframe: keyframe || contains_idr_nal(&access_unit),
-                        access_unit,
-                        sequence_header: self.sequence_header(),
-                        timestamp_us,
-                    }));
-                }
-                if started.elapsed() >= ASYNC_FRAME_BUDGET {
-                    return Err(EncoderError::Native(
-                        "hardware MFT output deadline exceeded".into(),
-                    ));
+                    super::async_mft::Action::SubmitInput => {
+                        unsafe { self.transform.ProcessInput(0, sample, 0) }
+                            .map_err(|error| native_error("submit hardware NV12 sample", error))?;
+                        self.scheduler.submitted(now_us);
+                        submitted = true;
+                    }
+                    super::async_mft::Action::Yield => {
+                        let output = self.async_outputs.pop_front();
+                        if let Some(output) = &output {
+                            self.async_output_bytes = self
+                                .async_output_bytes
+                                .saturating_sub(output.access_unit.len());
+                        }
+                        return Ok(output);
+                    }
+                    super::async_mft::Action::Wait => Self::wait_for_async_progress(started)?,
                 }
             }
         }
 
         fn wait_for_async_progress(started: Instant) -> Result<(), EncoderError> {
-            if started.elapsed() >= ASYNC_FRAME_BUDGET {
+            if super::async_mft::event_wait_expired(super::elapsed_us(started)) {
                 return Err(EncoderError::Native(
                     "hardware MFT progress deadline exceeded".into(),
                 ));
@@ -1677,6 +1697,9 @@ mod native {
                 .map_err(|error| native_error("coalesce H.264 output", error))?;
             let length = unsafe { buffer.GetCurrentLength() }
                 .map_err(|error| native_error("get H.264 output length", error))?;
+            if self.events.is_some() {
+                super::async_mft::queued_bytes_after(self.async_output_bytes, length as usize)?;
+            }
             let mut data = ptr::null_mut();
             unsafe { buffer.Lock(&mut data, None, None) }
                 .map_err(|error| native_error("lock H.264 output", error))?;
