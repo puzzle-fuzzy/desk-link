@@ -1,4 +1,5 @@
 export type AccountEnvironment = "development" | "test" | "production";
+import { normalizeAddress } from "./client-address";
 
 export interface AccountConfig {
   environment: AccountEnvironment;
@@ -10,6 +11,7 @@ export interface AccountConfig {
   mailUrl?: string;
   mailToken?: string;
   mailFrom?: string;
+  trustedProxyAddresses: string[];
 }
 
 export function loadAccountConfig(
@@ -34,6 +36,11 @@ export function loadAccountConfig(
     mailUrl: environment.DESKLINK_ACCOUNT_MAIL_URL,
     mailToken: environment.DESKLINK_ACCOUNT_MAIL_TOKEN,
     mailFrom: environment.DESKLINK_ACCOUNT_MAIL_FROM,
+    trustedProxyAddresses: (environment.DESKLINK_ACCOUNT_TRUSTED_PROXIES ?? "").split(",").filter(Boolean).map(value => {
+      const address = normalizeAddress(value.trim());
+      if (!address) throw new Error("DESKLINK_ACCOUNT_TRUSTED_PROXIES must contain exact IP addresses");
+      return address;
+    }),
   };
 
   try {

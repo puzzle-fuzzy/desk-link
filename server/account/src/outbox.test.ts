@@ -43,6 +43,8 @@ describe("email outbox", () => {
       }),
     }));
     expect(response.status).toBe(202);
+    expect(mailer.attempts).toBe(0);
+    expect(await app.flushOutbox()).toBe(0);
     expect(mailer.attempts).toBe(1);
     const firstToken = mailer.attempted[0].text.match(/token=([^\s]+)/)?.[1];
     expect(firstToken).toBeTruthy();

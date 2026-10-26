@@ -1,8 +1,12 @@
 import { AccountStore } from "./db/store";
+import { clientAddress } from "./client-address";
+import { cleanupAccountHistory } from "./db/retention";
 import type { AccountConfig } from "./config";
 import { loadAccountConfig } from "./config";
 import { AccountError } from "./domain/errors";
+import { normalizeEmail } from "./domain/email";
 import { RateLimiter } from "./domain/rate-limit";
+import type { PasswordOperations } from "./domain/password";
 import { errorResponse, corsHeaders, jsonResponse, noContent, readJson, requestId } from "./http";
 import { DevMailer } from "./providers/dev-mailer";
 import type { Mailer } from "./providers/mailer";
@@ -16,11 +20,14 @@ export interface AccountAppDependencies {
   mailer?: Mailer;
   now?: () => number;
   rateLimiter?: RateLimiter;
+  passwords?: PasswordOperations;
 }
 
 export interface AccountApp {
-  fetch(request: Request): Promise<Response>;
+  fetch(request: Request, context?: { remoteAddress?: string }): Promise<Response>;
   flushOutbox(): Promise<number>;
+  cleanupHistory(): ReturnType<typeof cleanupAccountHistory>;
+  close(): Promise<void>;
 }
 
 export function createAccountApp(dependencies: AccountAppDependencies = {}): AccountApp {
@@ -30,11 +37,13 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
   const now = dependencies.now ?? (() => Math.floor(Date.now() / 1000));
   const rateLimiter = dependencies.rateLimiter ?? new RateLimiter();
   const sessions = new SessionService(store, config, now);
-  const accounts = new AccountService(store, config, mailer, sessions, now);
+  const accounts = new AccountService(store, config, mailer, sessions, now, dependencies.passwords);
+  const requestBudget = new RateLimiter(1);
   const allowedOrigins = config.corsOrigins;
 
   return {
-    async fetch(request: Request): Promise<Response> {
+    async fetch(request: Request, context = {}): Promise<Response> {
+      const ip = clientAddress(request, context.remoteAddress, config.trustedProxyAddresses);
       const id = requestId(request);
       const origin = request.headers.get("origin");
       const cors = corsHeaders(origin, allowedOrigins);
@@ -43,11 +52,24 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
           return new Response(null, { status: 204, headers: { ...cors, "x-request-id": id } });
         }
         const url = new URL(request.url);
-        if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/ready")) {
+        const publicAction = (request.method === "POST"
+          && /^\/v1\/account\/(register|login|verify-email(?:\/resend)?|password\/(forgot|reset))$/.test(url.pathname))
+          || (request.method === "GET" && url.pathname === "/v1/account/verify-email");
+        if (publicAction
+          && !requestBudget.allow("unauthenticated", 120, 60, now())) {
+          throw new AccountError("rate_limited", 429, "请求过于频繁，请稍后再试。");
+        }
+        if (request.method === "GET" && url.pathname === "/ready") {
+          const dependencies = store.readiness();
+          const ready = dependencies.database === "ready";
+          return jsonResponse({ schema: 1, status: ready ? "ready" : "not_ready", service: "desklink-account", dependencies },
+            ready ? 200 : 503, id, cors);
+        }
+        if (request.method === "GET" && url.pathname === "/health") {
           return jsonResponse(
             {
               schema: 1,
-              status: url.pathname === "/ready" ? "ready" : "ok",
+              status: "ok",
               service: "desklink-account",
             },
             200,
@@ -58,7 +80,7 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
 
         if (request.method === "POST" && url.pathname === "/v1/account/register") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "register", body, now());
+          enforceRateLimit(rateLimiter, ip, "register", body, now());
           return jsonResponse(await accounts.register({
             email: body.email,
             password: body.password,
@@ -69,10 +91,11 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
         }
         if (request.method === "POST" && url.pathname === "/v1/account/verify-email") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "verify-email", body, now());
+          enforceRateLimit(rateLimiter, ip, "verify-email", body, now());
           return jsonResponse({ user: await accounts.verifyEmail(body.token) }, 200, id, cors);
         }
         if (request.method === "GET" && url.pathname === "/v1/account/verify-email") {
+          enforceRateLimit(rateLimiter, ip, "verify-email", {}, now());
           const user = await accounts.verifyEmail(url.searchParams.get("token"));
           return htmlResponse("邮箱验证成功", `邮箱 ${escapeHtml(user.email)} 已验证成功，现在可以返回 DeskLink 登录。`, id);
         }
@@ -81,13 +104,13 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
         }
         if (request.method === "POST" && url.pathname === "/v1/account/verify-email/resend") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "resend-verification", body, now());
+          enforceRateLimit(rateLimiter, ip, "resend-verification", body, now());
           await accounts.resendVerification(body.email);
           return jsonResponse({ ok: true }, 202, id, cors);
         }
         if (request.method === "POST" && url.pathname === "/v1/account/login") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "login", body, now());
+          enforceRateLimit(rateLimiter, ip, "login", body, now());
           return jsonResponse(await accounts.login({
             email: body.email,
             password: body.password,
@@ -106,13 +129,13 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
         }
         if (request.method === "POST" && url.pathname === "/v1/account/password/forgot") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "forgot-password", body, now());
+          enforceRateLimit(rateLimiter, ip, "forgot-password", body, now());
           await accounts.requestPasswordReset(body.email);
           return jsonResponse({ ok: true, message: "如果邮箱已注册，重置密码邮件会很快送达。" }, 202, id, cors);
         }
         if (request.method === "POST" && url.pathname === "/v1/account/password/reset") {
           const body = await readJson(request);
-          enforceRateLimit(rateLimiter, request, "reset-password", body, now());
+          enforceRateLimit(rateLimiter, ip, "reset-password", body, now());
           await accounts.resetPassword(body.token, body.password);
           return noContent(id);
         }
@@ -150,20 +173,27 @@ export function createAccountApp(dependencies: AccountAppDependencies = {}): Acc
       }
     },
     flushOutbox: () => accounts.flushOutbox(),
+    cleanupHistory: () => cleanupAccountHistory(store.database, now()),
+    async close() {
+      await accounts.stopOutbox();
+      store.close();
+    },
   };
 }
 
 function enforceRateLimit(
   limiter: RateLimiter,
-  request: Request,
+  ip: string,
   scope: string,
   body: Record<string, unknown>,
   now: number,
 ): void {
-  const ip = request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim()
-    || request.headers.get("cf-connecting-ip")?.trim()
-    || "unknown";
-  const email = typeof body.email === "string" ? body.email.trim().toLowerCase().slice(0, 320) : "missing";
+  let email: string | undefined;
+  if (scope === "register" || scope === "login" || scope === "forgot-password" || scope === "resend-verification") {
+    // Only actions whose identity really is an email get an email bucket. Token
+    // actions must ignore arbitrary body.email and never share a missing bucket.
+    try { email = normalizeEmail(body.email); } catch { /* The action validates invalid input. */ }
+  }
   const limits: Record<string, [number, number]> = {
     register: [5, 3_600],
     "verify-email": [10, 600],
@@ -174,7 +204,7 @@ function enforceRateLimit(
   };
   const [limit, windowSeconds] = limits[scope] ?? [20, 60];
   const allowed = limiter.allow(`${scope}:ip:${ip}`, limit, windowSeconds, now)
-    && limiter.allow(`${scope}:email:${email}`, limit, windowSeconds, now);
+    && (email === undefined || limiter.allow(`${scope}:email:${email}`, limit, windowSeconds, now));
   if (!allowed) throw new AccountError("rate_limited", 429, "请求过于频繁，请稍后再试。");
 }
 

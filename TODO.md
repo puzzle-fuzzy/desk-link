@@ -707,32 +707,100 @@
 
 ### DL2-036 · P2 · 同邮箱并发注册保持幂等和稳定响应
 
-- [ ] 把查重与创建改为数据库原子语义，正确处理唯一键竞争。
+- [x] 把查重与创建改为数据库原子语义，正确处理唯一键竞争。
 - **证据 / 类型：复现缺陷。** `server/account/src/services/account-service.ts:36-40` 先查询，await hashPassword 后插入；`server/account/src/db/store.ts:136-143` 普通 INSERT。两个并发同邮箱请求本次返回 202 与 500。
 - **方案：** 原子 insert-on-conflict / 明确 unique conflict 结果；用户、设备及验证任务采用一致事务/幂等策略。重复请求返回相同的通用确认，不泄露账号存在性，也不重复轰炸邮件。
 - **验收：** 同邮箱并发 N 次无 500、只创建一个用户，邮件/设备副作用有确定上限；不同邮箱并发不被全局大锁串行化。
+- **完成 / 验证（2026-10-26，`fix(DL2-036)`）：** 邮箱 `ON CONFLICT DO NOTHING` 与设备、审计、action token、outbox 同事务；密码哈希在事务外。Bun 1.3.14：账号 24 测试及 typecheck 通过；合成文件库双连接 16 次同邮箱并发仅各生成一条用户/设备/审计/token/outbox 和一封邮件；HTTP 并发均为相同 202；入队失败全回滚；不同邮箱可在另一邮件等待期间完成。
 
 ### DL2-037 · P2 · readiness 反映真实依赖状态
 
-- [ ] 将进程存活与数据库可服务分开检查。
+- [x] 将进程存活与数据库可服务分开检查。
 - **证据 / 类型：复现缺陷。** `server/account/src/app.ts:46-56` 固定返回 ready；本次关闭注入的真实 AccountStore 后，`/ready` 仍为 200。
 - **方案：** 低成本、带超时的数据库探测和 schema 状态；邮件故障单独暴露为可恢复降级，不让可选账号故障影响本机远控；输出稳定白名单状态。
 - **验收：** 关闭/锁住/只读数据库以及未完成迁移时正确非就绪；健康路径低开销；health 不暴露凭据、路径或内部堆栈。
+- **完成 / 验证（2026-10-26，`fix(DL2-037)`）：** `/health` 独立存活；`/ready` 校验 schema 及 rollback-only 写探测，SQLite 锁等待预算 25ms，失败 503，仅输出白名单状态。邮件失败显示可恢复 degraded，不影响数据库就绪。Bun 1.3.14：30 项账号测试及 typecheck 通过，覆盖 closed、双连接持写锁、真实 readonly 文件连接、query-only、迁移版本不全和缺表；100 次内存健康探测实测 1.09ms（本机合成，不代表部署性能）。
 
 ### DL2-038 · P2 · 邮件任务与账号历史记录具有完整生命周期
 
-- [ ] 将邮件投递从用户请求等待中解耦，并补齐失败终态、回收与恢复。
+- [x] 将邮件投递从用户请求等待中解耦，并补齐失败终态、回收与恢复。
 - **证据 / 类型：能力缺口、性能结构。** `server/account/src/services/account-service.ts:158-178` 注册/找回直接 await 投递，`server/account/src/providers/http-mailer.ts:15` 可等待 10 秒；`server/account/src/db/store.ts:302-316` 在 attempts 达 10 后不再查询，但没有明确终态接口；schema 中 session/action token/outbox/audit 没有保留期回收入口。
 - **现有保护：** 已有持久 outbox、进程内 single-flight、最多 10 次重试与退避，不能报告成没有重试或无限重试。
 - **方案：** 请求原子入队后返回；独立 worker 认领/恢复/去重，暴露 pending/delivered/failed；按用途保留最小审计与刷新令牌重放检测窗口后分批回收；进程关闭时停止定时器并完成资源释放。
 - **验收：** 邮件服务慢/宕机时注册响应不等待投递 timeout；第 10 次失败可诊断/受控重投；重启不丢任务；回收不破坏有效令牌和重放检测，长期数据库增长可解释。
+- **完成 / 验证（2026-10-26，`fix(DL2-038)`）：** 请求仅事务入队；独立 worker 按条认领 30s 租约、持久计数和所有权校验，保留 single-flight / 10 次 / 退避，补 delivered/failed 终态、崩溃恢复与本地审计重投接口。schema v3 迁移旧终态，provider 错误仅保存固定类别；关闭先停止接收/计时/新认领，再等当前邮件并释放全部固定 SQL statement。每表每分钟最多回收 500 条，outbox 终态 30 天、过期 action token 7 天、审计 90 天；整个 refresh family 最后到期后再保留 30 天，保留所有邮件引用 token。Bun 1.3.14：46 测试 / 368 断言及 typecheck 通过，含慢投递期间 register/resend/forgot 已返回、文件库重启/迁移、双连接租约去重/迟到 ack 拒绝、第 10 次失败或崩溃终态、显式重投、有效 token 与旧 rotated token 重放、清理边界/限量/计划和关闭文件释放。保留期、吞吐/页复用、至少一次投递与部署长稳边界见 `server/account/README.md`；未连接真实 provider 或线上库。
 
 ### DL2-039 · P2 · 诊断保留期清理不扫描并锁住全部历史
 
-- [ ] 为清理键补索引，并将大批回收移出每次接收事务。
+- [x] 为清理键补索引，并将大批回收移出每次接收事务。
 - **证据 / 类型：复现性能结构。** `server/diagnostics/src/store.ts:17-47` 的事件索引只有 correlation/installation；`103-111` 每次 insert 事务内按 received_at_unix_s 删除 events/batches。本次真实 schema 的 EXPLAIN 返回 SCAN events。
 - **方案：** 以 received_at 建索引，按时间/数量分批回收，独立低频维护；保留接收原子性和去重；监测 WAL、磁盘及清理耗时。SQLite 文件是否缩小需实际维护策略，删除行不等于空间立刻归还 OS。
 - **验收：** 用真实规模合成历史记录验证 query plan、接收 p95、清理锁时间和磁盘上界；14 天保留语义不变，不为性能丢失批次原子性。
+- **完成 / 验证（2026-10-26，`fix(DL2-039)`）：** 时间索引、独立维护（每片 1000 行）、批次标记延后至过期事件排空、关闭释放及白名单存储指标。Bun 1.3.14：17 测试 / 73 断言及 typecheck 通过，覆盖真实文件锁恢复、旧 schema 索引升级、接收失败全回滚和去重。25 万保留事件 + 两轮各 25 万过期事件的文件库：计划由 SCAN 改为时间索引；store 接收 p95 341.436ms → 0.331ms，清理分片 p95 29.236 / 34.205ms、max 137.687ms（完整事务调用作为锁时间保守上界），WAL 高水位 176,303,072 → 7,815,672B；第二轮主文件仅长 4KiB，证明该固定负载页复用。原始证据、命令及索引升级/物理空间边界见 `server/diagnostics/RETENTION.md` 和 `retention-benchmark-evidence.json`；本机合成不含 HTTP/签名、生产长稳或任意输入磁盘硬上限。
+
+#### DL2-044 · 服务端诊断契约切片（整体仍由媒体 / 产品验收）
+
+- [x] 核实 producer `a599246535b73f57e0425cbbfd18c7156e050bba` 的 `DiagnosticEvent::HostMedia(CursorSend)`；仅为 `host_cursor_send` 接受精确 9 字段、host source / warning / 固定 `capability_or_size` reason，三个新增字段不向其他事件开放。无需存储迁移。
+- [x] `fix(DL2-044)` 服务切片：保留完整 payload / 批次原子性与去重；分析仅生成一次可选光标通道停用 warning，保留独立视频健康证据，不累加跨 peer 快照、不把 send_errors 转为真实丢包/送达率或主机停止。
+- [x] 实际 rustc 1.97.1 经仓库 Cargo wrapper、producer 锁版本 `--locked --offline` 编译原 encoder 生成四组 JSONL fixture；六份输入 blob / SHA-256 已复核，独立重跑除 timestamp 外一致。Bun 1.3.14：54 测试 / 665 断言及 typecheck 通过，包含原 Rust JSONL → Ed25519 签名批次 → 验签/schema → app/store → analysis、混合批次、去重、错误字段/类型/source/reason/签名和 safe integer / u64 边界。
+- [ ] GUI observer 绑定 / 导出、真实硬件与媒体链路整体验收由产品 / 媒体工作面继续；本项不能关闭整个 044。045 listener_closed 已按后续真实 SHA 接线（见下方服务切片）；桌面上传器对永久 400 的重试生命周期仍不由本地 server 回归证明。
+- **契约 / 证据：** `server/diagnostics/HOST_MEDIA.md`、`fixtures/host-media-cursor-producer.json`、`scripts/generate-host-media-contract.py`。仅运行隔离编码 harness 和本地签名 / 数据库测试，未编造 GUI 已接通或远端送达证据。
+
+#### DL2-045 · 服务端直连监听诊断契约切片（整体仍由媒体 / 产品验收）
+
+- [x] 核实 producer `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`（区别于 98dd 前置测试）；仅为 `host_direct_listener_stopped` 接受精确 7 字段，host source / warning / 固定 `listener_closed` reason / 严格 boolean `retired_active`，不向其他事件开放新字段。存储无需迁移，044 光标契约保留。
+- [x] `fix(DL2-045)` 服务切片：新增一次固定 listener 终止 warning；保留独立健康视频/光标证据，不判主机或整个会话停止，不推导网络丢包、中继已恢复成功或重复 peer 次数。retired_active 两值都合法，仅反映是否从 slot 取出选定连接。
+- [x] 原 Rust encoder 经仓库 wrapper / rustc 1.97.1 / `--locked --offline` 生成四组真实 JSONL fixture；六份输入 blob / SHA-256 已复核。Bun 1.3.14：诊断 61 测试 / 868 断言及 typecheck 通过，覆盖 producer → 签名/验签 → 固定 schema → 混合 cursor/legacy/listener 批次入库/去重 → analysis，以及坏字段/类型/source/reason、签名篡改和 safe integer/u64 边界；原 cursor fixture 字节未改且其完整回归仍过。
+- [ ] 产品 observer 接线 / 导出、真实 listener 生命周期与 relay 回退验收继续由媒体 / 产品工作面处理，不能据 server 契约测试关闭整个 045。未知未来 schema 仍需真实 producer SHA；永久 400 的桌面重试策略不在本服务验证内。
+- **契约 / 证据：** `server/diagnostics/HOST_MEDIA.md`、`fixtures/host-media-listener-producer.json`、`scripts/generate-host-media-contract.py --event direct-listener`。仅隔离编码 harness 和本地合成签名/SQLite，未连接线上。
+
+#### DL2-044 / DL2-045 · 共享完整 u64 诊断精度切片
+
+- [x] 对齐实际 producer `28c11ee05a08183f7636ede7946e93029c7bbb16`：仅已确认 7 事件 / 18 个 u64 键接受 canonical 十进制字符串（至 `18446744073709551615`），兼容历史 safe-integer 数字；stream 非零，counter / u64 duration 可零，cursor errors ≤ attempts 精确比较。timestamp / u16 / u32 / Duration 数字字段、HostMedia 精确键 / source / reason / boolean 边界不变；未知字段/字符串不扩散。
+- [x] payload 仍存 TEXT JSON，无 schema 迁移；分析用精确本地整数与 canonical stream key，保留相邻大 ID、max / sum / threshold 和超过单个 u64 的汇总；小报告值保持 number，大值输出精确十进制字符串，BigInt 不进入 JSON。
+- [x] 同路径原 Git blob 导入唯一 `apps/windows/tests/fixtures/diagnostic-u64-producer.json`（`58f386235e9dda4c5045b21af9a1a37a53cc39da` / SHA-256 `8d7d3124436b52906c63905340d7fa7a968017de40a639db37efe18489bb19bf`），8 份源指纹均匹配 producer；不改写、不重签。6 当前 + 6 历史升级原始 Rust body/hash/签名 → 真实 loopback HTTP → 验签/schema → 文件 SQLite/重启/去重全部通过；旧 unsafe numeric 原签名批次仍整批 400。原 cursor/listener fixture 字节未变。Bun 1.3.14：诊断 129 测试 / 6017 断言及 typecheck 通过；详见 `server/diagnostics/U64_CONTRACT.md`。
+- [ ] GUI observer / 导出、真实设备和媒体恢复及最终联合候选验收继续保留；null correlation 样本不伪造真实会话，单独合成分组只验证已落库数值分析。本切片不能关闭整个 044 / 045。
+
+### DL2-054 · P2 · 诊断接收在验签前限额，持久配额限制留存增长
+
+- [x] 在读 body / 验签前按 socket / 显式可信代理 IP 和全局预算准入，有界键状态；为事件、批次、全部可变 TEXT 字节设事务持久配额。
+- **复核：** 039 仅修复清理；安装签名仍是自认证，换密钥不能算新准入额度。新增全局/IP 请求、字节和并发预算，验签后再加 installation/IP/全局事件预算；默认不信任转发头，systemd 模板显式信任 nginx loopback 覆盖的 X-Real-IP，溯源存真实 IP。
+- **实现（`fix(DL2-054)`）：** O(1) 有界状态，满额拒绝新键；SQLite 配额计数/触发器与接收同事务，计费全部复制元数据 UTF-8 字节，去重不重复计费，清理归还额度，超额整批回滚并 503。
+- **验证（2026-10-26）：** Bun 1.3.14：45 测试 / 453 断言及 typecheck 通过。真实 loopback socket 伪造头轮换后读 body 前 429；200 新密钥/IP 在 8 条持久配额下只写 8 条；1 万键洪泛上界、超时释放、Unicode/元数据计费、两连接/重启/旧库回填、满额去重、零新增事件批次上限均通过。配额后 1000 事件清理基准烟测通过。部署、默认配额和物理 WAL/磁盘边界见 `server/diagnostics/ADMISSION.md`；039 的 25 万性能证据明确是本项触发器前快照，未冒称当前百分位。
+
+### DL2-055 · P2 · 账号限流使用可信 socket / 代理来源且容量有界
+
+- [x] 拒绝以客户端自带 XFF / CF 头创建独立 IP 桶，限制限流键数和每次清理工作量。
+- **复核：** 036～039 后的 `enforceRateLimit` 仍取 XFF 最左项，原 RateLimiter 在有效窗口内无键数上限；038 已将邮件移出请求，不能再描述成同步外发。
+- **实现（`fix(DL2-055)`）：** Bun 注入 socket peer；默认不信任转发头，精确配置 `DESKLINK_ACCOUNT_TRUSTED_PROXIES` 后仅接受直属代理覆盖的单值合法 X-Real-IP。最多 16,384 桶，每次最多检查 16 项过期状态；满额拒绝新键，不淘汰有效耗尽额度。
+- **验证（2026-10-26）：** Bun 1.3.14 账号 49 测试 / 397 断言及 typecheck 通过；直连/可信反代/缺 socket context、伪造 XFF/CF/X-Real-IP、IPv4-mapped peer、1 万随机键洪泛与额度保持回归通过。未部署代理；部署时须按 README 配置可信精确 peer、覆盖头和阻断外部直连。
+- [x] 独立修复继承的缺失邮箱身份桶问题（`fix(DL2-055)` 后续提交）：真实复现 11 个不同 IP / 不同账号 / 有效 reset 与 verify token 的第 11 次均 429。现只有真实邮箱动作的合法规范化邮箱使用邮箱桶；token 动作忽略 body.email，保留原可信 IP 额度并将 GET/POST verify 纳入同一全局 120/min 前置预算。定向 9 测试 / 383 断言、完整账号 79 测试 / 1072 断言及 typecheck 通过，覆盖跨身份互不耗尽、同源额度、GET/POST 共桶、121 次前置拒绝且 token 未消费、email 注入隔离与合法邮箱限额保持；未连接线上/provider。
+
+### DL2-056 · P2 · 均衡账号发现路径并限制未认证计算资源
+
+- [ ] 完成部署形态下的时序枚举验收。
+  - [x] 注册重复/新地址均一次 hash，登录缺失/存在均一次 verify，找回/重发均一次 dummy verify；请求保持 outbox 解耦，统一 100～124ms 最低响应时间窗。
+  - [x] 增加预读 body 的全局 120/min 配额、16KiB / 2s body 边界、全进程 2 个 Argon2 工作 + 16 个等待上限和溢出 429；真实 gate 回归确认两个账号分支都等待计算。
+  - [x] Bun 1.3.14 本地每分支 100 样本计时：login/register/forgot 排序 AUC 0.5164 / 0.5794 / 0.5664；复现了仅均衡哈希仍有残余差异并加响应时间窗。10 项定向隐私/注册/密码测试及 typecheck 通过，完整账号集 59 项通过（含并行 058）。修复引用 `fix(DL2-056)`；方法、前后原始结果和资源预算见 `server/account/PRIVACY.md`。
+  - [x] 计时证据 JSON 换行归一后解析值逐项相同，提交范围 whitespace 检查通过（`chore(DL2-056)`）。
+  - [x] 修复预算引入的密码重置生命周期回归（`fix(DL2-056)` 独立后续提交）：基线真实复现满 2 个工作 + 16 个等待时 reset 429、排空后同 token 却 400。现仅只读预检，hash 成功后取得 IMMEDIATE 写锁并以新时钟重验/消费，密码、会话撤销和审计同事务；hash/DB 失败不误消费。Bun 1.3.14 定向 9 测试 / 74 断言，完整已跟踪账号集加本项回归 70 测试 / 689 断言及 typecheck 通过，含 429→排空→同 token 204、双连接仅一次成功、hash 拒绝、密码/审计写失败全回滚、过期/撤销竞态与锁忙后重试。无效 bearer token 同 400 且不占 hash，不新增邮箱枚举路径；未声称废除同账号其他独立重置链接。
+  - [ ] 部署形态网络与空闲/饱和负载对抗计时。有限本机样本不能证明任意负载下统计不可区分，CPU 工作超过响应窗时仍须实测；本次不连接线上库/provider。
+
+### DL2-057 · P2 · 服务关闭与启动任务拒绝处理
+
+- [ ] 完成所有服务的实际信号关闭验收（relay 部分由网络工作面处理）。
+  - [x] 复核 038 已捕获账号启动 worker 拒绝，038/039 已加两个 Bun 服务信号路径，无须重复实现旧 `void flushOutbox()` 缺陷。本提交 `fix(DL2-057)` 提取生产调用的幂等 runtime，关闭错误受控处理，补诊断固定 SQL/native handle 确定释放和初始化失败清理。
+  - [x] Bun 正常关闭使用 `stop(false)`：拒绝新连接并排空已接收请求后关库；`stop(true)` 实际会取消在途请求，不能据草稿误当排空。邮件持久待发任务留待重启，不停机无限 flush；诊断 systemd 模板显式 20s 关闭窗口。
+  - [x] Bun 1.3.14 完整账号 61 测试 / 615 断言，诊断 47 测试 / 463 断言及双方 typecheck 通过。真实 loopback socket 回归覆盖两个服务拒新连接、在途请求/签名批次成功后才关库、重复关闭单次执行、worker 启动拒绝无 unhandled rejection、定时器停止与文件无需 GC 释放。
+  - [ ] 部署系统实际 SIGTERM/SIGINT 交付、停止预算与故障负载验收；当前为 Windows 本地 runtime/socket 验证。
+  - [ ] relay 主动 QUIC CONNECTION_CLOSE、在途任务与对端及时重连验收；本工作面未修改 relay，也未据 Bun 测试关闭整项。
+
+### DL2-058 · P3 · 将账号设备标签隔离，消除跨账号登录阻塞
+
+- [x] 保留正常退出换号，同时使持他人 deviceId 的注册/登录无法改写或阻塞原账号登记。
+- **复核：** 真实 app 合成复现 A 退出后 B 使用同 ID 注册即可使 A 登录 409；没有获得 A 权限，属于可用性排他锁，不是账号接管。Windows/Apple 均持久复用安装标签，因此直接禁止跨用户 ID 会破坏正常换号。
+- **实现（`fix(DL2-058)`）：** `account_devices` 复合主键 `(user_id,id)`、session 复合外键；查询/撤销按账号作用域，客户端请求和响应 ID 不变。schema v4 迁移逐句执行并校验旧/新外键和会话数，保留 token/family/重放窗口；跨 owner 旧历史补已撤销占位，拒绝坏源，失败关库并全事务回滚。
+- **验证（2026-10-26）：** Bun 1.3.14 完整账号 59 测试 / 605 断言及 typecheck 通过；包含正常 A/B/A 换号、未验证注册不能阻塞原账号、session 跨账号外键拒绝、文件库迁移/重启/旧令牌刷新和重放、坏源及后段 DDL 失败全回滚。未修改桌面身份/远控协议，未连接线上库。
 
 ### DL2-052 · P0 · 收紧 relay 未使用流与资源预算
 
