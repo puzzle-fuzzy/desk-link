@@ -215,6 +215,42 @@ class VerificationTests(unittest.TestCase):
             if "install" in task.command:
                 self.assertIn("--frozen-lockfile", task.command)
 
+    def test_integrated_ffi_header_check_is_read_only_and_reports_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            header = root / "synthetic-header.h"
+            header.write_text("synthetic-original\n", encoding="utf-8")
+            # A synthetic generator deliberately mutates without --check, like the real CLI.
+            (scripts / "sync-ffi-header.py").write_text(
+                "from pathlib import Path\nimport sys\n"
+                "header = Path('synthetic-header.h')\n"
+                "if '--check' not in sys.argv:\n    header.write_text('rewritten')\n"
+                "if header.read_text() != 'synthetic-original\\n':\n    raise SystemExit('ABI header drift')\n"
+                "print('headers match')\n", encoding="utf-8",
+            )
+            task = next(task for task in verify.catalog(root / "target", 30) if task.id == "ffi-header-sync")
+            code, report = self.run_plan(root, [task])
+            self.assertEqual(code, 0)
+            self.assertEqual(report["checks"][0]["status"], "passed")
+            self.assertEqual(header.read_text(encoding="utf-8"), "synthetic-original\n")
+            header.write_text("synthetic-drift\n", encoding="utf-8")
+            code, report = self.run_plan(root, [task])
+            self.assertEqual(code, 1)
+            self.assertEqual(report["checks"][0]["status"], "failed")
+            self.assertEqual(header.read_text(encoding="utf-8"), "synthetic-drift\n")
+
+    def test_unintegrated_ffi_header_generator_is_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = next(task for task in verify.catalog(root / "target", 30) if task.id == "ffi-header-sync")
+            with patch.object(verify, "execute") as execute:
+                code, report = self.run_plan(root, [task])
+            self.assertEqual(code, 2)
+            self.assertEqual(report["checks"][0]["status"], "skipped")
+            execute.assert_not_called()
+
     def make_manifests(self, root):
         for directory in verify.PROJECTS.values():
             path = root / directory

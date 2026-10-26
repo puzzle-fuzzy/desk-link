@@ -399,6 +399,7 @@
 - [x] **入口回归：** Python 全套 127 项通过（新增入口回归 25 项，含真实子进程/子进程树、固定版本、零测试、skipped、失败阻断与间接 Cargo 依赖）；三个 Bun 项目的类型检查和测试通过（246 / 20 / 14 项），前端生产构建、Rust fmt/Clippy/workspace lib、protocol/video/session/crypto、localhost transport/relay、FFI runtime、媒体恢复和 Windows runtime 契约均通过。实际命令与结果另存 `dist/verify/verified-local.json`，运行时源码为基线 `a905b88` 加本切片，dirty=true；不是跨分支集成基线。
 - [x] **跳过语义：** `python scripts/verify.py native perf --report dist/verify/verified-device-skips.json` 实际记录 Apple/交互设备缺条件与 DL2-014 未集成，`passed=false` / incomplete；固定错误 Bun 与零匹配测试分别验证为 failed。
 - [ ] **仍需验收：** macOS/Xcode 实际运行、原生权限/硬件/双机/长稳与 DL2-014 同条件性能对照；离线媒体基线入口待媒体分支独立提交 `254f8be` 集成后执行。跨层新增关键覆盖仍随对应 DL2 修复补齐，主项保持未完成，不以本地入口成功代替用户流程验收。
+- [x] **ABI 检查入口增量（`feat(DL2-041): register read-only ABI header verification`）：** 检查 Apple 已提交的 `5691aba` 后注册跨平台 `--task ffi-header-sync`，只调用生成器 `--check`，不自动改头；源码未集成时 skipped。新增两项合成回归验证未集成不执行、同步检查不改头、漂移失败；统一入口 Python 全套 134 项通过（入口回归合计 27 项），证据 `dist/verify/abi-gate-python.json`。真实本基线 `--task ffi-header-sync` 记录 incomplete / passed=false（`abi-gate-unintegrated.json`），实际 ABI layout / Swift 仍待集成后验证，未复制其他分支 WIP。
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 

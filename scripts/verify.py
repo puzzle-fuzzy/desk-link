@@ -59,6 +59,7 @@ def catalog(target: Path, soak_seconds: int) -> list[Task]:
         Task("ffi-runtime", "integration", ("cargo", "test", "--locked", "-p", "desklink-ffi", "--tests")),
         Task("media-recovery", "integration", ("cargo", "test", "--locked", "-p", "desklink-end-to-end", "--test", "recovery")),
         Task("windows-contracts", "integration", ("cargo", "test", "--locked", "-p", "desklink-windows", "--tests"), host="win32"),
+        Task("ffi-header-sync", "native", ("python", "scripts/sync-ffi-header.py", "--check"), scope="DL2-025 generated header consistency only; no ABI runtime or native device acceptance", files=("scripts/sync-ffi-header.py",)),
         Task("apple-ffi-build", "native", ("cargo", "build", "--locked", "--release", "-p", "desklink-ffi", "--target", "aarch64-apple-darwin"), host="darwin", scope="Apple Silicon FFI build; no permissions/device acceptance"),
         Task("apple-core", "native", ("swift", "test", "--arch", "arm64", "-Xlinker", "-L" + str(target / "aarch64-apple-darwin/release")), "apps/apple", ("apple-ffi-build",), "darwin", scope="Swift/FFI tests; no actual AppKit IME/permission acceptance"),
         Task("macos-app", "native", ("swift", "test", "--arch", "arm64", "-Xlinker", "-L" + str(target / "aarch64-apple-darwin/release")), "apps/macos", ("apple-ffi-build",), "darwin", True, "macOS tests may access native input/encoder APIs; run only on a dedicated device"),

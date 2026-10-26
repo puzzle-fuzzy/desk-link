@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `fast`（默认） | 三个 Bun 项目 frozen 安装、类型检查、测试；Python 脚本测试；Rust fmt 与 workspace lib 测试 | 本地领域规则、现有契约和脚本行为；首次 Rust 编译仍可能较慢 |
 | `integration` | 前端生产构建、Rust Clippy、protocol/video/session/crypto 契约、localhost transport/relay、FFI runtime、媒体恢复、Windows runtime 契约 | 本地进程/流/ABI 的已有自动覆盖；Windows 专有任务在其他平台 skipped |
-| `native` | Apple Silicon FFI build、AppleCore Swift 测试、macOS 应用 Swift 测试；Windows 交互桌面捕获/编码 | 依赖平台、SDK、权限、设备；捕获与可能访问原生输入 API 的任务须显式 `--allow-device` |
+| `native` | DL2-025 生成 ABI 头只读同步检查、Apple Silicon FFI build、AppleCore Swift 测试、macOS 应用 Swift 测试；Windows 交互桌面捕获/编码 | 头检查跨平台可跑，依赖 Apple 分支 `5691aba` 的生成器；其余依赖平台、SDK、权限、设备，捕获与可能访问原生输入 API 的任务须显式 `--allow-device` |
 | `perf` | 本机加密媒体 hardware soak；DL2-014 离线合成基线入口与完整性能验收缺口 | 离线基线依赖 `codex/dl2-windows-media` 的 `254f8be`，源文件未集成时 skipped；soak 只检查本机持续媒体与光标，完整同硬件前后比较仍 skipped |
 
 任务成功只表示命令成功。已知测试 runner 必须报告至少一项测试；例如 Rust `--exact` 过滤器零匹配虽然退出 0，入口仍将其记为失败。报告的 `tests_reported` 是命令输出计数，不能累加为去重覆盖率；runner 内的 ignored/skipped 数量保留在原始日志，不能由一次命令成功推导所有功能已验收。当前注册的本地测试不访问托管中继/线上服务，也不调用发布入口。旧的 `verify-windows-resilience.py` 有托管中继探针，仍是单独的显式验收入口。
@@ -38,6 +38,7 @@ Rust 版本必须匹配 `rust-toolchain.toml`，Cargo test/build/clippy 都使�
 ```sh
 python scripts/verify.py all --list
 python scripts/verify.py --task transport-localhost --task ffi-runtime
+python scripts/verify.py --task ffi-header-sync
 python scripts/verify.py native perf --report dist/verify/device-status.json
 ```
 
@@ -53,3 +54,5 @@ python scripts/verify.py native perf --report dist/verify/device-status.json
 | `130` | 用户中断 |
 
 缺少 Apple 主机、交互设备、权限或 DL2-014 性能基线时，报告明确 skipped，不能写作 pass。当前注册测试不声称已覆盖所有 DL2 修复：TS→Rust 滚轮边界、AppKit IME 实际接线、拖放坐标、拓扑变化、慢盘和所有恢复代数仍须各编号提供真实回归，再加入本入口；FFI Rust runtime 测试不能替代 Swift/Xcode 或双机证明。统一入口本身的合成回归位于 `scripts/tests/test_verify.py`。
+
+`ffi-header-sync` 在生成器尚未集成时明确 skipped；集成 `5691aba250770d3c781c472966263a40ec0018de` 后只调用 `sync-ffi-header.py --check`，不自动改写头文件。它证明生成声明同步，真实 `abi_layout` 用例会随 FFI 的 `--tests` 任务执行；两者不能替代 Swift 调用、缓冲区所有权、错误恢复或设备验收。
