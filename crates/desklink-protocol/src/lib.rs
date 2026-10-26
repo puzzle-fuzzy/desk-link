@@ -1,5 +1,7 @@
 mod codec;
+mod lan_data;
 mod transfer_v14;
+pub use lan_data::*;
 pub use transfer_v14::*;
 
 pub use codec::{
@@ -424,6 +426,14 @@ pub enum ControlMessage {
     InputState {
         reason: Option<InputRestrictionReason>,
     },
+    /// Requires both authenticated capabilities and an exact Noise-bound LAN
+    /// candidate. This coordinates routing without changing the session's mode.
+    LanDataSwitch {
+        candidate_id: u64,
+        generation: u64,
+        channels: u16,
+        phase: LanDataSwitchPhase,
+    },
 }
 
 pub type TransferId = [u8; 16];
@@ -604,6 +614,10 @@ pub struct DeviceCapabilities {
     pub h264_profiles: Vec<H264Profile>,
     pub width: u16,
     pub height: u16,
+    /// None means this endpoint cannot use the LAN data envelope. Runtime must
+    /// freeze an authenticated intersection before production business traffic.
+    #[serde(default)]
+    pub lan_data: Option<LanDataCapabilities>,
 }
 impl DeviceCapabilities {
     pub fn validate(&self) -> Result<(), codec::ProtocolError> {
@@ -615,6 +629,9 @@ impl DeviceCapabilities {
             || !self.codecs.iter().all(|codec| matches!(codec, Codec::H264))
             || self.h264_profiles.is_empty()
             || !self.h264_profiles.contains(&H264Profile::Main)
+            || self
+                .lan_data
+                .is_some_and(|capabilities| !capabilities.is_valid())
         {
             return Err(codec::ProtocolError::InvalidCapabilities);
         }
@@ -623,6 +640,10 @@ impl DeviceCapabilities {
 
     pub fn supports_h264_profile(&self, profile: H264Profile) -> bool {
         self.codecs.contains(&Codec::H264) && self.h264_profiles.contains(&profile)
+    }
+
+    pub fn negotiated_lan_data(&self, peer: &Self) -> Option<LanDataCapabilities> {
+        self.lan_data?.intersect(peer.lan_data?)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
