@@ -33,9 +33,9 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 
 `IncomingFileWorker::spawn_with` 的磁盘线程在create/open成功后取得metadata，约175～177行的 `ready.send(Ok(metadata)).is_err()` 直接return。若调用方future在 `opened.await` 期间因断连被drop，receiver已关闭；已有resume partial打开后仍带 `remove_on_drop=true`，线程return会触发IncomingFile::drop删除partial。约212～214行的正常commands关闭路径会preserve，但初始化早退没有进入该路径。IncomingFile::preserve关闭文件并置remove_on_drop=false；Drop在true时remove_file，形成完整源码因果链。
 
-旧89源码上的初始化保留缺口已有媒体独立修复 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`**，当前分类为**源分支修复已验证、joint待复验**。本工程只读Git确认其parent `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`，只改TODO+transfer；ready发送失败改为同磁盘线程file.preserve后退出。来源TODO和协调方报告transfer28、lib/tests严格Clippy通过，本工程未复跑，也未导入媒体整包。
+旧89源码上的初始化保留缺口已有媒体独立修复 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`**，本工程只读Git确认其parent `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`，只改TODO+transfer；ready发送失败改为同磁盘线程file.preserve后退出。来源TODO和协调方报告transfer28、lib/tests严格Clippy通过。后续joint578已保留65c，原日志588/589/597/598行分别记录四项初始化相关回归通过；当前分类更新为**源修复及局部joint回归已核对、第一波完整聚合待验**。本工程未自行复跑joint。
 
-新增回归源码使用真实spawn_with/create和open后、读取/哈希前barrier，poll Pending后drop创建future，释放磁盘线程并等实际退出；9次取消后原4字节prefix、offset/hash/元数据不变，随后完整续传校验通过。另覆盖空part保留、显式cancel清理、初始化TooLarge不删旧prefix、Windows真实sync_data失败不发布。正常drop与显式cancel语义分开，未提高生产8线程上限；保留失败不发布完成或宣称成功保留。源码核对与来源实跑报告不能替代joint实际执行；最终joint须复用65c并重跑对应回归及所有适用测试，交付最终revision与原始报告。
+新增回归源码使用真实spawn_with/create和open后、读取/哈希前barrier，poll Pending后drop创建future，释放磁盘线程并等实际退出；9次取消后原4字节prefix、offset/hash/元数据不变，随后完整续传校验通过。另覆盖空part保留、显式cancel清理、初始化TooLarge不删旧prefix、Windows真实sync_data失败不发布。正常drop与显式cancel语义分开，未提高生产8线程上限；保留失败不发布完成或宣称成功保留。后续J已取得对应原始报告；第一波完整聚合仍须在实际候选执行适用套件，保留其精确源码身份。
 
 此前协调方另报告joint未提交、索引有UU、测试文件未跟踪，这是当时的审查快照，不能当stable或直接当作后续当前状态；本工程未自行检查该WIP。其shared日志汇总更正为174通过/1忽略，先前274是撤回的笔误；这些都是协调方日志信息，尚未绑定最终joint提交，不是本工程复跑结果，也不是联合验收已完成。
 
@@ -47,7 +47,7 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 
 协调方报告Apple最新源分支完整FFI71项、Python186项与双头检查实跑通过，013 worker owned future仍在进行；本次未给该报告的完整源码SHA，本工程不擅自绑定所见动态branch head。工程 `d6f153e` 的旧FFI Host8通过/2失败、旧joint的两个MacHost失败均属于未整合完整Apple ABI/Host链的快照，不能外推到Apple当前源分支。等待Apple最终稳定SHA和完整依赖一起整合，保留已有等价API/Sender扩展并去重，不单独flat-pick9ad；来源通过仍不能替代joint实际复跑、Swift/Xcode或真实Mac presented。
 
-最终joint计划以27fec为第一parent，以媒体65c70fd为另一parent；协调方报告产品已开始真实remerge，保留完整原问题历史、审计resolution和新联合测试。旧89bd仍是已核对缺陷来源，65c才是已交付修复来源。协调方另报告10份人工resolution/新增联合测试已备份并有SHA256清单，本工程未读取或核验这些备份，也未操作joint WIP。最终revision须实际包含所需resolution/测试，重跑跨包严格检查与所有适用测试，并交付源码身份和原始报告，才能更新联合验收状态。
+最终joint已交付5782341，parents确为27fec+65c，保留原问题历史和新联合测试；本工程读取固定Git对象及外部报告，不读取joint WIP。旧89bd仍是缺陷来源，65c为修复来源。协调方此前10份resolution/测试备份的报告保留历史身份，当前以最终tree、已跟踪测试与原日志为实际证据，完整结果见下节。
 
 ## 媒体冻结manifest与交接范围
 
@@ -58,3 +58,13 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 本次读取文件的SHA256：final-validation为 `9657b095b2050e17c1a1f96b33710db7504799b57bf6a8b90c074380a8d8b67e`；handoff为 `8a0f884575dcc42060bdddc4c08326469efaf6f226d513ddc6d3ff7fb5261bfb`。哈希仅绑定这次报告快照，文件路径后续可变化，不把它们当最终joint证据。
 
 handoff列37笔唯一提交，本工程核对其SHA/subject/ancestry均与Git对象吻合，集合精确覆盖main基线a905b88至65c的37笔提交，已包含三条imported contract，不额外再加三笔。仅020/046/050主项标完成，015/030明确部分实现，其他11项仅切片完成并有pending。015仍CPU读回，GPU缩放/NV12 surface/MFT设备绑定/租借池未实现；030仍256MiB，无大文件/4GiB、目录或持久块证明。046源分支的后续165fcca所有权/迟到结果切片不得与本工程已复用的初始3277取消树混为一笔。041/013和整包可交付性继续以最终joint及Apple完整稳定聚合的实际证据为准，不据448/18或37提交数关闭。
+
+## Windows最终joint578的固定对象核对
+
+`5782341e22ba55b2efe30a8eeaeafbebfe0daaba` 的tree为 `59c7270aea76bc1d542ac49c625e308b42ef20f2`，parents依序为27fec756与65c70fd；27笔产品及37笔媒体提交都保留为祖先。外部 `E:/desk-link/.worktrees/dl2-targets/windows-joint/handoff-final.json` 本次SHA256为 `5bd84ffebfb3f0953df7d899850f904e77358e032f37542fc4c90a2f1e9c58dd`。六份日志/JSON哈希均匹配；固定Git blob中的 `docs/windows-joint-integration.md` 哈希为 `8da83667d95cd5ee38aed2294aa770888388e9a4faebba9be46f18a99a724517`，与报告一致。clean/unmerged字段属于该次来源记录，本工程未访问动态index。
+
+本工程对原Rust日志38条summary与final-test-counts逐条核对：634通过、2失败、19忽略，Cargo101/包装器1；失败均为已列的FFI host_runtime两项，固定源码host_worker.rs:896仍input_epoch=0，完整Apple ABI/Host链尚未合入。该结果属于该tree，不能写Rust全绿，也不能外推Apple当前源分支失败。Bun1.3.14原日志474通过/0失败、71文件/1894断言，构建成功；八包lib/tests严格Clippy未用no-deps、来源exit0，限定范围保留。
+
+联合测试windows_joint_tests.rs确为tree blob并由runtime接入；477个源码快照逐项与Git blob SHA256吻合，测试候选tree至最终tree只补TODO/报告，可执行源码未变。本工程另检索到两项013软件MFT/QUIC/Noise/输入guard联合用例及四项021初始化回归为ok。真实WebView/compositor、系统输入注入、双机、硬件MFT/拓扑矩阵、完整Apple ABI、GUI observer闭环仍未运行。本次是源码/原日志核对，未冒充本工程实跑。
+
+工程12b54ce与J578的Git merge-tree影响预演产生5个需人工核对的冲突路径：TODO.md、Windows runtime/runtime_contract、transport direct_probe及013协议文档。预演不修改工作树、没有执行候选测试；后续独立第一波候选须保留J已解冲突与等价patch去重，实际处理这些路径，不把预演当合并完成。

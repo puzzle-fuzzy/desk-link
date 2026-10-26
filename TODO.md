@@ -42,7 +42,7 @@
 
 原媒体第一波010/011/012/013/014/020/021/022/023及030既有切片冻结在 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，已进入Windows joint；新GPU与文件功能继续独立提交。文件会话为 `01a17733-4bf0-79d3-831f-7c0190191591`，负责新增文件wire/API的协议14；当前工程与Windows joint仍协议13，main仍12。
 
-第一波集成按冻结Windows joint5782341、Apple当前013/media_generation完成后的完整稳定历史、网络/services固定来源及工程分支建立独立候选，保留逐问题commit并实际联合验证。GPU015/016、新文件030/协议14后置，不阻塞稳定13第一波；候选通过后由主会话决定合入main，工程组不切换或覆盖root checkout。
+第一波集成采用冻结Windows joint5782341、Apple完整稳定历史f954a68、网络/services固定来源及工程分支建立独立候选，保留逐问题commit并实际联合验证。GPU015/016、新文件030/协议14后置，不阻塞稳定13第一波；候选通过后由主会话决定合入main，工程组不切换或覆盖root checkout。
 
 网络第一波已冻结 `4b15561586fab7a1481ba6dd4ff4854f34123018`（直接parent为a41e1e2），后续024在独立LAN runtime分支推进。服务S快照后发现resetPassword预算满先消费token、token动作共用email:missing桶两处确定缺口，owner正在逐条独立补修；第一波服务集成等待其最终固定SHA，不用旧服务快照提前关闭该补修。
 
@@ -64,10 +64,12 @@
 | --- | --- | --- |
 | J | `5782341e22ba55b2efe30a8eeaeafbebfe0daaba`，tree `59c7270aea76bc1d542ac49c625e308b42ef20f2` | Windows产品27fec+媒体65c真实合并；Rust634通过/2失败/19忽略，Bun474通过及构建、八包严格Clippy通过。两失败为未合完整Apple链的Host零epoch，Rust整体exit101 |
 | M | `65c70fd658d0526a8a27b75fdbf120ae065222bf` | 冻结媒体448通过/18忽略、37笔提交；已成为J祖先 |
-| A | `880e3f87c7156173eb499b23383eaa137bad99dd` | Apple已提交快照及各切片Rust/Python记录；当前013/media_generation仍待最终稳定，不绑定此前无完整SHA的总计报告；Swift/Xcode未运行 |
+| A | `f954a68153168a1ded048ddf93eb9c565684d096`，tree `eed9ea733f256024f5839ce0a7c6763d3a6a920a` | Apple协议13冻结、41笔历史；来源原生165通过/0忽略（FFI88+transport/relay77）、Python201及check/限定Clippy/双头/fmt通过；工程正在独立核对，Swift/Xcode未运行 |
 | N | `4b15561586fab7a1481ba6dd4ff4854f34123018` | 网络第一波冻结，继承a41e1e2；本地QUIC/调度/资源/deadline及Linux候选关停证据，生产部署/真实WAN另验 |
 | S | `b1118ad465703493255123e23b6f522662c3d603` | 服务已提交快照；各项本地数据库/Bun/进程级回归与诊断producer合同，未部署；上述两处token预算/分桶补修后的最终SHA待交付 |
-| E | `e8978af99adf538996d82a5e5dfbc483a3863caf` | 工程入口/合同/来源核对；实际运行精确SHA与原报告见 `docs/local-verification.md`，不能合并不同源码报告为全绿 |
+| E | `12b54ceedc0799a556e502436bc08830db7edca1` | 工程入口/合同及实际共享transport恢复分类；其源码blob与已运行29/18/12及严格Clippy/fmt报告一致；其他报告精确SHA见 `docs/local-verification.md` |
+| G（后续波） | `2d79f9706303cb2dffa7abc764c8f7450591c3b6`，tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832` | 015 owned BGRA/NV12池、VP与capture入口；owner报告204通过/6忽略、7GPU含4合成及Clippy，rawlog待落盘，未独立复跑；016 dirty烟测不计入 |
+| D044 | `67cd1bf69cbeacf2a761054f17454f40e4b821f1`，parent J | GUI044固定切片，cloud_diagnostics相对J无diff；owner报告Windows218/0/2、UI137/0/1及两包lib/tests Clippy，命令target范围/最终联合闭环待核对，045后续SHA待交付 |
 
 来源TODO已关闭的主项为：产品001/034/035，媒体020/046/050，服务036/037/038/039/054/055/058，工程042；这些是各自来源范围的完成状态，剩余集成、已发现服务补修和设备验收继续按下表单独记录。
 
@@ -85,9 +87,9 @@
 | 010 · J/M | [x] 静态恢复IDR并保留buffered输出请求 | [x] 媒体恢复与联合软件MFT链 | [ ] 真桌面/双机恢复时延 |
 | 011 · J/M | [x] crypto短锁、独立probe窗口与取消树 | [x] 慢探测/重放/跨lane回归 | [ ] 双机黑洞输入/画面p95/p99 |
 | 012 · J/M | [x] 输入独立消费、慢配置合并与完成回执 | [x] 慢控制/输入并发回归 | [ ] 慢驱动双机输入预算 |
-| 013 · J/A | [x] Windows完整u64、绘制门禁、host epoch/版本与有序sender切片 | [x] J真实软件MFT→QUIC/Noise→生产sender→映射guard两项联合回环 | [ ] Apple完整稳定历史/media_generation整合、真实呈现/拓扑矩阵；J仍2项Host失败 |
+| 013 · J/A | [x] Windows完整u64/绘制/host映射切片，A完整FFI/owned future/media_generation稳定历史 | [x] J两项软件MFT/QUIC/Noise联合回环；A源FFI88及相关传输回归 | [ ] J+A真实候选合并/复跑、真实呈现/拓扑矩阵；J单支仍2项Host失败 |
 | 014 · M | [x] CPU离线分段基线与真实输入/输出身份 | [x] 可复跑离线工具及buffered时序校验 | [ ] GPU/双机/端到端/功耗温度/长稳对照 |
-| 015 · M | [x] staging纹理与NV12 scratch复用 | [x] 缓冲契约回归 | [ ] GPU缩放/NV12 surface/MFT绑定/租借池；仍CPU读回，第二波推进 |
+| 015 · M/G | [x] M复用staging/scratch；G新增owned surface池/VP缩放转色/capture入口 | [x] M缓冲回归；G204/6与合成GPU为owner报告，原日志待交付 | [ ] 016生产encoder链、tracked-sample lease寿命/CPU与GPU分别测量及适用硬件验收；主项保留未完成 |
 | 016 · M | [x] 硬件MFT枚举、有界异步泵/软件回退及timestamp校验 | [x] 后端/缓冲/输出身份回归 | [ ] 真实硬件成功编码及厂商/混合GPU/驱动丢失矩阵，第二波推进 |
 | 017 · J | [x] 有界AudioWorklet音频播放 | [x] 环形缓冲/生命周期与前端回归 | [ ] 实际播放、欠载/延迟/分配率测量 |
 | 018 · A | [x] 专用解码队列、字节/帧龄预算与合并presenter | [x] Python静态media合同，Swift调度器用例已提交 | [ ] Swift/Xcode、VideoToolbox与阻塞主线程性能；保留现有复制 |
@@ -112,7 +114,7 @@
 | 037 · S | [x] 可写数据库readiness与有界锁等待 | [x] 依赖不可用/锁竞争回归 | [ ] 第一波服务联合与实际运行环境 |
 | 038 · S | [x] leased邮件worker及账号历史生命周期 | [x] 本地投递状态/回收/恢复回归 | [ ] 真实邮件服务、长时故障恢复与部署 |
 | 039 · S | [x] 索引/分片分批保留期清理 | [x] 本地清理/容量/并发接收回归 | [ ] 长期磁盘/生产性能与部署验证 |
-| 040 · E | [x] 所有权/错误/epoch合同与重复策略影响核对 | [x] 来源/路径/合同检查 | [ ] 实际稳定策略职责拆分及候选测试；活跃input/media_generation不大改 |
+| 040 · E | [x] transport单一穷尽恢复策略，Host/Controller两生产入口删除重复match；合同整理 | [x] transport29/Windows策略18/FFI lib12、三包严格Clippy与fmt | [ ] 第一波候选接入、其余职责拆分；活跃input/media_generation与HostError字符串类型化分开处理 |
 | 041 · E/J | [x] 分层入口、固定工具/源码报告与joint证据核对 | [x] E入口回归、J634/2/19及Bun/Clippy记录核对 | [ ] 完整Apple后第一波候选实跑、平台/设备/性能门禁；不关闭主项 |
 | 042 · E | [x] 能力/版本/来源与当前检查框快照 | [x] manifest版本5项、本地链接/原报告哈希检查 | [ ] 每次稳定聚合继续同步；main状态须随真实合入对齐 |
 | 043 · A | [x] Main/1080p与实际profile/尺寸安全拒绝 | [x] Python2项合同，Swift用例已提交 | [ ] 动态完整协商、Swift/真实Mac编码与权限 |
@@ -121,7 +123,7 @@
 
 | 问题 | 已提交/核对的切片 | 未满足验收或成立性 |
 | --- | --- | --- |
-| 044 · J/M/S | [x] 可选cursor降级/typed observer与b111服务白名单合同；来源回归 | [ ] GUI接线/最终重跑及真实事件签名接收/store联合闭环、双机；原QueueFull论证已反证，observer不计作真实丢包 |
+| 044 · J/M/S/D044 | [x] cursor降级/typed observer、b111服务合同与67cd GUI持久化切片；所选来源回归 | [ ] 最终producer→签名接收/store联合闭环、GUI测试命令口径与双机；无永久cloud过滤，observer不计作真实丢包 |
 | 045 · J/M/bf5d7eb | [x] Some(Err)反证、None退役/迟到probe隔离及服务固定字段schema | [ ] GUI最终重跑/真实事件签名接收/store闭环与实际监听；不延续“任一Err永久禁用” |
 | 046 · M/J | [x] 路径所有权/按连接身份退役/迟到结果取消与真实回归，M主项完成 | [ ] 第一波候选接入验证 |
 | 048 · E | [x] Noise message3认证payload链路已核对 | [ ] P1/UKS攻击路径证据不足，熵源/篡改/拼接待独立证明；未直接改crypto |
@@ -546,6 +548,7 @@
 - **021来源修复已交付（`docs(DL2-042): distinguish verified media source repair from pending joint acceptance`）：** 只读核对65c70fd658d0526a8a27b75fdbf120ae065222bf直接parent6dbe53d，仅TODO+transfer；ready发送失败同磁盘线程先preserve再退出。源TODO与协调方报告transfer28、lib/tests严格Clippy通过，回归源码覆盖真实open barrier/drop future、9次prefix/offset/hash保留、完整续传及空part/显式cancel/初始化错误/sync失败。当前为“源分支修复已验证、joint待复验”，不再把65c写成未修代码；协调方报告产品已开始27fec+65c真实remerge，本工程未操作joint或复跑来源，最终jointSHA/严格检查及所有适用测试报告仍待交付。
 
 - **媒体冻结交接范围（`docs(DL2-042): record frozen media evidence without widening completion claims`）：** 只读65c的final-validation与windows-media-handoff，记录source前后SHA/空working_status/Cargo.lock和报告SHA256、448通过0失败18忽略及37笔提交；只作为来源结果，本工程未复跑。主项仅020/046/050完成，其他按切片/部分实现与pending保留；015仍CPU读回且GPU surface链未实现，030仍256MiB/无目录、大文件与持久块证明。046后续源切片不冒充本工程已有初始取消树。041/013和可交付性不因来源计数关闭，最终joint/Apple完整稳定聚合证据待交付。
+- [x] **固定joint与逐项快照更新（`docs(DL2-042): bind joint results and phased ownership to immutable snapshots`）：** J578的parents/tree、27+37历史、六份日志哈希、477源码blob及原Rust634/2/19、Bun474/Clippy范围已核对，021四项初始化与013两项真实加密联合用例见原日志；不写Rust全绿。前置检查框已逐项列代码/自动验证与剩余验收，明确未合main、root044–061作者未知且未覆盖；固定A f954完整13历史、N4b第一波与S/GUI待稳定来源分开，G015和030/协议14、024后续不阻塞第一波。GUI044固定67cd不改cloud过滤，服务044/045schema进入候选后仍须真实签名接收/store闭环。
 
 ## 8. 扩展角色
 

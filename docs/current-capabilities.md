@@ -91,9 +91,9 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 
 上述分类没有新增真实远控/性能证明，也没有修改其他编号完成状态；其他新项继续按owner复核当前分支后逐项记录。
 
-## 初始化保留缺口：源分支已修、joint待复验
+## 初始化保留缺口：源修复与Windows joint回归已记录
 
-协调方joint只读审查与本工程固定媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a` 源码核对确认过DL2-021初始化缺口：打开已有resume partial后，ready发送失败直接return，未走preserve，IncomingFile的remove_on_drop=true导致partial被删。媒体已独立提交 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`** 修复，在同一磁盘线程先preserve后退出；本工程只读Git确认parent为 `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`，仅TODO+transfer变更。源TODO及协调方报告transfer28项、lib/tests严格Clippy通过，包含真实open barrier/drop future、9次prefix保留及完整续传等回归；本工程未复跑。当前为**源分支修复已验证、joint待复验**，不能继续将65c视为未修源码，也不能提前标joint通过；详细链路见[证据记录](second-stage-review-evidence.md)。
+协调方joint只读审查与本工程固定媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a` 源码核对确认过DL2-021初始化缺口：打开已有resume partial后，ready发送失败直接return，未走preserve，IncomingFile的remove_on_drop=true导致partial被删。媒体已独立提交 **`65c70fd658d0526a8a27b75fdbf120ae065222bf`** 修复，在同一磁盘线程先preserve后退出；本工程只读Git确认parent为 `6dbe53d64c60bbdd50af4b592ebef7471b800fcc`，仅TODO+transfer变更。源TODO报告transfer28项通过，后续joint5782341已保留65c历史；其原日志明确包含初始化取消保留、空part/显式cancel、初始化错误和sync失败四项通过。本工程核对固定源码/日志但未复跑joint。当前为**来源修复与该局部联合回归已有证据、完整第一波候选待验**；详细链路见[证据记录](second-stage-review-evidence.md)。
 
 此前协调方报告的joint未提交/索引UU/测试未跟踪，是当时的审查快照；本工程未检查其WIP，不能将该快照当作当前状态。其日志计数已更正为shared174通过/1忽略（原274笔误撤回），不是本工程实际测试，也不能替代最终jointSHA/报告。除此项之外“暂未见新确定缺陷”的只读review表述不等于测试通过。FFI Mac Host/Swift、实际WebView和双机仍独立；本工程原始失败报告继续按各自源码身份保留。
 
@@ -102,10 +102,10 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 | 来源 | 已核对或收到的证据 | 当前边界 |
 | --- | --- | --- |
 | 产品 `27fec756ba97ee6f67228dc9530c7b0578a49ff3` | 本工程只读Git对象确认其parent为 `16594c4f8780cd565afd57695f88e29277ec5939`；代码仅将既有owned future提取为 `InputSendFuture<Writer>` 类型别名，发送语义不变。提交TODO报告UI库135通过/1项签名资产忽略、本包 `--lib --tests --no-deps` Clippy通过 | 本工程未复跑、未复用整包；本包Clippy不代表跨包严格检查。最终joint第一parent采用27fec，保留既有历史 |
-| Apple最新源分支 | 协调方报告完整FFI71项、Python186项、双头检查实际通过；013 worker owned future仍在进行 | 本次报告未附对应完整测试SHA，不把所见branch head擅自绑定到该结果；等待最终稳定SHA与完整依赖一起合并，不能单独flat-pick9ad。旧joint两个MacHost失败来自尚缺完整Apple ABI/Host链，不能写成Apple当前分支失败；源分支通过不等于最终joint或Swift/真机呈现通过 |
-| 媒体021修复及最终joint | 另一parent已固定为 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，源TODO及协调方报告transfer28与严格Clippy通过；协调方报告已开始27fec+65c真实remerge，10份人工resolution/新增联合测试已备份并有SHA256清单 | 最终jointSHA/完整报告仍待交付。本工程未复跑来源测试、未读取备份清单或joint WIP；备份不等于文件已纳入最终提交，合并后须重跑跨包严格检查及所有适用测试 |
+| Apple协议13冻结 | `f954a68153168a1ded048ddf93eb9c565684d096`，tree `eed9ea733f256024f5839ce0a7c6763d3a6a920a`，41笔完整历史；协调方核对来源原生165通过/0忽略（FFI88+transport/relay77）、Python201及限定check/Clippy/双头/fmt | 旧71/186报告保留历史身份；当前使用f954完整历史整合，不单独flat-pick9ad。保留J真实Windows非零producer；源通过不等于最终候选、Swift/Xcode或真实呈现通过 |
+| Windows最终joint | `5782341e22ba55b2efe30a8eeaeafbebfe0daaba`，tree `59c7270aea76bc1d542ac49c625e308b42ef20f2`，parents27fec+65c；27笔产品/37笔媒体历史、已跟踪联合测试与477源码blob已核对 | Rust634通过/2失败/19忽略，Cargo101；八包严格Clippy与Bun474/构建通过。完整Apple尚未合入，两项Host零epoch失败保留，整体验收继续未完成 |
 
-原产品16594与媒体89bd的合并安排、旧joint审查和工程d6f153e失败报告均保留其历史身份。021来源层已有修复及28项通过报告，联合层仍待复验；上述来源进展不关闭041联合验收、013完整生产接线或真实设备门禁。
+原产品16594与媒体89bd的合并安排、旧joint审查和工程d6f153e失败报告均保留其历史身份。joint578已有021局部回归和013本地加密软件链证据；上述进展不关闭041第一波整体验收、013完整Apple生产接线或真实设备门禁。
 
 ## 媒体源分支冻结交接（65c70fd）
 
@@ -120,4 +120,16 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 | 部分实现 | 030：单次流式源hash、Windows只读snapshot、peer退出取消 | 仍限256MiB；大文件/4GiB、目录与持久块证明未实现 |
 | 切片完成、主项未完成 | 010、011、012、013、014、016、021、022、023、044、045 | 各自pending仍按handoff保留：生产者/呈现/产品接线、真实硬件成功编码、GPU/双机性能、慢盘/驱动/睡眠恢复或实际诊断等不能由源码和合成测试代替 |
 
-041与013保持未完成，当前工程过渡源码仍不可作为可交付整包；待最终joint完整SHA/原始报告和Apple完整依赖稳定聚合后再整体收口。
+041与013保持未完成，当前工程过渡源码仍不可作为可交付整包；joint578的完整SHA/报告已取得，第一波仍待完整Apple、修复后的服务和工程/网络稳定来源聚合。
+
+## 当前第一波与后续波次
+
+第一波以协议13收口：冻结Windows joint578、Apple完整稳定历史f954、网络冻结 `4b15561586fab7a1481ba6dd4ff4854f34123018`、服务两处token预算/分桶缺口补修后的最终来源与工程分支。保留逐问题历史，在独立候选实际合并和测试，候选通过后由主会话决定合入main；根目录未知044–061未提交稿继续保留，工程组未写入且owner尚不明。
+
+GPU015/016在 `codex/dl2-windows-gpu` 后续独立推进。首切片 `2d79f9706303cb2dffa7abc764c8f7450591c3b6`（tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832`）已有owned BGRA/NV12池、VP缩放/BT709 limited与capture入口；协调方核对固定源码未发现确定缺陷，owner报告隔离源204通过/6忽略、7个GPU单测含4个合成GPU和Clippy通过，rawlog仍待落盘。本工程未独立复跑，016 runtime/encoder的dirty代码与33帧surface烟测不进入该结论；015主项仍待016生产链与测量。
+
+文件030由第七会话 `01a17733-4bf0-79d3-831f-7c0190191591`、`codex/dl2-file-transfer` 从joint578负责，独占新增文件业务协议14；当前工程/Windows joint仍13、main12。GPU和文件后续开发不阻塞稳定13第一波。
+
+044/045云诊断闭环必须合入服务固定schema历史：044为b1118ad，045为 `bf5d7eb27f3f41be59ac317b63d7e93d10f38066`。GUI云过滤WIP已由协调方确认全部撤回，后续正常上传；候选须以最终producer源码/共同fixture完成真实client事件→签名验签/schema→store验证，不能以旧joint缺schema为由永久吞掉事件。
+
+GUI044已独立提交 `67cd1bf69cbeacf2a761054f17454f40e4b821f1`，直接parent为joint578，本工程Git核对cloud_diagnostics.rs相对578无diff；协调方报告cursor fixture逐字节对应b111服务合同。owner所选Windows218通过/2忽略、UI137通过/1忽略及两包lib/tests Clippy为来源报告，本工程未复跑，实际命令target口径和联合闭环仍待核验，不覆盖joint634/2/19或workspace结果。045 GUI后续稳定SHA待交付。
