@@ -32,6 +32,7 @@ import {
   respondHostApproval,
   restartHost,
   pauseHostSharing,
+  endHostControl,
   resumeHostSharing,
   revokeTrustedController,
   saveConnectionSettings,
@@ -665,7 +666,7 @@ function renderWorkspaceTopbar(): string {
 function renderHostSharingActions(state: HostSnapshot): string {
   const paused = state.runtime.state === "paused";
   if (!state.connection && !paused) return "";
-  return `<button class="button button--secondary button--compact" type="button" data-host-sharing="${paused ? "resume" : "pause"}" ${hostSharingBusy ? 'disabled aria-busy="true"' : ""} title="${paused ? "恢复本机共享，保留信任和固定密码" : "停止本机共享，保留信任；当前连接其他设备的会话继续"}">${hostSharingBusy ? "正在处理…" : paused ? "恢复共享" : "暂停共享"}</button>`;
+  return `${state.runtime.state === "connected" ? `<button class="button button--secondary button--compact" type="button" data-host-end-control ${hostSharingBusy ? "disabled" : ""}>结束当前控制</button>` : ""}<button class="button button--secondary button--compact" type="button" data-host-sharing="${paused ? "resume" : "pause"}" ${hostSharingBusy ? 'disabled aria-busy="true"' : ""} title="${paused ? "恢复本机共享，保留信任和固定密码" : "停止本机共享，保留信任；当前连接其他设备的会话继续"}">${hostSharingBusy ? "正在处理…" : paused ? "恢复共享" : "暂停共享"}</button>`;
 }
 
 function renderUtilityMenu(): string {
@@ -1703,6 +1704,9 @@ async function exitDeskLink(): Promise<void> {
 }
 
 function bindInteractions(preservedController = false): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-host-end-control]").forEach((button) => {
+    button.addEventListener("click", () => { void endCurrentHostControl(); });
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-host-sharing]").forEach((button) => {
     button.addEventListener("click", () => { void changeHostSharing(button.dataset.hostSharing === "resume"); });
   });
@@ -2142,6 +2146,22 @@ async function changeHostSharing(resume: boolean): Promise<void> {
     clearPairingSecrets();
     pairingSession = null;
     feedback = { tone: "info", message: resume ? "本机共享已恢复，已保留信任与固定密码。" : "本机共享已暂停，信任与固定密码已保留。" };
+  } catch (error) {
+    feedback = { tone: "error", message: normalizeError(error) };
+  } finally {
+    await refreshSnapshot(false);
+    hostSharingBusy = false;
+    render();
+  }
+}
+
+async function endCurrentHostControl(): Promise<void> {
+  if (hostSharingBusy || snapshot?.runtime.state !== "connected") return;
+  hostSharingBusy = true;
+  render();
+  try {
+    await endHostControl();
+    feedback = { tone: "info", message: "当前控制已结束。信任仍保留，对方需要重新发起连接。" };
   } catch (error) {
     feedback = { tone: "error", message: normalizeError(error) };
   } finally {

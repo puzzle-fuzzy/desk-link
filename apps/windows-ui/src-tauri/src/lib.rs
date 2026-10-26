@@ -421,6 +421,15 @@ async fn restart_host(
 }
 
 #[tauri::command]
+async fn end_host_control(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+) -> Result<HostSnapshot, String> {
+    manager.end_current_control(app).await?;
+    get_host_snapshot(manager).await
+}
+
+#[tauri::command]
 async fn pause_host_sharing(
     app: AppHandle,
     manager: State<'_, HostManager>,
@@ -1756,6 +1765,7 @@ pub fn run() {
             quit_desklink,
             respond_host_approval,
             restart_host,
+            end_host_control,
             pause_host_sharing,
             resume_host_sharing,
             save_connection_settings,
@@ -1816,6 +1826,7 @@ pub fn run() {
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 DeskLink", true, None::<&str>)?;
+    let end = MenuItem::with_id(app, "end-host-control", "结束当前控制", true, None::<&str>)?;
     let pause = MenuItem::with_id(
         app,
         "pause-host-sharing",
@@ -1832,22 +1843,22 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出 DeskLink", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &pause, &resume, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &end, &pause, &resume, &separator, &quit])?;
     let mut tray = TrayIconBuilder::with_id(tray_id())
         .tooltip("DeskLink：正在启动")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
-            "pause-host-sharing" | "resume-host-sharing" => {
-                let pause = event.id().as_ref() == "pause-host-sharing";
+            "end-host-control" | "pause-host-sharing" | "resume-host-sharing" => {
+                let action = event.id().as_ref().to_owned();
                 let manager = app.state::<HostManager>().inner().clone();
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let result = if pause {
-                        manager.pause_sharing(app.clone()).await
-                    } else {
-                        manager.resume_sharing(app.clone()).await
+                    let result = match action.as_str() {
+                        "end-host-control" => manager.end_current_control(app.clone()).await,
+                        "pause-host-sharing" => manager.pause_sharing(app.clone()).await,
+                        _ => manager.resume_sharing(app.clone()).await,
                     };
                     if result.is_err() {
                         show_main_window(&app);

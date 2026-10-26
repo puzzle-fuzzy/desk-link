@@ -4388,7 +4388,7 @@ impl ConnectFailure {
                 ),
                 AccessDenialReason::HostUnavailable => Self::with_reason(
                     false,
-                    "主机已批准连接，但当前无法启动屏幕采集。请解锁主机屏幕、退出远程桌面或兼容模式后重试。",
+                    "主机已结束本次控制，或暂时无法提供共享。请在主机上确认共享状态后重新连接。",
                     "host_unavailable",
                     technical_reason,
                 ),
@@ -5773,8 +5773,8 @@ mod tests {
         ));
 
         assert!(!failure.retryable);
-        assert!(failure.detail.contains("屏幕采集"));
-        assert!(failure.detail.contains("解锁"));
+        assert!(failure.detail.contains("结束本次控制"));
+        assert!(failure.detail.contains("共享状态"));
     }
 
     #[test]

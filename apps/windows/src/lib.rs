@@ -25,6 +25,7 @@ mod input_restriction;
 #[cfg(windows)]
 pub mod recent_access;
 pub mod runtime;
+mod session_control;
 #[cfg(windows)]
 pub mod startup;
 mod storage;

@@ -8,13 +8,14 @@ test("actual sharing pause is single-flight, refreshes authoritative Host state 
   const calls: string[] = [];
   let resolve!: () => void;
   const pending = new Promise<void>((next) => {resolve = next;});
-  const create = new Function("pauseHostSharing", "resumeHostSharing", "refreshSnapshot", "clearPairingSecrets", `
+  const create = new Function("pauseHostSharing", "resumeHostSharing", "refreshSnapshot", "clearPairingSecrets", "endHostControl", `
     let hostSharingBusy = false, feedback = null, pairingSession = {};
+    let snapshot = {runtime:{state:"connected"}};
     const render = () => {}, normalizeError = error => error.message;
     ${new Bun.Transpiler({loader: "ts"}).transformSync(action)}
-    return {run:changeHostSharing, state:()=>({hostSharingBusy,feedback,pairingSession})};
+    return {run:changeHostSharing, end:endCurrentHostControl, state:()=>({hostSharingBusy,feedback,pairingSession})};
   `);
-  const flow = create(async () => {calls.push("pause-host"); await pending;}, async () => {calls.push("resume-host");}, async () => {calls.push("refresh-host");}, () => {calls.push("clear-one-time-pairing");});
+  const flow = create(async () => {calls.push("pause-host"); await pending;}, async () => {calls.push("resume-host");}, async () => {calls.push("refresh-host");}, () => {calls.push("clear-one-time-pairing");}, async () => {calls.push("end-host-control");});
   const first = flow.run(false);
   await flow.run(true);
   expect(calls).toEqual(["pause-host"]);
@@ -25,4 +26,7 @@ test("actual sharing pause is single-flight, refreshes authoritative Host state 
   expect(flow.state().pairingSession).toBeNull();
   await flow.run(true);
   expect(calls.at(-3)).toBe("resume-host");
+  await flow.end();
+  expect(calls.slice(-2)).toEqual(["end-host-control", "refresh-host"]);
+  expect(flow.state().feedback.message).toContain("重新发起");
 });

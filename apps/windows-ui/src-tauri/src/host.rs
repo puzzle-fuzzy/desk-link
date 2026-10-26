@@ -15,7 +15,10 @@ use apps_windows::{
     diagnostics::{DiagnosticEvent, DiagnosticLog},
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
-    runtime::{ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver, HostSupervisor},
+    runtime::{
+        ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver, HostSessionControl,
+        HostSupervisor,
+    },
     tray::HostStatusViewModel,
     trusted::{
         LocalControllerApproval, WindowsControllerAuthorizer, WindowsPairingAuthorizer,
@@ -318,6 +321,7 @@ impl Drop for PairingSessionSummary {
 struct HostWorker {
     shutdown: oneshot::Sender<()>,
     task: tauri::async_runtime::JoinHandle<()>,
+    session_control: Option<HostSessionControl>,
 }
 
 #[derive(Clone)]
@@ -442,6 +446,10 @@ impl HostManager {
         // this local safety action waits for the lifecycle lock.
         self.sharing_paused.store(true, Ordering::Release);
         let _restart = self.restart_lock.lock().await;
+        self.pause_sharing_locked().await
+    }
+
+    async fn pause_sharing_locked(&self) -> Result<(), String> {
         self.sharing_paused.store(true, Ordering::Release);
         self.next_lifecycle_generation();
         self.stop_current().await;
@@ -482,6 +490,59 @@ impl HostManager {
         }
         self.restart_current(app).await;
         Ok(())
+    }
+
+    pub async fn end_current_control(&self, app: AppHandle) -> Result<(), String> {
+        let _restart = self.restart_lock.lock().await;
+        let control = self
+            .worker
+            .lock()
+            .map_err(|_| "无法读取本机控制状态。".to_owned())?
+            .as_ref()
+            .and_then(|worker| worker.session_control.clone())
+            .ok_or_else(|| "当前没有正在控制本机的连接。".to_owned())?;
+        let completion = control.request_end().map_err(str::to_owned)?;
+        // Runtime first drops input/media, then sends an authenticated terminal
+        // denial and waits for the Controller's disconnect. No Controller role
+        // belonging to this application is affected by this Host-only command.
+        let result = self.complete_end_locked(completion).await;
+        if result.is_err() {
+            self.publish(&app, self.snapshot());
+        }
+        result
+    }
+
+    async fn complete_end_locked(&self, completion: oneshot::Receiver<bool>) -> Result<(), String> {
+        if tokio::time::timeout(Duration::from_secs(3), completion)
+            .await
+            .is_ok_and(|result| result.is_ok_and(|notified| notified))
+        {
+            return Ok(());
+        }
+        // Without terminal confirmation an automatic remote retry could regain
+        // control. Keep the Host closed until an explicit local resume instead.
+        let saved = self.pause_sharing_locked().await;
+        if saved.is_err() {
+            Err("未收到对方退出确认，已暂停本次运行的共享，但暂停设置未能保存。请检查本机存储权限。".to_owned())
+        } else {
+            Err(
+                "未收到对方退出确认，已暂停本机共享以阻止自动重新接入。确认后可手动恢复共享。"
+                    .to_owned(),
+            )
+        }
+    }
+
+    fn set_session_control_if_current(&self, generation: u64, control: HostSessionControl) {
+        let _guard = self
+            .lifecycle_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.may_start_worker(generation)
+            && let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.as_mut()
+        {
+            worker.session_control = Some(control);
+        }
     }
 
     pub fn snapshot(&self) -> HostRuntimeSummary {
@@ -636,7 +697,11 @@ impl HostManager {
                 .await;
         });
         if let Ok(mut worker) = self.worker.lock() {
-            *worker = Some(HostWorker { shutdown, task });
+            *worker = Some(HostWorker {
+                shutdown,
+                task,
+                session_control: None,
+            });
         } else {
             let _ = shutdown.send(());
             task.abort();
@@ -661,6 +726,7 @@ impl HostManager {
         self.set_pairing_active(true);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let manager = self.clone();
+        let session_control = supervisor.session_control();
         let task = tauri::async_runtime::spawn(async move {
             // The correlation marker must follow the worker, not the prepared
             // object. If preparation is cancelled, no stale marker remains.
@@ -679,7 +745,11 @@ impl HostManager {
             }
         });
         if let Ok(mut worker) = self.worker.lock() {
-            *worker = Some(HostWorker { shutdown, task });
+            *worker = Some(HostWorker {
+                shutdown,
+                task,
+                session_control: Some(session_control),
+            });
             true
         } else {
             let _ = shutdown.send(());
@@ -792,6 +862,7 @@ impl HostManager {
                 diagnostics,
                 session_id,
             })) => {
+                self.set_session_control_if_current(generation, supervisor.session_control());
                 let _session_correlation =
                     set_session_correlation(DiagnosticSource::Host, session_id).ok();
                 tokio::select! {
@@ -1304,7 +1375,11 @@ mod tests {
             shutdown_rx.await.unwrap();
             observed.store(true, Ordering::Release);
         });
-        *manager.worker.lock().unwrap() = Some(HostWorker { shutdown, task });
+        *manager.worker.lock().unwrap() = Some(HostWorker {
+            shutdown,
+            task,
+            session_control: None,
+        });
         // These records represent independent retained identities, not a live
         // remote session or real device input.
         std::fs::write(fixture.directory.join("saved-trust"), b"synthetic-trust").unwrap();
@@ -1387,5 +1462,28 @@ mod tests {
         drop(held);
         pause.await.unwrap().unwrap();
         assert!(fixture.manager().is_sharing_paused());
+    }
+    #[tokio::test]
+    async fn unconfirmed_control_end_persists_a_pause_instead_of_reporting_success() {
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        let (sender, completion) = tokio::sync::oneshot::channel();
+        sender.send(false).unwrap();
+        let result = manager.complete_end_locked(completion).await;
+        assert!(result.unwrap_err().contains("未收到对方退出确认"));
+        assert!(manager.is_sharing_paused());
+        assert_eq!(manager.snapshot().state, "paused");
+        assert!(fixture.manager().is_sharing_paused());
+    }
+
+    #[tokio::test]
+    async fn confirmed_control_end_does_not_pause_or_rewrite_retained_sharing_state() {
+        let fixture = SharingFixture::new();
+        let manager = fixture.manager();
+        let (sender, completion) = tokio::sync::oneshot::channel();
+        sender.send(true).unwrap();
+        manager.complete_end_locked(completion).await.unwrap();
+        assert!(!manager.is_sharing_paused());
+        assert!(!fixture.manager().is_sharing_paused());
     }
 }

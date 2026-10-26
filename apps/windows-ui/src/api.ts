@@ -129,6 +129,10 @@ export function pauseHostSharing(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("pause_host_sharing");
 }
 
+export function endHostControl(): Promise<HostSnapshot> {
+  return invoke<HostSnapshot>("end_host_control");
+}
+
 export function resumeHostSharing(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("resume_host_sharing");
 }

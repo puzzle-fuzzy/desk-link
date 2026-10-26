@@ -136,6 +136,7 @@
 - [ ] 提供“结束当前控制”“暂停共享”“恢复共享”三个独立动作。
 - [x] 暂停/恢复切片 `feat(DL2-008): persist independent Host sharing pause controls`：共享页、顶部状态区及托盘均可操作；只停止 Host，信任和固定密码保留、临时配对失效；独立 marker 跨重启保存，账号/电源恢复及配对回落尊重暂停，保存失败仍关闭本次共享。管理库 108 项通过、1 签名包忽略；新增 6 项原生暂停/存储/诊断测试；Bun 1.3.14 状态/持久表面/实际操作宿主 11 项通过，构建通过。
 - [ ] 真正结束当前控制并终止该 Controller 的自动重连（不能用 Host restart 冒充）；双角色/重启/睡眠真机验收保留。
+- [x] 结束控制切片 `feat(DL2-008): end authenticated Host control with terminal acknowledgement`：本机 stream 绑定命令先停止输入/媒体，再通过认证控制通道发送现有 HostUnavailable 终态并等待对端断开；确认后 Host 可接受新请求，未确认则报错并持久暂停共享。共享页、顶部与托盘提供独立“结束当前控制”。真实本地 relay + Noise + 生产 Controller 合成测试证明两次终态拒绝及同 Host 重新连接；不读消息 peer 返回失败。Windows 库 107 通过、1 桌面忽略；管理库 116 通过、1 签名资产忽略；前端相关测试与构建通过。没有启动真实捕获或注入输入。
 - **证据 / 类型：能力缺口。** `apps/windows-ui/src/main.ts:786-793` 共享操作集中在密码；`apps/windows-ui/src-tauri/src/lib.rs:1677-1741` 未暴露停止 Host / 结束当前 Host 会话命令，`1752-1770` 托盘只有打开/退出。`apps/windows-ui/src-tauri/src/host.rs:502` 已有底层 stop 能力。
 - **用户影响：** 要保留信任却立即结束本机被控状态，缺少直接入口；退出整个应用还会结束本机作为 Controller 的另一条连接。
 - **方案：** Host 与 Controller 生命周期分离；共享页、托盘及被控状态条均能立即收回控制；明确保留信任、临时密码处理及重启后是否继续暂停。暂停不得被账号恢复或电源恢复静默覆盖。

@@ -66,6 +66,9 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 // the person at the host enough time to inspect and approve the controller.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(150);
 const DENIAL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const END_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub use crate::session_control::HostSessionControl;
 const FILE_TRANSFER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 // Only one host-side file sender can be active for a session. Keep its
 // completion notification bounded so a late task cannot retain an unbounded
@@ -380,6 +383,10 @@ pub enum HostRuntimeError {
     PairingExpired,
     #[error("controller authorization backend failed: {0}")]
     AuthorizationBackend(String),
+    #[error("the local user ended the current control session")]
+    LocalControlEnded,
+    #[error("the local control termination was not acknowledged by the controller")]
+    LocalControlEndUnconfirmed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -442,6 +449,7 @@ pub struct HostSupervisor {
     expires_at_unix_s: Option<u64>,
     directory_registration: Option<RelayDirectoryRegistration>,
     observer: Option<Arc<dyn HostLifecycleObserver>>,
+    session_control: HostSessionControl,
 }
 
 impl HostSupervisor {
@@ -470,7 +478,12 @@ impl HostSupervisor {
             expires_at_unix_s,
             directory_registration: None,
             observer: None,
+            session_control: HostSessionControl::default(),
         })
+    }
+
+    pub fn session_control(&self) -> HostSessionControl {
+        self.session_control.clone()
     }
 
     pub fn with_reconnect_policy(mut self, policy: ReconnectPolicy) -> Self {
@@ -611,6 +624,7 @@ impl HostSupervisor {
                 identity,
                 self.authorizer.clone(),
             )?
+            .with_session_control(self.session_control.clone())
             .run_tracking_stability(stable, |stream_id| {
                 self.publish(HostLifecycleEvent::Connected { stream_id });
             })
@@ -669,7 +683,9 @@ pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
         HostRuntimeError::ApprovalRequired
         | HostRuntimeError::PairingRejected
         | HostRuntimeError::PairingExpired
-        | HostRuntimeError::AuthorizationBackend(_) => false,
+        | HostRuntimeError::AuthorizationBackend(_)
+        | HostRuntimeError::LocalControlEnded
+        | HostRuntimeError::LocalControlEndUnconfirmed => false,
     }
 }
 
@@ -682,6 +698,7 @@ fn host_error_is_retryable_for_session(error: &HostRuntimeError, persistent_sess
                     | HostRuntimeError::PairingRejected
                     | HostRuntimeError::PairingExpired
                     | HostRuntimeError::AuthorizationBackend(_)
+                    | HostRuntimeError::LocalControlEnded
             ))
 }
 
@@ -717,6 +734,7 @@ fn host_error_rearms_on_connected_relay(error: &HostRuntimeError) -> bool {
     !matches!(
         error,
         HostRuntimeError::TransportClosed(_)
+            | HostRuntimeError::LocalControlEndUnconfirmed
             | HostRuntimeError::Transport(
                 TransportError::Connection(_)
                     | TransportError::ConnectionLimit
@@ -976,6 +994,7 @@ pub struct HostRuntime {
     stream_id: u64,
     identity: DeviceIdentity,
     authorizer: Arc<dyn ControllerAuthorizer>,
+    session_control: HostSessionControl,
 }
 
 impl HostRuntime {
@@ -1025,7 +1044,13 @@ impl HostRuntime {
             stream_id,
             identity,
             authorizer,
+            session_control: HostSessionControl::default(),
         })
+    }
+
+    fn with_session_control(mut self, control: HostSessionControl) -> Self {
+        self.session_control = control;
+        self
     }
 
     pub async fn run(self) -> Result<(), HostRuntimeError> {
@@ -1043,6 +1068,7 @@ impl HostRuntime {
             stream_id,
             identity,
             authorizer,
+            session_control,
         } = self;
         let (secure, peer_generation) =
             perform_noise_handshake(&client, identity, authorizer.as_ref()).await?;
@@ -1183,6 +1209,7 @@ impl HostRuntime {
         };
         let input = InputInjector::new(VirtualDesktop::new(ready.desktop, ready.coordinate_space));
         stable.store(true, Ordering::Release);
+        let active_session = session_control.activate(stream_id);
         on_connected(stream_id);
 
         let mut video = Box::pin(send_video_loop(
@@ -1246,7 +1273,13 @@ impl HostRuntime {
         ));
         let mut worker_receiver = Box::pin(worker_receiver);
 
+        let mut end_request = None;
         let outcome = tokio::select! {
+            biased;
+            request = session_control.next_end(stream_id) => {
+                end_request = Some(request);
+                Err(HostRuntimeError::LocalControlEnded)
+            },
             result = &mut video => result,
             result = &mut inbound => result,
             result = &mut input_feedback => result,
@@ -1262,12 +1295,24 @@ impl HostRuntime {
         drop(transfer);
         drop(audio);
         drop(worker_receiver);
+        // Dropping inbound releases every tracked native key/button before
+        // waiting for terminal notification or touching any replacement peer.
+        drop(active_session);
         let outcome = match capture_worker.shutdown_and_join() {
             Ok(()) => outcome,
             Err(error) => Err(error),
         };
         if let Some(worker) = audio_worker.take() {
             worker.shutdown_and_join();
+        }
+        if let Some(request) = end_request {
+            let notified = notify_local_control_ended(&client, &secure, peer_generation).await;
+            request.complete(notified);
+            return Err(if notified {
+                HostRuntimeError::LocalControlEnded
+            } else {
+                HostRuntimeError::LocalControlEndUnconfirmed
+            });
         }
         if let Err(error) = &outcome
             && let Some(reason) = host_runtime_denial_reason(error)
@@ -1839,6 +1884,27 @@ fn host_runtime_denial_reason(error: &HostRuntimeError) -> Option<AccessDenialRe
         HostRuntimeError::Input(_) => Some(AccessDenialReason::HostInputFailed),
         _ => None,
     }
+}
+
+async fn notify_local_control_ended(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+) -> bool {
+    // A terminal encrypted denial makes controllers stop automatic recovery.
+    // Wait for their disconnect while the reliable stream is still alive.
+    tokio::time::timeout(END_CONTROL_TIMEOUT, async {
+        let mut secure = secure.lock().await;
+        send_access_denied(
+            client,
+            peer_generation,
+            &mut secure,
+            AccessDenialReason::HostUnavailable,
+        )
+        .await
+    })
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
 async fn send_runtime_failure(
@@ -3889,3 +3955,7 @@ mod direct_video_tests {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "session_control_tests.rs"]
+mod session_control_tests;
