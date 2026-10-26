@@ -14,10 +14,10 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
-/// Protocol 12 is the active development wire. The project has not shipped to
+/// Protocol 13 adds explicit input restriction / recovery feedback. The project has not shipped to
 /// end users, so development binaries move together instead of carrying a
 /// legacy protocol compatibility layer.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_NOISE_HANDSHAKE_BYTES: usize = 4 * 1024;
 pub const MAX_VIDEO_CONFIG_BYTES: usize = 16 * 1024;
@@ -356,6 +356,15 @@ pub enum VideoQualityPreference {
     Sharp,
 }
 
+/// A stable input failure category, independent of OS error strings or privileges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InputRestrictionReason {
+    Blocked,
+    UnsupportedKey,
+    InvalidInput,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
     RequestKeyframe {
@@ -406,6 +415,10 @@ pub enum ControlMessage {
         candidate_id: u64,
         accepted: bool,
         candidate: Option<DirectLanCandidate>,
+    },
+    /// None means a previously restricted input class was successfully injected again.
+    InputState {
+        reason: Option<InputRestrictionReason>,
     },
 }
 
