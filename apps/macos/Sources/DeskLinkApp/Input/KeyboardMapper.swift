@@ -6,9 +6,10 @@ enum KeyboardMapper {
         keyCode: UInt16,
         characters: String?,
         modifiers: NSEvent.ModifierFlags,
-        isDown: Bool
+        isDown: Bool,
+        policy: KeyboardMappingPolicy = KeyboardMappingPolicy()
     ) -> [RemoteInputCommand] {
-        let mappedModifiers = Modifiers(appKit: modifiers)
+        let mappedModifiers = policy.modifiers(for: modifiers)
         if let logicalKeyCode = MacKeyCodeMapper.protocolCode(forAppKitKeyCode: keyCode) {
             return [.key(code: logicalKeyCode, pressed: isDown, modifiers: mappedModifiers)]
         }
@@ -31,11 +32,12 @@ struct KeyboardInputState {
         keyCode: UInt16,
         characters: String?,
         modifiers: NSEvent.ModifierFlags,
-        isRepeat: Bool
+        isRepeat: Bool,
+        policy: KeyboardMappingPolicy = KeyboardMappingPolicy()
     ) -> [RemoteInputCommand] {
         if let held = pressedKeys[keyCode] { return isRepeat ? held : [] }
         let commands = KeyboardMapper.map(
-            keyCode: keyCode, characters: characters, modifiers: modifiers, isDown: true
+            keyCode: keyCode, characters: characters, modifiers: modifiers, isDown: true, policy: policy
         )
         if !commands.isEmpty { pressedKeys[keyCode] = commands }
         return commands
@@ -61,8 +63,8 @@ struct KeyboardInputState {
         return releases + modifierCommands(chordModifiers.intersection(heldModifiers), pressed: true)
     }
 
-    mutating func flagsChanged(_ flags: NSEvent.ModifierFlags) -> [RemoteInputCommand] {
-        let next = Modifiers(appKit: flags)
+    mutating func flagsChanged(_ flags: NSEvent.ModifierFlags, policy: KeyboardMappingPolicy = KeyboardMappingPolicy()) -> [RemoteInputCommand] {
+        let next = policy.modifiers(for: flags)
         var commands = modifierCommands(heldModifiers.subtracting(next), pressed: false)
         commands += modifierCommands(next.subtracting(heldModifiers), pressed: true)
         heldModifiers = next
@@ -164,16 +166,5 @@ enum MacKeyCodeMapper {
         case 31: return 0x37 // Command
         default: return nil
         }
-    }
-}
-
-private extension Modifiers {
-    init(appKit flags: NSEvent.ModifierFlags) {
-        var result: Modifiers = []
-        if flags.contains(.shift) { result.insert(.shift) }
-        if flags.contains(.control) { result.insert(.control) }
-        if flags.contains(.option) { result.insert(.option) }
-        if flags.contains(.command) { result.insert(.meta) }
-        self = result
     }
 }

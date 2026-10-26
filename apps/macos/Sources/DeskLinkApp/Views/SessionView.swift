@@ -12,13 +12,14 @@ struct SessionView: View {
     @ObservedObject var bridge: ControllerBridge
     @ObservedObject var host: HostBridge
     @ObservedObject var account: AccountClient
+    @State private var modifierMode = ModifierMode.automatic
 
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
                 MetalVideoView(pixelBuffer: bridge.latestPixelBuffer)
                     .background(Color.black)
-                SessionInputView(bridge: bridge, videoSize: videoSize)
+                SessionInputView(bridge: bridge, videoSize: videoSize, modifierMode: modifierMode)
                     .background(Color.clear)
                 GeometryReader { proxy in
                     RemoteCursorPositionLayer(
@@ -74,6 +75,28 @@ struct SessionView: View {
                 }
             }
             ToolbarItem(placement: .primaryAction) {
+                Menu("键盘") {
+                    Picker("按键映射", selection: $modifierMode) {
+                        ForEach(ModifierMode.allCases) { mode in Text(mode.title).tag(mode) }
+                    }
+                    if bridge.remotePlatform == .windows {
+                        Text("按本机习惯：Command 对应 Ctrl")
+                        Divider()
+                        Button("切换窗口（Alt+Tab）") { sendSystemKey(DeskLinkKeyCode.tab, modifiers: .option) }
+                        Button("Windows 键") { sendSystemKey(DeskLinkKeyCode.meta) }
+                        Button("运行（Win+R）") {
+                            bridge.send(input: .character(114, pressed: true, modifiers: .meta))
+                            bridge.send(input: .character(114, pressed: false, modifiers: .meta))
+                        }
+                    } else if bridge.remotePlatform != .unknown {
+                        Divider()
+                        Button("切换应用（Command+Tab）") { sendSystemKey(DeskLinkKeyCode.tab, modifiers: .meta) }
+                        Button("Command 键") { sendSystemKey(DeskLinkKeyCode.meta) }
+                    }
+                }
+                .disabled(!keyboardAvailable)
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button("请求关键帧") { bridge.requestKeyframe() }
                     .buttonStyle(.bordered)
             }
@@ -102,6 +125,17 @@ struct SessionView: View {
     private var videoSize: CGSize? {
         guard let pixelBuffer = bridge.latestPixelBuffer else { return nil }
         return CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+    }
+
+    private var keyboardAvailable: Bool {
+        if case .connected = bridge.state { return true }
+        return false
+    }
+
+    private func sendSystemKey(_ code: UInt32, modifiers: Modifiers = []) {
+        bridge.releaseAll()
+        bridge.send(input: .key(code: code, pressed: true, modifiers: modifiers))
+        bridge.send(input: .key(code: code, pressed: false, modifiers: modifiers))
     }
 
     private var cursorStreamID: UInt64? {

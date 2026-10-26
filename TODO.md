@@ -135,6 +135,9 @@
 ### DL2-007 · P1 · 将 Mac 快捷键映射接入实际输入路径
 
 - [ ] 统一“按本机习惯 / 发送原始按键”的策略与生产调用入口。
+- [x] 代码接线：同一 `KeyboardMappingPolicy` 驱动生产 keyDown、flagsChanged 与 AppKit `performKeyEquivalent`；仅已认证 Windows 的自动模式把 Command 映为 Ctrl，未确认 / Mac / iOS 及原始模式保留 Meta。切换映射或平台时释放旧输入；会话“键盘”菜单可选模式并发送 Alt+Tab、Windows 键和 Win+R 等原始系统组合。修复主题：`fix(DL2-007): route Mac shortcuts through negotiated keyboard policy`。
+- [x] Windows 自动验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract -v`，11 项静态源码合同通过；Apple 取消 / cursor / media / teardown 另外 20 项合同通过；`git diff --check` 通过。新增 Swift 生产 InputView → Bridge → FFI struct 回归，覆盖 C/V/A/Z、原始及未知平台、key equivalent 和切换时释放。
+- [ ] Mac 自动与双机：Windows 无 Swift/AppKit，新增 Swift 测试尚未运行；真实 Mac → Windows 的复制、粘贴、全选、撤销、窗口切换与原始 Win 键仍待验收，不以 helper / 静态合同替代。
 - **证据 / 类型：源码缺陷。** `apps/macos/Sources/DeskLinkApp/Input/InputMapper.swift:45-53` 有 automatic 的 Command→Control，但 `apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift:97-105` 使用 KeyboardMapper；`apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift:95` 实际把 Command 映为 Meta。remoteModifier 的相关测试只覆盖孤立 helper。
 - **用户影响：** Mac 用户常用 Command+C/V/A/Z 控制 Windows 时，实际可能变成 Win 组合键。
 - **方案：** 根据已协商的远端平台映射，默认符合用户习惯，原始 Win/Command 模式可选择；会话菜单显示必要系统组合键。不要只修测试 helper。

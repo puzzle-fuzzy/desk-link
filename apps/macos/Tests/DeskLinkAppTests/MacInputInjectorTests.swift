@@ -4,6 +4,12 @@ import XCTest
 @testable import DeskLinkApp
 
 final class MacInputInjectorTests: XCTestCase {
+    func testRawModifierEventsCarryTheirOwnNativeFlagOnlyWhilePressed() {
+        XCTAssertEqual(macKeyboardEventFlags(keyCode: 0x37, pressed: true, modifiers: []), .maskCommand)
+        XCTAssertEqual(macKeyboardEventFlags(keyCode: 0x3b, pressed: true, modifiers: .shift), [.maskControl, .maskShift])
+        XCTAssertEqual(macKeyboardEventFlags(keyCode: 0x3b, pressed: false, modifiers: [.control, .shift]), .maskShift)
+    }
+
     func testInputInjectorConvertsNormalizedCoordinatesAndUnicode() throws {
         let backend = RecordingCGEventBackend()
         let injector = MacInputInjector(

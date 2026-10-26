@@ -53,7 +53,7 @@ final class SystemCGEventBackend: CGEventBackend {
         guard let virtualKey = CGKeyCode(exactly: code),
               let event = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: pressed)
         else { throw MacInputInjectorError.invalidKeyCode }
-        event.flags = cgFlags(for: modifiers)
+        event.flags = macKeyboardEventFlags(keyCode: code, pressed: pressed, modifiers: modifiers)
         event.post(tap: .cghidEventTap)
     }
 
@@ -192,6 +192,22 @@ enum PressedInput: Hashable {
     case key(UInt32)
     case character(UInt32)
     case button(MouseButton)
+}
+
+func macKeyboardEventFlags(keyCode: UInt32, pressed: Bool, modifiers: Modifiers) -> CGEventFlags {
+    var flags = cgFlags(for: modifiers)
+    let ownModifier: CGEventFlags?
+    switch keyCode {
+    case 0x36, 0x37: ownModifier = .maskCommand
+    case 0x38, 0x3c: ownModifier = .maskShift
+    case 0x3a, 0x3d: ownModifier = .maskAlternate
+    case 0x3b, 0x3e: ownModifier = .maskControl
+    default: ownModifier = nil
+    }
+    if let ownModifier {
+        if pressed { flags.insert(ownModifier) } else { flags.remove(ownModifier) }
+    }
+    return flags
 }
 
 private func cgFlags(for modifiers: Modifiers) -> CGEventFlags {

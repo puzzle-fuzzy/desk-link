@@ -28,7 +28,7 @@ class MacInputSourceContractTests(unittest.TestCase):
     def test_production_view_tracks_physical_keyup_repeat_flags_and_reset(self) -> None:
         view = source("apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift")
         mapper = source("apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift")
-        for token in ["keyboard.keyDown(", "keyboard.keyUp(keyCode: event.keyCode)", "keyboard.flagsChanged(event.modifierFlags)", "keyboard.reset()", "event.isARepeat", "event.charactersIgnoringModifiers"]:
+        for token in ["keyboard.keyDown(", "keyboard.keyUp(keyCode: event.keyCode)", "keyboard.flagsChanged(event.modifierFlags, policy: keyboardPolicy)", "keyboard.reset()", "event.isARepeat", "event.charactersIgnoringModifiers"]:
             self.assertIn(token, view)
         self.assertIn("pressedKeys.removeValue(forKey: keyCode)", mapper)
         self.assertIn("return isRepeat ? held : []", mapper)
@@ -79,6 +79,27 @@ class MacInputSourceContractTests(unittest.TestCase):
         self.assertIn("window.convertToScreen(convert(anchor, to: nil))", view)
         self.assertIn("textFocusAnchor.x * videoRect.width", view)
         self.assertIn("textFocusAnchor.y * videoRect.height", view)
+
+    def test_production_keyboard_routes_use_authenticated_platform_policy(self) -> None:
+        view = source("apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift")
+        policy = source("apps/macos/Sources/DeskLinkApp/Input/KeyboardMappingPolicy.swift")
+        self.assertIn("mode == .automatic && remotePlatform == .windows", policy)
+        self.assertIn("mapsCommandToControl ? .control : .meta", policy)
+        self.assertIn("remotePlatform: bridge.remotePlatform", view)
+        self.assertGreaterEqual(view.count("policy: keyboardPolicy"), 2)
+        key_equivalent = view.split("override func performKeyEquivalent", 1)[1].split("override func flagsChanged", 1)[0]
+        self.assertIn("sendKeyboard(event, isDown: true)", key_equivalent)
+        self.assertIn("sendKeyboard(event, isDown: false)", key_equivalent)
+        changed_policy = view.split("func synchronizeKeyboardPolicy", 1)[1].split("func hasMarkedText", 1)[0]
+        self.assertIn("releaseAll()", changed_policy)
+
+    def test_session_menu_exposes_raw_mode_and_remote_system_chords(self) -> None:
+        view = source("apps/macos/Sources/DeskLinkApp/Views/SessionView.swift")
+        self.assertIn("modifierMode: modifierMode", view)
+        self.assertIn('Picker("按键映射", selection: $modifierMode)', view)
+        self.assertIn("sendSystemKey(DeskLinkKeyCode.tab, modifiers: .option)", view)
+        self.assertIn("sendSystemKey(DeskLinkKeyCode.meta)", view)
+        self.assertIn(".character(114, pressed: true, modifiers: .meta)", view)
 
 
 if __name__ == "__main__":

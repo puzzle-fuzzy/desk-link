@@ -18,20 +18,23 @@ private final class WindowFocusObservation: @unchecked Sendable {
 struct SessionInputView: NSViewRepresentable {
     @ObservedObject var bridge: ControllerBridge
     let videoSize: CGSize?
+    let modifierMode: ModifierMode
 
-    init(bridge: ControllerBridge, videoSize: CGSize? = nil) {
+    init(bridge: ControllerBridge, videoSize: CGSize? = nil, modifierMode: ModifierMode = .automatic) {
         self.bridge = bridge
         self.videoSize = videoSize
+        self.modifierMode = modifierMode
     }
 
     func makeNSView(context: Context) -> InputView {
-        InputView(bridge: bridge, videoSize: videoSize)
+        InputView(bridge: bridge, videoSize: videoSize, modifierMode: modifierMode)
     }
 
     func updateNSView(_ view: InputView, context: Context) {
         view.bridge = bridge
         view.videoSize = videoSize
         view.synchronizeSession(bridge.state)
+        view.synchronizeKeyboardPolicy(KeyboardMappingPolicy(mode: modifierMode, remotePlatform: bridge.remotePlatform))
     }
 
     static func dismantleNSView(_ view: InputView, coordinator: ()) {
@@ -48,6 +51,7 @@ struct SessionInputView: NSViewRepresentable {
         }
         private var pressedButtons = Set<MouseButton>()
         private var keyboard = KeyboardInputState()
+        private var keyboardPolicy: KeyboardMappingPolicy
         private var sessionState: ConnectionState
         private let windowFocusObservation = WindowFocusObservation()
         private var markedText = NSMutableAttributedString(string: "")
@@ -60,9 +64,10 @@ struct SessionInputView: NSViewRepresentable {
         // provides the known text-focus anchor, normalized to the video rect.
         private var textFocusAnchor = CGPoint(x: 0.5, y: 0.5)
 
-        init(bridge: ControllerBridge, videoSize: CGSize?) {
+        init(bridge: ControllerBridge, videoSize: CGSize?, modifierMode: ModifierMode = .automatic) {
             self.bridge = bridge
             self.videoSize = videoSize
+            keyboardPolicy = KeyboardMappingPolicy(mode: modifierMode, remotePlatform: bridge.remotePlatform)
             sessionState = bridge.state
             super.init(frame: .zero)
             wantsLayer = true
@@ -137,9 +142,19 @@ struct SessionInputView: NSViewRepresentable {
             composedDuringKeyDown = false
         }
         override func keyUp(with event: NSEvent) { sendKeyboard(event, isDown: false) }
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            guard window?.firstResponder === self, !hasMarkedText(), event.modifierFlags.contains(.command) else {
+                return super.performKeyEquivalent(with: event)
+            }
+            // AppKit routes Command shortcuts through key equivalents before
+            // keyDown. Send one balanced chord so local menus cannot consume it.
+            sendKeyboard(event, isDown: true)
+            sendKeyboard(event, isDown: false)
+            return true
+        }
         override func flagsChanged(with event: NSEvent) {
             guard !hasMarkedText() else { return }
-            for command in keyboard.flagsChanged(event.modifierFlags) { bridge?.send(input: command) }
+            for command in keyboard.flagsChanged(event.modifierFlags, policy: keyboardPolicy) { bridge?.send(input: command) }
         }
         override func mouseMoved(with event: NSEvent) { sendPointer(event) }
         override func mouseDragged(with event: NSEvent) { sendPointer(event) }
@@ -176,6 +191,12 @@ struct SessionInputView: NSViewRepresentable {
             guard state != sessionState else { return }
             releaseAll()
             sessionState = state
+        }
+
+        func synchronizeKeyboardPolicy(_ policy: KeyboardMappingPolicy) {
+            guard policy != keyboardPolicy else { return }
+            releaseAll()
+            keyboardPolicy = policy
         }
 
         func hasMarkedText() -> Bool { markedText.length > 0 }
@@ -300,7 +321,8 @@ struct SessionInputView: NSViewRepresentable {
                     keyCode: event.keyCode,
                     characters: isShortcut ? event.charactersIgnoringModifiers : event.characters,
                     modifiers: event.modifierFlags,
-                    isRepeat: event.isARepeat
+                    isRepeat: event.isARepeat,
+                    policy: keyboardPolicy
                 )
             } else {
                 commands = keyboard.keyUp(keyCode: event.keyCode)

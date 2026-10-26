@@ -42,7 +42,7 @@ final class InputMapperTests: XCTestCase {
     }
 
     func testCommandMapsToRemoteControlWhenAutomaticMappingIsEnabled() {
-        let mapper = InputMapper(videoRect: .zero, modifierMode: .automatic)
+        let mapper = InputMapper(videoRect: .zero, modifierMode: .automatic, remotePlatform: .windows)
 
         XCTAssertEqual(mapper.remoteModifier(for: .command), .control)
     }
@@ -136,6 +136,36 @@ final class InputMapperTests: XCTestCase {
         keyboard.reset()
         XCTAssertTrue(keyboard.keyUp(keyCode: 0).isEmpty)
         XCTAssertTrue(keyboard.flagsChanged([]).isEmpty)
+    }
+
+    func testAutomaticMappingRequiresAuthenticatedWindowsPlatform() {
+        XCTAssertEqual(KeyboardMappingPolicy(remotePlatform: .windows).modifiers(for: .command), .control)
+        for platform in [RemotePlatform.unknown, .macos, .ios] {
+            XCTAssertEqual(KeyboardMappingPolicy(remotePlatform: platform).modifiers(for: .command), .meta)
+            XCTAssertEqual(InputMapper(videoRect: .zero, remotePlatform: platform).remoteModifier(for: .command), .command)
+        }
+        XCTAssertEqual(KeyboardMappingPolicy(mode: .raw, remotePlatform: .windows).modifiers(for: .command), .meta)
+    }
+
+    func testMappedCommandAndLocalControlShareOneBalancedRemoteModifier() {
+        var keyboard = KeyboardInputState()
+        let policy = KeyboardMappingPolicy(remotePlatform: .windows)
+        XCTAssertEqual(keyboard.flagsChanged(.command, policy: policy), [.key(code: 28, pressed: true, modifiers: [])])
+        XCTAssertTrue(keyboard.flagsChanged([.command, .control], policy: policy).isEmpty)
+        XCTAssertTrue(keyboard.flagsChanged(.control, policy: policy).isEmpty)
+        XCTAssertEqual(keyboard.flagsChanged([], policy: policy), [.key(code: 28, pressed: false, modifiers: [])])
+    }
+
+    func testCopyPasteSelectAllUndoUseMappedModifiersInPhysicalState() {
+        for (keyCode, text) in [(UInt16(8), "c"), (9, "v"), (0, "a"), (6, "z")] {
+            var keyboard = KeyboardInputState()
+            let policy = KeyboardMappingPolicy(remotePlatform: .windows)
+            let scalar = text.unicodeScalars.first!.value
+            XCTAssertEqual(keyboard.keyDown(keyCode: keyCode, characters: text, modifiers: .command, isRepeat: false, policy: policy), [
+                .character(scalar, pressed: true, modifiers: .control),
+            ])
+            XCTAssertEqual(keyboard.keyUp(keyCode: keyCode), [.character(scalar, pressed: false, modifiers: .control)])
+        }
     }
 
     func testScrollQuantizationNeverSendsInvalidZeroOrOversizedDeltas() {
