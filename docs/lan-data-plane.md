@@ -55,4 +55,14 @@ git diff --check
 
 生产接线前仍需协商能力/代数与切换边界、适配现有 packetizer 和 relay readers、接通输入控制/音频/文件、定义 relay 不可达时的 LAN 存活及授权撤销、完善 LAN 发现和本地配对。能力协商应复用 DL2-009 统一的 v13 契约（来源独立提交 `9979c6424cf99f704feb212c7700833fce466dae`，本切片代码无其新增枚举依赖，后续由主会话整合并重跑验证），不单独修改全局 `PROTOCOL_VERSION` 或重排业务 `ControlMessage`。可靠逐消息收讫选择正确性优先，文件吞吐可能受单 lane 的收讫往返限制；需要本地及实机吞吐/帧龄/输入 p95/p99 测量后再设计有界滑动窗口，不能宣称该切片已达到极致性能。
 
-共享源码协调：已核对媒体组 DL2-011 提交 `3277c2a41af0ac923e1daa1c5cab5d952b355b9b`，其变更位于 probe 的共享 crypto API 与测试；本切片仅为未触及的 `DirectLanConnection` 增加 crate 内 getter，没有改 probe 实现或引入其 Windows runtime 改动。
+## 共享边界跟进（2026-10-26）
+
+已复用媒体组 DL2-011 独立提交 `3277c2a41af0ac923e1daa1c5cab5d952b355b9b` 和 `0836a8b311a858bf12f0d0b4427961c35f5986a7`。前者提供共享 crypto 的短锁探测 API，后者追加 `SecureLane::DirectProbe=8`，保持已有 0～7 不变，探测有独立的密钥、计数器和重放窗口。没有新增另一套 probe wire、重置相同 key 的计数器、变更协议 13 或 JOIN 信封。
+
+`CHANNEL_COUNT=8` 是业务 `ChannelKind` 1～8 的数量，不是 `SecureLane::COUNT`；新增内部 probe lane 不增加业务队列或 QUIC event 槽。LAN 连接仍来自相同 probe API，本模块只追加 crate 内认证连接 getter。整合共享 API 时保留当前基线的静态捕获逻辑，仅接入 probe 调用与代数退出时的任务取消；没有把 LAN 数据面接入生产 Host，也未替换媒体组后续的输入快路径。
+
+DL2-013 的 `InputEnvelope {stream_id,input_epoch}` 和 `VideoConfig.input_epoch` 由 Apple/FFI 提供唯一契约，本切片没有定义另一版本。业务正文在 seal 前仅包裹 DLB1/token，admit 后逐字节剥除包装并返回，不读取或重写输入字段。可靠业务上限仍为 65491 字节，epoch 占用业务体自身预算。Host 输入消费者必须校验 epoch；收讫仅表示传输入队，不能代替输入执行或 epoch 合法性。待该契约提交后，再用真实编码器补直连/回退字段保留和旧 epoch 拒绝的运行时回归。
+
+本分支实际验证：crypto 36 项、transport 38 项单元 +16 项 localhost、relay 34 项常规、FFI 39 项以及 Windows `direct_video_tests` 2 项全部通过。手工性能 probe 本次未重跑，原记录仍对应此前测量基线；没有用此前延迟替代新接入的性能证据。crypto/transport/relay/FFI all-targets Clippy、Windows lib Clippy（均 `--locked -- -D warnings`）、五个 package 的 fmt 与最终 `git diff --check` 通过。
+
+本地依赖提交分别为 `958f6262a42bb74e493eb82987f089516a93e5a7` 与 `84fe28952ebe2bf7aaf5e63ce44174aa41562f37`，均记录原始来源。整合时引入的 runtime 行尾变化在本跟进提交纠正，最终相对整合前的 runtime 差异只剩共享探测调用与任务取消管理。主分支若已有原始两个依赖，不应重复引入本地依赖副本。

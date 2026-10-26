@@ -30,6 +30,8 @@ const HEADER_BYTES: usize = 6;
 const RELIABLE_PAYLOAD_MAGIC: &[u8; 4] = b"DLB1";
 const RECEIPT_BYTES: usize = 16;
 const RELIABLE_PAYLOAD_OVERHEAD: usize = 4 + RECEIPT_BYTES;
+// Business ChannelKind values 1..=8 only. Crypto-only lanes such as
+// DirectProbe are not transport channels and do not add queue slots here.
 const CHANNEL_COUNT: usize = 8;
 const MAX_INBOUND_STREAMS: usize = 16;
 const PACKET_OVERHEAD: usize = MAX_ENCRYPTED_MESSAGE_BYTES - MAX_PACKET_PLAINTEXT_BYTES;
