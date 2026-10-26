@@ -30,6 +30,8 @@ mod session_control;
 pub mod startup;
 mod storage;
 pub mod transfer;
+pub mod transfer_checkpoint;
+pub mod transfer_directory;
 #[cfg(windows)]
 pub mod transfer_recovery;
 pub mod tray;

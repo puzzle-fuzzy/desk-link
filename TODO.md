@@ -462,6 +462,8 @@
 
 - [x] **协议14独立来源切片（非整链过渡）：** 新增有界FileTask合同：能力交集、单文件1TiB/聚合16TiB/100万项资源上限、逐项manifest、块摘要/持久确认/恢复证明、暂停/恢复/取消；旧FileOffer仍限制256MiB，输入上下文与Noise算法不变、relay JOIN版本不变。协议13在所有已有带版本载荷边界明确拒绝。`test -p desklink-protocol --locked` 54通过、1个既有benchmark ignored；新增3项行为测试覆盖>4GiB精确数值、截断/尾字节、恶意路径/预算/溢出。此提交只证明共享合同，不代表Windows/Mac功能已接通，主验收保留[ ]。
 
+- [x] **持久块证明与目录磁盘原语切片：** SourceIndex按48KiB块持久化摘要/前缀证明，恢复O(1)定位；CheckpointLedger先sync数据与日志再确认，重启截断未确认尾部，发布前重新校验实际所有块。目录按深度栈流式枚举、队列2/扫描worker8；逐项本地JSONL可保留源身份。Windows固定祖先句柄、拒绝重解析点/ADS/路径越界，暂存独占与create-only发布，保留空目录、中文和长路径。`test -p desklink-windows --lib transfer --locked -- --test-threads=1` 65通过/0ignored（旧传输28、checkpoint10、目录20、恢复7）。涵盖真实>4GiB稀疏偏移、源同长/恢复mtime变化、撕裂日志、离线篡改、满队列取消、旧writer Busy、junction和重名竞态。此切片尚未代表新任务端到端/UI/Mac接线完成。
+
 ### DL2-031 · P2 · 让等待队列中所有文件都能管理
 
 - [ ] 保留紧凑摘要，并允许展开完整队列、逐项移除。
