@@ -5,6 +5,7 @@ pub(super) enum ConfigurationKind {
     Display,
     Quality,
     Profile,
+    Bitrate,
 }
 
 impl ConfigurationKind {
@@ -13,6 +14,7 @@ impl ConfigurationKind {
             Self::Display => 0,
             Self::Quality => 1,
             Self::Profile => 2,
+            Self::Bitrate => 3,
         }
     }
 }
@@ -22,6 +24,7 @@ pub(super) enum ConfigurationAction {
     SelectDisplay(u32),
     SetVideoQuality(VideoQualityPreset),
     SetVideoProfile(H264Profile),
+    SetVideoBitrate(u32),
 }
 
 impl ConfigurationAction {
@@ -30,6 +33,7 @@ impl ConfigurationAction {
             Self::SelectDisplay(_) => ConfigurationKind::Display,
             Self::SetVideoQuality(_) => ConfigurationKind::Quality,
             Self::SetVideoProfile(_) => ConfigurationKind::Profile,
+            Self::SetVideoBitrate(_) => ConfigurationKind::Bitrate,
         }
     }
 }
@@ -47,8 +51,8 @@ pub(super) struct ConfigurationOperation {
 #[derive(Default)]
 pub(super) struct ConfigurationQueue {
     serial: u64,
-    latest: [u64; 3],
-    pending: [Option<ConfigurationOperation>; 3],
+    latest: [u64; 4],
+    pending: [Option<ConfigurationOperation>; 4],
 }
 
 impl ConfigurationQueue {
@@ -106,6 +110,23 @@ impl ConfigurationQueue {
 mod tests {
     use super::{ConfigurationAction as Action, ConfigurationKind as Kind, ConfigurationQueue};
     use desklink_protocol::{H264Profile, VideoQualityPreset};
+
+    #[test]
+    fn bitrate_is_independently_bounded_and_can_be_invalidated_by_manual_choice() {
+        let mut queue = ConfigurationQueue::default();
+        queue.request(Action::SetVideoBitrate(1_000_000));
+        let in_flight = queue.pop_next().unwrap();
+        for rate in 1..=1000 {
+            queue.request(Action::SetVideoBitrate(rate));
+        }
+        queue.request(Action::SelectDisplay(4));
+        queue.request(Action::SetVideoQuality(VideoQualityPreset::Sharp));
+        queue.request(Action::SetVideoProfile(H264Profile::High));
+        assert_eq!(queue.pending.iter().flatten().count(), 4);
+        queue.invalidate_kind(Kind::Bitrate);
+        assert!(!queue.is_current(&in_flight));
+        assert_eq!(queue.pending.iter().flatten().count(), 3);
+    }
 
     #[test]
     fn floods_replace_same_kind_and_keep_only_three_pending_choices() {

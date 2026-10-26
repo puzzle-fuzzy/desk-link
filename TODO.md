@@ -321,7 +321,10 @@
 
 - [x] **原生码率API切片（`feat(DL2-023): add transactional native bitrate updates`）：** `H264Encoder::try_set_bitrate` 在能力可修改/可回读时事务写Mean/Peak并验证，成功不重建reference/config/dims/fps；拒绝只有确认恢复旧值才返回false，不确定恢复返回错误要求调用方重建旧设置。见 `docs/windows-encoder-backends.md`。
 - **验证：** encoder 8项通过，含4事务故障/回滚、软件合成编码前后配置/参考连续性；lib严格Clippy通过。当前软件MFT返回“不支持动态修改”，未声称真实动态成功或硬件收益。
-- [ ] **待接入与完整策略：** Host配置完成事件及档内自适应码率、独立帧率/内容模式、扩充能力协商及4K/60门槛；带宽/弱硬件/清晰度/帧龄/切档与恢复矩阵尚待。
+- [ ] **完整策略/硬件仍待：** 独立帧率/内容模式、扩充能力协商及4K/60门槛；带宽/弱硬件/清晰度/帧龄/切档与恢复矩阵尚待。
+
+- [x] **生产策略接入（`feat(DL2-023): adapt bitrate independently within video presets`）：** Automatic下档内20%/严重35%降码率，原生确认后8反馈窗口冷却、12健康窗口后5%恢复；保持分辨率/帧率，手动偏好恢复档位ceiling。实际值随质量/Profile应答回传，拓扑/Profile保留码率；跨配置失效旧目标且阻止新rate观察，避免旧档位rate晚到。队列扩为4+1有界。配置future等真实原生完成、随peer取消，不把5秒超时当已拒绝；不支持/下限/渲染压力沿既有档位回退。
+- **验证：** Windows lib 159通过/2忽略、独立policy 8通过、配置队列6通过，严格lib+tests Clippy通过；含5.1秒迟到原生应答仍正确确认、手动门控、跨配置旧请求失效、精确上下限及回滚。说明/复跑见 `docs/windows-adaptive-bitrate.md`。当前软件MFT不支持动态码率，未宣称硬件成功或网络性能收益。
 
 ### DL2-024 · P2 · 将低延迟直连从视频优化扩展为完整数据路径
 

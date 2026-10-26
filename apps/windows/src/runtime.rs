@@ -1,3 +1,5 @@
+mod adaptive_bitrate;
+use adaptive_bitrate::AdaptiveBitrate;
 mod configuration_queue;
 use configuration_queue::{
     ConfigurationAction, ConfigurationKind, ConfigurationOperation, ConfigurationQueue,
@@ -254,6 +256,23 @@ impl AdaptiveVideoQuality {
         self.degraded_samples = 0;
         self.healthy_samples = 0;
     }
+}
+
+fn bitrate_feedback_decision(
+    preference: VideoQualityPreference,
+    policy: &mut AdaptiveBitrate,
+    received: u32,
+    dropped: u32,
+    decode_queue: u16,
+    freshness: u16,
+) -> (Option<u32>, bool) {
+    if preference != VideoQualityPreference::Automatic {
+        return (None, false);
+    }
+    let requested = policy.observe(received, dropped, decode_queue, freshness);
+    let handled = policy.can_handle_network_pressure(received, dropped, decode_queue, freshness)
+        || policy.should_recover_rate_first(received, dropped, decode_queue, freshness);
+    (requested, handled)
 }
 
 fn manual_video_quality(preference: VideoQualityPreference) -> Option<VideoQualityPreset> {
@@ -1431,11 +1450,15 @@ enum CaptureWorkerCommand {
     },
     SetVideoQuality {
         preset: VideoQualityPreset,
-        reply: oneshot::Sender<VideoQualityPreset>,
+        reply: oneshot::Sender<(VideoQualityPreset, u32)>,
     },
     SetVideoProfile {
         profile: H264Profile,
-        reply: oneshot::Sender<H264Profile>,
+        reply: oneshot::Sender<(H264Profile, u32)>,
+    },
+    SetVideoBitrate {
+        bitrate: u32,
+        reply: oneshot::Sender<Option<u32>>,
     },
 }
 
@@ -1553,7 +1576,14 @@ fn prepare_capture_topology(
     // reconfigure_for_source commits its backend/settings only after successful
     // creation. Keep the old capture and published coordinates on any error.
     encoder
-        .reconfigure_for_source(width, height, settings)
+        .reconfigure_for_source(
+            width,
+            height,
+            H264EncoderSettings {
+                bitrate: encoder.bitrate(),
+                ..settings
+            },
+        )
         .map_err(HostRuntimeError::Encoder)?;
     if refreshed_display_topology(topology)?.is_some() {
         // Encoder/driver creation can also span another display change. Keep
@@ -2190,7 +2220,9 @@ fn capture_encode_loop(
                     let _ = reply.send(switched);
                 }
                 CaptureWorkerCommand::SetVideoQuality { preset, reply } => {
-                    if preset != video_quality {
+                    if preset != video_quality
+                        || encoder.bitrate() != video_quality_settings(preset).bitrate
+                    {
                         let (source_width, source_height) = capture.dimensions();
                         if encoder
                             .reconfigure_for_source(
@@ -2211,7 +2243,7 @@ fn capture_encode_loop(
                             notify.notify_one();
                         }
                     }
-                    let _ = reply.send(video_quality);
+                    let _ = reply.send((video_quality, encoder.bitrate()));
                 }
                 CaptureWorkerCommand::SetVideoProfile { profile, reply } => {
                     if profile != video_profile {
@@ -2220,7 +2252,10 @@ fn capture_encode_loop(
                             .reconfigure_for_source(
                                 source_width,
                                 source_height,
-                                video_quality_settings_with_profile(video_quality, profile),
+                                H264EncoderSettings {
+                                    bitrate: encoder.bitrate(),
+                                    ..video_quality_settings_with_profile(video_quality, profile)
+                                },
                             )
                             .is_ok()
                         {
@@ -2230,7 +2265,27 @@ fn capture_encode_loop(
                             notify.notify_one();
                         }
                     }
-                    let _ = reply.send(video_profile);
+                    let _ = reply.send((video_profile, encoder.bitrate()));
+                }
+                CaptureWorkerCommand::SetVideoBitrate { bitrate, reply } => {
+                    let actual = match encoder.try_set_bitrate(bitrate) {
+                        Ok(true) => Some(encoder.bitrate()),
+                        Ok(false) => None,
+                        Err(_) => {
+                            // Native rollback was uncertain. Recreate the last
+                            // verified settings before encoding any more frames.
+                            let (width, height) = encoder.dimensions();
+                            encoder
+                                .rebuild(width, height)
+                                .map_err(HostRuntimeError::Encoder)?;
+                            video_profile = encoder.profile();
+                            lock_queue(&queue).clear();
+                            force_keyframe.store(true, Ordering::Release);
+                            notify.notify_one();
+                            None
+                        }
+                    };
+                    let _ = reply.send(actual);
                 }
             }
         }
@@ -2815,39 +2870,41 @@ async fn send_video_quality_state(
 async fn apply_video_quality(
     capture_commands: &std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     preset: VideoQualityPreset,
-) -> Result<Option<VideoQualityPreset>, HostRuntimeError> {
+) -> Result<Option<(VideoQualityPreset, u32)>, HostRuntimeError> {
     let (reply, applied) = oneshot::channel();
     capture_commands
         .try_send(CaptureWorkerCommand::SetVideoQuality { preset, reply })
         .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-    Ok(tokio::time::timeout(Duration::from_secs(5), applied)
-        .await
-        .ok()
-        .and_then(Result::ok))
+    Ok(Some(
+        applied
+            .await
+            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?,
+    ))
 }
 
 async fn apply_video_profile(
     capture_commands: &std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     profile: H264Profile,
-) -> Result<H264Profile, HostRuntimeError> {
+) -> Result<Option<(H264Profile, u32)>, HostRuntimeError> {
     let (reply, applied) = oneshot::channel();
     capture_commands
         .try_send(CaptureWorkerCommand::SetVideoProfile { profile, reply })
         .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-    Ok(tokio::time::timeout(Duration::from_secs(5), applied)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(H264Profile::Main))
+    Ok(Some(
+        applied
+            .await
+            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?,
+    ))
 }
 
 enum ConfigurationApplied {
     Display,
-    Quality(Option<VideoQualityPreset>),
-    Profile(H264Profile),
+    Quality(Option<(VideoQualityPreset, u32)>),
+    Profile(Option<(H264Profile, u32)>),
+    Bitrate(Option<u32>),
 }
 
-type PendingConfiguration = std::pin::Pin<
+type ConfigurationFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<(ConfigurationOperation, ConfigurationApplied), HostRuntimeError>,
@@ -2855,36 +2912,81 @@ type PendingConfiguration = std::pin::Pin<
     >,
 >;
 
+struct PendingConfiguration {
+    operation: ConfigurationOperation,
+    future: ConfigurationFuture,
+}
+
 fn start_configuration(
     commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     operation: ConfigurationOperation,
 ) -> PendingConfiguration {
-    Box::pin(async move {
-        let applied = match operation.action {
-            ConfigurationAction::SelectDisplay(display_id) => {
-                let (reply, switched) = oneshot::channel();
-                commands
-                    .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
-                    .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-                let _ = tokio::time::timeout(Duration::from_secs(5), switched).await;
-                ConfigurationApplied::Display
-            }
-            ConfigurationAction::SetVideoQuality(preset) => {
-                ConfigurationApplied::Quality(apply_video_quality(&commands, preset).await?)
-            }
-            ConfigurationAction::SetVideoProfile(profile) => {
-                ConfigurationApplied::Profile(apply_video_profile(&commands, profile).await?)
-            }
-        };
-        Ok((operation, applied))
-    })
+    PendingConfiguration {
+        operation,
+        future: Box::pin(async move {
+            let applied = match operation.action {
+                ConfigurationAction::SelectDisplay(display_id) => {
+                    let (reply, switched) = oneshot::channel();
+                    commands
+                        .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
+                        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                    let _ = switched
+                        .await
+                        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                    ConfigurationApplied::Display
+                }
+                ConfigurationAction::SetVideoQuality(preset) => {
+                    ConfigurationApplied::Quality(apply_video_quality(&commands, preset).await?)
+                }
+                ConfigurationAction::SetVideoProfile(profile) => {
+                    ConfigurationApplied::Profile(apply_video_profile(&commands, profile).await?)
+                }
+                ConfigurationAction::SetVideoBitrate(bitrate) => {
+                    let (reply, applied) = oneshot::channel();
+                    commands
+                        .try_send(CaptureWorkerCommand::SetVideoBitrate { bitrate, reply })
+                        .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                    ConfigurationApplied::Bitrate(
+                        applied
+                            .await
+                            .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?,
+                    )
+                }
+            };
+            Ok((operation, applied))
+        }),
+    }
+}
+
+fn queue_media_configuration(
+    queue: &mut ConfigurationQueue,
+    bitrate: &mut AdaptiveBitrate,
+    action: ConfigurationAction,
+) {
+    queue.invalidate_kind(ConfigurationKind::Bitrate);
+    bitrate.rejected();
+    queue.request(action);
+}
+
+fn configuration_blocks_bitrate(
+    queue: &ConfigurationQueue,
+    pending: &Option<PendingConfiguration>,
+) -> bool {
+    queue.has_pending(ConfigurationKind::Quality)
+        || queue.has_pending(ConfigurationKind::Profile)
+        || pending.as_ref().is_some_and(|work| {
+            matches!(
+                work.operation.action.kind(),
+                ConfigurationKind::Quality | ConfigurationKind::Profile
+            )
+        })
 }
 
 async fn next_configuration(
     pending: &mut Option<PendingConfiguration>,
 ) -> Result<(ConfigurationOperation, ConfigurationApplied), HostRuntimeError> {
     match pending {
-        Some(operation) => operation.await,
+        Some(operation) => operation.future.as_mut().await,
         None => std::future::pending().await,
     }
 }
@@ -3034,6 +3136,7 @@ async fn receive_host_control(
     } = context;
     let policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
+    let mut bitrate_policy = AdaptiveBitrate::new(video_quality.preset);
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
     let mut direct_probes = tokio::task::JoinSet::new();
     let mut configurations = ConfigurationQueue::default();
@@ -3058,16 +3161,20 @@ async fn receive_host_control(
                             let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
                             send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
                         }
-                        ConfigurationApplied::Quality(Some(actual)) => {
+                        ConfigurationApplied::Quality(Some((actual, bitrate))) => {
                             video_quality.record_applied(actual);
+                            bitrate_policy.reset_to_actual(actual, bitrate);
                             send_video_quality_state(&client, &secure, peer_generation, video_quality.preference, actual).await?;
                         }
-                        ConfigurationApplied::Profile(actual) => {
+                        ConfigurationApplied::Profile(Some((actual, bitrate))) => {
+                            bitrate_policy.reset_to_actual(video_quality.preset, bitrate);
                             if operation.action != ConfigurationAction::SetVideoProfile(actual) {
                                 force_keyframe.store(true, Ordering::Release);
                             }
                         }
-                        ConfigurationApplied::Quality(None) => {}
+                        ConfigurationApplied::Bitrate(Some(actual)) => { bitrate_policy.record_applied(actual); }
+                        ConfigurationApplied::Bitrate(None) => { bitrate_policy.rejected(); }
+                        ConfigurationApplied::Quality(None) | ConfigurationApplied::Profile(None) => {}
                     }
                 }
             }
@@ -3118,18 +3225,25 @@ async fn receive_host_control(
                         // Reassert the applied tier even for Automatic/same-tier
                         // choices: a previous slow native operation may be in flight.
                         configurations.invalidate_kind(ConfigurationKind::Quality);
-                        configurations.request(ConfigurationAction::SetVideoQuality(requested.unwrap_or(video_quality.preset)));
+                        queue_media_configuration(&mut configurations, &mut bitrate_policy, ConfigurationAction::SetVideoQuality(requested.unwrap_or(video_quality.preset)));
                     }
                     ControlMessage::SetVideoProfile { profile } => {
-                        configurations.request(ConfigurationAction::SetVideoProfile(profile));
+                        queue_media_configuration(&mut configurations, &mut bitrate_policy, ConfigurationAction::SetVideoProfile(profile));
                     }
                     ControlMessage::VideoNetworkFeedback {
                         received_packets, dropped_packets, decode_queue_peak, freshness_recoveries,
                     } => {
+                        if configuration_blocks_bitrate(&configurations, &pending_configuration) { continue; }
+                        let (rate, handled) = bitrate_feedback_decision(video_quality.preference, &mut bitrate_policy,
+                            received_packets, dropped_packets, decode_queue_peak, freshness_recoveries);
+                        if let Some(bitrate) = rate {
+                            configurations.request(ConfigurationAction::SetVideoBitrate(bitrate));
+                        }
+                        if handled { continue; }
                         if let Some(preset) = video_quality.observe(
                             received_packets, dropped_packets, decode_queue_peak, freshness_recoveries,
                         ) {
-                            configurations.request(ConfigurationAction::SetVideoQuality(preset));
+                            queue_media_configuration(&mut configurations, &mut bitrate_policy, ConfigurationAction::SetVideoQuality(preset));
                         }
                     }
                     ControlMessage::VideoPathCandidateOffer { candidate } => {
@@ -4125,6 +4239,126 @@ mod retry_policy_tests {
         ) -> Result<(), InputInjectionError> {
             Err(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn bitrate_waits_for_late_verified_native_completion_instead_of_inventing_rejection() {
+        let (commands, received) = std::sync::mpsc::sync_channel(1);
+        let mut queue = super::ConfigurationQueue::default();
+        queue.request(super::ConfigurationAction::SetVideoBitrate(12_000_000));
+        let mut pending = Some(super::start_configuration(
+            commands,
+            queue.pop_next().unwrap(),
+        ));
+        tokio::select! {
+            _ = super::next_configuration(&mut pending) => panic!("must await native worker"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        let super::CaptureWorkerCommand::SetVideoBitrate { bitrate, reply } =
+            received.try_recv().unwrap()
+        else {
+            panic!("wrong command")
+        };
+        let native = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5_100)).await;
+            reply.send(Some(bitrate)).unwrap();
+        });
+        let (_, applied) = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            super::next_configuration(&mut pending),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            applied,
+            super::ConfigurationApplied::Bitrate(Some(12_000_000))
+        ));
+        native.await.unwrap();
+    }
+
+    #[test]
+    fn preset_or_profile_work_invalidates_old_rate_intent_and_blocks_new_rate_observations() {
+        use super::{ConfigurationAction as Action, ConfigurationQueue};
+        let mut queue = ConfigurationQueue::default();
+        let mut rate = super::AdaptiveBitrate::new(VideoQualityPreset::Sharp);
+        rate.observe(90, 10, 1, 0);
+        let target = rate.observe(90, 10, 1, 0).unwrap();
+        queue.request(Action::SetVideoBitrate(target));
+        let old_rate = queue.pop_next().unwrap();
+        super::queue_media_configuration(
+            &mut queue,
+            &mut rate,
+            Action::SetVideoProfile(desklink_protocol::H264Profile::High),
+        );
+        assert!(!queue.is_current(&old_rate));
+        assert!(super::configuration_blocks_bitrate(&queue, &None));
+        let (commands, _received) = std::sync::mpsc::sync_channel(4);
+        let profile = queue.pop_next().unwrap();
+        let pending = Some(super::start_configuration(commands, profile));
+        assert!(super::configuration_blocks_bitrate(&queue, &pending));
+        assert_eq!(rate.observe(90, 10, 1, 0), None);
+        drop(pending);
+        rate.reset_to_actual(VideoQualityPreset::Sharp, 14_400_000);
+        assert!(rate.should_recover_rate_first(1000, 0, 1, 0));
+        super::queue_media_configuration(
+            &mut queue,
+            &mut rate,
+            Action::SetVideoQuality(VideoQualityPreset::Balanced),
+        );
+        assert!(super::configuration_blocks_bitrate(&queue, &None));
+    }
+
+    #[test]
+    fn bitrate_feedback_keeps_manual_quality_and_render_pressure_out_of_rate_adaptation() {
+        let mut policy = super::AdaptiveBitrate::new(VideoQualityPreset::Sharp);
+        for preference in [
+            VideoQualityPreference::Smooth,
+            VideoQualityPreference::Balanced,
+            VideoQualityPreference::Sharp,
+        ] {
+            for _ in 0..100 {
+                assert_eq!(
+                    super::bitrate_feedback_decision(preference, &mut policy, 80, 20, 1, 0),
+                    (None, false)
+                );
+            }
+        }
+        assert_eq!(policy.current(), policy.max());
+        assert_eq!(
+            super::bitrate_feedback_decision(
+                VideoQualityPreference::Automatic,
+                &mut policy,
+                80,
+                20,
+                5,
+                0
+            ),
+            (None, false)
+        );
+        assert_eq!(
+            super::bitrate_feedback_decision(
+                VideoQualityPreference::Automatic,
+                &mut policy,
+                80,
+                20,
+                1,
+                0
+            ),
+            (None, true)
+        );
+        assert!(
+            super::bitrate_feedback_decision(
+                VideoQualityPreference::Automatic,
+                &mut policy,
+                80,
+                20,
+                1,
+                0
+            )
+            .0
+            .is_some()
+        );
     }
 
     #[tokio::test]
