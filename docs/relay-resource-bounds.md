@@ -34,3 +34,13 @@ Linux 主进程每 60 秒记录固定字段的 `relay_memory`（RSS、cgroup-v2 
 新增真实 QUIC 夹具验证 uni 无 credit、17 条 bidi 之外的打开等待；这不是模拟发送违规 STREAM 包，更不能把 API 等待说成服务器主动关闭恶意连接。完整 65536 字节可靠消息能跨窗口发送；停读接收端确实阻塞后，其他会话 Input 仍可达，关闭后连接容量回收。没有公网流量或真实输入注入。
 
 本条目前只完成代码和本地自动回归。容器峰值、OOM 事件和更大负载下的资源数据待独立本地容器夹具测量；未认证会话的 deadline 属于 DL2-053，不能用 transport idle timeout 代替应用层 admission 清理。
+
+## Join 前 datagram 的元数据边界
+
+进一步读取锁定依赖的 `connection/datagrams.rs` 确认：接收队列按 `data.len()` 维护 `recv_buffered`。空 datagram 虽进入队列，却不增加这个字节计数，因此只配置 32KiB 接收额度不足以约束其队列元数据。不能将上述载荷预算解释为此类消息数量的硬上限。
+
+relay 现在在整个 join 阶段并行等待首条 datagram，任何 join 前 datagram 都会立即触发应用关闭。正常客户端必须先等 join ACK；已加入会话的 datagram 校验和正常媒体路径不变。join 结果就绪优先处理，避免正常 ACK 后首包被误判；取消未完成 join 时沿用 participant/admission guard，包含登记后回复仍阻塞的生命周期。
+
+本地真实 QUIC 四种回归覆盖空/非空 datagram 与未发 join/仅发部分 join 长度的组合。修复前四项均在 1 秒关闭等待上失败（join 默认 8 秒），修复后全部应用关闭并回收 admission/membership；这是实际红绿回归，不是把等待 join 超时当作立即拒绝。修复后 relay 62 项常规用例和 all-targets Clippy、fmt/diff 检查通过；三个手工 probe 默认忽略。
+
+已有 `e0d9fca502e5b2c663ace7ffcee7ab7a495bd90f` 初轮候选曾在 256MiB 本地容器、64 live connection 下取得 33398784 字节 cgroup 峰值和 0 OOM kill，但它不包含本节防护、053 或057，不能代替最新候选验收。最终候选容器复测及真实 SIGTERM 结果将在独立测量提交补充。057 的源连接关闭回归另证明可靠子任务不会在 admission 释放后继续持有旧缓冲；初轮容器测量不证明这个 churn 行为。

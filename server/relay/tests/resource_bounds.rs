@@ -159,6 +159,62 @@ async fn write_frame(send: &mut quinn::SendStream, payload: &[u8]) {
     send.write_all(payload).await.unwrap();
 }
 
+async fn assert_prejoin_datagram_is_closed(payload: Vec<u8>, partial_join: bool) {
+    assert_eq!(RelayConfig::default().join_timeout, Duration::from_secs(8));
+    let relay = TestRelay::new().await;
+    let peer = relay.connect_raw().await;
+    let _incomplete_join = if partial_join {
+        let (mut send, receive) = peer.connection.open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        Some((send, receive))
+    } else {
+        None
+    };
+    assert_eq!(relay.server.capacity_snapshot().accepted_connections, 1);
+    peer.connection.send_datagram(payload.into()).unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(1), peer.connection.closed())
+        .await
+        .expect("pre-join datagram must be rejected before the eight-second join deadline");
+    assert!(matches!(
+        reason,
+        quinn::ConnectionError::ApplicationClosed(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let capacity = relay.server.capacity_snapshot();
+            if capacity.accepted_connections == 0
+                && capacity.attached_participants == 0
+                && capacity.active_sessions == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pre-join rejection must reclaim admission without leaving membership");
+}
+
+#[tokio::test]
+async fn empty_datagram_before_any_join_is_closed_and_reclaims_admission() {
+    assert_prejoin_datagram_is_closed(Vec::new(), false).await;
+}
+
+#[tokio::test]
+async fn nonempty_datagram_before_any_join_is_closed_and_reclaims_admission() {
+    assert_prejoin_datagram_is_closed(vec![0xa5], false).await;
+}
+
+#[tokio::test]
+async fn empty_datagram_during_partial_join_is_closed_and_reclaims_admission() {
+    assert_prejoin_datagram_is_closed(Vec::new(), true).await;
+}
+
+#[tokio::test]
+async fn nonempty_datagram_during_partial_join_is_closed_and_reclaims_admission() {
+    assert_prejoin_datagram_is_closed(vec![0xa5], true).await;
+}
+
 #[tokio::test]
 async fn raw_unjoined_client_cannot_obtain_uni_or_more_than_seventeen_bidi_credits() {
     let relay = TestRelay::new().await;

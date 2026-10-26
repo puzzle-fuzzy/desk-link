@@ -1299,12 +1299,26 @@ async fn handle_connection(
     connection_id: u64,
     join_deadline: tokio::time::Instant,
 ) {
-    let (join, _participant) = match tokio::time::timeout_at(
-        join_deadline,
-        accept_join(&connection, state.clone(), connection_id),
-    )
-    .await
-    {
+    // Byte-only QUIC datagram buffering does not charge empty datagrams for
+    // queue metadata. No application datagram is legal before join completes,
+    // so actively consume this phase's first datagram and reject the peer.
+    // Dropping accept_join also drops a participant registered before a
+    // blocked join response, rather than leaving its admission behind.
+    let joined = tokio::select! {
+        biased;
+        result = tokio::time::timeout_at(
+            join_deadline,
+            accept_join(&connection, state.clone(), connection_id),
+        ) => result,
+        datagram = connection.read_datagram() => {
+            if datagram.is_ok() {
+                log_connection_event("join_rejected", connection_id, "datagram_before_join");
+                close_connection(&connection, b"datagram before join");
+            }
+            return;
+        }
+    };
+    let (join, _participant) = match joined {
         Ok(Some(joined)) => joined,
         Ok(None) => return,
         Err(_) => {

@@ -408,6 +408,7 @@
 - [ ] 完成候选容器负载实测并核对峰值/OOM 事件；不把载荷模型当 RSS 保证。
 - [x] 核实锁定 quinn-proto 0.11.16 的 uni=100、单流 1250000 字节、连接 VarInt::MAX 等默认；代码禁用 uni，显式限制 bidi/stream/connection/datagram/crypto/incoming 额度。默认连接/session 改为 64，声明 160MiB 缓冲预算，包含 accepted/rejection/incoming 的默认模型为 152MiB；超预算配置启动拒绝，候选 Compose/Dockerfile 与 256MiB 容器限制对应。未部署。
 - [x] 本地真实 QUIC 资源夹具、最大可靠帧、慢接收端隔离通过；relay 共 38 项常规测试，Clippy all-targets `--locked -- -D warnings`、fmt/diff 检查通过。Linux RSS/cgroup 只读观测和 CLI 已加入；容器实际测量仍待做。主题 `fix(DL2-052): bound relay QUIC buffers and validate admission budgets`，细节见 [relay 资源边界](docs/relay-resource-bounds.md)。
+- [x] Join 前 datagram 防护：依赖按载荷长度计队列字节，空 datagram 的元数据不能靠字节窗口限制；整个 join 阶段现拒绝首个任何 datagram，并取消未完成 join/登记。空/非空×未join/partial join 四种真实 QUIC 回归修复前均红、修复后全绿；relay 62 常规用例及 Clippy/fmt/diff 通过。初轮 e0 镜像的容器峰值不能作为本防护或057证明，最新候选复测仍待做。主题 `fix(DL2-052): reject datagrams before relay join completes`。
 
 ### DL2-053 · P1 · 为 join 与已开始的可靠帧建立应用层截止时间
 
