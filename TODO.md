@@ -197,6 +197,10 @@
 - **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked capture::identity_tests` 3通过，覆盖重排、拔插重现、大小写归一和注册表耗尽；原生API编译通过。
 - [ ] **仍待实现/真机：** runtime连接中拓扑刷新、视频/输入的拓扑代数绑定，以及插拔/旋转/负坐标/100%～200%DPI/睡眠矩阵；本提交只关闭稳定身份切片。
 
+- [x] **连接内拓扑切片（`fix(DL2-013): publish live display topology with coordinated input mapping`）：** 每秒元数据枚举，稳定ID排序下相同拓扑不重建；活动输出移除明确回退主屏/首屏。准备捕获/编码器并复核OS快照后，以同一锁发布列表/活动屏/坐标/代数，清空旧编码队列并请求IDR；watch推送列表。枚举/驱动失败保留旧发布状态、暂停输入并有界重试。注入持映射锁，跨发布等待的非释放事件丢弃。
+- **验证：** Windows lib 128通过/2忽略，含7拓扑和4注入/发布帮助器回归；严格lib+tests Clippy通过；补充编码器准备后OS快照复核后再跑 `--lib topology --locked` 11通过。所有输入用记录/阻塞合成后端，无真实注入或远控。
+- [ ] **严格上下文/真机仍待：** 目前wire无拓扑标记，发布后才迟到的旧包（含release）不能严格识别；等待统一input_epoch契约，不以本机seq/timestamp代替。热插拔/旋转/DPI/睡眠及资源/帧龄实测继续未完成。
+
 ## 4. 性能与数据通道
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线

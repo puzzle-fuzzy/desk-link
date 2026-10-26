@@ -9,6 +9,9 @@ mod readback;
 #[cfg(windows)]
 use readback::TextureReadback;
 
+mod topology;
+pub use topology::DisplayTopologySnapshot;
+
 #[derive(Clone, Debug)]
 pub struct CapturedFrame {
     pub width: u32,

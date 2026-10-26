@@ -15,10 +15,10 @@ use desklink_protocol::{
     DeviceCapabilities, DeviceRole, FrameFlags, H264Profile, InputEvent, MAX_INPUT_AGE_US,
     MAX_INPUT_FUTURE_SKEW_US, NoiseHandshake, NoiseHandshakeStep, PROTOCOL_VERSION, Platform,
     ProtocolError, RemoteDisplay, TransferId, TransferMessage, TransferResult, VideoConfig,
-    VideoQualityPreference, VideoQualityPreset, decode_control, decode_noise_handshake,
-    decode_session_input, decode_transfer, encode_audio_packet, encode_control,
-    encode_cursor_update, encode_noise_handshake, encode_transfer, encode_video_config,
-    VideoReliableBatchBuilder,
+    VideoQualityPreference, VideoQualityPreset, VideoReliableBatchBuilder, decode_control,
+    decode_noise_handshake, decode_session_input, decode_transfer, encode_audio_packet,
+    encode_control, encode_cursor_update, encode_noise_handshake, encode_transfer,
+    encode_video_config,
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -39,8 +39,8 @@ use crate::{
         run_loopback_capture,
     },
     capture::{
-        CaptureError, CapturedFrame, DesktopCapturer, DxgiDesktopCapturer, available_displays,
-        display_topology,
+        CaptureError, CapturedFrame, DesktopCapturer, DisplayDescriptor, DisplayTopologySnapshot,
+        DxgiDesktopCapturer, available_displays, display_topology,
     },
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
@@ -53,6 +53,7 @@ use crate::{
 };
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(50);
+const DISPLAY_TOPOLOGY_INTERVAL: Duration = Duration::from_secs(1);
 const STATIC_KEYFRAME_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_ENCODED_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1080,7 +1081,11 @@ impl HostRuntime {
         let selected_desktop = Arc::new(Mutex::new(SelectedDesktop {
             display_id: 0,
             desktop: VirtualDesktop::single(DesktopRect::new(0, 0, 1, 1)),
+            topology: None,
         }));
+        let release_input = Arc::new(Notify::new());
+        let input_suspended = Arc::new(AtomicBool::new(false));
+        let (topology_updates, mut topology_receiver) = watch::channel(0_u64);
         let capture_context = CaptureWorkerContext {
             commands: capture_command_receiver,
             queue: video_queue.clone(),
@@ -1088,6 +1093,9 @@ impl HostRuntime {
             force_keyframe: force_keyframe.clone(),
             shutdown: shutdown.clone(),
             selected_desktop: selected_desktop.clone(),
+            release_input: release_input.clone(),
+            input_suspended: input_suspended.clone(),
+            topology_updates,
             profile: negotiated_profile,
         };
         let capture_thread = std::thread::Builder::new()
@@ -1142,6 +1150,8 @@ impl HostRuntime {
                 )
                 .await?;
         }
+        // Initial capabilities already contained this generation's display list.
+        topology_receiver.borrow_and_update();
         capture_worker.start()?;
         let audio_queue = Arc::new(Mutex::new(AudioFrameQueue::new(AUDIO_QUEUE_CAPACITY)));
         let audio_notify = Arc::new(Notify::new());
@@ -1202,7 +1212,9 @@ impl HostRuntime {
             HostInboundContext {
                 capture_commands: capture_command_sender,
                 selected_desktop: selected_desktop.clone(),
-                displays: Arc::new(ready.displays),
+                release_input,
+                input_suspended,
+                topology_updates: topology_receiver,
                 audio_enabled: audio_enabled.clone(),
                 audio_enabled_updates,
                 audio_queue: audio_queue.clone(),
@@ -1378,10 +1390,30 @@ struct CaptureWorkerReady {
     profile: H264Profile,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SelectedDesktop {
     display_id: u32,
     desktop: VirtualDesktop,
+    topology: Option<DisplayTopologySnapshot>,
+}
+
+impl SelectedDesktop {
+    fn from_snapshot(topology: DisplayTopologySnapshot) -> Self {
+        Self {
+            display_id: topology.active_display_id(),
+            desktop: VirtualDesktop::new(
+                topology.active_display().rect,
+                topology.virtual_desktop(),
+            ),
+            topology: Some(topology),
+        }
+    }
+
+    fn topology_generation(&self) -> u64 {
+        self.topology
+            .as_ref()
+            .map_or(0, DisplayTopologySnapshot::generation)
+    }
 }
 
 enum CaptureWorkerCommand {
@@ -1406,19 +1438,122 @@ struct CaptureWorkerContext {
     force_keyframe: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
+    release_input: Arc<Notify>,
+    input_suspended: Arc<AtomicBool>,
+    topology_updates: watch::Sender<u64>,
     profile: H264Profile,
 }
 
 struct HostInboundContext {
     capture_commands: std::sync::mpsc::SyncSender<CaptureWorkerCommand>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
-    displays: Arc<Vec<RemoteDisplay>>,
+    release_input: Arc<Notify>,
+    input_suspended: Arc<AtomicBool>,
+    topology_updates: watch::Receiver<u64>,
     audio_enabled: Arc<AtomicBool>,
     audio_enabled_updates: watch::Sender<bool>,
     audio_queue: Arc<Mutex<AudioFrameQueue>>,
     audio_notify: Arc<Notify>,
     direct_session: Option<Arc<DirectLanSession>>,
     direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+}
+
+struct CaptureDesktopCoordinator<'a> {
+    selected: &'a Mutex<SelectedDesktop>,
+    release_input: &'a Notify,
+    input_suspended: &'a AtomicBool,
+    updates: &'a watch::Sender<u64>,
+}
+
+impl CaptureDesktopCoordinator<'_> {
+    fn current(&self) -> Result<DisplayTopologySnapshot, HostRuntimeError> {
+        lock_unpoisoned(self.selected)
+            .topology
+            .clone()
+            .ok_or(HostRuntimeError::CaptureWorkerStopped)
+    }
+
+    fn suspend(&self) {
+        suspend_desktop_input(self.selected, self.input_suspended, self.release_input);
+    }
+
+    fn resume(&self) {
+        resume_desktop_input(self.selected, self.input_suspended, self.release_input);
+    }
+
+    fn publish(&self, topology: DisplayTopologySnapshot) {
+        let generation = topology.generation();
+        let mut selected = lock_unpoisoned(self.selected);
+        *selected = SelectedDesktop::from_snapshot(topology);
+        self.release_input.notify_one();
+        self.input_suspended.store(false, Ordering::Release);
+        self.updates.send_replace(generation);
+    }
+}
+
+fn refreshed_display_topology(
+    current: &DisplayTopologySnapshot,
+) -> Result<Option<DisplayTopologySnapshot>, HostRuntimeError> {
+    let displays = available_displays().map_err(HostRuntimeError::Capture)?;
+    remote_displays(&displays)?;
+    let bounds = display_topology()
+        .map_err(HostRuntimeError::Capture)?
+        .virtual_desktop;
+    current
+        .refreshed(displays, bounds)
+        .map_err(HostRuntimeError::Capture)
+}
+
+fn prepare_capture_topology(
+    capture: &mut DxgiDesktopCapturer,
+    encoder: &mut H264Encoder,
+    topology: &DisplayTopologySnapshot,
+    settings: H264EncoderSettings,
+    retain_recovered_capture: bool,
+) -> Result<(), HostRuntimeError> {
+    let next_capture = if retain_recovered_capture
+        && capture.display_id() == topology.active_display_id()
+        && capture.desktop_rect() == topology.active_display().rect
+    {
+        None
+    } else {
+        Some(
+            DxgiDesktopCapturer::new_display(topology.active_display_id())
+                .map_err(HostRuntimeError::Capture)?,
+        )
+    };
+    let source = next_capture.as_ref().unwrap_or(capture);
+    if source.desktop_rect() != topology.active_display().rect {
+        return Err(HostRuntimeError::Capture(CaptureError::AccessLost));
+    }
+    let observed_bounds = display_topology()
+        .map_err(HostRuntimeError::Capture)?
+        .virtual_desktop;
+    let observed_displays = available_displays().map_err(HostRuntimeError::Capture)?;
+    if topology
+        .refreshed(observed_displays, observed_bounds)
+        .map_err(HostRuntimeError::Capture)?
+        .is_some()
+    {
+        // Resource creation can take long enough for another hotplug/rotation.
+        // Reject a candidate prepared from an already superseded OS snapshot.
+        return Err(HostRuntimeError::Capture(CaptureError::AccessLost));
+    }
+    let (width, height) = source.dimensions();
+    // reconfigure_for_source commits its backend/settings only after successful
+    // creation. Keep the old capture and published coordinates on any error.
+    encoder
+        .reconfigure_for_source(width, height, settings)
+        .map_err(HostRuntimeError::Encoder)?;
+    if refreshed_display_topology(topology)?.is_some() {
+        // Encoder/driver creation can also span another display change. Keep
+        // input gated and retry instead of publishing superseded geometry.
+        return Err(HostRuntimeError::Capture(CaptureError::AccessLost));
+    }
+    if let Some(next_capture) = next_capture {
+        *capture = next_capture;
+    }
+    Ok(())
 }
 
 type SharedSecureSession = Arc<AsyncMutex<SecureSession>>;
@@ -1586,6 +1721,54 @@ async fn open(
     Ok(secure.lock().await.open(lane, ciphertext)?)
 }
 
+fn remote_displays(displays: &[DisplayDescriptor]) -> Result<Vec<RemoteDisplay>, HostRuntimeError> {
+    displays
+        .iter()
+        .map(|display| {
+            Ok(RemoteDisplay {
+                id: display.id,
+                width: u16::try_from(display.rect.width)
+                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
+                height: u16::try_from(display.rect.height)
+                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
+                primary: display.primary,
+            })
+        })
+        .collect()
+}
+
+fn selected_display_list(
+    selected_desktop: &Mutex<SelectedDesktop>,
+) -> Result<(Vec<RemoteDisplay>, u32), HostRuntimeError> {
+    let selected = lock_unpoisoned(selected_desktop);
+    let topology = selected
+        .topology
+        .as_ref()
+        .ok_or(HostRuntimeError::CaptureWorkerStopped)?;
+    Ok((remote_displays(topology.displays())?, selected.display_id))
+}
+
+fn suspend_desktop_input(
+    selected_desktop: &Mutex<SelectedDesktop>,
+    input_suspended: &AtomicBool,
+    release_input: &Notify,
+) {
+    // Serialize the gate with the synchronous injection/coordinate lookup.
+    let _selected = lock_unpoisoned(selected_desktop);
+    input_suspended.store(true, Ordering::Release);
+    release_input.notify_one();
+}
+
+fn resume_desktop_input(
+    selected_desktop: &Mutex<SelectedDesktop>,
+    input_suspended: &AtomicBool,
+    release_input: &Notify,
+) {
+    let _selected = lock_unpoisoned(selected_desktop);
+    release_input.notify_one();
+    input_suspended.store(false, Ordering::Release);
+}
+
 fn capture_worker_entry(
     ready: oneshot::Sender<Result<CaptureWorkerReady, HostRuntimeError>>,
     start: std::sync::mpsc::Receiver<()>,
@@ -1599,20 +1782,7 @@ fn capture_worker_entry(
             return Ok(());
         }
     };
-    let displays = match display_descriptors
-        .iter()
-        .map(|display| {
-            Ok(RemoteDisplay {
-                id: display.id,
-                width: u16::try_from(display.rect.width)
-                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
-                height: u16::try_from(display.rect.height)
-                    .map_err(|_| HostRuntimeError::InvalidDimensions)?,
-                primary: display.primary,
-            })
-        })
-        .collect::<Result<Vec<_>, HostRuntimeError>>()
-    {
+    let displays = match remote_displays(&display_descriptors) {
         Ok(displays) => displays,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -1647,10 +1817,23 @@ fn capture_worker_entry(
         }
     };
     let active_display_id = capture.display_id();
-    *lock_unpoisoned(&context.selected_desktop) = SelectedDesktop {
-        display_id: active_display_id,
-        desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
+    let topology = match DisplayTopologySnapshot::new(
+        display_descriptors,
+        active_display_id,
+        coordinate_space,
+    ) {
+        Ok(topology) if topology.active_display().rect == capture.desktop_rect() => topology,
+        Ok(_) => {
+            let _ = ready.send(Err(HostRuntimeError::Capture(CaptureError::AccessLost)));
+            return Ok(());
+        }
+        Err(error) => {
+            let _ = ready.send(Err(HostRuntimeError::Capture(error)));
+            return Ok(());
+        }
     };
+    context.topology_updates.send_replace(topology.generation());
+    *lock_unpoisoned(&context.selected_desktop) = SelectedDesktop::from_snapshot(topology);
     let worker_ready = CaptureWorkerReady {
         desktop: capture.desktop_rect(),
         coordinate_space,
@@ -1663,7 +1846,7 @@ fn capture_worker_entry(
     if ready.send(Ok(worker_ready)).is_err() || start.recv().is_err() {
         return Ok(());
     }
-    capture_encode_loop(capture, encoder, context, coordinate_space)
+    capture_encode_loop(capture, encoder, context)
 }
 
 async fn receive_controller_capabilities(
@@ -1854,7 +2037,6 @@ fn capture_encode_loop(
     mut capture: DxgiDesktopCapturer,
     mut encoder: H264Encoder,
     context: CaptureWorkerContext,
-    mut coordinate_space: DesktopRect,
 ) -> Result<(), HostRuntimeError> {
     let CaptureWorkerContext {
         commands,
@@ -1863,8 +2045,19 @@ fn capture_encode_loop(
         force_keyframe,
         shutdown,
         selected_desktop,
+        release_input,
+        input_suspended,
+        topology_updates,
         profile: _,
     } = context;
+    let desktop_state = CaptureDesktopCoordinator {
+        selected: &selected_desktop,
+        release_input: &release_input,
+        input_suspended: &input_suspended,
+        updates: &topology_updates,
+    };
+    let mut next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+    let mut topology_recovery_pending = false;
     let mut encoder_recovery_attempts = 0_u8;
     let mut video_quality = DEFAULT_VIDEO_QUALITY;
     let mut video_profile = encoder.profile();
@@ -1877,44 +2070,113 @@ fn capture_encode_loop(
     let mut first_encoded_frame_deadline = None;
     let mut encoded_any_frame = false;
     while !shutdown.load(Ordering::Acquire) {
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                CaptureWorkerCommand::SelectDisplay { display_id, reply } => {
-                    let current_display_id = lock_unpoisoned(&selected_desktop).display_id;
-                    if display_id == current_display_id {
-                        let _ = reply.send(true);
-                        continue;
-                    }
-                    let switched = (|| {
-                        let next_capture = DxgiDesktopCapturer::new_display(display_id)
-                            .map_err(HostRuntimeError::Capture)?;
-                        let next_coordinate_space = display_topology()
-                            .map(|topology| topology.virtual_desktop)
-                            .unwrap_or(coordinate_space);
-                        let (source_width, source_height) = next_capture.dimensions();
-                        encoder
-                            .reconfigure_for_source(
-                                source_width,
-                                source_height,
-                                video_quality_settings_with_profile(video_quality, video_profile),
-                            )
-                            .map_err(HostRuntimeError::Encoder)?;
-                        capture = next_capture;
-                        coordinate_space = next_coordinate_space;
+        if Instant::now() >= next_topology_poll {
+            next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+            let current = desktop_state.current()?;
+            let next = match refreshed_display_topology(&current) {
+                Ok(Some(next)) => Some(next),
+                Ok(None) if topology_recovery_pending => {
+                    Some(current.renewed().map_err(HostRuntimeError::Capture)?)
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    // A transient empty/inconsistent OS enumeration must not
+                    // replace the last coherent list or inject into new bounds.
+                    desktop_state.suspend();
+                    topology_recovery_pending = true;
+                    None
+                }
+            };
+            if let Some(next) = next {
+                let reset_media =
+                    topology_recovery_pending || next.requires_capture_reconfigure(&current);
+                if reset_media {
+                    desktop_state.suspend();
+                    topology_recovery_pending = true;
+                    if prepare_capture_topology(
+                        &mut capture,
+                        &mut encoder,
+                        &next,
+                        video_quality_settings_with_profile(video_quality, video_profile),
+                        false,
+                    )
+                    .is_ok()
+                    {
                         video_profile = encoder.profile();
                         frame_pacer.reset(
                             video_quality_settings_with_profile(video_quality, video_profile).fps,
                         );
                         lock_queue(&queue).clear();
-                        *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
-                            display_id,
-                            desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
-                        };
                         force_keyframe.store(true, Ordering::Release);
+                        if !captured_any_frame {
+                            first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+                        }
+                        if !encoded_any_frame {
+                            first_encoded_frame_deadline = None;
+                        }
+                        desktop_state.publish(next);
                         notify.notify_one();
-                        Ok::<(), HostRuntimeError>(())
-                    })()
-                    .is_ok();
+                        topology_recovery_pending = false;
+                    }
+                } else {
+                    // Hotplug of an unused output or a primary/name change may
+                    // update the list without rebuilding unchanged media.
+                    desktop_state.publish(next);
+                }
+            }
+        }
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                CaptureWorkerCommand::SelectDisplay { display_id, reply } => {
+                    if topology_recovery_pending {
+                        let _ = reply.send(false);
+                        continue;
+                    }
+                    let current = desktop_state.current()?;
+                    let candidate = current.select(display_id);
+                    let switched = match candidate {
+                        Ok(None) => true,
+                        Ok(Some(next)) => {
+                            desktop_state.suspend();
+                            let prepared = prepare_capture_topology(
+                                &mut capture,
+                                &mut encoder,
+                                &next,
+                                video_quality_settings_with_profile(video_quality, video_profile),
+                                false,
+                            );
+                            if prepared.is_ok() {
+                                video_profile = encoder.profile();
+                                frame_pacer.reset(
+                                    video_quality_settings_with_profile(
+                                        video_quality,
+                                        video_profile,
+                                    )
+                                    .fps,
+                                );
+                                lock_queue(&queue).clear();
+                                force_keyframe.store(true, Ordering::Release);
+                                if !captured_any_frame {
+                                    first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
+                                }
+                                if !encoded_any_frame {
+                                    first_encoded_frame_deadline = None;
+                                }
+                                desktop_state.publish(next);
+                                notify.notify_one();
+                                true
+                            } else {
+                                if matches!(prepared, Err(HostRuntimeError::Capture(_))) {
+                                    topology_recovery_pending = true;
+                                } else {
+                                    desktop_state.resume();
+                                }
+                                next_topology_poll = Instant::now();
+                                false
+                            }
+                        }
+                        Err(_) => false,
+                    };
                     let _ = reply.send(switched);
                 }
                 CaptureWorkerCommand::SetVideoQuality { preset, reply } => {
@@ -1962,9 +2224,26 @@ fn capture_encode_loop(
                 }
             }
         }
-        let frame = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT)
-            .map_err(HostRuntimeError::Capture)?
-        {
+        if topology_recovery_pending {
+            std::thread::sleep(CAPTURE_TIMEOUT);
+            continue;
+        }
+        let outcome = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // An active monitor can disappear between the once-per-second
+                // checks. Try the new topology before treating capture as fatal.
+                let current = desktop_state.current()?;
+                if matches!(refreshed_display_topology(&current), Ok(None)) {
+                    return Err(HostRuntimeError::Capture(error));
+                }
+                desktop_state.suspend();
+                topology_recovery_pending = true;
+                next_topology_poll = Instant::now();
+                continue;
+            }
+        };
+        let frame = match outcome {
             CaptureOutcome::Frame(frame) => frame,
             CaptureOutcome::Idle => {
                 if initial_frame_deadline_expired(
@@ -2000,30 +2279,43 @@ fn capture_encode_loop(
                 }
             }
             CaptureOutcome::Recovered => {
+                desktop_state.suspend();
+                topology_recovery_pending = true;
+                let current = desktop_state.current()?;
+                let next = match refreshed_display_topology(&current) {
+                    Ok(Some(next)) => next,
+                    Ok(None) => current.renewed().map_err(HostRuntimeError::Capture)?,
+                    Err(_) => {
+                        next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+                        continue;
+                    }
+                };
+                if prepare_capture_topology(
+                    &mut capture,
+                    &mut encoder,
+                    &next,
+                    video_quality_settings_with_profile(video_quality, video_profile),
+                    true,
+                )
+                .is_err()
+                {
+                    next_topology_poll = Instant::now() + DISPLAY_TOPOLOGY_INTERVAL;
+                    continue;
+                }
                 if !captured_any_frame {
                     first_capture_deadline = Instant::now() + INITIAL_FRAME_TIMEOUT;
                 }
-                coordinate_space = display_topology()
-                    .map(|topology| topology.virtual_desktop)
-                    .unwrap_or(coordinate_space);
-                let (source_width, source_height) = capture.dimensions();
-                encoder
-                    .reconfigure_for_source(
-                        source_width,
-                        source_height,
-                        video_quality_settings_with_profile(video_quality, video_profile),
-                    )
-                    .map_err(HostRuntimeError::Encoder)?;
+                if !encoded_any_frame {
+                    first_encoded_frame_deadline = None;
+                }
                 video_profile = encoder.profile();
                 frame_pacer
                     .reset(video_quality_settings_with_profile(video_quality, video_profile).fps);
                 lock_queue(&queue).clear();
-                *lock_unpoisoned(&selected_desktop) = SelectedDesktop {
-                    display_id: capture.display_id(),
-                    desktop: VirtualDesktop::new(capture.desktop_rect(), coordinate_space),
-                };
                 force_keyframe.store(true, Ordering::Release);
+                desktop_state.publish(next);
                 notify.notify_one();
+                topology_recovery_pending = false;
                 continue;
             }
         };
@@ -2533,8 +2825,8 @@ async fn receive_input_and_control(
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
 ) -> Result<(), HostRuntimeError> {
-    let release_input = Arc::new(Notify::new());
-    let input_suspended = Arc::new(AtomicBool::new(false));
+    let release_input = context.release_input.clone();
+    let input_suspended = context.input_suspended.clone();
     run_inbound_lanes(
         receive_host_input(
             client.clone(),
@@ -2553,8 +2845,6 @@ async fn receive_input_and_control(
             stream_id,
             force_keyframe,
             context,
-            release_input,
-            input_suspended,
         ),
     )
     .await
@@ -2586,10 +2876,17 @@ async fn receive_host_input(
     input_suspended: Arc<AtomicBool>,
 ) -> Result<(), HostRuntimeError> {
     let mut policy = HostInboundPolicy::new(stream_id);
+    let mut input_generation = lock_unpoisoned(&selected_desktop).topology_generation();
     loop {
+        let wait_generation = lock_unpoisoned(&selected_desktop).topology_generation();
         tokio::select! {
             biased;
-            _ = release_input.notified() => { let _ = input.release_all(); }
+            _ = release_input.notified() => {
+                let selected = lock_unpoisoned(&selected_desktop);
+                input.set_desktop(selected.desktop);
+                let _ = input.release_all();
+                input_generation = selected.topology_generation();
+            }
             reason = client.next_closed_reason() => {
                 return Err(HostRuntimeError::TransportClosed(reason));
             }
@@ -2597,16 +2894,42 @@ async fn receive_host_input(
                 let bytes = result?;
                 let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
                 if let Some(event) = policy.decode_input(&plaintext, now_micros())? {
-                    // Consume and discard coordinates produced during a monitor
-                    // transition. ReleaseAll remains safe and must still run.
-                    if !input_suspended.load(Ordering::Acquire) || matches!(event, InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }) {
-                        input.set_desktop(lock_unpoisoned(&selected_desktop).desktop);
-                        apply_input_event(&mut input, event)?;
-                    }
+                    inject_desktop_input(
+                        &mut input, event, &selected_desktop, &input_suspended,
+                        wait_generation, &mut input_generation,
+                    )?;
                 }
             }
         }
     }
+}
+
+fn inject_desktop_input<B: crate::input::InputBackend>(
+    input: &mut InputInjector<B>,
+    event: InputEvent,
+    selected_desktop: &Mutex<SelectedDesktop>,
+    input_suspended: &AtomicBool,
+    wait_generation: u64,
+    input_generation: &mut u64,
+) -> Result<bool, HostRuntimeError> {
+    // Hold the same lock through synchronous injection, not just coordinate
+    // lookup. Publication cannot replace the mapping halfway through a sample.
+    let selected = lock_unpoisoned(selected_desktop);
+    let generation = selected.topology_generation();
+    if *input_generation != generation {
+        let _ = input.release_all();
+        *input_generation = generation;
+    }
+    let release = matches!(
+        event,
+        InputEvent::Key { pressed: false, .. } | InputEvent::MouseButton { pressed: false, .. }
+    );
+    if !release && (input_suspended.load(Ordering::Acquire) || wait_generation != generation) {
+        return Ok(false);
+    }
+    input.set_desktop(selected.desktop);
+    apply_input_event(input, event)?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2617,13 +2940,13 @@ async fn receive_host_control(
     stream_id: u64,
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
-    release_input: Arc<Notify>,
-    input_suspended: Arc<AtomicBool>,
 ) -> Result<(), HostRuntimeError> {
     let HostInboundContext {
         capture_commands,
         selected_desktop,
-        displays,
+        release_input: _,
+        input_suspended: _,
+        mut topology_updates,
         audio_enabled,
         audio_enabled_updates,
         audio_queue,
@@ -2637,6 +2960,11 @@ async fn receive_host_control(
     let mut direct_probes = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            updated = topology_updates.changed() => {
+                updated.map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
+                let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
+                send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+            }
             _ = direct_probes.join_next(), if !direct_probes.is_empty() => {}
             direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
                 if let Some(connection) = direct {
@@ -2653,37 +2981,21 @@ async fn receive_host_control(
                 }
                 match decode_control(&plaintext)? {
                     ControlMessage::SelectDisplay { display_id } => {
-                        let known_display = displays.iter().any(|display| display.id == display_id);
+                        let known_display = lock_unpoisoned(&selected_desktop)
+                            .topology.as_ref().is_some_and(|topology| {
+                                topology.displays().iter().any(|display| display.id == display_id)
+                            });
                         if known_display {
-                            // A transient Windows input rejection while switching
-                            // monitors must not close the video and control lanes.
-                            // Retained pressed-state entries are retried by later
-                            // release events and once more when the injector drops.
-                            input_suspended.store(true, Ordering::Release);
-                            release_input.notify_one();
                             let (reply, switched) = oneshot::channel();
                             capture_commands
                                 .try_send(CaptureWorkerCommand::SelectDisplay { display_id, reply })
                                 .map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
-                            if tokio::time::timeout(Duration::from_secs(5), switched)
-                                .await
-                                .ok()
-                                .and_then(Result::ok)
-                                .unwrap_or(false)
-                            {
-                                release_input.notify_one();
-                            }
-                            input_suspended.store(false, Ordering::Release);
+                            let _ = tokio::time::timeout(Duration::from_secs(5), switched).await;
                         }
-                        let active_display_id = lock_unpoisoned(&selected_desktop).display_id;
+                        let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
                         send_display_list(
-                            &client,
-                            &secure,
-                            peer_generation,
-                            &displays,
-                            active_display_id,
-                        )
-                        .await?;
+                            &client, &secure, peer_generation, &displays, active_display_id,
+                        ).await?;
                     }
                     ControlMessage::SetAudioEnabled { enabled } => {
                         audio_enabled.store(enabled, Ordering::Release);
@@ -3447,6 +3759,274 @@ mod retry_policy_tests {
     use desklink_session::DesktopRect;
 
     struct RejectingInputBackend(InputInjectionError);
+
+    #[derive(Clone)]
+    struct RecordingTopologyInputBackend {
+        sent:
+            std::sync::Arc<std::sync::Mutex<Vec<(desklink_protocol::InputEvent, VirtualDesktop)>>>,
+    }
+
+    impl InputBackend for RecordingTopologyInputBackend {
+        fn send(
+            &mut self,
+            event: &desklink_protocol::InputEvent,
+            desktop: VirtualDesktop,
+        ) -> Result<(), InputInjectionError> {
+            self.sent.lock().unwrap().push((event.clone(), desktop));
+            Ok(())
+        }
+    }
+
+    fn topology_pair() -> crate::capture::DisplayTopologySnapshot {
+        crate::capture::DisplayTopologySnapshot::new(
+            vec![
+                crate::capture::DisplayDescriptor {
+                    id: 7,
+                    name: "secondary".into(),
+                    rect: DesktopRect::new(-1280, 0, 1280, 720),
+                    primary: false,
+                },
+                crate::capture::DisplayDescriptor {
+                    id: 19,
+                    name: "primary".into(),
+                    rect: DesktopRect::new(0, 0, 1920, 1080),
+                    primary: true,
+                },
+            ],
+            7,
+            DesktopRect::new(-1280, 0, 3200, 1080),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn topology_publication_keeps_list_active_output_and_input_geometry_together() {
+        let current = topology_pair();
+        let surviving = current
+            .displays()
+            .iter()
+            .find(|display| display.id == 19)
+            .unwrap()
+            .clone();
+        let next = current
+            .refreshed(vec![surviving.clone()], surviving.rect)
+            .unwrap()
+            .unwrap();
+        let selected = std::sync::Mutex::new(super::SelectedDesktop::from_snapshot(current));
+        let release = tokio::sync::Notify::new();
+        let suspended = std::sync::atomic::AtomicBool::new(false);
+        let (updates, mut received) = tokio::sync::watch::channel(1_u64);
+        let coordinator = super::CaptureDesktopCoordinator {
+            selected: &selected,
+            release_input: &release,
+            input_suspended: &suspended,
+            updates: &updates,
+        };
+        coordinator.suspend();
+        assert!(suspended.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(selected.lock().unwrap().display_id, 7);
+        // Preparation above did not publish its fallback until the commit.
+        coordinator.publish(next);
+        let published = selected.lock().unwrap();
+        assert_eq!(published.display_id, 19);
+        assert_eq!(published.desktop, VirtualDesktop::single(surviving.rect));
+        assert_eq!(published.topology_generation(), 2);
+        drop(published);
+        let (list, active) = super::selected_display_list(&selected).unwrap();
+        assert_eq!(active, 19);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].id, list[0].width, list[0].height),
+            (19, 1920, 1080)
+        );
+        assert_eq!(*received.borrow_and_update(), 2);
+        assert!(!suspended.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn input_wait_crossing_topology_change_is_discarded_and_held_keys_are_released() {
+        use desklink_protocol::InputEvent;
+        let topology = topology_pair();
+        let old_desktop =
+            VirtualDesktop::new(topology.active_display().rect, topology.virtual_desktop());
+        let next = topology.select(19).unwrap().unwrap();
+        let selected = std::sync::Mutex::new(super::SelectedDesktop::from_snapshot(topology));
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut input = InputInjector::with_backend(
+            old_desktop,
+            RecordingTopologyInputBackend { sent: sent.clone() },
+        );
+        let suspended = std::sync::atomic::AtomicBool::new(false);
+        let mut input_generation = 1;
+        let key = |pressed| InputEvent::Key {
+            code: KeyCode::Character('a'),
+            pressed,
+            modifiers: Modifiers::default(),
+        };
+        assert!(
+            super::inject_desktop_input(
+                &mut input,
+                key(true),
+                &selected,
+                &suspended,
+                1,
+                &mut input_generation
+            )
+            .unwrap()
+        );
+        *selected.lock().unwrap() = super::SelectedDesktop::from_snapshot(next);
+        assert!(
+            !super::inject_desktop_input(
+                &mut input,
+                InputEvent::MouseMove {
+                    x: 500_000,
+                    y: 500_000
+                },
+                &selected,
+                &suspended,
+                1,
+                &mut input_generation
+            )
+            .unwrap()
+        );
+        let events = sent.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, key(true));
+        assert_eq!(events[1].0, key(false));
+        drop(events);
+        assert!(
+            super::inject_desktop_input(
+                &mut input,
+                InputEvent::MouseMove {
+                    x: 500_000,
+                    y: 500_000
+                },
+                &selected,
+                &suspended,
+                2,
+                &mut input_generation
+            )
+            .unwrap()
+        );
+        let events = sent.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].1.rect, DesktopRect::new(0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn topology_gate_discards_presses_and_coordinates_but_keeps_release_events() {
+        use desklink_protocol::InputEvent;
+        let topology = topology_pair();
+        let desktop =
+            VirtualDesktop::new(topology.active_display().rect, topology.virtual_desktop());
+        let selected = std::sync::Mutex::new(super::SelectedDesktop::from_snapshot(topology));
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut input = InputInjector::with_backend(
+            desktop,
+            RecordingTopologyInputBackend { sent: sent.clone() },
+        );
+        let suspended = std::sync::atomic::AtomicBool::new(true);
+        let mut input_generation = 1;
+        for event in [
+            InputEvent::MouseMove { x: 1, y: 1 },
+            InputEvent::MouseButton {
+                button: desklink_protocol::MouseButton::Left,
+                pressed: true,
+            },
+        ] {
+            assert!(
+                !super::inject_desktop_input(
+                    &mut input,
+                    event,
+                    &selected,
+                    &suspended,
+                    1,
+                    &mut input_generation
+                )
+                .unwrap()
+            );
+        }
+        let release = InputEvent::MouseButton {
+            button: desklink_protocol::MouseButton::Left,
+            pressed: false,
+        };
+        assert!(
+            super::inject_desktop_input(
+                &mut input,
+                release.clone(),
+                &selected,
+                &suspended,
+                0,
+                &mut input_generation
+            )
+            .unwrap()
+        );
+        let events = sent.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, release);
+    }
+
+    #[test]
+    fn topology_publication_lock_remains_held_through_synchronous_injection() {
+        struct BlockingBackend {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl InputBackend for BlockingBackend {
+            fn send(
+                &mut self,
+                _: &desklink_protocol::InputEvent,
+                _: VirtualDesktop,
+            ) -> Result<(), InputInjectionError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let topology = topology_pair();
+        let desktop =
+            VirtualDesktop::new(topology.active_display().rect, topology.virtual_desktop());
+        let selected = std::sync::Arc::new(std::sync::Mutex::new(
+            super::SelectedDesktop::from_snapshot(topology),
+        ));
+        let (entered, wait_entered) = std::sync::mpsc::sync_channel(0);
+        let (release, wait_release) = std::sync::mpsc::sync_channel(0);
+        let inject = std::thread::spawn({
+            let selected = selected.clone();
+            move || {
+                let mut input = InputInjector::with_backend(
+                    desktop,
+                    BlockingBackend {
+                        entered,
+                        release: wait_release,
+                    },
+                );
+                let suspended = std::sync::atomic::AtomicBool::new(false);
+                let mut generation = 1;
+                super::inject_desktop_input(
+                    &mut input,
+                    desklink_protocol::InputEvent::MouseMove { x: 100, y: 100 },
+                    &selected,
+                    &suspended,
+                    1,
+                    &mut generation,
+                )
+                .unwrap()
+            }
+        });
+        wait_entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            selected.try_lock().is_err(),
+            "publication must wait for an in-progress sample"
+        );
+        release.send(()).unwrap();
+        assert!(inject.join().unwrap());
+        assert!(selected.try_lock().is_ok());
+    }
 
     impl InputBackend for RejectingInputBackend {
         fn send(
