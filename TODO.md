@@ -536,6 +536,17 @@
 - [x] Windows 静态验证：`python -m unittest scripts.tests.test_dl2_apple_account_restore_contract -v`，8 项协议与源码合同通过；`git diff --check` 通过。新增 Swift mock transport + Keychain spy 行为用例覆盖断网、5xx、429、明确失效、重试、并发恢复、迟到响应、取消和持久化错误，全为合成数据且不访问真实服务 / 系统 Keychain。
 - [ ] Apple 自动 / 真机：Windows 无 Swift/AppKit/UIKit，新增行为用例尚未运行；断网启动、真实 Keychain 锁定 / 恢复、账号服务恢复后一键重试及明确失效后的重新登录仍需 Mac/iOS 验收，不能以源码合同代替。
 
+### DL2-059 · P2 · Mac Host 把未知事件当致命错误，Transfer 流量会拆掉主机会话
+
+- [ ] 未知事件 kind 显式忽略并计数，错误只能由显式 error 事件表达。
+- **证据 / 类型：源码缺陷（ABI 漂移的运行时后果）。** `apps/macos/Sources/DeskLinkApp/Bridge/HostBridge.swift:592` `hostCallbackKind` 的 `default: .error`；而 Rust 侧会发出两份手工头文件都没有的 kind：`crates/desklink-ffi/src/host_worker.rs:847` 收到控制器 Transfer 数据报时发出非终态 `HostEvent::Transfer`，`crates/desklink-ffi/src/lib.rs:416` 映射为 `DesklinkHostEventKind::Transfer`。HostBridge 把 error 转为 publishError（`332-333`），随后 `513-518` 置 `.failed` 并 stop()。
+- **用户影响：** Windows 控制端向 Mac 主机发送剪贴板/文件消息（SecureLane::Transfer）时，整个 macOS 主机会话被误判为错误并拆除。
+- **方案：** 依赖 DL2-025 的统一 ABI 契约：Swift 对未知 kind 记诊断并忽略；不得用 default 兜底成错误。
+- **验收：** 用超出当前头文件的 kind 注入事件，Mac 会话保持；Transfer 消息进入正常确认流程而不是 failed。
+
+- [x] 当前分支复核：致命误分类已由 `39c17ad4255e0c19f9b86a7a3d10fbcca3e7abbe` 修复并由生成 ABI 保持 Transfer=8；本次补未知 kind 固定计数，仅明确 error 才读错误文本，unknown不解析数据/metrics或拆会话。新增共享mapper的未知kind/极大无关字段/Transfer Swift回归（未执行），Windows 2项跨语言合同通过。主题 `fix(DL2-059): count unknown host events without interpreting their payload`。
+- [ ] Swift/macOS事件注入验收未执行；当前Transfer仅显示不支持提示，正常文件/剪贴板确认流程属于026待补，不能将整项勾完。旧证据描述的是025前状态，本分支已无default:error。
+
 ## 10. 第一阶段历史记录
 
 以下原文按本次审查前状态保留，仅供追溯。里面的“当前”“未验收”“下一阶段”、旧版本、线上探针结果和勾选项均属于原记录日期；第二阶段以本文前九节为准。尚未完成的签名、安装或设备组合验收可以继续引用，但不能用来否定用户本次已确认的两条远控路径。

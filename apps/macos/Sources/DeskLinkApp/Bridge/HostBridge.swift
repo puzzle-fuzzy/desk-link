@@ -52,6 +52,7 @@ final class HostBridge: ObservableObject {
     @Published private(set) var metrics = HostMetrics()
     @Published private(set) var trustedControllers: [TrustedController] = []
     @Published private(set) var lastError: String?
+    @Published private(set) var ignoredHostEventCount: UInt64 = 0
 
     var canStartCapture: Bool {
         permissions.screenRecording == .granted && state == .connected
@@ -355,9 +356,27 @@ final class HostBridge: ObservableObject {
         case .transfer:
             lastError = "当前 Mac 共享尚不支持文件和剪贴板传输。"
         case .unknown:
-            break
+            ignoredHostEventCount &+= 1
         }
     }
+
+#if DEBUG
+    /// Exercises event classification only; no native host or input injection.
+    func acceptEventKindForTesting(_ rawValue: UInt32, poisonUnrelatedFields: Bool = false) {
+        var value = DesklinkHostEvent()
+        value.kind = DesklinkHostEventKind(rawValue: rawValue)
+        value.state = DESKLINK_HOST_CONNECTED
+        if poisonUnrelatedFields {
+            value.data_len = Int.max
+            value.fingerprint_len = Int.max
+            value.metrics.sent_video_configs = UInt64.max
+            value.metrics.sent_video_packets = UInt64.max
+            value.metrics.received_input_events = UInt64.max
+            value.metrics.keyframe_requests = UInt64.max
+        }
+        consume(hostCallbackEvent(value))
+    }
+#endif
 
     private func consumeState(_ rawState: Int) {
         switch rawState {
@@ -559,25 +578,45 @@ private func desklinkHostEventCallback(_ context: UnsafeMutableRawPointer?, _ ev
     guard let bridge = callbackContext.bridge else { return }
     let generation = callbackContext.generation
     let value = event.pointee
-    let mapped = HostCallbackEvent(
-        kind: hostCallbackKind(value.kind),
-        state: Int(value.state.rawValue),
-        message: value.data.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.data_len), as: UTF8.self) },
-        fingerprint: value.fingerprint.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.fingerprint_len), as: UTF8.self) },
-        controllerDeviceID: withUnsafeBytes(of: value.controller_device_id) { Array($0) },
-        controllerVerifyKey: withUnsafeBytes(of: value.controller_verify_key) { Array($0) },
-        input: hostInputCommand(value.input),
-        metrics: HostMetrics(
-            sentVideoConfigurations: Int(value.metrics.sent_video_configs),
-            sentVideoPackets: Int(value.metrics.sent_video_packets),
-            receivedInputEvents: Int(value.metrics.received_input_events),
-            keyframeRequests: Int(value.metrics.keyframe_requests)
-        )
-    )
+    let mapped = hostCallbackEvent(value)
     DispatchQueue.main.async {
         guard bridge.acceptsCallback(generation: generation) else { return }
         bridge.consume(mapped)
     }
+}
+
+private func hostCallbackEvent(_ value: DesklinkHostEvent) -> HostCallbackEvent {
+    let kind = hostCallbackKind(value.kind)
+    let message: String?
+    if case .error = kind {
+        message = value.data.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.data_len), as: UTF8.self) }
+    } else {
+        // Unknown/transfer bytes need not be copied or interpreted as errors.
+        message = nil
+    }
+    let fingerprint: String?
+    if case .approvalRequested = kind {
+        fingerprint = value.fingerprint.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.fingerprint_len), as: UTF8.self) }
+    } else { fingerprint = nil }
+    let input: RemoteInputCommand?
+    if case .input = kind { input = hostInputCommand(value.input) } else { input = nil }
+    let metrics: HostMetrics?
+    if case .metrics = kind {
+        metrics = HostMetrics(sentVideoConfigurations: Int(clamping: value.metrics.sent_video_configs),
+            sentVideoPackets: Int(clamping: value.metrics.sent_video_packets),
+            receivedInputEvents: Int(clamping: value.metrics.received_input_events),
+            keyframeRequests: Int(clamping: value.metrics.keyframe_requests))
+    } else { metrics = nil }
+    return HostCallbackEvent(
+        kind: kind,
+        state: Int(value.state.rawValue),
+        message: message,
+        fingerprint: fingerprint,
+        controllerDeviceID: withUnsafeBytes(of: value.controller_device_id) { Array($0) },
+        controllerVerifyKey: withUnsafeBytes(of: value.controller_verify_key) { Array($0) },
+        input: input,
+        metrics: metrics
+    )
 }
 
 private extension HostBridge {
