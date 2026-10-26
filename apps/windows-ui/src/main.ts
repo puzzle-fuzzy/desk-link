@@ -76,6 +76,7 @@ import { hostStatusSummary } from "./host-status";
 import { hostSnapshotPresentationChanged } from "./host-snapshot-presentation";
 import { approvalNeedsFocus, approvalTabFocusIndex } from "./approval-focus";
 import { WindowsUpdater, windowsUpdateProgressLabel } from "./windows-update";
+import { AccountFormDraft } from "./account-form-draft";
 
 type View = "controller" | "connection" | "devices" | "pairing" | "fixedAccess" | "settings" | "about";
 type Feedback = { tone: "success" | "error" | "info"; message: string } | null;
@@ -146,6 +147,8 @@ let accountMode: "login" | "register" | "forgot" = "login";
 let accountBusy = false;
 let accountNotice: string | null = null;
 let accountCanResendVerification = false;
+const accountDraft = new AccountFormDraft();
+let accountErrorField: "email" | "password" | "confirmation" | null = null;
 let snapshotRecoveryTimer: number | null = null;
 const workspaceHostEvents = ["host-runtime-changed", "host-approval-changed"] as const;
 const workspaceHostListeners = new Set<string>();
@@ -227,6 +230,17 @@ function renderAccountGate(): string {
 }
 
 function bindAccountInteractions(): void {
+  const accountForm = document.querySelector<HTMLFormElement>("[data-account-form]");
+  if (accountForm) {
+    accountDraft.restore(accountForm);
+    accountForm.addEventListener("input", () => accountDraft.capture(new FormData(accountForm)));
+    if (accountErrorField) {
+      const input = accountForm.querySelector<HTMLInputElement>(`input[name="${accountErrorField}"]`);
+      input?.setAttribute("aria-invalid", "true");
+      input?.focus();
+      accountErrorField = null;
+    }
+  }
   const accountTabs = Array.from(
     document.querySelectorAll<HTMLButtonElement>('[role="tab"][data-account-mode]'),
   );
@@ -234,6 +248,7 @@ function bindAccountInteractions(): void {
     const mode = button.dataset.accountMode;
     if (mode !== "login" && mode !== "register" && mode !== "forgot") return;
     accountMode = mode;
+    accountDraft.clearSecrets();
     accountError = null;
     accountNotice = null;
     accountCanResendVerification = false;
@@ -267,6 +282,7 @@ function bindAccountInteractions(): void {
 }
 
 async function enterAccountLocalMode(): Promise<void> {
+  accountDraft.leave();
   accountLocalMode = true;
   accountError = null;
   accountNotice = null;
@@ -283,7 +299,7 @@ async function enterAccountLocalMode(): Promise<void> {
 
 async function resendVerification(): Promise<void> {
   if (accountBusy) return;
-  const email = document.querySelector<HTMLInputElement>('[data-account-form] input[name="email"]')?.value.trim() ?? "";
+  const email = accountDraft.pendingVerificationEmail;
   if (!email) {
     accountError = "请先填写注册邮箱。";
     render();
@@ -306,16 +322,13 @@ async function resendVerification(): Promise<void> {
 async function submitAccount(form: HTMLFormElement): Promise<void> {
   if (accountBusy) return;
   const data = new FormData(form);
+  accountDraft.capture(data);
   const email = String(data.get("email") ?? "").trim();
   const password = String(data.get("password") ?? "");
-  const confirmation = String(data.get("confirmation") ?? "");
-  if (!email || (accountMode !== "forgot" && password.length < 12)) {
-    accountError = "请填写有效邮箱和至少 12 个字符的密码。";
-    render();
-    return;
-  }
-  if (accountMode === "register" && password !== confirmation) {
-    accountError = "两次输入的密码不一致。";
+  const validation = accountDraft.validate(accountMode);
+  if (validation) {
+    accountError = validation.message;
+    accountErrorField = validation.field;
     render();
     return;
   }
@@ -327,17 +340,20 @@ async function submitAccount(form: HTMLFormElement): Promise<void> {
     if (accountMode === "login") {
       account = await accountLogin(email, password);
       if (account.signedIn) {
+        accountDraft.leave();
         accountLocalMode = false;
         setAccountLocalModeEnabled(false);
         await startWorkspace();
       }
     } else if (accountMode === "register") {
       await accountRegister(email, password);
+      accountDraft.registered(email);
       accountMode = "login";
       accountNotice = "验证邮件已发送，请完成邮箱验证后再登录。";
       accountCanResendVerification = true;
     } else {
       await accountForgotPassword(email);
+      accountDraft.clearSecrets();
       accountMode = "login";
       accountNotice = "如果邮箱已注册，重置密码邮件会很快送达。";
       accountCanResendVerification = false;
@@ -353,6 +369,7 @@ async function submitAccount(form: HTMLFormElement): Promise<void> {
 async function logoutAccount(): Promise<void> {
   if (accountBusy) return;
   accountBusy = true;
+  accountDraft.leave();
   clearFixedAccessSecrets();
   clearPairingSecrets();
   pairingSession = null;
