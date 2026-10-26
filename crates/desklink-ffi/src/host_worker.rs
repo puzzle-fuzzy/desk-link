@@ -745,6 +745,7 @@ async fn negotiate_controller(
             h264_profiles: vec![H264Profile::Main],
             width: 1920,
             height: 1080,
+            lan_data: None,
         }),
     )
     .await?;
@@ -770,6 +771,11 @@ async fn negotiate_controller(
                 }
                 ControlMessage::Capabilities(_) => {
                     return Err(HostError::InvalidControllerCapabilities);
+                }
+                ControlMessage::LanDataSwitch { .. } => {
+                    return Err(HostError::Protocol(
+                        "LAN data switching was not negotiated".into(),
+                    ));
                 }
                 ControlMessage::Hello { .. }
                 | ControlMessage::RequestKeyframe { .. }
@@ -831,7 +837,11 @@ async fn run_connected(
                 match event.map_err(transport_error)? {
                     TransportEvent::Control(ciphertext) => {
                         let plaintext = secure.open(SecureLane::Control, &ciphertext).map_err(crypto_error)?;
-                        if matches!(decode_control(&plaintext).map_err(protocol_error)?, ControlMessage::RequestKeyframe { .. }) {
+                        let message = decode_control(&plaintext).map_err(protocol_error)?;
+                        if matches!(message, ControlMessage::LanDataSwitch { .. }) {
+                            return Err(HostError::Protocol("LAN data switching was not negotiated".into()));
+                        }
+                        if matches!(message, ControlMessage::RequestKeyframe { .. }) {
                             metrics.keyframe_requests = metrics.keyframe_requests.saturating_add(1);
                             emit_nonterminal(events, HostEvent::KeyframeRequested);
                         }

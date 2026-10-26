@@ -877,6 +877,7 @@ async fn run_fake_host(
             h264_profiles: vec![H264Profile::Main],
             width: 1280,
             height: 720,
+            lan_data: None,
         }),
     )
     .await;
@@ -1095,6 +1096,7 @@ async fn run_reference_gap_host(
             h264_profiles: vec![H264Profile::Main],
             width: 1280,
             height: 720,
+            lan_data: None,
         }),
     )
     .await;
@@ -1214,6 +1216,7 @@ async fn accept_reconnect_controller(
             h264_profiles: vec![H264Profile::Main],
             width: 1280,
             height: 720,
+            lan_data: None,
         }),
     )
     .await;

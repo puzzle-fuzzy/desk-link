@@ -178,8 +178,8 @@ impl QueuedTransferRecoveryFile {
             || !self.path.is_absolute()
             || self.path.as_os_str().encode_wide().count() > 32_767
             || self.path.file_name().and_then(|value| value.to_str()) != Some(&self.name)
-            || !is_valid_transfer_file_name(&self.name)
-            || self.size > MAX_TRANSFER_FILE_BYTES
+            || !desklink_protocol::is_valid_transfer_path_segment(&self.name)
+            || self.size > desklink_protocol::MAX_LARGE_FILE_BYTES
         {
             return Err(WindowsTransferRecoveryError::CorruptStore);
         }

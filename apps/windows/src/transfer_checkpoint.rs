@@ -5,8 +5,10 @@
 //! and publish a destination only after `verify_all` succeeds. A checkpoint ACK
 //! means both the bytes and their journal record have been synced to disk.
 
+#[cfg(any(not(windows), test))]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
@@ -29,18 +31,55 @@ fn io_failed(_: std::io::Error) -> TransferResult {
     TransferResult::IoFailed
 }
 
+#[cfg(not(windows))]
 fn private_file_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
+    options
+}
+
+fn create_cache_file(path: &Path) -> Result<File, TransferResult> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-        options
-            .share_mode(FILE_SHARE_READ.0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+        crate::transfer_directory::native::create_file_path(path)
     }
-    options
+    #[cfg(not(windows))]
+    {
+        private_file_options()
+            .create_new(true)
+            .open(path)
+            .map_err(io_failed)
+    }
+}
+
+fn open_cache_file(path: &Path, write: bool) -> Result<File, TransferResult> {
+    #[cfg(windows)]
+    {
+        crate::transfer_directory::native::open_file_path(path, write)
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = fs::symlink_metadata(path).map_err(io_failed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(TransferResult::InvalidData);
+        }
+        OpenOptions::new()
+            .read(true)
+            .write(write)
+            .open(path)
+            .map_err(io_failed)
+    }
+}
+
+fn delete_cache_path(path: &Path) -> Result<(), TransferResult> {
+    #[cfg(windows)]
+    {
+        crate::transfer_directory::native::delete_path(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path).map_err(io_failed)
+    }
 }
 
 fn cancelled(flag: &AtomicBool) -> Result<(), TransferResult> {
@@ -124,10 +163,81 @@ fn read_record(
     Ok((hash, proof))
 }
 
-/// Stable identity of the opened source, including the OS file identity and
-/// change time where available. It is a cache key, never a replacement for the
-/// block digests or final on-disk verification.
+type ChangeTokenReader = fn(&File) -> Result<Option<i64>, TransferResult>;
+
+/// FSCTL_READ_FILE_USN_DATA returns the file's last journal USN. Timestamp and
+/// reason fields are intentionally ignored; Microsoft does not define them for
+/// this request. An absent/zero/unsupported token requires full content checking.
+fn file_change_token(file: &File) -> Result<Option<i64>, TransferResult> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            System::{
+                IO::DeviceIoControl,
+                Ioctl::{
+                    FSCTL_READ_FILE_USN_DATA, READ_FILE_USN_DATA, USN_RECORD_V2, USN_RECORD_V3,
+                },
+            },
+        };
+        let versions = READ_FILE_USN_DATA {
+            MinMajorVersion: 2,
+            MaxMajorVersion: 3,
+        };
+        let mut buffer = [0_u64; 128];
+        let mut returned = 0_u32;
+        let result = unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_READ_FILE_USN_DATA,
+                Some((&versions as *const READ_FILE_USN_DATA).cast()),
+                std::mem::size_of::<READ_FILE_USN_DATA>() as u32,
+                Some(buffer.as_mut_ptr().cast()),
+                std::mem::size_of_val(&buffer) as u32,
+                Some(&mut returned),
+                None,
+            )
+        };
+        if result.is_err() {
+            return Ok(None);
+        }
+        let returned = returned as usize;
+        if returned < 8 || returned > std::mem::size_of_val(&buffer) {
+            return Ok(None);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), returned) };
+        let record_length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let offset = match version {
+            2 => std::mem::offset_of!(USN_RECORD_V2, Usn),
+            3 => std::mem::offset_of!(USN_RECORD_V3, Usn),
+            _ => return Ok(None),
+        };
+        if record_length > returned || record_length < offset + 8 {
+            return Ok(None);
+        }
+        let usn = i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        Ok((usn > 0).then_some(usn))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(None)
+    }
+}
+
+/// Stable identity of the opened source, including the OS file identity,
+/// change time and nonzero journal USN where available. Without a reliable
+/// change token, cached source indices require full content revalidation.
 pub(crate) fn source_stamp(file: &File) -> Result<(u64, [u8; 32]), TransferResult> {
+    source_stamp_with_reader(file, file_change_token)
+}
+
+fn source_stamp_with_reader(
+    file: &File,
+    token_reader: ChangeTokenReader,
+) -> Result<(u64, [u8; 32]), TransferResult> {
     let metadata = file.metadata().map_err(io_failed)?;
     if !metadata.is_file() {
         return Err(TransferResult::InvalidData);
@@ -135,6 +245,16 @@ pub(crate) fn source_stamp(file: &File) -> Result<(u64, [u8; 32]), TransferResul
     let mut stamp = Blake2s256::new();
     stamp.update(b"DeskLink source identity v14\0");
     stamp.update(metadata.len().to_le_bytes());
+    match token_reader(file)? {
+        Some(token) => {
+            stamp.update([1]);
+            stamp.update(token.to_le_bytes());
+        }
+        None => {
+            stamp.update([0]);
+            stamp.update(0_i64.to_le_bytes());
+        }
+    }
     for timestamp in [metadata.modified(), metadata.created()] {
         match timestamp
             .ok()
@@ -194,28 +314,18 @@ pub(crate) fn source_stamp(file: &File) -> Result<(u64, [u8; 32]), TransferResul
 }
 
 fn open_stable_source(path: &Path) -> Result<File, TransferResult> {
-    let metadata = fs::symlink_metadata(path).map_err(io_failed)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(TransferResult::InvalidData);
-    }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        use windows::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        };
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-            return Err(TransferResult::InvalidData);
-        }
-        return OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ.0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(path)
-            .map_err(io_failed);
+        crate::transfer_directory::native::open_file_path(path, false)
     }
     #[cfg(not(windows))]
-    File::open(path).map_err(io_failed)
+    {
+        let metadata = fs::symlink_metadata(path).map_err(io_failed)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(TransferResult::InvalidData);
+        }
+        File::open(path).map_err(io_failed)
+    }
 }
 
 /// One verified, canonical protocol block. At most 48 KiB is allocated.
@@ -226,8 +336,10 @@ pub struct IndexedBlock {
 }
 
 /// A source file and a persistent disk index. The initial scan is O(file bytes),
-/// with one 64-byte record per block and constant memory. Reopening uses the
-/// stable source identity and exact index length; resume proof lookup is O(1).
+/// with one 64-byte record per block and constant memory. A reliable nonzero
+/// change token permits reopening without source-prefix reads. Other filesystems
+/// revalidate the complete source with cancellation/progress before reuse.
+/// Resume proof lookup is O(1).
 /// Each outgoing block is checked against its indexed digest before it is sent.
 pub struct SourceIndex {
     source: File,
@@ -235,6 +347,7 @@ pub struct SourceIndex {
     size: u64,
     stamp: [u8; 32],
     root: [u8; 32],
+    token_reader: ChangeTokenReader,
 }
 
 impl SourceIndex {
@@ -255,18 +368,38 @@ impl SourceIndex {
     /// The caller retains any ancestor pins associated with `source`. Existing
     /// index files are never overwritten, including an incomplete prior build.
     pub fn build_from_file(
+        source: File,
+        index_path: &Path,
+        cancellation: &AtomicBool,
+        progress: impl FnMut(u64),
+    ) -> Result<Self, TransferResult> {
+        Self::build_with_reader(
+            source,
+            index_path,
+            file_change_token,
+            cancellation,
+            progress,
+        )
+    }
+
+    fn build_with_reader(
         mut source: File,
         index_path: &Path,
+        token_reader: ChangeTokenReader,
         cancellation: &AtomicBool,
         mut progress: impl FnMut(u64),
     ) -> Result<Self, TransferResult> {
         cancelled(cancellation)?;
-        let (size, stamp) = source_stamp(&source)?;
+        let (size, stamp) = source_stamp_with_reader(&source, token_reader)?;
         validate_size(size)?;
-        let mut index = private_file_options()
-            .create_new(true)
-            .open(index_path)
-            .map_err(io_failed)?;
+        // The index is disk backed and may itself exceed a gigabyte for a
+        // negotiated 1-TiB file. Reserve its complete growth before scanning;
+        // the helper includes the normal receive/cache free-space margin.
+        crate::transfer::ensure_receive_capacity(
+            index_path.parent().ok_or(TransferResult::InvalidData)?,
+            source_index_bytes(size)?,
+        )?;
+        let mut index = create_cache_file(index_path)?;
         let result = (|| {
             index.write_all(INDEX_MAGIC).map_err(io_failed)?;
             index
@@ -298,7 +431,7 @@ impl SourceIndex {
                 progress(offset);
             }
             cancelled(cancellation)?;
-            if source_stamp(&source)? != (size, stamp) {
+            if source_stamp_with_reader(&source, token_reader)? != (size, stamp) {
                 return Err(TransferResult::SourceChanged);
             }
             let root = digest(&root);
@@ -314,11 +447,15 @@ impl SourceIndex {
                 size,
                 stamp,
                 root,
+                token_reader,
             }),
             Err(error) => {
+                #[cfg(windows)]
+                let _ = crate::transfer_directory::native::delete_file(&index);
                 drop(index);
                 // This path was created by this call with create_new. No other
                 // owner is allowed to replace it while the build handle lives.
+                #[cfg(not(windows))]
                 let _ = fs::remove_file(index_path);
                 Err(error)
             }
@@ -329,28 +466,99 @@ impl SourceIndex {
         Self::open_from_file(open_stable_source(source)?, index_path)
     }
 
-    pub fn open_from_file(source: File, index_path: &Path) -> Result<Self, TransferResult> {
-        let (actual_size, actual_stamp) = source_stamp(&source)?;
-        let index_metadata = fs::symlink_metadata(index_path).map_err(io_failed)?;
-        if !index_metadata.is_file() || index_metadata.file_type().is_symlink() {
+    /// Rebuild only an incomplete/corrupt index in the caller's private owned
+    /// cache. SourceChanged is never erased or silently accepted. The source
+    /// handle remains pinned throughout, and regular source files are never
+    /// removed. Do not pass an arbitrary user-selected path as `index_path`.
+    pub fn recover_or_build_from_file(
+        source: File,
+        index_path: &Path,
+        cancellation: &AtomicBool,
+        mut progress: impl FnMut(u64),
+    ) -> Result<Self, TransferResult> {
+        cancelled(cancellation)?;
+        let metadata = match fs::symlink_metadata(index_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::build_from_file(source, index_path, cancellation, progress);
+            }
+            Err(error) => return Err(io_failed(error)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(TransferResult::InvalidData);
         }
-        let mut index_options = OpenOptions::new();
-        index_options.read(true);
         #[cfg(windows)]
         {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-            };
-            index_options
-                .share_mode(FILE_SHARE_READ.0)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes()
+                & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                != 0
+            {
+                return Err(TransferResult::InvalidData);
+            }
         }
-        let mut index = index_options.open(index_path).map_err(io_failed)?;
+        match Self::open_checked(
+            source.try_clone().map_err(io_failed)?,
+            index_path,
+            file_change_token,
+            cancellation,
+            &mut progress,
+        ) {
+            Ok(index) => Ok(index),
+            Err(TransferResult::InvalidData) => {
+                // A live Windows builder denies delete sharing; this removal
+                // fails rather than replacing an index owned by another worker.
+                delete_cache_path(index_path)?;
+                Self::build_from_file(source, index_path, cancellation, progress)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn open_from_file(source: File, index_path: &Path) -> Result<Self, TransferResult> {
+        Self::open_checked(
+            source,
+            index_path,
+            file_change_token,
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+    }
+
+    pub fn open_from_file_with_control(
+        source: File,
+        index_path: &Path,
+        cancellation: &AtomicBool,
+        mut progress: impl FnMut(u64),
+    ) -> Result<Self, TransferResult> {
+        Self::open_checked(
+            source,
+            index_path,
+            file_change_token,
+            cancellation,
+            &mut progress,
+        )
+    }
+
+    fn open_checked(
+        source: File,
+        index_path: &Path,
+        token_reader: ChangeTokenReader,
+        cancellation: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<Self, TransferResult> {
+        cancelled(cancellation)?;
+        let (actual_size, actual_stamp) = source_stamp_with_reader(&source, token_reader)?;
+        let mut index = open_cache_file(index_path, false)?;
         source_stamp(&index)?;
         let mut header = [0; INDEX_HEADER_BYTES as usize];
-        index.read_exact(&mut header).map_err(io_failed)?;
+        index.read_exact(&mut header).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                TransferResult::InvalidData
+            } else {
+                io_failed(error)
+            }
+        })?;
         if &header[..8] != INDEX_MAGIC
             || header[8..12] != FILE_BLOCK_BYTES.to_le_bytes()
             || header[12..16] != [0; 4]
@@ -377,13 +585,18 @@ impl SourceIndex {
         } else if read_record(&mut index, INDEX_HEADER_BYTES, blocks(size) - 1)?.1 != root {
             return Err(TransferResult::InvalidData);
         }
-        Ok(Self {
+        let mut opened = Self {
             source,
             index,
             size,
             stamp,
             root,
-        })
+            token_reader,
+        };
+        if token_reader(&opened.source)?.is_none() {
+            opened.verify_entire_source(cancellation, progress)?;
+        }
+        Ok(opened)
     }
 
     pub fn size(&self) -> u64 {
@@ -392,16 +605,58 @@ impl SourceIndex {
     pub fn content_root(&self) -> [u8; 32] {
         self.root
     }
+
     pub fn source_identity(&self) -> [u8; 32] {
         self.stamp
     }
 
     pub fn verify_source(&self) -> Result<(), TransferResult> {
-        if source_stamp(&self.source)? == (self.size, self.stamp) {
+        if source_stamp_with_reader(&self.source, self.token_reader)? == (self.size, self.stamp) {
             Ok(())
         } else {
             Err(TransferResult::SourceChanged)
         }
+    }
+
+    fn verify_entire_source(
+        &mut self,
+        cancellation: &AtomicBool,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<(), TransferResult> {
+        self.source.seek(SeekFrom::Start(0)).map_err(io_failed)?;
+        let mut root = root_hasher(self.size);
+        let mut offset = 0;
+        let mut buffer = vec![0; FILE_BLOCK_BYTES as usize];
+        while offset < self.size {
+            cancelled(cancellation)?;
+            let count = block_len(self.size, offset)?;
+            self.source
+                .read_exact(&mut buffer[..count])
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        TransferResult::SourceChanged
+                    } else {
+                        io_failed(error)
+                    }
+                })?;
+            let hash = block_digest(&buffer[..count]);
+            let (expected, _) = read_record(
+                &mut self.index,
+                INDEX_HEADER_BYTES,
+                offset / u64::from(FILE_BLOCK_BYTES),
+            )?;
+            if hash != expected {
+                return Err(TransferResult::SourceChanged);
+            }
+            root.update(hash);
+            offset += count as u64;
+            progress(offset);
+        }
+        cancelled(cancellation)?;
+        if digest(&root) != self.root {
+            return Err(TransferResult::SourceChanged);
+        }
+        self.verify_source()
     }
 
     pub fn resume_proof(&mut self, offset: u64) -> Result<[u8; 32], TransferResult> {
@@ -469,8 +724,10 @@ impl CheckpointLedger {
         root: [u8; 32],
     ) -> Result<Self, TransferResult> {
         validate_size(size)?;
-        let mut journal = match private_file_options().create_new(true).open(journal_path) {
-            Ok(mut journal) => {
+        let mut journal = match fs::symlink_metadata(journal_path) {
+            Ok(_) => open_cache_file(journal_path, true)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut journal = create_cache_file(journal_path)?;
                 // A prefix without a proof journal cannot be acknowledged.
                 part.set_len(0).map_err(io_failed)?;
                 part.sync_data().map_err(io_failed)?;
@@ -483,25 +740,6 @@ impl CheckpointLedger {
                 journal.write_all(&root).map_err(io_failed)?;
                 journal.sync_all().map_err(io_failed)?;
                 journal
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(journal_path).map_err(io_failed)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(TransferResult::InvalidData);
-                }
-                let mut options = private_file_options();
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-                    use windows::Win32::Storage::FileSystem::{
-                        FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ,
-                    };
-                    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-                        return Err(TransferResult::InvalidData);
-                    }
-                    options.share_mode(FILE_SHARE_READ.0);
-                }
-                options.open(journal_path).map_err(io_failed)?
             }
             Err(error) => return Err(io_failed(error)),
         };
@@ -548,6 +786,12 @@ impl CheckpointLedger {
             part.set_len(offset).map_err(io_failed)?;
             part.sync_data().map_err(io_failed)?;
         }
+        // A process can exit after writing a complete journal record but
+        // before its sync returns. Re-adopting that valid record promotes it
+        // to a durable checkpoint only after both handles are synced here.
+        // This reads no prefix data and therefore remains cheap on reconnect.
+        part.sync_data().map_err(io_failed)?;
+        journal.sync_data().map_err(io_failed)?;
         part.seek(SeekFrom::Start(offset)).map_err(io_failed)?;
         journal.seek(SeekFrom::End(0)).map_err(io_failed)?;
         Ok(Self {
@@ -570,6 +814,11 @@ impl CheckpointLedger {
     }
     pub fn content_root(&self) -> [u8; 32] {
         self.root
+    }
+
+    pub fn remaining_journal_bytes(&self) -> Result<u64, TransferResult> {
+        Ok(checkpoint_ledger_bytes(self.size)?
+            .saturating_sub(self.journal.metadata().map_err(io_failed)?.len()))
     }
 
     pub fn write_block(
@@ -942,6 +1191,76 @@ mod tests {
         assert_eq!(part.metadata().unwrap().len(), 0);
     }
 
+    #[tokio::test]
+    async fn blocked_checkpoint_disk_thread_keeps_async_timers_live_and_cancel_creates_no_ack() {
+        let fixture = Fixture::new();
+        let bytes = vec![0x59; FILE_BLOCK_BYTES as usize];
+        let mut hash = root_hasher(bytes.len() as u64);
+        hash.update(block_digest(&bytes));
+        let root = digest(&hash);
+        let journal_path = fixture.path("receive.ledger");
+        let part_path = fixture.path("receive.part");
+        let mut part = fixture.part();
+        let mut ledger =
+            CheckpointLedger::open_or_create(&journal_path, &mut part, bytes.len() as u64, root)
+                .unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = ledger.write_block_with_sync_hook(
+                &mut part,
+                0,
+                &bytes,
+                block_digest(&bytes),
+                &worker_cancellation,
+                || {
+                    // The fixture reaches this gate only after the real OS
+                    // data sync. Holding this disk thread models a slow sync
+                    // boundary, without blocking Tokio's event consumption.
+                    ready.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                },
+            );
+            assert_eq!(ledger.resume_offset(), 0);
+            result
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tokio::time::sleep(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(
+            fs::metadata(&journal_path).unwrap().len(),
+            LEDGER_HEADER_BYTES
+        );
+        release.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Err(TransferResult::Cancelled));
+        let mut part = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(part_path)
+            .unwrap();
+        let ledger = CheckpointLedger::open_or_create(
+            &journal_path,
+            &mut part,
+            FILE_BLOCK_BYTES as u64,
+            root,
+        )
+        .unwrap();
+        assert_eq!(ledger.resume_offset(), 0);
+        assert_eq!(part.metadata().unwrap().len(), 0);
+    }
+
     #[test]
     fn changed_source_is_detected_even_when_writer_restores_size_and_modified_time() {
         let fixture = Fixture::new();
@@ -968,6 +1287,201 @@ mod tests {
             SourceIndex::open(&source_path, &fixture.path("source.index")),
             Err(TransferResult::SourceChanged)
         ));
+    }
+
+    #[cfg(windows)]
+    fn basic_info(file: &File) -> windows::Win32::Storage::FileSystem::FILE_BASIC_INFO {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx},
+        };
+        let mut basic = FILE_BASIC_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        }
+        .unwrap();
+        basic
+    }
+
+    #[cfg(windows)]
+    fn overwrite_prefix_and_restore_all_basic_info(
+        path: &Path,
+        original: windows::Win32::Storage::FileSystem::FILE_BASIC_INFO,
+    ) {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileBasicInfo, SetFileInformationByHandle,
+            },
+        };
+        {
+            let mut data = OpenOptions::new().write(true).open(path).unwrap();
+            data.write_all(&[0xff]).unwrap();
+            data.sync_all().unwrap();
+        }
+        // Restore after closing the data writer, using a separate attribute-only
+        // handle, so closing the original writer cannot rewrite the timestamps.
+        {
+            let metadata = OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0)
+                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+                .open(path)
+                .unwrap();
+            unsafe {
+                SetFileInformationByHandle(
+                    HANDLE(metadata.as_raw_handle()),
+                    FileBasicInfo,
+                    (&original as *const FILE_BASIC_INFO).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            }
+            .unwrap();
+        }
+        let actual = basic_info(&File::open(path).unwrap());
+        assert_eq!(
+            (
+                actual.CreationTime,
+                actual.LastAccessTime,
+                actual.LastWriteTime,
+                actual.ChangeTime,
+                actual.FileAttributes
+            ),
+            (
+                original.CreationTime,
+                original.LastAccessTime,
+                original.LastWriteTime,
+                original.ChangeTime,
+                original.FileAttributes
+            ),
+            "fixture did not restore every FILE_BASIC_INFO member"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_usn_rejects_prefix_changes_after_all_basic_file_metadata_is_restored_without_rescanning()
+     {
+        let fixture = Fixture::new();
+        let source_path = fixture.source(&sample());
+        let source = open_stable_source(&source_path).unwrap();
+        let original = basic_info(&source);
+        let original_usn = file_change_token(&source)
+            .unwrap()
+            .expect("NTFS fixture requires a nonzero per-file journal USN");
+        let index_path = fixture.path("source.index");
+        let index =
+            SourceIndex::build_from_file(source, &index_path, &AtomicBool::new(false), |_| {})
+                .unwrap();
+        drop(index);
+        // The reliable NTFS token path must not read the prefix on an unchanged
+        // restart. The fallback callback would fire once per real data block.
+        let unchanged = SourceIndex::open_from_file_with_control(
+            open_stable_source(&source_path).unwrap(),
+            &index_path,
+            &AtomicBool::new(false),
+            |_| panic!("unchanged NTFS cache rehashed source data"),
+        )
+        .unwrap();
+        drop(unchanged);
+        overwrite_prefix_and_restore_all_basic_info(&source_path, original);
+        let changed = open_stable_source(&source_path).unwrap();
+        let changed_usn = file_change_token(&changed)
+            .unwrap()
+            .expect("NTFS USN disappeared");
+        assert_ne!(original_usn, changed_usn);
+        let mut scanned = 0;
+        assert!(matches!(
+            SourceIndex::open_from_file_with_control(
+                changed,
+                &index_path,
+                &AtomicBool::new(false),
+                |bytes| scanned = bytes
+            ),
+            Err(TransferResult::SourceChanged)
+        ));
+        assert_eq!(
+            scanned, 0,
+            "USN change was not detected before reading cached prefix data"
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"ntfsChangeTokenAvailable":true,"beforeUsn":original_usn.to_string(),"afterUsn":changed_usn.to_string(),"unchangedSourceRevalidationBytes":0,"changedSourceRevalidationBytes":scanned,"allBasicInfoRestored":true,"changedSourceRejected":true})
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsupported_change_tokens_force_cancellable_full_content_revalidation_of_cached_sources() {
+        fn unavailable(_: &File) -> Result<Option<i64>, TransferResult> {
+            Ok(None)
+        }
+        let fixture = Fixture::new();
+        let data = sample();
+        let source_path = fixture.source(&data);
+        let source = open_stable_source(&source_path).unwrap();
+        let original = basic_info(&source);
+        let original_stamp = source_stamp_with_reader(&source, unavailable).unwrap();
+        let index_path = fixture.path("source.index");
+        let index = SourceIndex::build_with_reader(
+            source,
+            &index_path,
+            unavailable,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        drop(index);
+        let mut scanned = 0;
+        let unchanged = SourceIndex::open_checked(
+            open_stable_source(&source_path).unwrap(),
+            &index_path,
+            unavailable,
+            &AtomicBool::new(false),
+            &mut |bytes| scanned = bytes,
+        )
+        .unwrap();
+        assert_eq!(scanned, data.len() as u64);
+        drop(unchanged);
+        let cancelled = AtomicBool::new(false);
+        assert!(matches!(
+            SourceIndex::open_checked(
+                open_stable_source(&source_path).unwrap(),
+                &index_path,
+                unavailable,
+                &cancelled,
+                &mut |_| cancelled.store(true, Ordering::Release)
+            ),
+            Err(TransferResult::Cancelled)
+        ));
+        overwrite_prefix_and_restore_all_basic_info(&source_path, original);
+        let changed = open_stable_source(&source_path).unwrap();
+        assert_eq!(
+            source_stamp_with_reader(&changed, unavailable).unwrap(),
+            original_stamp,
+            "fixture did not eliminate all metadata-only change signals"
+        );
+        assert!(matches!(
+            SourceIndex::open_checked(
+                changed,
+                &index_path,
+                unavailable,
+                &AtomicBool::new(false),
+                &mut |_| {}
+            ),
+            Err(TransferResult::SourceChanged)
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"changeTokenProvider":"forced-unavailable","unchangedFullRevalidationBytes":scanned,"cancellationObserved":true,"metadataOnlyStampUnchanged":true,"changedSourceRejected":true})
+        );
     }
 
     #[test]
@@ -1037,6 +1551,77 @@ mod tests {
         receive
             .verify_all(&mut part, &AtomicBool::new(false), |_| {})
             .unwrap();
+    }
+
+    #[test]
+    fn interrupted_source_scan_index_is_rebuilt_but_changed_source_is_not_accepted() {
+        let fixture = Fixture::new();
+        let source_path = fixture.source(&sample());
+        let index_path = fixture.path("source.index");
+        fs::write(&index_path, b"DLIDX14\0").unwrap();
+        let recovered = SourceIndex::recover_or_build_from_file(
+            open_stable_source(&source_path).unwrap(),
+            &index_path,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let stamp = recovered.source_identity();
+        drop(recovered);
+        let original_index = fs::read(&index_path).unwrap();
+        let mut source = OpenOptions::new().write(true).open(&source_path).unwrap();
+        source.write_all(&[0xff]).unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+        assert!(matches!(
+            SourceIndex::recover_or_build_from_file(
+                open_stable_source(&source_path).unwrap(),
+                &index_path,
+                &AtomicBool::new(false),
+                |_| {},
+            ),
+            Err(TransferResult::SourceChanged)
+        ));
+        assert_eq!(fs::read(&index_path).unwrap(), original_index);
+        assert_ne!(
+            source_stamp(&File::open(source_path).unwrap()).unwrap().1,
+            stamp
+        );
+    }
+
+    #[test]
+    fn disk_budget_includes_proof_growth_and_reduces_only_after_durable_ack() {
+        let fixture = Fixture::new();
+        let bytes = vec![1; FILE_BLOCK_BYTES as usize * 2];
+        let mut root = root_hasher(bytes.len() as u64);
+        let hash = block_digest(&bytes[..FILE_BLOCK_BYTES as usize]);
+        root.update(hash);
+        root.update(hash);
+        let mut part = fixture.part();
+        let mut receive = CheckpointLedger::open_or_create(
+            &fixture.path("receive.ledger"),
+            &mut part,
+            bytes.len() as u64,
+            digest(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            source_index_bytes(bytes.len() as u64).unwrap(),
+            INDEX_HEADER_BYTES + 2 * RECORD_BYTES
+        );
+        assert_eq!(receive.remaining_journal_bytes().unwrap(), 2 * RECORD_BYTES);
+        receive
+            .write_block(&mut part, 0, &bytes[..FILE_BLOCK_BYTES as usize], hash)
+            .unwrap();
+        assert_eq!(receive.remaining_journal_bytes().unwrap(), RECORD_BYTES);
+        assert_eq!(
+            checkpoint_ledger_bytes(1_u64 << 40).unwrap(),
+            LEDGER_HEADER_BYTES + blocks(1_u64 << 40) * RECORD_BYTES
+        );
+        assert_eq!(
+            source_index_bytes(MAX_LARGE_FILE_BYTES + 1),
+            Err(TransferResult::TooLarge)
+        );
     }
 
     #[test]
@@ -1114,6 +1699,10 @@ mod tests {
         source.seek(SeekFrom::Start(offset)).unwrap();
         source.write_all(&payload).unwrap();
         source.sync_all().unwrap();
+        // A writable NTFS handle emits a final USN on close. Production source
+        // indices are built from a stable read-only handle after that boundary.
+        drop(source);
+        let source = open_stable_source(&source_path).unwrap();
         let (_, stamp) = source_stamp(&source).unwrap();
         let mut index = File::create(fixture.path("sparse-source.index")).unwrap();
         index.write_all(INDEX_MAGIC).unwrap();

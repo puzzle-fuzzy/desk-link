@@ -96,11 +96,11 @@ async fn joined_controller(relay: &TestRelay, session: u8, participant: u8) -> Q
 }
 
 /// The common wire layout is decoded with the current codec, then the exact
-/// protocol-12 version guard is applied. This is an explicitly synthetic legacy
+/// protocol-13 version guard is applied. This is an explicitly synthetic legacy
 /// peer, not execution of an installed old Windows application.
-fn legacy_12_version_guard(bytes: &[u8]) -> Result<(), ProtocolError> {
+fn legacy_13_version_guard(bytes: &[u8]) -> Result<(), ProtocolError> {
     let response = decode_noise_handshake(bytes)?;
-    if response.protocol_version != 12 {
+    if response.protocol_version != 13 {
         return Err(ProtocolError::UnsupportedVersion(response.protocol_version));
     }
     Ok(())
@@ -133,8 +133,8 @@ async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenti
         payload: vec![1],
     })
     .unwrap();
-    assert_eq!(old_hello[0], 13);
-    old_hello[0] = 12;
+    assert_eq!(old_hello[0], PROTOCOL_VERSION as u8);
+    old_hello[0] = 13;
     legacy.send_control(old_hello).await.unwrap();
     let reject_and_rearm = async {
         let result = next_initiator_hello(&host).await;
@@ -150,7 +150,7 @@ async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenti
     let error = host_result.unwrap().unwrap_err();
     assert!(matches!(
         &error,
-        HostRuntimeError::Protocol(ProtocolError::UnsupportedVersion(12))
+        HostRuntimeError::Protocol(ProtocolError::UnsupportedVersion(13))
     ));
     assert!(host_error_rearms_on_connected_relay(&error));
     let response = response.unwrap().unwrap();
@@ -159,8 +159,8 @@ async fn old_noise_gets_a_version_reply_and_same_host_accepts_a_current_authenti
     assert_eq!(reply.step, NoiseHandshakeStep::ResponderHello);
     assert_eq!(reply.payload, [0]);
     assert_eq!(
-        legacy_12_version_guard(&response),
-        Err(ProtocolError::UnsupportedVersion(13))
+        legacy_13_version_guard(&response),
+        Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION))
     );
     // The synthetic legacy peer stops on this version error. The Host has
     // already rearmed, retaining its original relay connection.

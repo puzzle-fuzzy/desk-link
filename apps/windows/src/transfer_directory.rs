@@ -2,8 +2,9 @@
 //!
 //! Every method here performs blocking filesystem IO. Call it on a bounded
 //! scanner/disk worker, never from the input, audio or video consumer. Windows
-//! directory handles reject reparse points and deny write/delete sharing while
-//! a path operation is in flight. Non-Windows callers must not advertise this
+//! source directory handles deny write/delete sharing. Receiver operations use
+//! directory-relative handles, reject reparse points and deny directory delete
+//! sharing. Non-Windows callers must not advertise this
 //! destination implementation as a platform security capability.
 
 use std::{
@@ -16,14 +17,21 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use desklink_protocol::{ManifestEntry, TransferEntryKind, TransferResult};
+use desklink_protocol::{
+    MAX_FILE_TASK_BYTES, MAX_FILE_TASK_ENTRIES, MAX_LARGE_FILE_BYTES, MAX_TRANSFER_DIRECTORY_DEPTH,
+    MAX_TRANSFER_RELATIVE_PATH_BYTES, ManifestEntry, TransferEntryKind, TransferResult,
+};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+#[cfg(windows)]
+#[path = "transfer_directory_native.rs"]
+pub(crate) mod native;
+
 pub const DIRECTORY_SCAN_QUEUE_CAPACITY: usize = 2;
-pub const DIRECTORY_MAX_DEPTH: usize = 64;
-pub const DIRECTORY_MAX_RELATIVE_PATH_BYTES: usize = 4096;
+pub const DIRECTORY_MAX_DEPTH: usize = MAX_TRANSFER_DIRECTORY_DEPTH;
+pub const DIRECTORY_MAX_RELATIVE_PATH_BYTES: usize = MAX_TRANSFER_RELATIVE_PATH_BYTES;
 const PART_PREFIX: &str = ".desklink-part-";
 const MAX_DIRECTORY_SCAN_WORKERS: usize = 8;
 static ACTIVE_DIRECTORY_SCAN_WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -59,6 +67,10 @@ pub struct DirectoryScanLimits {
 impl DirectoryScanLimits {
     pub fn validate(self) -> Result<Self, TransferResult> {
         if self.max_entries == 0
+            || self.max_entries > MAX_FILE_TASK_ENTRIES
+            || self.max_file_bytes == 0
+            || self.max_file_bytes > MAX_LARGE_FILE_BYTES
+            || self.max_total_bytes > MAX_FILE_TASK_BYTES
             || self.max_depth == 0
             || self.max_depth > DIRECTORY_MAX_DEPTH
             || self.max_relative_path_bytes == 0
@@ -176,6 +188,19 @@ impl DirectoryEntry {
 pub struct GuardedSourceFile {
     pub file: File,
     _directory_pins: Vec<File>,
+}
+
+impl GuardedSourceFile {
+    pub fn verify_location(&self) -> Result<(), TransferResult> {
+        #[cfg(windows)]
+        {
+            native::check_chain(&self._directory_pins)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -460,11 +485,20 @@ impl DirectoryDestination {
             return Err(TransferResult::InvalidData);
         }
         let parent = absolute_path(authorized_parent)?;
-        let mut pins = pin_directory_chain(&parent)?;
+        let mut pins = destination_pin_chain(&parent)?;
         ensure_sibling_absent(&parent, name)?;
         let root = parent.join(name);
-        fs::create_dir(&root).map_err(io_result)?;
-        pins.push(open_directory_pin(&root)?);
+        #[cfg(windows)]
+        pins.push(native::create_dir(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            std::ffi::OsStr::new(name),
+        )?);
+        #[cfg(not(windows))]
+        {
+            fs::create_dir(&root).map_err(io_result)?;
+            pins.push(open_directory_pin(&root)?);
+        }
+        check_destination_pins(&pins)?;
         Ok(Self {
             root,
             _root_ancestor_pins: pins,
@@ -490,10 +524,17 @@ impl DirectoryDestination {
             return Err(TransferResult::InvalidData);
         }
         let parent = absolute_path(authorized_parent)?;
-        let mut pins = pin_directory_chain(&parent)?;
+        let mut pins = destination_pin_chain(&parent)?;
         ensure_exact_sibling(&parent, name)?;
         let root = parent.join(name);
+        #[cfg(windows)]
+        pins.push(native::open_dir(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            std::ffi::OsStr::new(name),
+        )?);
+        #[cfg(not(windows))]
         pins.push(open_directory_pin(&root)?);
+        check_destination_pins(&pins)?;
         Ok(Self {
             root,
             _root_ancestor_pins: pins,
@@ -504,11 +545,20 @@ impl DirectoryDestination {
 
     pub fn create_directory(&mut self, relative_path: &str) -> Result<PathBuf, TransferResult> {
         self.reserve_entry(relative_path)?;
-        let (parent, name, _pins) = self.resolve_parent(relative_path)?;
+        let (parent, name, pins) = self.resolve_parent(relative_path)?;
         ensure_sibling_absent(&parent, &name)?;
         let path = parent.join(name);
-        fs::create_dir(&path).map_err(io_result)?;
-        let _pin = open_directory_pin(&path)?;
+        #[cfg(windows)]
+        let _pin = native::create_dir(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            path.file_name().ok_or(TransferResult::InvalidData)?,
+        )?;
+        #[cfg(not(windows))]
+        {
+            fs::create_dir(&path).map_err(io_result)?;
+            let _pin = open_directory_pin(&path)?;
+        }
+        check_destination_pins(&pins)?;
         Ok(path)
     }
 
@@ -524,19 +574,24 @@ impl DirectoryDestination {
         OsRng.fill_bytes(&mut random);
         let staging_name = format!("{PART_PREFIX}{}", hex_id(&random));
         let staging_path = parent.join(staging_name);
+        #[cfg(not(windows))]
         let mut options = OpenOptions::new();
+        #[cfg(not(windows))]
         options.create_new(true).read(true).write(true);
         #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-            };
-            options
-                .share_mode(FILE_SHARE_READ.0)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
-        }
+        let file = native::create_file(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            staging_path
+                .file_name()
+                .ok_or(TransferResult::InvalidData)?,
+        )?;
+        #[cfg(not(windows))]
         let file = options.open(&staging_path).map_err(io_result)?;
+        if let Err(error) = check_destination_pins(&pins) {
+            #[cfg(windows)]
+            let _ = native::delete_owned(&file);
+            return Err(error);
+        }
         Ok(GuardedDestinationFile {
             file: Some(file),
             staging_path,
@@ -564,27 +619,29 @@ impl DirectoryDestination {
             return Err(TransferResult::InvalidData);
         }
         ensure_sibling_absent(&parent, &name)?;
+        #[cfg(not(windows))]
         let metadata = fs::symlink_metadata(staging_path).map_err(io_result)?;
+        #[cfg(not(windows))]
         if is_link_or_reparse(&metadata) || !metadata.is_file() {
             return Err(TransferResult::PermissionDenied);
         }
+        #[cfg(not(windows))]
         let mut options = OpenOptions::new();
+        #[cfg(not(windows))]
         options.read(true).write(true);
         #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-            };
-            options
-                .share_mode(FILE_SHARE_READ.0)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
-        }
+        let file = native::open_file(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            std::ffi::OsStr::new(staging_name),
+            true,
+        )?;
+        #[cfg(not(windows))]
         let file = options.open(staging_path).map_err(io_result)?;
         let metadata = file.metadata().map_err(io_result)?;
         if is_link_or_reparse(&metadata) || !metadata.is_file() {
             return Err(TransferResult::PermissionDenied);
         }
+        check_destination_pins(&pins)?;
         Ok(GuardedDestinationFile {
             file: Some(file),
             staging_path: staging_path.to_owned(),
@@ -592,6 +649,58 @@ impl DirectoryDestination {
             _directory_pins: pins,
             remove_on_drop: true,
         })
+    }
+
+    /// Opens a final file only for journal reconciliation. The coordinator must
+    /// verify its complete expected size and content root before considering
+    /// the item complete; path existence alone is never completion evidence.
+    pub fn open_existing_file(
+        &self,
+        relative_path: &str,
+    ) -> Result<GuardedSourceFile, TransferResult> {
+        if !is_valid_relative_path_with_limits(
+            relative_path,
+            self.limits.max_depth,
+            self.limits.max_relative_path_bytes,
+        ) {
+            return Err(TransferResult::InvalidData);
+        }
+        let (parent, name, pins) = self.resolve_parent(relative_path)?;
+        ensure_exact_sibling(&parent, &name)?;
+        #[cfg(windows)]
+        let file = native::open_file(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            std::ffi::OsStr::new(&name),
+            false,
+        )?;
+        #[cfg(not(windows))]
+        let file = open_source_file(&parent.join(name))?;
+        check_destination_pins(&pins)?;
+        Ok(GuardedSourceFile {
+            file,
+            _directory_pins: pins,
+        })
+    }
+
+    pub fn validate_existing_directory(&self, relative_path: &str) -> Result<(), TransferResult> {
+        if !is_valid_relative_path_with_limits(
+            relative_path,
+            self.limits.max_depth,
+            self.limits.max_relative_path_bytes,
+        ) {
+            return Err(TransferResult::InvalidData);
+        }
+        let (parent, name, pins) = self.resolve_parent(relative_path)?;
+        ensure_exact_sibling(&parent, &name)?;
+        #[cfg(windows)]
+        let _pin = native::open_dir(
+            pins.last().ok_or(TransferResult::InvalidData)?,
+            std::ffi::OsStr::new(&name),
+        )?;
+        #[cfg(not(windows))]
+        let _pin = open_directory_pin(&parent.join(name))?;
+        check_destination_pins(&pins)?;
+        Ok(())
     }
 
     fn reserve_entry(&mut self, relative_path: &str) -> Result<(), TransferResult> {
@@ -615,15 +724,22 @@ impl DirectoryDestination {
     ) -> Result<(PathBuf, String, Vec<File>), TransferResult> {
         let mut parts = relative_path.split('/').peekable();
         let mut parent = self.root.clone();
-        let mut pins = vec![open_directory_pin(&parent)?];
+        let mut pins = destination_pin_chain(&parent)?;
         while let Some(part) = parts.next() {
             if parts.peek().is_none() {
+                check_destination_pins(&pins)?;
                 return Ok((parent, part.to_owned(), pins));
             }
             // Require exact parent spelling and an already announced directory.
             // This prevents a case alias from changing manifest identities.
             ensure_exact_sibling(&parent, part)?;
             parent.push(part);
+            #[cfg(windows)]
+            pins.push(native::open_dir(
+                pins.last().ok_or(TransferResult::InvalidData)?,
+                std::ffi::OsStr::new(part),
+            )?);
+            #[cfg(not(windows))]
             pins.push(open_directory_pin(&parent)?);
         }
         Err(TransferResult::InvalidData)
@@ -640,6 +756,7 @@ pub struct GuardedDestinationFile {
 
 impl GuardedDestinationFile {
     pub fn file_mut(&mut self) -> Result<&mut File, TransferResult> {
+        check_destination_pins(&self._directory_pins)?;
         self.file.as_mut().ok_or(TransferResult::InvalidData)
     }
 
@@ -652,8 +769,8 @@ impl GuardedDestinationFile {
     }
 
     /// The checkpoint worker must validate the complete content root first.
-    /// Publication then flushes data and uses create-only hard-link semantics:
-    /// a racing final path cannot be overwritten on Windows or Unix.
+    /// Publication flushes data and creates the final path without replacement.
+    /// Windows renames the owned handle relative to its pinned parent.
     pub fn publish(mut self) -> Result<PathBuf, TransferResult> {
         self.file_mut()?.sync_all().map_err(io_result)?;
         let parent = self
@@ -666,10 +783,26 @@ impl GuardedDestinationFile {
             .and_then(|name| name.to_str())
             .ok_or(TransferResult::InvalidData)?;
         ensure_sibling_absent(parent, name)?;
-        // Windows file sharing denies delete until this data handle is closed.
-        self.file.take();
-        fs::hard_link(&self.staging_path, &self.destination_path).map_err(io_result)?;
-        fs::remove_file(&self.staging_path).map_err(io_result)?;
+        #[cfg(windows)]
+        {
+            check_destination_pins(&self._directory_pins)?;
+            native::rename(
+                self.file.as_ref().ok_or(TransferResult::InvalidData)?,
+                self._directory_pins
+                    .last()
+                    .ok_or(TransferResult::InvalidData)?,
+                std::ffi::OsStr::new(name),
+                false,
+            )?;
+            check_destination_pins(&self._directory_pins)?;
+            self.file.take();
+        }
+        #[cfg(not(windows))]
+        {
+            self.file.take();
+            fs::hard_link(&self.staging_path, &self.destination_path).map_err(io_result)?;
+            fs::remove_file(&self.staging_path).map_err(io_result)?;
+        }
         self.remove_on_drop = false;
         Ok(self.destination_path.clone())
     }
@@ -684,12 +817,45 @@ impl GuardedDestinationFile {
 
 impl Drop for GuardedDestinationFile {
     fn drop(&mut self) {
-        self.file.take();
+        #[cfg(windows)]
+        {
+            if self.remove_on_drop
+                && let Some(file) = self.file.as_ref()
+            {
+                let _ = native::delete_owned(file);
+            }
+            self.file.take();
+        }
+        #[cfg(not(windows))]
         if self.remove_on_drop {
+            self.file.take();
             // Random, create_new staging names are never reused by a later
             // worker. Directory pins outlive this cleanup.
             let _ = fs::remove_file(&self.staging_path);
         }
+    }
+}
+
+fn destination_pin_chain(path: &Path) -> Result<Vec<File>, TransferResult> {
+    #[cfg(windows)]
+    {
+        native::pin_chain(path)
+    }
+    #[cfg(not(windows))]
+    {
+        pin_directory_chain(path)
+    }
+}
+
+fn check_destination_pins(pins: &[File]) -> Result<(), TransferResult> {
+    #[cfg(windows)]
+    {
+        native::check_chain(pins)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pins;
+        Ok(())
     }
 }
 
@@ -713,38 +879,7 @@ fn is_valid_relative_path_with_limits(
 }
 
 fn is_valid_path_segment(name: &str) -> bool {
-    if name.is_empty()
-        || name.encode_utf16().count() > 255
-        || matches!(name, "." | "..")
-        || name.ends_with(['.', ' '])
-        || name.chars().any(|character| {
-            character.is_control()
-                || matches!(
-                    character,
-                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
-                )
-        })
-    {
-        return false;
-    }
-    let stem = name.split('.').next().unwrap_or_default();
-    let stem = stem.trim_end_matches(['.', ' ']).to_uppercase();
-    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") {
-        return false;
-    }
-    if let Some(suffix) = stem
-        .strip_prefix("COM")
-        .or_else(|| stem.strip_prefix("LPT"))
-    {
-        // Win32 also recognizes superscript 1, 2 and 3 as device numbers.
-        if matches!(
-            suffix,
-            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-        ) {
-            return false;
-        }
-    }
-    true
+    desklink_protocol::is_valid_transfer_path_segment(name)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, TransferResult> {
@@ -756,28 +891,36 @@ fn absolute_path(path: &Path) -> Result<PathBuf, TransferResult> {
 }
 
 fn pin_directory_chain(path: &Path) -> Result<Vec<File>, TransferResult> {
+    directory_chain_paths(path)?
+        .iter()
+        .map(|path| open_directory_pin(path))
+        .collect()
+}
+
+fn directory_chain_paths(path: &Path) -> Result<Vec<PathBuf>, TransferResult> {
     let mut current = PathBuf::new();
-    let mut pins = Vec::new();
+    let mut paths = Vec::new();
     for component in path.components() {
         match component {
-            Component::Prefix(_) | Component::RootDir => {
+            // A verbatim drive prefix reports has_root(), but `\\?\C:`
+            // itself is not an openable filesystem root. Wait for RootDir.
+            Component::Prefix(_) => current.push(component.as_os_str()),
+            Component::RootDir => {
                 current.push(component.as_os_str());
-                if current.has_root() {
-                    pins.push(open_directory_pin(&current)?);
-                }
+                paths.push(current.clone());
             }
             Component::Normal(name) => {
                 current.push(name);
-                pins.push(open_directory_pin(&current)?);
+                paths.push(current.clone());
             }
             Component::CurDir => {}
             Component::ParentDir => return Err(TransferResult::InvalidData),
         }
     }
-    if pins.is_empty() {
+    if paths.is_empty() || !path.is_absolute() {
         Err(TransferResult::InvalidData)
     } else {
-        Ok(pins)
+        Ok(paths)
     }
 }
 
@@ -792,11 +935,11 @@ fn open_directory_pin(path: &Path) -> Result<File, TransferResult> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
         };
         options
-            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .access_mode(FILE_READ_ATTRIBUTES.0 | FILE_LIST_DIRECTORY.0)
             .share_mode(FILE_SHARE_READ.0)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
     }
@@ -843,6 +986,16 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+#[cfg(windows)]
+fn ensure_sibling_absent(parent: &Path, name: &str) -> Result<(), TransferResult> {
+    if matching_sibling(parent, name)?.is_some() {
+        Err(TransferResult::Busy)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
 fn ensure_sibling_absent(parent: &Path, name: &str) -> Result<(), TransferResult> {
     let collision_key = name.to_uppercase();
     for entry in fs::read_dir(parent).map_err(io_result)? {
@@ -858,6 +1011,16 @@ fn ensure_sibling_absent(parent: &Path, name: &str) -> Result<(), TransferResult
     Ok(())
 }
 
+#[cfg(windows)]
+fn ensure_exact_sibling(parent: &Path, name: &str) -> Result<(), TransferResult> {
+    if matching_sibling(parent, name)?.as_deref() == Some(name) {
+        Ok(())
+    } else {
+        Err(TransferResult::InvalidData)
+    }
+}
+
+#[cfg(not(windows))]
 fn ensure_exact_sibling(parent: &Path, name: &str) -> Result<(), TransferResult> {
     let collision_key = name.to_uppercase();
     for entry in fs::read_dir(parent).map_err(io_result)? {
@@ -873,6 +1036,39 @@ fn ensure_exact_sibling(parent: &Path, name: &str) -> Result<(), TransferResult>
         }
     }
     Err(TransferResult::InvalidData)
+}
+
+#[cfg(windows)]
+fn matching_sibling(parent: &Path, name: &str) -> Result<Option<String>, TransferResult> {
+    use windows::{
+        Win32::{
+            Foundation::ERROR_FILE_NOT_FOUND,
+            Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
+        },
+        core::HSTRING,
+    };
+
+    // canonicalize supplies the verbatim long-path prefix. The parent is held
+    // by non-reparse directory pins for this lookup and the following create.
+    // No wildcard is possible after relative-path validation, so Windows does
+    // one name lookup instead of enumerating every sibling for every entry.
+    let pattern = fs::canonicalize(parent).map_err(io_result)?.join(name);
+    let pattern = HSTRING::from(pattern.as_os_str());
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = match unsafe { FindFirstFileW(&pattern, &mut data) } {
+        Ok(handle) => handle,
+        Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => return Ok(None),
+        Err(_) => return Err(TransferResult::IoFailed),
+    };
+    unsafe { FindClose(handle) }.map_err(|_| TransferResult::IoFailed)?;
+    let length = data
+        .cFileName
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(data.cFileName.len());
+    String::from_utf16(&data.cFileName[..length])
+        .map(Some)
+        .map_err(|_| TransferResult::InvalidData)
 }
 
 fn modified_at_unix_ns(metadata: &fs::Metadata) -> u64 {
@@ -1040,6 +1236,43 @@ mod tests {
         }
         assert_eq!(count, 9);
         assert_eq!(scanner.total_bytes(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_verbatim_file_and_directory_sources_open_and_scan() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("中文文件.bin"), b"canonical source").unwrap();
+        let canonical_root = fs::canonicalize(&fixture.0).unwrap();
+        let canonical_file = fs::canonicalize(fixture.0.join("中文文件.bin")).unwrap();
+        assert!(canonical_root.to_string_lossy().starts_with(r"\\?\"));
+        let entry = DirectoryEntry::single_file(&canonical_file).unwrap();
+        let mut source = entry.open_verified_source().unwrap();
+        let mut content = Vec::new();
+        source.file.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"canonical source");
+        drop(source);
+        let entries = scan(&canonical_root)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, "中文文件.bin");
+        assert_eq!(entries[0].size, 16);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_and_unc_pin_steps_wait_for_rootdir_including_verbatim_prefixes() {
+        // Structural UNC validation only: this fixture does not contact a share.
+        for (path, root) in [
+            (r"C:\folder", r"C:\"),
+            (r"\\?\C:\folder", r"\\?\C:\"),
+            (r"\\server\share\folder", r"\\server\share\"),
+            (r"\\?\UNC\server\share\folder", r"\\?\UNC\server\share\"),
+        ] {
+            let paths = directory_chain_paths(Path::new(path)).unwrap();
+            assert_eq!(paths, [PathBuf::from(root), PathBuf::from(path)], "{path}");
+        }
     }
 
     #[test]
@@ -1300,6 +1533,34 @@ mod tests {
         let final_path = resumed.publish().unwrap();
         assert_eq!(fs::read(final_path).unwrap(), b"partial-complete");
         assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn publication_can_be_opened_under_pins_after_crash_before_journal_update() {
+        let fixture = Fixture::new();
+        let mut destination =
+            DirectoryDestination::create_new(&fixture.0, "receive", limits()).unwrap();
+        destination.create_directory("parent").unwrap();
+        let mut staged = destination.create_file("parent/final").unwrap();
+        staged
+            .file_mut()
+            .unwrap()
+            .write_all(b"verified content")
+            .unwrap();
+        let staging_path = staged.staging_path().to_owned();
+        staged.publish().unwrap();
+        assert!(!staging_path.exists());
+        drop(destination);
+        let destination =
+            DirectoryDestination::open_existing(&fixture.0, "receive", limits()).unwrap();
+        let mut final_file = destination.open_existing_file("parent/final").unwrap();
+        let mut bytes = Vec::new();
+        final_file.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"verified content");
+        assert!(matches!(
+            destination.open_existing_file("Parent/final"),
+            Err(TransferResult::InvalidData)
+        ));
     }
 
     #[test]

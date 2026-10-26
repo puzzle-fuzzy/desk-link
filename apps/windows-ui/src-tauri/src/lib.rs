@@ -661,10 +661,55 @@ async fn choose_and_send_controller_file(
     manager: State<'_, ControllerManager>,
 ) -> Result<(), String> {
     let target = manager.capture_file_target()?;
-    let paths = tauri::async_runtime::spawn_blocking(file_picker::pick_files)
-        .await
-        .map_err(|_| "DeskLink 无法打开 Windows 文件选择器。".to_owned())??;
+    let paths = file_picker::pick_files(manager.inner().clone(), target).await?;
     manager.send_files(paths, target).await
+}
+
+#[tauri::command]
+async fn choose_and_send_controller_directory(
+    manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    let target = manager.capture_file_target()?;
+    let path = file_picker::pick_directory(manager.inner().clone(), target).await?;
+    if let Some(path) = path {
+        manager.start_file_task(path, target, true)?;
+    }
+    Ok(())
+}
+#[tauri::command]
+fn pause_controller_file_task(
+    manager: State<'_, ControllerManager>,
+    task_id: String,
+) -> Result<(), String> {
+    manager.file_task_action(&task_id, desklink_protocol::FileTaskAction::Pause)
+}
+#[tauri::command]
+fn resume_controller_file_task(
+    manager: State<'_, ControllerManager>,
+    task_id: String,
+) -> Result<(), String> {
+    manager.file_task_action(&task_id, desklink_protocol::FileTaskAction::Resume)
+}
+#[tauri::command]
+fn cancel_controller_file_task(
+    manager: State<'_, ControllerManager>,
+    task_id: String,
+) -> Result<(), String> {
+    manager.file_task_action(&task_id, desklink_protocol::FileTaskAction::Cancel)
+}
+#[tauri::command]
+fn retry_controller_file_task(
+    manager: State<'_, ControllerManager>,
+    task_id: String,
+    item_id: Option<String>,
+) -> Result<(), String> {
+    manager.retry_file_task(&task_id, item_id.as_deref())
+}
+#[tauri::command]
+fn request_controller_remote_directory(
+    manager: State<'_, ControllerManager>,
+) -> Result<(), String> {
+    manager.request_remote_directory()
 }
 
 #[tauri::command]
@@ -1819,6 +1864,12 @@ pub fn run() {
             send_controller_clipboard,
             request_controller_clipboard,
             choose_and_send_controller_file,
+            choose_and_send_controller_directory,
+            pause_controller_file_task,
+            resume_controller_file_task,
+            cancel_controller_file_task,
+            retry_controller_file_task,
+            request_controller_remote_directory,
             queue_controller_files,
             remove_controller_queued_file,
             clear_controller_file_queue,

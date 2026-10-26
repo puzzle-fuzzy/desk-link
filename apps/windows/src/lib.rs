@@ -34,6 +34,14 @@ pub mod transfer_checkpoint;
 pub mod transfer_directory;
 #[cfg(windows)]
 pub mod transfer_recovery;
+pub mod transfer_task;
+pub mod transfer_task_catalog;
+#[cfg(windows)]
+pub mod transfer_task_dialog;
+pub mod transfer_task_native;
+pub mod transfer_task_recovery;
+#[cfg(test)]
+mod transfer_task_tests;
 pub mod tray;
 #[cfg(windows)]
 pub mod trusted;
