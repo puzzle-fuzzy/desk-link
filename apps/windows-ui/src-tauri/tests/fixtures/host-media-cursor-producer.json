@@ -1,0 +1,54 @@
+{
+  "producer_commit": "a599246535b73f57e0425cbbfd18c7156e050bba",
+  "sources": [
+    {
+      "path": "apps/windows/src/diagnostics.rs",
+      "git_blob": "96986f424b96f5c4624a981053b18bfa96aae883",
+      "sha256": "99c1f057e38e2521dc9b35f34fcfc8bdf34df35100c9a3862e6f2b5743883c3d"
+    },
+    {
+      "path": "apps/windows/src/runtime/media_diagnostics.rs",
+      "git_blob": "1ea44a519bcb0d5fcf9dfe23ad94bd03e599fffa",
+      "sha256": "04be3794c8d5f3bec19a4bed58e959afce2aaed7c9e9f7e1eed4fc2491264b7c"
+    },
+    {
+      "path": "apps/windows/src/runtime/cursor_send.rs",
+      "git_blob": "1d65d1e5bc17816ac5aa6f46eb3f27fffc45d84e",
+      "sha256": "d1c09df6436f8ec87358ee920df21c99dfea244a9f9fdcac696cb06038165079"
+    },
+    {
+      "path": "Cargo.toml",
+      "git_blob": "3c86110fb521cc83ad46a6e5f1f873ed5a459853",
+      "sha256": "705bf882dc4f27848dc804c21b31c5b2cf68335d05c17fe7c7edf6478511e4c2"
+    },
+    {
+      "path": "Cargo.lock",
+      "git_blob": "74aee08b43fd294ec3067df7ea280030a3069394",
+      "sha256": "4a3df4b7fc92340f5296c0691eb77c78ae8d45d689f1d2b323aec7fb371427f6"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "git_blob": "172630994a6e77e6155c4f9d076ff2e9f4bc6895",
+      "sha256": "a5b3bbd32ba465bfce6ccbcbacc6eafd4b9560b3cb15c7fd57ab18a7df56e1b2"
+    }
+  ],
+  "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-pc-windows-msvc\nrelease: 1.97.1\nLLVM version: 22.1.6",
+  "cases": [
+    {
+      "name": "disabled",
+      "line": "{\"schema\":1,\"timestamp_unix_ms\":1792999987083,\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":7,\"send_attempts\":2,\"send_errors\":1,\"disabled\":true,\"reason\":\"capability_or_size\"}\n"
+    },
+    {
+      "name": "enabled",
+      "line": "{\"schema\":1,\"timestamp_unix_ms\":1792999987084,\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":8,\"send_attempts\":5,\"send_errors\":2,\"disabled\":false,\"reason\":\"capability_or_size\"}\n"
+    },
+    {
+      "name": "max_safe",
+      "line": "{\"schema\":1,\"timestamp_unix_ms\":1792999987084,\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":9007199254740991,\"send_attempts\":9007199254740991,\"send_errors\":9007199254740991,\"disabled\":true,\"reason\":\"capability_or_size\"}\n"
+    },
+    {
+      "name": "u64_overflow",
+      "line": "{\"schema\":1,\"timestamp_unix_ms\":1792999987084,\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":18446744073709551615,\"send_attempts\":18446744073709551615,\"send_errors\":18446744073709551615,\"disabled\":true,\"reason\":\"capability_or_size\"}\n"
+    }
+  ]
+}

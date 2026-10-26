@@ -357,7 +357,8 @@
 - [x] **生产策略（`fix(DL2-044): disable unsupported cursor datagrams without ending peers`）：** 首个Datagram错误仅停用当前peer的可选光标，后续不采样、不加密、不重发，future保持pending等待主peer取消。连接/代数/身份/preflight错误仍立即传播。每个peer独立状态，一次固定capability_or_size原因；send_attempts/send_errors/disabled字段只表示本地操作。
 - [x] **有界诊断接线：** HostSupervisor/HostRuntime提供with_media_diagnostics_observer，构造时初始化进程唯一32槽队列/工作线程；热路径try_send、不做同步文件或HTTP，回调异常不杀接收器。DiagnosticEvent::HostMedia提供固定JSON字段映射；队列拒绝数与网络丢包明确分离。未绑定observer时仅后台stderr回退，不视为用户导出/服务端可见性已交付。接口见docs/windows-host-media-diagnostics.md。
 - **验证：** 光标10项（含真实生产循环停止采样但不完成peer future）+诊断分发2项通过；真实127.0.0.1传输20项通过，包括对端禁用、低于应用preflight上限的TooLarge、终态/代数检查及1字节Quinn发送缓冲下1000次Ok，之后同连接控制/输入可用。Windows+transport lib/tests严格Clippy通过。
-- [ ] 产品层绑定observer到实际诊断导出/服务端schema并验证最终可见性；真实网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
+- [x] **GUI 日志与报告接线（`fix(DL2-044): persist cursor diagnostics in desktop reports`）：** 普通Host与配对Host均注册typed observer，复用各worker的DiagnosticLog；既有后台有界dispatcher执行落盘，原stream保持为历史记录，不更新当前GUI状态。实际callback→临时日志/sync_data→sanitized history→生产合并/报告builder回归通过；同services `b1118ad465703493255123e23b6f522662c3d603` 原样fixture的4个case逐字段/类型比对通过（仅忽略动态timestamp，u64溢出仍是服务拒绝的negative）。Windows lib218通过/2忽略、管理库137通过/1签名资产忽略，两包lib+tests严格Clippy通过。云上传源码保持冻结基线，不吞事件；服务历史尚未合入本GUI分支，整体验签/存储另验。
+- [ ] 将已提交服务合同与GUI接线纳入最终整体候选并验证真实接收/存储；真实GUI导出操作、网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
 
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 
@@ -366,7 +367,8 @@
 - [x] **已有正确行为的真实回归（`test(DL2-045): distinguish transient direct handshakes from listener shutdown`）：** 空truststore触发真实127.0.0.1 QUIC证书握手失败，确认Some(Err)，同一listener随后使用生产配置+Noise会话成功认证probe并收发datagram；显式endpoint关闭才在100ms内返回None（重复等待一致）。probe 14项通过，transport lib+tests严格Clippy通过。
 - [x] **终态生产处理（`fix(DL2-045): retire direct paths when the listener terminates`）：** accept返回None时一次性take本代session、abort探测，路径锁内同时禁用后续安装并取走活动Arc，锁外关闭、请求IDR；继续控制/配置/输入消费。迟到探测在同一路径锁内检查禁用标记，不能在清理后复活路径。固定DirectListenerStopped/ListenerClosed原因通过044后台observer分发，DiagnosticEvent映射host_direct_listener_stopped；session=None的accept future保持pending防刷屏。
 - **验证：** Windows新增2项通过：真实认证双路径的活动Arc清理/IDR、已完成probe但尚未安装的迟到连接被关闭、诊断只一次与禁用后accept pending；固定日志字段测试。原有Some(Err)continue与真实endpoint.close→None边界另由probe回归证明，不冒称复现原本不存在的“握手错误禁用”缺陷。
-- [ ] 产品层实际诊断导出/服务端schema绑定和真实监听故障状态验收；后台事件producer不等于用户可见性完成。
+- [x] **GUI 日志与报告接线（`fix(DL2-045): retain listener termination in desktop reports`）：** 044已注册的普通/配对Host observer同时记录typed DirectListenerStopped，复用原日志与报告链；固定reason与retired_active两值均保留，不推断中继随后已恢复。新增同services `bf5d7eb27f3f41be59ac317b63d7e93d10f38066` 原样fixture四case→实际callback/临时日志/sync_data→生产合并/报告builder的七字段/类型回归；仅忽略动态timestamp，完整保留u64，overflow仍是服务negative。最终管理库`--lib`138通过/1签名资产忽略，两包lib+tests严格Clippy通过；044已验证的Windows`--lib`218通过/2忽略源码保持不变，不混同原joint的283/17（lib+integration范围）。原始日志与源码前后指纹见 `E:/desk-link/.worktrees/dl2-targets/windows-diagnostics/validation/`。
+- [ ] 将GUI接线与已提交服务合同纳入最终整体候选，验证真实验签/接收/存储及实际GUI导出；真实监听故障、设备与长稳另验。服务历史尚未合入此GUI分支，不把producer/报告builder自动证据当成整套验收。
 
 ### DL2-046 · P1 · 出站探测生命周期与活动直连仲裁
 

@@ -16,8 +16,8 @@ use apps_windows::{
     fixed_access::WindowsFixedAccessStore,
     identity::WindowsIdentityStore,
     runtime::{
-        ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver, HostSessionControl,
-        HostSupervisor,
+        ControllerAuthorizer, HostLifecycleEvent, HostLifecycleObserver,
+        HostMediaDiagnosticsObserver, HostSessionControl, HostSupervisor,
     },
     tray::HostStatusViewModel,
     trusted::{
@@ -1084,7 +1084,9 @@ fn prepare_host(
     if let Some(registration) = directory_registration {
         supervisor = supervisor.with_directory_registration(registration);
     }
-    let supervisor = supervisor.with_observer(observer);
+    let supervisor = supervisor
+        .with_observer(observer)
+        .with_media_diagnostics_observer(host_media_diagnostics_observer(diagnostics.clone()));
     Ok(PreparedHost::Ready {
         supervisor: Box::new(supervisor),
         diagnostics,
@@ -1184,12 +1186,24 @@ fn prepare_pairing(
     )
     .map_err(|_| HostPreparationFailure::Runtime)?
     .with_directory_registration(directory_registration)
-    .with_observer(observer);
+    .with_observer(observer)
+    .with_media_diagnostics_observer(host_media_diagnostics_observer(diagnostics.clone()));
     Ok(PreparedPairing {
         supervisor: Box::new(supervisor),
         diagnostics,
         session,
         session_id: connection.session_id(),
+    })
+}
+
+// The runtime invokes this callback on its bounded diagnostics worker. Keep
+// disk writes off media/input tasks and retain the event's original stream;
+// delayed history must never change current GUI lifecycle state.
+pub(crate) fn host_media_diagnostics_observer(
+    diagnostics: DiagnosticLog,
+) -> HostMediaDiagnosticsObserver {
+    Arc::new(move |event| {
+        record_diagnostic(&diagnostics, &DiagnosticEvent::HostMedia(event));
     })
 }
 
