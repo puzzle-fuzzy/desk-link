@@ -4,6 +4,7 @@ use desklink_crypto::SessionId;
 use desklink_protocol::{DeviceRole, PROTOCOL_VERSION};
 use thiserror::Error;
 
+mod business_transport;
 mod direct_probe;
 mod lan_candidate;
 mod lan_data;
@@ -11,6 +12,10 @@ mod quic;
 mod video_egress;
 mod video_path;
 
+pub use business_transport::{
+    DirectPathId, LanAttachAuthority, LanSwitchAction, LanSwitchNegotiator, NegotiatedLanData,
+    QuicRelayBackend, SessionDataError, SessionDataHealth, SessionDataPlane, SessionLaneHealth,
+};
 pub use direct_probe::{
     DirectLanConnection, DirectLanEndpoint, DirectLanProbeError, DirectLanProbeResult,
     DirectLanSession,

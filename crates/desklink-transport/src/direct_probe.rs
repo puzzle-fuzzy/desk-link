@@ -374,11 +374,20 @@ impl DirectLanEndpoint {
     pub fn bind(bind_addr: SocketAddr) -> Result<Self, TransportError> {
         let certificate = rcgen::generate_simple_self_signed(vec!["desklink-lan".to_owned()])
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
-        let server_config = quinn::ServerConfig::with_single_cert(
+        let mut server_config = quinn::ServerConfig::with_single_cert(
             vec![CertificateDer::from(certificate.cert.der().to_vec())],
             PrivateKeyDer::Pkcs8(certificate.key_pair.serialize_der().into()),
         )
         .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .keep_alive_interval(Some(crate::KEEPALIVE_INTERVAL))
+            .max_idle_timeout(Some(
+                quinn::IdleTimeout::try_from(crate::DEAD_TIMEOUT)
+                    .map_err(|error| TransportError::InvalidConfig(error.to_string()))?,
+            ));
+        let transport = Arc::new(transport);
+        server_config.transport_config(transport.clone());
         let endpoint = quinn::Endpoint::server(server_config, bind_addr)
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
         let tls = rustls::ClientConfig::builder()
@@ -387,9 +396,11 @@ impl DirectLanEndpoint {
             .with_no_client_auth();
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|error| TransportError::InvalidConfig(error.to_string()))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        client_config.transport_config(transport);
         Ok(Self {
             endpoint,
-            client_config: quinn::ClientConfig::new(Arc::new(crypto)),
+            client_config,
         })
     }
 

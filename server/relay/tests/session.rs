@@ -671,8 +671,8 @@ async fn directory_rejects_incompatible_protocol_only_after_password_matches() {
 }
 
 #[tokio::test]
-async fn protocol_12_and_13_directory_mismatch_is_bidirectional_and_password_protected() {
-    for (host_version, controller_version) in [(12, 13), (13, 12)] {
+async fn protocol_13_and_current_directory_mismatch_is_bidirectional_and_password_protected() {
+    for (host_version, controller_version) in [(13, PROTOCOL_VERSION), (PROTOCOL_VERSION, 13)] {
         let relay = spawn_test_relay().await;
         let device_id = 143_456_789_012;
         let access_code = *b"AB2DEF3G";
