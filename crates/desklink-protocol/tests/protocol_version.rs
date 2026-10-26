@@ -5,19 +5,19 @@ use desklink_protocol::{
 };
 
 #[test]
-fn protocol_12_is_rejected_by_every_versioned_payload_boundary() {
-    assert_eq!(PROTOCOL_VERSION, 13);
+fn protocol_13_is_rejected_by_every_versioned_payload_boundary() {
+    assert_eq!(PROTOCOL_VERSION, 14);
     let noise = NoiseHandshake {
-        protocol_version: 12,
+        protocol_version: 13,
         step: NoiseHandshakeStep::ResponderHello,
         payload: vec![1],
     };
     assert_eq!(
         decode_noise_handshake(&postcard::to_allocvec(&noise).unwrap()),
-        Err(ProtocolError::UnsupportedVersion(12))
+        Err(ProtocolError::UnsupportedVersion(13))
     );
     let config = VideoConfig {
-        protocol_version: 12,
+        protocol_version: 13,
         stream_id: 1,
         input_epoch: 1,
         config_version: 1,
@@ -28,10 +28,10 @@ fn protocol_12_is_rejected_by_every_versioned_payload_boundary() {
     };
     assert_eq!(
         decode_video_config(&postcard::to_allocvec(&config).unwrap()),
-        Err(ProtocolError::UnsupportedVersion(12))
+        Err(ProtocolError::UnsupportedVersion(13))
     );
     let header = VideoFrameHeader {
-        protocol_version: 12,
+        protocol_version: 13,
         stream_id: 1,
         config_version: 1,
         frame_id: 1,
@@ -45,10 +45,10 @@ fn protocol_12_is_rejected_by_every_versioned_payload_boundary() {
     };
     assert_eq!(
         decode_video_header(&postcard::to_allocvec(&header).unwrap()),
-        Err(ProtocolError::UnsupportedVersion(12))
+        Err(ProtocolError::UnsupportedVersion(13))
     );
     let cursor = CursorUpdate {
-        protocol_version: 12,
+        protocol_version: 13,
         stream_id: 1,
         sequence: 1,
         timestamp_us: 1,
@@ -59,10 +59,10 @@ fn protocol_12_is_rejected_by_every_versioned_payload_boundary() {
     };
     assert_eq!(
         decode_cursor_update(&postcard::to_allocvec(&cursor).unwrap()),
-        Err(ProtocolError::UnsupportedVersion(12))
+        Err(ProtocolError::UnsupportedVersion(13))
     );
     let audio = AudioPacket {
-        protocol_version: 12,
+        protocol_version: 13,
         stream_id: 1,
         sequence: 1,
         capture_timestamp_us: 1,
@@ -73,6 +73,6 @@ fn protocol_12_is_rejected_by_every_versioned_payload_boundary() {
     };
     assert_eq!(
         decode_audio_packet(&postcard::to_allocvec(&audio).unwrap()),
-        Err(ProtocolError::UnsupportedVersion(12))
+        Err(ProtocolError::UnsupportedVersion(13))
     );
 }

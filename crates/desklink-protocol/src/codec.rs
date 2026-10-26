@@ -143,6 +143,7 @@ fn validate_transfer(message: &TransferMessage) -> Result<(), ProtocolError> {
 
     let valid_id = |id: &[u8; 16]| id.iter().any(|byte| *byte != 0);
     let valid = match message {
+        FileTask(message) => message.is_valid(),
         ClipboardSet { request_id, text } | ClipboardData { request_id, text } => {
             *request_id != 0 && text.len() <= crate::MAX_CLIPBOARD_TEXT_BYTES
         }

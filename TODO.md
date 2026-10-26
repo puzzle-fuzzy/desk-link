@@ -549,6 +549,8 @@
 - [x] **会话退出切片（`fix(DL2-030): cancel file producers when host peers disconnect`）：** 出站任务由HostOutgoingTransfer RAII持有，peer退出/错误/取消均置取消并abort异步sender，释放receiver唤醒堵在有界队列的磁盘producer；已取消reader在打开源/取得Windows共享锁前退出。取消仍不声称能中断已进入OS的read。
 - **验证：** `--lib outgoing_peer_drop --locked` 1通过，确认满队列producer原先受背压、peer Drop后250ms内退出；transfer 24通过，新增取消不打开不存在源文件回归；lib+tests严格Clippy通过。
 
+- [x] **协议14独立来源切片（非整链过渡）：** 新增有界FileTask合同：能力交集、单文件1TiB/聚合16TiB/100万项资源上限、逐项manifest、块摘要/持久确认/恢复证明、暂停/恢复/取消；旧FileOffer仍限制256MiB，输入上下文与Noise算法不变、relay JOIN版本不变。协议13在所有已有带版本载荷边界明确拒绝。`test -p desklink-protocol --locked` 54通过、1个既有benchmark ignored；新增3项行为测试覆盖>4GiB精确数值、截断/尾字节、恶意路径/预算/溢出。此提交只证明共享合同，不代表Windows/Mac功能已接通，主验收保留[ ]。
+
 ### DL2-031 · P2 · 让等待队列中所有文件都能管理
 
 - [ ] 保留紧凑摘要，并允许展开完整队列、逐项移除。
