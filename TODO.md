@@ -2,6 +2,7 @@
 
 > 更新日期：2026-10-26（Asia/Shanghai）
 > 初始审查基线（历史）：`main@85bdf7278baf11b1adb9b401b978643c261daf2b`；Windows 客户端 `0.1.93`，协议 `12`。当前已提交成果的源码身份与子项检查框见下方快照；分支成果尚未合入 main。
+> 当前第一波软件验证源：`a4c5b404d43794d646394923a481f23c9298c3ed`（执行时干净，协议13），25个检查全部通过；平台报告仍 incomplete（2通过/7跳过）。完整来源、原始报告及本地签名→HTTP/SQLite证据见 [第一波集成记录](docs/wave1-integration.md)。本文后续文档收口不改写该测试源；main仍未合入。
 > 本阶段目标：补齐远控工作流、消除真实缺陷、重整模块职责，并以可重复测量推进低延迟、低资源占用和稳定吞吐。允许调整协议、ABI、模块边界及实现，不以开发成本或现有部署兼容性限制方案。
 > 用户已确认 Windows → Windows、macOS → Windows 可以正常连接并良好控制，这两条路径是已成立的产品基础。本文件不把旧文档中“尚未验收”的历史表述当作当前不可用证据。
 > 本清单已进入并行实施阶段。各项按下述会话分工推进，完成一个问题并通过对应验证后立即独立 commit，同时更新该项完成标记。第一阶段记录保留在文末，不能用其旧日期、版本或勾选状态代替本阶段验收。
@@ -37,16 +38,16 @@
 | Windows 媒体 / GPU 第二波 | 015、016 | `codex/dl2-windows-gpu` | 原媒体65c冻结交接；后续GPU surface/硬件编码单独合入 |
 | 中继与直连 | 第一波019/052/053/057冻结；第二波024 | 第一波 `codex/dl2-network`；后续 `codex/dl2-lan-runtime` | 4b15561可进入第一波；024真实生产接线后置 |
 | 账号与诊断服务 | 036、037、038、039 | `codex/dl2-services` | 036、037、039，再处理邮件与长期运行 |
-| 工程验证与收口 | 040、041、042 | `codex/dl2-engineering` | 041 验证入口；040 跨模块重构待共享接口稳定 |
+| 工程验证与收口 | 040、041、042 | `codex/dl2-engineering` | 040共享transport策略已落生产；041第一波软件收口，平台/设备继续待验 |
 | 大文件与目录传输（第七会话） | 030 | `codex/dl2-file-transfer` | 从Windows joint5782341起步，独占新增文件功能的业务协议14 |
 
 原媒体第一波010/011/012/013/014/020/021/022/023及030既有切片冻结在 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，已进入Windows joint；新GPU与文件功能继续独立提交。文件会话为 `01a17733-4bf0-79d3-831f-7c0190191591`，负责新增文件wire/API的协议14；当前工程与Windows joint仍协议13，main仍12。
 
-第一波集成采用冻结Windows joint5782341、Apple完整稳定历史f954a68、网络/services固定来源及工程分支建立独立候选，保留逐问题commit并实际联合验证。GPU015/016、新文件030/协议14后置，不阻塞稳定13第一波；候选通过后由主会话决定合入main，工程组不切换或覆盖root checkout。
+第一波独立候选已完整merge冻结Windows joint5782341、Apple f954a68及receipt后继cb751、网络4b15561、服务最终d2d4、工程6b31360、GUI506及原生诊断producer28c11，保留来源历史。干净a4c5b40已实际联合验证25检查全通过；main合入仍由主会话决定，工程组不切换或覆盖root checkout。GPU235的015/016、新文件030/协议14、024后续生产接线继续独立，不计入本第一波测试源。
 
-网络第一波已冻结 `4b15561586fab7a1481ba6dd4ff4854f34123018`（直接parent为a41e1e2），后续024在独立LAN runtime分支推进。服务S快照后发现resetPassword预算满先消费token、token动作共用email:missing桶两处确定缺口，owner正在逐条独立补修；第一波服务集成等待其最终固定SHA，不用旧服务快照提前关闭该补修。
+网络第一波已冻结 `4b15561586fab7a1481ba6dd4ff4854f34123018`（直接parent为a41e1e2），后续024在独立LAN runtime分支推进。**历史集成前快照：** 服务S快照后发现resetPassword预算满先消费token、token动作共用email:missing桶两处确定缺口，当时等待owner补修；当前最终 `d2d4f1c4c4942df03eda71e8aa1ebf3f8ab22c3a` 已包含补修并进入a4软件验证，部署/长期运行仍待验。
 
-044/045服务schema分别已有 `b1118ad465703493255123e23b6f522662c3d603` / `bf5d7eb27f3f41be59ac317b63d7e93d10f38066`，GUI最终来源 `5069158584dfa1f729defe2fadb5b9933acdfcff` 与限定lib报告已核对，候选聚合/重跑仍待执行。协调方确认未提交的cloud过滤切片已全部撤回，正常上传策略保留；整体候选合入服务历史后须用共同fixture验证真实client事件→签名验签/schema→store，不因旧joint缺字段永久吞掉两种事件。中间编译日志不作为撤回后源码证据。
+044/045服务schema历史来源分别为 `b1118ad465703493255123e23b6f522662c3d603` / `bf5d7eb27f3f41be59ac317b63d7e93d10f38066`；GUI506、原生producer `28c11ee05a08183f7636ede7946e93029c7bbb16` 与服务最终d2d4已完整merge。a4新native签名fixture→本地HTTP验签/schema→临时SQLite重开/去重/分析共19案例全通过，关闭全u64本地合同切片；设备GUI和远端生产送达仍待验。历史未提交cloud过滤切片已全部撤回，正常上传策略保留；撤回前中间编译日志不作为当前源码证据，observer仍只计尝试/发送错误，不计真实丢包。
 
 - 各会话在独立 worktree 中工作，不在主 checkout 切换分支或提交别人的改动。表中编号均为 DL2 编号。
 - **一个问题一个 commit。** 对应实现、必要测试和该项 TODO 状态一起提交，主题包含 DL2-ID；验证通过就提交，不累计多个问题。整体重构中可独立验证的切片也必须标明所属问题。
@@ -58,20 +59,21 @@
 
 ### 已提交成果检查框快照（2026-10-26；尚未合入main）
 
-下表的 `[x]` 只关闭其后明确列出的代码或自动验证切片，剩余验收继续 `[ ]`。来源均为不可变Git提交；自动列依据来源已提交记录或已核对原始报告，工程组未重跑的分支结果单列。main只读核对仍为 `a905b8807c83677f6f962c18f8fd1593f0d4ca32`，下列来源尚未成为main祖先。
+下表的 `[x]` 只关闭其后明确列出的代码或自动验证切片，剩余验收继续 `[ ]`。来源均为不可变Git提交；V为当前第一波候选实际联合验证，其他代号保留来源/历史报告身份，不能把来源总数当V结果。main只读核对仍为 `a905b8807c83677f6f962c18f8fd1593f0d4ca32`，下列来源尚未成为main祖先。
 
 | 来源代号 | 不可变source / joint | 证据范围 |
 | --- | --- | --- |
+| V（当前第一波） | `a4c5b404d43794d646394923a481f23c9298c3ed`，tree `154d51e9258a7731d78e78e1d7462bba475c0e36` | 干净源fast/integration 25检查全pass；Bun前端474/账号79/诊断129、Python257、FFI91、Windows292/17忽略、relay64/3忽略、Windows UI141/1忽略；native 2通过/7跳过仍incomplete；新native签名→本地HTTP/SQLite19案例全过。计数范围有重叠，不求和；见[完整报告](docs/wave1-integration.md) |
 | J | `5782341e22ba55b2efe30a8eeaeafbebfe0daaba`，tree `59c7270aea76bc1d542ac49c625e308b42ef20f2` | Windows产品27fec+媒体65c真实合并；Rust634通过/2失败/19忽略，Bun474通过及构建、八包严格Clippy通过。两失败为未合完整Apple链的Host零epoch，Rust整体exit101 |
 | M | `65c70fd658d0526a8a27b75fdbf120ae065222bf` | 冻结媒体448通过/18忽略、37笔提交；已成为J祖先 |
-| A | `f954a68153168a1ded048ddf93eb9c565684d096`，tree `eed9ea733f256024f5839ce0a7c6763d3a6a920a` | Apple协议13冻结、41笔历史；来源原生165通过/0忽略（FFI88+transport/relay77）、Python201及check/限定Clippy/双头/fmt通过；工程正在独立核对，Swift/Xcode未运行 |
+| A / CB | `f954a68153168a1ded048ddf93eb9c565684d096`，tree `eed9ea733f256024f5839ce0a7c6763d3a6a920a`；后继 `cb7514cc29b7a94ad40ac00f0a5b98936b7d5be5` | Apple协议13完整41笔历史及input receipt/admission后继均已merge V；原生165/0（FFI88+transport/relay77）、Python201为A来源历史报告，当前以V实跑为准；6项Swift Recording与Xcode/真实拓扑未运行 |
 | N | `4b15561586fab7a1481ba6dd4ff4854f34123018` | 网络第一波冻结，继承a41e1e2；本地QUIC/调度/资源/deadline及Linux候选关停证据，生产部署/真实WAN另验 |
-| S | `b1118ad465703493255123e23b6f522662c3d603` | 服务已提交快照；各项本地数据库/Bun/进程级回归与诊断producer合同，未部署；上述两处token预算/分桶补修后的最终SHA待交付 |
-| E | `12b54ceedc0799a556e502436bc08830db7edca1` | 工程入口/合同及实际共享transport恢复分类；其源码blob与已运行29/18/12及严格Clippy/fmt报告一致；其他报告精确SHA见 `docs/local-verification.md` |
-| G（后续波） | `2d79f9706303cb2dffa7abc764c8f7450591c3b6`，tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832` | 015 owned BGRA/NV12池、VP与capture入口；owner报告204通过/6忽略、7GPU含4合成及Clippy，rawlog待落盘，未独立复跑；016 dirty烟测不计入 |
-| D | `5069158584dfa1f729defe2fadb5b9933acdfcff`，parent67cd1bf、tree `3740f354bce3c1d14d32f8435bb44b0c2b6a1006` | GUI044/045固定历史；原日志核对044所选lib Windows218/2忽略、UI137/1忽略，045 UI138/1忽略及限定包Clippy；cloud代码相对J无diff，完整u64 JSON合同后继补修待交付 |
+| S | 最终 `d2d4f1c4c4942df03eda71e8aa1ebf3f8ab22c3a`；历史快照 `b1118ad465703493255123e23b6f522662c3d603` | 最终schema/预算/分桶/u64历史完整merge V，本地数据库/Bun/进程回归和19案例签名/store联合链已执行；旧快照后两处补修等待已结束，未部署 |
+| E | 最终 `6b31360ce4dc40d0f1715ce1e40c000788a6b812`；历史快照 `12b54ceedc0799a556e502436bc08830db7edca1` | 工程入口/合同及单一transport恢复分类完整merge V；29/18/12及三包严格Clippy/fmt为原策略切片报告，当前另有V整套25检查；其他历史报告见 `docs/local-verification.md` |
+| G（后续独立候选） | 最终 `23526f23f450e64edea098a36b07ed4c62d4982b`；早期 `2d79f9706303cb2dffa7abc764c8f7450591c3b6`，tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832` | 015/016完整七笔GPU历史；290通过/17忽略仅owner来源报告，未进入V、未在本候选复跑。早期204/6、7GPU含4合成及Clippy为当时来源记录；后续独立worktree集成与适用硬件验收另行执行 |
+| D / producer | `5069158584dfa1f729defe2fadb5b9933acdfcff`，parent67cd1bf、tree `3740f354bce3c1d14d32f8435bb44b0c2b6a1006`；后继 `28c11ee05a08183f7636ede7946e93029c7bbb16` | GUI044/045及完整u64 producer已merge V；Windows218/2、UI137/1与138/1及限定Clippy为D来源历史报告。V实际验证规范十进制string/原始签名字节与服务store/analysis全值域链；设备GUI/远端生产送达未验 |
 
-来源TODO已关闭的主项为：产品001/034/035，媒体020/046/050，服务036/037/038/039/054/055/058，工程042；这些是各自来源范围的完成状态，剩余集成、已发现服务补修和设备验收继续按下表单独记录。
+来源TODO已关闭的主项为：产品001/034/035，媒体020/046/050，服务036/037/038/039/054/055/058，工程042；这些主项的来源身份保留，当前第一波软件集成与服务补修已由V验证，平台、设备、部署及性能剩余验收继续按下表单独记录。
 
 | 问题 | 已提交代码 / 合同切片 | 已完成自动验证切片 | 未满足验收 |
 | --- | --- | --- | --- |
@@ -87,19 +89,19 @@
 | 010 · J/M | [x] 静态恢复IDR并保留buffered输出请求 | [x] 媒体恢复与联合软件MFT链 | [ ] 真桌面/双机恢复时延 |
 | 011 · J/M | [x] crypto短锁、独立probe窗口与取消树 | [x] 慢探测/重放/跨lane回归 | [ ] 双机黑洞输入/画面p95/p99 |
 | 012 · J/M | [x] 输入独立消费、慢配置合并与完成回执 | [x] 慢控制/输入并发回归 | [ ] 慢驱动双机输入预算 |
-| 013 · J/A | [x] Windows完整u64/绘制/host映射切片，A完整FFI/owned future/media_generation稳定历史 | [x] J两项软件MFT/QUIC/Noise联合回环；A源FFI88及相关传输回归 | [ ] 候选合并/复跑、Swift旧input receipt后继P2修复、真实呈现/拓扑；J单支仍2项Host失败 |
+| 013 · J/A/CB/V | [x] Windows完整u64/绘制/host映射、完整Apple ABI/owned future/media_generation与receipt/admission后继均已合入 | [x] V Rust本地FFI91、Windows292/17忽略及真实软件MFT/QUIC/Noise联合回环；J634/2/19仅旧源历史 | [ ] 6项Swift Recording、Swift/Xcode、实际presented与同stream完整拓扑映射；主项不因Rust本地通过关闭 |
 | 014 · M | [x] CPU离线分段基线与真实输入/输出身份 | [x] 可复跑离线工具及buffered时序校验 | [ ] GPU/双机/端到端/功耗温度/长稳对照 |
-| 015 · M/G | [x] M复用staging/scratch；G新增owned surface池/VP缩放转色/capture入口 | [x] M缓冲回归；G204/6与合成GPU为owner报告，原日志待交付 | [ ] 016生产encoder链、tracked-sample lease寿命/CPU与GPU分别测量及适用硬件验收；主项保留未完成 |
-| 016 · M | [x] 硬件MFT枚举、有界异步泵/软件回退及timestamp校验 | [x] 后端/缓冲/输出身份回归 | [ ] 真实硬件成功编码及厂商/混合GPU/驱动丢失矩阵，第二波推进 |
+| 015 · M/G | [x] V仅含M的staging/scratch复用；G235另有owned surface池/VP缩放转色/capture入口 | [x] V媒体软件回归；G290/17及合成GPU仅owner来源报告，不属于V | [ ] G独立候选集成/复跑、CPU/GPU同条件测量及适用硬件验收；主项保留未完成 |
+| 016 · M/G | [x] V含M的有界MFT泵/软件回退与timestamp校验；G235另有tracked-sample GPU编码/同帧回退 | [x] V后端/缓冲/输出身份软件回归；G合成硬件结果保留来源身份 | [ ] G独立候选、厂商/混合GPU/真实驱动丢失与性能矩阵，第二波推进 |
 | 017 · J | [x] 有界AudioWorklet音频播放 | [x] 环形缓冲/生命周期与前端回归 | [ ] 实际播放、欠载/延迟/分配率测量 |
 | 018 · A | [x] 专用解码队列、字节/帧龄预算与合并presenter | [x] Python静态media合同，Swift调度器用例已提交 | [ ] Swift/Xcode、VideoToolbox与阻塞主线程性能；保留现有复制 |
 | 019 · N | [x] 三类媒体独立有界sender及代数隔离 | [x] QUIC ACK黑洞、健康会话隔离及本机调度测量 | [ ] 真实WAN/双机/容量与音频体验 |
-| 020 · M/J | [x] 可靠视频builder单次增量构造并复用buffer | [x] builder等价/边界与来源套件通过 | [ ] 第一波候选合并验证；M将本主项列完成 |
+| 020 · M/J/V | [x] 可靠视频builder单次增量构造并复用buffer | [x] builder等价/边界、来源套件与V软件接入通过 | —；M主项完成，本切片候选软件缺项已收口 |
 | 021 · J | [x] 两端有界磁盘worker/独占收尾及初始化取消preserve | [x] 原prefix保留/续传、慢盘隔离及J完整Windows套件 | [ ] 真实慢盘/云盘/杀毒/空间耗尽的媒体预算 |
 | 022 · M/J | [x] GDI兜底中退避探测DXGI并迟滞恢复 | [x] 恢复状态/后端契约回归 | [ ] 真实UI诊断、睡眠/RDP/驱动恢复与帧龄 |
 | 023 · M/J | [x] 事务ICodecAPI码率更新与预设内自适应 | [x] 策略/动态更新契约回归 | [ ] 实际支持硬件的效果与失败恢复；完整协商 |
 | 024 · N | [x] opt-in认证八通道LAN/可靠回退/去重/随机收讫 | [x] localhost多lane、伪ACK、慢文件、013上下文保留 | [ ] 平台生产接线、实际LAN/WAN/恢复；未整体交付 |
-| 025 · A | [x] 双C头生成、ABI布局/有界命令及Swift能力映射 | [x] Rust/MSVC布局与Python头/合同检查 | [ ] 与J完整Apple稳定历史合并、Swift/Xcode与ABI运行 |
+| 025 · A/V | [x] 完整Apple历史、双C头生成、ABI布局/有界命令及Swift能力映射已合入 | [x] V真实MSVC C布局、双头检查、Rust/Python合同通过 | [ ] Swift/Xcode及Apple平台ABI运行 |
 | 026 · A | [x] Mac屏幕/画质控制与远端回执状态切片 | [x] Rust codec fixture、Python会话合同 | [ ] Swift执行、实际音频/剪贴板/文件等其余功能闭环 |
 | 027 · A | [x] 有界位置解码与Mac/iOS独立位置overlay | [x] Rust光标fixture/Python合同 | [ ] 完整shape/hotspot及真实几何/呈现效果 |
 | 028 · A | [x] 授权/expiry/身份pin与Keychain重连模型 | [x] Rust授权/持久等待取消与Python保存设备合同 | [ ] 真Keychain迁移、长期重连、跨设备误连保护 |
@@ -110,36 +112,36 @@
 | 033 · J | [x] 发送Esc/系统组合与宿主快捷键入口 | [x] 按下/释放平衡与路由回归 | [ ] 全屏/IME/布局与实际远端应用 |
 | 034 · J | [x] 内存账号草稿与重发邮箱绑定 | [x] 表单失败/重试/地址回归 | [ ] 实际账号页网络失败体验 |
 | 035 · J | [x] 完整三笔IPC所有权链与失败取消可重试 | [x] 迟到响应/持久化/host重启归属回归 | [ ] 实际登录/退出/换号与服务组合验证 |
-| 036 · S | [x] 数据库原子注册与并发幂等 | [x] 本地并发/唯一键竞争回归 | [ ] 第一波服务联合及部署验收 |
-| 037 · S | [x] 可写数据库readiness与有界锁等待 | [x] 依赖不可用/锁竞争回归 | [ ] 第一波服务联合与实际运行环境 |
+| 036 · S/V | [x] 数据库原子注册与并发幂等 | [x] 本地并发/唯一键竞争与V最终服务回归 | [ ] 部署及真实运行环境验收 |
+| 037 · S/V | [x] 可写数据库readiness与有界锁等待 | [x] 依赖不可用/锁竞争与V最终服务回归 | [ ] 实际运行环境与部署 |
 | 038 · S | [x] leased邮件worker及账号历史生命周期 | [x] 本地投递状态/回收/恢复回归 | [ ] 真实邮件服务、长时故障恢复与部署 |
 | 039 · S | [x] 索引/分片分批保留期清理 | [x] 本地清理/容量/并发接收回归 | [ ] 长期磁盘/生产性能与部署验证 |
-| 040 · E | [x] transport单一穷尽恢复策略，Host/Controller两生产入口删除重复match；合同整理 | [x] transport29/Windows策略18/FFI lib12、三包严格Clippy与fmt | [ ] 第一波候选接入、其余职责拆分；活跃input/media_generation与HostError字符串类型化分开处理 |
-| 041 · E/J | [x] 分层入口、固定工具/源码报告与joint证据核对 | [x] E入口回归、J634/2/19及Bun/Clippy记录核对 | [ ] 完整Apple后第一波候选实跑、平台/设备/性能门禁；不关闭主项 |
-| 042 · E | [x] 能力/版本/来源与当前检查框快照 | [x] manifest版本5项、本地链接/原报告哈希检查 | [ ] 每次稳定聚合继续同步；main状态须随真实合入对齐 |
+| 040 · E/V | [x] transport单一穷尽恢复策略，Host/Controller两生产入口删除重复match并已合入V | [x] 原策略29/18/12、三包严格Clippy/fmt与V完整软件门禁 | [ ] 其余实际职责拆分、HostError字符串类型化及性能比较；不扩大本策略角色，040主项保留未完成 |
+| 041 · E/V | [x] 分层入口、固定工具/源码报告、MSVC真实C环境与完整relay门禁 | [x] 干净a4的25检查、FFI91与本地签名→HTTP/SQLite19案例通过 | [ ] native仍2通过/7跳过、incomplete；Swift/平台/设备/性能待验，软件收口子项完成而主项不关闭 |
+| 042 · E/V | [x] 当前能力/版本/完整来源与逐项进度同步 | [x] V固定源与完整报告、历史失败和来源状态分别记录 | [ ] main合入后的状态同步；本次不宣称已合main/推送/部署 |
 | 043 · A | [x] Main/1080p与实际profile/尺寸安全拒绝 | [x] Python2项合同，Swift用例已提交 | [ ] 动态完整协商、Swift/真实Mac编码与权限 |
 
 新增044–061不复制root未知作者的未提交草稿；当前已核实来源切片另列如下，未获证据者继续待核实：
 
 | 问题 | 已提交/核对的切片 | 未满足验收或成立性 |
 | --- | --- | --- |
-| 044 · J/M/S/D | [x] cursor降级/typed observer、b111服务合同与GUI持久化切片/所选lib回归 | [ ] full-u64 JSON字符串后继补修及最终producer→签名接收/store全值域闭环、双机；observer不计真实丢包 |
-| 045 · J/M/D/bf5d7eb | [x] Some(Err)反证、None退役/迟到probe隔离、GUI/服务固定字段与所选lib回归 | [ ] full-u64 JSON后继补修、最终真实签名接收/store与实际监听；不延续“任一Err永久禁用” |
-| 046 · M/J | [x] 路径所有权/按连接身份退役/迟到结果取消与真实回归，M主项完成 | [ ] 第一波候选接入验证 |
+| 044 · J/M/S/D/V | [x] cursor降级/typed observer、全u64 producer/service/GUI合同及V本地签名/store/analysis全值域19案例 | [ ] 设备GUI/双机、远端生产送达；observer不计真实丢包 |
+| 045 · J/M/D/S/V | [x] Some(Err)反证、None退役/迟到probe隔离、全u64合同与V本地签名/store/analysis19案例 | [ ] 设备GUI/真实监听、远端生产送达；不延续“任一Err永久禁用” |
+| 046 · M/J/V | [x] 路径所有权/按连接身份退役/迟到结果取消及V软件接入通过，M主项完成 | —；来源及本候选软件切片已收口 |
 | 048 · E | [x] Noise message3认证payload链路已核对 | [ ] P1/UKS攻击路径证据不足，熵源/篡改/拼接待独立证明；未直接改crypto |
-| 049 · N | [x] 按relay IPv4/IPv6族绑定本地socket，真实::1/v4握手/join/目录/可靠与datagram回归 | [ ] 第一波候选接入；真实WAN IPv6/NAT/双栈路由另验 |
-| 050 · M/J | [x] 重复chunk保留首payload且不延寿与回归，M主项完成 | [ ] 第一波候选接入验证 |
+| 049 · N/V | [x] 按relay IPv4/IPv6族绑定本地socket，真实::1/v4及V完整relay回归 | [ ] 真实WAN IPv6/NAT/双栈路由另验 |
+| 050 · M/J/V | [x] 重复chunk保留首payload且不延寿、来源及V软件回归，M主项完成 | —；来源及本候选软件切片已收口 |
 | 051 · A | [x] 网络/服务故障保留账号会话、generation隔离及旋转token取消落盘；Python10项合同 | [ ] Swift行为用例17项未运行，真实Keychain/断网/重新登录 |
-| 052 · N | [x] QUIC资源预算、join前datagram防护及固定容器负载/cgroup实测 | [ ] 第一波聚合；容量结论只限已测载荷，生产环境另验 |
-| 053 · N | [x] 绝对join/partial-frame截止、真实QUIC与512连接本机probe | [ ] 第一波聚合与部署长稳 |
-| 054 · S | [x] 诊断验签前准入与事务持久配额、来源回归 | [ ] 第一波服务最终补修聚合与部署容量 |
-| 055 · S | [x] 可信socket/显式代理来源与有界限流键、来源回归 | [ ] 服务token动作分桶新缺口补修及最终聚合 |
-| 056 · S | [x] 哈希/响应窗/未认证计算门控与本机计时切片 | [ ] resetPassword预算与token顺序补修、部署空闲/饱和枚举 |
-| 057 · S/N | [x] Bun请求/socket排空及N Linux候选关停证据 | [ ] 服务最终来源聚合与第一波跨进程关闭验证 |
-| 058 · S | [x] 设备标签按账号隔离及来源越权/换号回归 | [ ] 第一波服务聚合与部署 |
+| 052 · N/V | [x] QUIC资源预算、join前datagram防护、V完整relay回归；容器/cgroup为N来源实测 | [ ] 容量结论只限已测载荷，生产环境另验 |
+| 053 · N/V | [x] 绝对join/partial-frame截止与V完整relay回归；512连接probe保留N来源身份 | [ ] 部署长稳 |
+| 054 · S/V | [x] 诊断验签前准入与事务持久配额、最终服务已聚合并通过V本地回归 | [ ] 部署容量 |
+| 055 · S/V | [x] 可信socket/显式代理来源、有界限流键与token动作独立分桶补修，V最终服务回归通过 | [ ] 部署环境与长期负载 |
+| 056 · S/V | [x] 哈希/响应窗/计算门控、resetPassword预算先于token消费补修与V最终服务回归 | [ ] 部署空闲/饱和枚举 |
+| 057 · S/N/V | [x] 最终服务来源与V跨进程关闭回归；N Linux候选关停为来源证据 | [ ] 实际部署关闭/重启与长稳 |
+| 058 · S/V | [x] 设备标签账号隔离、越权/换号与V最终服务回归 | [ ] 部署验收 |
 | 059 · A | [x] 未知Host事件固定计数/不解析、Transfer非终态；Windows2静态合同 | [ ] Swift及真实Transfer全流程 |
-| 060 · A | [x] 认证会话时钟校准/context先验隔离、策略/QUIC来源回归 | [ ] 真Mac时钟跳变/输入注入及完整Apple聚合 |
-| 061 · A | [x] direct绝对静默截止、真实loopback黑洞/持续收包红绿回归 | [ ] Mac/iOS实际启用、双机/防火墙与第一波聚合 |
+| 060 · A/V | [x] 认证会话时钟校准/context先验隔离、完整Apple已聚合并通过V Rust本地回归 | [ ] 真Mac时钟跳变/输入注入 |
+| 061 · A/V | [x] direct绝对静默截止、真实loopback黑洞/持续收包红绿回归与V软件接入 | [ ] Mac/iOS实际启用、双机/防火墙 |
 | 047 | [ ] 成立性、来源/owner与实跑范围待核实 | [ ] 保留root未提交稿，不能总括全部确认或修改其owner |
 
 ## 2. 本次验证基线（初始记录，后续源码结果见上表）
@@ -846,6 +848,8 @@
 - **会话新鲜度与u64合同（`docs(DL2-040): require fresh Noise epochs and lossless IPC identities`）：** 只读确认HostConnectionSettings.stream_id持久化、supervisor仅run内推进，撤回“新stream可固定1”假设。每次新认证会话/Noise用OsRng非零随机起点（同进程也重新分配），仅几何/活动输出/有效性边界checked推进，纯编码不变；RNG/零/溢出明确失败或重建，无默认1/wrap/round/clamp。Windows身份IPC规范十进制字符串+BigInt完整u64，C/Swift UInt64；epoch不作key/nonce。记录为待接线合同，不冒称当前sender或host已实现这些规则。
 - **真实帧配置配对（`docs(DL2-040): preserve config consistency while pairing geometry epochs`）：** 帧/mailbox无独立epoch，host同会话epoch变化必须推进真实config_version并发布配置/恢复关键帧，同尺寸/原点改变也覆盖；纯编码可只变version不清键。源码已有同stream+同version任一VideoConfig字段变化→InconsistentVideoConfig（Eq含epoch），保留此拒绝，不描述成已复现旧帧误激活；禁止放宽校验或重贴旧buffered输出，正确新配置+对应帧实际呈现后才放行。
 - [x] **实际共享错误策略拆分（`refactor(DL2-040): centralize role-aware transport retry classification`）：** transport纯模块唯一穷尽分类，Windows host/FFI controller删除重复match并按显式上下文委托；保留Malformed/SessionNotFound/SessionOccupied三项Host可重建、Controller永久失败差异，persistent/预算/取消和HostError(String)不变。CodeGraph定位后核对工程/Apple880e/网络a41原函数一致；真实报告transport-policy/report.json源f8a89d6+dirty切片：Rust1.97.1、隔离target经wrapper，transport29/Windows策略18/FFI lib12通过0忽略、三包lib/tests严格Clippy及workspace fmt通过。两个生产入口与全部错误/rejection双角色覆盖；未改wire/ABI、不声称整体040或性能完成。
+- [x] **当前第一波实际职责收口（2026-10-26，测试源a4c5b40）：** 工程完整来源6b31360已merge，transport策略单一owner与Windows Host/FFI Controller两生产委托在完整J+A/CB+N+S+D候选中保留，三项Host/Controller差异、persistent/预算/取消与HostError::Transport(String)现状不变。干净 `a4c5b404d43794d646394923a481f23c9298c3ed` 的fast/integration 25检查、all-targets/all-features check、严格Clippy与fmt通过，完成该真实策略拆分的第一波接入；其余职责拆分和同条件性能比较仍未完成，040主项保持 `[ ]`。证据见[第一波集成记录](docs/wave1-integration.md)。
+- **历史来源状态：** 本节此前“合同尚未落地、零生产者、待完整Apple/候选接入”的记录属于各自明确源码时点，不代表a4当前状态；保留原失败与未验范围。013的完整代码/Rust本地切片现已通过，Swift Recording/实际呈现拓扑仍待验；GPU235与文件协议14后置，不扩大本次040修改范围。
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 
@@ -874,6 +878,11 @@
 - [ ] **冻结媒体不替代联合门禁（`docs(DL2-041): keep joint acceptance pending after media source freeze`）：** 65c的final-validation/handoff及三组原日志448通过0失败18忽略相互一致，source前后/锁hash/37笔提交清单已只读核对，限定包Clippy等范围单列，本工程未复跑来源。020/046/050源主项完成，其他切片或部分实现与pending保持；015 GPU surface链未实现、030仍256MiB/无目录等不能按总数关闭。待最终joint树、Apple完整稳定来源和实际跨包/适用测试聚合，再收口041/013与可交付性，18忽略不算通过。
 - [ ] **第一波独立候选实际合并/复跑（`docs(DL2-041): start the protocol-13 candidate without waiting for later feature waves`）：** 独立wave1 worktree已从J578真实merge完整Apple f954历史；N4b、工程040/041/042、服务token补修后的最终来源及GUI506最终历史按稳定提交聚合，保留Windows非零producer与原问题历史。Apple新发现Swift input receipt P2由owner后继补丁追加；候选实际报告、真实事件签名接收/store闭环与未运行平台清单待交付。GPU、文件协议14、024后续开发不阻塞本轮，main由主会话在候选通过后决定合入。
 - [ ] **044/045完整u64云诊断合同补修：** 合法大于2^53的stream ID仍可由native producer以JSON u64 number产出，而现服务safeInteger拒整batch；原u64_overflow fixture仅两端一致不能证明全值域正确。producer/services各自后继切片改规范有界十进制字符串、native仍u64、白名单/原因不放宽，必要计数无损；实际最终client→签名schema/store全值域闭环待候选执行，当前不勾完成。
+- [x] **当前第一波软件收口（2026-10-26，干净测试源a4c5b40）：** `dist/verify/wave1/final-software-v3.json` 的25个检查全部passed，包含安装/构建/静态检查，不称25个测试。Bun前端474、账号79、诊断129，Python257，FFI完整91/0忽略，Windows完整292/17忽略，relay完整lib/tests 64/3忽略，Windows UI141/1忽略；另有workspace lib511/3忽略及all-targets/all-features check、严格Clippy、fmt通过。范围有重叠，忽略不算通过，不相加为去重覆盖率。FFI包含真实MSVC C布局，双头检查通过；relay不再只跑session。完整来源/命令见[第一波集成记录](docs/wave1-integration.md)。
+- [x] **完整来源与013代码/Rust本地收口：** J578、A f954、Apple receipt/admission后继cb751、N4b、E6b、服务最终d2d4、GUI506及原生u64 producer28c11均为a4祖先，完整历史保留。去重桥接/Sender后保留Windows非零随机epoch、捕获前context/异步输出归属、完整Apple ABI/owned future/media_generation和040策略owner；当前FFI91通过，不沿用旧工程/旧joint缺完整Apple时的Host零epoch失败作为现状，也不改写其原始失败报告。013代码与Rust本地子项 `[x]`，6项Swift Recording、Swift/Xcode及实际同stream拓扑/呈现仍 `[ ]`。
+- [x] **044/045全u64本地生产链收口：** 在干净a4重新运行production native签名fixture，以合成身份/临时日志产生原始body/hash/Ed25519签名，再经127.0.0.1真实HTTP接收、生产schema/store、临时文件SQLite关闭重开、去重与analysis验证，19案例全部通过、differences为空。覆盖12项当前/历史规范化正例、2项旧安全数值、4项旧不安全Number拒绝且零存储、1项重hash但保留旧签名的篡改拒绝；规范十进制string与原始签名字节保留。该结果关闭本地client签名/store/analysis切片，设备GUI与远端生产送达继续 `[ ]`；未读用户日志或执行远端上传。
+- [ ] **平台/设备门禁继续待验：** `platform-conditions.json` 为incomplete / passed=false，2通过/7跳过；通过的是双头检查与合成CPU离线基线，不能称真实捕获/编码、GPU或完整性能通过。Swift/Xcode、6项Swift Recording、实际WebView/拓扑/权限、真实输入/双机、设备恢复、长稳与签名安装/发布继续待验。041软件收口子项 `[x]`，主项保持 `[ ]`；GPU235及其owner来源290/17不属于本第一波候选。
+- **历史来源状态：** 本节此前5501/56f/d6/旧joint的failed报告、a97f2d4+dirty MSVC局部验证、首轮夹具失败、v2与待聚合/待u64补修记录均按其源码时点保留；本次a4最终报告收口对应软件缺项，不把历史失败改成通过，不把跳过平台项改成已验。
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 
@@ -900,6 +909,9 @@
 
 - **媒体冻结交接范围（`docs(DL2-042): record frozen media evidence without widening completion claims`）：** 只读65c的final-validation与windows-media-handoff，记录source前后SHA/空working_status/Cargo.lock和报告SHA256、448通过0失败18忽略及37笔提交；只作为来源结果，本工程未复跑。主项仅020/046/050完成，其他按切片/部分实现与pending保留；015仍CPU读回且GPU surface链未实现，030仍256MiB/无目录、大文件与持久块证明。046后续源切片不冒充本工程已有初始取消树。041/013和可交付性不因来源计数关闭，最终joint/Apple完整稳定聚合证据待交付。
 - [x] **固定joint与逐项快照更新（`docs(DL2-042): bind joint results and phased ownership to immutable snapshots`）：** J578的parents/tree、27+37历史、六份日志哈希、477源码blob及原Rust634/2/19、Bun474/Clippy范围已核对，021四项初始化与013两项真实加密联合用例见原日志；不写Rust全绿。前置检查框已逐项列代码/自动验证与剩余验收，明确未合main、root044–061作者未知且未覆盖；固定A f954完整13历史、N4b第一波与S/GUI待稳定来源分开，G015和030/协议14、024后续不阻塞第一波。GUI044固定67cd不改cloud过滤，服务044/045schema进入候选后仍须真实签名接收/store闭环。
+- [x] **当前第一波来源与逐项状态收口（2026-10-26）：** 首部增加V=`a4c5b404d43794d646394923a481f23c9298c3ed`、测试时干净tree154d51e，区分25检查全pass、本地签名→HTTP/SQLite19案例全过与native 2通过/7跳过incomplete；同步A+CB、服务最终d2d4和D+producer28完整merge，013代码/Rust本地、044/045全u64本地链、041软件子项完成，Swift/真实拓扑/设备GUI/远端送达/平台与性能仍待验。GPU235的290/17只列owner来源，未计入本候选；main仍a905b88/协议12，候选0.1.93/协议13尚未合main/推送/发布。证据索引为[第一波集成记录](docs/wave1-integration.md)，最终文档提交与已测试a4源码由交接manifest分别绑定。
+- **本次文档验证：** 根会话实际运行current_source_versions 5项通过；文档链接/diff及最终提交由根会话统一收口。
+- **历史来源状态：** 本节旧工程、媒体、产品、Apple及joint报告保留原SHA、原计数和当时失败/待验含义；上文“尚待完整Apple、服务最终来源或u64后继”均为当时快照，当前状态以首部V及本条为准，不用来源通过替代本候选实跑，也不把本地软件结果外推成设备或生产验收。
 
 ## 8. 扩展角色
 

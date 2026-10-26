@@ -7,8 +7,8 @@
 
 ## 1. 产品边界
 
-- Windows 10/11 x64 是当前唯一正式发布目标；main `a905b88` 产品基线为 `0.1.93` 公开测试构建、业务协议 `12`。工程分支已为 probe 接入复用协议 `13` 独立契约及 DirectProbe lane，尚不代表该 main 已集成；当前 checkout 的应用/协议/工具链用 `python scripts/verify-windows-release.py --versions-only` 读取。[能力与证据矩阵](current-capabilities.md)分别保留功能基线、复用来源和工程源码身份。
-- 后续工程已复用 input context wire/codec 合同，但 host/发送/呈现尚未接线，零epoch生产结果被codec拒绝，真实host runtime测试失败；编译通过不表示运行通过，当前工程源码不可作为可用整包交付。不能默认1、发送时取当前epoch或跳过业务失败绕过门禁。
+- Windows 10/11 x64 是当前唯一正式发布目标；main `a905b88` 产品基线为 `0.1.93` 公开测试构建、业务协议 `12`。第一波软件候选的已测试源码为 `a4c5b404d43794d646394923a481f23c9298c3ed`，业务协议为 `13`，尚未合入 main；当前 checkout 的应用/协议/工具链用 `python scripts/verify-windows-release.py --versions-only` 读取。[能力与证据矩阵](current-capabilities.md)分别保留 main 历史基线、候选来源和实际验证范围。
+- 工程 `5501aad`、`56f53b4`、`d6f153e` 阶段尚未接通 host/发送/呈现，零 epoch 被 codec 拒绝并导致业务测试失败；这些结果保留原来源，不能外推为当前候选仍有零 producer 或七处旧生产调用未迁移。当前候选已保留 J 的非零 Windows producer/host 和完整 Apple/FFI 后继接线；仍禁止默认1、发送时补当前 epoch 或跳过失败绕过门禁。
 - Windows 支持不登录账号的本地模式。可选账号只用于邮箱验证、账号会话和安装实例可见性，不替代设备配对、主机批准或端到端加密认证。
 - macOS Apple Silicon 同时保留 controller/host 开发与验收能力；iOS 16+ 只作为 controller，不对外宣称能托管或控制 iOS 系统。
 - 用户已确认 Windows→Windows、macOS→Windows 基础远控良好。Mac 的 IME、音频、剪贴板、文件、多屏、特殊恢复与真实权限分别核验；ScreenCaptureKit/VideoToolbox host 已有实现，不能写成未来空白计划，也不能用已有 Rust API 代替 Apple UI/桥接闭环。
@@ -16,6 +16,16 @@
 - DirectLan 是有认证、短生命周期、会话绑定的视频数据面优化，只传视频，失败时必须无感回退到 relay，不能结束控制会话。
 
 当前版本明确不承诺：公网上开放注册、多租户权限管理、iOS host、UAC/安全桌面控制、4K/高帧率专业采集、无人值守静默升级，以及未经独立验收的生产级高可用 relay/account 服务。
+
+第一波候选完整来源为 J `5782341`、Apple `f954a68` 与 input admission 后继 `cb7514c`、网络 `4b155615`、工程 `6b31360`、GUI `50691585`、诊断 producer `28c11ee` 和 services `d2d4f1c`。`a4c5b40` 的 v3 共25个软件门禁全部通过：Python257、Bun前端474/账号79/诊断129、FFI91（含真实 MSVC C ABI）、Windows292通过/17忽略、relay64通过/3忽略；任务计数有重叠，不累加成独立覆盖率。19个 fresh 真实 HTTP 案例按预期通过，正例直接使用原始 RustSignedRequest 的 body/hash/签名，不以改写或重签替代，覆盖 schema、文件 SQLite、重开与去重；范围为7事件、24个 event/field 对、18个不同 u64 键，另有旧 unsafe numeric 拒绝与篡改后401负例。详细原始报告与执行范围见[本地验证说明](local-verification.md)。
+
+平台 native/perf 报告仍为 incomplete：2项通过（双头检查、CPU离线基线）、7项 skipped，忽略和跳过均不计通过。以下验收继续未完成：
+
+- [ ] Swift/Xcode、六项 Swift Recording 用例与真实 Apple presented 行为。
+- [ ] 实际 WebView、真实输入注入、权限、双机与显示拓扑验收，包括 Apple 同 stream 完整源拓扑/epoch 权威映射。
+- [ ] 完整 Mac 功能、硬件/GPU、同条件性能比较和长稳、安装签名及正式发布门禁。
+
+GPU235 后续独立候选、文件030/业务协议14与LAN024后续生产接线不合入本轮；这些后续功能不阻塞已完成的协议13软件候选验证。
 
 ## 2. 平台职责
 
@@ -69,7 +79,7 @@ Rust 共享层拥有协议、设备身份、配对邀请、Noise 会话、业务
 | `relay` | 会话目录与密文转发 | 保存或解析业务明文 |
 | `account` | 账号生命周期和实例登记 | 默认为远程授权或 relay 健康证明 |
 
-第二阶段的现状差异、公共错误/资源合同和集成前置见[所有权与边界合同](second-stage-boundary-contracts.md)。该文档是 DL2-040 的整理切片，不表示巨型模块已经拆分或性能已经改善。
+第二阶段的现状差异、公共错误/资源合同和后续迁移见[所有权与边界合同](second-stage-boundary-contracts.md)。DL2-040 已实际拆分共享 transport 错误分类并接通 Host/Controller 两个生产入口；其余具体 owner 迁移仍逐切片推进，无需等全部功能完成后才继续。巨型 controller/runtime/FFI 模块整体拆分及性能收益尚未完成验收。
 
 ## 6. 发布门禁
 
