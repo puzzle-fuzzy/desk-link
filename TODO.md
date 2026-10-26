@@ -427,7 +427,8 @@
 - **体验约束：** 维持连接/共享两主入口、原生平台习惯和清楚的下一步；本次不把既有视觉取舍、没有装饰或旧阶段未签名一概判成远控功能缺陷。
 - **完成（`docs(DL2-042): align current capabilities and manifest version evidence`）：** 新增 `docs/current-capabilities.md`，以 main `a905b88` / 工程切片 `44a2a99` 为基线，逐方向列基础控制、IME、音频、剪贴板、文件、多屏、权限和恢复；同步 README、PRODUCT、DESIGN、架构契约，保留历史记录日期。明确用户已确认两条基础远控、Mac VideoToolbox 已实现、未接通 Apple UI 不能因底层方法存在而勾选；其他分支只列固定提交证据，035 三笔链和 009 协议 13 契约不冒充已合入 main/完整反馈功能。
 - **实际验证：** 只读 `python scripts/verify-windows-release.py --versions-only` 输出 manifest 的 0.1.93 / 协议 12 / Bun 1.3.14 / Rust 1.97.1；5 项新增元数据/版本漂移回归通过，空 PATH 的真实 CLI 不调用构建/原生准备，文档版本表与 README 动态对照 manifest。统一入口 `--task python-tests --report dist/verify/dl2-042-python.json` 全套 132 项通过；6 份相关文档的本地链接全部可解析，`git diff --check` 通过。源码验证为 `44a2a99` 加本切片（dirty=true）；本次未新增真机、发布或性能结论。
-- **接入分支版本增量（`docs(DL2-042): distinguish probe integration protocol from main baseline`）：** 按后续授权复用协议13、shared-probe与DirectProbe独立提交后，工程源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，main `a905b88` 仍协议12；同步矩阵/README/架构契约和三笔来源→本分支SHA，明确不是其余功能已集成。只读版本入口实际输出13，5项版本/文档回归通过；013 epoch 合同仍待owner提交，不以计划字段宣称已实现。
+- **probe接入时的版本记录（`docs(DL2-042): distinguish probe integration protocol from main baseline`）：** 按后续授权复用协议13、shared-probe与DirectProbe独立提交后，工程源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，main `a905b88` 仍协议12；同步矩阵/README/架构契约和三笔来源→本分支SHA，明确不是其余功能已集成。只读版本入口实际输出13，5项版本/文档回归通过；当时013 epoch合同未提交。
+- **合同过渡状态（`docs(DL2-042): label zero-context integration as non-deliverable`）：** 记录bc6c0a→本分支5501aad来源，wire/codec已落地但零生产者未接线；编译/protocol49/probe79通过而host runtime9通过1失败，整体failed/passed=false。同步矩阵/README/架构契约，禁止用此前4c3648a的绿色probe报告覆盖新源码失败；main仍协议12与用户已确认的基础路径分开。版本/文档5项回归与链接/diff检查通过。
 
 ## 8. 扩展角色
 

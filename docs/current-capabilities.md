@@ -2,11 +2,15 @@
 
 更新日期：2026-10-26。用户已确认 **Windows→Windows、macOS→Windows 的基础连接、画面与控制良好**。这条确认保留为产品事实；高级功能、特殊权限、故障恢复与性能仍分别核验。
 
+**当前工程分支不可作为可用整包交付。** 后续已复用 DL2-013 wire/codec 合同，但生产 context/epoch 仍为零；编译与 codec 测试通过，host runtime 业务测试实际失败。此过渡状态不改变用户确认的 main 基础路径，也不能被先前 probe 接入的绿色报告覆盖。
+
 ## 源码身份与版本
 
-本矩阵的功能实现基线是 `main@a905b8807c83677f6f962c18f8fd1593f0d4ca32`，初始工程入口切片是 `44a2a997834d01157ae27a08bc810804422a0f72`。后续工程 probe 接入源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`：只复用协议13契约、shared-probe 和独立 probe lane，尚不包含其他产品/Apple/媒体修复，也不是 main 已整合。下面的功能矩阵仍按 main 基线逐项说明；当前工程 checkout 的协议版本单列。
+本矩阵的功能实现基线是 `main@a905b8807c83677f6f962c18f8fd1593f0d4ca32`，初始工程入口切片是 `44a2a997834d01157ae27a08bc810804422a0f72`。后续工程 probe 接入源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，再复用 input context 合同后为 `5501aad9f7d160f751048036ac2a14cf0a315680`；尚不包含 host/发送/呈现接线及其他分支完整修复，也不是 main 已整合。下面的功能矩阵仍按 main 基线逐项说明；当前工程 checkout 的协议版本和失败状态单列。
 
 复用来源：协议 `9979c6424cf99f704feb212c7700833fce466dae` → 本分支 `e0d8df8a10fecab5818e04b999fbd424b12b933f`；shared-probe `3277c2a41af0ac923e1daa1c5cab5d952b355b9b` → `9c4119581508fc08c895aa8e3b24063ad03e657e`；probe lane `0836a8b311a858bf12f0d0b4427961c35f5986a7` → `673ec15a50afdffa06f9d65462a568ad2bb8f440`。shared-probe 的合并仅保留探测接线，排除依赖未引入 DL2-010 的两处 snapshot 格式调整；未为此引入整个媒体分支。接入测试另有带源码身份的报告，不用来源提交的测试结果替代。
+
+input context 合同 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` → `5501aad9f7d160f751048036ac2a14cf0a315680`。字段、非零校验和统一输入前缀已落地；`ControllerRuntime::send_input` 的显式 InputContext 参数和两平台生产者还未接通，不得在发送时补当前值。Windows HostVideoPipeline、FFI host 配置和两处 controller 输入生产者仍显式为零；非零校验会拒绝，不可用默认 1 绕过。
 
 版本从 manifest/配置读取，命令只读，不构建、不访问设备或网络：
 
@@ -24,7 +28,7 @@ python scripts/verify-windows-release.py --versions-only
 
 Windows 0.1.93 是公开测试构建，测试更新清单有独立签名；尚无 Windows Authenticode 正式发布验收。历史 0.1.91/0.1.92 的协议与安装记录保留原日期和范围，不能替代本阶段验收。
 
-产品分支在 `9979c6424cf99f704feb212c7700833fce466dae` 建立了 **协议 13** 的 `InputState { reason }` 契约，原因是 Blocked / UnsupportedKey / InvalidInput，`None` 表示恢复；仅末尾追加 postcard variant，relay JOIN 信封不变。本工程已为 probe 接入复用该独立契约，main 基线仍为 12；输入反馈/UI/旧端静默握手恢复不能仅凭契约提交算完成。DL2-013 的非零 input_epoch/stream 上下文尚待 Apple/FFI owner 独立交付，当前工程不具备严格端到端几何绑定。
+产品分支在 `9979c6424cf99f704feb212c7700833fce466dae` 建立了 **协议 13** 的 `InputState { reason }` 契约，原因是 Blocked / UnsupportedKey / InvalidInput，`None` 表示恢复；仅末尾追加 postcard variant，relay JOIN 信封不变。本工程已为 probe 接入复用该独立契约，main 基线仍为 12；输入反馈/UI/旧端静默握手恢复不能仅凭契约提交算完成。DL2-013 后续合同沿同一未发布13开发线，新增非零 input_epoch/stream、统一 `[0, version:u16 LE]` 输入前缀及 exact 解码；wire/codec 通过不等于 host 原子校验、事件入队 context 与实际首帧呈现门禁已接通，严格绑定仍未完成。
 
 ## 方向与功能矩阵
 
@@ -49,6 +53,8 @@ Windows 0.1.93 是公开测试构建，测试更新清单有独立签名；尚�
 工程切片的 Windows 本地结果：三个 Bun 项目测试 246 / 20 / 14 项与类型检查、前端生产构建、Python 127 项、Rust fmt/Clippy/workspace lib、协议与会话契约、localhost transport/relay、FFI runtime、媒体恢复及 Windows runtime 契约通过。原始命令/日志见本工作区 `dist/verify/verified-local.json`；记录的 source_commit 为 `a905b88`、dirty=true，表示基线加当时工程切片，而非 main 已整合所有修复。后续文档元数据检查另有独立结果。
 
 `native perf` 在当前 Windows 环境实际记录 Apple、未授权交互设备、未集成离线基线和完整性能条件为 skipped，报告 incomplete / passed=false。未运行真实远控、输入注入、线上发布/探针、Swift/Xcode、双机、GPU/CPU 对照或长稳。入口说明见[分层本地验证](local-verification.md)。2026-07-26 的 Apple、旧 Windows 发布冻结和其他历史报告保留原范围；第二阶段以 [TODO](../TODO.md) 前九节及本矩阵为准。
+
+最新合同过渡报告 `dist/verify/input-context-transition.json` 记录源码 `5501aad`、dirty=true：workspace 全target/feature编译、protocol49项、crypto/transport79项通过；host runtime 9通过/1失败，生产 `HostVideoPipeline::prepare` 的零epoch被拒绝为 `Protocol(InvalidVideoConfig)`，报告整体 failed / passed=false。它是待owner接线的业务失败，没有 skip、填默认值或改断言标绿。此前 `probe-integration.json` / `probe-clippy.json` 的源码是 `4c3648a`，仅证明此前 probe 接入，不能证明新过渡源码可运行。
 
 ## 独立分支的已提交证据快照
 

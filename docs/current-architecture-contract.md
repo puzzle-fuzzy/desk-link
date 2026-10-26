@@ -8,6 +8,7 @@
 ## 1. 产品边界
 
 - Windows 10/11 x64 是当前唯一正式发布目标；main `a905b88` 产品基线为 `0.1.93` 公开测试构建、业务协议 `12`。工程分支已为 probe 接入复用协议 `13` 独立契约及 DirectProbe lane，尚不代表该 main 已集成；当前 checkout 的应用/协议/工具链用 `python scripts/verify-windows-release.py --versions-only` 读取。[能力与证据矩阵](current-capabilities.md)分别保留功能基线、复用来源和工程源码身份。
+- 后续工程已复用 input context wire/codec 合同，但 host/发送/呈现尚未接线，零epoch生产结果被codec拒绝，真实host runtime测试失败；编译通过不表示运行通过，当前工程源码不可作为可用整包交付。不能默认1、发送时取当前epoch或跳过业务失败绕过门禁。
 - Windows 支持不登录账号的本地模式。可选账号只用于邮箱验证、账号会话和安装实例可见性，不替代设备配对、主机批准或端到端加密认证。
 - macOS Apple Silicon 同时保留 controller/host 开发与验收能力；iOS 16+ 只作为 controller，不对外宣称能托管或控制 iOS 系统。
 - 用户已确认 Windows→Windows、macOS→Windows 基础远控良好。Mac 的 IME、音频、剪贴板、文件、多屏、特殊恢复与真实权限分别核验；ScreenCaptureKit/VideoToolbox host 已有实现，不能写成未来空白计划，也不能用已有 Rust API 代替 Apple UI/桥接闭环。

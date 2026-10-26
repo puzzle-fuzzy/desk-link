@@ -95,7 +95,7 @@ python scripts/verify-managed-relay.py
 
 完整步骤、输入范围与故障处理见 [`docs/windows-two-pc-setup.md`](docs/windows-two-pc-setup.md)。
 
-当前候选的协议、功能和发布边界以本节、[CHANGELOG.md](CHANGELOG.md)、[当前架构契约](docs/current-architecture-contract.md) 与[能力矩阵](docs/current-capabilities.md)为准。下面的 0.1.91/0.1.92 段落是历史协议说明；当前 checkout 的版本用 `--versions-only` 读取。工程分支已为 probe 接入复用协议 13 契约，main 基线仍为协议 12，不构成已发布兼容承诺或各组功能已整合。
+当前候选的协议、功能和发布边界以本节、[CHANGELOG.md](CHANGELOG.md)、[当前架构契约](docs/current-architecture-contract.md) 与[能力矩阵](docs/current-capabilities.md)为准。下面的 0.1.91/0.1.92 段落是历史协议说明；当前 checkout 的版本用 `--versions-only` 读取。工程分支已复用协议 13 与 input context wire 合同，但生产者仍显式零、业务测试失败，是不可交付过渡；main 基线仍为协议 12，不构成已发布兼容承诺或各组功能已整合。
 
 0.1.91 将开发协议统一升级到 12，加入 H.264 Main/High Profile 能力协商、按 Noise 会话派生的候选绑定和视频直连 Offer/Answer 状态机。Windows 控制端会先探测 High Profile，WebView2 不支持时自动请求主机切回 Main；主机编码器创建 High MFT 失败也会自动回退。同一局域网会阶段性尝试经过认证的 DirectLan 视频数据面，探测失败自动回落公网中继；跨网络仍使用中继，4K 仍未作为用户能力开放。项目尚未正式发布；0.1.92 保持协议 12，可与 0.1.91 互连。
 
