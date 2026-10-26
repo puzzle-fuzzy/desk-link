@@ -34,6 +34,62 @@ impl Drop for TestRelay {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saved_direct_join_without_directory_still_rejects_protocol_12_noise() {
+    let relay = spawn_test_relay().await;
+    let config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+    let host = QuicClient::connect(config()).await.unwrap();
+    let controller = QuicClient::connect(config()).await.unwrap();
+    let session_id = SessionId::from_bytes([61; 16]);
+    host.join(RelayJoin::host_with_participant(
+        session_id, [62; 32], [1; 16],
+    ))
+    .await
+    .unwrap();
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session_id, [62; 32], [2; 16],
+        ))
+        .await
+        .unwrap();
+    let host_identity = DeviceIdentity::from_secret_key([63; 16], &[64; 32]);
+    let host_verify_key = host_identity.verify_key();
+    let host_task = tokio::spawn(async move {
+        let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
+        assert_eq!(first.protocol_version, 13);
+        let mut legacy_response = encode_noise_handshake(&NoiseHandshake {
+            protocol_version: PROTOCOL_VERSION,
+            step: NoiseHandshakeStep::ResponderHello,
+            payload: vec![1],
+        })
+        .unwrap();
+        assert_eq!(legacy_response[0], 13);
+        legacy_response[0] = 12;
+        host.send_control(legacy_response).await.unwrap();
+        host
+    });
+    let identity = DeviceIdentity::from_secret_key([65; 16], &[66; 32]);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        ControllerRuntime::connect(controller, identity, host_verify_key),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        Err(desklink_ffi::ControllerError::Protocol(
+            desklink_protocol::ProtocolError::UnsupportedVersion(12)
+        ))
+    ));
+    let _host = host_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_runtime_authenticates_decrypts_reassembles_and_sends_encrypted_actions() {
     let relay = spawn_test_relay().await;
     let config = || {

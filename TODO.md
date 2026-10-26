@@ -139,6 +139,8 @@
 ### DL2-009 · P1 · 让“有画面但无法操作”可解释、可恢复
 
 - [ ] 将持续输入受限转为独立会话状态，并补齐权限场景指引。
+- [x] 共享契约切片 `feat(DL2-009): add protocol 13 input restriction state`：唯一业务协议升至 13，末尾追加 InputState，三个稳定原因及 None 恢复；保留 relay JOIN 信封版本。协议/FFI 77 项、目录 6 项、Windows 原生升级提示 1 项测试通过，覆盖非法原因/截断、旧 tag、目录 12↔13 与密码先验、收到旧版 Noise/媒体拒绝。当前仅契约，未宣称输入反馈已接通。
+- [ ] 新旧直接/保存连接静默握手的有界退出与提示、持续输入失败汇总/恢复、前端提示及真实权限场景验收。
 - **证据 / 类型：源码缺陷、能力边界。** `apps/windows/src/input.rs:306-326` 返回 Blocked；`apps/windows/src/runtime.rs:2714-2723` 把 Blocked / UnsupportedKey / InvalidInput 都转为 Ok。`apps/windows/assets/desklink.manifest:8` 为 asInvoker、uiAccess=false。
 - **用户影响：** 输入持续失败时，控制端仍只看到已连接；无法区分权限限制、不支持的键或远端没有响应。
 - **方案：** 临时失败保留会话，持续失败按稳定原因汇总反馈并自动解除；对普通桌面、管理员窗口、UAC、安全桌面、锁屏分别定义支持范围；需要提权或受信服务时采用明确的本机授权流程。

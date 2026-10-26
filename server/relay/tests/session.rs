@@ -512,6 +512,62 @@ async fn directory_rejects_incompatible_protocol_only_after_password_matches() {
 }
 
 #[tokio::test]
+async fn protocol_12_and_13_directory_mismatch_is_bidirectional_and_password_protected() {
+    for (host_version, controller_version) in [(12, 13), (13, 12)] {
+        let relay = spawn_test_relay().await;
+        let device_id = 143_456_789_012;
+        let access_code = *b"AB2DEF3G";
+        let registration = RelayDirectoryRegistration::new_for_protocol(
+            device_id,
+            access_code,
+            b"protocol boundary invitation".to_vec(),
+            60,
+            host_version,
+        )
+        .unwrap();
+        let host = QuicClient::connect(config(&relay)).await.unwrap();
+        host.join(
+            RelayJoin::host_with_participant(session(34), [4; 32], [7; 16])
+                .with_directory_registration(registration)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let wrong_password = QuicClient::connect(config(&relay)).await.unwrap();
+        assert_eq!(
+            wrong_password
+                .lookup_directory(
+                    RelayDirectoryLookup::new_for_protocol(
+                        device_id,
+                        *b"AB2DEF4G",
+                        controller_version,
+                    )
+                    .unwrap()
+                )
+                .await,
+            Err(TransportError::DirectoryNotFound)
+        );
+        let correct_password = QuicClient::connect(config(&relay)).await.unwrap();
+        assert_eq!(
+            correct_password
+                .lookup_directory(
+                    RelayDirectoryLookup::new_for_protocol(
+                        device_id,
+                        access_code,
+                        controller_version,
+                    )
+                    .unwrap()
+                )
+                .await,
+            Err(TransportError::DirectoryProtocolMismatch {
+                controller: Some(controller_version),
+                host: Some(host_version),
+            })
+        );
+    }
+}
+
+#[tokio::test]
 async fn persistent_directory_entry_lives_until_the_host_disconnects() {
     let relay = spawn_test_relay().await;
     let device_id = 223_456_789_012;
