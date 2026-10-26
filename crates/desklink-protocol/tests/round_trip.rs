@@ -88,8 +88,8 @@ fn video_quality_commands_round_trip() {
 }
 
 #[test]
-fn playback_pressure_requires_profile_negotiation_protocol() {
-    assert_eq!(PROTOCOL_VERSION, 12);
+fn input_state_requires_protocol_13() {
+    assert_eq!(PROTOCOL_VERSION, 13);
 }
 
 #[test]
@@ -769,7 +769,7 @@ fn direct_lan_candidate_rejects_public_addresses_expiry_and_binding_reuse() {
 }
 
 #[test]
-fn direct_video_control_round_trips_inside_protocol_12() {
+fn direct_video_control_round_trips_inside_protocol_13() {
     let binding = [4; 16];
     let candidate = DirectLanCandidate::new(
         77,

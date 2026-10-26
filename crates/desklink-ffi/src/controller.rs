@@ -1092,6 +1092,7 @@ async fn negotiate_host(
                 | ControlMessage::SelectDisplay { .. }
                 | ControlMessage::SetAudioEnabled { .. }
                 | ControlMessage::AudioState { .. }
+                | ControlMessage::InputState { .. }
                 | ControlMessage::SetVideoQuality { .. }
                 | ControlMessage::SetVideoProfile { .. }
                 | ControlMessage::VideoQualityState { .. }
