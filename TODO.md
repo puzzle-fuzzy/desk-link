@@ -291,13 +291,18 @@
 
 - [x] **已实现并自动验证（`feat(DL2-016): select hardware MFTs with bounded software fallback`）：** 显式MFTEnumEx枚举NV12→H264硬件候选（最多尝试16），async unlock/事件credit授权/100ms进展预算；失败以相同帧在新config_version强制IDR重试软件，后续重配保持软件避免振荡。backend_info及基线报告记录实际后端/候选/稳定原因；见 `docs/windows-encoder-backends.md`。
 - **验证：** 2个新增credit/合成硬件故障用例通过，encoder_contract 11通过/1人工项忽略，基线percentile 1通过；lib+example严格Clippy通过。64×64合成软件及prefer-hardware各3帧烟测通过；后者真实枚举1候选、拒绝该配置后软件完成，报告source_unchanged=true。
-- [ ] **仍待硬件验收：** 本机未实际成功激活硬件异步编码；Intel/AMD/NVIDIA/混合GPU、真实device-loss与参数拒绝矩阵、CPU/GPU/帧龄恢复测量及GPU surface输入联合DL2-015验证。当前硬件输入仍为CPU NV12，不宣称零复制；进展预算不能中断驱动内部阻塞COM调用。
+- [ ] **仍待硬件验收：** 第一波仅验证CPU NV12输入和64²软件兜底，第二波surface实测见后续完成项；Intel/AMD/NVIDIA/混合GPU、真实device-loss与参数拒绝矩阵、CPU/GPU/帧龄恢复测量仍需联合DL2-015验收。进展预算不能中断驱动内部阻塞COM调用。
 
 - [x] **异步缓冲跟进（`fix(DL2-016): pump asynchronous MFT events across buffered inputs`）：** 合法NeedInput→输入1→NeedInput可返回等待下一输入，不再强求每输入100ms内必有输出；先排空旧输出、接收本次输入再交付旧帧，保留各时间戳/IDR元数据，不因INCOMPLETE把不同sample合为一帧。128 credit、16 pending、8MiB输出和100ms无事件/跨调用1秒无输出预算保持有界。
 - **验证：** encoder 14项通过（新增6个事件序列/容量/截止回归），lib严格Clippy通过；此为注入事件状态机验证，未代替真实硬件MFT事件执行与恢复矩阵。
 
 - [x] **输出时间戳跟进（`fix(DL2-016): reject unmatched encoder output timestamps`）：** 硬件缺失/未知输出时间戳在既有错误边界重试同一输入为软件IDR并锁定软件；软件未知明确时间戳产生可恢复错误，保留pending元数据，不再假装NeedMoreInput。软件未提供时间戳时保留FIFO契约。
 - **验证：** encoder 18项通过，新增当前/旧/未知/缺失时间戳矩阵及合成硬件损坏输出的同帧软件恢复；lib严格Clippy通过。真实厂商时间戳差异继续保留矩阵验收。
+
+- [x] **第二波真实surface编码（`feat(DL2-016): encode owned D3D11 surfaces with tracked sample leases`）：** runtime实际选择CaptureMediaFrame并进入GPU编码；按输入device LUID枚举硬件MFT，只读检查非零D3D11_AWARE，在async unlock后/格式协商前绑定DXGI device manager，包装NV12 subresource为MF DXGI buffer。TrackedSample回调持有独占lease直到最后外部sample引用释放，output/flush不提前归还。沿用原有async credit/pending/output/watchdog预算，真实backend替换先checked预留config后继；CPU/GPU切换、尺寸/设备重绑清旧pending但保持几何epoch。GPU错误从同一owned BGRA明确读回，切软件新config+IDR，当前peer关闭GPU重试；ConfigVersionExhausted仍typed退出、不wrap。
+- **本机验证：** NVIDIA720p实际8个surface输入/8输出，强制IDR1/3、709 matrix/limited metadata和CPU NV12/MF显式输入copy=0；6个GPU编码回归全部通过，含真正延迟交付输出的原ID/timestamp/config、故障同帧软件IDR/sticky关闭、版本耗尽，以及已有output后仍持额外sample COM引用→flush/drop encoder与原MFStartup guard→pool仍Busy→最后sample引用释放才精确归还同纹理。不是用“有输出”等价sample已释放。
+- **内容/R2联合验证：** GPU AnnexB→强制软件CMSH264DecoderMFT实际解码128帧，Main/High各512²及640×384重配、两phase更新；颜色/方向/UV/严格timestamp与SPS profile77/100、resize新SPS/首IDR通过，左右/上下/UV交换及旧phase反证也通过。真实runtime编码入口→submission归属→HostPipeline→VideoConfig token回归通过：GPU→CPU→GPU与纯codec重配保持epoch，同尺寸原点变化分配新epoch，旧实际GPU输出/旧release不能进入新映射。没有调用真实SendInput或采集桌面。相关库/tests严格Clippy通过。
+- [ ] **完整硬件/性能仍待：** Intel/AMD/混合GPU、实际driver/device loss、真实DXGI Acquire/Release、双机/长稳与帧龄/功耗；1080p/1440p/显式4K合成矩阵和可复跑阶段计量由后续015工具切片提供。首批64²软件兜底证据保留为历史，不再代表本机未成功GPU编码；本切片不把CopyResource+VP称零拷贝。
 
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 

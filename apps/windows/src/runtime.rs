@@ -58,8 +58,8 @@ use crate::{
         run_loopback_capture,
     },
     capture::{
-        CaptureError, CapturedFrame, DesktopCapturer, DisplayDescriptor, DisplayTopologySnapshot,
-        DxgiDesktopCapturer, available_displays, display_topology,
+        CaptureError, CaptureMediaFrame, CapturedFrame, DesktopCapturer, DisplayDescriptor,
+        DisplayTopologySnapshot, DxgiDesktopCapturer, available_displays, display_topology,
     },
     encoder::{EncodedFrame, EncoderError, H264Encoder, H264EncoderSettings},
     input::{InputInjectionError, InputInjector, VirtualDesktop},
@@ -364,8 +364,8 @@ pub enum PrepareVideo {
 }
 
 #[derive(Debug)]
-pub enum CaptureOutcome {
-    Frame(CapturedFrame),
+pub enum CaptureOutcome<T = CapturedFrame> {
+    Frame(T),
     Idle,
     Recovered,
 }
@@ -1028,6 +1028,46 @@ pub fn next_frame_with_recovery<C: DesktopCapturer>(
             Ok(CaptureOutcome::Recovered)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn next_media_frame_with_recovery(
+    capture: &mut DxgiDesktopCapturer,
+    timeout: Duration,
+    prefer_gpu: bool,
+) -> Result<CaptureOutcome<CaptureMediaFrame>, CaptureError> {
+    match capture.next_media_frame(timeout, prefer_gpu) {
+        Ok(frame) => Ok(CaptureOutcome::Frame(frame)),
+        Err(CaptureError::Timeout) => Ok(CaptureOutcome::Idle),
+        Err(CaptureError::AccessLost | CaptureError::Native(_)) => {
+            capture.recover()?;
+            Ok(CaptureOutcome::Recovered)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn encode_media_frame(
+    encoder: &mut H264Encoder,
+    frame: CaptureMediaFrame,
+    force_keyframe: bool,
+) -> Result<EncodedFrame, EncoderError> {
+    match frame {
+        CaptureMediaFrame::Cpu(frame) => encoder.encode(frame, force_keyframe),
+        #[cfg(windows)]
+        CaptureMediaFrame::Gpu(frame) => encoder.encode_gpu(&frame, force_keyframe),
+    }
+}
+
+fn prefer_gpu_input(encoder: &H264Encoder) -> bool {
+    #[cfg(windows)]
+    {
+        encoder.wants_gpu_input()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = encoder;
+        false
     }
 }
 
@@ -2583,7 +2623,11 @@ fn capture_encode_loop(
         let captured_context = lock_unpoisoned(&selected_desktop)
             .input_context()
             .ok_or(HostRuntimeError::CaptureWorkerStopped)?;
-        let outcome = match next_frame_with_recovery(&mut capture, CAPTURE_TIMEOUT) {
+        let outcome = match next_media_frame_with_recovery(
+            &mut capture,
+            CAPTURE_TIMEOUT,
+            prefer_gpu_input(&encoder),
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 // An active monitor can disappear between the once-per-second
@@ -2627,7 +2671,7 @@ fn capture_encode_loop(
                     .snapshot_due(force_keyframe.load(Ordering::Acquire), Instant::now())
                 {
                     capture
-                        .snapshot_frame()
+                        .snapshot_media_frame(prefer_gpu_input(&encoder))
                         .map_err(HostRuntimeError::Capture)?
                 } else {
                     continue;
@@ -2689,10 +2733,10 @@ fn capture_encode_loop(
             )));
         }
         let request_keyframe = force_keyframe.swap(false, Ordering::AcqRel);
-        if !frame_pacer.should_encode(frame.timestamp_us, request_keyframe) {
+        if !frame_pacer.should_encode(frame.timestamp_us(), request_keyframe) {
             continue;
         }
-        let result = encoder.encode(frame, request_keyframe);
+        let result = encode_media_frame(&mut encoder, frame, request_keyframe);
         if !encoder
             .last_performance_sample()
             .is_some_and(|sample| frame_input_contexts.record_submission(sample, captured_context))
@@ -4639,6 +4683,72 @@ mod retry_policy_tests {
             }
         }
 
+        #[cfg(windows)]
+        fn actual_media_context(
+            &mut self,
+            media: crate::capture::CaptureMediaFrame,
+            timestamp_base: u64,
+        ) -> (
+            InputContext,
+            crate::encoder::EncodedFrame,
+            crate::encoder::EncoderPerformanceSample,
+        ) {
+            let expected = self.selected.lock().unwrap().input_context().unwrap();
+            let mut identities = super::FrameInputContexts::default();
+            for tick in 0..32_u64 {
+                let timestamp_us = timestamp_base + tick * 33_333;
+                let frame = match &media {
+                    crate::capture::CaptureMediaFrame::Gpu(frame) => {
+                        crate::capture::CaptureMediaFrame::Gpu(frame.with_timestamp(timestamp_us))
+                    }
+                    crate::capture::CaptureMediaFrame::Cpu(frame) => {
+                        crate::capture::CaptureMediaFrame::Cpu(crate::capture::CapturedFrame {
+                            timestamp_us,
+                            ..frame.clone()
+                        })
+                    }
+                };
+                let result = super::encode_media_frame(&mut self.encoder, frame, true);
+                let sample = self
+                    .encoder
+                    .last_performance_sample()
+                    .expect("submission identity");
+                assert!(identities.record_submission(sample, expected));
+                let output = match result {
+                    Ok(output) => output,
+                    Err(EncoderError::NeedMoreInput) => continue,
+                    Err(error) => panic!("actual media encode failed: {error:?}"),
+                };
+                let captured = identities
+                    .take_output(&output)
+                    .expect("actual output identity");
+                assert_eq!(captured, expected);
+                let (width, height) = self.encoder.dimensions();
+                let super::PrepareVideo::Ready(prepared) = self
+                    .pipeline
+                    .prepare(output.clone(), width, height, captured.input_epoch)
+                    .unwrap()
+                else {
+                    continue;
+                };
+                let configuration = decode_video_config(
+                    prepared
+                        .video_config
+                        .as_deref()
+                        .expect("new actual encoder config"),
+                )
+                .unwrap();
+                assert_eq!(configuration.config_version, output.config_version);
+                let context = InputContext {
+                    stream_id: configuration.stream_id,
+                    input_epoch: configuration.input_epoch,
+                };
+                assert_eq!(context, expected);
+                return (context, output, sample);
+            }
+            panic!("no actual media output within bounded submissions");
+        }
+
         fn inject(&mut self, context: InputContext, sequence: u64, event: InputEvent) -> bool {
             let envelope = InputEnvelope {
                 stream_id: context.stream_id,
@@ -4657,6 +4767,129 @@ mod retry_policy_tests {
             )
             .unwrap()
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opt-in actual GPU surface encoding and synthetic epoch test; no desktop/input injection"]
+    fn gpu_media_backend_changes_preserve_epochs_and_same_size_geometry_rejects_old_outputs() {
+        use crate::{
+            capture::{CaptureMediaFrame, CapturedFrame},
+            gpu::{GpuBgraPool, create_device, create_synthetic_bgra, enumerate_adapters},
+        };
+        let adapter = enumerate_adapters()
+            .unwrap()
+            .into_iter()
+            .find(|a| !a.software)
+            .expect("hardware adapter");
+        let device = create_device(adapter.index).unwrap();
+        let pixels = [24u8, 100, 200, 255].repeat(1280 * 720);
+        let source = create_synthetic_bgra(&device, 1280, 720, &pixels).unwrap();
+        let pool = GpuBgraPool::from_device(device.clone(), 1280, 720, 2).unwrap();
+        let gpu = pool.copy_from(&source, 1).unwrap();
+        let mut fixture = EpochFixture::new();
+        fixture.encoder = crate::encoder::H264Encoder::new_with_settings(
+            1280,
+            720,
+            crate::encoder::H264EncoderSettings::default(),
+        )
+        .unwrap();
+        let (initial, old_output, old_sample) =
+            fixture.actual_media_context(CaptureMediaFrame::Gpu(gpu.clone()), 10_000_000);
+        assert!(
+            old_sample.gpu_surface_input,
+            "{:?}",
+            fixture.encoder.gpu_status()
+        );
+        assert_eq!(fixture.encoder.gpu_status().cpu_fallbacks, 0);
+        assert!(fixture.inject(initial, 1, key_event(true)));
+        let initial_version = old_output.config_version;
+        let (cpu_context, cpu_output, cpu_sample) = fixture.actual_media_context(
+            CaptureMediaFrame::Cpu(CapturedFrame {
+                width: 1280,
+                height: 720,
+                timestamp_us: 0,
+                pixels,
+            }),
+            20_000_000,
+        );
+        assert_eq!(cpu_context, initial);
+        assert!(!cpu_sample.gpu_surface_input);
+        assert!(cpu_output.keyframe && cpu_output.config_version > initial_version);
+        assert!(fixture.inject(cpu_context, 2, key_event(false)));
+        assert!(
+            super::prefer_gpu_input(&fixture.encoder),
+            "normal CPU transition must not latch a GPU failure"
+        );
+        let (rebound, rebound_output, rebound_sample) =
+            fixture.actual_media_context(CaptureMediaFrame::Gpu(gpu), 30_000_000);
+        assert_eq!(rebound, initial);
+        assert!(
+            rebound_sample.gpu_surface_input
+                && rebound_output.config_version > cpu_output.config_version
+        );
+        assert!(fixture.inject(rebound, 3, key_event(true)));
+        fixture.advance_codec_only();
+        let codec_source =
+            create_synthetic_bgra(&device, 1280, 720, &[80u8, 30, 140, 255].repeat(1280 * 720))
+                .unwrap();
+        let codec_frame = pool.copy_from(&codec_source, 1).unwrap();
+        let (codec_context, _, codec_sample) =
+            fixture.actual_media_context(CaptureMediaFrame::Gpu(codec_frame), 40_000_000);
+        assert_eq!(codec_context, initial);
+        assert!(codec_sample.gpu_surface_input);
+        let current = fixture.coordinator().current().unwrap();
+        let mut displays = current.displays().to_vec();
+        displays
+            .iter_mut()
+            .find(|d| d.id == current.active_display_id())
+            .unwrap()
+            .rect
+            .left += 10;
+        let next = current
+            .refreshed(displays, current.virtual_desktop())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.active_display().rect.width,
+            current.active_display().rect.width
+        );
+        fixture.coordinator().suspend();
+        assert!(fixture.publish_prepared(next).unwrap());
+        let next_source = create_synthetic_bgra(
+            &device,
+            1280,
+            720,
+            &[112u8, 66, 170, 255].repeat(1280 * 720),
+        )
+        .unwrap();
+        let next_frame = pool.copy_from(&next_source, 1).unwrap();
+        let (renewed, new_output, new_sample) =
+            fixture.actual_media_context(CaptureMediaFrame::Gpu(next_frame), 50_000_000);
+        assert_ne!(renewed.input_epoch, initial.input_epoch);
+        assert_eq!(renewed.stream_id, initial.stream_id);
+        assert!(
+            new_sample.gpu_surface_input && new_output.config_version > old_output.config_version
+        );
+        let mut queued = super::FrameInputContexts::default();
+        assert!(queued.record_submission(old_sample, initial));
+        assert!(queued.record_submission(new_sample, renewed));
+        assert!(
+            queued.take_output(&old_output).is_none(),
+            "an old actual GPU output cannot acquire the new geometry context"
+        );
+        assert!(
+            fixture
+                .pipeline
+                .prepare(old_output, 1280, 720, renewed.input_epoch)
+                .is_err()
+        );
+        assert!(fixture.inject(renewed, 4, key_event(true)));
+        assert!(!fixture.inject(initial, 9000, key_event(false)));
+        assert!(
+            fixture.inject(renewed, 5, key_event(false)),
+            "stale release must not consume the new context sequence"
+        );
     }
 
     #[test]

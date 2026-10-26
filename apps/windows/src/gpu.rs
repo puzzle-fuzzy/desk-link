@@ -898,3 +898,5 @@ fn copy_mapped(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod bitstream_validation;

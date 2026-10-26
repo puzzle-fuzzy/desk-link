@@ -2,8 +2,8 @@
 
 The second wave starts from frozen `65c70fd` on `codex/dl2-windows-gpu`.
 Protocol 13 and its input epoch/configuration ownership remain unchanged.
-The first GPU slice adds owned surfaces and capture APIs; production runtime
-selection and Media Foundation surface input are a subsequent DL2-016 slice.
+The first GPU slice adds owned surfaces and capture APIs. The DL2-016 slice
+connects production runtime selection and Media Foundation surface input.
 
 ## Surface ownership
 
@@ -65,6 +65,59 @@ tests passed on RTX 4070 Ti SUPER; four explicitly opted in to synthetic native
 GPU execution. This proves owned-copy, conversion and pool behavior, and does
 not prove MFT surface encoding, interactive DXGI capture, multi-adapter recovery
 or performance gains.
+
+## D3D11 surface encoding
+
+The runtime selects CPU or GPU capture using the encoder's actual input policy.
+GPU initialization binds the source device's adapter LUID and configures only
+an activated D3D11-aware hardware MFT. Async unlock precedes the DXGI device
+manager message, and the manager is installed before media-type negotiation.
+`MF_SA_D3D11_AWARE` is read, never overwritten. NV12 textures are wrapped in
+`MFCreateDXGISurfaceBuffer`; the tracked sample owns the pool lease.
+
+The existing async input credits, 16 pending frames, 8 MiB output budget and
+progress watchdog remain. A consumed output does not return the input lease.
+An external sample COM reference can keep a slot busy even after encoder flush,
+shutdown, drop and release of its startup guard. Only the final sample reference
+permits the allocator callback to return the lease.
+
+Every actual backend/configuration change reserves a checked new version before
+publication. GPU errors keep the source owned BGRA image for a same-frame CPU
+readback, software IDR retry and sticky GPU disable for this peer. Version
+exhaustion exits with its typed error. Ordinary CPU input after GPU changes the
+real backend/configuration without latching a device failure, allowing later
+GPU input to bind again. Empty old NV12 pool owners are dropped during switches;
+outstanding sample leases continue to own their surfaces independently.
+
+`gpu_status.surface_backend_active` describes the current backend. Adapter/MFT
+and manager negotiation fields retain historical attempt information and cannot
+alone identify an active GPU path. Normal GPU submissions report
+`gpu_surface_input=true`, CPU NV12 writes=0 and MF input copy bytes=0. BGRA GPU
+CopyResource and VP output writes still occur: this is not a zero-copy claim.
+
+Native opt-in tests verified NVIDIA720p eight surface inputs/eight outputs,
+forced IDRs, color attributes, CPU/GPU transitions, delayed output identity,
+same-frame software fallback, version exhaustion and final-release ownership.
+A separate software H.264 decoder validates 128 actual encoded frames across
+Main/High, two phases and 512²→640×384 reconfiguration. It checks timestamp,
+SPS/profile/dimensions and tile colors with compression tolerance; swapped
+axes/UV and stale-phase counterexamples fail the comparator.
+
+The R2 regression obtains input tokens from real encoded pipeline VideoConfig
+bytes. GPU→CPU→GPU and codec-only changes preserve the epoch. Same-size origin
+changes renew it; old encoded output and old input releases cannot acquire the
+new context. Injection uses a recording backend, never native SendInput.
+
+```powershell
+python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked encoder::gpu_tests:: -- --ignored --test-threads=1
+python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked gpu::bitstream_validation -- --include-ignored --test-threads=1
+python scripts/run-windows-cargo.py test -p desklink-windows --lib --locked gpu_media_backend_changes -- --ignored --test-threads=1
+```
+
+Intel/AMD/hybrid adapters, physical device/driver loss, actual duplication,
+two-machine latency and sustained workload measurements remain separate gates.
+The registry currently reclaims completed, unowned retired generations on its
+next allocation; an idle process may retain this bounded cache meanwhile.
 
 ## Official API basis
 

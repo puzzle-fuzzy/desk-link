@@ -4,6 +4,18 @@ use desklink_protocol::H264Profile;
 #[cfg(any(windows, test))]
 mod async_mft;
 mod bitrate;
+#[cfg(windows)]
+mod gpu;
+#[cfg(windows)]
+mod gpu_capabilities;
+#[cfg(windows)]
+mod gpu_sample;
+#[cfg(all(windows, test))]
+mod gpu_tests;
+#[cfg(windows)]
+pub use gpu::GpuEncoderStatus;
+#[cfg(windows)]
+pub use gpu_capabilities::{HardwareEncoderCapability, probe_hardware_encoder_capabilities};
 
 const MAX_ENCODE_WIDTH: u32 = 2560;
 const MAX_ENCODE_HEIGHT: u32 = 1440;
@@ -91,6 +103,7 @@ pub struct EncoderPerformanceSample {
     pub nv12_written_bytes: usize,
     pub nv12_buffer_grew: bool,
     pub mf_input_copy_bytes: usize,
+    pub gpu_surface_input: bool,
 }
 
 fn elapsed_us(started: std::time::Instant) -> u64 {
@@ -620,7 +633,16 @@ pub enum EncoderError {
     BackendUnavailable,
     NeedMoreInput,
     ConfigVersionExhausted,
+    #[cfg(windows)]
+    GpuOperation(GpuEncoderFailure),
     Native(String),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct GpuEncoderFailure {
+    pub stage: &'static str,
+    pub hresult: Option<i32>,
 }
 
 fn next_config_version(current: u32) -> Result<u32, EncoderError> {
@@ -634,7 +656,8 @@ fn next_config_version(current: u32) -> Result<u32, EncoderError> {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct EncoderBackendInfo {
-    /// Hardware MFTs still receive CPU NV12 here. This is not a GPU surface path.
+    /// The actual input path is explicit; system-memory and D3D11 surface
+    /// backends must never be conflated in capability/performance evidence.
     pub kind: &'static str,
     pub name: String,
     pub hardware_candidates: usize,
@@ -1019,6 +1042,12 @@ pub struct H264Encoder {
     pending_frames: std::collections::VecDeque<PendingFrame>,
     #[cfg(windows)]
     backend: native::MediaFoundationEncoder,
+    #[cfg(windows)]
+    gpu_input: Option<gpu::GpuInputState>,
+    #[cfg(windows)]
+    gpu_failed: bool,
+    #[cfg(windows)]
+    gpu_status: GpuEncoderStatus,
 }
 
 #[cfg(any(windows, test))]
@@ -1111,6 +1140,9 @@ impl H264Encoder {
                 last_performance_sample: None,
                 pending_frames: std::collections::VecDeque::new(),
                 backend,
+                gpu_input: None,
+                gpu_failed: false,
+                gpu_status: GpuEncoderStatus::default(),
             })
         }
 
@@ -1136,6 +1168,9 @@ impl H264Encoder {
         if target_dimensions != (self.width, self.height) {
             self.rebuild(target_dimensions.0, target_dimensions.1)?;
         }
+
+        #[cfg(windows)]
+        let force_keyframe = self.ensure_cpu_input_mode()? || force_keyframe;
 
         #[cfg(windows)]
         {
@@ -1193,6 +1228,8 @@ impl H264Encoder {
                     // A backend failure invalidates all reference pictures. Bind
                     // the retry to a fresh config and force an IDR of this frame.
                     self.backend = replacement;
+                    self.gpu_status.surface_backend_active = false;
+                    self.gpu_input = None;
                     self.backend_preference = EncoderBackendPreference::SoftwareOnly;
                     self.profile = profile;
                     self.config_version = config_version;
@@ -1210,7 +1247,7 @@ impl H264Encoder {
                 }
                 Err(error) => return Err(error),
             };
-            self.last_performance_sample = Some(EncoderPerformanceSample {
+            let performance_sample = EncoderPerformanceSample {
                 frame_id: next_frame_id,
                 output_frame_id: None,
                 config_version: self.config_version,
@@ -1222,44 +1259,15 @@ impl H264Encoder {
                 nv12_buffer_grew: self.nv12_buffer.capacity() > previous_nv12_capacity,
                 mf_input_copy_bytes: failed_input_copy_bytes
                     .saturating_add(self.backend.last_input_copy_bytes()),
-            });
-            self.frame_id = next_frame_id;
-            self.pending_frames.push_back(PendingFrame {
-                frame_id: next_frame_id,
-                config_version: self.config_version,
-                timestamp_us: frame.timestamp_us,
+                gpu_surface_input: false,
+            };
+            self.finish_submission(
+                frame.timestamp_us,
                 submitted_at,
-            });
-            if self.pending_frames.len() > MAX_PENDING_FRAMES {
-                self.pending_frames.clear();
-                return Err(EncoderError::Native(
-                    "encoder pending metadata budget exceeded".into(),
-                ));
-            }
-            let Some(output) = output else {
-                if let Some(sample) = &mut self.last_performance_sample {
-                    sample.pending_frames = self.pending_frames.len();
-                }
-                return Err(EncoderError::NeedMoreInput);
-            };
-            let pending = match_pending_output(&mut self.pending_frames, output.timestamp_us);
-            let Some(pending) = pending else {
-                return Err(EncoderError::Native(
-                    "encoder_output_without_pending_input".into(),
-                ));
-            };
-            if let Some(sample) = &mut self.last_performance_sample {
-                sample.pending_frames = self.pending_frames.len();
-                record_output_performance(sample, pending);
-            }
-            Ok(EncodedFrame {
-                frame_id: pending.frame_id,
-                config_version: pending.config_version,
-                keyframe: output.keyframe,
-                timestamp_us: pending.timestamp_us,
-                access_unit: output.access_unit,
-                sequence_header: output.sequence_header,
-            })
+                next_frame_id,
+                output,
+                performance_sample,
+            )
         }
 
         #[cfg(not(windows))]
@@ -1267,6 +1275,55 @@ impl H264Encoder {
             let _ = (frame, force_keyframe);
             Err(EncoderError::BackendUnavailable)
         }
+    }
+
+    #[cfg(windows)]
+    fn finish_submission(
+        &mut self,
+        timestamp_us: u64,
+        submitted_at: std::time::Instant,
+        next_frame_id: u64,
+        output: Option<native::EncodedOutput>,
+        performance_sample: EncoderPerformanceSample,
+    ) -> Result<EncodedFrame, EncoderError> {
+        self.last_performance_sample = Some(performance_sample);
+        self.frame_id = next_frame_id;
+        self.pending_frames.push_back(PendingFrame {
+            frame_id: next_frame_id,
+            config_version: self.config_version,
+            timestamp_us,
+            submitted_at,
+        });
+        if self.pending_frames.len() > MAX_PENDING_FRAMES {
+            self.pending_frames.clear();
+            return Err(EncoderError::Native(
+                "encoder pending metadata budget exceeded".into(),
+            ));
+        }
+        let Some(output) = output else {
+            if let Some(sample) = &mut self.last_performance_sample {
+                sample.pending_frames = self.pending_frames.len();
+            }
+            return Err(EncoderError::NeedMoreInput);
+        };
+        let pending = match_pending_output(&mut self.pending_frames, output.timestamp_us);
+        let Some(pending) = pending else {
+            return Err(EncoderError::Native(
+                "encoder_output_without_pending_input".into(),
+            ));
+        };
+        if let Some(sample) = &mut self.last_performance_sample {
+            sample.pending_frames = self.pending_frames.len();
+            record_output_performance(sample, pending);
+        }
+        Ok(EncodedFrame {
+            frame_id: pending.frame_id,
+            config_version: pending.config_version,
+            keyframe: output.keyframe,
+            timestamp_us: pending.timestamp_us,
+            access_unit: output.access_unit,
+            sequence_header: output.sequence_header,
+        })
     }
 
     pub fn rebuild(&mut self, width: u32, height: u32) -> Result<(), EncoderError> {
@@ -1301,6 +1358,8 @@ impl H264Encoder {
                 Err(error) => return Err(error),
             };
             self.backend = backend;
+            self.gpu_status.surface_backend_active = false;
+            self.gpu_input = None;
             self.profile = profile;
             self.pending_frames.clear();
             self.last_performance_sample = None;
@@ -1350,6 +1409,8 @@ impl H264Encoder {
                 Err(error) => return Err(error),
             };
             self.backend = backend;
+            self.gpu_status.surface_backend_active = false;
+            self.gpu_input = None;
             self.profile = profile;
             self.pending_frames.clear();
             self.last_performance_sample = None;
@@ -1430,28 +1491,32 @@ mod native {
     use windows::{
         Win32::{
             Foundation::{RPC_E_CHANGED_MODE, VARIANT_FALSE, VARIANT_TRUE},
+            Graphics::Direct3D11::ID3D11Device,
             Media::MediaFoundation::{
                 CMSH264EncoderMFT, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
                 CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
                 CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVDefaultBPictureCount,
                 CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
-                CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaEventGenerator,
-                IMFMediaType, IMFSample, IMFShutdown, IMFTransform, METransformHaveOutput,
-                METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
-                MF_E_TRANSFORM_NEED_MORE_INPUT, MF_EVENT_FLAG_NO_WAIT, MF_LOW_LATENCY,
-                MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-                MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE,
-                MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
-                MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer,
-                MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint,
-                MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+                CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFDXGIDeviceManager,
+                IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown, IMFTransform,
+                METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
+                MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_EVENT_FLAG_NO_WAIT,
+                MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+                MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER,
+                MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+                MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
+                MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
+                MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+                MFNominalRange_16_235, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown,
+                MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
                 MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
                 MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
                 MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-                MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-                MFT_OUTPUT_DATA_BUFFER_INCOMPLETE, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-                MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-                MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+                MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
+                MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_DATA_BUFFER_INCOMPLETE,
+                MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+                MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+                MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_PeakConstrainedVBR,
                 eAVEncH264VProfile_High, eAVEncH264VProfile_Main,
             },
             System::Com::{
@@ -1522,7 +1587,7 @@ mod native {
         result
     }
 
-    fn hardware_candidates() -> Result<Vec<IMFActivate>, EncoderError> {
+    pub(super) fn hardware_candidates() -> Result<Vec<IMFActivate>, EncoderError> {
         let input = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_NV12,
@@ -1557,7 +1622,7 @@ mod native {
         Ok(candidates)
     }
 
-    fn activation_name(activation: &IMFActivate) -> String {
+    pub(super) fn activation_name(activation: &IMFActivate) -> String {
         let length = unsafe { activation.GetStringLength(&MFT_FRIENDLY_NAME_Attribute) }
             .unwrap_or(0)
             .min(512);
@@ -1580,12 +1645,12 @@ mod native {
         pub timestamp_us: Option<u64>,
     }
 
-    struct NativeRuntime {
+    pub(super) struct NativeRuntime {
         com_initialized: bool,
     }
 
     impl NativeRuntime {
-        fn start() -> Result<Self, EncoderError> {
+        pub(super) fn start() -> Result<Self, EncoderError> {
             let com_result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
             let com_initialized = if com_result.is_ok() {
                 true
@@ -1630,14 +1695,104 @@ mod native {
         async_output_bytes: usize,
         async_clock: Instant,
         last_input_copy_bytes: usize,
+        device_manager: Option<IMFDXGIDeviceManager>,
+        gpu_adapter_luid: Option<u64>,
+        last_input_accepted: bool,
         #[cfg(test)]
         simulated_hardware_failure: bool,
         #[cfg(test)]
         simulated_output_timestamp: Option<(Option<u64>, bool)>,
+        #[cfg(test)]
+        delay_surface_output_once: bool,
         _runtime: NativeRuntime,
     }
 
     impl MediaFoundationEncoder {
+        pub fn for_gpu(
+            device: &ID3D11Device,
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate: u32,
+            profile: H264Profile,
+        ) -> Result<Self, EncoderError> {
+            let _runtime = NativeRuntime::start()?;
+            let mut token = 0;
+            let mut manager = None;
+            unsafe { MFCreateDXGIDeviceManager(&mut token, &mut manager) }
+                .map_err(|error| gpu_error("create_dxgi_device_manager", error))?;
+            let manager = manager.ok_or({
+                EncoderError::GpuOperation(super::GpuEncoderFailure {
+                    stage: "create_dxgi_device_manager_null",
+                    hresult: None,
+                })
+            })?;
+            unsafe { manager.ResetDevice(device, token) }
+                .map_err(|error| gpu_error("reset_dxgi_device", error))?;
+            let (adapter_luid, candidates) =
+                super::gpu_capabilities::hardware_candidates_for_device(device)?;
+            let count = candidates.len();
+            let mut failure = EncoderError::GpuOperation(super::GpuEncoderFailure {
+                stage: "no_d3d11_hardware_candidate",
+                hresult: None,
+            });
+            for (rejected, activation) in
+                candidates.iter().take(MAX_HARDWARE_CANDIDATES).enumerate()
+            {
+                let transform = match unsafe { activation.ActivateObject::<IMFTransform>() } {
+                    Ok(transform) => transform,
+                    Err(error) => {
+                        failure = gpu_error("activate_gpu_mft", error);
+                        continue;
+                    }
+                };
+                let aware = unsafe {
+                    transform
+                        .GetAttributes()
+                        .and_then(|attributes| attributes.GetUINT32(&MF_SA_D3D11_AWARE))
+                };
+                match aware {
+                    Ok(value) if value != 0 => {}
+                    Ok(_) => {
+                        let _ = unsafe { activation.ShutdownObject() };
+                        continue;
+                    }
+                    Err(error) => {
+                        failure = gpu_error("read_d3d11_awareness", error);
+                        let _ = unsafe { activation.ShutdownObject() };
+                        continue;
+                    }
+                }
+                let info = EncoderBackendInfo {
+                    kind: "hardware_mft_d3d11_surface",
+                    name: activation_name(activation),
+                    hardware_candidates: count,
+                    rejected_candidates: rejected,
+                    fallback_reason: None,
+                };
+                match Self::configure(
+                    transform,
+                    info,
+                    width,
+                    height,
+                    fps,
+                    bitrate,
+                    profile,
+                    Some(manager.clone()),
+                ) {
+                    Ok(mut backend) => {
+                        backend.gpu_adapter_luid = Some(adapter_luid);
+                        return Ok(backend);
+                    }
+                    Err(error) => {
+                        failure = error;
+                        let _ = unsafe { activation.ShutdownObject() };
+                    }
+                }
+            }
+            Err(failure)
+        }
+
         pub fn with_preference(
             width: u32,
             height: u32,
@@ -1681,8 +1836,9 @@ mod native {
                         fallback_reason: None,
                     };
                     if let Ok(transform) = unsafe { activation.ActivateObject::<IMFTransform>() } {
-                        match Self::configure(transform, info, width, height, fps, bitrate, profile)
-                        {
+                        match Self::configure(
+                            transform, info, width, height, fps, bitrate, profile, None,
+                        ) {
                             Ok(backend) => return Ok(backend),
                             Err(_) => {
                                 let _ = unsafe { activation.ShutdownObject() };
@@ -1722,9 +1878,10 @@ mod native {
                 rejected_candidates: 0,
                 fallback_reason: None,
             };
-            Self::configure(transform, info, width, height, fps, bitrate, profile)
+            Self::configure(transform, info, width, height, fps, bitrate, profile, None)
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn configure(
             transform: IMFTransform,
             info: EncoderBackendInfo,
@@ -1733,9 +1890,17 @@ mod native {
             fps: u32,
             bitrate: u32,
             profile: H264Profile,
+            device_manager: Option<IMFDXGIDeviceManager>,
         ) -> Result<Self, EncoderError> {
             let runtime = NativeRuntime::start()?;
-            let events = if info.kind == "hardware_mft_system_memory" {
+            let native_error = |stage: &'static str, error: windows::core::Error| {
+                if device_manager.is_some() {
+                    gpu_error(stage, error)
+                } else {
+                    native_error(stage, error)
+                }
+            };
+            let events = if info.kind != "microsoft_software_mft" {
                 let attributes = unsafe { transform.GetAttributes() }
                     .map_err(|error| native_error("hardware MFT attributes", error))?;
                 if unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 1 {
@@ -1753,6 +1918,12 @@ mod native {
             } else {
                 None
             };
+            if let Some(manager) = &device_manager {
+                unsafe {
+                    transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+                }
+                .map_err(|error| gpu_error("set_d3d_manager", error))?;
+            }
             let output_type = create_output_type(width, height, fps, bitrate, profile)?;
             let input_type = create_input_type(width, height, fps)?;
             let codec_api = transform.cast::<ICodecAPI>().ok();
@@ -1763,11 +1934,9 @@ mod native {
                 if let Ok(attributes) = transform.GetAttributes() {
                     let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
                 }
-                transform
-                    .SetOutputType(0, &output_type, 0)
+                set_type_with_color_fallback(&transform, &output_type, true)
                     .map_err(|error| native_error("set H.264 output type", error))?;
-                transform
-                    .SetInputType(0, &input_type, 0)
+                set_type_with_color_fallback(&transform, &input_type, false)
                     .map_err(|error| native_error("set NV12 input type", error))?;
                 transform
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
@@ -1816,10 +1985,15 @@ mod native {
                 async_output_bytes: 0,
                 async_clock: Instant::now(),
                 last_input_copy_bytes: 0,
+                device_manager,
+                gpu_adapter_luid: None,
+                last_input_accepted: false,
                 #[cfg(test)]
                 simulated_hardware_failure: false,
                 #[cfg(test)]
                 simulated_output_timestamp: None,
+                #[cfg(test)]
+                delay_surface_output_once: false,
                 _runtime: runtime,
             })
         }
@@ -1831,6 +2005,7 @@ mod native {
             force_keyframe: bool,
         ) -> Result<Option<EncodedOutput>, EncoderError> {
             self.last_input_copy_bytes = 0;
+            self.last_input_accepted = false;
             #[cfg(test)]
             if self.simulated_hardware_failure {
                 return Err(EncoderError::Native("synthetic hardware failure".into()));
@@ -1893,6 +2068,50 @@ mod native {
             &self.info
         }
 
+        pub fn encode_surface(
+            &mut self,
+            sample: &IMFSample,
+            force_keyframe: bool,
+        ) -> Result<Option<EncodedOutput>, EncoderError> {
+            self.last_input_copy_bytes = 0;
+            self.last_input_accepted = false;
+            #[cfg(test)]
+            if self.simulated_hardware_failure {
+                return Err(EncoderError::GpuOperation(super::GpuEncoderFailure {
+                    stage: "synthetic_surface_failure",
+                    hresult: None,
+                }));
+            }
+            if !self.uses_gpu_surfaces() {
+                return Err(EncoderError::GpuOperation(super::GpuEncoderFailure {
+                    stage: "surface_backend_not_configured",
+                    hresult: None,
+                }));
+            }
+            if force_keyframe && let Some(codec) = &self.codec_api {
+                let _ =
+                    unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &u32_variant(1)) };
+            }
+            let output = self.encode_async(sample)?;
+            #[cfg(test)]
+            if std::mem::take(&mut self.delay_surface_output_once) {
+                if let Some(output) = output {
+                    self.async_output_bytes = super::async_mft::queued_bytes_after(
+                        self.async_output_bytes,
+                        output.access_unit.len(),
+                    )?;
+                    self.async_outputs.push_front(output);
+                }
+                return Ok(None);
+            }
+            Ok(output)
+        }
+
+        pub fn record_fallback(&mut self, previous: EncoderBackendInfo, reason: &'static str) {
+            self.record_runtime_fallback(previous);
+            self.info.fallback_reason = Some(reason);
+        }
+
         pub fn try_set_bitrate(&mut self, bitrate: u32) -> Result<bool, EncoderError> {
             let Some(codec) = &self.codec_api else {
                 return Ok(false);
@@ -1919,9 +2138,49 @@ mod native {
             self.events.is_some()
         }
 
+        pub fn uses_gpu_surfaces(&self) -> bool {
+            self.device_manager.is_some()
+        }
+
+        pub fn last_input_accepted(&self) -> bool {
+            self.last_input_accepted
+        }
+
+        fn operation_error(
+            &self,
+            stage: &'static str,
+            error: windows::core::Error,
+        ) -> EncoderError {
+            if self.uses_gpu_surfaces() {
+                gpu_error(stage, error)
+            } else {
+                native_error(stage, error)
+            }
+        }
+        pub fn gpu_adapter_luid(&self) -> Option<u64> {
+            self.gpu_adapter_luid
+        }
+
+        pub fn color_metadata(&self) -> (Option<u32>, Option<u32>) {
+            let media_type = unsafe { self.transform.GetOutputCurrentType(0) }.ok();
+            (
+                media_type
+                    .as_ref()
+                    .and_then(|value| unsafe { value.GetUINT32(&MF_MT_YUV_MATRIX) }.ok()),
+                media_type
+                    .as_ref()
+                    .and_then(|value| unsafe { value.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }.ok()),
+            )
+        }
+
         #[cfg(test)]
         pub fn inject_hardware_failure(&mut self) {
             self.simulated_hardware_failure = true;
+        }
+
+        #[cfg(test)]
+        pub fn delay_next_surface_output(&mut self) {
+            self.delay_surface_output_once = true;
         }
 
         #[cfg(test)]
@@ -1948,13 +2207,13 @@ mod native {
                 let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                     Ok(event) => event,
                     Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => break,
-                    Err(error) => return Err(native_error("read hardware MFT event", error)),
+                    Err(error) => return Err(self.operation_error("read_async_event", error)),
                 };
                 unsafe { event.GetStatus() }
                     .and_then(|status| status.ok())
-                    .map_err(|error| native_error("hardware MFT event status", error))?;
+                    .map_err(|error| self.operation_error("async_event_status", error))?;
                 let event_type = unsafe { event.GetType() }
-                    .map_err(|error| native_error("hardware MFT event type", error))?;
+                    .map_err(|error| self.operation_error("async_event_type", error))?;
                 if event_type == METransformNeedInput.0 as u32 {
                     self.scheduler.need_input()?;
                 } else if event_type == METransformHaveOutput.0 as u32 {
@@ -2011,8 +2270,9 @@ mod native {
                     }
                     super::async_mft::Action::SubmitInput => {
                         unsafe { self.transform.ProcessInput(0, sample, 0) }
-                            .map_err(|error| native_error("submit hardware NV12 sample", error))?;
+                            .map_err(|error| self.operation_error("submit_async_input", error))?;
                         self.scheduler.submitted(now_us);
+                        self.last_input_accepted = true;
                         submitted = true;
                     }
                     super::async_mft::Action::Yield => {
@@ -2077,7 +2337,7 @@ mod native {
 
         fn take_output_part(&self) -> Result<Option<OutputPart>, EncoderError> {
             let stream_info = unsafe { self.transform.GetOutputStreamInfo(0) }
-                .map_err(|error| native_error("refresh H.264 output stream info", error))?;
+                .map_err(|error| self.operation_error("refresh_output_stream_info", error))?;
             let sample = if stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0 {
                 None
             } else {
@@ -2101,7 +2361,7 @@ mod native {
                 if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                     return Ok(None);
                 }
-                return Err(native_error("read H.264 output", error));
+                return Err(self.operation_error("process_output", error));
             }
             let Some(sample) = sample else {
                 return Ok(None);
@@ -2113,22 +2373,22 @@ mod native {
                 .and_then(|timestamp| u64::try_from(timestamp).ok())
                 .map(|timestamp| timestamp / 10);
             let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-                .map_err(|error| native_error("coalesce H.264 output", error))?;
+                .map_err(|error| self.operation_error("coalesce_output", error))?;
             let length = unsafe { buffer.GetCurrentLength() }
-                .map_err(|error| native_error("get H.264 output length", error))?;
+                .map_err(|error| self.operation_error("get_output_length", error))?;
             if self.events.is_some() {
                 super::async_mft::queued_bytes_after(self.async_output_bytes, length as usize)?;
             }
             let mut data = ptr::null_mut();
             unsafe { buffer.Lock(&mut data, None, None) }
-                .map_err(|error| native_error("lock H.264 output", error))?;
+                .map_err(|error| self.operation_error("lock_output", error))?;
             let bytes = if data.is_null() || length == 0 {
                 Vec::new()
             } else {
                 unsafe { slice::from_raw_parts(data, length as usize) }.to_vec()
             };
             unsafe { buffer.Unlock() }
-                .map_err(|error| native_error("unlock H.264 output", error))?;
+                .map_err(|error| self.operation_error("unlock_output", error))?;
             Ok(Some(OutputPart {
                 bytes,
                 keyframe,
@@ -2148,6 +2408,11 @@ mod native {
                 let _ = self
                     .transform
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+                if self.device_manager.is_some() {
+                    let _ = self
+                        .transform
+                        .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+                }
                 if self.events.is_some()
                     && let Ok(shutdown) = self.transform.cast::<IMFShutdown>()
                 {
@@ -2217,6 +2482,7 @@ mod native {
         };
         unsafe { media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile_value as u32) }
             .map_err(|error| native_error("set H.264 profile", error))?;
+        set_color_attributes(&media_type);
         Ok(media_type)
     }
 
@@ -2256,7 +2522,40 @@ mod native {
             media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
         }
         .map_err(|error| native_error("set NV12 interlace mode", error))?;
+        set_color_attributes(&media_type);
         Ok(media_type)
+    }
+
+    fn set_color_attributes(media_type: &IMFMediaType) {
+        unsafe {
+            let _ = media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
+            let _ =
+                media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
+        }
+    }
+
+    unsafe fn set_type_with_color_fallback(
+        transform: &IMFTransform,
+        media_type: &IMFMediaType,
+        output: bool,
+    ) -> windows::core::Result<()> {
+        let apply = || unsafe {
+            if output {
+                transform.SetOutputType(0, media_type, 0)
+            } else {
+                transform.SetInputType(0, media_type, 0)
+            }
+        };
+        if apply().is_ok() {
+            return Ok(());
+        }
+        // Metadata support is optional; preserve the existing NV12 pixel
+        // conversion contract when a driver rejects explicit color attributes.
+        unsafe {
+            let _ = media_type.DeleteItem(&MF_MT_YUV_MATRIX);
+            let _ = media_type.DeleteItem(&MF_MT_VIDEO_NOMINAL_RANGE);
+        }
+        apply()
     }
 
     fn create_input_sample(
@@ -2381,5 +2680,12 @@ mod native {
 
     fn native_error(context: &str, error: windows::core::Error) -> EncoderError {
         EncoderError::Native(format!("{context}: {error}"))
+    }
+
+    fn gpu_error(stage: &'static str, error: windows::core::Error) -> EncoderError {
+        EncoderError::GpuOperation(super::GpuEncoderFailure {
+            stage,
+            hresult: Some(error.code().0),
+        })
     }
 }
