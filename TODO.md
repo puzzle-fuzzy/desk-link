@@ -214,6 +214,10 @@
 - **验收：** 1080p/1440p、集显/独显/混合 GPU 下比较复制字节、分配、CPU/GPU 时间及帧龄；GPU 常驻路径故障可降级且不破坏输入。收益待实测。
 - **依据：** [Microsoft 的 Direct3D-aware MFT 说明](https://learn.microsoft.com/en-us/windows/win32/medfound/direct3d-aware-mfts)给出了 surface 输入和 D3D manager 接口；是否能用于具体编码器必须实测能力。
 
+- [x] **已实现并自动验证（`perf(DL2-015): reuse owned staging textures for desktop readback`）：** 捕获进程持有staging/context缓存，以D3D device身份和完整texture布局失效；Map/复制/Unmap在ReleaseFrame前完成，不保留失效桌面surface。
+- **验证：** `test -p desklink-windows --lib --locked capture::` 10通过、2忽略；3个WARP合成用例验证复用后新像素、尺寸/device失效、row pitch/padding；显式dev WARP基准1通过、staging创建60→1。命令与release复跑规范见 `docs/windows-capture-readback-benchmark.md`。上述是软件D3D工具/正确性验证，不代表真实GPU收益；CPU回读字节不变。
+- [ ] **仍待实现/硬件验收：** GPU缩放/转色/NV12 surface编码链、CPU输出/转换buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照。
+
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
 - [ ] 建立编码后端能力探测、选择、诊断与恢复机制。

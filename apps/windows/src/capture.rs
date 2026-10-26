@@ -4,6 +4,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use desklink_session::DesktopRect;
 
+#[cfg(windows)]
+mod readback;
+#[cfg(windows)]
+use readback::TextureReadback;
+
 #[derive(Clone, Debug)]
 pub struct CapturedFrame {
     pub width: u32,
@@ -37,6 +42,7 @@ pub struct DxgiDesktopCapturer {
     /// fallback so a static desktop still produces the first remote frame.
     initial_snapshot_pending: bool,
     dxgi_recovery: DxgiRecoverySchedule,
+    readback: TextureReadback,
 }
 
 #[cfg(windows)]
@@ -336,6 +342,7 @@ impl DxgiDesktopCapturer {
             display_id,
             initial_snapshot_pending: true,
             dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
+            readback: TextureReadback::default(),
         })
     }
 
@@ -388,6 +395,7 @@ impl DxgiDesktopCapturer {
             display_id,
             initial_snapshot_pending: true,
             dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
+            readback: TextureReadback::default(),
         })
     }
 
@@ -415,6 +423,7 @@ impl DxgiDesktopCapturer {
             display_id,
             initial_snapshot_pending: false,
             dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
+            readback: TextureReadback::default(),
         })
     }
 
@@ -723,7 +732,8 @@ impl DesktopCapturer for DxgiDesktopCapturer {
                 .ok_or_else(|| CaptureError::Native("DXGI returned no desktop resource".into()))
                 .and_then(|resource| resource.cast::<ID3D11Texture2D>().map_err(native_error))
                 .and_then(|texture| {
-                    copy_texture_pixels(&texture, self.dimensions.0, self.dimensions.1)
+                    self.readback
+                        .copy_pixels(&texture, self.dimensions.0, self.dimensions.1)
                 });
             let release_result = unsafe { duplication.ReleaseFrame() };
             let pixels = pixels?;
@@ -895,90 +905,6 @@ fn capture_gdi_frame(desktop: DesktopRect) -> Result<CapturedFrame, CaptureError
         timestamp_us: now_micros(),
         pixels,
     })
-}
-
-#[cfg(windows)]
-fn copy_texture_pixels(
-    texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, CaptureError> {
-    use std::slice;
-
-    use windows::Win32::Graphics::{
-        Direct3D11::{
-            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
-            D3D11_USAGE_STAGING, ID3D11Texture2D,
-        },
-        Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
-    };
-
-    let mut description = D3D11_TEXTURE2D_DESC::default();
-    unsafe { texture.GetDesc(&mut description) };
-    if description.Width != width || description.Height != height {
-        return Err(CaptureError::Native(
-            "DXGI desktop texture dimensions changed unexpectedly".into(),
-        ));
-    }
-    if !matches!(
-        description.Format,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-    ) {
-        return Err(CaptureError::Native(format!(
-            "unsupported DXGI desktop texture format: {:?}",
-            description.Format
-        )));
-    }
-
-    let device = unsafe { texture.GetDevice() }.map_err(native_error)?;
-    let context = unsafe { device.GetImmediateContext() }.map_err(native_error)?;
-    description.Usage = D3D11_USAGE_STAGING;
-    description.BindFlags = 0;
-    description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-    description.MiscFlags = 0;
-    let mut staging: Option<ID3D11Texture2D> = None;
-    unsafe { device.CreateTexture2D(&description, None, Some(&mut staging)) }
-        .map_err(native_error)?;
-    let staging = staging
-        .ok_or_else(|| CaptureError::Native("D3D11 did not return a staging texture".into()))?;
-    unsafe { context.CopyResource(&staging, texture) };
-
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-        .map_err(native_error)?;
-    let copied = (|| {
-        if mapped.pData.is_null() {
-            return Err(CaptureError::Native(
-                "D3D11 returned an empty desktop surface".into(),
-            ));
-        }
-        let row_bytes = usize::try_from(width)
-            .ok()
-            .and_then(|width| width.checked_mul(4))
-            .ok_or_else(|| CaptureError::Native("desktop row size overflow".into()))?;
-        let height = usize::try_from(height)
-            .map_err(|_| CaptureError::Native("desktop height overflow".into()))?;
-        let source_pitch = mapped.RowPitch as usize;
-        if source_pitch < row_bytes {
-            return Err(CaptureError::Native(
-                "D3D11 desktop row pitch is smaller than the active image".into(),
-            ));
-        }
-        let total_bytes = row_bytes
-            .checked_mul(height)
-            .ok_or_else(|| CaptureError::Native("desktop frame size overflow".into()))?;
-        let mut pixels = vec![0_u8; total_bytes];
-        for row in 0..height {
-            let source = unsafe {
-                slice::from_raw_parts(mapped.pData.cast::<u8>().add(row * source_pitch), row_bytes)
-            };
-            let destination = &mut pixels[row * row_bytes..(row + 1) * row_bytes];
-            destination.copy_from_slice(source);
-        }
-        Ok(pixels)
-    })();
-    unsafe { context.Unmap(&staging, 0) };
-    copied
 }
 
 #[cfg(windows)]
