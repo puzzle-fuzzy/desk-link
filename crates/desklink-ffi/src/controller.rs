@@ -138,7 +138,7 @@ impl AtomicControllerMetrics {
 pub struct ControllerRuntime {
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
-    input_sequence: Mutex<InputSequencer>,
+    input_sequence: Arc<Mutex<InputSequencer>>,
     assembler: FrameAssembler,
     reliable_assembler: FrameAssembler,
     video_config: Option<VideoConfig>,
@@ -154,6 +154,33 @@ pub struct ControllerRuntime {
     video_path: DirectVideoPathMachine,
     direct_session: Option<DirectLanSession>,
     direct_connection: Option<Arc<DirectLanConnection>>,
+}
+
+#[derive(Clone)]
+pub struct ControllerInputSender {
+    client: Arc<QuicClient>,
+    secure: Arc<Mutex<SecureSession>>,
+    input_sequence: Arc<Mutex<InputSequencer>>,
+}
+
+impl ControllerInputSender {
+    /// Sends exactly the context captured when input was admitted. The sender
+    /// does not adopt a newer presentation epoch or cancel an in-flight frame
+    /// when that epoch changes; the owning session controls cancellation.
+    pub async fn send_input_with_context(
+        &self,
+        context: InputContext,
+        event: InputEvent,
+    ) -> Result<(), ControllerError> {
+        send_session_input(
+            &self.client,
+            &self.secure,
+            &self.input_sequence,
+            context,
+            event,
+        )
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -244,7 +271,7 @@ impl ControllerRuntime {
         Ok(Self {
             client,
             secure,
-            input_sequence: Mutex::new(InputSequencer::new()),
+            input_sequence: Arc::new(Mutex::new(InputSequencer::new())),
             assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, ASSEMBLY_MAX_AGE),
             reliable_assembler: FrameAssembler::new(ASSEMBLY_CAPACITY, RELIABLE_ASSEMBLY_MAX_AGE),
             video_config: None,
@@ -326,18 +353,24 @@ impl ControllerRuntime {
         context: InputContext,
         event: InputEvent,
     ) -> Result<(), ControllerError> {
-        context.validate()?;
-        let sequence = self.input_sequence.lock().await.next_sequence();
-        let plaintext = encode_input(&InputEnvelope {
-            sequence,
-            timestamp_us: now_micros(),
-            stream_id: context.stream_id,
-            input_epoch: context.input_epoch,
+        send_session_input(
+            &self.client,
+            &self.secure,
+            &self.input_sequence,
+            context,
             event,
-        })?;
-        let ciphertext = seal(&self.secure, SecureLane::Input, &plaintext).await?;
-        self.client.send_input(ciphertext).await?;
-        Ok(())
+        )
+        .await
+    }
+
+    /// Clone the input lane once for a session-owned send future that can run
+    /// alongside `next_event`. Runtime and all clones share one wire sequence.
+    pub fn input_sender(&self) -> ControllerInputSender {
+        ControllerInputSender {
+            client: self.client.clone(),
+            secure: self.secure.clone(),
+            input_sequence: self.input_sequence.clone(),
+        }
     }
 
     pub async fn request_keyframe(&self) -> Result<(), ControllerError> {
@@ -1133,6 +1166,30 @@ async fn send_control(
     client
         .send_control(seal(secure, SecureLane::Control, &plaintext).await?)
         .await?;
+    Ok(())
+}
+
+async fn send_session_input(
+    client: &QuicClient,
+    secure: &Arc<Mutex<SecureSession>>,
+    input_sequence: &Mutex<InputSequencer>,
+    context: InputContext,
+    event: InputEvent,
+) -> Result<(), ControllerError> {
+    context.validate()?;
+    // This input-only guard preserves allocation and wire order across Runtime
+    // and cloned senders. The crypto guard inside seal is released before I/O.
+    let mut sequence = input_sequence.lock().await;
+    let plaintext = encode_input(&InputEnvelope {
+        sequence: sequence.next_sequence(),
+        timestamp_us: now_micros(),
+        stream_id: context.stream_id,
+        input_epoch: context.input_epoch,
+        event,
+    })?;
+    let ciphertext = seal(secure, SecureLane::Input, &plaintext).await?;
+    client.send_input(ciphertext).await?;
+    drop(sequence);
     Ok(())
 }
 
