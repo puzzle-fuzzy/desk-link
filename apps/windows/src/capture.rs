@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use desklink_session::DesktopRect;
@@ -34,12 +36,70 @@ pub struct DxgiDesktopCapturer {
     /// Desktop Duplication only reports changed frames. Keep a one-shot
     /// fallback so a static desktop still produces the first remote frame.
     initial_snapshot_pending: bool,
+    dxgi_recovery: DxgiRecoverySchedule,
 }
 
 #[cfg(windows)]
 enum WindowsCaptureBackend {
     Dxgi(windows::Win32::Graphics::Dxgi::IDXGIOutputDuplication),
     Gdi,
+}
+
+/// Limit expensive device recreation to a small burst, then leave the working
+/// GDI path alone for a cooldown. A successful constructor is not recovery:
+/// only a real acquired DXGI frame is enough to switch back.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct DxgiRecoverySchedule {
+    not_before: Instant,
+    failed_attempts: u32,
+    restored_at: Option<Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl DxgiRecoverySchedule {
+    const FAILURE_BUDGET: u32 = 6;
+    const COOLDOWN: Duration = Duration::from_secs(60);
+    const STABILITY_WINDOW: Duration = Duration::from_secs(30);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            not_before: now + Duration::from_secs(1),
+            failed_attempts: 0,
+            restored_at: None,
+        }
+    }
+
+    fn probe_due(&self, now: Instant) -> bool {
+        now >= self.not_before
+    }
+
+    fn failed_probe(&mut self, now: Instant) {
+        self.failed_attempts += 1;
+        let delay = if self.failed_attempts >= Self::FAILURE_BUDGET {
+            self.failed_attempts = 0;
+            Self::COOLDOWN
+        } else {
+            Duration::from_secs(1_u64 << self.failed_attempts)
+        };
+        self.not_before = now + delay;
+    }
+
+    fn restored(&mut self, now: Instant) {
+        self.restored_at = Some(now);
+    }
+
+    fn fell_back(&mut self, now: Instant) {
+        self.not_before = now
+            + if self.restored_at.is_some_and(|restored| {
+                now.saturating_duration_since(restored) < Self::STABILITY_WINDOW
+            }) {
+                Self::COOLDOWN
+            } else {
+                Duration::from_secs(1)
+            };
+        self.restored_at = None;
+    }
 }
 
 #[cfg(not(windows))]
@@ -275,6 +335,7 @@ impl DxgiDesktopCapturer {
             ),
             display_id,
             initial_snapshot_pending: true,
+            dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
         })
     }
 
@@ -326,6 +387,7 @@ impl DxgiDesktopCapturer {
             ),
             display_id,
             initial_snapshot_pending: true,
+            dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
         })
     }
 
@@ -352,12 +414,47 @@ impl DxgiDesktopCapturer {
             desktop_rect: display.rect,
             display_id,
             initial_snapshot_pending: false,
+            dxgi_recovery: DxgiRecoverySchedule::new(Instant::now()),
         })
     }
 
     #[cfg(not(windows))]
     pub fn mark_access_lost(&mut self) {
         self.access_lost = true;
+    }
+
+    #[cfg(windows)]
+    fn try_restore_dxgi(&mut self) -> Option<CapturedFrame> {
+        let now = Instant::now();
+        if !self.dxgi_recovery.probe_due(now) {
+            return None;
+        }
+        let recovered = Self::new_dxgi_display(self.display_id).and_then(|mut candidate| {
+            if candidate.desktop_rect != self.desktop_rect {
+                // Topology changes need the runtime's coordinated encoder/input
+                // reconfiguration. A backend probe must not change coordinates
+                // behind that owner, even when it finds a usable duplication.
+                return Err(CaptureError::Native(
+                    "DXGI recovery awaits coordinated display topology refresh".into(),
+                ));
+            }
+            // Do not mistake the initial GDI snapshot for a successful DXGI probe.
+            candidate.initial_snapshot_pending = false;
+            let frame = candidate.next_frame(Duration::from_millis(1))?;
+            Ok((candidate, frame))
+        });
+        match recovered {
+            Ok((mut candidate, frame)) => {
+                candidate.dxgi_recovery = self.dxgi_recovery;
+                candidate.dxgi_recovery.restored(Instant::now());
+                *self = candidate;
+                Some(frame)
+            }
+            Err(_) => {
+                self.dxgi_recovery.failed_probe(Instant::now());
+                None
+            }
+        }
     }
 }
 
@@ -591,9 +688,15 @@ impl DesktopCapturer for DxgiDesktopCapturer {
                 return Err(CaptureError::Timeout);
             }
             let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-            let WindowsCaptureBackend::Dxgi(duplication) = &self.backend else {
+            if matches!(&self.backend, WindowsCaptureBackend::Gdi) {
+                if let Some(frame) = self.try_restore_dxgi() {
+                    return Ok(frame);
+                }
                 std::thread::sleep(timeout.min(Duration::from_millis(33)));
                 return capture_gdi_frame(self.desktop_rect);
+            }
+            let WindowsCaptureBackend::Dxgi(duplication) = &self.backend else {
+                unreachable!()
             };
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
@@ -664,11 +767,14 @@ impl DesktopCapturer for DxgiDesktopCapturer {
         {
             // A DXGI duplication object can be created successfully and still fail on the
             // first acquired frame on hybrid-GPU, locked, RDP, or recently resumed desktops.
-            // Retrying `new_primary` would select DXGI again and loop forever. Once a live DXGI
-            // backend fails, deliberately downgrade this runtime to the slower but much more
-            // compatible GDI path. A failing GDI backend is terminal for this controller attempt.
+            // Retain reliable GDI capture while bounded, backed-off probes try a real DXGI
+            // frame. A constructor alone is insufficient evidence that a driver recovered.
+            // A failing GDI backend remains terminal for this controller attempt.
             if matches!(&self.backend, WindowsCaptureBackend::Dxgi(_)) {
-                *self = Self::new_gdi_display(self.display_id)?;
+                let mut fallback = Self::new_gdi_display(self.display_id)?;
+                fallback.dxgi_recovery = self.dxgi_recovery;
+                fallback.dxgi_recovery.fell_back(Instant::now());
+                *self = fallback;
             } else {
                 return Err(CaptureError::Native(
                     "GDI desktop capture failed after DXGI fallback".into(),
@@ -954,6 +1060,53 @@ mod identity_tests {
         assert!(registry.id_for(&identity("another-monitor")).is_err());
         assert_eq!(registry.id_for(&identity("monitor-0")).unwrap(), 1);
         assert_eq!(registry.identities.len(), DisplayIdentityRegistry::CAPACITY);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn dxgi_probe_failures_back_off_and_enter_a_bounded_burst_cooldown() {
+        let start = Instant::now();
+        let mut schedule = DxgiRecoverySchedule::new(start);
+        assert!(!schedule.probe_due(start));
+        let mut now = start + Duration::from_secs(1);
+        for delay in [2, 4, 8, 16, 32, 60] {
+            assert!(schedule.probe_due(now));
+            schedule.failed_probe(now);
+            assert!(!schedule.probe_due(now + Duration::from_secs(delay - 1)));
+            now += Duration::from_secs(delay);
+        }
+        // The next bounded retry burst is available after the quiet cooldown;
+        // a desktop restored much later need not start a new remote session.
+        assert!(schedule.probe_due(now));
+        schedule.failed_probe(now);
+        assert!(!schedule.probe_due(now + Duration::from_secs(1)));
+        assert!(schedule.probe_due(now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn unstable_restoration_cannot_oscillate_at_the_normal_probe_rate() {
+        let start = Instant::now();
+        let mut schedule = DxgiRecoverySchedule::new(start);
+        schedule.restored(start);
+        let failed_at = start + Duration::from_secs(2);
+        schedule.fell_back(failed_at);
+        assert!(!schedule.probe_due(failed_at + Duration::from_secs(59)));
+        assert!(schedule.probe_due(failed_at + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn stable_backend_failure_can_begin_a_new_probe_burst() {
+        let start = Instant::now();
+        let mut schedule = DxgiRecoverySchedule::new(start);
+        schedule.restored(start);
+        let failed_at = start + DxgiRecoverySchedule::STABILITY_WINDOW;
+        schedule.fell_back(failed_at);
+        assert!(!schedule.probe_due(failed_at));
+        assert!(schedule.probe_due(failed_at + Duration::from_secs(1)));
     }
 }
 
