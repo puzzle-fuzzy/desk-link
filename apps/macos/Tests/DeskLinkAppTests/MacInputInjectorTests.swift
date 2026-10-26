@@ -15,8 +15,9 @@ final class MacInputInjectorTests: XCTestCase {
         try injector.inject(.unicode("中", modifiers: [.shift]))
 
         XCTAssertEqual(backend.moves, [CGPoint(x: 300, y: 500)])
-        XCTAssertEqual(backend.unicodeEvents, ["中"])
-        XCTAssertEqual(backend.unicodeModifiers, [.shift])
+        XCTAssertEqual(backend.unicodeEvents, ["中", "中"])
+        XCTAssertEqual(backend.unicodeModifiers, [.shift, .shift])
+        XCTAssertEqual(backend.unicodePressed, [true, false])
     }
 
     func testInputInjectorKeepsNormalizedMaximumInsideDisplayBounds() throws {
@@ -58,6 +59,29 @@ final class MacInputInjectorTests: XCTestCase {
         XCTAssertEqual(failures.count, 2)
         XCTAssertEqual(injector.pressedInputs, [.key(0x24), .button(.left)])
     }
+
+    func testPhysicalUnicodeReleaseIsNotConvertedToAnotherTextInsertion() throws {
+        let backend = RecordingCGEventBackend()
+        let injector = MacInputInjector(backend: backend)
+        try injector.inject(.character(0x1f600, pressed: true, modifiers: []))
+        XCTAssertEqual(injector.pressedInputs, [.character(0x1f600)])
+        try injector.inject(.character(0x1f600, pressed: false, modifiers: []))
+        XCTAssertEqual(backend.unicodePressed, [true, false])
+        XCTAssertTrue(injector.pressedInputs.isEmpty)
+    }
+
+    func testCharacterReleaseAllRetriesFailedRelease() throws {
+        let backend = RecordingCGEventBackend()
+        let injector = MacInputInjector(backend: backend)
+        try injector.inject(.character(65, pressed: true, modifiers: .shift))
+        backend.failReleases = true
+        XCTAssertEqual(injector.releaseAll(), [.eventCreationFailed])
+        XCTAssertEqual(injector.pressedInputs, [.character(65)])
+        backend.failReleases = false
+        XCTAssertTrue(injector.releaseAll().isEmpty)
+        XCTAssertEqual(backend.unicodePressed, [true, false])
+        XCTAssertTrue(injector.pressedInputs.isEmpty)
+    }
 }
 
 private final class RecordingCGEventBackend: CGEventBackend {
@@ -65,6 +89,7 @@ private final class RecordingCGEventBackend: CGEventBackend {
     var moves: [CGPoint] = []
     var unicodeEvents: [String] = []
     var unicodeModifiers: [Modifiers] = []
+    var unicodePressed: [Bool] = []
     var releasedKeys: [UInt32] = []
     var releasedButtons: [MouseButton] = []
 
@@ -82,8 +107,10 @@ private final class RecordingCGEventBackend: CGEventBackend {
         if !pressed { releasedKeys.append(code) }
     }
 
-    func postUnicode(_ text: String, modifiers: Modifiers) throws {
+    func postUnicode(_ text: String, pressed: Bool, modifiers: Modifiers) throws {
+        if !pressed, failReleases { throw MacInputInjectorError.eventCreationFailed }
         unicodeEvents.append(text)
         unicodeModifiers.append(modifiers)
+        unicodePressed.append(pressed)
     }
 }

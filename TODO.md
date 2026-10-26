@@ -111,6 +111,9 @@
 ### DL2-005 · P1 · 补齐 macOS 字符按键的释放语义
 
 - [ ] 分离物理按键与提交文本，保证按下 / 松开及修饰键状态平衡。
+- [x] 代码与静态合同：物理字符保留原始 scalar / modifiers，repeat 复用按下记录，keyUp 成对发送；flagsChanged 差量同步修饰键，失焦、会话状态变化和销毁清理；提交文本按 scalar 发送 down/up，Mac Host 保留 Unicode pressed 并追踪失败释放。修复主题：`fix(DL2-005): balance Apple physical character and modifier releases`。
+- [x] Windows 自动验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract -v`，6 项静态源码合同通过；`git diff --check` 通过。
+- [ ] macOS 自动 / 真机验收：新增 Swift 状态、repeat、FFI struct 编码、Host Unicode 释放与失败重试回归，但 Windows 无 Swift/AppKit，尚未运行；大写、快捷键、拖动、长按、失焦与快速重连的双机无粘键结果仍待真 Mac。
 - **证据 / 类型：源码缺陷。** `apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift:15-16` 对普通字符只在 keyDown 发 unicode；`apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:248-252` 只发送 pressed=1；Windows `apps/windows/src/input.rs:359-379` 依赖 pressed=false 生成 keyUp 和修饰键释放。
 - **用户影响：** 字符及 Shift/Ctrl/Alt/Meta 组合存在残留按下状态路径，可能要等失焦或断开才整体释放。不能用“文字能显示”证明按键状态完整。
 - **方案：** 物理键记录 press/release/repeat；文本提交使用原子文本语义或完整 down/up；flagsChanged 差量同步修饰键；失焦、权限变化和断开统一 ReleaseAll。

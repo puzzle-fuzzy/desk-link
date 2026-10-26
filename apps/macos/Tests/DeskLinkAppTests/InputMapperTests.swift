@@ -1,5 +1,6 @@
 import CoreGraphics
 import AppKit
+import DeskLinkAppleCore
 import XCTest
 @testable import DeskLinkApp
 
@@ -46,14 +47,14 @@ final class InputMapperTests: XCTestCase {
         XCTAssertEqual(mapper.remoteModifier(for: .command), .control)
     }
 
-    func testKeyboardMapperPreservesUnicodeAndModifierFlags() {
+    func testKeyboardMapperPreservesCharacterAndModifierFlags() {
         XCTAssertEqual(KeyboardMapper.map(
             keyCode: 0x00,
             characters: "中",
             modifiers: [.command, .shift],
             isDown: true
         ), [
-            .unicode("中", modifiers: [.meta, .shift]),
+            .character(0x4e2d, pressed: true, modifiers: [.meta, .shift]),
         ])
     }
 
@@ -69,7 +70,7 @@ final class InputMapperTests: XCTestCase {
     func testKeyboardMapperSendsOrdinaryASCIIAsProtocolCharacter() {
         XCTAssertEqual(
             KeyboardMapper.map(keyCode: 0, characters: "a", modifiers: [], isDown: true),
-            [.unicode("a", modifiers: [])]
+            [.character(97, pressed: true, modifiers: [])]
         )
     }
 
@@ -90,7 +91,51 @@ final class InputMapperTests: XCTestCase {
         XCTAssertEqual(MacKeyCodeMapper.protocolCode(forAppKitKeyCode: 0x74), 13)
         XCTAssertEqual(MacKeyCodeMapper.protocolCode(forAppKitKeyCode: 0x6d), 25)
         XCTAssertNil(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 0))
-        XCTAssertNil(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 28))
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 28), 0x3b)
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 29), 0x3a)
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 30), 0x38)
+        XCTAssertEqual(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 31), 0x37)
+        XCTAssertNil(MacKeyCodeMapper.appKitKeyCode(forProtocolCode: 32))
+    }
+
+    func testCharacterReleaseUsesOriginalUppercaseAfterShiftIsReleased() {
+        var keyboard = KeyboardInputState()
+        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: false), [
+            .character(65, pressed: true, modifiers: .shift),
+        ])
+        _ = keyboard.flagsChanged([])
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0), [.character(65, pressed: false, modifiers: .shift)])
+        XCTAssertTrue(keyboard.keyUp(keyCode: 0).isEmpty)
+    }
+
+    func testRepeatsUseOriginalKeyAndHaveOneFinalRelease() {
+        var keyboard = KeyboardInputState()
+        let down: [RemoteInputCommand] = [.character(97, pressed: true, modifiers: [])]
+        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: false), down)
+        XCTAssertEqual(keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: true), down)
+        XCTAssertTrue(keyboard.keyDown(keyCode: 0, characters: "a", modifiers: [], isRepeat: false).isEmpty)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 0), [.character(97, pressed: false, modifiers: [])])
+    }
+
+    func testFlagsChangedEmitsOnlyModifierDifferencesAndKeepsDragModifier() {
+        var keyboard = KeyboardInputState()
+        XCTAssertEqual(keyboard.flagsChanged(.control), [.key(code: 28, pressed: true, modifiers: [])])
+        XCTAssertTrue(keyboard.flagsChanged(.control).isEmpty)
+        _ = keyboard.keyDown(keyCode: 8, characters: "c", modifiers: .control, isRepeat: false)
+        XCTAssertEqual(keyboard.keyUp(keyCode: 8), [
+            .character(99, pressed: false, modifiers: .control),
+            .key(code: 28, pressed: true, modifiers: []),
+        ])
+        XCTAssertEqual(keyboard.flagsChanged([]), [.key(code: 28, pressed: false, modifiers: [])])
+    }
+
+    func testResetDoesNotReleaseOldKeysIntoNewSession() {
+        var keyboard = KeyboardInputState()
+        _ = keyboard.flagsChanged(.shift)
+        _ = keyboard.keyDown(keyCode: 0, characters: "A", modifiers: .shift, isRepeat: false)
+        keyboard.reset()
+        XCTAssertTrue(keyboard.keyUp(keyCode: 0).isEmpty)
+        XCTAssertTrue(keyboard.flagsChanged([]).isEmpty)
     }
 
     func testScrollQuantizationNeverSendsInvalidZeroOrOversizedDeltas() {

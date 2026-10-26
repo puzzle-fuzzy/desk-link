@@ -18,6 +18,7 @@ struct SessionInputView: NSViewRepresentable {
     func updateNSView(_ view: InputView, context: Context) {
         view.bridge = bridge
         view.videoSize = videoSize
+        view.synchronizeSession(bridge.state)
     }
 
     static func dismantleNSView(_ view: InputView, coordinator: ()) {
@@ -28,10 +29,14 @@ struct SessionInputView: NSViewRepresentable {
         weak var bridge: ControllerBridge?
         var videoSize: CGSize?
         private var pressedButtons = Set<MouseButton>()
+        private var keyboard = KeyboardInputState()
+        private var sessionState: ConnectionState
+        private var windowFocusObserver: NSObjectProtocol?
 
         init(bridge: ControllerBridge, videoSize: CGSize?) {
             self.bridge = bridge
             self.videoSize = videoSize
+            sessionState = bridge.state
             super.init(frame: .zero)
             wantsLayer = true
         }
@@ -42,11 +47,18 @@ struct SessionInputView: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            if let windowFocusObserver { NotificationCenter.default.removeObserver(windowFocusObserver) }
+            windowFocusObserver = nil
             if window == nil {
                 releaseAll()
                 return
             }
             window?.acceptsMouseMovedEvents = true
+            windowFocusObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.releaseAll() }
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.window?.makeFirstResponder(self)
@@ -65,6 +77,9 @@ struct SessionInputView: NSViewRepresentable {
 
         override func keyDown(with event: NSEvent) { sendKeyboard(event, isDown: true) }
         override func keyUp(with event: NSEvent) { sendKeyboard(event, isDown: false) }
+        override func flagsChanged(with event: NSEvent) {
+            for command in keyboard.flagsChanged(event.modifierFlags) { bridge?.send(input: command) }
+        }
         override func mouseMoved(with event: NSEvent) { sendPointer(event) }
         override func mouseDragged(with event: NSEvent) { sendPointer(event) }
         override func rightMouseDragged(with event: NSEvent) { sendPointer(event) }
@@ -85,6 +100,7 @@ struct SessionInputView: NSViewRepresentable {
         }
 
         deinit {
+            if let windowFocusObserver { NotificationCenter.default.removeObserver(windowFocusObserver) }
             let bridge = bridge
             Task { @MainActor in bridge?.releaseAll() }
         }
@@ -92,15 +108,29 @@ struct SessionInputView: NSViewRepresentable {
         func releaseAll() {
             bridge?.releaseAll()
             pressedButtons.removeAll()
+            keyboard.reset()
+        }
+
+        func synchronizeSession(_ state: ConnectionState) {
+            guard state != sessionState else { return }
+            releaseAll()
+            sessionState = state
         }
 
         private func sendKeyboard(_ event: NSEvent, isDown: Bool) {
-            for command in KeyboardMapper.map(
-                keyCode: event.keyCode,
-                characters: event.characters,
-                modifiers: event.modifierFlags,
-                isDown: isDown
-            ) {
+            let commands: [RemoteInputCommand]
+            if isDown {
+                let isShortcut = !event.modifierFlags.intersection([.command, .control]).isEmpty
+                commands = keyboard.keyDown(
+                    keyCode: event.keyCode,
+                    characters: isShortcut ? event.charactersIgnoringModifiers : event.characters,
+                    modifiers: event.modifierFlags,
+                    isRepeat: event.isARepeat
+                )
+            } else {
+                commands = keyboard.keyUp(keyCode: event.keyCode)
+            }
+            for command in commands {
                 bridge?.send(input: command)
             }
         }

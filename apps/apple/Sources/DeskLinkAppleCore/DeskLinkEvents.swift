@@ -67,6 +67,7 @@ public enum RemoteInputCommand: Equatable, Sendable {
     case mouseButton(MouseButton, pressed: Bool)
     case wheel(deltaX: Int32, deltaY: Int32)
     case key(code: UInt32, pressed: Bool, modifiers: Modifiers)
+    case character(UInt32, pressed: Bool, modifiers: Modifiers)
     case unicode(String, modifiers: Modifiers)
 }
 

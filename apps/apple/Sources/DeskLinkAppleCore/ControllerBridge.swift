@@ -59,6 +59,8 @@ public final class ControllerBridge: ObservableObject {
     private var requestKeyframeAfterNextVideoConfig = false
 #if DEBUG
     public private(set) var releaseAllCallCountForTesting = 0
+    public var recordInputsForTesting = false
+    public private(set) var sentInputsForTesting: [DesklinkInput] = []
     public var activeRuntimeForTesting: Bool { handleOwner.pointer != nil }
     public var activeStreamIDForTesting: UInt64 { activeStreamID }
 #endif
@@ -245,9 +247,13 @@ public final class ControllerBridge: ObservableObject {
             input = DesklinkInput(kind: DESKLINK_INPUT_MOUSE_WHEEL, x: 0, y: 0, wheel_x: x, wheel_y: y, button: 0, key_code: 0, character: 0, pressed: 0, modifiers: 0)
         case let .key(code, pressed, modifiers):
             input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: code, character: 0, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
+        case let .character(scalar, pressed, modifiers):
+            input = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: scalar, pressed: pressed ? 1 : 0, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
         case let .unicode(text, modifiers):
             for scalar in text.unicodeScalars {
                 var characterInput = DesklinkInput(kind: DESKLINK_INPUT_KEY, x: 0, y: 0, wheel_x: 0, wheel_y: 0, button: 0, key_code: 0, character: scalar.value, pressed: 1, modifiers: UInt8(truncatingIfNeeded: modifiers.rawValue & 0x0f))
+                sendInput(&characterInput)
+                characterInput.pressed = 0
                 sendInput(&characterInput)
             }
             return
@@ -489,6 +495,9 @@ public final class ControllerBridge: ObservableObject {
     }
 
     private func sendInput(_ input: inout DesklinkInput) {
+#if DEBUG
+        if recordInputsForTesting { sentInputsForTesting.append(input) }
+#endif
         guard case .connected = state, let handle = handleOwner.pointer else { return }
         let result = desklink_send_input(handle, &input)
         guard result != DESKLINK_INVALID_ARGUMENT else { return }

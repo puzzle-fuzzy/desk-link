@@ -608,10 +608,8 @@ private func hostInputCommand(_ input: DesklinkHostInput) -> RemoteInputCommand?
         return .wheel(deltaX: input.wheel_x, deltaY: input.wheel_y)
     case DESKLINK_INPUT_KEY:
         let modifiers = Modifiers(rawValue: UInt32(input.modifiers))
-        if input.pressed != 0,
-           input.character != 0,
-           let scalar = UnicodeScalar(input.character) {
-            return .unicode(String(Character(scalar)), modifiers: modifiers)
+        if input.character != 0, UnicodeScalar(input.character) != nil {
+            return .character(input.character, pressed: input.pressed != 0, modifiers: modifiers)
         }
         guard let virtualKeyCode = MacKeyCodeMapper.appKitKeyCode(forProtocolCode: input.key_code) else { return nil }
         return .key(code: virtualKeyCode, pressed: input.pressed != 0, modifiers: modifiers)

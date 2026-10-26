@@ -1,9 +1,37 @@
 import Foundation
+import DeskLinkC
 import XCTest
 @testable import DeskLinkAppleCore
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
+    func testPhysicalCharacterEncodesPressedStateAndModifierMaskIntoFFIInput() {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
+        bridge.recordInputsForTesting = true
+        bridge.send(input: .character(65, pressed: true, modifiers: [.shift, .control]))
+        bridge.send(input: .character(65, pressed: false, modifiers: [.shift, .control]))
+        let inputs = bridge.sentInputsForTesting
+        XCTAssertEqual(inputs.count, 2)
+        XCTAssertTrue(inputs.allSatisfy { $0.kind == DESKLINK_INPUT_KEY && $0.key_code == 0 })
+        XCTAssertEqual(inputs.map(\.character), [65, 65])
+        XCTAssertEqual(inputs.map(\.pressed), [1, 0])
+        XCTAssertEqual(inputs.map(\.modifiers), [3, 3])
+    }
+
+    func testCommittedUnicodeEncodesOrderedDownUpForEveryScalar() {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
+        bridge.recordInputsForTesting = true
+        bridge.send(input: .unicode("中😀", modifiers: []))
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.character), [0x4e2d, 0x4e2d, 0x1f600, 0x1f600])
+        XCTAssertEqual(bridge.sentInputsForTesting.map(\.pressed), [1, 0, 1, 0])
+    }
+
+    func testInputRecordingRequiresExplicitTestOptIn() {
+        let bridge = ControllerBridge.testing()
+        bridge.send(input: .unicode("test", modifiers: []))
+        XCTAssertTrue(bridge.sentInputsForTesting.isEmpty)
+    }
+
     func testRecoverableErrorPreservesRuntimeLifecycleAndCanReconnect() {
         let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
         bridge.acceptErrorForTesting(stateValue: 10, recoverable: true)

@@ -12,10 +12,87 @@ enum KeyboardMapper {
         if let logicalKeyCode = MacKeyCodeMapper.protocolCode(forAppKitKeyCode: keyCode) {
             return [.key(code: logicalKeyCode, pressed: isDown, modifiers: mappedModifiers)]
         }
-        guard isDown, let characters, !characters.isEmpty else { return [] }
-        return [.unicode(characters, modifiers: mappedModifiers)]
+        guard let characters, !characters.isEmpty else { return [] }
+        return characters.unicodeScalars
+            .filter { !CharacterSet.controlCharacters.contains($0) }
+            .map { .character($0.value, pressed: isDown, modifiers: mappedModifiers) }
     }
 
+}
+
+// A key's release must use its original character and modifiers. AppKit may
+// report different characters after Shift, the keyboard layout, or IME changes.
+struct KeyboardInputState {
+    private var pressedKeys: [UInt16: [RemoteInputCommand]] = [:]
+    private var heldModifiers: Modifiers = []
+    private var capsLockEnabled = false
+
+    mutating func keyDown(
+        keyCode: UInt16,
+        characters: String?,
+        modifiers: NSEvent.ModifierFlags,
+        isRepeat: Bool
+    ) -> [RemoteInputCommand] {
+        if let held = pressedKeys[keyCode] { return isRepeat ? held : [] }
+        let commands = KeyboardMapper.map(
+            keyCode: keyCode, characters: characters, modifiers: modifiers, isDown: true
+        )
+        if !commands.isEmpty { pressedKeys[keyCode] = commands }
+        return commands
+    }
+
+    mutating func keyUp(keyCode: UInt16) -> [RemoteInputCommand] {
+        guard let held = pressedKeys.removeValue(forKey: keyCode) else { return [] }
+        let releases = held.reversed().compactMap { command -> RemoteInputCommand? in
+            switch command {
+            case let .key(code, _, modifiers): .key(code: code, pressed: false, modifiers: modifiers)
+            case let .character(scalar, _, modifiers): .character(scalar, pressed: false, modifiers: modifiers)
+            default: nil
+            }
+        }
+        // The protocol's chord key-up also releases its modifier mask. Restore
+        // modifiers still physically held for a subsequent drag or key chord.
+        let chordModifiers = held.reduce(Modifiers()) { result, command in
+            switch command {
+            case let .key(_, _, modifiers), let .character(_, _, modifiers): result.union(modifiers)
+            default: result
+            }
+        }
+        return releases + modifierCommands(chordModifiers.intersection(heldModifiers), pressed: true)
+    }
+
+    mutating func flagsChanged(_ flags: NSEvent.ModifierFlags) -> [RemoteInputCommand] {
+        let next = Modifiers(appKit: flags)
+        var commands = modifierCommands(heldModifiers.subtracting(next), pressed: false)
+        commands += modifierCommands(next.subtracting(heldModifiers), pressed: true)
+        heldModifiers = next
+        let capsLock = flags.contains(.capsLock)
+        if capsLock != capsLockEnabled {
+            commands += [
+                .key(code: DeskLinkKeyCode.capsLock, pressed: true, modifiers: []),
+                .key(code: DeskLinkKeyCode.capsLock, pressed: false, modifiers: []),
+            ]
+            capsLockEnabled = capsLock
+        }
+        return commands
+    }
+
+    mutating func reset() {
+        pressedKeys.removeAll()
+        heldModifiers = []
+        capsLockEnabled = false
+    }
+
+    private func modifierCommands(_ flags: Modifiers, pressed: Bool) -> [RemoteInputCommand] {
+        let mapping: [(Modifiers, UInt32)] = [
+            (.control, DeskLinkKeyCode.control), (.option, DeskLinkKeyCode.alt),
+            (.shift, DeskLinkKeyCode.shift), (.meta, DeskLinkKeyCode.meta),
+        ]
+        let entries = pressed ? mapping : Array(mapping.reversed())
+        return entries.compactMap { flag, code in
+            flags.contains(flag) ? .key(code: code, pressed: pressed, modifiers: []) : nil
+        }
+    }
 }
 
 enum MacKeyCodeMapper {
@@ -81,6 +158,10 @@ enum MacKeyCodeMapper {
         case 25: return 0x6d // F10
         case 26: return 0x67 // F11
         case 27: return 0x6f // F12
+        case 28: return 0x3b // Control
+        case 29: return 0x3a // Option
+        case 30: return 0x38 // Shift
+        case 31: return 0x37 // Command
         default: return nil
         }
     }
