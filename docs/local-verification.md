@@ -123,6 +123,8 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 
 Apple最新来源由协调方报告完整FFI71项、Python186项、双头检查实跑通过，013 worker owned future仍在进行；本次没有附对应完整测试SHA，本工程不擅自绑定动态branch head。旧joint的两个MacHost失败来自尚缺完整Apple ABI/Host链，不能写成Apple当前分支也失败。等待Apple最终稳定SHA与完整依赖一起合并，不单独flat-pick9ad；整合时保留已有等价桥接与Sender扩展。来源通过不替代joint重跑，也不替代Swift/Xcode、真实Mac presented或设备验收。
 
+媒体65c冻结交接已读取 `E:/desk-link/.worktrees/dl2-targets/windows-media/validation/final-validation.json` 与同目录 `windows-media-handoff.json`，本工程核对三组原日志合计448通过/0失败/18忽略、source前后均65c、空working_status及固定Git对象Cargo.lock哈希一致；37笔唯一提交/subject/ancestry与handoff吻合，已包含三条imported contract。另有来源workspace/all-targets check、限定包lib/tests严格Clippy及workspace fmt通过，均不是本工程复跑。主项仅020/046/050完成，015仍CPU读回且GPU surface链未实现，030仍256MiB/无目录、大文件与持久块证明；源冻结不能关闭041/013或把当前工程树标可交付。报告哈希和完整边界见[来源核对记录](second-stage-review-evidence.md)。
+
 收口须同时取得：joint最终完整SHA及dirty/parents/来源记录、所需resolution和新增联合测试已提交的证据、逐问题历史/等价patch去重说明、新parents整合后的实际跨包严格检查与所有适用测试命令和原始报告，以及上表各epoch/config/IPC/呈现/取消门禁对应的运行结果。当前尚未收到joint最终SHA/完整报告，不能据安排、merge完成或来源各自通过更新041/042为联合通过。失败、忽略与缺设备条件分别保留，不能把选中用例通过扩大成全部通过。FFI Mac Host、Swift/真实Mac presented、实际WebView与双机验收继续单列；Windows joint不能代替这些证据，也不会使本工程旧源码上的失败报告失效。
 
 ### joint新增前置：接收文件初始化时保留已有partial
