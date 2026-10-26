@@ -97,6 +97,9 @@
 - **方案：** 错误事件携带稳定 code、可恢复性和状态；恢复期更新状态及提示，认证拒绝、明确失效或用户断开才销毁句柄。错误文字不再承担状态判断。
 - **验收：** 注入 Reconnecting → 可恢复 Error → 新 VideoConfig → Frame，句柄保持有效且恢复画面；终态认证错误才关闭；macOS → Windows 切 Wi-Fi、relay 重启再做真机回归。
 
+- [x] 代码与 Rust 自动回归：Error 携带稳定 error_code/recoverable；Swift 恢复告警仅更新提示，Connected 清告警，终态仍销毁。`python scripts/run-windows-cargo.py test -p desklink-ffi --lib --locked`：13 通过。修复提交 `30a902a`（主题 `fix(DL2-003): preserve Apple runtime during recoverable errors`）。
+- [ ] macOS Wi-Fi/relay 重启与 VideoConfig→Frame 恢复验收；已补 Swift 生命周期回归，本 Windows 环境未执行。
+
 ### DL2-004 · P1 · 已连接发送背压时仍能及时取消和退出
 
 - [ ] 为发送、关闭及 FFI teardown 建立可取消、有截止时间的异步生命周期。
