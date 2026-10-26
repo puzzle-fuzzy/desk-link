@@ -242,6 +242,10 @@
 - **方案：** 长驻磁盘 worker 或有界异步管线，网络回压跟随落盘速度；不要每个 48 KiB chunk 新建 blocking task。两个传输方向一起核对；校验/flush 成功后才发布完成。
 - **验收：** 慢盘、云盘、杀毒扫描、空间耗尽、取消同时发生时，媒体/输入仍满足预算、内存有界、残留可清理；不能显示尚未落盘的虚假完成。
 
+- [x] **已实现并自动验证（`fix(DL2-021): isolate host receive writes on bounded disk workers`）：** `IncomingFileWorker` 每文件长驻磁盘线程，进程最多8线程，队列2×48KiB（另有当前块）；写入/hash/sync/rename及Drop保留均离开async线程。Host接入create/write/finish/preserve/cancel，校验并sync成功后才回完成；原出站有界blocking生产者保持。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-windows --lib transfer::tests --locked` 16通过；覆盖人工阻塞磁盘时current-thread Tokio定时器仍执行、队列预算、取消清理、保留续传、错hash、完成后发布。Windows删除前先关闭staging文件句柄。
+- [ ] **跨组及实机未完成：** Windows控制端接入由产品组负责；慢盘/云盘/杀毒/空间耗尽时媒体与输入预算需双机测量。取消不能中断已进入OS的磁盘syscall，线程总量有界，不宣称立即物理清理。
+
 ### DL2-022 · P2 · 从 GDI 兜底恢复到高性能捕获后端
 
 - [ ] 增加有退避、有限失败预算的 DXGI 恢复探测。

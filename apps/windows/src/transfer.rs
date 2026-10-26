@@ -2,6 +2,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +17,7 @@ use desklink_protocol::{
     is_valid_transfer_file_name,
 };
 use rand_core::{OsRng, RngCore};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::storage::downloads_path;
 
@@ -22,6 +27,220 @@ const INCOMING_PART_SUFFIX: &str = ".part";
 const STALE_INCOMING_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STAGING_ENTRIES_TO_CLEAN: usize = 256;
 const MIN_FREE_SPACE_AFTER_RECEIVE: u64 = 64 * 1024 * 1024;
+
+/// Two maximum-sized chunks may wait behind the one being written. The sender
+/// awaits completed worker writes instead of buffering an entire network file.
+pub const INCOMING_DISK_QUEUE_CAPACITY: usize = 2;
+const MAX_INCOMING_DISK_WORKERS: usize = 8;
+static ACTIVE_INCOMING_DISK_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct IncomingDiskWorkerPermit;
+
+impl IncomingDiskWorkerPermit {
+    fn acquire() -> Result<Self, TransferResult> {
+        ACTIVE_INCOMING_DISK_WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_INCOMING_DISK_WORKERS).then_some(active + 1)
+            })
+            .map(|_| Self)
+            .map_err(|_| TransferResult::Busy)
+    }
+}
+
+impl Drop for IncomingDiskWorkerPermit {
+    fn drop(&mut self) {
+        ACTIVE_INCOMING_DISK_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum IncomingDiskCommand {
+    Write {
+        offset: u64,
+        bytes: Box<[u8]>,
+        reply: oneshot::Sender<Result<(), TransferResult>>,
+    },
+    Finish {
+        hash: [u8; 32],
+        reply: oneshot::Sender<Result<PathBuf, TransferResult>>,
+    },
+    Preserve(oneshot::Sender<Result<(), TransferResult>>),
+}
+
+/// Owns a single receive file on one disk thread. No filesystem operation,
+/// including disconnect cleanup, runs from this handle's async methods or Drop.
+/// Dropping an unfinished handle preserves its staged prefix; explicit cancel
+/// removes it as soon as an in-flight OS write returns.
+pub struct IncomingFileWorker {
+    transfer_id: TransferId,
+    resume_offset: u64,
+    resume_prefix_hash: Option<[u8; 32]>,
+    commands: Option<mpsc::Sender<IncomingDiskCommand>>,
+    cancelled: Arc<AtomicBool>,
+    finishing: bool,
+}
+
+impl IncomingFileWorker {
+    pub async fn create(
+        transfer_id: TransferId,
+        name: String,
+        expected_size: u64,
+    ) -> Result<Self, TransferResult> {
+        Self::spawn_with(
+            move || IncomingFile::create(transfer_id, name, expected_size),
+            || {},
+        )
+        .await
+    }
+
+    async fn spawn_with(
+        create: impl FnOnce() -> Result<IncomingFile, TransferResult> + Send + 'static,
+        before_write: impl Fn() + Send + 'static,
+    ) -> Result<Self, TransferResult> {
+        // Cancel cannot interrupt a driver-blocked syscall. Keep repeated
+        // reconnects from creating unlimited abandoned disk threads.
+        let permit = IncomingDiskWorkerPermit::acquire()?;
+        let (commands, mut pending) = mpsc::channel(INCOMING_DISK_QUEUE_CAPACITY);
+        let (ready, opened) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        std::thread::Builder::new()
+            .name("desklink-file-receive".to_owned())
+            .spawn(move || {
+                let _permit = permit;
+                let mut file = match create() {
+                    Ok(file) => file,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                let metadata = (
+                    file.transfer_id(),
+                    file.resume_offset(),
+                    file.resume_prefix_hash(),
+                );
+                if ready.send(Ok(metadata)).is_err() {
+                    return;
+                }
+                while let Some(command) = pending.blocking_recv() {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match command {
+                        IncomingDiskCommand::Write {
+                            offset,
+                            bytes,
+                            reply,
+                        } => {
+                            before_write();
+                            let result = if worker_cancelled.load(Ordering::Acquire) {
+                                Err(TransferResult::Cancelled)
+                            } else {
+                                file.write_chunk(offset, &bytes)
+                            };
+                            let failed = result.is_err();
+                            let _ = reply.send(result);
+                            if failed {
+                                return;
+                            }
+                        }
+                        IncomingDiskCommand::Finish { hash, reply } => {
+                            let result = file.finish_unless_cancelled(hash, &worker_cancelled);
+                            let _ = reply.send(result);
+                            return;
+                        }
+                        IncomingDiskCommand::Preserve(reply) => {
+                            let _ = reply.send(file.preserve());
+                            return;
+                        }
+                    }
+                }
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = file.preserve();
+                }
+            })
+            .map_err(|_| TransferResult::IoFailed)?;
+        let (transfer_id, resume_offset, resume_prefix_hash) =
+            opened.await.map_err(|_| TransferResult::IoFailed)??;
+        Ok(Self {
+            transfer_id,
+            resume_offset,
+            resume_prefix_hash,
+            commands: Some(commands),
+            cancelled,
+            finishing: false,
+        })
+    }
+
+    pub fn transfer_id(&self) -> TransferId {
+        self.transfer_id
+    }
+
+    pub fn resume_offset(&self) -> u64 {
+        self.resume_offset
+    }
+
+    pub fn resume_prefix_hash(&self) -> Option<[u8; 32]> {
+        self.resume_prefix_hash
+    }
+
+    pub async fn write_chunk(&mut self, offset: u64, bytes: Vec<u8>) -> Result<(), TransferResult> {
+        if bytes.is_empty() || bytes.len() > MAX_TRANSFER_CHUNK_BYTES {
+            return Err(TransferResult::InvalidData);
+        }
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(TransferResult::InvalidData)?
+            .send(IncomingDiskCommand::Write {
+                offset,
+                bytes: bytes.into_boxed_slice(),
+                reply,
+            })
+            .await
+            .map_err(|_| TransferResult::IoFailed)?;
+        response.await.map_err(|_| TransferResult::IoFailed)?
+    }
+
+    pub async fn finish(mut self, hash: [u8; 32]) -> Result<PathBuf, TransferResult> {
+        self.finishing = true;
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(TransferResult::InvalidData)?
+            .send(IncomingDiskCommand::Finish { hash, reply })
+            .await
+            .map_err(|_| TransferResult::IoFailed)?;
+        let result = response.await.map_err(|_| TransferResult::IoFailed)?;
+        self.finishing = false;
+        result
+    }
+
+    pub async fn preserve(self) -> Result<(), TransferResult> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(TransferResult::InvalidData)?
+            .send(IncomingDiskCommand::Preserve(reply))
+            .await
+            .map_err(|_| TransferResult::IoFailed)?;
+        response.await.map_err(|_| TransferResult::IoFailed)?
+    }
+
+    pub fn cancel(mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.commands.take();
+    }
+}
+
+impl Drop for IncomingFileWorker {
+    fn drop(&mut self) {
+        // A cancelled finish future must not publish a late completed download.
+        if self.finishing {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OutgoingFile {
@@ -374,7 +593,18 @@ impl IncomingFile {
         Ok(())
     }
 
-    pub fn finish(mut self, content_hash: [u8; 32]) -> Result<PathBuf, TransferResult> {
+    pub fn finish(self, content_hash: [u8; 32]) -> Result<PathBuf, TransferResult> {
+        self.finish_unless_cancelled(content_hash, &AtomicBool::new(false))
+    }
+
+    fn finish_unless_cancelled(
+        mut self,
+        content_hash: [u8; 32],
+        cancelled: &AtomicBool,
+    ) -> Result<PathBuf, TransferResult> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(TransferResult::Cancelled);
+        }
         if self.written != self.expected_size
             || self.hasher.clone().finalize().as_slice() != content_hash
         {
@@ -383,6 +613,9 @@ impl IncomingFile {
         let file = self.file.take().ok_or(TransferResult::InvalidData)?;
         file.sync_all().map_err(|_| TransferResult::IoFailed)?;
         drop(file);
+        if cancelled.load(Ordering::Acquire) {
+            return Err(TransferResult::Cancelled);
+        }
         fs::create_dir_all(&self.destination_directory).map_err(|_| TransferResult::IoFailed)?;
         let destination = available_destination(&self.destination_directory, &self.name)?;
         fs::rename(&self.temporary_path, &destination).map_err(|_| TransferResult::IoFailed)?;
@@ -422,6 +655,8 @@ fn ensure_receive_capacity(_directory: &Path, _remaining: u64) -> Result<(), Tra
 
 impl Drop for IncomingFile {
     fn drop(&mut self) {
+        // Windows cannot remove an open staging file without delete sharing.
+        self.file.take();
         if self.remove_on_drop && self.temporary_path.exists() {
             let _ = fs::remove_file(&self.temporary_path);
         }
@@ -766,7 +1001,8 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        IncomingFile, MIN_FREE_SPACE_AFTER_RECEIVE, STALE_INCOMING_FILE_AGE, chunk_after_resume,
+        INCOMING_DISK_QUEUE_CAPACITY, IncomingDiskCommand, IncomingFile, IncomingFileWorker,
+        MIN_FREE_SPACE_AFTER_RECEIVE, STALE_INCOMING_FILE_AGE, chunk_after_resume,
         cleanup_stale_incoming_files, discard_incoming_resume_in, incoming_staging_directory,
         incoming_temporary_path, prepare_outgoing_file, receive_capacity_is_sufficient,
         verify_resume_prefix,
@@ -791,6 +1027,193 @@ mod tests {
         let staging = root.join("staging");
         let downloads = root.join("downloads");
         (root, staging, downloads)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_worker_orders_chunks_and_only_acknowledges_verified_publication() {
+        let (root, staging, downloads) = roots("worker-publish");
+        let target = downloads.join("worker.bin");
+        let mut worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in([21; 16], "worker.bin".to_owned(), 8, staging, downloads)
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.resume_offset(), 0);
+        worker.write_chunk(0, b"desk".to_vec()).await.unwrap();
+        worker.write_chunk(4, b"link".to_vec()).await.unwrap();
+        assert!(!target.exists());
+        let saved = worker
+            .finish(Blake2s256::digest(b"desklink").into())
+            .await
+            .unwrap();
+        assert_eq!(saved, target);
+        assert_eq!(fs::read(&saved).unwrap(), b"desklink");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_disk_worker_does_not_block_async_timers() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let (root, staging, downloads) = roots("worker-slow");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let mut worker = IncomingFileWorker::spawn_with(
+            move || IncomingFile::create_in([22; 16], "slow.bin".to_owned(), 1, staging, downloads),
+            move || {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                let (lock, wake) = &*worker_gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let pending = tokio::spawn(async move {
+            worker.write_chunk(0, vec![42]).await.unwrap();
+            worker.finish(Blake2s256::digest([42]).into()).await
+        });
+        ready.await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::time::sleep(Duration::from_millis(1)),
+        )
+        .await
+        .expect("disk wait must not block a single-thread Tokio runtime");
+        assert!(!pending.is_finished());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
+        pending.await.unwrap().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_worker_preserve_then_resume_keeps_only_acknowledged_prefix() {
+        let (root, staging, downloads) = roots("worker-resume");
+        let worker_staging = staging.clone();
+        let worker_downloads = downloads.clone();
+        let mut worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    [23; 16],
+                    "resume.bin".to_owned(),
+                    8,
+                    worker_staging,
+                    worker_downloads,
+                )
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+        worker.write_chunk(0, b"desk".to_vec()).await.unwrap();
+        worker.preserve().await.unwrap();
+        let resumed = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in([23; 16], "resume.bin".to_owned(), 8, staging, downloads)
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.resume_offset(), 4);
+        assert_eq!(
+            resumed.resume_prefix_hash(),
+            Some(Blake2s256::digest(b"desk").into())
+        );
+        resumed.cancel();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_queue_has_a_fixed_chunk_budget_and_cancel_discards_pending_work() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let (root, staging, downloads) = roots("worker-budget");
+        let partial = incoming_temporary_path(&staging, [24; 16]);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in([24; 16], "cancel.bin".to_owned(), 4, staging, downloads)
+            },
+            move || {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                let (lock, wake) = &*worker_gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let sender = worker.commands.as_ref().unwrap().clone();
+        let command = |offset| {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            IncomingDiskCommand::Write {
+                offset,
+                bytes: vec![0].into_boxed_slice(),
+                reply,
+            }
+        };
+        sender.send(command(0)).await.unwrap();
+        ready.await.unwrap();
+        for offset in 1..=INCOMING_DISK_QUEUE_CAPACITY {
+            sender.try_send(command(offset as u64)).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(command(3)),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+        worker.cancel();
+        drop(sender);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while partial.exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_worker_rejects_oversized_chunks_and_invalid_hashes() {
+        let (root, staging, downloads) = roots("worker-invalid");
+        let mut worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in([25; 16], "invalid.bin".to_owned(), 1, staging, downloads)
+            },
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            worker
+                .write_chunk(0, vec![0; desklink_protocol::MAX_TRANSFER_CHUNK_BYTES + 1])
+                .await,
+            Err(TransferResult::InvalidData)
+        );
+        worker.write_chunk(0, vec![42]).await.unwrap();
+        assert_eq!(
+            worker.finish([0; 32]).await,
+            Err(TransferResult::InvalidData)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
