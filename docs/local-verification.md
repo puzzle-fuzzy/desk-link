@@ -122,3 +122,15 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 产品源交接路径 `E:/desk-link/.worktrees/dl2-targets/windows-product/evidence/handoff-16594c4.json` 与媒体源分支测试都只证明各自快照，不等于联合通过。当前尚未收到joint最终SHA/报告，因此不据安排、merge完成或源分支各自通过更新041/042为联合通过。
 
 收口须同时取得：joint最终完整SHA及dirty/来源记录、逐问题历史/等价patch去重说明、实际Bun/原生/跨层命令和原始报告，以及上表各epoch/config/IPC/呈现/取消门禁对应的运行结果。失败、忽略与缺设备条件分别保留，不能把选中用例通过扩大成全部通过。FFI Mac Host、Swift/真实Mac presented、实际WebView与双机验收继续单列；Windows joint不能代替这些证据，也不会使本工程旧源码上的失败报告失效。
+
+### joint新增前置：接收文件初始化时保留已有partial
+
+独立只读review及固定媒体89bd1e5源码核对发现DL2-021缺口：worker已成功create/open已有resume partial，但caller的create future在opened.await期间因断连被drop，ready发送失败直接return；IncomingFile的remove_on_drop=true随后删除partial。正常handle-drop的preserve在这个初始化窗口未执行。媒体owner负责独立修复，joint最终提交前须复用修复并运行新增回归；本工程没有代修或运行该未交付回归。
+
+| 必须取得的实际证据 | 不能用来替代的结果 |
+| --- | --- |
+| 真实临时文件预置有效prefix/resume元数据；barrier精确停在打开后、ready交付前，drop create future，再释放线程；断言partial内容/长度/hash保留并能再次resume | 只测试ready已交付后的handle-drop、sleep碰运气、源码出现preserve、仅assert worker退出 |
+| 正常handle-drop仍保留；明确cancel/校验失败仍按原政策清理，资源与并发permit收尾 | 把断连和显式cancel都改成永久保留，或只证明future返回 |
+| 独立修复来源/本地复用SHA、最终joint revision和该窗口对应测试/相关套件原始结果 | 两个源分支各自通过、旧suite通过、没有复现新缺陷的只读review结论 |
+
+协调方报告joint当前仍未提交、索引UU、测试未跟踪，本工程没有读取或操作这些WIP；在最终状态证据到达前继续待验。协调方的shared日志汇总是174通过/1忽略，原274为已撤回笔误；该计数尚不等于可整合revision，更不是本工程执行数。初始化缺口的源码确认、未来实际回归和最终联合验收保持三层记录。
