@@ -7,6 +7,8 @@ type TextSender = (text: string, streamId: number) => Promise<void>;
 interface QueuedInput {
   input?: ControllerInput;
   text?: string;
+  shortcut?: ControllerInput;
+  shortcutGeneration?: number;
   streamId: number;
   resolve?: () => void;
   reject?: (error: unknown) => void;
@@ -28,6 +30,7 @@ export class RemoteInputDispatcher {
   private readonly pendingMouseMove = { x: 0, y: 0, streamId: 0 };
   private hasPendingMouseMove = false;
   private generation = 0;
+  private shortcutGeneration = 0;
 
   constructor(
     private readonly sender: InputSender,
@@ -82,6 +85,22 @@ export class RemoteInputDispatcher {
     return Promise.all(pending).then(() => {});
   }
 
+  enqueueShortcut(input: ControllerInput, streamId: number): Promise<void> {
+    if (input.kind !== "key" || !input.key || input.pressed !== true) {
+      return Promise.reject(new Error("Invalid remote shortcut"));
+    }
+    this.flushPendingMouseMove();
+    const pending = new Promise<void>((resolve, reject) => {
+      this.queue.push({ shortcut: { ...input }, shortcutGeneration: this.shortcutGeneration, streamId, resolve, reject });
+    });
+    this.startPump();
+    return pending;
+  }
+
+  cancelShortcuts(): void {
+    this.shortcutGeneration += 1;
+  }
+
   /**
    * Queues a pointer move without allocating a ControllerInput for every
    * hardware event while an IPC call is still in flight. Discrete input is
@@ -119,6 +138,7 @@ export class RemoteInputDispatcher {
   }
 
   discardAll(): void {
+    this.cancelShortcuts();
     this.generation += 1;
     for (let index = this.queueHead; index < this.queue.length; index += 1) {
       this.queue[index]?.reject?.(new Error("Remote input was cleared"));
@@ -155,7 +175,18 @@ export class RemoteInputDispatcher {
           continue;
         }
         try {
-          if (queued.text !== undefined) {
+          if (queued.shortcut) {
+            if (queued.shortcutGeneration !== this.shortcutGeneration) throw new Error("Remote shortcut was cancelled");
+            // A single key plus its modifier mask is a complete native chord.
+            // Key-up uses the same mask, releasing the main key before modifiers.
+            // Always attempt it after an uncertain IPC result or cancellation.
+            try {
+              await this.sender(queued.shortcut, queued.streamId);
+              if (queued.shortcutGeneration !== this.shortcutGeneration) throw new Error("Remote shortcut was cancelled");
+            } finally {
+              await this.sender({ ...queued.shortcut, pressed: false }, queued.streamId);
+            }
+          } else if (queued.text !== undefined) {
             if (!this.textSender) throw new Error("Remote text sender is unavailable");
             await this.textSender(queued.text, queued.streamId);
           } else if (queued.input) {

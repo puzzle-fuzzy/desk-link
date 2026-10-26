@@ -78,6 +78,7 @@ function inputHost() {
     inputDispatcher: {
       enqueueText: (text: string) => { texts.push(text); return Promise.resolve(); },
       discardPendingMoves: () => {},
+      cancelShortcuts: () => {},
     },
     isRemoteClipboardPasteShortcut: () => false,
     remoteTextInput: null,

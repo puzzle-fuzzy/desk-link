@@ -118,6 +118,7 @@ import {
 import { fileQueueProtectionPresentation } from "./file-queue-protection";
 import { FileQueueView } from "./file-queue-view";
 import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
+import { REMOTE_SHORTCUTS, remoteShortcutInput } from "./remote-shortcuts";
 import {
   FileQueueActionGate,
   type FileQueueActionKind,
@@ -252,6 +253,7 @@ let transferActivity: TransferActivityState = { unreadResults: 0, tone: null };
 let transferPanelUpdateTimer: number | null = null;
 let lastTransferProgressPaintAtMs: number | null = null;
 let smartPasteBusy = false;
+let remoteShortcutBusy = false;
 let smartPastePending = false;
 let filePickerBusy = false;
 let discardFileRecoveryBusy = false;
@@ -598,8 +600,12 @@ export function bindControllerInteractions(): void {
   document.querySelector<HTMLButtonElement>("[data-controller-pan]")?.addEventListener("click", () => {
     setRemotePanMode(!remotePanMode);
   });
-  document.querySelector<HTMLButtonElement>("[data-controller-windows-key]")?.addEventListener("click", () => {
-    sendRemoteKeyTap("meta");
+  document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]").forEach((button) => {
+    button.addEventListener("click", () => { void sendRemoteShortcut(button.dataset.controllerShortcut ?? ""); });
+  });
+  const shortcuts = document.querySelector<HTMLDetailsElement>("[data-controller-shortcuts]");
+  shortcuts?.addEventListener("focusout", (event) => {
+    if (!shortcuts.contains(event.relatedTarget as Node | null)) shortcuts.open = false;
   });
   document.querySelector<HTMLButtonElement>("[data-controller-text]")?.addEventListener("click", () => {
     const panel = document.querySelector<HTMLElement>("[data-controller-text-panel]");
@@ -989,7 +995,13 @@ function renderRemoteDesktop(): string {
             </select>
           </label>
           <button class="toolbar-button${remotePanMode ? " toolbar-button--active" : ""}" type="button" data-controller-pan aria-pressed="${remotePanMode}" ${remoteScaleMode === "actual" ? "" : "disabled"} title="${remoteScaleMode === "actual" ? (remotePanMode ? "恢复向远程电脑发送鼠标和键盘输入" : "只在本地拖动或滚动画面，不会操作远程电脑") : "切换到 1:1 后可以浏览超出窗口的画面"}">${icon("hand")}${remotePanMode ? "继续控制" : "浏览画面"}</button>
-          <button class="toolbar-button" type="button" data-controller-windows-key title="在远程电脑打开或关闭开始菜单，不会打开本机开始菜单">${icon("panels-top-left")}Windows 键</button>
+          <details class="remote-shortcuts" data-controller-shortcuts>
+            <summary class="toolbar-button" title="发送远端 Esc、Windows 键和系统组合键">${icon("keyboard")}快捷键</summary>
+            <div class="remote-shortcuts-panel" aria-label="发送快捷键到远端">
+              ${REMOTE_SHORTCUTS.map((shortcut) => `<button type="button" data-controller-shortcut="${shortcut.id}" ${remoteShortcutBusy ? "disabled" : ""}><strong>${shortcut.label}</strong><small>${shortcut.description}</small></button>`).join("")}
+              <p>本机 Esc：退出全屏。<br>Ctrl + Alt + Delete：请在被控电脑本机操作。</p>
+            </div>
+          </details>
           <button class="toolbar-button" type="button" data-controller-text title="发送中文、符号或一段文字">${icon("keyboard")}发送文字</button>
           ${renderTransferToolbarButton()}
           <button class="toolbar-button" type="button" data-controller-keyframe title="刷新远程画面">${icon("refresh-cw")}刷新画面</button>
@@ -997,7 +1009,7 @@ function renderRemoteDesktop(): string {
           <button class="toolbar-button toolbar-button--danger" type="button" data-controller-disconnect>${icon("log-out")}断开连接</button>
         </div>
       </div>
-      <div class="remote-fullscreen-guide" aria-hidden="true">鼠标移到顶部显示工具栏 · Esc 退出全屏</div>
+      <div class="remote-fullscreen-guide" aria-hidden="true">鼠标移到顶部显示工具栏 · Esc 退出全屏 · 快捷键菜单可发送远端 Esc</div>
       ${renderTransferPanel()}
       <form class="remote-text-entry" data-controller-text-form data-controller-text-panel hidden>
         <label for="remote-text-input">发送文字到远程电脑</label>
@@ -3455,6 +3467,7 @@ function resetRemoteTextInput(): void {
 }
 
 function resetRemoteInputState(): void {
+  inputDispatcher.cancelShortcuts();
   resetRemoteTextInput();
   releaseInputState();
 }
@@ -3519,10 +3532,26 @@ function fireMouseMove(x: number, y: number): void {
   }
 }
 
-function sendRemoteKeyTap(key: string): void {
-  fireInput({ kind: "key", key, pressed: true, modifiers: 0 });
-  fireInput({ kind: "key", key, pressed: false, modifiers: 0 });
-  focusRemoteKeyboard();
+async function sendRemoteShortcut(id: string): Promise<void> {
+  const input = remoteShortcutInput(id);
+  const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
+  if (!input || streamId === null || remoteShortcutBusy || remoteTextInput?.state.isComposing) return;
+  const generation = channelGeneration;
+  resetRemoteInputState();
+  remoteShortcutBusy = true;
+  const menu = document.querySelector<HTMLDetailsElement>("[data-controller-shortcuts]");
+  if (menu) menu.open = false;
+  const buttons = document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]");
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await inputDispatcher.enqueueShortcut(input, streamId);
+  } catch (error) {
+    if (channelGeneration === generation && snapshot?.runtime.streamId === streamId) showOperationError(error);
+  } finally {
+    remoteShortcutBusy = false;
+    document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]").forEach((button) => { button.disabled = false; });
+    if (channelGeneration === generation && snapshot?.runtime.streamId === streamId) focusRemoteKeyboard();
+  }
 }
 
 async function submitTextInput(event: SubmitEvent): Promise<void> {
