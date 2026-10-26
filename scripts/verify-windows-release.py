@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -98,6 +99,26 @@ def verify_versions() -> str:
         detail = ", ".join(f"{name}={version}" for name, version in versions.items())
         raise SystemExit(f"Windows release versions do not match: {detail}")
     return unique.pop()
+
+
+def current_source_versions() -> dict[str, object]:
+    """Read source metadata without building, connecting or touching a device."""
+    protocol = required_match(
+        ROOT / "crates/desklink-protocol/src/lib.rs",
+        r"pub const PROTOCOL_VERSION: u16 = (\d+);",
+        "application protocol version",
+    )
+    toolchain = required_match(
+        ROOT / "rust-toolchain.toml",
+        r'(?m)^channel\s*=\s*"([^"]+)"',
+        "Rust toolchain",
+    )
+    return {
+        "windows_version": verify_versions(),
+        "protocol_version": int(protocol),
+        "bun_version": expected_bun_version(),
+        "rust_toolchain": toolchain,
+    }
 
 
 def expected_bun_version() -> str:
@@ -297,6 +318,15 @@ def verify_pe(path: Path) -> dict[str, object]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--versions-only", action="store_true",
+        help="print versions read from source manifests; no build or device access",
+    )
+    args = parser.parse_args()
+    if args.versions_only:
+        print(json.dumps(current_source_versions(), indent=2))
+        return 0
     if os.name != "nt":
         raise SystemExit("Windows release verification must run on Windows")
     prepare_windows_native_build_environment()

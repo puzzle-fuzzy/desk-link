@@ -2,6 +2,7 @@ use super::*;
 use desklink_crypto::SessionId;
 use desklink_ffi::ControllerRuntime;
 use desklink_relay::{RelayConfig, RelayServer};
+use desklink_transport::JoinRejectCode;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 struct TestRelay {

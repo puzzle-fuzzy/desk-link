@@ -1,7 +1,7 @@
 # DeskLink 第二阶段 TODO
 
 > 更新日期：2026-10-26（Asia/Shanghai）
-> 审查基线：`main@85bdf7278baf11b1adb9b401b978643c261daf2b`；Windows 客户端 `0.1.93`，协议 `12`。
+> 初始审查基线（历史）：`main@85bdf7278baf11b1adb9b401b978643c261daf2b`；Windows 客户端 `0.1.93`，协议 `12`。当前已提交成果的源码身份与子项检查框见下方快照；分支成果尚未合入 main。
 > 本阶段目标：补齐远控工作流、消除真实缺陷、重整模块职责，并以可重复测量推进低延迟、低资源占用和稳定吞吐。允许调整协议、ABI、模块边界及实现，不以开发成本或现有部署兼容性限制方案。
 > 用户已确认 Windows → Windows、macOS → Windows 可以正常连接并良好控制，这两条路径是已成立的产品基础。本文件不把旧文档中“尚未验收”的历史表述当作当前不可用证据。
 > 本清单已进入并行实施阶段。各项按下述会话分工推进，完成一个问题并通过对应验证后立即独立 commit，同时更新该项完成标记。第一阶段记录保留在文末，不能用其旧日期、版本或勾选状态代替本阶段验收。
@@ -34,10 +34,19 @@
 | --- | --- | --- | --- |
 | Windows 产品与交互 | 001、002、008、009、017、031、032、033、034、035 | `codex/dl2-windows-product` | 001、034、032，再处理会话生命周期和共享控制 |
 | Apple 与 FFI | 003、004、005、006、007、018、025、026、027、028、029、043 | `codex/dl2-apple-ffi` | 003、005、029，再完善 ABI、输入法和会话能力 |
-| Windows 媒体与文件 | 010、011、012、013、014、015、016、020、021、022、023、030 | `codex/dl2-windows-media` | 010、011、012、020，以及性能基线 |
-| 中继与直连 | 019、024 | `codex/dl2-network` | 019 调度隔离，024 多通道直连后置 |
+| Windows 媒体 / GPU 第二波 | 015、016 | `codex/dl2-windows-gpu` | 原媒体65c冻结交接；后续GPU surface/硬件编码单独合入 |
+| 中继与直连 | 第一波019/052/053/057冻结；第二波024 | 第一波 `codex/dl2-network`；后续 `codex/dl2-lan-runtime` | 4b15561可进入第一波；024真实生产接线后置 |
 | 账号与诊断服务 | 036、037、038、039 | `codex/dl2-services` | 036、037、039，再处理邮件与长期运行 |
 | 工程验证与收口 | 040、041、042 | `codex/dl2-engineering` | 041 验证入口；040 跨模块重构待共享接口稳定 |
+| 大文件与目录传输（第七会话） | 030 | `codex/dl2-file-transfer` | 从Windows joint5782341起步，独占新增文件功能的业务协议14 |
+
+原媒体第一波010/011/012/013/014/020/021/022/023及030既有切片冻结在 `65c70fd658d0526a8a27b75fdbf120ae065222bf`，已进入Windows joint；新GPU与文件功能继续独立提交。文件会话为 `01a17733-4bf0-79d3-831f-7c0190191591`，负责新增文件wire/API的协议14；当前工程与Windows joint仍协议13，main仍12。
+
+第一波集成采用冻结Windows joint5782341、Apple完整稳定历史f954a68、网络/services固定来源及工程分支建立独立候选，保留逐问题commit并实际联合验证。GPU015/016、新文件030/协议14后置，不阻塞稳定13第一波；候选通过后由主会话决定合入main，工程组不切换或覆盖root checkout。
+
+网络第一波已冻结 `4b15561586fab7a1481ba6dd4ff4854f34123018`（直接parent为a41e1e2），后续024在独立LAN runtime分支推进。服务S快照后发现resetPassword预算满先消费token、token动作共用email:missing桶两处确定缺口，owner正在逐条独立补修；第一波服务集成等待其最终固定SHA，不用旧服务快照提前关闭该补修。
+
+044/045服务schema分别已有 `b1118ad465703493255123e23b6f522662c3d603` / `bf5d7eb27f3f41be59ac317b63d7e93d10f38066`，GUI最终来源 `5069158584dfa1f729defe2fadb5b9933acdfcff` 与限定lib报告已核对，候选聚合/重跑仍待执行。协调方确认未提交的cloud过滤切片已全部撤回，正常上传策略保留；整体候选合入服务历史后须用共同fixture验证真实client事件→签名验签/schema→store，不因旧joint缺字段永久吞掉两种事件。中间编译日志不作为撤回后源码证据。
 
 - 各会话在独立 worktree 中工作，不在主 checkout 切换分支或提交别人的改动。表中编号均为 DL2 编号。
 - **一个问题一个 commit。** 对应实现、必要测试和该项 TODO 状态一起提交，主题包含 DL2-ID；验证通过就提交，不累计多个问题。整体重构中可独立验证的切片也必须标明所属问题。
@@ -47,7 +56,93 @@
 - 各会话只维护自己编号的 TODO 条目及必要证据，不改其他任务状态。DL2-040 不提前跨组重写，集成时逐问题保留提交；不把仅在分支完成当成已经合入 main。
 - 仅处理本地代码、测试及提交；线上部署、发布和真实远控/输入注入不作为本次安排的自动动作。
 
-## 2. 本次验证基线
+### 已提交成果检查框快照（2026-10-26；尚未合入main）
+
+下表的 `[x]` 只关闭其后明确列出的代码或自动验证切片，剩余验收继续 `[ ]`。来源均为不可变Git提交；自动列依据来源已提交记录或已核对原始报告，工程组未重跑的分支结果单列。main只读核对仍为 `a905b8807c83677f6f962c18f8fd1593f0d4ca32`，下列来源尚未成为main祖先。
+
+| 来源代号 | 不可变source / joint | 证据范围 |
+| --- | --- | --- |
+| J | `5782341e22ba55b2efe30a8eeaeafbebfe0daaba`，tree `59c7270aea76bc1d542ac49c625e308b42ef20f2` | Windows产品27fec+媒体65c真实合并；Rust634通过/2失败/19忽略，Bun474通过及构建、八包严格Clippy通过。两失败为未合完整Apple链的Host零epoch，Rust整体exit101 |
+| M | `65c70fd658d0526a8a27b75fdbf120ae065222bf` | 冻结媒体448通过/18忽略、37笔提交；已成为J祖先 |
+| A | `f954a68153168a1ded048ddf93eb9c565684d096`，tree `eed9ea733f256024f5839ce0a7c6763d3a6a920a` | Apple协议13冻结、41笔历史；来源原生165通过/0忽略（FFI88+transport/relay77）、Python201及check/限定Clippy/双头/fmt通过；工程正在独立核对，Swift/Xcode未运行 |
+| N | `4b15561586fab7a1481ba6dd4ff4854f34123018` | 网络第一波冻结，继承a41e1e2；本地QUIC/调度/资源/deadline及Linux候选关停证据，生产部署/真实WAN另验 |
+| S | `b1118ad465703493255123e23b6f522662c3d603` | 服务已提交快照；各项本地数据库/Bun/进程级回归与诊断producer合同，未部署；上述两处token预算/分桶补修后的最终SHA待交付 |
+| E | `12b54ceedc0799a556e502436bc08830db7edca1` | 工程入口/合同及实际共享transport恢复分类；其源码blob与已运行29/18/12及严格Clippy/fmt报告一致；其他报告精确SHA见 `docs/local-verification.md` |
+| G（后续波） | `2d79f9706303cb2dffa7abc764c8f7450591c3b6`，tree `6a24e9bc7a4599d1a02bdb6bed4868c3d3ced832` | 015 owned BGRA/NV12池、VP与capture入口；owner报告204通过/6忽略、7GPU含4合成及Clippy，rawlog待落盘，未独立复跑；016 dirty烟测不计入 |
+| D | `5069158584dfa1f729defe2fadb5b9933acdfcff`，parent67cd1bf、tree `3740f354bce3c1d14d32f8435bb44b0c2b6a1006` | GUI044/045固定历史；原日志核对044所选lib Windows218/2忽略、UI137/1忽略，045 UI138/1忽略及限定包Clippy；cloud代码相对J无diff，完整u64 JSON合同后继补修待交付 |
+
+来源TODO已关闭的主项为：产品001/034/035，媒体020/046/050，服务036/037/038/039/054/055/058，工程042；这些是各自来源范围的完成状态，剩余集成、已发现服务补修和设备验收继续按下表单独记录。
+
+| 问题 | 已提交代码 / 合同切片 | 已完成自动验证切片 | 未满足验收 |
+| --- | --- | --- | --- |
+| 001 · J | [x] 滚轮按协议边界拆分，保留总距离 | [x] 跨层滚轮边界回归 | [ ] 真实设备连续滚动/特殊应用 |
+| 002 · J | [x] 持久远控surface与shell局部更新 | [x] DOM会话存活/清理回归 | [ ] 实际WebView持续输入与静态恢复 |
+| 003 · A | [x] 可恢复error与终态分离 | [x] Rust错误事件/Windows静态合同 | [ ] Swift/Xcode及Mac真实恢复 |
+| 004 · A | [x] 发送取消/截止与后台句柄退役 | [x] Rust堵塞发送/截止、Python teardown合同 | [ ] Mac真实背压/主线程退出预算 |
+| 005 · A | [x] 物理字符/修饰键平衡与重复键边界 | [x] Python静态输入合同 | [ ] Swift回归与真实布局/按键释放 |
+| 006 · A | [x] 生产NSTextInputClient组合/提交链 | [x] Python输入合同，Swift用例已提交 | [ ] Swift执行、拼音候选/取消/最终提交 |
+| 007 · A | [x] 生产快捷键策略与原始组合入口 | [x] Python映射合同，Swift用例已提交 | [ ] Mac真实菜单/系统组合与切换释放 |
+| 008 · J | [x] Host暂停/恢复、结束控制与peer终态确认 | [x] 本地状态/结束确认/取消回归 | [ ] 双机本机立即收回与权限场景 |
+| 009 · J | [x] InputState、真实apply反馈与静默握手有界退出 | [x] 输入受限/恢复、旧端握手与联合回归 | [ ] 管理员/UAC/锁屏等真实权限矩阵 |
+| 010 · J/M | [x] 静态恢复IDR并保留buffered输出请求 | [x] 媒体恢复与联合软件MFT链 | [ ] 真桌面/双机恢复时延 |
+| 011 · J/M | [x] crypto短锁、独立probe窗口与取消树 | [x] 慢探测/重放/跨lane回归 | [ ] 双机黑洞输入/画面p95/p99 |
+| 012 · J/M | [x] 输入独立消费、慢配置合并与完成回执 | [x] 慢控制/输入并发回归 | [ ] 慢驱动双机输入预算 |
+| 013 · J/A | [x] Windows完整u64/绘制/host映射切片，A完整FFI/owned future/media_generation稳定历史 | [x] J两项软件MFT/QUIC/Noise联合回环；A源FFI88及相关传输回归 | [ ] 候选合并/复跑、Swift旧input receipt后继P2修复、真实呈现/拓扑；J单支仍2项Host失败 |
+| 014 · M | [x] CPU离线分段基线与真实输入/输出身份 | [x] 可复跑离线工具及buffered时序校验 | [ ] GPU/双机/端到端/功耗温度/长稳对照 |
+| 015 · M/G | [x] M复用staging/scratch；G新增owned surface池/VP缩放转色/capture入口 | [x] M缓冲回归；G204/6与合成GPU为owner报告，原日志待交付 | [ ] 016生产encoder链、tracked-sample lease寿命/CPU与GPU分别测量及适用硬件验收；主项保留未完成 |
+| 016 · M | [x] 硬件MFT枚举、有界异步泵/软件回退及timestamp校验 | [x] 后端/缓冲/输出身份回归 | [ ] 真实硬件成功编码及厂商/混合GPU/驱动丢失矩阵，第二波推进 |
+| 017 · J | [x] 有界AudioWorklet音频播放 | [x] 环形缓冲/生命周期与前端回归 | [ ] 实际播放、欠载/延迟/分配率测量 |
+| 018 · A | [x] 专用解码队列、字节/帧龄预算与合并presenter | [x] Python静态media合同，Swift调度器用例已提交 | [ ] Swift/Xcode、VideoToolbox与阻塞主线程性能；保留现有复制 |
+| 019 · N | [x] 三类媒体独立有界sender及代数隔离 | [x] QUIC ACK黑洞、健康会话隔离及本机调度测量 | [ ] 真实WAN/双机/容量与音频体验 |
+| 020 · M/J | [x] 可靠视频builder单次增量构造并复用buffer | [x] builder等价/边界与来源套件通过 | [ ] 第一波候选合并验证；M将本主项列完成 |
+| 021 · J | [x] 两端有界磁盘worker/独占收尾及初始化取消preserve | [x] 原prefix保留/续传、慢盘隔离及J完整Windows套件 | [ ] 真实慢盘/云盘/杀毒/空间耗尽的媒体预算 |
+| 022 · M/J | [x] GDI兜底中退避探测DXGI并迟滞恢复 | [x] 恢复状态/后端契约回归 | [ ] 真实UI诊断、睡眠/RDP/驱动恢复与帧龄 |
+| 023 · M/J | [x] 事务ICodecAPI码率更新与预设内自适应 | [x] 策略/动态更新契约回归 | [ ] 实际支持硬件的效果与失败恢复；完整协商 |
+| 024 · N | [x] opt-in认证八通道LAN/可靠回退/去重/随机收讫 | [x] localhost多lane、伪ACK、慢文件、013上下文保留 | [ ] 平台生产接线、实际LAN/WAN/恢复；未整体交付 |
+| 025 · A | [x] 双C头生成、ABI布局/有界命令及Swift能力映射 | [x] Rust/MSVC布局与Python头/合同检查 | [ ] 与J完整Apple稳定历史合并、Swift/Xcode与ABI运行 |
+| 026 · A | [x] Mac屏幕/画质控制与远端回执状态切片 | [x] Rust codec fixture、Python会话合同 | [ ] Swift执行、实际音频/剪贴板/文件等其余功能闭环 |
+| 027 · A | [x] 有界位置解码与Mac/iOS独立位置overlay | [x] Rust光标fixture/Python合同 | [ ] 完整shape/hotspot及真实几何/呈现效果 |
+| 028 · A | [x] 授权/expiry/身份pin与Keychain重连模型 | [x] Rust授权/持久等待取消与Python保存设备合同 | [ ] 真Keychain迁移、长期重连、跨设备误连保护 |
+| 029 · A | [x] Mac/iOS连接/审批/恢复取消与generation隔离 | [x] Python取消UI合同 | [ ] Swift和真实等待阶段取消/重连 |
+| 030 · M→文件会话 | [x] 单次源hash、Windows只读snapshot与peer退出取消 | [x] 现有256MiB范围传输/取消回归 | [ ] 大文件/4GiB、目录、持久块证明；新增文件协议14由第七会话独占 |
+| 031 · J | [x] 完整等待队列、稳定焦点与逐项移除 | [x] 队列/键盘焦点前端回归 | [ ] 实际多文件长队列操作体验 |
+| 032 · J | [x] 原生drop绑定可见会话区域与目标身份 | [x] 命中/会话代数回归 | [ ] 多显示器DPI/双机原生拖放 |
+| 033 · J | [x] 发送Esc/系统组合与宿主快捷键入口 | [x] 按下/释放平衡与路由回归 | [ ] 全屏/IME/布局与实际远端应用 |
+| 034 · J | [x] 内存账号草稿与重发邮箱绑定 | [x] 表单失败/重试/地址回归 | [ ] 实际账号页网络失败体验 |
+| 035 · J | [x] 完整三笔IPC所有权链与失败取消可重试 | [x] 迟到响应/持久化/host重启归属回归 | [ ] 实际登录/退出/换号与服务组合验证 |
+| 036 · S | [x] 数据库原子注册与并发幂等 | [x] 本地并发/唯一键竞争回归 | [ ] 第一波服务联合及部署验收 |
+| 037 · S | [x] 可写数据库readiness与有界锁等待 | [x] 依赖不可用/锁竞争回归 | [ ] 第一波服务联合与实际运行环境 |
+| 038 · S | [x] leased邮件worker及账号历史生命周期 | [x] 本地投递状态/回收/恢复回归 | [ ] 真实邮件服务、长时故障恢复与部署 |
+| 039 · S | [x] 索引/分片分批保留期清理 | [x] 本地清理/容量/并发接收回归 | [ ] 长期磁盘/生产性能与部署验证 |
+| 040 · E | [x] transport单一穷尽恢复策略，Host/Controller两生产入口删除重复match；合同整理 | [x] transport29/Windows策略18/FFI lib12、三包严格Clippy与fmt | [ ] 第一波候选接入、其余职责拆分；活跃input/media_generation与HostError字符串类型化分开处理 |
+| 041 · E/J | [x] 分层入口、固定工具/源码报告与joint证据核对 | [x] E入口回归、J634/2/19及Bun/Clippy记录核对 | [ ] 完整Apple后第一波候选实跑、平台/设备/性能门禁；不关闭主项 |
+| 042 · E | [x] 能力/版本/来源与当前检查框快照 | [x] manifest版本5项、本地链接/原报告哈希检查 | [ ] 每次稳定聚合继续同步；main状态须随真实合入对齐 |
+| 043 · A | [x] Main/1080p与实际profile/尺寸安全拒绝 | [x] Python2项合同，Swift用例已提交 | [ ] 动态完整协商、Swift/真实Mac编码与权限 |
+
+新增044–061不复制root未知作者的未提交草稿；当前已核实来源切片另列如下，未获证据者继续待核实：
+
+| 问题 | 已提交/核对的切片 | 未满足验收或成立性 |
+| --- | --- | --- |
+| 044 · J/M/S/D | [x] cursor降级/typed observer、b111服务合同与GUI持久化切片/所选lib回归 | [ ] full-u64 JSON字符串后继补修及最终producer→签名接收/store全值域闭环、双机；observer不计真实丢包 |
+| 045 · J/M/D/bf5d7eb | [x] Some(Err)反证、None退役/迟到probe隔离、GUI/服务固定字段与所选lib回归 | [ ] full-u64 JSON后继补修、最终真实签名接收/store与实际监听；不延续“任一Err永久禁用” |
+| 046 · M/J | [x] 路径所有权/按连接身份退役/迟到结果取消与真实回归，M主项完成 | [ ] 第一波候选接入验证 |
+| 048 · E | [x] Noise message3认证payload链路已核对 | [ ] P1/UKS攻击路径证据不足，熵源/篡改/拼接待独立证明；未直接改crypto |
+| 049 · N | [x] 按relay IPv4/IPv6族绑定本地socket，真实::1/v4握手/join/目录/可靠与datagram回归 | [ ] 第一波候选接入；真实WAN IPv6/NAT/双栈路由另验 |
+| 050 · M/J | [x] 重复chunk保留首payload且不延寿与回归，M主项完成 | [ ] 第一波候选接入验证 |
+| 051 · A | [x] 网络/服务故障保留账号会话、generation隔离及旋转token取消落盘；Python10项合同 | [ ] Swift行为用例17项未运行，真实Keychain/断网/重新登录 |
+| 052 · N | [x] QUIC资源预算、join前datagram防护及固定容器负载/cgroup实测 | [ ] 第一波聚合；容量结论只限已测载荷，生产环境另验 |
+| 053 · N | [x] 绝对join/partial-frame截止、真实QUIC与512连接本机probe | [ ] 第一波聚合与部署长稳 |
+| 054 · S | [x] 诊断验签前准入与事务持久配额、来源回归 | [ ] 第一波服务最终补修聚合与部署容量 |
+| 055 · S | [x] 可信socket/显式代理来源与有界限流键、来源回归 | [ ] 服务token动作分桶新缺口补修及最终聚合 |
+| 056 · S | [x] 哈希/响应窗/未认证计算门控与本机计时切片 | [ ] resetPassword预算与token顺序补修、部署空闲/饱和枚举 |
+| 057 · S/N | [x] Bun请求/socket排空及N Linux候选关停证据 | [ ] 服务最终来源聚合与第一波跨进程关闭验证 |
+| 058 · S | [x] 设备标签按账号隔离及来源越权/换号回归 | [ ] 第一波服务聚合与部署 |
+| 059 · A | [x] 未知Host事件固定计数/不解析、Transfer非终态；Windows2静态合同 | [ ] Swift及真实Transfer全流程 |
+| 060 · A | [x] 认证会话时钟校准/context先验隔离、策略/QUIC来源回归 | [ ] 真Mac时钟跳变/输入注入及完整Apple聚合 |
+| 061 · A | [x] direct绝对静默截止、真实loopback黑洞/持续收包红绿回归 | [ ] Mac/iOS实际启用、双机/防火墙与第一波聚合 |
+| 047 | [ ] 成立性、来源/owner与实跑范围待核实 | [ ] 保留root未提交稿，不能总括全部确认或修改其owner |
+
+## 2. 本次验证基线（初始记录，后续源码结果见上表）
 
 以下均为本次在当前 Windows checkout 上执行的结果，不是引用历史记录：
 
@@ -232,6 +327,8 @@
 - [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
 - [x] Windows 共享 Rust API 来源切片 `feat(DL2-013): expose the captured-context runtime input bridge`：准确提取 Apple 已提交 `9ad7154b365de875d725188cfa091f5c21da0b5a` 的 ControllerRuntime::send_input_with_context(&self, InputContext, InputEvent)、必要 import、旧 send_input 明确拒绝及 encrypted controller_runtime 回归；未引入 C/Swift/worker 队列依赖。唯一必要前置为 `bc6c0a62` 的共享合同。`python scripts/run-windows-cargo.py test -p desklink-ffi --test controller_runtime --locked` 5 通过，包含真实加密输入传输；不表示主机/呈现/生产者整链已接通。
 - [x] 独立发送所有权切片 `feat(DL2-013): share an ordered input sender outside runtime event polling`：ControllerInputSender/input_sender 与 Runtime 共用同一发送实现及序号，输入专用锁覆盖完整 wire 写入；共享加密锁在网络等待前释放，热路径不逐包 clone Arc。FFI lib 12 通过、真实 encrypted controller_runtime 6 通过；36 帧含 32 并发 sender clone 严格 1..36，原 context 保留、零 context 不发包/不消耗序号。完整 FFI 尚有 2 个旧 Host 零 input_epoch 配置测试失败，保留为生产者未接通证据，不算全通过。
+- **工程合同阶段历史范围：** 工程来源 `5501aad9f7d160f751048036ac2a14cf0a315680` 当时只有 wire/codec 合同，host 分配/映射锁及输入生产者仍用显式无效零 context/epoch，并被 codec 拒绝；这不是当前 epoch 兜底。该阶段“尚在接线/不可交付”的记录保留其来源身份，不能覆盖下列 J 的非零 Windows producer 与 A 的完整 FFI/Apple 接线。当前候选仍须联合复跑、补 Apple 旧 input callback receipt 后继修复，并分别验收 Windows 实际 WebView、Apple presented 与真实拓扑/输入，不整体关闭 013。
+
 - [x] Windows 生产者切片 `feat(DL2-013): bind Windows input to painted full-width contexts`：所有 context/VideoConfig 身份 IPC 使用规范十进制字符串，Rust 内部保留完整 u64；覆盖 2^53 前后、u64::MAX 与非法格式拒绝。DOM 事件/pending pointer/滚轮/文字/IME/快捷键/粘贴/释放均固定原 pair；精确 frame/config/channel token 在 drawImage 成功后的可见 rAF 屏障才激活，同 epoch 画质变更保留 DOM 与 held keys。稳态不重复排激活 rAF，输入热路径不读布局。Native 仅持一个输入 future，主循环继续配置/媒体/取消；ACK 粘贴至 Ctrl+V 完成前保持 busy，旧 epoch 后半段局部取消而不拆正在写的可靠帧。Bun 1.3.14 全套 474 通过、构建通过；管理库 135 通过/1 签名资产忽略，Windows 库 113 通过/1 交互桌面忽略。含既有智能粘贴完成/失败后可再次操作回归；不冒称硬件呈现或整链已可交付。
 
 - [x] **已实现并自动验证（`fix(DL2-013): preserve stable monitor identities across enumeration`）：** 使用EnumDisplayDevicesW监视器接口路径稳定映射，进程内最多1024身份且不复用ID；枚举重排/主屏变化不再使旧ID指向另一输出。GDI主屏保留实际descriptor ID；身份不可用/歧义时安全失败。
@@ -280,8 +377,10 @@
 
 ## 4. 性能与数据通道
 
+以下 Apple/FFI 013 条目按来源提交顺序保留阶段记录；其中“本分支”指对应 Apple 来源，早期生产隔离点及测试计数不代表当前 J+A+N 候选。Apple 最终来源为上表 A（`f954a68153168a1ded048ddf93eb9c565684d096`），候选实际联合复跑尚未完成。
+
 - [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
-- [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
+- [ ] **当前候选剩余验收：** J 的 Windows 非零 host/producer 与 A 的 FFI/Apple 接线合入后，仍须候选跨包复跑、Apple 旧 input callback receipt 后继修复及实际 WebView / presented / 拓扑和输入验收。合同阶段的零 context 隔离记录见 013 历史范围，不据此认定当前候选生产者仍为零，也不整体关闭 013。
 
 - [x] Controller/FFI 输入切片：`ControllerRuntime::send_input_with_context(context: InputContext, event: InputEvent)` 严格校验并序列化原 context；旧无上下文方法保持拒绝。FFI DesklinkInput/Event 贯通 epoch，有界队列、合成 release 按 context 保存；新增 `desklink_release_all_for_context`，旧 epoch 的同名键释放不会清掉新 epoch ledger，空 ledger 回收且最多跟踪 8 个 context。生成 C 头与实际 C/Rust 布局一致。Rust 20 单元+7 ABI+2布局+5 Controller loopback共34项通过。主题 `feat(DL2-013): preserve captured input context across FFI queues and releases`。
 
@@ -291,7 +390,7 @@
 - [x] Controller 同 epoch 改编码尺寸视为配置合同错误，拒绝保留可输入的旧几何；同几何画质重配保持 epoch，epoch 身份不按数值排序。新增真实运行 Rust guard 回归；本分支 FFI 全57项与 Clippy all-targets `-D warnings` 通过。主题 `fix(DL2-013): reject geometry changes that reuse an input epoch`。
 
 - [x] Apple 呈现与输入完整代码切片：VideoConfig epoch 绑定解码/呈现令牌；Metal drawable 真正呈现且 presentedTime>0 才启用新输入 surface，迟到回调校验 runtime/stream/config/epoch。Mac/iOS 按键、IME、手势和延迟长按捕获原 context，纯画质重配同 target 不释放；重连在 FFI callback 同步退役旧流，支持新认证会话较小 epoch/stream，旧 callback 不清新 runtime。Python DL2 合同74项通过（其中呈现10、输入捕获9）；Swift模型/事件测试已补但本Windows环境未执行。主题 `fix(DL2-013): bind Apple input lifetimes to actual frame presentation`。
-- [ ] 本分支 Windows Host/前端仍有合同隔离点，待媒体/产品分支接通整合；FFI Mac Host 完整捕获拓扑身份、Swift6编译、真机呈现/输入/跨设备验收仍缺。以上是代码/本地合成证明，不是013整体验收。
+- [ ] **Apple 来源与候选剩余验收：** 此早期 Apple 切片的 Windows Host/前端隔离点由候选保留的 J 生产接线承接，不能外推为候选仍未接通；FFI Mac Host 完整捕获拓扑身份、Swift 旧 input callback receipt 后继修复、Swift6编译、真机呈现/输入/跨设备验收仍缺。以上是代码/本地合成证明，不是013整体验收。
 
 - [x] 新认证会话与熵源补充：每个新 Noise 即使 stream/尺寸复用也取得不同随机起点序列中的 context；RNG 使用 try_fill_bytes，错误/零值/MAX 初始化失败均明确拒绝并缓存，无panic/回落1。新增合成熵源边界与真实 relay generation 切换回归；修复夹具无截止等待后新Noise回环0.70s通过，本分支完整FFI 62项通过。主题 `fix(DL2-013): fail closed on epoch entropy errors and verify reconnect identity`。
 
@@ -651,6 +750,8 @@
 
 ## 7. 代码整理与验证体系
 
+本节保留工程各阶段的原始来源与报告；“当时/当前未接线”、零 producer、旧 API 调用及失败计数仅描述各条绑定的工程快照（包括 `5501aad`、`56f53b4`、`d6f153e`），不外推为当前候选状态。当前候选已保留 J 的 Windows 非零生产者、完整 A 与 N 的已提交切片；工程 040 实际共享错误策略的独立代码/验证切片另列，整合后仍须实际复跑。合并、既有来源报告和本次文档裁决均不等于候选联合测试已通过。
+
 ### DL2-040 · P1 · 按实际所有权拆分巨型控制模块
 
 - [ ] 将协议/会话策略、平台能力、媒体、输入、传输和 UI 生命周期分开，消除重复实现。
@@ -658,6 +759,15 @@
 - **方案：** Rust 共享 session/transport/policy 持有恢复、能力和背压规则；平台 adapter 只做捕获、注入、存储、权限；前端分为 session store、media presenter、input、transfer、shell。统一错误 code/状态/命令结果，减少依靠字符串和裸整数分支。
 - **实施方式：** 随真实修复完成纵向切片迁移，删除被替代路径；允许直接调整内部 API/协议，但不把重命名目录或更换框架当作性能收益。用 CodeGraph 确认调用方，再以编译和测试验证。
 - **验收：** 一项策略只有一个所有者，生产调用与测试调用相同；Windows 和 Apple 使用同一语义；每个新边界具有资源/取消/错误合同；通过 DL2-014 的前后性能比较。
+- [x] **不冲突的公共合同整理（`docs(DL2-040): define boundary ownership and integration gates`）：** 新增 `docs/second-stage-boundary-contracts.md`，经 CodeGraph 查询/调用影响和本 worktree 源码逐项确认 SessionMachine、ReconnectSchedule、三处 transport 分类、两套 controller ConnectFailure、同步 join 和 ABI/Swift 映射。保留 persistent/临时邀请、host 服务/单次 controller 的语义差异，明确命令接纳/完成/终态、取消/资源/callback 所有权和稳定错误类别，记录已提交跨组接口与固定 SHA。
+- **本切片验证：** 文档本地链接、10 处相关源码路径和 12 个完整提交身份可解析，独立只读复核无阻塞事实错误，`git diff --check` 通过；未修改 crates/apps/server 业务源码。既有 Windows 全栈验证保留原始源码身份，不冒称各组集成验证或新增性能结果。
+- [ ] **仍依赖集成：** 009 协议13、Apple 003/004/025、媒体011/012/021与产品002等提交须在第一波稳定revision收口；网络024生产接线和文件协议14后置。稳定transport分类已独立迁移，其他controller input/presentation/media_generation与FFI输入发送所有权待Apple当前013稳定；HostError::Transport(String)须独立类型化，不能套Controller规则。DL2-014同硬件比较、Swift/Xcode、资源/取消/权限场景仍缺，040主项未完成。
+- [x] **追加协调合同（`docs(DL2-040): record input epoch ownership and probe lane gates`）：** 明确 Apple/FFI 单一 owner 发布 `VideoConfig.input_epoch` / `InputEnvelope{stream_id,input_epoch}`，媒体 host 原子清键/推进/映射锁校验，产品实际首帧呈现后启用并在入队固定 context；旧输入/旧 release 必须隔离，取消与本机收回独立有效，不以 seq/wallclock/config_version 替代。013 严格绑定仍未完成。已核对媒体独立 probe lane 提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`；合同、调用方及接入验证须分别交付。文档链接、固定提交身份与 diff 检查通过，未改活跃模块。
+- **合同导入前的字段记录（`docs(DL2-040): clarify pending framed input context contract`）：** 记录 owner 明确的字段顺序、非零 stream/epoch、显式 InputContext 和 `[0, PROTOCOL_VERSION:u16 little-endian]` 前缀，由 encode_input/decode_session_input 唯一处理；禁止旧合法 Function(1) 的布局歧义、无context fallback和发送时补当前值。当时字段/前缀尚未落本分支；首帧门禁适用于该context远端输入，取消/本机收回独立。
+- **合同导入后的实际边界（`docs(DL2-040): separate landed wire contract from zero-context producers`）：** 来源 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c` 已复用为 `5501aad9f7d160f751048036ac2a14cf0a315680`，只有wire/codec合同落地。HostVideoPipeline、FFI host配置以及两处controller输入生产者仍显式零；显式发送API/host映射/两平台生产者待接线。真实host runtime在prepare生成配置处被拒绝InvalidVideoConfig，非夹具缺字段；当前不可交付，不默认1、不在发送时取当前epoch、不跳过业务失败。
+- **会话新鲜度与u64合同（`docs(DL2-040): require fresh Noise epochs and lossless IPC identities`）：** 只读确认HostConnectionSettings.stream_id持久化、supervisor仅run内推进，撤回“新stream可固定1”假设。每次新认证会话/Noise用OsRng非零随机起点（同进程也重新分配），仅几何/活动输出/有效性边界checked推进，纯编码不变；RNG/零/溢出明确失败或重建，无默认1/wrap/round/clamp。Windows身份IPC规范十进制字符串+BigInt完整u64，C/Swift UInt64；epoch不作key/nonce。记录为待接线合同，不冒称当前sender或host已实现这些规则。
+- **真实帧配置配对（`docs(DL2-040): preserve config consistency while pairing geometry epochs`）：** 帧/mailbox无独立epoch，host同会话epoch变化必须推进真实config_version并发布配置/恢复关键帧，同尺寸/原点改变也覆盖；纯编码可只变version不清键。源码已有同stream+同version任一VideoConfig字段变化→InconsistentVideoConfig（Eq含epoch），保留此拒绝，不描述成已复现旧帧误激活；禁止放宽校验或重贴旧buffered输出，正确新配置+对应帧实际呈现后才放行。
+- [x] **实际共享错误策略拆分（`refactor(DL2-040): centralize role-aware transport retry classification`）：** transport纯模块唯一穷尽分类，Windows host/FFI controller删除重复match并按显式上下文委托；保留Malformed/SessionNotFound/SessionOccupied三项Host可重建、Controller永久失败差异，persistent/预算/取消和HostError(String)不变。CodeGraph定位后核对工程/Apple880e/网络a41原函数一致；真实报告transport-policy/report.json源f8a89d6+dirty切片：Rust1.97.1、隔离target经wrapper，transport29/Windows策略18/FFI lib12通过0忽略、三包lib/tests严格Clippy及workspace fmt通过。两个生产入口与全部错误/rejection双角色覆盖；未改wire/ABI、不声称整体040或性能完成。
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 
@@ -666,14 +776,48 @@
 - **方案：** fast：format/typecheck/领域与契约测试；integration：本地 transport、慢发送/慢盘、取消/代数、跨 ABI；native：捕获/编码/权限/设备；performance：可重复基准与 soak。固定 Bun 1.3.14 与仓库 Rust toolchain，输出版本、源码 SHA、命令、跳过原因。
 - **新增关键覆盖：** TS→Rust 滚轮边界；FFI→Swift 可恢复错误；AppKit 实际键盘/输入法接线；shell 更新不销毁会话；backpressure 下关停；静态关键帧；拖放坐标；拓扑变化；并发注册与依赖失效 readiness。
 - **验收：** 从干净依赖环境可重复运行；缺少 Apple/设备条件时明确 skipped，不能算 pass；不以源码正则匹配代替关键用户流程。只为已稳定且有明确验收标准的界面增加 DOM/交互测试。
+- [x] **统一入口代码与 Windows 自动验证切片（`feat(DL2-041): add layered local verification with source-bound reports`）：** `python scripts/verify.py` 统一 fast / integration / native / perf，PowerShell/POSIX 薄入口转发；固定 Bun 1.3.14、仓库 Rust toolchain 与 frozen/locked 安装，Windows Cargo 经原生环境 wrapper；任务可单选且自动带前置，记录源码 SHA/dirty、工具版本、命令、耗时和原始日志，零测试不能误通过，超时清理整个子进程树，清理失败阻断后续任务。说明见 `docs/local-verification.md`。
+- [x] **入口回归：** Python 全套 127 项通过（新增入口回归 25 项，含真实子进程/子进程树、固定版本、零测试、skipped、失败阻断与间接 Cargo 依赖）；三个 Bun 项目的类型检查和测试通过（246 / 20 / 14 项），前端生产构建、Rust fmt/Clippy/workspace lib、protocol/video/session/crypto、localhost transport/relay、FFI runtime、媒体恢复和 Windows runtime 契约均通过。实际命令与结果另存 `dist/verify/verified-local.json`，运行时源码为基线 `a905b88` 加本切片，dirty=true；不是跨分支集成基线。
+- [x] **跳过语义：** `python scripts/verify.py native perf --report dist/verify/verified-device-skips.json` 实际记录 Apple/交互设备缺条件与 DL2-014 未集成，`passed=false` / incomplete；固定错误 Bun 与零匹配测试分别验证为 failed。
+- [ ] **仍需验收：** macOS/Xcode 实际运行、原生权限/硬件/双机/长稳与 DL2-014 同条件性能对照；离线媒体基线入口待媒体分支独立提交 `254f8be` 集成后执行。跨层新增关键覆盖仍随对应 DL2 修复补齐，主项保持未完成，不以本地入口成功代替用户流程验收。
+- [x] **ABI 检查入口增量（`feat(DL2-041): register read-only ABI header verification`）：** 检查 Apple 已提交的 `5691aba` 后注册跨平台 `--task ffi-header-sync`，只调用生成器 `--check`，不自动改头；源码未集成时 skipped。新增两项合成回归验证未集成不执行、同步检查不改头、漂移失败；统一入口 Python 全套 134 项通过（入口回归合计 27 项），证据 `dist/verify/abi-gate-python.json`。真实本基线 `--task ffi-header-sync` 记录 incomplete / passed=false（`abi-gate-unintegrated.json`），实际 ABI layout / Swift 仍待集成后验证，未复制其他分支 WIP。
+- [x] **跨层门禁与 probe 接入（`feat(DL2-041): gate probe integration and pending input context acceptance`）：** 新增 `--task direct-probe` 执行 crypto/transport `--lib --tests --locked`；按授权只复用协议13契约9979、shared-probe3277和独立lane0836，精确来源→本分支SHA见能力矩阵。实际统一入口在源码 `4c3648a` 加本切片（dirty=true）通过 crypto/transport79、workspace lib259、契约109、relay27、FFI39、媒体恢复2、Windows契约131、Python134与fmt；另一报告的前端frozen安装/生产构建、全workspace Clippy通过。原始证据 `dist/verify/probe-integration.json` / `probe-clippy.json`；计数有重叠，不推导独立覆盖总量或双机性能。
+- [ ] **严格 epoch 门禁的历史缺口与候选验收：** 工程5501aad的非零context/字段顺序/InputContext/保留前缀合同codec47项通过，56f53b4显式API桥接及加密loopback5项通过；其时七处旧生产调用、host映射与两平台呈现尚未接齐。当前候选保留 J 的非零 Windows producer/host 与 A 的完整接线，不沿用旧零值结论；仍须联合验证旧事件不重贴、旧release不影响新epoch、首帧实际呈现前禁用、host原子清键/推进/映射锁与取消独立生效，并补 Apple 旧 input callback receipt 后继修复。Windows合成/实际WebView和Apple presented真机分别记录；013整体验收仍 `[ ]`，不能用seq/wallclock/config_version或字段正则替代，不以编译或API原语通过标绿。
+- [x] **编译/codec/运行分层入口（`feat(DL2-041): retain failed runtime gates during input context transition`）：** 新增rust-check、protocol-wire、host-runtime-contract与controller-loopback；本工程实际编译通过、protocol47/probe79通过，但HostVideoPipeline runtime9通过1失败（InvalidVideoConfig），controller加密loopback3通过2失败（旧send_input返回InvalidInput），两份整体报告均failed/passed=false；未跳过或改默认值。入口/脚本Python134项另通过。清点七处旧send_input生产直接调用，覆盖普通键鼠/Text/IME/粘贴/FFI优先及延迟release；完整9ad未pick，待产品独立Rust桥接，完整C/Swift/FFI保持Apple源所有权。实际命令与源码身份见 `input-context-transition.json`、`controller-context-transition.json`、`transition-runner-python.json`；旧probe绿色报告不替代当前业务失败。
+- [x] **最小桥接实际复跑（`docs(DL2-041): record bridge loopback success without closing host gates`）：** b473498复用为56f53b4，与9ad的controller/test hunk等价、去重patch-id已记录；无C/Swift/worker祖先依赖。干净源码56f53b4的 `captured-context-bridge.json`：编译、protocol47、controller-loopback5通过0忽略；host仍9通过1失败，整体failed/passed=false。干净源码31e9fb0的fmt与Python134项通过（`captured-context-bridge-tooling.json`）。七处旧生产调用保持清单，API与测试成功不等于生产迁移；完整Apple整合保留一份等价API/test，不覆盖其他传输改动。
+- [x] **有序Sender与扩展门禁（`docs(DL2-041): distinguish sender regressions from epoch integration gates`）：** 来源3ea72dc已复用d6f153e；本地干净源码报告fmt/编译/protocol47与独立loopback6通过（32并发clone共36帧连续seq、原context、零ctx不发/不耗seq），完整FFI旧Host8通过2失败、Windows host9通过1失败，整体failed（ordered-input-sender.json），不只报lib12/loopback绿。补持久stream+新Noise/重启/同进程fresh RNG、零/失败/overflow、仅映射边界推进、u64字符串/BigInt、C/Swift边界、同尺寸/原点变化配对config_version与旧buffered帧门禁。保留既有InconsistentVideoConfig拒绝，未把设计风险写成现态复现；这些新规则待owner接线，不关闭013。
+- [x] **固定Windows joint来源与报告已取得（`docs(DL2-041): require joint revision evidence before closing Windows gates`）：** J5782341e22ba55b2efe30a8eeaeafbebfe0daaba/tree59c7270已核对parents27fec+65c、27/37历史、477源码blob及六份日志；Rust634通过2失败19忽略/Cargo101，Bun474/构建与八包严格Clippy通过。两FFI Host失败为完整Apple缺项，不写Rust全绿。本工程只读核对而未复跑J，完整第一波仍待下项，不操作root未知dirty。
+- [x] **joint初始化保留局部回归已记录（`docs(DL2-041): gate joint completion on resumed-partial initialization safety`）：** 65c源修复/28项报告后，J原日志588/589/597/598明确记录真实初始化取消保留、空part/显式cancel、初始化错误/sync失败四项ok；本工程只读核对，不冒充自行实跑。该子项已有证据；真实慢盘预算和第一波聚合继续未完成，旧89缺陷及174/1更正计数保留历史身份。
+- [ ] **新parents与完整Apple依赖联合复跑（`docs(DL2-041): bind final joint gates to updated parents and Apple dependencies`）：** 初期27fec/65c及Apple71/186来源报告保留历史身份；当前J578完整634/2/19与A f954来源165原生/201Python已绑定固定SHA，J两Host失败不能外推Apple源。第一波候选去重既有桥接/Sender并保留完整Apple历史、真实Windows非零producer，合入稳定服务/GUI/网络与Apple receipt后继修复，再实际跨包复跑；当前merge不等于测试完成，不单独flat-pick9ad，不操作root未知WIP。
+- [ ] **冻结媒体不替代联合门禁（`docs(DL2-041): keep joint acceptance pending after media source freeze`）：** 65c的final-validation/handoff及三组原日志448通过0失败18忽略相互一致，source前后/锁hash/37笔提交清单已只读核对，限定包Clippy等范围单列，本工程未复跑来源。020/046/050源主项完成，其他切片或部分实现与pending保持；015 GPU surface链未实现、030仍256MiB/无目录等不能按总数关闭。待最终joint树、Apple完整稳定来源和实际跨包/适用测试聚合，再收口041/013与可交付性，18忽略不算通过。
+- [ ] **第一波独立候选实际合并/复跑（`docs(DL2-041): start the protocol-13 candidate without waiting for later feature waves`）：** 独立wave1 worktree已从J578真实merge完整Apple f954历史；N4b、工程040/041/042、服务token补修后的最终来源及GUI506最终历史按稳定提交聚合，保留Windows非零producer与原问题历史。Apple新发现Swift input receipt P2由owner后继补丁追加；候选实际报告、真实事件签名接收/store闭环与未运行平台清单待交付。GPU、文件协议14、024后续开发不阻塞本轮，main由主会话在候选通过后决定合入。
+- [ ] **044/045完整u64云诊断合同补修：** 合法大于2^53的stream ID仍可由native producer以JSON u64 number产出，而现服务safeInteger拒整batch；原u64_overflow fixture仅两端一致不能证明全值域正确。producer/services各自后继切片改规范有界十进制字符串、native仍u64、白名单/原因不放宽，必要计数无损；实际最终client→签名schema/store全值域闭环待候选执行，当前不勾完成。
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 
-- [ ] 更新产品能力矩阵和当前架构契约，明确用户确认、源码能力与本次验证的边界。
+- [x] 更新产品能力矩阵和当前架构契约，明确用户确认、源码能力与本次验证的边界。
 - **证据 / 类型：文档缺陷。** `docs/current-architecture-contract.md:10,22,74` 仍以 0.1.91 为当前候选；package/README 已为 0.1.93。原 TODO 把 macOS VideoToolbox 当未来项，但 `apps/macos/Sources/DeskLinkApp/Capture/MacH264Encoder.swift` 已有实现；原“下一阶段”还停留在 Windows 首发冻结。
 - **方案：** 以 Windows→Windows、macOS→Windows 为核心矩阵，逐项列输入/IME/音频/剪贴板/文件/多屏/权限/恢复；被控 Mac 和 iOS 单列。版本由 manifest/配置读取，历史发布验收与新阶段开发任务分离。
 - **验收：** README、PRODUCT、DESIGN、架构契约及验证脚本的能力描述一致；用户确认的正常控制不再被标为未实现，尚未接通的 Mac 功能也不能因 Rust 方法存在而打勾；旧检查记录保留日期和原始范围。
 - **体验约束：** 维持连接/共享两主入口、原生平台习惯和清楚的下一步；本次不把既有视觉取舍、没有装饰或旧阶段未签名一概判成远控功能缺陷。
+- **完成（`docs(DL2-042): align current capabilities and manifest version evidence`）：** 新增 `docs/current-capabilities.md`，以 main `a905b88` / 工程切片 `44a2a99` 为基线，逐方向列基础控制、IME、音频、剪贴板、文件、多屏、权限和恢复；同步 README、PRODUCT、DESIGN、架构契约，保留历史记录日期。明确用户已确认两条基础远控、Mac VideoToolbox 已实现、未接通 Apple UI 不能因底层方法存在而勾选；其他分支只列固定提交证据，035 三笔链和 009 协议 13 契约不冒充已合入 main/完整反馈功能。
+- **实际验证：** 只读 `python scripts/verify-windows-release.py --versions-only` 输出 manifest 的 0.1.93 / 协议 12 / Bun 1.3.14 / Rust 1.97.1；5 项新增元数据/版本漂移回归通过，空 PATH 的真实 CLI 不调用构建/原生准备，文档版本表与 README 动态对照 manifest。统一入口 `--task python-tests --report dist/verify/dl2-042-python.json` 全套 132 项通过；6 份相关文档的本地链接全部可解析，`git diff --check` 通过。源码验证为 `44a2a99` 加本切片（dirty=true）；本次未新增真机、发布或性能结论。
+- **probe接入时的版本记录（`docs(DL2-042): distinguish probe integration protocol from main baseline`）：** 按后续授权复用协议13、shared-probe与DirectProbe独立提交后，工程源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，main `a905b88` 仍协议12；同步矩阵/README/架构契约和三笔来源→本分支SHA，明确不是其余功能已集成。只读版本入口实际输出13，5项版本/文档回归通过；当时013 epoch合同未提交。
+- **合同过渡状态（`docs(DL2-042): label zero-context integration as non-deliverable`）：** 记录bc6c0a→本分支5501aad来源，wire/codec已落地但零生产者未接线；编译/protocol47/probe79通过而host runtime9通过1失败，整体failed/passed=false。同步矩阵/README/架构契约，禁止用此前4c3648a的绿色probe报告覆盖新源码失败；main仍协议12与用户已确认的基础路径分开。版本/文档5项回归与链接/diff检查通过。计数已按本地原始报告更正（`docs(DL2-042): correct transition verification to local test counts`），49是来源分支报告，不是本次执行数。
+- **最小API桥接状态（`docs(DL2-042): record the verified runtime bridge and remaining host failure`）：** 来源b473498已复用为56f53b4，仅ControllerRuntime显式API与加密loopback；两文件hunk与完整9ad的稳定patch-id相同，后续Apple整合去重，不重复覆盖。干净源码56f53b4的本地报告：编译、protocol47、controller-loopback5通过0忽略，host runtime9通过1失败，整体failed。七处旧生产调用、host epoch、完整C/Swift/FFI和呈现仍未接齐，013不关闭。矩阵/边界合同同步，来源/patch-id/报告/链接检查通过。
+- **新增审查证据分类（`docs(DL2-042): record disputed review evidence without endorsing root draft`）：** `docs/second-stage-review-evidence.md` 记录主目录156增/16删稿非工程主会话或两个子agent所写，作者未确认，保持未代stage/覆盖。只读核对045原实现已continue Some(Err)、046取消树已由3277修复而仲裁待验、048未直接入Ed签名不构成已确认P1（Noise payload先认证解密），列防御纵深与篡改/拼接验证范围。不沿用“新增全部确认”，其余新项待owner核实后再更新最终矩阵；未改crypto或新增条目状态。
+- **有序Sender证据（`docs(DL2-042): separate sender success from failed host integration`）：** 来源3ea72dc→本工程d6f153e仅bc6+b473前置，保留单一Runtime/Sender实现；干净源码本地报告fmt/编译/protocol47/独立loopback6通过，完整FFI含lib12等选中项通过但旧Host8通过2失败，Windows host9通过1失败，整体failed。32并发clone/原context/连续seq与零ctx不耗seq是发送原语证据，不是生产迁移/新Noise随机epoch/IPC完整u64或呈现验收；来源与具体报告在能力矩阵分开记录。
+
+- **044反证与逐条归因（`docs(DL2-042): correct cursor congestion evidence and observer limits`）：** 按Cargo.lock核对quinn0.11.11/proto0.11.16缓存与版本化API：send_datagram拥塞可淘汰旧包并Ok，公开错误无QueueFull，wait内部Blocked为Pending；原拥塞P1路径不成立。保留cursor真实错误?传播/可选通道分类降级的待验范围，observer只计尝试/返回错误不是真实丢包。能力矩阵逐条区分044/045反证、046取消树已修与仲裁待验、048P1证据不足；不延续全部确认。主目录草稿仍非本组写入、作者未知、保持未stage/覆盖；未改crypto/transport或其他编号状态。
+
+- **joint初始化保留缺陷与日志归因（`docs(DL2-042): record the joint partial-retention blocker and review limits`）：** 只读固定媒体89bd1e5确认021 create/open后ready发送失败直接return，绕过正常preserve并由remove_on_drop=true删除已有resume partial；确定源码链路不是已运行回归。媒体owner独立修复与确定性回归待joint复用，未改其WIP或021状态。协调方报告joint未提交/UU/测试未跟踪，不当stable；shared174通过1忽略为其日志更正，274笔误撤回，不冒充本工程测试或joint最终验收，其余review未见问题也不等于测试通过。
+
+- **来源更新与MacHost归因（`docs(DL2-042): scope source reports and refresh joint parent provenance`）：** 只读Git核对产品27fec756的parent16594c4与唯一InputSendFuture类型别名变更；其135通过/1签名资产忽略和本包--no-deps Clippy为来源报告，未冒充工程或跨包实跑。协调方报告Apple完整FFI71/Python186/双头通过、013 worker owned future仍在做，测试完整SHA待交付；旧工程d6/旧joint的MacHost失败因缺完整Apple链，不能外推Apple当前分支失败。最终joint第一parent更新为27fec，另一parent后续已固定媒体65c（见下条），10份resolution/测试备份及SHA256清单为协调方报告；待完整Apple依赖/稳定SHA一起合并、去重既有桥接，禁止单独flat-pick9ad，最终跨包严格检查及适用测试仍待实际报告。
+
+- **021来源修复已交付（`docs(DL2-042): distinguish verified media source repair from pending joint acceptance`）：** 只读核对65c70fd658d0526a8a27b75fdbf120ae065222bf直接parent6dbe53d，仅TODO+transfer；ready发送失败同磁盘线程先preserve再退出。源TODO与协调方报告transfer28、lib/tests严格Clippy通过，回归源码覆盖真实open barrier/drop future、9次prefix/offset/hash保留、完整续传及空part/显式cancel/初始化错误/sync失败。当前为“源分支修复已验证、joint待复验”，不再把65c写成未修代码；协调方报告产品已开始27fec+65c真实remerge，本工程未操作joint或复跑来源，最终jointSHA/严格检查及所有适用测试报告仍待交付。
+
+- **媒体冻结交接范围（`docs(DL2-042): record frozen media evidence without widening completion claims`）：** 只读65c的final-validation与windows-media-handoff，记录source前后SHA/空working_status/Cargo.lock和报告SHA256、448通过0失败18忽略及37笔提交；只作为来源结果，本工程未复跑。主项仅020/046/050完成，其他按切片/部分实现与pending保留；015仍CPU读回且GPU surface链未实现，030仍256MiB/无目录、大文件与持久块证明。046后续源切片不冒充本工程已有初始取消树。041/013和可交付性不因来源计数关闭，最终joint/Apple完整稳定聚合证据待交付。
+- [x] **固定joint与逐项快照更新（`docs(DL2-042): bind joint results and phased ownership to immutable snapshots`）：** J578的parents/tree、27+37历史、六份日志哈希、477源码blob及原Rust634/2/19、Bun474/Clippy范围已核对，021四项初始化与013两项真实加密联合用例见原日志；不写Rust全绿。前置检查框已逐项列代码/自动验证与剩余验收，明确未合main、root044–061作者未知且未覆盖；固定A f954完整13历史、N4b第一波与S/GUI待稳定来源分开，G015和030/协议14、024后续不阻塞第一波。GUI044固定67cd不改cloud过滤，服务044/045schema进入候选后仍须真实签名接收/store闭环。
 
 ## 8. 扩展角色
 

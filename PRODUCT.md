@@ -12,6 +12,12 @@ DeskLink serves one person connecting their own Windows and Mac devices. The pri
 
 DeskLink provides a dependable, private remote-desktop path between personal devices. Success means the owner can understand whether the host is available or controlled, recover from ordinary network disruption, and stop or revoke access immediately without learning networking or cryptographic terminology.
 
+## 当前能力与阶段（2026-10-26）
+
+用户已确认 Windows→Windows、macOS→Windows 的基础远控良好。Windows 是当前正式发布目标，现有构建处于公开测试阶段；产品能力、方向和本次验证以[当前能力矩阵](docs/current-capabilities.md)为准。Mac 控制侧的 IME、系统音频、剪贴板、文件和多屏工具需要独立接通与验收，被控 Mac 和 iOS 单列；真实权限、恢复、性能、签名和安装记录各自保留证明范围。
+
+应用版本、业务协议和工具链由 `python scripts/verify-windows-release.py --versions-only` 读取。其他第二阶段分支的已提交实现保持独立证据，未集成到 main 时不提升本基线能力状态。连接/共享两主入口与平台原生习惯继续保留，不因文档收口增加用户操作。
+
 ## Application Account
 
 DeskLink can be used immediately in local mode without an email account. An optional application account adds email verification, session management and account-device visibility; it does not grant remote-device access, replace host approval, or synchronize saved connections between devices. A single account may be used on multiple Windows, macOS, and iPhone installations, while each installation must pair with hosts independently. Logging out releases the current remote session, clears the installation's saved remote connection records, and removes its account session; users can re-enter local mode without an account.

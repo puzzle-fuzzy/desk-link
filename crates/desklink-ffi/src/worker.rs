@@ -18,7 +18,7 @@ use desklink_protocol::{
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    JoinRejectCode, QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayJoin, TransportError,
+    QuicClient, QuicClientConfig, RelayDirectoryLookup, RelayJoin, TransportError,
 };
 use ed25519_dalek::VerifyingKey;
 use tokio::sync::{mpsc, watch};
@@ -922,29 +922,10 @@ fn controller_error_is_retryable(error: &ControllerError) -> bool {
 }
 
 fn transport_error_is_retryable(error: &TransportError) -> bool {
-    match error {
-        TransportError::Connection(_)
-        | TransportError::ConnectionLimit
-        | TransportError::Stream(_)
-        | TransportError::Datagram(_)
-        | TransportError::Closed
-        | TransportError::PeerDisconnected
-        | TransportError::PeerReplaced => true,
-        TransportError::JoinRejected(code) => matches!(
-            code,
-            JoinRejectCode::Internal
-                | JoinRejectCode::ConnectionLimit
-                | JoinRejectCode::SessionLimit
-        ),
-        TransportError::MessageTooLarge { .. }
-        | TransportError::NotJoined
-        | TransportError::AlreadyJoined
-        | TransportError::DirectoryNotFound
-        | TransportError::DirectoryRateLimited
-        | TransportError::DirectoryProtocolMismatch { .. }
-        | TransportError::Malformed
-        | TransportError::InvalidConfig(_) => false,
-    }
+    desklink_transport::transport_error_is_retryable(
+        error,
+        desklink_transport::TransportRetryContext::ControllerSession,
+    )
 }
 
 fn now_unix_s() -> u64 {
@@ -1209,6 +1190,8 @@ fn resolve_relay(relay_url: &str) -> Result<SocketAddr, String> {
 
 #[cfg(test)]
 mod tests {
+    use desklink_transport::JoinRejectCode;
+
     use super::*;
 
     #[test]
@@ -1326,6 +1309,7 @@ mod tests {
 
     #[test]
     fn retry_classification_keeps_authentication_failures_permanent() {
+        assert!(!transport_error_is_retryable(&TransportError::Malformed));
         assert!(!transport_error_is_retryable(
             &TransportError::JoinRejected(JoinRejectCode::SessionNotFound)
         ));
@@ -1344,6 +1328,10 @@ mod tests {
         assert!(!controller_error_is_retryable(
             &ControllerError::UnexpectedHandshakeStep
         ));
+        assert!(
+            ConnectFailure::from_transport(TransportError::Stream("synthetic interruption".into()))
+                .retryable
+        );
     }
 
     #[tokio::test]
