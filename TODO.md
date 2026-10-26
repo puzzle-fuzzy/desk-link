@@ -433,6 +433,7 @@
 - **probe接入时的版本记录（`docs(DL2-042): distinguish probe integration protocol from main baseline`）：** 按后续授权复用协议13、shared-probe与DirectProbe独立提交后，工程源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`，main `a905b88` 仍协议12；同步矩阵/README/架构契约和三笔来源→本分支SHA，明确不是其余功能已集成。只读版本入口实际输出13，5项版本/文档回归通过；当时013 epoch合同未提交。
 - **合同过渡状态（`docs(DL2-042): label zero-context integration as non-deliverable`）：** 记录bc6c0a→本分支5501aad来源，wire/codec已落地但零生产者未接线；编译/protocol47/probe79通过而host runtime9通过1失败，整体failed/passed=false。同步矩阵/README/架构契约，禁止用此前4c3648a的绿色probe报告覆盖新源码失败；main仍协议12与用户已确认的基础路径分开。版本/文档5项回归与链接/diff检查通过。计数已按本地原始报告更正（`docs(DL2-042): correct transition verification to local test counts`），49是来源分支报告，不是本次执行数。
 - **最小API桥接状态（`docs(DL2-042): record the verified runtime bridge and remaining host failure`）：** 来源b473498已复用为56f53b4，仅ControllerRuntime显式API与加密loopback；两文件hunk与完整9ad的稳定patch-id相同，后续Apple整合去重，不重复覆盖。干净源码56f53b4的本地报告：编译、protocol47、controller-loopback5通过0忽略，host runtime9通过1失败，整体failed。七处旧生产调用、host epoch、完整C/Swift/FFI和呈现仍未接齐，013不关闭。矩阵/边界合同同步，来源/patch-id/报告/链接检查通过。
+- **新增审查证据分类（`docs(DL2-042): record disputed review evidence without endorsing root draft`）：** `docs/second-stage-review-evidence.md` 记录主目录156增/16删稿非工程主会话或两个子agent所写，作者未确认，保持未代stage/覆盖。只读核对045原实现已continue Some(Err)、046取消树已由3277修复而仲裁待验、048未直接入Ed签名不构成已确认P1（Noise payload先认证解密），列防御纵深与篡改/拼接验证范围。不沿用“新增全部确认”，其余新项待owner核实后再更新最终矩阵；未改crypto或新增条目状态。
 
 ## 8. 扩展角色
 
