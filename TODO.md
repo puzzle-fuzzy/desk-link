@@ -223,7 +223,8 @@
 
 - [ ] 分离读取与发送调度，为各类数据设置独立预算和时效。
 - [x] 调度隔离切片：每连接固定 3 个媒体 sender，音频/光标/视频独立有界 FIFO（32/8/256 包；60/40/250ms 总年龄），入队不等待；去掉逐包 task，关闭时取消 sender；入队绑定目标代数并在发送前复核，独占 `Bytes` 可原地改路由头。
-- [x] 自动回归：媒体队列 3 项测试；真实 loopback QUIC 通过 UDP ACK 黑洞触发 `send_datagram_wait` 超时后，验证音频仍可入队、另一会话输入/控制正常、新可靠流仍被接受及全部 sender/容量回收。relay 合计 33 项测试（5 lib + 1 bin + 27 session）及 Clippy `--all-targets --locked -- -D warnings`、rustfmt 通过。
+- [x] 自动回归：媒体队列 3 项测试；真实 loopback QUIC 通过 UDP ACK 黑洞触发 `send_datagram_wait` 超时后，验证音频仍可入队、另一会话输入/控制正常、新可靠流仍被接受及全部 sender/容量回收。协议 13 整合后 relay 合计 34 项常规测试（5 lib + 1 bin + 28 session）及 Clippy `--all-targets --locked -- -D warnings`、rustfmt 通过。
+- [x] 可重复本机测量切片：1 条已确认 ACK 黑洞拥塞会话 + 4 条健康会话并发，各取得 300 个合成输入往返/音频 event 到达样本；协议 13 基线上 p95/p99 分别为 0.9534/1.5978ms 与 0.5286/0.6031ms，30 个媒体 sender 最终全部回收。debug loopback、非真实注入/播放/双机容量；测量用例默认 ignored，本轮已显式执行通过。提交主题：`test(DL2-019): measure local scheduling under media backpressure`，完整环境、命令与结果见调度记录。
 - [ ] 帧/依赖级丢弃及真实多会话性能验收：中继当前只见密文，本切片仅实施逐通道包预算，仍共享 QUIC 拥塞窗口/发送缓存；输入/音频 p95/p99、CPU/吞吐、容量及长稳未测。实现和验证边界见 [中继调度记录](docs/phase-two-relay-scheduling.md)。提交主题：`fix(DL2-019): isolate relay media queues from connection reads`。
 - **证据 / 类型：性能结构。** `server/relay/src/lib.rs:92,1112-1135` 共用 256 个 datagram 转发槽，耗尽时在连接 select 分支内 await permit，暂停同循环 accept_bi/closed；`1392-1415` 视频、音频、光标共用路径，每包建任务/Vec，单包等待上限 250ms。
 - **现有保护：** `server/relay/src/lib.rs:1080-1109` 已把建立的可靠通道放入独立 forward_reliable 任务，它们仍能继续转发；直接受阻的是新可靠流的接受、同循环关闭处理和后续 datagram 读取，不能据此断言所有现有键鼠/控制都被槽位直接阻塞。

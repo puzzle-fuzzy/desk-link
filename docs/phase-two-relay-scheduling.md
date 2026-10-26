@@ -33,6 +33,28 @@ python scripts/run-windows-cargo.py fmt -p desklink-relay -- --check
 
 本地 QUIC 回归通过 UDP proxy 在完成 join 后屏蔽慢端到中继的 ACK，再持续供给合法视频；明确观察到 `video.send_timeouts > 0` 后才判断发生真实发送背压。随后音频仍能进入独立队列，另一会话的输入/控制正常，新可靠流被接受，关闭后 12 个 sender 及连接容量全部回收。测试不以停止读取 datagram 冒充 QUIC 流控。
 
-实际结果：relay 5 项 lib、1 项 bin、27 项 session 全通过，Clippy 所有目标零警告，rustfmt 和 `git diff --check` 通过。以上是本地合成故障结果，不是实机网络容量数据。
+协议 13 整合后实际结果：relay 5 项 lib、1 项 bin、28 项 session 全通过，另 1 项手工测量用例默认 ignored；该测量本轮已显式执行通过。Clippy 所有目标零警告，rustfmt 和 `git diff --check` 通过。以上是本地合成故障结果，不是实机网络容量数据。
+
+## 本机多会话测量（2026-10-26）
+
+测量主题：`test(DL2-019): measure local scheduling under media backpressure`。已复用产品组独立协议提交 `9979c6424cf99f704feb212c7700833fce466dae`（本分支 cherry-pick `aadf757241b9d0eefa13c4a719153d0ecd0a0a2c`），未另改业务版本或 JOIN 信封。协议、transport、relay、FFI 合计 162 项常规测试通过，默认忽略的测量用例另外显式运行通过；四个 package 的 all-targets Clippy 与 fmt 检查均通过。
+
+环境：Windows 11 build 26200、i7-13700KF（16 核 / 24 线程）、Rust 1.97.1、debug 构建、Tokio 4 workers。只使用本机 loopback socket 和内存中的合成不透明字节；不注入系统输入，不采集或播放真实音频。先使一条慢会话的 ACK 黑洞触发真实 QUIC 发送超时，再并发运行四条健康会话，每条取得 75 组样本。
+
+| 观察 | 样本数 | p95 | p99 |
+| --- | --- | --- | --- |
+| Input 发送、远端接收、Control echo 返回 | 300 | 0.9534 ms | 1.5978 ms |
+| 音频发送至健康端 transport event | 300 | 0.5286 ms | 0.6031 ms |
+
+测量循环 79.9237ms，全用例 0.39 秒。末尾媒体 snapshot：30 个 sender；音频入队/转发各 300、满队列/过期/超时均为 0、最大出队年龄 11μs；慢视频入队 1566、满队列丢弃 32771、过期 249、发送超时 6、交给 Quinn 1054、最大出队年龄 250993μs。关闭后 sender 和 accepted connection 均为 0。计数为瞬时独立采样，测量末尾仍可能有排队或在途包。
+
+这些是健康会话旁存在慢会话时的传输层本机观察，不是黑洞链路音频可达性、真实输入到画面延迟、音频播放延迟、生产容量、CPU 收益或长稳结果。没有用本次样本建立通用性能阈值或相对于旧版本的提升比例。
+
+```powershell
+$env:CARGO_TARGET_DIR='E:\desk-link\.worktrees\dl2-targets\network'
+python scripts/run-windows-cargo.py test -p desklink-relay --test session local_multi_session_media_scheduling_probe --locked -- --ignored --nocapture --test-threads=1
+```
+
+本次完整控制台证据保留在本地 `E:\desk-link\.worktrees\dl2-targets\network\dl2-019-local-probe-protocol13.log`；该日志不是运行时所需文件，未加入源码提交。
 
 尚未完成 DL2-019 整体验收：中继只看到端到端密文，无法判断帧边界、关键帧或 delta 依赖，因此本切片没有实现按帧/依赖丢弃。三个 sender 仍共享目标 QUIC 连接的拥塞窗口与发送缓存，独立应用队列不能保证物理链路堵塞时音频可达。真实输入/音频 p95/p99、CPU、吞吐、多会话容量和长稳数据仍需测量；此处预算是策略参数，不是实测性能结论。
