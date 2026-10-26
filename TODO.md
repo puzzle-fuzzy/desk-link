@@ -234,7 +234,9 @@
 - [ ] 区分监听终态并使禁用原因可观测。
 - **源码复核修正：** a905b88与本分支 `DirectLanEndpoint::accept` 都返回Option<Result>；握手失败/超时是Some(Err)，Host已continue。`endpoint.accept().await?`只传播None监听终态，不能把“任何Err永久禁用”当作已确认缺陷；实际剩余缺项是None后的明确降级诊断。
 - [x] **已有正确行为的真实回归（`test(DL2-045): distinguish transient direct handshakes from listener shutdown`）：** 空truststore触发真实127.0.0.1 QUIC证书握手失败，确认Some(Err)，同一listener随后使用生产配置+Noise会话成功认证probe并收发datagram；显式endpoint关闭才在100ms内返回None（重复等待一致）。probe 14项通过，transport lib+tests严格Clippy通过。
-- [ ] 终态禁用的稳定原因/诊断接通与真实监听故障状态验收；本提交未把原有continue实现冒称新修复。
+- [x] **终态生产处理（`fix(DL2-045): retire direct paths when the listener terminates`）：** accept返回None时一次性take本代session、abort探测，路径锁内同时禁用后续安装并取走活动Arc，锁外关闭、请求IDR；继续控制/配置/输入消费。迟到探测在同一路径锁内检查禁用标记，不能在清理后复活路径。固定DirectListenerStopped/ListenerClosed原因通过044后台observer分发，DiagnosticEvent映射host_direct_listener_stopped；session=None的accept future保持pending防刷屏。
+- **验证：** Windows新增2项通过：真实认证双路径的活动Arc清理/IDR、已完成probe但尚未安装的迟到连接被关闭、诊断只一次与禁用后accept pending；固定日志字段测试。原有Some(Err)continue与真实endpoint.close→None边界另由probe回归证明，不冒称复现原本不存在的“握手错误禁用”缺陷。
+- [ ] 产品层实际诊断导出/服务端schema绑定和真实监听故障状态验收；后台事件producer不等于用户可见性完成。
 
 ### DL2-046 · P1 · 出站探测生命周期与活动直连仲裁
 

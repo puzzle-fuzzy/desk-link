@@ -24,6 +24,15 @@ connection error. Generation and application size checks remain independent.
 These counters neither prove delivery nor count network loss or queue eviction.
 Raw error strings, endpoint addresses, cursor pixels and input content are absent.
 
+`DirectListenerStopped` contains stream_id, retired_active and the fixed
+`ListenerClosed` reason. It is emitted once when the direct acceptor reaches
+terminal None. Ordinary handshake/probe errors continue accepting. Shutdown
+cancels pending probes, retires the selected direct connection outside its lock,
+requests an IDR and keeps the control/input session running through relay.
+Disabling and every installation share the path mutex, so a late successful
+probe cannot repopulate a disabled slot. A missing direct session parks the
+accept future instead of repeatedly returning None.
+
 `DiagnosticEvent::HostMedia(event)` formats the product log event. The product
 owner must bind the observer to the actual log/export sink (and, separately, any
 server schema). Without an observer the worker uses stderr as a fallback; this

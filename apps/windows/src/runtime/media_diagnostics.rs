@@ -9,6 +9,20 @@ use std::{
 
 use super::cursor_send::CursorDisableReason;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectListenerStopReason {
+    ListenerClosed,
+}
+
+impl DirectListenerStopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ListenerClosed => "listener_closed",
+        }
+    }
+}
+
 /// Fixed fields only: no endpoint addresses, raw driver errors or input data.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -19,6 +33,11 @@ pub enum HostMediaDiagnostic {
         send_errors: u64,
         disabled: bool,
         reason: CursorDisableReason,
+    },
+    DirectListenerStopped {
+        stream_id: u64,
+        retired_active: bool,
+        reason: DirectListenerStopReason,
     },
 }
 

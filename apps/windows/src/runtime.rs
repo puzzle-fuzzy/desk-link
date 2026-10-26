@@ -2,7 +2,8 @@ mod cursor_send;
 mod media_diagnostics;
 pub use cursor_send::CursorDisableReason;
 pub use media_diagnostics::{
-    HostMediaDiagnostic, HostMediaDiagnosticsObserver, rejected_host_media_diagnostics,
+    DirectListenerStopReason, HostMediaDiagnostic, HostMediaDiagnosticsObserver,
+    rejected_host_media_diagnostics,
 };
 mod adaptive_bitrate;
 #[cfg(test)]
@@ -1373,6 +1374,7 @@ impl HostRuntime {
                 audio_notify: audio_notify.clone(),
                 direct_session: direct_session.clone(),
                 direct_connection: direct_connection.clone(),
+                media_observer: media_observer.clone(),
             },
         ));
         let mut cursor = Box::pin(send_cursor_loop(
@@ -1699,6 +1701,7 @@ struct HostInboundContext {
     audio_notify: Arc<Notify>,
     direct_session: Option<Arc<DirectLanSession>>,
     direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    media_observer: Option<HostMediaDiagnosticsObserver>,
 }
 
 struct CaptureDesktopCoordinator<
@@ -3467,12 +3470,14 @@ async fn receive_host_control(
         audio_notify,
         mut direct_session,
         direct_connection,
+        media_observer,
     } = context;
     let policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
     let mut bitrate_policy = AdaptiveBitrate::new(video_quality.preset);
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
     let mut direct_probes = tokio::task::JoinSet::new();
+    let direct_enabled = Arc::new(AtomicBool::new(true));
     let mut configurations = ConfigurationQueue::default();
     let mut pending_configuration = None;
     loop {
@@ -3519,9 +3524,11 @@ async fn receive_host_control(
             _ = direct_probes.join_next(), if !direct_probes.is_empty() => {}
             direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
                 if let Some(connection) = direct {
-                    install_direct_connection(&direct_connection, connection).await;
+                    install_direct_connection(&direct_connection, connection, &direct_enabled).await;
                 } else {
-                    direct_session = None;
+                    direct_probes.abort_all();
+                    stop_direct_listener(&mut direct_session, &direct_connection, &direct_enabled,
+                        &force_keyframe, &media_observer, stream_id).await;
                 }
             }
             result = client.next_control_for_generation(peer_generation) => {
@@ -3591,6 +3598,7 @@ async fn receive_host_control(
                             let local_candidate = session.candidate().clone();
                             let secure_for_probe = secure.clone();
                             let direct_connection_for_probe = direct_connection.clone();
+                            let direct_enabled_for_probe = direct_enabled.clone();
                             let candidate_for_probe = candidate.clone();
                             let accepted = if let Ok(permit) = direct_probe_slots
                                 .clone()
@@ -3609,7 +3617,7 @@ async fn receive_host_control(
                                         )
                                         .await;
                                     if let Ok((connection, _)) = result {
-                                        install_direct_connection(&direct_connection_for_probe, Arc::new(connection)).await;
+                                        install_direct_connection(&direct_connection_for_probe, Arc::new(connection), &direct_enabled_for_probe).await;
                                     }
                                 });
                                 true
@@ -3665,10 +3673,17 @@ fn apply_input_event<B: crate::input::InputBackend>(
 async fn install_direct_connection(
     slot: &Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
     candidate: Arc<DirectLanConnection>,
+    enabled: &AtomicBool,
 ) -> bool {
     let outcome = {
         let mut active = slot.lock().await;
-        direct_path_slot::install(&mut active, candidate, DirectLanConnection::is_closed)
+        if enabled.load(Ordering::Acquire) {
+            direct_path_slot::install(&mut active, candidate, DirectLanConnection::is_closed)
+        } else {
+            direct_path_slot::InstallOutcome::Retained {
+                rejected: candidate,
+            }
+        }
     };
     // No network close/drop while holding the path arbitration mutex.
     match outcome {
@@ -3679,11 +3694,44 @@ async fn install_direct_connection(
             true
         }
         direct_path_slot::InstallOutcome::Retained { rejected } => {
-            rejected.close(b"desklink retained active direct path");
+            rejected.close(b"desklink direct path not selected");
             false
         }
         direct_path_slot::InstallOutcome::AlreadyCurrent => true,
     }
+}
+
+async fn stop_direct_listener(
+    session: &mut Option<Arc<DirectLanSession>>,
+    slot: &Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    enabled: &AtomicBool,
+    force_keyframe: &AtomicBool,
+    observer: &Option<HostMediaDiagnosticsObserver>,
+    stream_id: u64,
+) {
+    if session.take().is_none() {
+        return;
+    }
+    let retired = {
+        let mut active = slot.lock().await;
+        // Serializes with late successful probes: abort_all alone cannot stop
+        // a task already executing its installation step on another worker.
+        enabled.store(false, Ordering::Release);
+        active.take()
+    };
+    let retired_active = retired.is_some();
+    if let Some(connection) = retired {
+        connection.close(b"desklink direct listener closed");
+    }
+    force_keyframe.store(true, Ordering::Release);
+    media_diagnostics::emit(
+        observer,
+        HostMediaDiagnostic::DirectListenerStopped {
+            stream_id,
+            retired_active,
+            reason: DirectListenerStopReason::ListenerClosed,
+        },
+    );
 }
 
 async fn accept_host_direct_connection(

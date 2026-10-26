@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use desklink_crypto::{
     DeviceIdentity, NoiseInitiator, NoiseResponder, SecureLane, SecureRole, SecureSession,
@@ -183,11 +189,13 @@ impl AuthenticatedPaths {
 async fn real_late_outbound_probe_cannot_close_or_replace_the_active_inbound_path() {
     let paths = AuthenticatedPaths::new().await;
     let slot = Arc::new(AsyncMutex::new(None));
-    assert!(install_direct_connection(&slot, paths.inbound.clone()).await);
+    assert!(install_direct_connection(&slot, paths.inbound.clone(), &AtomicBool::new(true)).await);
     // An alias must be recognized before rejection/close handling.
-    assert!(install_direct_connection(&slot, paths.inbound.clone()).await);
+    assert!(install_direct_connection(&slot, paths.inbound.clone(), &AtomicBool::new(true)).await);
     assert!(!paths.inbound.is_closed());
-    assert!(!install_direct_connection(&slot, paths.outbound.clone()).await);
+    assert!(
+        !install_direct_connection(&slot, paths.outbound.clone(), &AtomicBool::new(true)).await
+    );
     assert!(paths.outbound.is_closed());
     tokio::time::timeout(Duration::from_secs(1), paths.outbound_peer.closed())
         .await
@@ -212,12 +220,12 @@ async fn real_late_outbound_probe_cannot_close_or_replace_the_active_inbound_pat
 async fn real_closed_active_path_can_be_replaced_without_stale_egress_retiring_its_successor() {
     let paths = AuthenticatedPaths::new().await;
     let slot = Arc::new(AsyncMutex::new(None));
-    assert!(install_direct_connection(&slot, paths.inbound.clone()).await);
+    assert!(install_direct_connection(&slot, paths.inbound.clone(), &AtomicBool::new(true)).await);
     paths.inbound.close(b"simulate old path failure");
     tokio::time::timeout(Duration::from_secs(1), paths.inbound_peer.closed())
         .await
         .unwrap();
-    assert!(install_direct_connection(&slot, paths.outbound.clone()).await);
+    assert!(install_direct_connection(&slot, paths.outbound.clone(), &AtomicBool::new(true)).await);
     {
         let mut active = slot.lock().await;
         assert!(direct_path_slot::retire_if_current(&mut active, &paths.inbound).is_none());
@@ -309,4 +317,88 @@ async fn dropping_pending_probe_join_set_releases_guard_permit_and_shared_crypto
     // JoinSet cancellation proves task/resource cleanup, not a peer-observed
     // QUIC close deadline. Explicitly close the local fixture connection.
     peer.close(0_u32.into(), b"cancelled probe fixture complete");
+}
+
+#[tokio::test]
+async fn terminal_listener_cleanup_reports_once_and_late_real_probe_cannot_reinstall() {
+    use super::{
+        DirectListenerStopReason, HostMediaDiagnostic, HostMediaDiagnosticsObserver,
+        accept_host_direct_connection, media_diagnostics, now_unix_s, stop_direct_listener,
+    };
+    use desklink_transport::DirectLanSession;
+
+    let paths = AuthenticatedPaths::new().await;
+    let slot = Arc::new(AsyncMutex::new(None));
+    let enabled = Arc::new(AtomicBool::new(true));
+    assert!(install_direct_connection(&slot, paths.inbound.clone(), &enabled).await);
+    let force_keyframe = AtomicBool::new(false);
+    let binding = paths.host_secure.lock().await.video_path_binding();
+    let mut session = Some(Arc::new(
+        DirectLanSession::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:9".parse().unwrap(),
+            72,
+            binding,
+            now_unix_s(),
+        )
+        .unwrap(),
+    ));
+    media_diagnostics::initialize();
+    let (reported, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let observer: Option<HostMediaDiagnosticsObserver> = Some(Arc::new(move |event| {
+        reported.send(event).unwrap();
+    }));
+
+    // A genuine authenticated connection has finished probing before shutdown,
+    // but its task has not reached the shared installation step yet.
+    let (release, wait) = oneshot::channel();
+    let late = tokio::spawn({
+        let slot = slot.clone();
+        let enabled = enabled.clone();
+        let connection = paths.outbound.clone();
+        async move {
+            wait.await.unwrap();
+            install_direct_connection(&slot, connection, &enabled).await
+        }
+    });
+    stop_direct_listener(&mut session, &slot, &enabled, &force_keyframe, &observer, 9).await;
+    assert!(session.is_none());
+    assert!(!enabled.load(Ordering::Acquire));
+    assert!(slot.lock().await.is_none());
+    assert!(force_keyframe.load(Ordering::Acquire));
+    assert!(paths.inbound.is_closed());
+    tokio::time::timeout(Duration::from_secs(1), paths.inbound_peer.closed())
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    assert!(!late.await.unwrap());
+    assert!(paths.outbound.is_closed());
+    assert!(slot.lock().await.is_none());
+    tokio::time::timeout(Duration::from_secs(1), paths.outbound_peer.closed())
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event,
+        HostMediaDiagnostic::DirectListenerStopped {
+            stream_id: 9,
+            retired_active: true,
+            reason: DirectListenerStopReason::ListenerClosed,
+        }
+    );
+    stop_direct_listener(&mut session, &slot, &enabled, &force_keyframe, &observer, 9).await;
+    // The next production accept future parks; no repeated None/diagnostic loop.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            accept_host_direct_connection(session, paths.host_secure.clone())
+        )
+        .await
+        .is_err()
+    );
+    assert!(received.try_recv().is_err());
 }

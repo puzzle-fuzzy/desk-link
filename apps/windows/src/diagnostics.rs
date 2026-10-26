@@ -406,6 +406,14 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             "\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":{stream_id},\"send_attempts\":{send_attempts},\"send_errors\":{send_errors},\"disabled\":{disabled},\"reason\":\"{}\"",
             reason.as_str()
         ),
+        DiagnosticEvent::HostMedia(HostMediaDiagnostic::DirectListenerStopped {
+            stream_id,
+            retired_active,
+            reason,
+        }) => format!(
+            "\"level\":\"warning\",\"event\":\"host_direct_listener_stopped\",\"stream_id\":{stream_id},\"retired_active\":{retired_active},\"reason\":\"{}\"",
+            reason.as_str()
+        ),
         DiagnosticEvent::OperationSucceeded(operation) => format!(
             "\"level\":\"info\",\"event\":{}",
             json_string(operation.event_name(true))
@@ -704,6 +712,23 @@ mod tests {
     use super::*;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn host_listener_terminal_diagnostic_has_only_fixed_reason_and_retirement_state() {
+        let encoded = encode_event(&DiagnosticEvent::HostMedia(
+            HostMediaDiagnostic::DirectListenerStopped {
+                stream_id: 7,
+                retired_active: true,
+                reason: crate::runtime::DirectListenerStopReason::ListenerClosed,
+            },
+        ));
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["event"], "host_direct_listener_stopped");
+        assert_eq!(value["reason"], "listener_closed");
+        assert_eq!(value["retired_active"], true);
+        assert!(value.get("endpoint").is_none());
+        assert!(value.get("error").is_none());
+    }
 
     #[test]
     fn host_cursor_diagnostic_keeps_operation_counters_and_fixed_reason() {
