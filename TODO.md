@@ -211,6 +211,8 @@
 - [x] FFI Mac Host 切片：随机种子进程共享非零 epoch 分配器，溢出失败；同 stream/尺寸编码重配保留 epoch，换流/尺寸发布前可靠清键，输入仅匹配已发布 context。旧 context 在时钟/过期检查前丢弃；满队列保留终态清理容量，清键/keyup 无法可靠入队则安全终止。Rust 23 单元 + 14 真实本地 Host loopback 共37项通过，覆盖配置前不注入、旧keyup/过期旧keyup/鼠标丢弃、换几何、饱和与取消。主题 `fix(DL2-013): enforce published input epochs on the FFI host`。
 - [ ] FFI Mac Host 当前只可绑定 stream 与编码尺寸；完整源显示器/捕获拓扑身份和真实 Mac 注入验收仍缺，不能据此整体关闭 013。
 
+- [x] Controller 同 epoch 改编码尺寸视为配置合同错误，拒绝保留可输入的旧几何；同几何画质重配保持 epoch，epoch 身份不按数值排序。新增真实运行 Rust guard 回归；本分支 FFI 全57项与 Clippy all-targets `-D warnings` 通过。主题 `fix(DL2-013): reject geometry changes that reuse an input epoch`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

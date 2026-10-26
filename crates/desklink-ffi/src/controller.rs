@@ -85,7 +85,7 @@ pub enum ControllerError {
     UnexpectedHandshakeStep,
     #[error("host capabilities are invalid or incompatible")]
     InvalidHostCapabilities,
-    #[error("video configuration changed without advancing its version")]
+    #[error("video configuration changed without advancing its version or geometry epoch")]
     InconsistentVideoConfig,
     #[error("no active video stream is available")]
     NoActiveStream,
@@ -509,6 +509,9 @@ impl ControllerRuntime {
                             && config.config_version < current.config_version
                         {
                             continue;
+                        }
+                        if !input_geometry_change_is_valid(current, &config) {
+                            return Err(ControllerError::InconsistentVideoConfig);
                         }
                         if config.stream_id == current.stream_id
                             && config.config_version == current.config_version
@@ -1181,6 +1184,12 @@ fn cursor_sequence_is_newer(last_sequence: u64, candidate_sequence: u64) -> bool
     candidate_sequence > last_sequence
 }
 
+fn input_geometry_change_is_valid(previous: &VideoConfig, next: &VideoConfig) -> bool {
+    previous.stream_id != next.stream_id
+        || previous.input_epoch != next.input_epoch
+        || (previous.width, previous.height) == (next.width, next.height)
+}
+
 fn next_direct_candidate_id() -> u64 {
     let mut candidate_id = 0_u64;
     while candidate_id == 0 {
@@ -1195,6 +1204,31 @@ mod tests {
     use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
     use desklink_protocol::DirectLanCandidate;
     use rand_core::OsRng;
+
+    #[test]
+    fn quality_reconfiguration_keeps_geometry_epoch_but_resize_cannot_reuse_it() {
+        let original = VideoConfig {
+            protocol_version: PROTOCOL_VERSION,
+            stream_id: 7,
+            input_epoch: 91,
+            config_version: 1,
+            codec: Codec::H264,
+            width: 1920,
+            height: 1080,
+            sequence_header: vec![1],
+        };
+        let mut next = original.clone();
+        next.config_version = 2;
+        next.sequence_header = vec![2];
+        assert!(input_geometry_change_is_valid(&original, &next));
+        next.width = 1280;
+        next.height = 720;
+        assert!(!input_geometry_change_is_valid(&original, &next));
+        next.input_epoch = 92;
+        assert!(input_geometry_change_is_valid(&original, &next));
+        next.input_epoch = 1; // Identity is not ordered across a host restart.
+        assert!(input_geometry_change_is_valid(&original, &next));
+    }
 
     #[test]
     fn cursor_updates_reject_duplicates_and_out_of_order_datagrams() {
