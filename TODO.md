@@ -547,6 +547,16 @@
 - [x] 当前分支复核：致命误分类已由 `39c17ad4255e0c19f9b86a7a3d10fbcca3e7abbe` 修复并由生成 ABI 保持 Transfer=8；本次补未知 kind 固定计数，仅明确 error 才读错误文本，unknown不解析数据/metrics或拆会话。新增共享mapper的未知kind/极大无关字段/Transfer Swift回归（未执行），Windows 2项跨语言合同通过。主题 `fix(DL2-059): count unknown host events without interpreting their payload`。
 - [ ] Swift/macOS事件注入验收未执行；当前Transfer仅显示不支持提示，正常文件/剪贴板确认流程属于026待补，不能将整项勾完。旧证据描述的是025前状态，本分支已无default:error。
 
+### DL2-061 · P3 · FFI 控制端直连静默超时被 relay 事件反复重置
+
+- [ ] 静默判定基于"上次 direct 数据报到达时间"，而不是每次轮询新建计时器。
+- **证据 / 类型：源码缺陷。** `crates/desklink-ffi/src/controller.rs:758-778` 每次进入 `next_transport_event` 都新建 5 秒 sleep；select 的 relay 分支返回任意事件（包括 host 持续经 relay 发送的光标数据报，`host_worker.rs:963-969`）后回到循环重建计时器——direct 路径被防火墙黑洞时（正是该超时要防的场景）静默判定可能永不触发，控制端停留在黑屏 direct 路径不回退。Windows 原生控制端的第一阶段实现按"5 秒静默回落并记录 datagramSilence"正确处理，本项仅涉及 FFI/Apple 路径。
+- **方案：** 记录 last_direct_datagram 时刻并在循环中比较 elapsed；relay 事件不重置该计时。
+- **验收：** 注入"direct 黑洞 + relay 光标持续到达"场景，5 秒内回退 relay；正常 direct 流量不误判。
+
+- [x] 持久 direct 接收时间/绝对截止；只有 direct 收包刷新，relay事件或取消轮询不刷新。真实localhost relay QUIC + Noise认证direct探测：旧实现黑洞/relaycursor红测超5.75s；修后黑洞与持续6s direct双回归均通过（生产5s预算，750ms测试调度容差），并已跑本分支FFI完整62项通过。主题 `fix(DL2-061): keep direct silence deadlines across relay events`。
+- [ ] 真双机/防火墙与Mac/iOS生产direct启用验收未执行。现源码仅Platform::Windows创建direct_session；这是FFI共用启用路径证明，不能称当前Mac实机缺陷或H264显示/性能证明。
+
 ## 10. 第一阶段历史记录
 
 以下原文按本次审查前状态保留，仅供追溯。里面的“当前”“未验收”“下一阶段”、旧版本、线上探针结果和勾选项均属于原记录日期；第二阶段以本文前九节为准。尚未完成的签名、安装或设备组合验收可以继续引用，但不能用来否定用户本次已确认的两条远控路径。

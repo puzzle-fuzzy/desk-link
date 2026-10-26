@@ -155,6 +155,7 @@ pub struct ControllerRuntime {
     video_path: DirectVideoPathMachine,
     direct_session: Option<DirectLanSession>,
     direct_connection: Option<Arc<DirectLanConnection>>,
+    last_direct_datagram_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -262,6 +263,7 @@ impl ControllerRuntime {
             video_path,
             direct_session,
             direct_connection: None,
+            last_direct_datagram_at: None,
         })
     }
 
@@ -794,20 +796,42 @@ impl ControllerRuntime {
     async fn next_transport_event(&mut self) -> Result<TransportEvent, ControllerError> {
         loop {
             if let Some(connection) = self.direct_connection.clone() {
-                let silence_timeout = tokio::time::sleep(DIRECT_VIDEO_SILENCE_TIMEOUT);
-                tokio::pin!(silence_timeout);
-                tokio::select! {
-                    relay = self.client.next_event() => return relay.map_err(ControllerError::from),
-                        direct = connection.recv_datagram() => match direct {
-                            Ok(bytes) => return Ok(TransportEvent::VideoDatagram(bytes)),
-                            Err(_) => {
-                                self.direct_connection = None;
-                                let actions = self.video_path.apply(DirectVideoPathEvent::Stop);
-                                self.apply_video_path_actions(actions).await?;
-                            }
-                        },
-                    _ = &mut silence_timeout => {
+                let last_datagram = *self
+                    .last_direct_datagram_at
+                    .get_or_insert_with(Instant::now);
+                let deadline = last_datagram + DIRECT_VIDEO_SILENCE_TIMEOUT;
+                let direct = if Instant::now() >= deadline {
+                    // At expiry, an already queued direct packet still proves
+                    // liveness. Otherwise fall back before servicing more relay
+                    // events, so continuous cursor traffic cannot defer expiry.
+                    tokio::select! {
+                        biased;
+                        direct = connection.recv_datagram() => Some(direct),
+                        () = std::future::ready(()) => None,
+                    }
+                } else {
+                    // Preserve fairness between live direct and relay lanes.
+                    // The timeout is absolute and survives every relay return.
+                    tokio::select! {
+                        relay = self.client.next_event() => return relay.map_err(ControllerError::from),
+                        direct = connection.recv_datagram() => Some(direct),
+                        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => continue,
+                    }
+                };
+                match direct {
+                    Some(Ok(bytes)) => {
+                        self.last_direct_datagram_at = Some(Instant::now());
+                        return Ok(TransportEvent::VideoDatagram(bytes));
+                    }
+                    Some(Err(_)) => {
                         self.direct_connection = None;
+                        self.last_direct_datagram_at = None;
+                        let actions = self.video_path.apply(DirectVideoPathEvent::Stop);
+                        self.apply_video_path_actions(actions).await?;
+                    }
+                    None => {
+                        self.direct_connection = None;
+                        self.last_direct_datagram_at = None;
                         connection.close(b"desklink direct video silence timeout");
                         let actions = self.video_path.apply(DirectVideoPathEvent::DatagramSilence);
                         self.apply_video_path_actions(actions).await?;
@@ -847,6 +871,7 @@ impl ControllerRuntime {
                             .await;
                     if let Ok((connection, result)) = accepted {
                         self.direct_connection = Some(Arc::new(connection));
+                        self.last_direct_datagram_at = Some(Instant::now());
                         let actions = self.video_path.apply(DirectVideoPathEvent::ProbeSucceeded {
                             candidate_id: self.probe_candidate_id(result.candidate_id),
                             quality: VideoPathQuality {
@@ -917,6 +942,7 @@ impl ControllerRuntime {
                     match result {
                         Ok((connection, probe)) => {
                             self.direct_connection = Some(Arc::new(connection));
+                            self.last_direct_datagram_at = Some(Instant::now());
                             pending.extend(self.video_path.apply(
                                 DirectVideoPathEvent::ProbeSucceeded {
                                     candidate_id: self.probe_candidate_id(probe.candidate_id),
@@ -942,6 +968,7 @@ impl ControllerRuntime {
                 }
                 DirectVideoPathAction::ActivateDirect { .. } => {}
                 DirectVideoPathAction::UseRelay { .. } => {
+                    self.last_direct_datagram_at = None;
                     if let Some(connection) = self.direct_connection.take() {
                         connection.close(b"desklink direct video fallback");
                     }
@@ -1324,3 +1351,7 @@ mod tests {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "controller/direct_silence_tests.rs"]
+mod direct_silence_tests;
