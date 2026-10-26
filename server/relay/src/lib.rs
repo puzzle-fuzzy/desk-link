@@ -845,8 +845,25 @@ pub struct RelayServer {
 impl RelayServer {
     pub async fn bind(
         bind_addr: SocketAddr,
+        server_config: quinn::ServerConfig,
+        config: RelayConfig,
+    ) -> Result<Self, RelayError> {
+        Self::bind_with_transport(
+            bind_addr,
+            server_config,
+            config,
+            quinn::TransportConfig::default(),
+        )
+        .await
+    }
+
+    /// Uses explicit transport tuning while retaining relay-owned lifecycle
+    /// timeouts. The ordinary bind constructor keeps its existing defaults.
+    pub async fn bind_with_transport(
+        bind_addr: SocketAddr,
         mut server_config: quinn::ServerConfig,
         config: RelayConfig,
+        mut transport: quinn::TransportConfig,
     ) -> Result<Self, RelayError> {
         if config.keep_alive.is_zero() || config.dead_timeout.is_zero() {
             return Err(RelayError::InvalidConfig(
@@ -865,7 +882,6 @@ impl RelayServer {
         }
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
-        let mut transport = quinn::TransportConfig::default();
         transport
             .keep_alive_interval(Some(config.keep_alive))
             .max_idle_timeout(Some(idle_timeout));

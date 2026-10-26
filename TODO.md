@@ -229,6 +229,8 @@
 
 - [x] Host 配置版本跟进：保存完整已发布 VideoConfig；同 stream 任何版本回退在发布前拒绝，同版本的解码配置（含 SPS/PPS、尺寸、epoch、codec/protocol）必须完全一致；幂等重试不重发配置或把后续 delta 误标 CONFIG，新 stream 仍可从 version 1 开始。旧 access unit 不重贴新版本。`test -p desklink-ffi --test host_runtime --locked` 实跑 23 项通过（新增 4 个真实本地回环）；完整配置比较单测从当前编译的测试二进制运行通过。日志位于本机 apple-ffi target/evidence/host-version-*.log；Swift producer 最后投递归属另有后续切片，不能以此项替代。主题 `fix(DL2-013): reject regressed or mutated host decoder configurations`。
 
+- [x] 真实背压夹具所需的传输构造入口：QuicFlowControlLimits 显式限制 send / connection receive / stream receive，非零、最多 512 MiB 且 stream 不超过 connection；默认行为保持原值。client connect 应用限值后统一 keepalive / dead timeout，relay 新 bind_with_transport 保留传入窗口并统一生命周期超时。原来只设置 TLS client/server config 的窗口会被构造器覆盖，不能据此声称制造了背压。`test -p desklink-transport -p desklink-relay --lib --tests --locked` 实跑 77 项通过；最终端点背压证明见后续 worker 切片。主题 `feat(DL2-013): expose explicit bounded QUIC flow-control tuning`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。
