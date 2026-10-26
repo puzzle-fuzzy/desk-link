@@ -13,7 +13,7 @@ protocol CGEventBackend: AnyObject {
     func postMouseButton(_ button: MouseButton, pressed: Bool, at point: CGPoint) throws
     func postScroll(deltaX: Int32, deltaY: Int32) throws
     func postKey(code: UInt32, pressed: Bool, modifiers: Modifiers) throws
-    func postUnicode(_ text: String, modifiers: Modifiers) throws
+    func postUnicode(_ text: String, pressed: Bool, modifiers: Modifiers) throws
 }
 
 final class SystemCGEventBackend: CGEventBackend {
@@ -53,29 +53,25 @@ final class SystemCGEventBackend: CGEventBackend {
         guard let virtualKey = CGKeyCode(exactly: code),
               let event = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: pressed)
         else { throw MacInputInjectorError.invalidKeyCode }
-        event.flags = cgFlags(for: modifiers)
+        event.flags = macKeyboardEventFlags(keyCode: code, pressed: pressed, modifiers: modifiers)
         event.post(tap: .cghidEventTap)
     }
 
-    func postUnicode(_ text: String, modifiers: Modifiers) throws {
+    func postUnicode(_ text: String, pressed: Bool, modifiers: Modifiers) throws {
         guard !text.isEmpty,
-              let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+              let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: pressed)
         else {
             throw MacInputInjectorError.eventCreationFailed
         }
         let characters = Array(text.utf16)
-        let flags = cgFlags(for: modifiers)
-        for event in [keyDown, keyUp] {
-            event.flags = flags
-            characters.withUnsafeBufferPointer {
-                event.keyboardSetUnicodeString(
-                    stringLength: characters.count,
-                    unicodeString: $0.baseAddress!
-                )
-            }
-            event.post(tap: .cghidEventTap)
+        event.flags = cgFlags(for: modifiers)
+        characters.withUnsafeBufferPointer {
+            event.keyboardSetUnicodeString(
+                stringLength: characters.count,
+                unicodeString: $0.baseAddress!
+            )
         }
+        event.post(tap: .cghidEventTap)
     }
 
     private func mouseEvent(type: CGEventType, point: CGPoint, button: CGMouseButton) -> CGEvent? {
@@ -94,12 +90,15 @@ final class MacInputInjector {
     private let lock = NSLock()
     private var pointer: CGPoint
     private var pressedKeys = Set<UInt32>()
+    private var pressedCharacters: [UInt32: Modifiers] = [:]
     private var pressedButtons = Set<MouseButton>()
 
     var pressedInputs: Set<PressedInput> {
         lock.lock()
         defer { lock.unlock() }
-        return Set(pressedKeys.map(PressedInput.key)).union(pressedButtons.map(PressedInput.button))
+        return Set(pressedKeys.map(PressedInput.key))
+            .union(pressedCharacters.keys.map(PressedInput.character))
+            .union(pressedButtons.map(PressedInput.button))
     }
 
     init(
@@ -136,8 +135,13 @@ final class MacInputInjector {
         case let .key(code, pressed, modifiers):
             try backend.postKey(code: code, pressed: pressed, modifiers: modifiers)
             if pressed { pressedKeys.insert(code) } else { pressedKeys.remove(code) }
+        case let .character(value, pressed, modifiers):
+            guard let scalar = UnicodeScalar(value) else { throw MacInputInjectorError.invalidKeyCode }
+            try backend.postUnicode(String(scalar), pressed: pressed, modifiers: modifiers)
+            if pressed { pressedCharacters[value] = modifiers } else { pressedCharacters.removeValue(forKey: value) }
         case let .unicode(text, modifiers):
-            try backend.postUnicode(text, modifiers: modifiers)
+            try backend.postUnicode(text, pressed: true, modifiers: modifiers)
+            try backend.postUnicode(text, pressed: false, modifiers: modifiers)
         }
     }
 
@@ -146,8 +150,20 @@ final class MacInputInjector {
         lock.lock()
         defer { lock.unlock() }
         let keys = pressedKeys.sorted()
+        let characters = pressedCharacters.keys.sorted()
         let buttons = pressedButtons.sorted()
         var failures: [MacInputInjectorError] = []
+        for value in characters {
+            do {
+                guard let scalar = UnicodeScalar(value) else { throw MacInputInjectorError.invalidKeyCode }
+                try backend.postUnicode(String(scalar), pressed: false, modifiers: pressedCharacters[value] ?? [])
+                pressedCharacters.removeValue(forKey: value)
+            } catch let error as MacInputInjectorError {
+                failures.append(error)
+            } catch {
+                failures.append(.eventCreationFailed)
+            }
+        }
         for key in keys {
             do {
                 try backend.postKey(code: key, pressed: false, modifiers: [])
@@ -174,7 +190,24 @@ final class MacInputInjector {
 
 enum PressedInput: Hashable {
     case key(UInt32)
+    case character(UInt32)
     case button(MouseButton)
+}
+
+func macKeyboardEventFlags(keyCode: UInt32, pressed: Bool, modifiers: Modifiers) -> CGEventFlags {
+    var flags = cgFlags(for: modifiers)
+    let ownModifier: CGEventFlags?
+    switch keyCode {
+    case 0x36, 0x37: ownModifier = .maskCommand
+    case 0x38, 0x3c: ownModifier = .maskShift
+    case 0x3a, 0x3d: ownModifier = .maskAlternate
+    case 0x3b, 0x3e: ownModifier = .maskControl
+    default: ownModifier = nil
+    }
+    if let ownModifier {
+        if pressed { flags.insert(ownModifier) } else { flags.remove(ownModifier) }
+    }
+    return flags
 }
 
 private func cgFlags(for modifiers: Modifiers) -> CGEventFlags {

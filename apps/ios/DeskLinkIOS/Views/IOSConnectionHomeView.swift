@@ -52,15 +52,16 @@ struct IOSConnectionHomeView: View {
                                     controller.connect(savedHost: host)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 3) {
-                                        Text(host.serverName)
+                                        Text(host.displayName)
                                             .foregroundStyle(.primary)
-                                        Text("已保存的安全连接")
+                                        Text(host.canReconnect ? "已保存的安全连接" : "连接授权需更新，请重新配对")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
                                 }
                                 .buttonStyle(.borderless)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .disabled(isBusy || !host.canReconnect)
 
                                 Button(role: .destructive) {
                                     removeSavedHost(host)
@@ -68,7 +69,7 @@ struct IOSConnectionHomeView: View {
                                     Image(systemName: "trash")
                                 }
                                 .buttonStyle(.borderless)
-                                .accessibilityLabel("删除 \(host.serverName)")
+                                .accessibilityLabel("删除 \(host.displayName)")
                             }
                         }
                     }
@@ -80,6 +81,7 @@ struct IOSConnectionHomeView: View {
                         .autocorrectionDisabled()
                         .focused($isInviteFieldFocused)
                         .font(.footnote.monospaced())
+                        .disabled(isBusy)
                     HStack(spacing: 18) {
                         Button("从剪贴板粘贴") { pasteInvite() }
                             .buttonStyle(.borderless)
@@ -90,8 +92,9 @@ struct IOSConnectionHomeView: View {
                         .buttonStyle(.borderless)
                         .accessibilityIdentifier("scan-invite")
                     }
+                    .disabled(isBusy)
                     Button("开始连接") { connectInviteText() }
-                        .disabled(inviteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(isBusy || inviteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     if isBusy {
                         HStack(spacing: 8) {
                             ProgressView()
@@ -101,8 +104,11 @@ struct IOSConnectionHomeView: View {
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel(statusText)
                     }
-                    Button("断开连接", role: .destructive) { controller.disconnect() }
+                    Button(isBusy ? "取消连接" : "断开连接", role: .destructive) {
+                        controller.disconnect()
+                    }
                         .disabled(!isConnectedOrConnecting)
+                        .accessibilityIdentifier("cancel-controller-connection")
                 }
 
                 Section("状态") {
@@ -193,6 +199,7 @@ struct IOSConnectionHomeView: View {
     }
 
     private func connect(invite: Data) {
+        guard !isBusy else { return }
         inputError = nil
         controller.connect(invite: invite)
     }
@@ -226,7 +233,7 @@ struct IOSMoreView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("账号") {
-                    if case let .signedIn(user) = account.state {
+                    if let user = account.state.cachedUser {
                         Label(user.email, systemImage: "person.crop.circle")
                     }
                     Button("退出登录", role: .destructive) {

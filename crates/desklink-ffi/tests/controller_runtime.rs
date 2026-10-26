@@ -62,14 +62,14 @@ async fn saved_direct_join_without_directory_still_rejects_protocol_12_noise() {
     let host_verify_key = host_identity.verify_key();
     let host_task = tokio::spawn(async move {
         let first = decode_noise_handshake(&host.next_control().await.unwrap()).unwrap();
-        assert_eq!(first.protocol_version, 13);
+        assert_eq!(first.protocol_version, PROTOCOL_VERSION);
         let mut legacy_response = encode_noise_handshake(&NoiseHandshake {
             protocol_version: PROTOCOL_VERSION,
             step: NoiseHandshakeStep::ResponderHello,
             payload: vec![1],
         })
         .unwrap();
-        assert_eq!(legacy_response[0], 13);
+        assert_eq!(legacy_response[0], PROTOCOL_VERSION as u8);
         legacy_response[0] = 12;
         host.send_control(legacy_response).await.unwrap();
         host

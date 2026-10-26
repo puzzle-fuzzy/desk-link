@@ -1,9 +1,17 @@
 import CoreGraphics
 import DeskLinkAppleCore
 
-enum ModifierMode: Equatable {
+enum ModifierMode: String, CaseIterable, Identifiable {
     case automatic
     case raw
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .automatic: "按本机习惯"
+        case .raw: "发送原始按键"
+        }
+    }
 }
 
 enum LocalModifier: Equatable {
@@ -25,10 +33,12 @@ enum RemoteModifier: Equatable {
 struct InputMapper {
     let videoRect: CGRect
     let modifierMode: ModifierMode
+    let remotePlatform: RemotePlatform
 
-    init(videoRect: CGRect, modifierMode: ModifierMode = .automatic) {
+    init(videoRect: CGRect, modifierMode: ModifierMode = .automatic, remotePlatform: RemotePlatform = .unknown) {
         self.videoRect = videoRect
         self.modifierMode = modifierMode
+        self.remotePlatform = remotePlatform
     }
 
     func normalizedPoint(for point: CGPoint) -> CGPoint? {
@@ -43,7 +53,7 @@ struct InputMapper {
     }
 
     func remoteModifier(for modifier: LocalModifier) -> RemoteModifier {
-        guard modifierMode == .automatic else {
+        guard KeyboardMappingPolicy(mode: modifierMode, remotePlatform: remotePlatform).mapsCommandToControl else {
             return rawModifier(modifier)
         }
         switch modifier {

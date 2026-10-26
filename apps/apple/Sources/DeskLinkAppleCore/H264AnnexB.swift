@@ -24,64 +24,74 @@ public enum H264AnnexB {
     }
 
     public static func avccAccessUnit(from annexB: Data) throws -> Data {
-        let units = nalUnits(in: annexB)
-        guard !units.isEmpty else { throw H264AnnexBError.noNALUnits }
+        let ranges = nalRanges(in: annexB)
+        guard !ranges.isEmpty else { throw H264AnnexBError.noNALUnits }
         var output = Data()
-        output.reserveCapacity(annexB.count)
-        for unit in units {
-            guard let length = UInt32(exactly: unit.count) else {
-                throw H264AnnexBError.oversizedNALUnit
+        output.reserveCapacity(annexB.count + ranges.count)
+        try annexB.withUnsafeBytes { rawBytes in
+            let bytes = rawBytes.bindMemory(to: UInt8.self)
+            for range in ranges {
+                guard let length = UInt32(exactly: range.count) else {
+                    throw H264AnnexBError.oversizedNALUnit
+                }
+                output.append(UInt8(truncatingIfNeeded: length >> 24))
+                output.append(UInt8(truncatingIfNeeded: length >> 16))
+                output.append(UInt8(truncatingIfNeeded: length >> 8))
+                output.append(UInt8(truncatingIfNeeded: length))
+                output.append(contentsOf: bytes[range])
             }
-            output.append(UInt8(truncatingIfNeeded: length >> 24))
-            output.append(UInt8(truncatingIfNeeded: length >> 16))
-            output.append(UInt8(truncatingIfNeeded: length >> 8))
-            output.append(UInt8(truncatingIfNeeded: length))
-            output.append(unit)
         }
         return output
     }
 
     public static func nalUnits(in annexB: Data) -> [Data] {
-        let bytes = [UInt8](annexB)
-        guard !bytes.isEmpty else { return [] }
-        var markers: [(offset: Int, length: Int)] = []
-        var index = 0
-        while index + 2 < bytes.count {
-            if index + 3 < bytes.count,
-               bytes[index] == 0,
-               bytes[index + 1] == 0,
-               bytes[index + 2] == 0,
-               bytes[index + 3] == 1
-            {
-                markers.append((index, 4))
-                index += 4
-            } else if bytes[index] == 0,
-                      bytes[index + 1] == 0,
-                      bytes[index + 2] == 1
-            {
-                markers.append((index, 3))
-                index += 3
-            } else {
-                index += 1
-            }
+        nalRanges(in: annexB).map { range in
+            annexB.subdata(in: (annexB.startIndex + range.lowerBound)..<(annexB.startIndex + range.upperBound))
         }
-        guard !markers.isEmpty else { return [] }
+    }
 
-        var units: [Data] = []
-        units.reserveCapacity(markers.count)
-        for markerIndex in markers.indices {
-            let start = markers[markerIndex].offset + markers[markerIndex].length
-            var end = markerIndex + 1 < markers.count
-                ? markers[markerIndex + 1].offset
-                : bytes.count
-            while end > start, bytes[end - 1] == 0 {
-                end -= 1
-            }
-            if start < end {
-                units.append(Data(bytes[start..<end]))
-            }
+    public static func containsIDR(in annexB: Data) -> Bool {
+        let ranges = nalRanges(in: annexB)
+        return annexB.withUnsafeBytes { rawBytes in
+            let bytes = rawBytes.bindMemory(to: UInt8.self)
+            return ranges.contains { bytes[$0.lowerBound] & 0x1f == 5 }
         }
-        return units
+    }
+
+    /// Offsets into the original Data. Scanning never materializes a byte array
+    /// or a Data for every NAL; conversion copies payloads only into its output.
+    static func nalRanges(in annexB: Data) -> [Range<Int>] {
+        annexB.withUnsafeBytes { rawBytes in
+            let bytes = rawBytes.bindMemory(to: UInt8.self)
+            var ranges: [Range<Int>] = []
+            var payloadStart: Int?
+            var index = 0
+            while index + 2 < bytes.count {
+                let markerLength: Int
+                if index + 3 < bytes.count, bytes[index] == 0,
+                   bytes[index + 1] == 0, bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                    markerLength = 4
+                } else if bytes[index] == 0, bytes[index + 1] == 0, bytes[index + 2] == 1 {
+                    markerLength = 3
+                } else {
+                    index += 1
+                    continue
+                }
+                if let start = payloadStart {
+                    var end = index
+                    while end > start, bytes[end - 1] == 0 { end -= 1 }
+                    if start < end { ranges.append(start..<end) }
+                }
+                payloadStart = index + markerLength
+                index += markerLength
+            }
+            if let start = payloadStart {
+                var end = bytes.count
+                while end > start, bytes[end - 1] == 0 { end -= 1 }
+                if start < end { ranges.append(start..<end) }
+            }
+            return ranges
+        }
     }
 
     private static func nalType(_ unit: Data) -> UInt8? {

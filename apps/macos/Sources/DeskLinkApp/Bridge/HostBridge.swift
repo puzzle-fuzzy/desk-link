@@ -7,10 +7,12 @@ import Foundation
 private final class HostCallbackContext: @unchecked Sendable {
     weak var bridge: HostBridge?
     let generation: UInt64
+    let captureAdmission: HostCaptureAdmission
 
-    init(bridge: HostBridge, generation: UInt64) {
+    init(bridge: HostBridge, generation: UInt64, captureAdmission: HostCaptureAdmission) {
         self.bridge = bridge
         self.generation = generation
+        self.captureAdmission = captureAdmission
     }
 }
 
@@ -52,6 +54,7 @@ final class HostBridge: ObservableObject {
     @Published private(set) var metrics = HostMetrics()
     @Published private(set) var trustedControllers: [TrustedController] = []
     @Published private(set) var lastError: String?
+    @Published private(set) var ignoredHostEventCount: UInt64 = 0
 
     var canStartCapture: Bool {
         permissions.screenRecording == .granted && state == .connected
@@ -71,8 +74,12 @@ final class HostBridge: ObservableObject {
     private let identityStore: HostIdentityStore
     private let trustedControllerStore: TrustedControllerStore
     private let handleOwner = HostHandleOwner()
-    private let captureSource = ScreenCaptureSource()
-    private let encoder = MacH264Encoder()
+    private let captureFactory: HostCaptureFactory
+    private var captureAdmission: HostCaptureAdmission?
+    private var connectionReceipt: HostCaptureConnectionReceipt?
+    private var activeCapture: HostCaptureAttempt?
+    private var captureCleanupTask: Task<Void, Never>?
+    private var captureWarningOwner: HostCaptureOwner?
     private var inputInjector = MacInputInjector()
     private var captureStarting = false
     private var captureRunning = false
@@ -82,36 +89,111 @@ final class HostBridge: ObservableObject {
     private var permissionRefreshTask: Task<Void, Never>?
     private var callbackGeneration: UInt64 = 0
     private var activeControllerDeviceID: [UInt8]?
+#if DEBUG
+    func observeConnectionForTesting(_ phase: HostCaptureConnectionPhase, mediaGeneration: UInt64,
+                                     deliver: Bool = true) -> HostCaptureConnectionReceipt? {
+        let raw = testingRawState(phase)
+        guard let receipt = observeNativeStateForTesting(raw, mediaGeneration: mediaGeneration) else { return nil }
+        if deliver { deliverNativeStateForTesting(raw, receipt: receipt) }
+        return receipt
+    }
+
+    func deliverConnectionForTesting(_ receipt: HostCaptureConnectionReceipt) {
+        deliverNativeStateForTesting(testingRawState(receipt.phase), receipt: receipt)
+    }
+
+    private func testingRawState(_ phase: HostCaptureConnectionPhase) -> UInt32 {
+        switch phase {
+        case .connected: DESKLINK_HOST_CONNECTED.rawValue
+        case .unavailable: DESKLINK_HOST_CONNECTING.rawValue
+        case .terminal: DESKLINK_HOST_CLOSED.rawValue
+        }
+    }
+
+    var recordCaptureEventsForTesting = false
+    var captureSubmitResultForTesting: UInt32 = DESKLINK_OK.rawValue
+    /// Swift-boundary attempts, including those the simulated Rust gate rejects.
+    private(set) var admittedVideoEventsForTesting: [OwnedHostVideoEvent] = []
+    private var syntheticCaptureForTesting = false
+    var activeCaptureOwnerForTesting: HostCaptureOwner? { activeCapture?.owner }
+    var captureRunningForTesting: Bool { captureRunning }
+    private var inputBackendForTesting: (any CGEventBackend)?
+    var recordInputDeliveriesForTesting = false
+    private(set) var injectedInputsForTesting: [HostInputDelivery] = []
+
+    func installInputBackendForTesting(_ backend: any CGEventBackend) {
+        inputBackendForTesting = backend
+        inputInjector = makeInputInjector(displayFrame: .zero)
+    }
+
+    /// Uses the same native scheduling path as the real C callback. The return
+    /// value observes preparation only; injection still waits for MainActor.
+    @discardableResult
+    func enqueueNativeInputForTesting(mediaGeneration: UInt64, streamID: UInt64,
+                                      inputEpoch: UInt64, pressed: Bool = true) -> HostInputDelivery? {
+        var event = DesklinkHostEvent()
+        event.kind = DESKLINK_HOST_EVENT_INPUT
+        event.state = DESKLINK_HOST_CONNECTED
+        event.media_generation = mediaGeneration
+        event.input.kind = DESKLINK_INPUT_MOUSE_BUTTON
+        event.input.button = 1
+        event.input.pressed = pressed ? 1 : 0
+        event.input.stream_id = streamID
+        event.input.input_epoch = inputEpoch
+        return scheduleHostCallbackEvent(callbackContextForTesting(), event)
+    }
+
+    func enqueueNativeStateForTesting(_ phase: HostCaptureConnectionPhase, mediaGeneration: UInt64) {
+        var event = DesklinkHostEvent()
+        event.kind = DESKLINK_HOST_EVENT_STATE
+        event.state = DesklinkHostState(rawValue: testingRawState(phase))
+        event.media_generation = mediaGeneration
+        _ = scheduleHostCallbackEvent(callbackContextForTesting(), event)
+    }
+
+    func enqueueNativeReleaseAllForTesting() {
+        var event = DesklinkHostEvent()
+        event.kind = DESKLINK_HOST_EVENT_RELEASE_ALL
+        _ = scheduleHostCallbackEvent(callbackContextForTesting(), event)
+    }
+
+    private func callbackContextForTesting() -> HostCallbackContext {
+        let admission = captureAdmission ?? HostCaptureAdmission(runtimeGeneration: callbackGeneration)
+        captureAdmission = admission
+        return HostCallbackContext(bridge: self, generation: callbackGeneration, captureAdmission: admission)
+    }
+#endif
 
     init(
         relayURL: String = DeskLinkRuntimeConfiguration.macOSDefaults.relayURL,
         serverName: String = DeskLinkRuntimeConfiguration.macOSDefaults.relayServerName,
         permissions: MacPermissions = MacPermissions(),
         identityStore: HostIdentityStore = HostIdentityStore(),
-        trustedControllerStore: TrustedControllerStore = TrustedControllerStore()
+        trustedControllerStore: TrustedControllerStore = TrustedControllerStore(),
+        captureFactory: @escaping HostCaptureFactory = { owner, callbacks in NativeHostCaptureSession(owner: owner, callbacks: callbacks) },
+        loadTrustedControllers: Bool = true
     ) {
         self.relayURL = relayURL
         self.serverName = serverName
         permissionProvider = permissions
         self.identityStore = identityStore
         self.trustedControllerStore = trustedControllerStore
+        self.captureFactory = captureFactory
         self.permissions = permissions.snapshot()
-        encoder.onEvent = { [weak self] event in
-            DispatchQueue.main.async { [weak self] in self?.sendVideo(event) }
-        }
-        encoder.onError = { [weak self] error in
-            Task { @MainActor in self?.publishError("Video encoding could not continue: \(error).") }
-        }
-        reloadTrustedControllers()
+        if loadTrustedControllers { reloadTrustedControllers() }
     }
 
-    static func testing(permissionSnapshot: MacPermissionSnapshot) -> HostBridge {
+    static func testing(permissionSnapshot: MacPermissionSnapshot,
+                        captureFactory: @escaping HostCaptureFactory = { _, _ in InertHostCaptureSession() }) -> HostBridge {
         let bridge = HostBridge(permissions: MacPermissions(provider: StaticMacPermissionProvider(
             screenRecordingGranted: permissionSnapshot.screenRecording == .granted,
             accessibilityGranted: permissionSnapshot.accessibility == .granted
-        )))
+        )), captureFactory: captureFactory, loadTrustedControllers: false)
         bridge.permissions = permissionSnapshot
         bridge.state = .idle
+#if DEBUG
+        bridge.syntheticCaptureForTesting = true
+#endif
         return bridge
     }
 
@@ -120,7 +202,10 @@ final class HostBridge: ObservableObject {
         do {
             let identity = try identityStore.loadOrCreate()
             callbackGeneration &+= 1
-            let context = HostCallbackContext(bridge: self, generation: callbackGeneration)
+            let admission = HostCaptureAdmission(runtimeGeneration: callbackGeneration)
+            captureAdmission = admission
+            connectionReceipt = nil
+            let context = HostCallbackContext(bridge: self, generation: callbackGeneration, captureAdmission: admission)
             let contextPointer = Unmanaged.passRetained(context).toOpaque()
             var handle: OpaquePointer?
             let result = relayURL.withCString { relayURL in
@@ -298,6 +383,9 @@ final class HostBridge: ObservableObject {
     }
 
     private func beginStop() {
+        captureAdmission?.close()
+        retireActiveCapture()
+        connectionReceipt = nil
         callbackGeneration &+= 1
         activeControllerDeviceID = nil
         state = .stopping
@@ -309,15 +397,13 @@ final class HostBridge: ObservableObject {
             self.pairingTask = nil
         }
         isCreatingInvite = false
-        await captureSource.stop()
-        captureStarting = false
-        captureRunning = false
-        encoder.stop()
+        if let captureCleanupTask { await captureCleanupTask.value }
         if let handle = handleOwner.pointer {
             _ = desklink_host_release_all(handle)
             _ = desklink_host_stop(handle)
         }
         handleOwner.destroy()
+        captureAdmission = nil
         releaseAllLocalInput()
         pairingInvite = nil
         pendingApproval = nil
@@ -328,10 +414,11 @@ final class HostBridge: ObservableObject {
     fileprivate func consume(_ event: HostCallbackEvent) {
         switch event.kind {
         case .state:
-            consumeState(event.state)
+            consumeState(event.state, receipt: event.connectionReceipt)
         case .error:
             publishError(event.message ?? "The host runtime reported an error.")
         case .approvalRequested:
+            retireActiveCapture()
             pendingApproval = HostApproval(
                 id: UUID(),
                 fingerprint: event.fingerprint ?? "Unverified controller",
@@ -340,33 +427,81 @@ final class HostBridge: ObservableObject {
             )
             state = .waitingForApproval
         case .input:
-            guard canInjectInput, let input = event.input else { return }
-            do {
-                try inputInjector.inject(input)
-            } catch {
-                publishError("Remote input could not be applied.")
-            }
+            guard let input = event.inputDelivery else { return }
+            inject(input)
         case .keyframeRequested:
-            encoder.requestKeyframe()
+            if let capture = activeCapture, capture.admission.allows(capture.owner) { capture.session.requestKeyframe() }
         case .releaseAll:
             releaseAllLocalInput()
         case .metrics:
             if let metrics = event.metrics { self.metrics = metrics }
+        case .transfer:
+            lastError = "当前 Mac 共享尚不支持文件和剪贴板传输。"
+        case .unknown:
+            ignoredHostEventCount &+= 1
         }
     }
 
-    private func consumeState(_ rawState: Int) {
+#if DEBUG
+    /// Models only native metadata and task ordering; never creates a Rust host.
+    func observeNativeStateForTesting(_ rawState: UInt32, mediaGeneration: UInt64) -> HostCaptureConnectionReceipt? {
+        if captureAdmission == nil { captureAdmission = HostCaptureAdmission(runtimeGeneration: callbackGeneration) }
+        return captureAdmission?.observe(captureConnectionPhase(Int(rawState)), mediaGeneration: mediaGeneration)
+    }
+
+    func deliverNativeStateForTesting(_ rawState: UInt32, receipt: HostCaptureConnectionReceipt) {
+        consumeState(Int(rawState), receipt: receipt)
+    }
+
+    func waitForCaptureStartForTesting() async {
+        let starting = activeCapture?.startTask
+        await starting?.value
+    }
+
+    func waitForCaptureCleanupForTesting() async { await captureCleanupTask?.value }
+
+    func flushCaptureCallbacksForTesting() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    /// Exercises event classification only; no native host or input injection.
+    func acceptEventKindForTesting(_ rawValue: UInt32, poisonUnrelatedFields: Bool = false) {
+        var value = DesklinkHostEvent()
+        value.kind = DesklinkHostEventKind(rawValue: rawValue)
+        value.state = DESKLINK_HOST_CONNECTED
+        if poisonUnrelatedFields {
+            value.data_len = Int.max
+            value.fingerprint_len = Int.max
+            value.metrics.sent_video_configs = UInt64.max
+            value.metrics.sent_video_packets = UInt64.max
+            value.metrics.received_input_events = UInt64.max
+            value.metrics.keyframe_requests = UInt64.max
+        }
+        consume(hostCallbackEvent(value))
+    }
+#endif
+
+    private func consumeState(_ rawState: Int, receipt: HostCaptureConnectionReceipt?) {
+        guard let receipt, let admission = captureAdmission,
+              receipt.runtimeGeneration == callbackGeneration, admission.matches(receipt) else { return }
+        connectionReceipt = receipt
+        if receipt.phase != .connected { retireActiveCapture() }
         switch rawState {
-        case Int(DESKLINK_HOST_CONNECTING.rawValue):
-            state = .connecting
-            pauseCaptureForReconnect()
+        case Int(DESKLINK_HOST_CONNECTING.rawValue): state = .connecting
         case Int(DESKLINK_HOST_WAITING_FOR_APPROVAL.rawValue): state = .waitingForApproval
-        case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue):
-            state = .negotiating
-            pauseCaptureForReconnect()
+        case Int(DESKLINK_HOST_NEGOTIATING_CAPABILITIES.rawValue): state = .negotiating
         case Int(DESKLINK_HOST_CONNECTED.rawValue):
+            // Connecting may have been superseded while its UI delivery waited.
+            // The native gate already retired that connection's capture.
+            if let current = activeCapture, !admission.allows(current.owner) { retireActiveCapture() }
             state = .connected
             pendingApproval = nil
+            if captureWarningOwner != nil {
+                captureWarningOwner = nil
+                lastError = nil
+            }
             startCaptureIfPermitted()
         case Int(DESKLINK_HOST_STOPPING.rawValue): state = .stopping
         case Int(DESKLINK_HOST_CLOSED.rawValue):
@@ -377,89 +512,118 @@ final class HostBridge: ObservableObject {
     }
 
     private func startCaptureIfPermitted() {
-        guard canStartCapture, !captureStarting, !captureRunning else { return }
-        let streamID: UInt64
-        if nextStreamID == UInt64.max {
-            streamID = 1
-        } else {
-            streamID = max(1, nextStreamID + 1)
+        guard canStartCapture, activeCapture == nil, !captureStarting, !captureRunning,
+              let admission = captureAdmission, let receipt = connectionReceipt,
+              receipt.phase == .connected, admission.matches(receipt) else { return }
+        guard nextStreamID < UInt64.max else {
+            publishError("The capture stream sequence is exhausted. Restart host mode.")
+            return
         }
+        // Burn the identifier when reserving, including failed/cancelled starts.
+        nextStreamID += 1
+        guard let owner = admission.register(receipt, streamID: nextStreamID) else { return }
+        let callbacks = HostCaptureCallbacks(
+            video: { [weak self, owner, admission] event in
+                DispatchQueue.main.async { [weak self, owner, admission] in
+                    self?.sendVideo(event, owner: owner, admission: admission)
+                }
+            },
+            encodingError: { [weak self, owner, admission] error in
+                DispatchQueue.main.async { [weak self, owner, admission] in
+                    self?.encodingFailed(error, owner: owner, admission: admission)
+                }
+            },
+            captureStopped: { [weak self, owner, admission] message in
+                DispatchQueue.main.async { [weak self, owner, admission] in
+                    self?.captureStoppedUnexpectedly(owner: owner, admission: admission, message: message)
+                }
+            }
+        )
+        let attempt = HostCaptureAttempt(owner: owner, admission: admission, session: captureFactory(owner, callbacks))
+        activeCapture = attempt
         captureStarting = true
-        Task { @MainActor [weak self] in
+        let previousCleanup = captureCleanupTask
+        attempt.startTask = Task { @MainActor [weak self, attempt, previousCleanup] in
+            if let previousCleanup { await previousCleanup.value }
             guard let self else { return }
+            guard !Task.isCancelled, isCurrentCapture(attempt.owner, admission: attempt.admission) else {
+                retireCaptureIfOwned(attempt.owner)
+                return
+            }
             do {
-                try await captureSource.start(
-                    displayID: CGMainDisplayID(),
-                    streamID: streamID,
-                    onFrame: { [weak encoder] buffer, frameID in
-                        encoder?.encode(pixelBuffer: buffer, frameID: frameID)
-                    },
-                    onStop: { [weak self] _ in
-                        Task { @MainActor in self?.captureStoppedUnexpectedly() }
-                    }
-                )
-                guard state == .connected else {
-                    await captureSource.stop()
-                    captureStarting = false
+                let geometry = try await attempt.session.start()
+                guard !Task.isCancelled, isCurrentCapture(attempt.owner, admission: attempt.admission) else {
+                    retireCaptureIfOwned(attempt.owner)
                     return
                 }
-                let frame = captureSource.capturedDisplayFrame
-                let videoSize = captureSource.capturedVideoSize
-                guard videoSize.width > 0, videoSize.height > 0 else {
-                    throw ScreenCaptureSourceError.displayUnavailable
-                }
-                try encoder.start(
-                    width: Int(videoSize.width),
-                    height: Int(videoSize.height),
-                    streamID: streamID
-                )
-                inputInjector = MacInputInjector(displayFrame: frame)
-                nextStreamID = streamID
+                inputInjector = makeInputInjector(displayFrame: geometry.displayFrame)
                 captureRunning = true
                 captureStarting = false
+                if captureWarningOwner != nil {
+                    captureWarningOwner = nil
+                    lastError = nil
+                }
             } catch {
-                captureStarting = false
-                captureRunning = false
-                publishError("Screen capture could not start. Check Screen Recording permission.")
+                guard isCurrentCapture(attempt.owner, admission: attempt.admission) else {
+                    retireCaptureIfOwned(attempt.owner)
+                    return
+                }
+                // Retirement cancels this task, so preserve its incoming
+                // cancellation state before cancelling our own resource owner.
+                let wasCancelled = error is CancellationError || Task.isCancelled
+                retireActiveCapture()
+                if wasCancelled { return }
+                captureWarningOwner = attempt.owner
+                lastError = "Screen capture could not start. Check Screen Recording permission and refresh permissions to retry."
             }
         }
     }
 
-    private func pauseCaptureForReconnect() {
-        guard captureStarting || captureRunning else { return }
+    private func isCurrentCapture(_ owner: HostCaptureOwner, admission: HostCaptureAdmission) -> Bool {
+        state == .connected && owner.runtimeGeneration == callbackGeneration
+            && captureAdmission === admission && activeCapture?.owner == owner && admission.allows(owner)
+    }
+
+    private func retireCaptureIfOwned(_ owner: HostCaptureOwner) {
+        if activeCapture?.owner == owner { retireActiveCapture() }
+    }
+
+    private func retireActiveCapture() {
+        guard let attempt = activeCapture else { return }
+        activeCapture = nil
         captureStarting = false
         captureRunning = false
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await captureSource.stop()
-            encoder.stop()
-            releaseAllLocalInput()
+        attempt.admission.retire(attempt.owner)
+        attempt.startTask?.cancel()
+        releaseAllLocalInput()
+        let previousCleanup = captureCleanupTask
+        let starting = attempt.startTask
+        captureCleanupTask = Task { @MainActor [attempt, previousCleanup, starting] in
+            if let previousCleanup { await previousCleanup.value }
+            if let starting { await starting.value }
+            await attempt.session.stop()
         }
     }
 
-    private func captureStoppedUnexpectedly() {
-        guard captureRunning || captureStarting else { return }
-        captureRunning = false
-        captureStarting = false
-        encoder.stop()
-        releaseAllLocalInput()
-        if state == .connected { publishError("Screen capture stopped unexpectedly.") }
+    private func captureStoppedUnexpectedly(owner: HostCaptureOwner, admission: HostCaptureAdmission, message: String) {
+        guard isCurrentCapture(owner, admission: admission) else { return }
+        retireActiveCapture()
+        captureWarningOwner = owner
+        lastError = "Screen capture stopped unexpectedly. Refresh permissions or restart sharing to retry."
+    }
+
+    private func encodingFailed(_ error: MacH264EncoderError, owner: HostCaptureOwner, admission: HostCaptureAdmission) {
+        guard isCurrentCapture(owner, admission: admission) else { return }
+        retireActiveCapture()
+        captureWarningOwner = owner
+        lastError = Self.redact("Video encoding could not continue: \(error). Refresh permissions or restart sharing to retry.")
     }
 
     private func applyPermissions(_ snapshot: MacPermissionSnapshot) {
         let previous = permissions
         permissions = snapshot
-        if previous.screenRecording == .granted, snapshot.screenRecording != .granted,
-           captureRunning || captureStarting
-        {
-            captureRunning = false
-            captureStarting = false
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                await captureSource.stop()
-                encoder.stop()
-                releaseAllLocalInput()
-            }
+        if previous.screenRecording == .granted, snapshot.screenRecording != .granted {
+            retireActiveCapture()
             if state == .connected { stop() }
         }
         if previous.accessibility == .granted, snapshot.accessibility != .granted {
@@ -478,24 +642,72 @@ final class HostBridge: ObservableObject {
         }
     }
 
-    private func sendVideo(_ event: EncodedVideoEvent) {
-        guard state == .connected, let handle = handleOwner.pointer else { return }
-        let result: DesklinkResult
+    private func sendVideo(_ event: EncodedVideoEvent, owner: HostCaptureOwner, admission: HostCaptureAdmission) {
+        guard isCurrentCapture(owner, admission: admission) else { return }
+        let eventStream: UInt64
         switch event {
-        case let .configuration(streamID, version, width, height, bytes):
-            result = bytes.withUnsafeBytes {
-                desklink_host_send_video_config(handle, streamID, version, width, height, $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+        case let .configuration(streamID, _, _, _, _): eventStream = streamID
+        case let .accessUnit(streamID, _, _, _, _): eventStream = streamID
+        }
+        guard eventStream == owner.streamID else { return }
+        let result: DesklinkResult? = admission.withAdmission(owner) {
+#if DEBUG
+            if recordCaptureEventsForTesting { admittedVideoEventsForTesting.append(OwnedHostVideoEvent(owner: owner, event: event)) }
+#endif
+            guard let handle = handleOwner.pointer else {
+#if DEBUG
+                if syntheticCaptureForTesting { return DesklinkResult(rawValue: captureSubmitResultForTesting) }
+#endif
+                return DESKLINK_INVALID_STATE
             }
-        case let .accessUnit(streamID, frameID, configVersion, _, bytes):
-            result = bytes.withUnsafeBytes {
-                desklink_host_send_video_access_unit(handle, streamID, frameID, configVersion, $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+            switch event {
+            case let .configuration(streamID, version, width, height, bytes):
+                return bytes.withUnsafeBytes {
+                    desklink_host_send_video_config_for_generation(handle, owner.mediaGeneration, streamID, version, width, height,
+                        $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+                }
+            case let .accessUnit(streamID, frameID, configVersion, _, bytes):
+                return bytes.withUnsafeBytes {
+                    desklink_host_send_video_access_unit_for_generation(handle, owner.mediaGeneration, streamID, frameID, configVersion,
+                        $0.bindMemory(to: UInt8.self).baseAddress, bytes.count)
+                }
             }
         }
-        if result != DESKLINK_OK { publishResultError("Video delivery could not continue.", result: result) }
+        guard let result, result != DESKLINK_STALE_GENERATION,
+              isCurrentCapture(owner, admission: admission) else { return }
+        if result != DESKLINK_OK {
+            retireActiveCapture()
+            captureWarningOwner = owner
+            lastError = "Video delivery could not continue (code \(result.rawValue)). Refresh permissions or restart sharing to retry."
+        }
     }
 
     private func releaseAllLocalInput() {
         _ = inputInjector.releaseAll()
+    }
+
+    private func makeInputInjector(displayFrame: CGRect) -> MacInputInjector {
+#if DEBUG
+        if let inputBackendForTesting { return MacInputInjector(backend: inputBackendForTesting, displayFrame: displayFrame) }
+#endif
+        return MacInputInjector(displayFrame: displayFrame)
+    }
+
+    private func inject(_ input: HostInputDelivery) {
+        guard canInjectInput, captureRunning, captureAdmission === input.admission,
+              activeCapture?.owner == input.captureOwner,
+              input.captureOwner.runtimeGeneration == callbackGeneration else { return }
+        let outcome: Result<Void, Error>? = input.admission.withInputAdmission(input) {
+            Result {
+                try inputInjector.inject(input.command)
+#if DEBUG
+                if recordInputDeliveriesForTesting { injectedInputsForTesting.append(input) }
+#endif
+            }
+        }
+        if case .failure? = outcome, isCurrentCapture(input.captureOwner, admission: input.admission) {
+            publishError("Remote input could not be applied.")
+        }
     }
 
     private func reloadTrustedControllers() {
@@ -526,7 +738,7 @@ final class HostBridge: ObservableObject {
     }
 }
 
-private enum HostCallbackKind {
+private enum HostCallbackKind: Sendable {
     case state
     case error
     case approvalRequested
@@ -534,43 +746,110 @@ private enum HostCallbackKind {
     case keyframeRequested
     case releaseAll
     case metrics
+    case transfer
+    case unknown
 }
 
-private struct HostCallbackEvent {
+private struct HostCallbackEvent: Sendable {
     let kind: HostCallbackKind
     let state: Int
     let message: String?
     let fingerprint: String?
     let controllerDeviceID: [UInt8]
     let controllerVerifyKey: [UInt8]
-    let input: RemoteInputCommand?
+    let inputDelivery: HostInputDelivery?
     let metrics: HostMetrics?
+    let connectionReceipt: HostCaptureConnectionReceipt?
 }
 
 private func desklinkHostEventCallback(_ context: UnsafeMutableRawPointer?, _ event: UnsafePointer<DesklinkHostEvent>?) {
     guard let context, let event else { return }
     let callbackContext = Unmanaged<HostCallbackContext>.fromOpaque(context).takeUnretainedValue()
-    guard let bridge = callbackContext.bridge else { return }
+    _ = scheduleHostCallbackEvent(callbackContext, event.pointee)
+}
+
+/// Both C callbacks and synthetic queue regressions enter this preparation path.
+/// All original Rust fields are copied before scheduling any MainActor work.
+private func scheduleHostCallbackEvent(_ callbackContext: HostCallbackContext, _ value: DesklinkHostEvent) -> HostInputDelivery? {
+    guard let bridge = callbackContext.bridge else { return nil }
     let generation = callbackContext.generation
-    let value = event.pointee
-    let mapped = HostCallbackEvent(
-        kind: hostCallbackKind(value.kind),
-        state: Int(value.state.rawValue),
-        message: value.data.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.data_len), as: UTF8.self) },
-        fingerprint: value.fingerprint.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.fingerprint_len), as: UTF8.self) },
-        controllerDeviceID: withUnsafeBytes(of: value.controller_device_id) { Array($0) },
-        controllerVerifyKey: withUnsafeBytes(of: value.controller_verify_key) { Array($0) },
-        input: hostInputCommand(value.input),
-        metrics: HostMetrics(
-            sentVideoConfigurations: Int(value.metrics.sent_video_configs),
-            sentVideoPackets: Int(value.metrics.sent_video_packets),
-            receivedInputEvents: Int(value.metrics.received_input_events),
-            keyframeRequests: Int(value.metrics.keyframe_requests)
-        )
-    )
+    let kind = hostCallbackKind(value.kind)
+    let receipt: HostCaptureConnectionReceipt?
+    let inputDelivery: HostInputDelivery?
+    switch kind {
+    case .state:
+        // Retire encoded deliveries before waiting for the MainActor. The
+        // immutable Rust generation remains attached to the connection receipt.
+        guard let observed = callbackContext.captureAdmission.observe(
+            captureConnectionPhase(Int(value.state.rawValue)), mediaGeneration: value.media_generation
+        ) else { return nil }
+        receipt = observed
+        inputDelivery = nil
+    case .approvalRequested:
+        guard let observed = callbackContext.captureAdmission.observe(.unavailable, mediaGeneration: value.media_generation) else { return nil }
+        receipt = observed
+        inputDelivery = nil
+    case .input:
+        guard let command = hostInputCommand(value.input),
+              let input = callbackContext.captureAdmission.captureInput(
+                mediaGeneration: value.media_generation,
+                context: HostInputContext(streamID: value.input.stream_id, inputEpoch: value.input.input_epoch),
+                command: command
+              ) else { return nil }
+        inputDelivery = input
+        receipt = input.connectionReceipt
+    default:
+        receipt = nil
+        inputDelivery = nil
+    }
+    let mapped = hostCallbackEvent(value, connectionReceipt: receipt, inputDelivery: inputDelivery)
     DispatchQueue.main.async {
         guard bridge.acceptsCallback(generation: generation) else { return }
+        if let receipt, !callbackContext.captureAdmission.matches(receipt) { return }
         bridge.consume(mapped)
+    }
+    return inputDelivery
+}
+
+private func hostCallbackEvent(_ value: DesklinkHostEvent, connectionReceipt: HostCaptureConnectionReceipt? = nil,
+                               inputDelivery: HostInputDelivery? = nil) -> HostCallbackEvent {
+    let kind = hostCallbackKind(value.kind)
+    let message: String?
+    if case .error = kind {
+        message = value.data.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.data_len), as: UTF8.self) }
+    } else {
+        // Unknown/transfer bytes need not be copied or interpreted as errors.
+        message = nil
+    }
+    let fingerprint: String?
+    if case .approvalRequested = kind {
+        fingerprint = value.fingerprint.map { String(decoding: UnsafeBufferPointer(start: $0, count: value.fingerprint_len), as: UTF8.self) }
+    } else { fingerprint = nil }
+    let metrics: HostMetrics?
+    if case .metrics = kind {
+        metrics = HostMetrics(sentVideoConfigurations: Int(clamping: value.metrics.sent_video_configs),
+            sentVideoPackets: Int(clamping: value.metrics.sent_video_packets),
+            receivedInputEvents: Int(clamping: value.metrics.received_input_events),
+            keyframeRequests: Int(clamping: value.metrics.keyframe_requests))
+    } else { metrics = nil }
+    return HostCallbackEvent(
+        kind: kind,
+        state: Int(value.state.rawValue),
+        message: message,
+        fingerprint: fingerprint,
+        controllerDeviceID: withUnsafeBytes(of: value.controller_device_id) { Array($0) },
+        controllerVerifyKey: withUnsafeBytes(of: value.controller_verify_key) { Array($0) },
+        inputDelivery: inputDelivery,
+        metrics: metrics,
+        connectionReceipt: connectionReceipt
+    )
+}
+
+private func captureConnectionPhase(_ state: Int) -> HostCaptureConnectionPhase {
+    switch state {
+    case Int(DESKLINK_HOST_CONNECTED.rawValue): .connected
+    case Int(DESKLINK_HOST_STOPPING.rawValue), Int(DESKLINK_HOST_CLOSED.rawValue): .terminal
+    default: .unavailable
     }
 }
 
@@ -589,7 +868,8 @@ private func hostCallbackKind(_ kind: DesklinkHostEventKind) -> HostCallbackKind
     case DESKLINK_HOST_EVENT_KEYFRAME_REQUESTED: .keyframeRequested
     case DESKLINK_HOST_EVENT_RELEASE_ALL: .releaseAll
     case DESKLINK_HOST_EVENT_METRICS: .metrics
-    default: .error
+    case DESKLINK_HOST_EVENT_TRANSFER: .transfer
+    default: .unknown
     }
 }
 
@@ -608,10 +888,8 @@ private func hostInputCommand(_ input: DesklinkHostInput) -> RemoteInputCommand?
         return .wheel(deltaX: input.wheel_x, deltaY: input.wheel_y)
     case DESKLINK_INPUT_KEY:
         let modifiers = Modifiers(rawValue: UInt32(input.modifiers))
-        if input.pressed != 0,
-           input.character != 0,
-           let scalar = UnicodeScalar(input.character) {
-            return .unicode(String(Character(scalar)), modifiers: modifiers)
+        if input.character != 0, UnicodeScalar(input.character) != nil {
+            return .character(input.character, pressed: input.pressed != 0, modifiers: modifiers)
         }
         guard let virtualKeyCode = MacKeyCodeMapper.appKitKeyCode(forProtocolCode: input.key_code) else { return nil }
         return .key(code: virtualKeyCode, pressed: input.pressed != 0, modifiers: modifiers)

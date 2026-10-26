@@ -1293,6 +1293,7 @@ impl ControllerManager {
         }
     }
 
+    #[cfg(test)]
     fn remember_file_queue(
         &self,
         host_device_id: [u8; 16],

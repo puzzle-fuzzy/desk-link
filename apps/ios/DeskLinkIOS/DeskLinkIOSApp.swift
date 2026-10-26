@@ -49,10 +49,11 @@ struct IOSAuthenticatedRootView: View {
                 ProgressView("正在准备 DeskLink…")
             case .signedOut:
                 AccountLoginView(account: account, allowsSkipLogin: true)
-            case .skipped:
-                IOSRootView(account: account, controller: controller)
-            case .signedIn:
-                IOSRootView(account: account, controller: controller)
+            case .skipped, .signedIn, .offline:
+                VStack(spacing: 0) {
+                    AccountRecoveryNotice(account: account)
+                    IOSRootView(account: account, controller: controller)
+                }
             }
         }
         .task { await account.restore() }

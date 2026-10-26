@@ -100,6 +100,9 @@
 - **方案：** 错误事件携带稳定 code、可恢复性和状态；恢复期更新状态及提示，认证拒绝、明确失效或用户断开才销毁句柄。错误文字不再承担状态判断。
 - **验收：** 注入 Reconnecting → 可恢复 Error → 新 VideoConfig → Frame，句柄保持有效且恢复画面；终态认证错误才关闭；macOS → Windows 切 Wi-Fi、relay 重启再做真机回归。
 
+- [x] 代码与 Rust 自动回归：Error 携带稳定 error_code/recoverable；Swift 恢复告警仅更新提示，Connected 清告警，终态仍销毁。`python scripts/run-windows-cargo.py test -p desklink-ffi --lib --locked`：13 通过。修复提交 `30a902a`（主题 `fix(DL2-003): preserve Apple runtime during recoverable errors`）。
+- [ ] macOS Wi-Fi/relay 重启与 VideoConfig→Frame 恢复验收；已补 Swift 生命周期回归，本 Windows 环境未执行。
+
 ### DL2-004 · P1 · 已连接发送背压时仍能及时取消和退出
 
 - [ ] 为发送、关闭及 FFI teardown 建立可取消、有截止时间的异步生命周期。
@@ -108,9 +111,16 @@
 - **方案：** 发送本身参与 cancellation/deadline；关闭 transport 唤醒等待者；将阻塞 join 移出 UI 线程，以停止完成事件管理 callback context 的释放，避免为了快速返回制造回调悬空。
 - **验收：** 本地 peer 建连后停止读流、队列满时取消，UI 仍响应；建议关闭完成预算 ≤2 秒，超时有明确清理结果；随后能重新连接。连接阶段超时用例不能替代此项。
 
+- [x] 发送 await 本身增加 cancellation + 1 秒截止（含 ReleaseAll/关键帧）；Swift 先退役句柄，再后台 destroy/join，回调上下文仅在 join 后释放。Rust 15 单元测试通过（新增已开始且堵塞发送的取消、无取消截止、新会话独立 token）；Python teardown 3、取消 UI 5 项合同通过。提交主题 `fix(DL2-004): cancel blocked sends and retire Apple handles off main thread`。
+- [ ] 实际本地 QUIC peer 停止读取、队列满的 ≤2 秒关闭/重连及真 Mac UI 响应实测；合成有界 channel 不等于真实流控证明。
+
 ### DL2-005 · P1 · 补齐 macOS 字符按键的释放语义
 
 - [ ] 分离物理按键与提交文本，保证按下 / 松开及修饰键状态平衡。
+- [x] 代码与静态合同：物理字符保留原始 scalar / modifiers，repeat 复用按下记录，keyUp 成对发送；flagsChanged 差量同步修饰键，失焦、会话状态变化和销毁清理；提交文本按 scalar 发送 down/up，Mac Host 保留 Unicode pressed 并追踪失败释放。修复主题：`fix(DL2-005): balance Apple physical character and modifier releases`。
+- [x] Windows 自动验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract -v`，6 项静态源码合同通过；`git diff --check` 通过。
+- [x] 后续边界切片：长按期间字符 / chord 变化先释放旧逻辑身份再按下新身份，最终松开匹配新记录；Caps Lock 只响应真实锁定键的 flagsChanged，不因重新取得焦点后的其他修饰键而猜测 / 切换远端状态。当前静态合同 12 项通过，新增相应 Swift 回归尚未在 Mac 运行；主题 `fix(DL2-005): balance repeats across glyph changes and physical caps events`。
+- [ ] macOS 自动 / 真机验收：新增 Swift 状态、repeat、FFI struct 编码、Host Unicode 释放与失败重试回归，但 Windows 无 Swift/AppKit，尚未运行；大写、快捷键、拖动、长按、失焦与快速重连的双机无粘键结果仍待真 Mac。
 - **证据 / 类型：源码缺陷。** `apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift:15-16` 对普通字符只在 keyDown 发 unicode；`apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:248-252` 只发送 pressed=1；Windows `apps/windows/src/input.rs:359-379` 依赖 pressed=false 生成 keyUp 和修饰键释放。
 - **用户影响：** 字符及 Shift/Ctrl/Alt/Meta 组合存在残留按下状态路径，可能要等失焦或断开才整体释放。不能用“文字能显示”证明按键状态完整。
 - **方案：** 物理键记录 press/release/repeat；文本提交使用原子文本语义或完整 down/up；flagsChanged 差量同步修饰键；失焦、权限变化和断开统一 ReleaseAll。
@@ -119,6 +129,9 @@
 ### DL2-006 · P1 · 为 macOS 接入真实本地输入法
 
 - [ ] 接通 AppKit 组合文本、候选、最终提交和文本发送链。
+- [x] 代码接线：生产 InputView 实现 `NSTextInputClient`，`keyDown → interpretKeyEvents → setMarkedText / insertText / doCommand` 接入系统输入上下文；组合文本及 UTF-16 选区留本地，最终提交按文本发送；候选取消、失焦和会话切换丢弃组合，避免透传 Escape / 空格。修复主题：`fix(DL2-006): connect AppKit composition to remote text commits`。
+- [x] Windows 静态验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract -v`，9 项源码合同通过；`git diff --check` 通过。新增 5 项 Swift 输入上下文回调与最终 FFI 编码回归，尚未在 Mac 运行；这些回调合同不代表真实拼音验收。
+- [ ] Mac 自动与真机：拼音、中文标点、选词、中英切换、Emoji、死键、多行和候选取消仍需 Swift/Xcode 与真 Mac；候选坐标目前随最后一次远端点击及视频布局变化，协议尚未提供远端 caret 几何，远端用方向键移动插入点后的精确候选跟随仍未完成。
 - **证据 / 类型：能力缺口。** `apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift:27,66-67,97-105` 是直接读取 event.characters 的 NSView，没有 NSTextInputClient、interpretKeyEvents、insertText 或 marked-text 管理。现有人工传入“中”的 mapper 测试不覆盖真实输入法。
 - **方案：** 使用原生文本承载或实现 NSTextInputClient；组合期间不转发拼音和选词键，提交后有序发送最终文本；候选窗口定位跟随远程输入焦点；与 DL2-005 共用清晰的文本/按键契约。[Apple 文本输入接口](https://developer.apple.com/documentation/appkit/nstextinputclient?language=objc)规定了自定义视图需要接入的组合文本方法。
 - **验收：** 真 Mac 拼音、中文标点、中英切换、退格、回车/空格选词、Emoji、死键及多行输入；取消候选不向远端多发 Escape/空格。
@@ -126,6 +139,9 @@
 ### DL2-007 · P1 · 将 Mac 快捷键映射接入实际输入路径
 
 - [ ] 统一“按本机习惯 / 发送原始按键”的策略与生产调用入口。
+- [x] 代码接线：同一 `KeyboardMappingPolicy` 驱动生产 keyDown、flagsChanged 与 AppKit `performKeyEquivalent`；仅已认证 Windows 的自动模式把 Command 映为 Ctrl，未确认 / Mac / iOS 及原始模式保留 Meta。切换映射或平台时释放旧输入；会话“键盘”菜单可选模式并发送 Alt+Tab、Windows 键和 Win+R 等原始系统组合。修复主题：`fix(DL2-007): route Mac shortcuts through negotiated keyboard policy`。
+- [x] Windows 自动验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract -v`，11 项静态源码合同通过；Apple 取消 / cursor / media / teardown 另外 20 项合同通过；`git diff --check` 通过。新增 Swift 生产 InputView → Bridge → FFI struct 回归，覆盖 C/V/A/Z、原始及未知平台、key equivalent 和切换时释放。
+- [ ] Mac 自动与双机：Windows 无 Swift/AppKit，新增 Swift 测试尚未运行；真实 Mac → Windows 的复制、粘贴、全选、撤销、窗口切换与原始 Win 键仍待验收，不以 helper / 静态合同替代。
 - **证据 / 类型：源码缺陷。** `apps/macos/Sources/DeskLinkApp/Input/InputMapper.swift:45-53` 有 automatic 的 Command→Control，但 `apps/macos/Sources/DeskLinkApp/Input/SessionInputView.swift:97-105` 使用 KeyboardMapper；`apps/macos/Sources/DeskLinkApp/Input/KeyboardMapper.swift:95` 实际把 Command 映为 Meta。remoteModifier 的相关测试只覆盖孤立 helper。
 - **用户影响：** Mac 用户常用 Command+C/V/A/Z 控制 Windows 时，实际可能变成 Win 组合键。
 - **方案：** 根据已协商的远端平台映射，默认符合用户习惯，原始 Win/Command 模式可选择；会话菜单显示必要系统组合键。不要只修测试 helper。
@@ -206,6 +222,8 @@
 ### DL2-013 · P1 · 连接中刷新显示拓扑并稳定识别屏幕
 
 - [ ] 将显示列表、活动屏幕、视频配置和输入坐标作为带版本的拓扑快照。
+- [x] Apple 输入生产侧切片：按实际呈现 context 捕获事件；Mac key / modifiers / mouse-button / IME 与 iOS 键盘 / 手势 / 延迟长按保留原 stream / epoch，keyup、文本整段和合成释放不重新贴当前标签。仅 stream / inputEpoch / runtimeGeneration 的目标屏障取消旧组合与 gesture；纯 configVersion 画质重配保留按键 / IME / gesture 与原始 context，跨目标屏障 repeat 不重建 press；UI 清理同步或按原 context 释放，Mac 输入几何使用已呈现 rect。主题 `fix(DL2-013): retain captured presentation context across Apple input lifetimes`。
+- [x] Windows 可运行验证：`python -m unittest scripts.tests.test_dl2_mac_input_contract scripts.tests.test_dl2_apple_input_capture_contract scripts.tests.test_dl2_mac_session_contract -v`，27 项源码合同通过；新增 Swift 事件模型 / FFI 编码回归覆盖迟到 keyup、旧 modifier、IME 屏障与长按 ticket，但本机无 Swift/AppKit/UIKit，尚未执行，不能代替 Apple 编译或硬件呈现验收。
 - **证据 / 类型：源码缺陷。** `apps/windows/src/runtime.rs:1597-1622` 只在会话建立时枚举；`1414-1417` 保存不可变列表，`2545,2565-2571` 按旧列表校验并回发；`1992-2015` 恢复捕获时未刷新列表。`apps/windows/src/capture.rs:387-390` 的 ID 使用枚举序号。
 - **用户影响：** 扩展屏热插拔、主屏变化后，新屏不可选，序号变更还可能选择到不同输出。
 - **方案：** 监听/检测拓扑变化，用稳定输出身份而非临时索引；活动屏移除时明确回退；旧拓扑下的输入不落入新输出。
@@ -261,6 +279,41 @@
 - **验证：** 6个固定槽位用例+3个真实127.0.0.1 QUIC/Noise回归通过，lib+tests严格Clippy通过。两条竞争路径共用同Noise会话，晚出站被关闭后原入站仍双向传输加密VideoDatagram；关闭旧路径可替换且旧egress不能清新路径；真实connect_shared响应等待时Drop JoinSet后250ms内guard/permit释放、crypto锁可取。未建立实际远控/输入会话；011的双机p95/p99仍单列。
 
 ## 4. 性能与数据通道
+
+- [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
+- [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
+
+- [x] Controller/FFI 输入切片：`ControllerRuntime::send_input_with_context(context: InputContext, event: InputEvent)` 严格校验并序列化原 context；旧无上下文方法保持拒绝。FFI DesklinkInput/Event 贯通 epoch，有界队列、合成 release 按 context 保存；新增 `desklink_release_all_for_context`，旧 epoch 的同名键释放不会清掉新 epoch ledger，空 ledger 回收且最多跟踪 8 个 context。生成 C 头与实际 C/Rust 布局一致。Rust 20 单元+7 ABI+2布局+5 Controller loopback共34项通过。主题 `feat(DL2-013): preserve captured input context across FFI queues and releases`。
+
+- [x] FFI Mac Host 切片：随机种子进程共享非零 epoch 分配器，溢出失败；同 stream/尺寸编码重配保留 epoch，换流/尺寸发布前可靠清键，输入仅匹配已发布 context。旧 context 在时钟/过期检查前丢弃；满队列保留终态清理容量，清键/keyup 无法可靠入队则安全终止。Rust 23 单元 + 14 真实本地 Host loopback 共37项通过，覆盖配置前不注入、旧keyup/过期旧keyup/鼠标丢弃、换几何、饱和与取消。主题 `fix(DL2-013): enforce published input epochs on the FFI host`。
+- [ ] FFI Mac Host 当前只可绑定 stream 与编码尺寸；完整源显示器/捕获拓扑身份和真实 Mac 注入验收仍缺，不能据此整体关闭 013。
+
+- [x] Controller 同 epoch 改编码尺寸视为配置合同错误，拒绝保留可输入的旧几何；同几何画质重配保持 epoch，epoch 身份不按数值排序。新增真实运行 Rust guard 回归；本分支 FFI 全57项与 Clippy all-targets `-D warnings` 通过。主题 `fix(DL2-013): reject geometry changes that reuse an input epoch`。
+
+- [x] Apple 呈现与输入完整代码切片：VideoConfig epoch 绑定解码/呈现令牌；Metal drawable 真正呈现且 presentedTime>0 才启用新输入 surface，迟到回调校验 runtime/stream/config/epoch。Mac/iOS 按键、IME、手势和延迟长按捕获原 context，纯画质重配同 target 不释放；重连在 FFI callback 同步退役旧流，支持新认证会话较小 epoch/stream，旧 callback 不清新 runtime。Python DL2 合同74项通过（其中呈现10、输入捕获9）；Swift模型/事件测试已补但本Windows环境未执行。主题 `fix(DL2-013): bind Apple input lifetimes to actual frame presentation`。
+- [ ] 本分支 Windows Host/前端仍有合同隔离点，待媒体/产品分支接通整合；FFI Mac Host 完整捕获拓扑身份、Swift6编译、真机呈现/输入/跨设备验收仍缺。以上是代码/本地合成证明，不是013整体验收。
+
+- [x] 新认证会话与熵源补充：每个新 Noise 即使 stream/尺寸复用也取得不同随机起点序列中的 context；RNG 使用 try_fill_bytes，错误/零值/MAX 初始化失败均明确拒绝并缓存，无panic/回落1。新增合成熵源边界与真实 relay generation 切换回归；修复夹具无截止等待后新Noise回环0.70s通过，本分支完整FFI 62项通过。主题 `fix(DL2-013): fail closed on epoch entropy errors and verify reconnect identity`。
+
+- [x] FFI Host 发布前也校验同 stream 的尺寸变化必须提高真实 config_version；不在 Rust 层重写 Swift 帧版本。无效旧版本几何配置明确终止并保留清键，Controller原有same-version变化拒绝保持。新增本地回环与几何policy回归各1项通过。主题 `fix(DL2-013): require new frame versions for changed host geometry`。
+
+- [x] 复用产品组有序 input sender：来源 `3ea72dc7f5a66d4cd96c197c0aadb7603cee2436`（其最小前置为bc合同+b473桥接，本分支已有等价9ad）；Runtime与clone共用序号并持input专用锁至可靠写完成，secure锁不跨网络await。此依赖的本分支接入回归将在后续worker切片记录，不能引用来源分支结果冒充当前证明。
+- [x] 共享 sender 接入回归：修正本分支 direct-silence 夹具的共享序号器构造；`python scripts/run-windows-cargo.py test -p desklink-ffi --lib --tests --locked` 实跑 71 项通过，包含 sender/runtime 加密序号与原始 context、直连静默及 C ABI 布局。此项仅证明 sender 接口，worker 并发事件轮询仍待后续切片。
+
+- [x] Host 配置版本跟进：保存完整已发布 VideoConfig；同 stream 任何版本回退在发布前拒绝，同版本的解码配置（含 SPS/PPS、尺寸、epoch、codec/protocol）必须完全一致；幂等重试不重发配置或把后续 delta 误标 CONFIG，新 stream 仍可从 version 1 开始。旧 access unit 不重贴新版本。`test -p desklink-ffi --test host_runtime --locked` 实跑 23 项通过（新增 4 个真实本地回环）；完整配置比较单测从当前编译的测试二进制运行通过。日志位于本机 apple-ffi target/evidence/host-version-*.log；Swift producer 最后投递归属另有后续切片，不能以此项替代。主题 `fix(DL2-013): reject regressed or mutated host decoder configurations`。
+
+- [x] 真实背压夹具所需的传输构造入口：QuicFlowControlLimits 显式限制 send / connection receive / stream receive，非零、最多 512 MiB 且 stream 不超过 connection；默认行为保持原值。client connect 应用限值后统一 keepalive / dead timeout，relay 新 bind_with_transport 保留传入窗口并统一生命周期超时。原来只设置 TLS client/server config 的窗口会被构造器覆盖，不能据此声称制造了背压。`test -p desklink-transport -p desklink-relay --lib --tests --locked` 实跑 77 项通过；最终端点背压证明见后续 worker 切片。主题 `feat(DL2-013): expose explicit bounded QUIC flow-control tuning`。
+
+- [x] Host 原生生产者归属：每次认证 Noise 的 Connected 固定生成非零、全局随机起点后 checked 推进的 media_generation；Connected 先保留 required event 槽、发布 owner / state，再投递原始令牌，断会话立即退役。scoped config / access-unit / cursor C 入口在入队和所有实际出队阶段校验原 owner，旧 producer 或已入队旧媒体只拒绝 / 丢弃，不关闭后继会话；StaleGeneration=5，事件尾字段与双头、C ABI 布局同步。Rust legacy 同步媒体入队也保留当时 owner，异步 producer 必须使用 scoped 入口。Host runtime 26 项、Host ABI 5 项、双头与全部 public struct 布局 2 项通过；另实际首连→换 Noise→审批 / 协商 / Connected 注入旧队列的 lib 回环及不可改写 Connected callback 快照通过。完整 source display / topology 仍未覆盖。主题 `fix(DL2-013): bind host media producers to their authenticated Noise session`。
+
+- [x] Controller worker 并发：clone sender 的 owned future 与持久栈 pin next_event 同时轮询，命令 / send 完成不会重建已取可靠消息且等待 crypto 的 reader；输入保持原 context，epoch 只过滤未首次 poll 的发送 / 未出队旧输入，已开始可靠写不截帧。ReleaseAll 有界 1024，溢出 fail-closed；取消独立于满队列，结果分支再检查用户取消，避免错误重连。Control 专用锁保证 seal / write 顺序，secure 锁不跨网络；包括自动关键帧 / Direct 回答在内的控制发送共用一秒预算，截止关闭原会话。6 项并发回归实跑通过（4 项真实 QUIC / Noise，2 项边界策略）：真实双跳背压时配置 / 帧继续、旧输入过滤且原在途帧完整、长 release 仍收媒体且取消有界、已 dequeue 可靠消息不丢、控制背压截止与连接关闭。测试端点使用明确 2 KiB flight 窗口，不靠无效 TLS config 参数或 mock 背压。主题 `fix(DL2-013): keep receiving media while ordered input writes are pending`。
+
+- [x] Mac Host 最后投递归属：每 capture attempt 独立 source / encoder，所有配置 / 帧 / 错误闭包绑定 immutable runtime / connection receipt / native media_generation / stream；native callback 同步退役 gate，主线程 receipt 校验后最终 scoped C admission。失败 / 取消的 stream 号不复用；新 start 等旧 start / stop cleanup barrier，旧 catch / stop 不能影响后继 encoder。捕获错误只退役自身并保留可重试告警，旧错误不全局停止新 Noise。新增 8 项 portable 合同通过；10 个合成 Swift 生命周期 / 调度用例未运行，不能代替实际 ScreenCaptureKit / VideoToolbox / 权限 / GPU 验收。主题 `fix(DL2-013): retire captured host resources before a successor can start`。
+- [x] 本地组合门禁：`test -p desklink-ffi --lib --tests --locked` 实跑 88 passed / 0 failed / 0 ignored；`python -m unittest discover -s scripts/tests -p "test_*.py"` 实跑 201 passed；双 C 头生成检查、fmt / diff 检查通过。日志在 `E:/desk-link/.worktrees/dl2-targets/apple-ffi/evidence/`，最终不可变 HEAD 与日志哈希由交接证据绑定。Windows 本分支 producer 的 epoch=0 隔离占位仍待整合 Windows 联合快照；不能将 FFI 套通过宣称整包可交付。
+
+- [x] P2 排队输入的最终注入 admission 跟进（独立于冻结 f954）：修复旧 A.input 已排 MainActor、native 已观察 Connecting / B Connected、Swift state 尚显示 connected 时旧点击仍被注入的缺口。HostEvent 保留原 fixed Noise media_generation 与完整 InputEnvelope；C callback 传原 grant、stream_id、input_epoch，双头与 ABI 尾字段同步，不从 current 重新贴标签。native input 入队时固定连接 receipt / capture owner / 原 context，最后注入必须同时满足 captureRunning、当前 capture / runtime 身份及同一 native admission，检查和本地同步 backend 调用共享短 gate 临界区。ReleaseAll 与用户取消保持清理语义；不持 crypto / 网络锁跨注入。主题 `fix(DL2-013): preserve native host input admission until final injection`。
+- [x] 本条 Windows 实跑：FFI lib/tests 91 passed（新增 2 个真实 QUIC / Noise input 归属回环、1 个实际 C callback 快照；含全部 C struct sizeof / align / offset）；Python 全套 208 passed（新增 7 个输入 admission 源码合同）；workspace all-targets check、严格 FFI all-targets Clippy、双头生成、fmt / diff 检查通过。证据在 `E:/desk-link/.worktrees/dl2-targets/apple-ffi/evidence/host-input-admission/`。
+- [ ] 本条 Apple 行为验收：新增 6 个不调用真实系统注入的 Swift recording backend / native callback 调度用例，覆盖两个 UI 滞后交错、合法 B 输入、原 owner/context 不重贴、退役 capture、release / stop；Windows 无 Swift/Xcode，尚未编译或执行。真实 Mac 输入与权限验收、未来同 stream 完整源拓扑 / epoch 的权威映射仍不在本条已证范围，不整体关闭 013。
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
@@ -321,6 +374,11 @@
 ### DL2-018 · P1 · 为 Apple 编码帧输入增加有界解码调度
 
 - [ ] 将逐帧转换/解码提交移出主线程，并约束解码前的积压。
+  - [x] 源码实施：FFI callback 复制前限制 header 64 KiB / frame 8 MiB，直接送专用串行解码调度，不再逐帧排 main closure；默认待解码队列最多 6 帧 / 8 MiB / 250 ms，另允许 1 帧原生在途。拥塞/过期清除完整待解码依赖链并等待 IDR，按 generation / stream / config 隔离迟到输出。
+  - [x] 输出与转换：UI mailbox 合并最新 pixelBuffer / 配置 / 关键帧请求，主线程再次校验代数和配置；早于 Connected 通知到达的配置、帧和恢复请求各保留最新 1 项并在状态建立后重放，不依赖两种调度机制的 FIFO；Annex B 用原 Data range 扫描，AVCC 一次构建。仍保留 FFI 所有权复制和 CMBlockBuffer 拷贝，未宣称零拷贝或实测性能收益。
+  - [x] 自动验证：`python -m unittest discover -s scripts/tests -p test_dl2_apple_media_contract.py -v` 共 9 项静态合同通过（本项 7、043 2）；生产 callback 入口、复制前上限、队列预算、IDR 恢复、串行原生提交和迟到输出保护均入检查；新增 Swift 真实调度器的拥塞/字节/年龄/代数/重配用例及 Annex B 边界用例。
+  - [ ] Windows 无 Swift/Xcode，Swift 编译及 XCTest 未执行；仍需 Mac/iOS 阻塞主线程、VideoToolbox/GPU 解码、长稳和 CPU/GPU/内存/分配/copy bytes/解码渲染耗时实测，主项保持未完成。
+  - 提交主题：`perf(DL2-018): bound Apple encoded ingress before main actor decoding`。
 - **证据 / 类型：性能结构。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:569-589` 每个 FFI 事件复制 Data 并 DispatchQueue.main.async，`442-450` 在主线程提交解码；`apps/apple/Sources/DeskLinkAppleCore/H264AnnexB.swift:26-45,80-81` 多次数组/Data 构建，`apps/apple/Sources/DeskLinkAppleCore/H264Decoder.swift:214-220` 再复制到 CMBlockBuffer。
 - **现有保护：** `apps/apple/Sources/DeskLinkAppleCore/H264Decoder.swift:17-57` 已合并解码后的输出；本项针对它之前的队列和转换，不能重复报告输出无限缓存。
 - **方案：** 专用串行解码队列、按字节/数量/年龄限制输入；保持配置、关键帧和 delta 依赖，必要时请求关键帧；NAL 用 range/slice 一次构建，UI 只发布最新 pixelBuffer 和低频指标。
@@ -416,17 +474,31 @@
 - **方案：** 为所有命令、事件、结果、错误及 capability 建立唯一契约来源，生成/校验 C 与 Swift 声明；事件携带代数、版本、可恢复性。通过有界 worker 命令暴露现有 runtime 能力。
 - **验收：** 每个公开枚举、struct 布局、长度/所有权与命令均有 ABI 测试；新增事件不能无声落入 Swift default。此项是 DL2-026、027 和多个输入修复的共同前置。
 
+- [x] ABI 基础切片：Rust 公开枚举/struct/extern 签名生成两份字节一致 C 头；新增有界显示器/音频/画质/profile 命令及 transfer 消息入口，统一取消截止；认证能力事件含远端平台/尺寸/profile，Swift 显式接收 Control/Transfer/Audio/Capabilities。Rust 16 单元 + 2 ABI 布局回归通过（MSVC 实际编译所有公开 struct 的 sizeof/align/offset，与 Rust 对照）；Python 4 合同、生成检查通过。主题 `feat(DL2-025): generate ABI headers and expose bounded session commands`。
+- [ ] 其余 typed Swift 事件/能力消费及每种命令端到端回执；当前最新消息暂存不等于音频播放或文件工作流，事件所有权由生成头明确为仅回调期间借用。Swift/Xcode 目标布局与端到端调用尚待 Apple 环境。
+
+- [x] 契约同步补充：复用产品组协议 13 独立提交 `9979c6424cf99f704feb212c7700833fce466dae`（本分支 cherry-pick `da44ff2`），生成 C/Swift 版本常量并对齐光标 fixture；修正生成 C uint32_t 的 Swift 参数类型、显式测试 C 模块依赖；已知 Host Transfer 不再落入终态错误。Python FFI 6 + 光标 6 合同、Rust 光标 fixture/InputState/版本边界 5 项通过。主题 `fix(DL2-025): align generated Swift and protocol 13 contracts`。
+
+- [x] FFI 直连发送与入站探测改用已提交共享锁接口，网络 await 不再持加密锁。复用媒体组 `3277c2a41af0ac923e1daa1c5cab5d952b355b9b`，本分支依赖提交 `3b4923f`（排除与基线无关的 DL2-010 纯格式冲突片段）。Rust FFI 全套 48、transport shared 探测 2 项通过，FFI all-targets Clippy `-D warnings` 通过；Python 全部 155 项通过。主题 `fix(DL2-025): reuse cancellable shared-crypto direct probes`。
+
 ### DL2-026 · P1 · 补齐 macOS → Windows 的会话功能闭环
 
 - [ ] 将已有底层功能真正接到 AppleCore 与 macOS 会话界面。
+- [x] 首个代码切片：严格、有界的 Control 状态解析接入显示器 / 当前屏、画质偏好 / 实际 preset、音频可用状态及可恢复输入受限；Mac 会话菜单通过真实有界 FFI 命令发送切屏和画质请求，仅在 capabilities + connected 时启用。排队成功只显示等待，远端回执才确认；不匹配 / 5 秒无回执可重试，输入恢复后清除受限提示。主题 `feat(DL2-026): connect Mac display and quality controls to remote acknowledgements`。
+- [x] Windows 静态与 wire oracle：`python -m unittest scripts.tests.test_dl2_mac_session_contract -v` 6 项通过；新增 Swift 解码、回执 / 拒绝 / 超时状态回归及跨语言 Rust postcard fixture，Swift/AppKit 尚未运行，Rust fixture 由本组统一验证后记录。
+- [ ] 其余闭环与真机：适应 / 1:1 / 会话全屏的统一视频与输入几何、音频实际播放 / 静音 / 音量、双向剪贴板、双向文件流程及所有 Mac → Windows 交互 / 恢复仍待完成；typed 音频状态不是音频播放，菜单源码和合成回执不是双机结果。
 - **证据 / 类型：能力缺口。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:336-350` 只消费 state/error/video/cursor，Control/Audio/Transfer 落入 default；`apps/macos/Sources/DeskLinkApp/Views/SessionView.swift:56-84` 缺少相应会话操作。Rust 有方法不能代表 Mac 用户已可使用。
 - **分项交付：** 多屏列表/切换；会话内适应/1:1/全屏操作与清晰度；音频播放/静音/音量及失败恢复；纯文本剪贴板双向操作；文件双向选择、确认、进度、取消、重试与断点恢复。macOS 原生窗口全屏已有系统入口，本项不把它说成完全无法全屏。
 - **方案：** capability 驱动操作可用性；每项提供等待、成功、拒绝、失败和下一步，不支持时准确说明；布局沿用平台原生习惯，控件命名与 Windows 保持任务语义一致。
 - **验收：** Mac → Windows 每个分项都完成真实用户动作和错误恢复；接收文件仍经被控端授权，换设备不能恢复到错误目标；与 DL2-025、029～032 联合验证。
 
+- [x] Bridge 实际消费 DisplayList/VideoQualityState/AudioState/InputState，重复同值回执仍推进 revision；输入受限与恢复独立于会话终态，新能力/断开清空。Rust 真实 codec→Swift 六组 fixture 回归 1 项通过；Python 会话合同 6 项通过。主题 `feat(DL2-026): connect Mac display and quality controls to remote acknowledgements`。
+
 ### DL2-027 · P1 · 在 Apple 会话呈现远端独立光标
 
 - [ ] 解码并绘制形状、热点、位置和可见性，不依赖视频中烘焙光标。
+- [x] 位置切片：严格解码真实 postcard CursorUpdate，按 stream/sequence 隔离迟到与乱序；Mac/iOS 在实际视频几何（含 iOS zoom/pan）上独立绘制中性位置圆环并响应隐藏。连接恢复/关闭隔离旧位置，视频冻结或关键帧恢复期间仍消费当前会话位置。Metal 仅帧身份、几何或布局尺寸变化时请求重绘。`python -m unittest discover -s scripts/tests -p test_dl2_apple_cursor_contract.py -v`：6 项通过；`python scripts/run-windows-cargo.py test -p desklink-protocol --test apple_cursor_contract --locked`：1 项通过，生产 Rust codec 校验 Swift 的可见/隐藏/边界字节 fixture。提交主题：`fix(DL2-027): render isolated Apple cursor position updates`。
+- [ ] 完整形状/hotspot/cache 尚缺上游数据：协议 v12 仅发送 opaque shape_id，Windows 当前值来自 hCursor，未传 BGRA、尺寸或热点，不把该句柄推断为远端形状。需扩展上游生产契约；本切片圆环只表达位置。Swift/Xcode、真实 I-beam/resize/忙碌/隐藏及不同 DPI/缩放四角验收仍待运行，尚无性能实测。
 - **证据 / 类型：能力缺口。** `apps/apple/Sources/DeskLinkAppleCore/ControllerBridge.swift:346-348` 已写 cursorOverlay；`apps/apple/Sources/DeskLinkAppleCore/DeskLinkEvents.swift:202-209` 保存 encodedUpdate；macOS `apps/macos/Sources/DeskLinkApp/Views/SessionView.swift:18-22` 只有视频和输入层，Apple 展示路径没有消费此 overlay。
 - **方案：** 独立低延迟光标层、shape cache、统一视频几何与 DPI 映射；处理隐藏、切屏和缩放后的热点。
 - **验收：** 文本 I-beam、resize、忙碌、隐藏光标与四角热点在不同 DPI/缩放模式正确；仅光标变化不强制整帧重绘。
@@ -439,9 +511,14 @@
 - **方案：** 稳定设备 ID、公钥、可编辑别名、授权类型/过期、上次连接、连接材料分别建模；固定访问重新解析目录并核对身份；临时授权失效明确要求重新连接。
 - **验收：** 同一 relay 的多台电脑清楚可辨；固定主机重启/session 重建可恢复，临时密码刷新/过期与撤销不得盲目循环；设备身份改变需重新确认。
 
+- [x] 保存/重连代码切片：FFI 与 Keychain 保留明确授权类型、expiry、目录 ID/访问码；目录重查必须匹配已批准公钥，认证成功才发布材料。临时过期与未知旧记录不升级永久；明确持久授权退避预算耗尽后仍可取消地等待。列表支持身份名称/本机别名，刷新保留 UUID/别名并更新材料。Rust `desklink-ffi --lib --tests --locked` 47 项通过（含 C/Rust 实际布局、身份 pin、授权边界与持久等待取消）；Python SavedHost 合同 7 项通过。主题 `fix(DL2-028): persist authorization and pin saved host reconnects`。
+- [ ] Mac Keychain 与真实固定主机重启/session 重建、临时刷新/撤销及身份变化确认验收；Swift 测试已补但本 Windows 环境未执行。
+
 ### DL2-029 · P1 · macOS 连接和等待批准期间提供取消
 
 - [ ] 统一连接进度页，所有非终态等待均可取消或更换目标。
+- [x] 代码与静态合同：Mac 连接表单的连接/审批等待区提供直接取消和 Escape，保留设备 ID/密码；会话恢复期提供直接取消。iOS 等待区明确取消动作并阻止重复提交/扫描。取消复用 generation 隔离的 `disconnect()`。`python -m unittest discover -s scripts/tests -p test_dl2_apple_cancel_contract.py -v`：5 项通过；`git diff --check` 通过。提交主题：`fix(DL2-029): expose cancellation throughout Apple connection waits`。
+- [ ] Mac/iOS 编译与真实逐阶段取消、取消后更换目标、迟到批准/错误/视频不复活验收；本 Windows 环境无法运行 SwiftUI/Xcode。DL2-004 的异步停止与 ≤2 秒主线程响应实测仍是依赖，不以静态合同代替。
 - **证据 / 类型：能力缺口。** `apps/macos/Sources/DeskLinkApp/Views/ConnectView.swift:63-71` 及 `apps/macos/Sources/DeskLinkApp/Views/ControllerHomeView.swift:108-119` busy 时只禁用连接；`apps/macos/Sources/DeskLinkApp/DeskLinkApp.swift:118-121` connecting/pairing 尚未进入有断开按钮的会话页；`crates/desklink-ffi/src/controller.rs:44-47` 握手可等待 150 秒，等待批准/能力协商可等待 120 秒。
 - **方案：** 展示查找、建立连接、等待批准、恢复等状态，始终提供取消；保留可重试的用户输入；generation 隔离迟到批准、错误及视频。
 - **验收：** 每个阶段立即取消，再连另一台设备，旧结果不复活；取消本身满足 DL2-004 的时间和主线程响应预算。
@@ -577,6 +654,10 @@
 ### DL2-043 · P3 · 被控 Mac 的能力协商与实际编码一致
 
 - [ ] 在扩展 Windows→Mac / Mac→Mac 前，统一声明能力和真正的捕获编码参数。
+  - [x] 安全切片：捕获默认上限统一为 FFI 已声明的 1920×1080，VideoToolbox 请求 Main；启动拒绝超限尺寸，输出在发布配置/帧前校验 SPS profile_idc=77，且 VideoToolbox 实际格式尺寸必须等于当前配置尺寸；后端意外产出 High 或尺寸不符时明确失败而不发送未声明码流。
+  - [x] 自动验证：`python -m unittest discover -s scripts/tests -p test_dl2_apple_media_contract.py -v` 2 项跨 Swift/FFI 静态合同通过；新增 Swift Main 输出、High 拒绝及捕获尺寸用例，但本机无 Swift/Xcode，未执行 Swift。
+  - [ ] 仍需接通控制端 profile/尺寸约束到实际后端的动态协商，验证 High 支持端、Main-only 端、编码器降级、切屏/分辨率变化及真实 Mac；当前安全切片未宣称完整协商或硬件验收完成。
+  - 提交主题：`fix(DL2-043): constrain Mac capture and encoding to declared Main capability`；验证记录及换行归一在后续 `fix(DL2-043): record verified safety slice and normalize sources` 提交。
 - **证据 / 类型：源码契约缺陷。** `crates/desklink-ffi/src/host_worker.rs:741-748` 声明 Main/1920×1080；`apps/macos/Sources/DeskLinkApp/Capture/MacH264Encoder.swift:355-362` 实际配置 High，`apps/macos/Sources/DeskLinkApp/Capture/ScreenCaptureSource.swift:87-105` 默认捕获上限为 2560×1440。
 - **方案：** 根据实际 VideoToolbox 后端能力构建协商结果，确保每次重配的 profile、尺寸和配置版本一致；不向对端发送其没有声明支持的码流。
 - **验收：** Main-only 控制端、High 支持端、编码器失败降级、切屏/分辨率变化分别验证；真实 Mac 系统权限、签名/公证和无人值守边界另记。此项不阻塞已经跑通的 Mac→Windows。
@@ -619,6 +700,54 @@
 - 最终状态：代码完成 / 自动验证完成 / 真机完成，分别勾选。
 
 不得为了减少本清单数量，把未验证条目直接标成已完成。
+
+## Apple/FFI 追加复核
+
+### DL2-051 · P2 · Mac 账号 restore 遇瞬时网络故障即删除钥匙串会话
+
+- [ ] 区分令牌失效与网络/服务不可达，只有前者清除本地会话。
+- **证据 / 类型：源码缺陷。** `apps/apple/Sources/DeskLinkAppleCore/AccountClient.swift:127-132` restore 中 me 请求失败后尝试 refresh，refresh 再失败落入外层 catch 执行 `clearLocalSession()`（删除 Keychain token 并置 signedOut）。启动时无网或账号服务瞬时不可达即被永久登出。Windows 侧 `apps/windows-ui/src-tauri/src/account.rs:80-127` 失败仅返回 Err 并保留存储会话，两端行为不一致。
+- **方案：** 网络类错误保留会话进入"离线、稍后重试"；仅明确的令牌无效/被撤销才清除；与 DL2-035 的迟到响应隔离一起设计。
+- **验收：** 断网启动、服务 5xx、refresh token 过期三种场景行为各自正确；恢复网络后自动或一键恢复登录。
+
+- [x] 代码与离线入口：HTTP status + 稳定 error code 分类；仅 `/me` 的明确令牌错误触发 refresh，仅 refresh 明确 `401 / token_invalid` 清除会话。网络、服务、429、解码、取消及 Keychain 故障保留凭据并进入离线可重试状态；Mac/iOS 本机工作区继续可用。single-flight 与 session generation 隔离迟到恢复 / 刷新 / 登出；旋转令牌落盘失败先保留内存新令牌，避免重试旧 refresh。主题 `fix(DL2-051): preserve Apple account sessions across transient restore failures`。
+- [x] Windows 静态验证：`python -m unittest scripts.tests.test_dl2_apple_account_restore_contract -v`，8 项协议与源码合同通过；`git diff --check` 通过。新增 Swift mock transport + Keychain spy 行为用例覆盖断网、5xx、429、明确失效、重试、并发恢复、迟到响应、取消和持久化错误，全为合成数据且不访问真实服务 / 系统 Keychain。
+- [ ] Apple 自动 / 真机：Windows 无 Swift/AppKit/UIKit，新增行为用例尚未运行；断网启动、真实 Keychain 锁定 / 恢复、账号服务恢复后一键重试及明确失效后的重新登录仍需 Mac/iOS 验收，不能以源码合同代替。
+
+- [x] 取消与 refresh 旋转跟进：只允许已完整收到的 refresh 2xx 在取消后继续验证；按 session generation 检查并先保留新令牌到内存及 Keychain，再表现取消。Keychain 失败仍保留内存新 pair 供重试，旧 generation 的响应不能覆盖新登录或复活已登出会话。`python -m unittest scripts.tests.test_dl2_apple_account_restore_contract -v` 实跑 10 项通过；新增 3 个 Swift 方法（取消成功响应含写成功 / 失败两分支），总 17 个行为测试仍未运行。主题 `fix(DL2-051): checkpoint rotated refresh tokens before honoring cancellation`。
+
+### DL2-059 · P2 · Mac Host 把未知事件当致命错误，Transfer 流量会拆掉主机会话
+
+- [ ] 未知事件 kind 显式忽略并计数，错误只能由显式 error 事件表达。
+- **证据 / 类型：源码缺陷（ABI 漂移的运行时后果）。** `apps/macos/Sources/DeskLinkApp/Bridge/HostBridge.swift:592` `hostCallbackKind` 的 `default: .error`；而 Rust 侧会发出两份手工头文件都没有的 kind：`crates/desklink-ffi/src/host_worker.rs:847` 收到控制器 Transfer 数据报时发出非终态 `HostEvent::Transfer`，`crates/desklink-ffi/src/lib.rs:416` 映射为 `DesklinkHostEventKind::Transfer`。HostBridge 把 error 转为 publishError（`332-333`），随后 `513-518` 置 `.failed` 并 stop()。
+- **用户影响：** Windows 控制端向 Mac 主机发送剪贴板/文件消息（SecureLane::Transfer）时，整个 macOS 主机会话被误判为错误并拆除。
+- **方案：** 依赖 DL2-025 的统一 ABI 契约：Swift 对未知 kind 记诊断并忽略；不得用 default 兜底成错误。
+- **验收：** 用超出当前头文件的 kind 注入事件，Mac 会话保持；Transfer 消息进入正常确认流程而不是 failed。
+
+- [x] 当前分支复核：致命误分类已由 `39c17ad4255e0c19f9b86a7a3d10fbcca3e7abbe` 修复并由生成 ABI 保持 Transfer=8；本次补未知 kind 固定计数，仅明确 error 才读错误文本，unknown不解析数据/metrics或拆会话。新增共享mapper的未知kind/极大无关字段/Transfer Swift回归（未执行），Windows 2项跨语言合同通过。主题 `fix(DL2-059): count unknown host events without interpreting their payload`。
+- [ ] Swift/macOS事件注入验收未执行；当前Transfer仅显示不支持提示，正常文件/剪贴板确认流程属于026待补，不能将整项勾完。旧证据描述的是025前状态，本分支已无default:error。
+
+### DL2-061 · P3 · FFI 控制端直连静默超时被 relay 事件反复重置
+
+- [ ] 静默判定基于"上次 direct 数据报到达时间"，而不是每次轮询新建计时器。
+- **证据 / 类型：源码缺陷。** `crates/desklink-ffi/src/controller.rs:758-778` 每次进入 `next_transport_event` 都新建 5 秒 sleep；select 的 relay 分支返回任意事件（包括 host 持续经 relay 发送的光标数据报，`host_worker.rs:963-969`）后回到循环重建计时器——direct 路径被防火墙黑洞时（正是该超时要防的场景）静默判定可能永不触发，控制端停留在黑屏 direct 路径不回退。Windows 原生控制端的第一阶段实现按"5 秒静默回落并记录 datagramSilence"正确处理，本项仅涉及 FFI/Apple 路径。
+- **方案：** 记录 last_direct_datagram 时刻并在循环中比较 elapsed；relay 事件不重置该计时。
+- **验收：** 注入"direct 黑洞 + relay 光标持续到达"场景，5 秒内回退 relay；正常 direct 流量不误判。
+
+- [x] 持久 direct 接收时间/绝对截止；只有 direct 收包刷新，relay事件或取消轮询不刷新。真实localhost relay QUIC + Noise认证direct探测：旧实现黑洞/relaycursor红测超5.75s；修后黑洞与持续6s direct双回归均通过（生产5s预算，750ms测试调度容差），并已跑本分支FFI完整62项通过。主题 `fix(DL2-061): keep direct silence deadlines across relay events`。
+- [ ] 真双机/防火墙与Mac/iOS生产direct启用验收未执行。现源码仅Platform::Windows创建direct_session；这是FFI共用启用路径证明，不能称当前Mac实机缺陷或H264显示/性能证明。
+
+### DL2-060 · P2 · FFI Host 输入新鲜度用本机墙钟，时钟偏差直接终态关闭
+
+- [ ] 建立会话级时钟偏移，或把超窗输入降级为丢弃并告警。
+- **证据 / 类型：源码缺陷。** `crates/desklink-ffi/src/host_worker.rs:840` 用 `decode_input(&plaintext, now_micros())` 做墙钟校验（5 秒 age / 1 秒 future skew），而 `crates/desklink-protocol/src/codec.rs:287-299` 专门提供了不做墙钟比较的 `decode_session_input`，注释明确说明两台机器的时钟不保证同步。控制端时间戳来自其自身 `now_micros()`（`crates/desklink-ffi/src/controller.rs:315`）。超窗时第一条输入即 `TimestampOutsideWindow` → `HostError::Protocol`，`is_retryable_host_error`（`host_worker.rs:517-519`）只放行 Transport 类错误，会话进入终态 Closed 且不重连。
+- **用户影响：** 控制端机器时钟偏差超出窗口（新装机、虚拟机、双系统切换后常见）时，连接成功但第一次键鼠操作就断线，且表现为不可重试的协议错误。
+- **方案：** 握手互换时间戳建立 per-session 偏移，用 `decode_session_input` 加偏移校验；或降级为丢弃单条输入并发可恢复告警。Windows 原生 host 侧一并核对是否存在同类用法。
+- **验收：** 人为偏移控制端时钟 ±10 分钟，会话保持且输入可用（或明确提示校时）；不出现终态协议错误。
+
+- [x] FFI Host 会话输入策略：每个认证 Noise 会话独立校准 controller / host 墙钟；目标切换重新校准，纯画质重配保留锚点，严格递增序号门槛在同一会话中保持。先丢弃未发布 / 旧 context，再处理时钟及序号，避免旧目标的极值污染后继；时钟跳变重新校准最新认证输入，不再终态关闭；序号耗尽必须新建 Noise 会话。主题 `fix(DL2-060): calibrate host input clocks per authenticated session`。
+- [x] Windows 实跑：4 项纯策略测试和 3 项真实 QUIC / Noise 本地回环覆盖正负 10 分钟、双端时钟跳变、重复序号、旧 context 极值、u64 边界；整套 `python scripts/run-windows-cargo.py test -p desklink-ffi --lib --tests --locked` 共 71 项通过。
+- [ ] Apple 真机：Mac Host 与真实 Windows / iOS controller 的时钟偏差、系统校时及输入恢复仍需设备验收；本地回环不代表系统事件注入或硬件证明。
 
 ## 10. 第一阶段历史记录
 
