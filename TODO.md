@@ -342,6 +342,13 @@
 - **方案：** 同一已认证路径承载独立优先级的输入、控制、音频和文件，并支持逐通道切换、回退和去重；完善局域网发现/本地配对与 relay 不可达时的行为。公网打洞作为独立实验，不把“换 WebRTC”本身当性能结论。
 - **验收：** 同网输入延迟符合实际 LAN 路径；断开公网后按定义保持本地连接；切换不重放按键、不串会话、不中断授权。公网方案另测不同 NAT/IPv6/UDP 限制与回退时间。
 
+### DL2-050 · P3 · FrameAssembler 重复分片先覆盖后判重
+
+- [x] 重复分片保留首次内容并丢弃后续。
+- **证据 / 类型：源码缺陷。** 审查基线 `crates/desklink-video/src/packet.rs:182-188` 的chunks.insert先替换旧值再返回DuplicateChunk，内容不一致重传可污染组帧；CodeGraph定位后以本分支实际源码确认。
+- **修复（`fix(DL2-050): preserve first payload when video chunks repeat`）：** BTreeMap entry已占用时拒绝新payload并饱和增加dropped_chunks，未占用才插入；重复不延长原分片期限。
+- **验证：** `python scripts/run-windows-cargo.py test -p desklink-video --lib --tests --locked` 6单元+17排序=23通过；同package严格Clippy通过。新增不同payload首内容保留/相同内容重复/1000包洪泛三项，覆盖乱序补片、计数取走复位、单partial与120ms原期限。该条不依赖真实硬件验收。
+
 ## 5. 功能完备与用户流程
 
 ### DL2-025 · P1 · 统一 Rust、C 头文件和 Swift 的能力契约
