@@ -33,6 +33,7 @@ const PHASE_RUNNING: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
 
@@ -450,7 +451,7 @@ async fn run_connected(
     let mut stable = false;
     if let Some(events) = pending_release.take() {
         for event in events {
-            if let Err(error) = controller.send_input(event).await {
+            if let Err(error) = send_cancellable(cancellation, controller.send_input(event)).await {
                 return ConnectedOutcome::Failed {
                     failure: ConnectFailure::from_controller(error),
                     stream_id: controller.active_stream_id().unwrap_or(0),
@@ -467,7 +468,7 @@ async fn run_connected(
                     release_pending.store(0, Ordering::Release);
                     let events = take_release_events(release_events);
                     for event in events {
-                        if let Err(error) = controller.send_input(event).await {
+                        if let Err(error) = send_cancellable(cancellation, controller.send_input(event)).await {
                             return ConnectedOutcome::Failed {
                                 failure: ConnectFailure::from_controller(error),
                                 stream_id: controller.active_stream_id().unwrap_or(0),
@@ -477,7 +478,7 @@ async fn run_connected(
                     }
                 }
                 Some(ControllerCommand::SendInput(event)) => {
-                    if let Err(error) = controller.send_input(event).await {
+                    if let Err(error) = send_cancellable(cancellation, controller.send_input(event)).await {
                         return ConnectedOutcome::Failed {
                             failure: ConnectFailure::from_controller(error),
                             stream_id: controller.active_stream_id().unwrap_or(0),
@@ -486,7 +487,7 @@ async fn run_connected(
                     }
                 }
                 Some(ControllerCommand::RequestKeyframe) => {
-                    if let Err(error) = controller.request_keyframe().await {
+                    if let Err(error) = send_cancellable(cancellation, controller.request_keyframe()).await {
                         if matches!(error, ControllerError::NoActiveStream) {
                             callback.emit_error_with_state(
                                 &error.to_string(),
@@ -540,6 +541,24 @@ async fn run_connected(
     }
 }
 
+/// Cancellation must cover the send itself: the outer event select is not
+/// polled while one of its branches is awaiting QUIC flow-control credit.
+async fn send_cancellable<T>(
+    cancellation: &mut watch::Receiver<bool>,
+    send: impl std::future::Future<Output = Result<T, ControllerError>>,
+) -> Result<T, ControllerError> {
+    if *cancellation.borrow() {
+        return Err(TransportError::Closed.into());
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.changed() => Err(TransportError::Closed.into()),
+        result = tokio::time::timeout(SEND_TIMEOUT, send) => {
+            result.unwrap_or_else(|_| Err(TransportError::Connection("controller send deadline exceeded".into()).into()))
+        }
+    }
+}
+
 struct RetryContext<'a> {
     schedule: &'a mut ReconnectSchedule,
     commands: &'a mut mpsc::Receiver<ControllerCommand>,
@@ -562,6 +581,9 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
     } = context;
     if !failure.retryable {
         callback.emit_error(&failure.message, 0);
+        return false;
+    }
+    if *cancellation.borrow() {
         return false;
     }
     if stable {
@@ -927,6 +949,49 @@ fn resolve_relay(relay_url: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn full_connected_send_is_cancelled_even_with_queued_commands() {
+        // A full channel models an established reliable stream with no credit;
+        // unlike connection-time cancellation this future has already started.
+        let (queue, _peer) = mpsc::channel(1);
+        queue.send(()).await.unwrap();
+        let (cancel, mut cancelled) = watch::channel(false);
+        let send = async {
+            queue.send(()).await.unwrap();
+            Ok::<_, ControllerError>(())
+        };
+        let task = async {
+            tokio::task::yield_now().await;
+            cancel.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(send_cancellable(&mut cancelled, send), task);
+        assert!(matches!(
+            result,
+            Err(ControllerError::Transport(TransportError::Closed))
+        ));
+        // A new session's cancellation token is independent of the old one.
+        let (_new_cancel, mut new_receiver) = watch::channel(false);
+        assert!(
+            send_cancellable(&mut new_receiver, async { Ok::<_, ControllerError>(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_send_has_a_deadline_without_user_cancellation() {
+        let (_sender, mut cancellation) = watch::channel(false);
+        let result = send_cancellable(
+            &mut cancellation,
+            std::future::pending::<Result<(), ControllerError>>(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ControllerError::Transport(TransportError::Connection(_)))
+        ));
+    }
 
     #[test]
     fn recovery_errors_are_structured_and_terminal_errors_are_not_retryable() {

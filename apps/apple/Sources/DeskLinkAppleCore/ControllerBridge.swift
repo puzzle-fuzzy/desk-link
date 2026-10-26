@@ -18,16 +18,28 @@ private final class DeskLinkHandleOwner: @unchecked Sendable {
     var callbackContext: UnsafeMutableRawPointer?
 
     func destroy() {
-        let pointer = self.pointer
+        let retired = RetiredControllerHandle(pointer: self.pointer, callbackContext: self.callbackContext)
         self.pointer = nil
-        if let pointer { desklink_destroy(pointer) }
-        if let callbackContext {
-            self.callbackContext = nil
-            Unmanaged<ControllerCallbackContext>.fromOpaque(callbackContext).release()
-        }
+        self.callbackContext = nil
+        guard retired.pointer != nil || retired.callbackContext != nil else { return }
+        DispatchQueue.global(qos: .userInitiated).async { retired.finish() }
     }
 
     deinit { destroy() }
+}
+
+/// The callback context stays retained until Rust has joined its worker. The
+/// old generation is retired by the bridge before this cleanup is scheduled.
+private struct RetiredControllerHandle: @unchecked Sendable {
+    let pointer: OpaquePointer?
+    let callbackContext: UnsafeMutableRawPointer?
+
+    func finish() {
+        if let pointer { desklink_destroy(pointer) }
+        if let callbackContext {
+            Unmanaged<ControllerCallbackContext>.fromOpaque(callbackContext).release()
+        }
+    }
 }
 
 @MainActor
@@ -278,7 +290,6 @@ public final class ControllerBridge: ObservableObject {
         suspendedForBackground = true
         callbackGeneration &+= 1
         releaseAll()
-        if let handle = handleOwner.pointer { _ = desklink_reject(handle) }
         handleOwner.destroy()
         resetDisplayedSessionState()
         requestKeyframeAfterNextVideoConfig = false
@@ -307,7 +318,6 @@ public final class ControllerBridge: ObservableObject {
         requestKeyframeAfterNextVideoConfig = false
         callbackGeneration &+= 1
         releaseAll()
-        if let handle = handleOwner.pointer { _ = desklink_reject(handle) }
         handleOwner.destroy()
         resetDisplayedSessionState()
         awaitingApprovedHostMaterial = false

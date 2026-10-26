@@ -108,6 +108,9 @@
 - **方案：** 发送本身参与 cancellation/deadline；关闭 transport 唤醒等待者；将阻塞 join 移出 UI 线程，以停止完成事件管理 callback context 的释放，避免为了快速返回制造回调悬空。
 - **验收：** 本地 peer 建连后停止读流、队列满时取消，UI 仍响应；建议关闭完成预算 ≤2 秒，超时有明确清理结果；随后能重新连接。连接阶段超时用例不能替代此项。
 
+- [x] 发送 await 本身增加 cancellation + 1 秒截止（含 ReleaseAll/关键帧）；Swift 先退役句柄，再后台 destroy/join，回调上下文仅在 join 后释放。Rust 15 单元测试通过（新增已开始且堵塞发送的取消、无取消截止、新会话独立 token）；Python teardown 3、取消 UI 5 项合同通过。提交主题 `fix(DL2-004): cancel blocked sends and retire Apple handles off main thread`。
+- [ ] 实际本地 QUIC peer 停止读取、队列满的 ≤2 秒关闭/重连及真 Mac UI 响应实测；合成有界 channel 不等于真实流控证明。
+
 ### DL2-005 · P1 · 补齐 macOS 字符按键的释放语义
 
 - [ ] 分离物理按键与提交文本，保证按下 / 松开及修饰键状态平衡。
