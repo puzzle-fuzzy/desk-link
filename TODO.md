@@ -215,6 +215,8 @@
 - [x] **Host严格绑定（`fix(DL2-013): authorize host input with published geometry epochs`）：** 全宽非零随机起点+checked进程共享分配，真实VideoConfig发布；映射锁内先匹配完整context再处理所有事件，旧release不能清除新按键。共享injector统一锁顺序完成旧状态释放/epoch/映射协调，受阻保持暂停重试；纯编码与列表元数据不换epoch。固定32项frame/config→采集context绑定拒绝异步旧输出被贴新epoch，peer退出主动清理。
 - **验证：** `test -p desklink-windows --lib --test runtime_contract --locked` 170库通过/2忽略+11契约通过，lib+tests严格Clippy通过。真实生产pipeline配置编码/解码后取token，记录后端覆盖旧移动/Unicode/release、A→B→A、新Noise/进程相同stream、纯编码保持、旧MFT输出、RNG失败/零值/u64耗尽。规则/复跑见 `docs/windows-host-input-epochs.md`；无真实注入/共享。
 
+- [x] **配置版本边界（`fix(DL2-013): prevent encoder configuration version reuse`）：** 编码器三个配置推进点均在替换后端/设置前checked预留非零后继，u32耗尽返回ConfigVersionExhausted，不wrap或重置1；提供实际config_version读取供Host原子配对校验。encoder 20项通过，边界失败后COM后端/设置/帧计数/pending引用不变，lib严格Clippy通过。
+
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 
 - [ ] 区分监听终态并使禁用原因可观测。

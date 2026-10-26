@@ -146,6 +146,131 @@ mod backend_tests {
     use super::*;
 
     #[test]
+    fn config_versions_reserve_a_strict_nonzero_successor_without_wrap() {
+        assert_eq!(next_config_version(1), Ok(2));
+        assert_eq!(next_config_version(u32::MAX - 1), Ok(u32::MAX));
+        assert_eq!(
+            next_config_version(u32::MAX),
+            Err(EncoderError::ConfigVersionExhausted)
+        );
+        assert_eq!(
+            next_config_version(0),
+            Err(EncoderError::ConfigVersionExhausted)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exhausted_config_version_does_not_mutate_backend_settings_or_pending_references() {
+        let mut encoder = H264Encoder::new_with_settings_and_backend(
+            64,
+            64,
+            H264EncoderSettings::default(),
+            EncoderBackendPreference::SoftwareOnly,
+        )
+        .unwrap();
+        assert_eq!(encoder.config_version(), 1);
+        encoder.config_version = u32::MAX - 1;
+        encoder.rebuild(64, 64).unwrap();
+        assert_eq!(encoder.config_version(), u32::MAX);
+        let backend = encoder.backend.identity();
+        encoder.pending_frames.push_back(PendingFrame {
+            frame_id: 77,
+            config_version: u32::MAX,
+            timestamp_us: 42_000,
+            submitted_at: std::time::Instant::now(),
+        });
+        let reference = *encoder.pending_frames.front().unwrap();
+        let settings = (
+            encoder.dimensions(),
+            encoder.fps,
+            encoder.bitrate(),
+            encoder.max_width,
+            encoder.max_height,
+            encoder.profile(),
+        );
+        assert_eq!(
+            encoder.rebuild(128, 96),
+            Err(EncoderError::ConfigVersionExhausted)
+        );
+        assert_eq!(
+            encoder.reconfigure_for_source(
+                128,
+                96,
+                H264EncoderSettings {
+                    max_width: 128,
+                    max_height: 96,
+                    fps: 60,
+                    bitrate: 1_000_000,
+                    profile: H264Profile::High
+                }
+            ),
+            Err(EncoderError::ConfigVersionExhausted)
+        );
+        assert_eq!(encoder.config_version(), u32::MAX);
+        assert_eq!(
+            (
+                encoder.dimensions(),
+                encoder.fps,
+                encoder.bitrate(),
+                encoder.max_width,
+                encoder.max_height,
+                encoder.profile()
+            ),
+            settings
+        );
+        assert_eq!(encoder.backend.identity(), backend);
+        assert_eq!(encoder.pending_frames.len(), 1);
+        assert_eq!(
+            encoder.pending_frames.front().unwrap().submitted_at,
+            reference.submitted_at
+        );
+        assert_eq!(
+            encoder.pending_frames.front().unwrap().frame_id,
+            reference.frame_id
+        );
+
+        encoder.backend_preference = EncoderBackendPreference::PreferHardware;
+        encoder.backend.inject_hardware_failure();
+        assert_eq!(
+            encoder.encode(
+                CapturedFrame {
+                    width: 64,
+                    height: 64,
+                    timestamp_us: 123_000,
+                    pixels: vec![0; 64 * 64 * 4]
+                },
+                true
+            ),
+            Err(EncoderError::ConfigVersionExhausted)
+        );
+        assert_eq!(encoder.config_version(), u32::MAX);
+        assert_eq!(encoder.backend.identity(), backend);
+        assert_eq!(
+            encoder.backend_preference,
+            EncoderBackendPreference::PreferHardware
+        );
+        assert_eq!(encoder.frame_id, 0);
+        assert_eq!(encoder.pending_frames.len(), 1);
+        assert_eq!(
+            encoder.pending_frames.front().unwrap().frame_id,
+            reference.frame_id
+        );
+
+        encoder.config_version = 0;
+        assert_eq!(
+            encoder.rebuild(64, 64),
+            Err(EncoderError::ConfigVersionExhausted)
+        );
+        assert_eq!(
+            encoder.config_version(),
+            0,
+            "invalid zero must not silently become a reused version1"
+        );
+        assert_eq!(encoder.backend.identity(), backend);
+    }
+
+    #[test]
     fn produced_timestamps_must_match_current_or_pending_input_without_consuming_metadata() {
         let pending = std::collections::VecDeque::from([PendingFrame {
             frame_id: 7,
@@ -494,7 +619,17 @@ pub enum EncoderError {
     FrameTooLarge,
     BackendUnavailable,
     NeedMoreInput,
+    ConfigVersionExhausted,
     Native(String),
+}
+
+fn next_config_version(current: u32) -> Result<u32, EncoderError> {
+    if current == 0 {
+        return Err(EncoderError::ConfigVersionExhausted);
+    }
+    current
+        .checked_add(1)
+        .ok_or(EncoderError::ConfigVersionExhausted)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1031,6 +1166,7 @@ impl H264Encoder {
             let output = match encoded {
                 Ok(output) => output,
                 Err(_) if self.backend.is_hardware() => {
+                    let config_version = next_config_version(self.config_version)?;
                     failed_input_copy_bytes = self.backend.last_input_copy_bytes();
                     let previous = self.backend.info().clone();
                     let (mut replacement, profile) = match native::MediaFoundationEncoder::software(
@@ -1059,7 +1195,7 @@ impl H264Encoder {
                     self.backend = replacement;
                     self.backend_preference = EncoderBackendPreference::SoftwareOnly;
                     self.profile = profile;
-                    self.config_version = self.config_version.wrapping_add(1).max(1);
+                    self.config_version = config_version;
                     self.pending_frames.clear();
                     let output = self.backend.encode(nv12, frame.timestamp_us, true)?;
                     if let Some(output) = &output {
@@ -1139,6 +1275,7 @@ impl H264Encoder {
         {
             return Err(EncoderError::InvalidDimensions);
         }
+        let config_version = next_config_version(self.config_version)?;
         #[cfg(windows)]
         {
             let (backend, profile) = match native::MediaFoundationEncoder::with_preference(
@@ -1170,7 +1307,7 @@ impl H264Encoder {
         }
         self.width = width;
         self.height = height;
-        self.config_version = self.config_version.wrapping_add(1).max(1);
+        self.config_version = config_version;
         Ok(())
     }
 
@@ -1187,6 +1324,7 @@ impl H264Encoder {
             settings.max_width,
             settings.max_height,
         )?;
+        let config_version = next_config_version(self.config_version)?;
         #[cfg(windows)]
         {
             let (backend, profile) = match native::MediaFoundationEncoder::with_preference(
@@ -1222,12 +1360,16 @@ impl H264Encoder {
         self.bitrate = settings.bitrate;
         self.max_width = settings.max_width;
         self.max_height = settings.max_height;
-        self.config_version = self.config_version.wrapping_add(1).max(1);
+        self.config_version = config_version;
         Ok(())
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    pub fn config_version(&self) -> u32 {
+        self.config_version
     }
 
     pub fn profile(&self) -> H264Profile {
@@ -1780,6 +1922,11 @@ mod native {
         #[cfg(test)]
         pub fn inject_hardware_failure(&mut self) {
             self.simulated_hardware_failure = true;
+        }
+
+        #[cfg(test)]
+        pub fn identity(&self) -> usize {
+            self.transform.as_raw() as usize
         }
 
         #[cfg(test)]
