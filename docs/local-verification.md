@@ -114,3 +114,11 @@ ReleaseAll还要回溯 Windows `controller.ts::releaseRemoteInput` 的普通释�
 本工程 `ordered-input-sender.json` 记录干净源码d6f153e、dirty=false：fmt/编译/protocol47通过，独立controller-loopback **6通过、0忽略**。新增真实加密回归收到32并发clone加Runtime共36帧，seq严格1..36、原context保留；零context/旧无context入口不发包也不消耗序号。它证明“不把旧context补成最新值”，不证明host会拒绝旧context或新Noise已分配新epoch。
 
 同次完整 `ffi-runtime` 中lib12、ABI7、platform1、controller6、directory4通过，旧Host **8通过/2失败**；Windows host-runtime-contract **9通过/1失败**，仍为零epoch配置未接通。整体 **failed / passed=false**。选择lib或loopback的通过不能改写完整FFI失败，不能跳过这两个Host测试后宣称全通过；新鲜度、config配对、IPC、Text/粘贴/release生产路径与真实presented继续按上表验收。
+
+### Windows joint证据入口（尚待交付）
+
+产品组已被安排在独立 `codex/dl2-windows-joint` 从产品固定快照 `16594c4f8780cd565afd57695f88e29277ec5939` 整合媒体固定快照 **`89bd1e5161653dd668d290a417bd5f6cc146290a`**。媒体先前快照为 `fb9734499fc560af79b11709aae185eb4ddcc81a`；若joint已整合旧快照，追加89并保留已解冲突，不重置或覆盖原WIP。本工程未操作该joint worktree。
+
+产品源交接路径 `E:/desk-link/.worktrees/dl2-targets/windows-product/evidence/handoff-16594c4.json` 与媒体源分支测试都只证明各自快照，不等于联合通过。当前尚未收到joint最终SHA/报告，因此不据安排、merge完成或源分支各自通过更新041/042为联合通过。
+
+收口须同时取得：joint最终完整SHA及dirty/来源记录、逐问题历史/等价patch去重说明、实际Bun/原生/跨层命令和原始报告，以及上表各epoch/config/IPC/呈现/取消门禁对应的运行结果。失败、忽略与缺设备条件分别保留，不能把选中用例通过扩大成全部通过。FFI Mac Host、Swift/真实Mac presented、实际WebView与双机验收继续单列；Windows joint不能代替这些证据，也不会使本工程旧源码上的失败报告失效。
