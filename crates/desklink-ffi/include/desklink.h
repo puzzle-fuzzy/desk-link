@@ -164,6 +164,9 @@ typedef struct DesklinkEvent {
     uint16_t width;
     uint16_t height;
     DesklinkState state;
+    /* 0 none, 1 reconnecting, 2 video recovery, 3 terminal. */
+    uint32_t error_code;
+    uint8_t recoverable;
 } DesklinkEvent;
 
 typedef void (*DesklinkEventCallback)(void *context, const DesklinkEvent *event);

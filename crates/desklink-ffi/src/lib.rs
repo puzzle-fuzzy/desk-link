@@ -242,6 +242,9 @@ pub struct DesklinkEvent {
     pub width: u16,
     pub height: u16,
     pub state: DesklinkState,
+    /// Stable classification; message bytes are diagnostic text only.
+    pub error_code: u32,
+    pub recoverable: u8,
 }
 
 pub type DesklinkEventCallback = extern "C" fn(*mut c_void, *const DesklinkEvent);
@@ -503,6 +506,12 @@ impl DesklinkRuntime {
             width: meta.width,
             height: meta.height,
             state: self.state(),
+            error_code: if kind == DesklinkEventKind::Error {
+                3
+            } else {
+                0
+            },
+            recoverable: 0,
         };
         callback(self.callback_context, &event);
     }

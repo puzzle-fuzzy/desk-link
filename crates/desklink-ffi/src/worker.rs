@@ -99,6 +99,8 @@ impl CallbackTarget {
             width: meta.width,
             height: meta.height,
             state,
+            error_code: error_metadata(kind, state).0,
+            recoverable: error_metadata(kind, state).1,
         };
         callback(self.context as *mut std::ffi::c_void, &event);
     }
@@ -123,6 +125,18 @@ impl CallbackTarget {
             EventMeta::for_stream(stream_id),
             state,
         );
+    }
+}
+
+// This contract is independent of error message wording and localization.
+fn error_metadata(kind: DesklinkEventKind, state: DesklinkState) -> (u32, u8) {
+    if kind != DesklinkEventKind::Error {
+        return (0, 0);
+    }
+    match state {
+        DesklinkState::Reconnecting => (1, 1),
+        DesklinkState::StartingVideo | DesklinkState::RecoveringVideo => (2, 1),
+        _ => (3, 0),
     }
 }
 
@@ -913,6 +927,26 @@ fn resolve_relay(relay_url: &str) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_errors_are_structured_and_terminal_errors_are_not_retryable() {
+        assert_eq!(
+            error_metadata(DesklinkEventKind::Error, DesklinkState::Reconnecting),
+            (1, 1)
+        );
+        assert_eq!(
+            error_metadata(DesklinkEventKind::Error, DesklinkState::StartingVideo),
+            (2, 1)
+        );
+        assert_eq!(
+            error_metadata(DesklinkEventKind::Error, DesklinkState::Closed),
+            (3, 0)
+        );
+        assert_eq!(
+            error_metadata(DesklinkEventKind::VideoConfig, DesklinkState::Connected),
+            (0, 0)
+        );
+    }
 
     #[test]
     fn retry_classification_keeps_authentication_failures_permanent() {

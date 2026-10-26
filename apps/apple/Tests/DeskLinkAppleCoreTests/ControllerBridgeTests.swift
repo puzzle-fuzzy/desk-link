@@ -4,6 +4,18 @@ import XCTest
 
 @MainActor
 final class ControllerBridgeTests: XCTestCase {
+    func testRecoverableErrorPreservesRuntimeLifecycleAndCanReconnect() {
+        let bridge = ControllerBridge.testing(state: .connected(streamID: 4))
+        bridge.acceptErrorForTesting(stateValue: 10, recoverable: true)
+        XCTAssertEqual(bridge.state, .reconnecting)
+        XCTAssertEqual(bridge.releaseAllCallCountForTesting, 0)
+        bridge.acceptStateForTesting(streamID: 5)
+        XCTAssertEqual(bridge.state, .connected(streamID: 5))
+        XCTAssertNil(bridge.lastError)
+        bridge.acceptErrorForTesting(stateValue: 12, recoverable: false)
+        if case .failed = bridge.state {} else { XCTFail("terminal error must fail") }
+    }
+
     func testControllerErrorDoesNotExposeRelayAuthentication() {
         let bridge = ControllerBridge.testing(error: "relay authentication failed: AUTH_KEY relay secret")
 

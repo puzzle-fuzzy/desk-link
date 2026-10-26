@@ -331,14 +331,21 @@ public final class ControllerBridge: ObservableObject {
         configVersion: UInt32,
         width: UInt16,
         height: UInt16,
-        stateValue: Int
+        stateValue: Int,
+        errorCode: UInt32 = 0,
+        recoverable: Bool = false
     ) {
         switch eventKind {
         case 1:
             consumeState(streamID: streamID, stateValue: stateValue)
         case 2:
             let message = String(decoding: data, as: UTF8.self)
-            publishErrorMessage(message.isEmpty ? "The connection reported an error." : message)
+            if recoverable {
+                consumeState(streamID: streamID, stateValue: stateValue)
+                lastError = errorCode == 2 ? "正在恢复画面，请稍候。" : "连接已中断，正在自动重连。"
+            } else {
+                publishErrorMessage(message.isEmpty ? "The connection reported an error." : message)
+            }
         case 6:
             consumeVideoConfig(data: data, streamID: streamID, version: configVersion, width: width, height: height)
         case 7:
@@ -399,6 +406,7 @@ public final class ControllerBridge: ObservableObject {
             }
             highestStreamID = max(highestStreamID, streamID)
             state = .connected(streamID: streamID)
+            lastError = nil
             stageApprovedHostMaterialIfNeeded()
         case Int(DESKLINK_CLOSED.rawValue):
             guard streamID == 0 || activeStreamID == 0 || streamID == activeStreamID else { return }
@@ -560,6 +568,12 @@ public final class ControllerBridge: ObservableObject {
     }
 
 #if DEBUG
+    public func acceptErrorForTesting(stateValue: Int, recoverable: Bool) {
+        consume(eventKind: 2, data: Data("transport unavailable".utf8), streamID: 0,
+                frameID: 0, configVersion: 0, width: 0, height: 0,
+                stateValue: stateValue, errorCode: recoverable ? 1 : 3, recoverable: recoverable)
+    }
+
     public func acceptStateForTesting(streamID: UInt64) {
         consumeState(streamID: streamID, stateValue: Int(DESKLINK_CONNECTED.rawValue))
     }
@@ -580,11 +594,14 @@ private func desklinkEventCallback(_ context: UnsafeMutableRawPointer?, _ event:
     let width = value.width
     let height = value.height
     let stateValue = Int(value.state.rawValue)
+    let errorCode = value.error_code
+    let recoverable = value.recoverable != 0
     DispatchQueue.main.async {
         guard bridge.acceptsCallback(generation: generation) else { return }
         bridge.consume(
             eventKind: eventKind, data: data, streamID: streamID, frameID: frameID,
-            configVersion: configVersion, width: width, height: height, stateValue: stateValue
+            configVersion: configVersion, width: width, height: height, stateValue: stateValue,
+            errorCode: errorCode, recoverable: recoverable
         )
     }
 }
