@@ -22,7 +22,7 @@ async function host() {
   const create = new Function("FileDropTargetGate", "nativeFileDropHitsSurface", "document", "queueControllerFiles", `
     let listener, fileDropInitialized = false, dragActive = false;
     const fileDropTargetGate = new FileDropTargetGate();
-    let snapshot = {runtime: {state: 'connected', streamId: 9}};
+    let snapshot = {runtime: {state: 'connected', streamId: "9"}};
     let attemptTarget = '123 456 789', deviceIdDraft = '', channelGeneration = 3;
     const window = {devicePixelRatio: 1.5};
     const getCurrentWebview = () => ({onDragDropEvent: async callback => {listener = callback;}});
@@ -32,7 +32,7 @@ async function host() {
     const fileQueueActions = {busy:false};
     ${new Bun.Transpiler({ loader: "ts" }).transformSync(initialize + enqueue)}
     return {initialize: initializeNativeFileDrop, emit: payload => listener({payload}),
-      active: () => dragActive, switchStream: () => {snapshot.runtime.streamId += 1; channelGeneration += 1;}};
+      active: () => dragActive, switchStream: () => {snapshot.runtime.streamId = "10"; channelGeneration += 1;}};
   `);
   const flow = create(FileDropTargetGate, nativeFileDropHitsSurface, document, async (...args: unknown[]) => { calls.push(args); });
   await flow.initialize();
@@ -52,7 +52,7 @@ test("actual native drag callback shares hit testing for hint and drop and forwa
   setInSurface(true);
   flow.emit({ type: "enter", position, paths: ["synthetic.txt"] });
   flow.emit({ type: "drop", position, paths: ["synthetic.txt"] });
-  expect(calls).toEqual([[["synthetic.txt"], 9, "123 456 789"]]);
+  expect(calls).toEqual([[["synthetic.txt"], "9", "123 456 789"]]);
   expect(flow.active()).toBe(false);
 });
 

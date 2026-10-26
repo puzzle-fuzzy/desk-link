@@ -17,7 +17,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-const firstKey: VideoPullKey = { streamId: 9, configVersion: 3 };
+const firstKey: VideoPullKey = { streamId: "9", configVersion: 3 };
 
 function manualWait() {
   const pending: Array<{ delay: number; release: () => void }> = [];
@@ -208,7 +208,7 @@ describe("serial video pull", () => {
     await Promise.resolve();
 
     pull.start(
-      { streamId: 9, configVersion: 4 },
+      { streamId: "9", configVersion: 4 },
       () => newFrame.promise,
       (value) => {
         delivered.push(value);

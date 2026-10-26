@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io::Read,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -33,15 +34,16 @@ use apps_windows::{
 use blake2::{Blake2s256, Digest};
 use desklink_crypto::{PairingCode, PairingInvite};
 use desklink_ffi::{
-    ControllerError, ControllerEvent, ControllerMetrics, ControllerRuntime,
+    ControllerError, ControllerEvent, ControllerInputSender, ControllerMetrics, ControllerRuntime,
     ControllerTransferSender,
 };
 use desklink_protocol::{
     AccessDenialReason, AudioCodec, AudioPacket, ControlMessage, FileResumeHint, FrameFlags,
-    H264Profile, InputEvent, InputRestrictionReason, KeyCode, MAX_CLIPBOARD_TEXT_BYTES,
-    MAX_EXPERIMENTAL_4K_HEIGHT, MAX_EXPERIMENTAL_4K_WIDTH, MAX_POINTER_COORDINATE,
-    MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton, Platform, ProtocolError,
-    TransferId, TransferMessage, TransferResult, VideoQualityPreference, VideoQualityPreset,
+    H264Profile, InputContext, InputEvent, InputRestrictionReason, KeyCode,
+    MAX_CLIPBOARD_TEXT_BYTES, MAX_EXPERIMENTAL_4K_HEIGHT, MAX_EXPERIMENTAL_4K_WIDTH,
+    MAX_POINTER_COORDINATE, MAX_TRANSFER_CHUNK_BYTES, MAX_WHEEL_DELTA, Modifiers, MouseButton,
+    Platform, ProtocolError, TransferId, TransferMessage, TransferResult, VideoQualityPreference,
+    VideoQualityPreset,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -220,6 +222,7 @@ pub struct ControllerRuntimeSummary {
     pub state: &'static str,
     pub title: String,
     pub detail: String,
+    #[serde(serialize_with = "crate::ipc_identity::serialize_optional")]
     pub stream_id: Option<u64>,
 }
 
@@ -468,7 +471,10 @@ impl DeviceCredentialSource {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerInput {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
+    input_epoch: u64,
     kind: String,
     x: Option<i32>,
     y: Option<i32>,
@@ -492,13 +498,17 @@ pub enum ControllerSignal {
         runtime: ControllerRuntimeSummary,
     },
     VideoConfig {
+        #[serde(serialize_with = "crate::ipc_identity::serialize")]
         stream_id: u64,
+        #[serde(serialize_with = "crate::ipc_identity::serialize")]
+        input_epoch: u64,
         config_version: u32,
         width: u16,
         height: u16,
         sequence_header: Vec<u8>,
     },
     Cursor {
+        #[serde(serialize_with = "crate::ipc_identity::serialize")]
         stream_id: u64,
         sequence: u64,
         x_millionths: i32,
@@ -568,6 +578,7 @@ pub struct QueuedFileSummary {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerRenderMetrics {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
     video_width: u16,
     video_height: u16,
@@ -591,6 +602,7 @@ pub struct ControllerRenderMetrics {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerPlaybackPressure {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
     peak_decode_queue_size: u16,
     freshness_recoveries: u16,
@@ -599,6 +611,7 @@ pub struct ControllerPlaybackPressure {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerVideoPullInput {
+    #[serde(deserialize_with = "crate::ipc_identity::deserialize")]
     stream_id: u64,
     config_version: u32,
 }
@@ -626,11 +639,11 @@ impl ControllerFileTarget {
 
 enum ControllerCommand {
     Input {
-        stream_id: u64,
+        context: InputContext,
         event: InputEvent,
     },
     Text {
-        stream_id: u64,
+        context: InputContext,
         text: String,
     },
     RequestKeyframe,
@@ -639,7 +652,10 @@ enum ControllerCommand {
     SetVideoQuality(VideoQualityPreference),
     SetVideoProfile(H264Profile),
     SendClipboard(String),
-    PasteClipboard(String),
+    PasteClipboard {
+        context: InputContext,
+        text: String,
+    },
     RequestClipboard,
     SendFiles {
         target: ControllerFileTarget,
@@ -696,6 +712,8 @@ impl ClipboardOperation {
 struct PendingClipboardOperation {
     request_id: u64,
     operation: ClipboardOperation,
+    input_context: Option<InputContext>,
+    shortcut_pending: bool,
     deadline: Instant,
 }
 
@@ -704,13 +722,113 @@ impl PendingClipboardOperation {
         Self {
             request_id,
             operation,
+            input_context: None,
+            shortcut_pending: false,
             deadline: now + CLIPBOARD_RESPONSE_TIMEOUT,
         }
+    }
+
+    fn paste(request_id: u64, context: InputContext, now: Instant) -> Self {
+        Self {
+            input_context: Some(context),
+            ..Self::new(request_id, ClipboardOperation::Paste, now)
+        }
+    }
+
+    fn paste_context(self, active: Option<InputContext>) -> Option<InputContext> {
+        self.input_context
+            .filter(|context| context.is_valid() && Some(*context) == active)
     }
 
     fn matches(self, request_id: u64, operation: ClipboardOperation) -> bool {
         self.request_id == request_id && self.operation == operation
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputSendKind {
+    Input,
+    Text,
+    Paste { request_id: u64 },
+}
+
+enum InputSendWork {
+    Input(InputEvent),
+    Text(String),
+    Paste { request_id: u64 },
+}
+
+struct ControllerInputWriter {
+    sender: ControllerInputSender,
+    context: Arc<Mutex<Option<InputContext>>>,
+}
+
+struct PendingInputSend<Writer> {
+    kind: InputSendKind,
+    future: Pin<Box<dyn Future<Output = (Writer, Result<bool, ControllerError>)> + Send>>,
+}
+
+impl<Writer> PendingInputSend<Writer> {
+    fn new<F>(kind: InputSendKind, future: F) -> Self
+    where
+        F: Future<Output = (Writer, Result<bool, ControllerError>)> + Send + 'static,
+    {
+        Self {
+            kind,
+            future: Box::pin(future),
+        }
+    }
+}
+
+async fn next_input_completion<Writer>(
+    active: &mut Option<PendingInputSend<Writer>>,
+) -> (Writer, Result<bool, ControllerError>) {
+    match active.as_mut() {
+        Some(active) => active.future.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn begin_input_send(
+    writer: ControllerInputWriter,
+    context: InputContext,
+    work: InputSendWork,
+) -> PendingInputSend<ControllerInputWriter> {
+    let kind = match &work {
+        InputSendWork::Input(_) => InputSendKind::Input,
+        InputSendWork::Text(_) => InputSendKind::Text,
+        InputSendWork::Paste { request_id } => InputSendKind::Paste {
+            request_id: *request_id,
+        },
+    };
+    PendingInputSend::new(kind, async move {
+        let result = match work {
+            InputSendWork::Input(event) => {
+                send_captured_input_events(
+                    context,
+                    std::iter::once(event),
+                    |context| input_context_is_current(&writer.context, context),
+                    |context, event| writer.sender.send_input_with_context(context, event),
+                )
+                .await
+            }
+            InputSendWork::Text(text) => {
+                send_text_input(&writer.sender, &writer.context, context, &text).await
+            }
+            InputSendWork::Paste { .. } => {
+                send_remote_paste_shortcut(&writer.sender, &writer.context, context).await
+            }
+        };
+        (writer, result)
+    })
+}
+
+fn input_context_is_current(active: &Mutex<Option<InputContext>>, context: InputContext) -> bool {
+    context.is_valid()
+        && active
+            .lock()
+            .ok()
+            .is_some_and(|active| *active == Some(context))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -903,6 +1021,7 @@ struct ControllerOutputChannels {
 #[derive(Clone)]
 pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
+    input_context: Arc<Mutex<Option<InputContext>>>,
     worker: Arc<Mutex<Option<ControllerWorker>>>,
     last_file_action: Arc<Mutex<Option<LastFileAction>>>,
     file_recovery_store: Option<WindowsTransferRecoveryStore>,
@@ -927,6 +1046,7 @@ impl Default for ControllerManager {
     fn default() -> Self {
         Self {
             status: Arc::new(Mutex::new(ControllerRuntimeSummary::idle())),
+            input_context: Arc::new(Mutex::new(None)),
             worker: Arc::new(Mutex::new(None)),
             last_file_action: Arc::new(Mutex::new(None)),
             file_recovery_store: None,
@@ -1651,31 +1771,25 @@ impl ControllerManager {
     }
 
     pub async fn send_input(&self, input: ControllerInput) -> Result<(), String> {
-        if input.stream_id == 0 {
-            return Err("远程输入缺少有效的视频流标识。".to_owned());
-        }
-        let stream_id = input.stream_id;
+        let context = InputContext {
+            stream_id: input.stream_id,
+            input_epoch: input.input_epoch,
+        };
+        validate_input_context(context)?;
         let event = parse_input(input)?;
-        if self.active_stream_id() != Some(stream_id) {
+        if !self.accepts_input_context(context) {
             return Ok(());
         }
-        self.send(ControllerCommand::Input { stream_id, event })
-            .await
+        self.send(ControllerCommand::Input { context, event }).await
     }
 
-    pub async fn send_text(&self, text: String, stream_id: Option<u64>) -> Result<(), String> {
+    pub async fn send_text(&self, text: String, context: InputContext) -> Result<(), String> {
         validate_text_input(&text)?;
-        let stream_id = match stream_id {
-            Some(0) => return Err("文字输入缺少有效的视频流标识。".to_owned()),
-            Some(stream_id) => stream_id,
-            None => self
-                .active_stream_id()
-                .ok_or_else(|| "当前没有正在运行的远程控制会话。".to_owned())?,
-        };
-        if self.active_stream_id() != Some(stream_id) {
+        validate_input_context(context)?;
+        if !self.accepts_input_context(context) {
             return Ok(());
         }
-        self.send(ControllerCommand::Text { stream_id, text }).await
+        self.send(ControllerCommand::Text { context, text }).await
     }
 
     pub async fn request_keyframe(&self) -> Result<(), String> {
@@ -1710,11 +1824,16 @@ impl ControllerManager {
         self.send(ControllerCommand::SendClipboard(text)).await
     }
 
-    pub async fn paste_clipboard(&self, text: String) -> Result<(), String> {
+    pub async fn paste_clipboard(&self, text: String, context: InputContext) -> Result<(), String> {
+        validate_input_context(context)?;
+        if !self.accepts_input_context(context) {
+            return Ok(());
+        }
         if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
             return Err("剪贴板文本超过 48 KB，无法粘贴。".to_owned());
         }
-        self.send(ControllerCommand::PasteClipboard(text)).await
+        self.send(ControllerCommand::PasteClipboard { context, text })
+            .await
     }
 
     pub async fn request_clipboard(&self) -> Result<(), String> {
@@ -1937,6 +2056,48 @@ impl ControllerManager {
             .map_err(|_| "远程控制会话已结束，无法继续执行操作。".to_owned())
     }
 
+    fn accepts_input_context(&self, context: InputContext) -> bool {
+        input_context_is_current(&self.input_context, context)
+    }
+
+    fn active_input_context(&self) -> Option<InputContext> {
+        self.input_context.lock().ok().and_then(|active| *active)
+    }
+
+    fn clear_input_context(&self) {
+        if let Ok(mut context) = self.input_context.lock() {
+            *context = None;
+        }
+    }
+
+    fn set_video_input_context_if_current(
+        &self,
+        generation: u64,
+        config: &desklink_protocol::VideoConfig,
+    ) -> bool {
+        self.set_input_context_if_current(
+            generation,
+            InputContext {
+                stream_id: config.stream_id,
+                input_epoch: config.input_epoch,
+            },
+        )
+    }
+
+    fn set_input_context_if_current(&self, generation: u64, context: InputContext) -> bool {
+        let _guard = self
+            .operation_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_current(generation) {
+            return false;
+        }
+        if let Ok(mut active) = self.input_context.lock() {
+            *active = context.is_valid().then_some(context);
+        }
+        true
+    }
+
     fn active_stream_id(&self) -> Option<u64> {
         self.status.lock().ok().and_then(|status| status.stream_id)
     }
@@ -2147,6 +2308,7 @@ impl ControllerManager {
     }
 
     async fn stop_current(&self) {
+        self.clear_input_context();
         self.video_mailbox.close();
         let worker = self.worker.lock().ok().and_then(|mut worker| worker.take());
         let Some(mut worker) = worker else {
@@ -2168,6 +2330,13 @@ impl ControllerManager {
     }
 
     fn set_status(&self, status: ControllerRuntimeSummary) {
+        if status.state != "connected"
+            || self.input_context.lock().ok().is_some_and(|context| {
+                context.is_some_and(|context| Some(context.stream_id) != status.stream_id)
+            })
+        {
+            self.clear_input_context();
+        }
         if let Ok(mut current) = self.status.lock() {
             *current = status;
         }
@@ -2178,6 +2347,7 @@ impl ControllerManager {
             .operation_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.clear_input_context();
         self.operation_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -2186,6 +2356,7 @@ impl ControllerManager {
             .operation_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.clear_input_context();
         self.operation_generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -2478,7 +2649,7 @@ async fn run_controller(
                     | Some(ControllerCommand::RequestKeyframe)
                     | Some(ControllerCommand::SelectDisplay(_))
                     | Some(ControllerCommand::SendClipboard(_))
-                    | Some(ControllerCommand::PasteClipboard(_))
+                    | Some(ControllerCommand::PasteClipboard { .. })
                     | Some(ControllerCommand::RequestClipboard)
                     | Some(ControllerCommand::SendFiles { .. })
                     | Some(ControllerCommand::RetryFile(_))
@@ -2578,6 +2749,15 @@ async fn run_controller(
             mpsc::channel::<IncomingFileEvent>(INCOMING_EVENT_CAPACITY);
         let mut pending_remote_file_request: Option<PendingRemoteFileRequest> = None;
         let mut pending_clipboard: Option<PendingClipboardOperation> = None;
+        // The writer is moved into one owned future and returned on completion.
+        // The existing bounded command queue supplies backpressure; no second
+        // queue or per-event sender/manager Arc clone is needed.
+        let mut input_writer = Some(ControllerInputWriter {
+            sender: runtime.input_sender(),
+            context: manager.input_context.clone(),
+        });
+        let mut active_input: Option<PendingInputSend<ControllerInputWriter>> = None;
+        let mut pending_paste: Option<(u64, InputContext)> = None;
         let mut audio_decoder = ControllerAudioDecoder::new();
         // There can be at most one file sender for the active transfer. Keep
         // completion notifications bounded so a late task from a disconnected
@@ -2594,6 +2774,15 @@ async fn run_controller(
             file_queue_paused,
         );
         let failure = loop {
+            if active_input.is_none()
+                && let Some((request_id, context)) = pending_paste.take()
+            {
+                active_input = Some(begin_input_send(
+                    input_writer.take().expect("idle input writer"),
+                    context,
+                    InputSendWork::Paste { request_id },
+                ));
+            }
             if outgoing.is_none()
                 && incoming.is_none()
                 && pending_remote_file_request.is_none()
@@ -2674,27 +2863,42 @@ async fn run_controller(
                         return;
                     }
                 }
-                command = commands.recv() => match command {
-                    Some(ControllerCommand::Input { stream_id, event }) => {
-                        if manager.active_stream_id() != Some(stream_id) {
+                input_result = next_input_completion(&mut active_input), if active_input.is_some() => {
+                    let kind = active_input.take().expect("completed input work").kind;
+                    let (writer, result) = input_result;
+                    input_writer = Some(writer);
+                    if let InputSendKind::Paste { request_id } = kind {
+                        if pending_clipboard.is_some_and(|pending| pending.request_id == request_id && pending.shortcut_pending) {
+                            pending_clipboard = None;
+                            match result {
+                                Ok(completed) => { let _ = signals.send(ControllerSignal::Clipboard {
+                                    state: if completed { "completed" } else { "failed" }, operation: "paste",
+                                    message: if completed { "已将本机剪贴板粘贴到远程电脑。" } else { "远程画面已经切换，已停止本次粘贴；请确认当前画面后重试。" }.to_owned(),
+                                }); },
+                                Err(error) => break ConnectFailure::from_controller(error),
+                            }
+                        }
+                    } else if let Err(error) = result {
+                        break ConnectFailure::from_controller(error);
+                    }
+                }
+                command = commands.recv(), if active_input.is_none() => match command {
+                    Some(ControllerCommand::Input { context, event }) => {
+                        if !manager.accepts_input_context(context) {
                             continue;
                         }
-                        if let Err(error) = runtime.send_input(event).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        active_input = Some(begin_input_send(input_writer.take().expect("idle input writer"), context, InputSendWork::Input(event)));
                     }
                     Some(ControllerCommand::SetVideoProfile(profile)) => {
                         if let Err(error) = runtime.set_video_profile(profile).await {
                             break ConnectFailure::from_controller(error);
                         }
                     }
-                    Some(ControllerCommand::Text { stream_id, text }) => {
-                        if manager.active_stream_id() != Some(stream_id) {
+                    Some(ControllerCommand::Text { context, text }) => {
+                        if !manager.accepts_input_context(context) {
                             continue;
                         }
-                        if let Err(error) = send_text_input(&runtime, &text).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        active_input = Some(begin_input_send(input_writer.take().expect("idle input writer"), context, InputSendWork::Text(text)));
                     }
                     Some(ControllerCommand::RequestKeyframe) => {
                         if let Err(error) = runtime.request_keyframe().await
@@ -2749,7 +2953,8 @@ async fn run_controller(
                             Instant::now(),
                         ));
                     }
-                    Some(ControllerCommand::PasteClipboard(text)) => {
+                    Some(ControllerCommand::PasteClipboard { context, text }) => {
+                        if !manager.accepts_input_context(context) { continue; }
                         if pending_clipboard.is_some() {
                             let _ = signals.send(ControllerSignal::Clipboard {
                                 state: "failed",
@@ -2771,11 +2976,7 @@ async fn run_controller(
                         }).await {
                             break ConnectFailure::from_controller(error);
                         }
-                        pending_clipboard = Some(PendingClipboardOperation::new(
-                            request_id,
-                            ClipboardOperation::Paste,
-                            Instant::now(),
-                        ));
+                        pending_clipboard = Some(PendingClipboardOperation::paste(request_id, context, Instant::now()));
                     }
                     Some(ControllerCommand::RequestClipboard) => {
                         if pending_clipboard.is_some() {
@@ -3128,6 +3329,7 @@ async fn run_controller(
                 }
                 event = runtime.next_event_with_transfer(incoming.as_ref().is_none_or(|transfer| transfer.file.can_receive())) => match event {
                     Ok(ControllerEvent::VideoConfig(config)) => {
+                        if !manager.set_video_input_context_if_current(generation, &config) { continue; }
                         if !stable {
                             record_controller_diagnostic(
                                 diagnostics.as_ref(),
@@ -3167,6 +3369,7 @@ async fn run_controller(
                         );
                         let _ = signals.send(ControllerSignal::VideoConfig {
                             stream_id: config.stream_id,
+                            input_epoch: config.input_epoch,
                             config_version: config.config_version,
                             width: config.width,
                             height: config.height,
@@ -3301,13 +3504,21 @@ async fn run_controller(
                             }) else {
                                 continue;
                             };
+                            if pending.shortcut_pending { continue; }
                             pending_clipboard = None;
                             let completed = result == TransferResult::Completed
                                 && pending.operation != ClipboardOperation::Receive;
-                            if pending.operation == ClipboardOperation::Paste && completed
-                                && let Err(error) = send_remote_paste_shortcut(&runtime).await
-                            {
-                                break ConnectFailure::from_controller(error);
+                            if pending.operation == ClipboardOperation::Paste && completed {
+                                let Some(context) = pending.paste_context(manager.active_input_context()) else {
+                                    let _ = signals.send(ControllerSignal::Clipboard {
+                                        state: "failed", operation: "paste",
+                                        message: "远程画面已经切换；文本已写入剪贴板，请确认当前画面后重新粘贴。".to_owned(),
+                                    });
+                                    continue;
+                                };
+                                pending_clipboard = Some(PendingClipboardOperation { shortcut_pending: true, ..pending });
+                                pending_paste = Some((request_id, context));
+                                continue;
                             }
                             let _ = signals.send(ControllerSignal::Clipboard {
                                 state: if completed { "completed" } else { "failed" },
@@ -3652,7 +3863,7 @@ async fn run_controller(
                 _ = transfer_watchdog.tick() => {
                     let now = Instant::now();
                     if pending_clipboard
-                        .is_some_and(|pending| deadline_expired(pending.deadline, now))
+                        .is_some_and(|pending| !pending.shortcut_pending && deadline_expired(pending.deadline, now))
                     {
                         let pending = pending_clipboard.take().expect("checked clipboard deadline");
                         let _ = signals.send(ControllerSignal::Clipboard {
@@ -3794,6 +4005,7 @@ async fn run_controller(
                 last_metrics = Instant::now();
             }
         };
+        drop(active_input.take());
         record_controller_video_metrics(
             diagnostics.as_ref(),
             attempt,
@@ -4654,29 +4866,63 @@ fn record_controller_video_metrics(
     });
 }
 
-async fn send_text_input(runtime: &ControllerRuntime, text: &str) -> Result<(), ControllerError> {
-    for character in text.chars() {
+async fn send_captured_input_events<Events, IsCurrent, Send, SendFuture>(
+    context: InputContext,
+    events: Events,
+    mut is_current: IsCurrent,
+    mut send: Send,
+) -> Result<bool, ControllerError>
+where
+    Events: IntoIterator<Item = InputEvent>,
+    IsCurrent: FnMut(InputContext) -> bool,
+    Send: FnMut(InputContext, InputEvent) -> SendFuture,
+    SendFuture: Future<Output = Result<(), ControllerError>>,
+{
+    context.validate()?;
+    for event in events {
+        if !is_current(context) {
+            return Ok(false);
+        }
+        send(context, event).await?;
+    }
+    Ok(true)
+}
+
+fn text_input_events(text: &str) -> impl Iterator<Item = InputEvent> + '_ {
+    text.chars().flat_map(|character| {
         let code = match character {
             '\n' => KeyCode::Enter,
             '\t' => KeyCode::Tab,
             character => KeyCode::Character(character),
         };
-        runtime
-            .send_input(InputEvent::Key {
+        [
+            InputEvent::Key {
                 code,
                 pressed: true,
                 modifiers: Modifiers(0),
-            })
-            .await?;
-        runtime
-            .send_input(InputEvent::Key {
+            },
+            InputEvent::Key {
                 code,
                 pressed: false,
                 modifiers: Modifiers(0),
-            })
-            .await?;
-    }
-    Ok(())
+            },
+        ]
+    })
+}
+
+async fn send_text_input(
+    sender: &ControllerInputSender,
+    active: &Mutex<Option<InputContext>>,
+    context: InputContext,
+    text: &str,
+) -> Result<bool, ControllerError> {
+    send_captured_input_events(
+        context,
+        text_input_events(text),
+        |context| input_context_is_current(active, context),
+        |context, event| sender.send_input_with_context(context, event),
+    )
+    .await
 }
 
 fn remote_paste_shortcut_events() -> [InputEvent; 2] {
@@ -4694,11 +4940,24 @@ fn remote_paste_shortcut_events() -> [InputEvent; 2] {
     ]
 }
 
-async fn send_remote_paste_shortcut(runtime: &ControllerRuntime) -> Result<(), ControllerError> {
-    for event in remote_paste_shortcut_events() {
-        runtime.send_input(event).await?;
-    }
-    Ok(())
+async fn send_remote_paste_shortcut(
+    sender: &ControllerInputSender,
+    active: &Mutex<Option<InputContext>>,
+    context: InputContext,
+) -> Result<bool, ControllerError> {
+    send_captured_input_events(
+        context,
+        remote_paste_shortcut_events(),
+        |context| input_context_is_current(active, context),
+        |context, event| sender.send_input_with_context(context, event),
+    )
+    .await
+}
+
+fn validate_input_context(context: InputContext) -> Result<(), String> {
+    context
+        .validate()
+        .map_err(|_| "远程输入缺少有效的画面上下文，请等待当前画面显示后重试。".to_owned())
 }
 
 fn validate_text_input(text: &str) -> Result<(), String> {
@@ -4934,14 +5193,13 @@ mod tests {
     use desklink_ffi::ControllerError;
     use desklink_protocol::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AccessDenialReason, AudioCodec, AudioPacket,
-        H264Profile, InputEvent, KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers, MouseButton,
-        PROTOCOL_VERSION, ProtocolError, TransferResult,
+        H264Profile, InputContext, InputEvent, KeyCode, MAX_AUDIO_PAYLOAD_BYTES, Modifiers,
+        MouseButton, PROTOCOL_VERSION, ProtocolError, TransferResult,
     };
     use desklink_session::{ReconnectPolicy, ReconnectSchedule};
     use desklink_transport::{JoinRejectCode, TransportError};
 
     use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
-
 
     fn file_target_fixture() -> (
         ControllerManager,
@@ -5543,6 +5801,7 @@ mod tests {
     fn empty_input(kind: &str) -> ControllerInput {
         ControllerInput {
             stream_id: 1,
+            input_epoch: 100,
             kind: kind.to_owned(),
             x: None,
             y: None,
@@ -5559,11 +5818,17 @@ mod tests {
     #[test]
     fn pointer_backlog_is_bounded_without_dropping_discrete_input() {
         let pointer = ControllerCommand::Input {
-            stream_id: 1,
+            context: InputContext {
+                stream_id: 1,
+                input_epoch: 100,
+            },
             event: InputEvent::MouseMove { x: 1, y: 1 },
         };
         let release = ControllerCommand::Input {
-            stream_id: 1,
+            context: InputContext {
+                stream_id: 1,
+                input_epoch: 100,
+            },
             event: InputEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: false,
@@ -5585,37 +5850,110 @@ mod tests {
     async fn stale_or_missing_stream_ids_never_enter_the_active_command_queue() {
         let manager = ControllerManager::default();
         manager.set_status(ControllerRuntimeSummary::connected(42));
-
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 100,
+            },
+        );
         let mut stale = empty_input("mouseMove");
         stale.stream_id = 41;
         stale.x = Some(1);
         stale.y = Some(1);
         assert!(manager.send_input(stale).await.is_ok());
-
         let mut missing = empty_input("mouseMove");
         missing.stream_id = 0;
         missing.x = Some(1);
         missing.y = Some(1);
         assert!(manager.send_input(missing).await.is_err());
+        let mut zero_epoch = empty_input("mouseMove");
+        zero_epoch.stream_id = 42;
+        zero_epoch.input_epoch = 0;
+        zero_epoch.x = Some(1);
+        zero_epoch.y = Some(1);
+        assert!(manager.send_input(zero_epoch).await.is_err());
+        let mut old_epoch = empty_input("mouseMove");
+        old_epoch.stream_id = 42;
+        old_epoch.input_epoch = 99;
+        old_epoch.x = Some(1);
+        old_epoch.y = Some(1);
+        assert!(manager.send_input(old_epoch).await.is_ok());
     }
 
     #[tokio::test]
     async fn stale_composed_text_is_discarded_without_entering_a_new_session_queue() {
         let manager = ControllerManager::default();
         manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 100,
+            },
+        );
         // No worker is registered: reaching the command queue would fail.
-        assert!(manager.send_text("中文".to_owned(), Some(41)).await.is_ok());
-        assert!(manager.send_text("中文".to_owned(), Some(0)).await.is_err());
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 41,
+                        input_epoch: 100
+                    }
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 42,
+                        input_epoch: 99
+                    }
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 42,
+                        input_epoch: 0
+                    }
+                )
+                .await
+                .is_err()
+        );
         manager.set_status(ControllerRuntimeSummary::idle());
-        assert!(manager.send_text("中文".to_owned(), Some(42)).await.is_ok());
-        assert!(manager.send_text("中文".to_owned(), None).await.is_err());
+        assert!(
+            manager
+                .send_text(
+                    "中文".to_owned(),
+                    InputContext {
+                        stream_id: 42,
+                        input_epoch: 100
+                    }
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
-    async fn composed_and_explicit_text_commands_keep_their_submission_stream() {
+    async fn composed_text_input_and_paste_keep_their_captured_context_in_the_queue() {
         let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
         manager.set_status(ControllerRuntimeSummary::connected(42));
-        let (commands, mut receiver) = mpsc::channel(2);
+        manager.set_input_context_if_current(0, context);
+        let (commands, mut receiver) = mpsc::channel(4);
         let (cancellation, _cancellation_receiver) = watch::channel(false);
         *manager.worker.lock().unwrap() = Some(super::ControllerWorker {
             generation: 0,
@@ -5624,24 +5962,350 @@ mod tests {
             cancellation,
             task: tauri::async_runtime::spawn(async {}),
         });
+        manager.send_text("中文".to_owned(), context).await.unwrap();
+        let mut input = empty_input("key");
+        input.stream_id = context.stream_id;
+        input.input_epoch = context.input_epoch;
+        input.key = Some("character".to_owned());
+        input.character = Some("x".to_owned());
+        input.pressed = Some(false);
+        manager.send_input(input).await.unwrap();
         manager
-            .send_text("中文".to_owned(), Some(42))
+            .paste_clipboard("粘贴".to_owned(), context)
             .await
             .unwrap();
-        manager
-            .send_text("文字面板".to_owned(), None)
-            .await
-            .unwrap();
-        manager.set_status(ControllerRuntimeSummary::connected(43));
-        for expected in ["中文", "文字面板"] {
-            let ControllerCommand::Text { stream_id, text } = receiver.recv().await.unwrap() else {
-                panic!("expected queued text command");
-            };
-            assert_eq!(stream_id, 42);
-            assert_eq!(text, expected);
-            assert_ne!(manager.active_stream_id(), Some(stream_id));
-        }
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 101,
+            },
+        );
+        assert!(!manager.accepts_input_context(context));
+        let ControllerCommand::Text {
+            context: text_context,
+            text,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(text_context, context);
+        assert_eq!(text, "中文");
+        let ControllerCommand::Input {
+            context: input_context,
+            event,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected release");
+        };
+        assert_eq!(input_context, context);
+        assert!(matches!(event, InputEvent::Key { pressed: false, .. }));
+        let ControllerCommand::PasteClipboard {
+            context: paste_context,
+            text,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected paste");
+        };
+        assert_eq!(paste_context, context);
+        assert_eq!(text, "粘贴");
         manager.stop_current().await;
+    }
+
+    #[test]
+    fn missing_input_context_is_a_deserialization_error_instead_of_a_default() {
+        assert!(
+            serde_json::from_value::<ControllerInput>(serde_json::json!({
+                "streamId":"42","kind":"mouseMove","x":1,"y":1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ControllerInput>(serde_json::json!({
+                "inputEpoch":"100","kind":"mouseMove","x":1,"y":1
+            }))
+            .is_err()
+        );
+        let input = serde_json::from_value::<ControllerInput>(serde_json::json!({
+            "streamId":"42","inputEpoch":"100","kind":"mouseMove","x":1,"y":1
+        }))
+        .unwrap();
+        assert_eq!(input.stream_id, 42);
+        assert_eq!(input.input_epoch, 100);
+    }
+
+    #[test]
+    fn native_video_and_input_ipc_keep_full_u64_identities_as_canonical_strings() {
+        for value in [(1_u64 << 53) - 1, 1_u64 << 53, (1_u64 << 53) + 1, u64::MAX] {
+            let text = value.to_string();
+            let input = serde_json::from_value::<ControllerInput>(serde_json::json!({
+                "streamId":text,"inputEpoch":text,"kind":"mouseMove","x":1,"y":1
+            }))
+            .unwrap();
+            assert_eq!(input.stream_id, value);
+            assert_eq!(input.input_epoch, value);
+            let pull =
+                serde_json::from_value::<super::ControllerVideoPullInput>(serde_json::json!({
+                    "streamId":text,"configVersion":1
+                }))
+                .unwrap();
+            assert_eq!(pull.stream_id, value);
+            let signal = super::ControllerSignal::VideoConfig {
+                stream_id: value,
+                input_epoch: value,
+                config_version: 1,
+                width: 16,
+                height: 16,
+                sequence_header: vec![],
+            };
+            let signal = serde_json::to_value(signal).unwrap();
+            assert_eq!(signal["streamId"], text);
+            assert_eq!(signal["inputEpoch"], text);
+            let status = serde_json::to_value(ControllerRuntimeSummary::connected(value)).unwrap();
+            assert_eq!(status["streamId"], text);
+        }
+        for value in [
+            serde_json::json!(42),
+            serde_json::json!("0"),
+            serde_json::json!("01"),
+            serde_json::json!("-1"),
+            serde_json::json!("1.2"),
+            serde_json::json!("18446744073709551616"),
+        ] {
+            assert!(
+                serde_json::from_value::<ControllerInput>(serde_json::json!({
+                    "streamId":value,"inputEpoch":"100","kind":"mouseMove","x":1,"y":1
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<ControllerInput>(serde_json::json!({
+                    "streamId":"42","inputEpoch":value,"kind":"mouseMove","x":1,"y":1
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn paste_ack_only_admits_the_original_context_and_quality_changes_keep_it_valid() {
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(0, context);
+        let paste = PendingClipboardOperation::paste(7, context, Instant::now());
+        assert_eq!(
+            paste.paste_context(manager.active_input_context()),
+            Some(context)
+        );
+        // A pure quality config may retain the epoch.
+        manager.set_input_context_if_current(0, context);
+        assert_eq!(
+            paste.paste_context(manager.active_input_context()),
+            Some(context)
+        );
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 42,
+                input_epoch: 101,
+            },
+        );
+        assert!(
+            paste
+                .paste_context(manager.active_input_context())
+                .is_none()
+        );
+        assert_eq!(paste.input_context, Some(context));
+        manager.set_input_context_if_current(
+            0,
+            InputContext {
+                stream_id: 43,
+                input_epoch: 100,
+            },
+        );
+        assert!(
+            paste
+                .paste_context(manager.active_input_context())
+                .is_none()
+        );
+        manager.cancel_operations();
+        assert!(manager.active_input_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn connected_select_consumes_new_video_config_before_a_blocked_input_send_finishes() {
+        use std::sync::{Arc, Mutex};
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(0, context);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let captured = sent.clone();
+        let current = manager.clone();
+        let event_manager = manager.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (configs, mut config_events) = tokio::sync::mpsc::channel(1);
+        let (consumed, config_consumed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut entered = Some(entered);
+            let mut released = Some(released);
+            let mut active = Some(super::PendingInputSend::new(
+                super::InputSendKind::Text,
+                async move {
+                    let result = super::send_captured_input_events(
+                        context,
+                        super::text_input_events("中文"),
+                        |context| current.accepts_input_context(context),
+                        move |context, event| {
+                            captured.lock().unwrap().push((context, event));
+                            if let Some(entered) = entered.take() {
+                                let _ = entered.send(());
+                            }
+                            let released = released.take();
+                            async move {
+                                if let Some(released) = released {
+                                    let _ = released.await;
+                                }
+                                Ok::<(), ControllerError>(())
+                            }
+                        },
+                    )
+                    .await;
+                    ((), result)
+                },
+            ));
+            // This is the production connected-loop structure: input owns its
+            // future while protocol events keep being polled by the same loop.
+            tokio::select! {
+                _ = super::next_input_completion(&mut active) => panic!("send gate was not released"),
+                config = config_events.recv() => {
+                    let config = config.unwrap();
+                    assert!(event_manager.set_video_input_context_if_current(0, &config));
+                    consumed.send(()).unwrap();
+                },
+            }
+            let (_, result) = super::next_input_completion(&mut active).await;
+            result
+        });
+        started.await.unwrap();
+        configs
+            .send(desklink_protocol::VideoConfig {
+                protocol_version: PROTOCOL_VERSION,
+                stream_id: 42,
+                input_epoch: 101,
+                config_version: 2,
+                codec: desklink_protocol::Codec::H264,
+                width: 16,
+                height: 16,
+                sequence_header: vec![0, 0, 1],
+            })
+            .await
+            .unwrap();
+        config_consumed.await.unwrap();
+        assert_eq!(
+            manager.active_input_context(),
+            Some(InputContext {
+                stream_id: 42,
+                input_epoch: 101
+            })
+        );
+        // A successful send proves the in-flight reliable-write future was
+        // retained across the config event instead of being dropped mid-frame.
+        release.send(()).unwrap();
+        assert!(!task.await.unwrap().unwrap());
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, context);
+        assert!(matches!(sent[0].1, InputEvent::Key { pressed: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn text_and_shortcut_sender_keep_the_original_pair_and_balance_normal_keys() {
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        manager.set_input_context_if_current(0, context);
+        let mut sent = Vec::new();
+        assert!(
+            super::send_captured_input_events(
+                context,
+                super::text_input_events("中\n"),
+                |context| manager.accepts_input_context(context),
+                |captured, event| {
+                    // Quality-only updates retain the input authorization epoch.
+                    manager.set_input_context_if_current(0, context);
+                    sent.push((captured, event));
+                    std::future::ready(Ok::<(), ControllerError>(()))
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(sent.len(), 4);
+        assert!(sent.iter().all(|(actual, _)| *actual == context));
+        for pair in sent.chunks_exact(2) {
+            assert!(matches!(pair[0].1, InputEvent::Key { pressed: true, .. }));
+            assert!(matches!(pair[1].1, InputEvent::Key { pressed: false, .. }));
+        }
+        let mut paste = Vec::new();
+        assert!(
+            !super::send_captured_input_events(
+                context,
+                remote_paste_shortcut_events(),
+                |context| manager.accepts_input_context(context),
+                |captured, event| {
+                    paste.push((captured, event));
+                    manager.set_input_context_if_current(
+                        0,
+                        InputContext {
+                            stream_id: 42,
+                            input_epoch: 101,
+                        },
+                    );
+                    std::future::ready(Ok::<(), ControllerError>(()))
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(paste.len(), 1);
+        assert_eq!(paste[0].0, context);
+    }
+
+    #[tokio::test]
+    async fn connection_status_never_supplies_an_input_epoch_and_old_generations_cannot_rearm_it() {
+        let manager = ControllerManager::default();
+        let context = InputContext {
+            stream_id: 42,
+            input_epoch: 100,
+        };
+        manager.set_status(ControllerRuntimeSummary::connected(42));
+        assert!(manager.active_input_context().is_none());
+        // No worker exists, so an accidental admission would produce an error.
+        assert!(
+            manager
+                .send_text("unchanged".to_owned(), context)
+                .await
+                .is_ok()
+        );
+        let generation = manager.begin_operation();
+        assert!(!manager.set_input_context_if_current(generation - 1, context));
+        assert!(manager.active_input_context().is_none());
+        assert!(manager.set_input_context_if_current(generation, context));
+        manager.cancel_operations();
+        assert!(manager.active_input_context().is_none());
+        assert!(!manager.set_input_context_if_current(generation, context));
     }
 
     #[test]
@@ -5837,38 +6501,67 @@ mod tests {
             } else {
                 TransportError::Connection("synthetic temporary relay outage".into())
             };
-            assert!(ConnectFailure::from_transport(error, true)
-                .limit_unanswered_handshake(&mut budget).retryable);
+            assert!(
+                ConnectFailure::from_transport(error, true)
+                    .limit_unanswered_handshake(&mut budget)
+                    .retryable
+            );
         }
-        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-            .limit_unanswered_handshake(&mut budget).retryable);
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
         // Intervening offline periods preserve, but never consume or reset, the
         // count of actual unanswered handshakes after the peer has joined.
         for _ in 0..100 {
-            assert!(ConnectFailure::from_transport(
-                TransportError::JoinRejected(JoinRejectCode::SessionNotFound), true,
-            ).limit_unanswered_handshake(&mut budget).retryable);
+            assert!(
+                ConnectFailure::from_transport(
+                    TransportError::JoinRejected(JoinRejectCode::SessionNotFound),
+                    true,
+                )
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+            );
         }
-        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-            .limit_unanswered_handshake(&mut budget).retryable);
-        assert!(!ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-            .limit_unanswered_handshake(&mut budget).retryable);
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        assert!(
+            !ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
     }
 
     #[test]
     fn completed_authenticated_connection_resets_only_the_no_response_budget() {
         let mut budget = super::HandshakeResponseBudget::default();
         for _ in 0..2 {
-            assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-                .limit_unanswered_handshake(&mut budget).retryable);
+            assert!(
+                ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                    .limit_unanswered_handshake(&mut budget)
+                    .retryable
+            );
         }
         budget.authenticated();
-        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-            .limit_unanswered_handshake(&mut budget).retryable);
-        assert!(ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-            .limit_unanswered_handshake(&mut budget).retryable);
-        assert!(!ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
-            .limit_unanswered_handshake(&mut budget).retryable);
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        assert!(
+            ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
+        assert!(
+            !ConnectFailure::from_controller(ControllerError::HandshakeTimeout)
+                .limit_unanswered_handshake(&mut budget)
+                .retryable
+        );
     }
 
     #[tokio::test]
@@ -5887,14 +6580,25 @@ mod tests {
         let mut schedule = ReconnectSchedule::new(ReconnectPolicy::default(), None);
         let (_commands, mut receiver) = mpsc::channel(1);
         let (_cancellation, mut cancellation_receiver) = watch::channel(false);
-        let retry = tokio::time::timeout(Duration::from_millis(200), super::schedule_failure(
-            &manager, &signals, &mut schedule, failure,
-            super::ControllerWaitChannels {
-                generation, persistent: true, commands: &mut receiver,
-                cancellation: &mut cancellation_receiver,
-            },
-            None, 3,
-        )).await.expect("silent handshakes must stop before another persistent retry wait");
+        let retry = tokio::time::timeout(
+            Duration::from_millis(200),
+            super::schedule_failure(
+                &manager,
+                &signals,
+                &mut schedule,
+                failure,
+                super::ControllerWaitChannels {
+                    generation,
+                    persistent: true,
+                    commands: &mut receiver,
+                    cancellation: &mut cancellation_receiver,
+                },
+                None,
+                3,
+            ),
+        )
+        .await
+        .expect("silent handshakes must stop before another persistent retry wait");
         assert!(!retry);
         assert_eq!(manager.snapshot().state, "stopped");
         assert_eq!(manager.snapshot().detail, expected_detail);
@@ -6312,5 +7016,4 @@ mod tests {
             );
         }
     }
-
 }

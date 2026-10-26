@@ -54,7 +54,7 @@ describe("原生文件拖放可见区域", () => {
 });
 
 describe("拖放会话所有权", () => {
-  const target = { streamId: 7, deviceId: "123 456 789", generation: 3 };
+  const target = { streamId: "7", deviceId: "123 456 789", generation: 3 };
 
   test("提示与提交共用命中规则；移出接收区域不清除原目标", () => {
     const gate = new FileDropTargetGate();
@@ -69,7 +69,7 @@ describe("拖放会话所有权", () => {
 
   test("stream、设备或连接代数变化后，本次拖动不能重新绑定新会话", () => {
     for (const replacement of [
-      { ...target, streamId: 8 },
+      { ...target, streamId: "8" },
       { ...target, deviceId: "987 654 321" },
       { ...target, generation: 4 },
       null,

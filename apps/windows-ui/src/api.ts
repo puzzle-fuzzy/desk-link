@@ -9,6 +9,7 @@ import type {
   ControllerRenderMetrics,
   ControllerSignal,
   ControllerSnapshot,
+  RemoteInputContext,
   DiagnosticExportResult,
   DiagnosticUploadResult,
   FixedAccessSummary,
@@ -23,6 +24,8 @@ import type {
 } from "./types";
 import type { H264Profile, VideoQualityPreference } from "./types";
 import type { WindowsReleaseSource, WindowsUpdateProgress } from "./windows-update";
+import { validInputContext } from "./remote-input-context";
+import { isU64Identity } from "./u64-identity";
 
 export interface AccountUser {
   id: string;
@@ -211,6 +214,7 @@ export function createControllerChannels(
 export function nextControllerVideoFrame(
   input: ControllerVideoPullInput,
 ): Promise<ControllerVideoPayload> {
+  if (!isU64Identity(input.streamId)) return Promise.reject(new Error("远程画面的会话标识无效。"));
   return invoke<ControllerVideoPayload>("next_controller_video_frame", { input });
 }
 
@@ -235,15 +239,18 @@ export function reconnectController(
 }
 
 export function sendControllerInput(input: StreamBoundControllerInput): Promise<void> {
+  if (!validInputContext(input)) return Promise.reject(new Error("远程输入缺少有效的画面标识。"));
   return invoke<void>("send_controller_input", { input });
 }
 
-export function sendControllerText(text: string, streamId?: number): Promise<void> {
-  return invoke<void>("send_controller_text", { text, streamId });
+export function sendControllerText(text: string, context: RemoteInputContext): Promise<void> {
+  if (!validInputContext(context)) return Promise.reject(new Error("远程文字缺少有效的画面标识。"));
+  return invoke<void>("send_controller_text", { text, ...context });
 }
 
-export function pasteControllerClipboardText(): Promise<void> {
-  return invoke<void>("paste_controller_clipboard_text");
+export function pasteControllerClipboardText(context: RemoteInputContext): Promise<void> {
+  if (!validInputContext(context)) return Promise.reject(new Error("远程粘贴缺少有效的画面标识。"));
+  return invoke<void>("paste_controller_clipboard_text", { ...context });
 }
 
 export function setControllerAudioEnabled(enabled: boolean): Promise<void> {
@@ -270,7 +277,8 @@ export function chooseAndSendControllerFile(): Promise<void> {
   return invoke<void>("choose_and_send_controller_file");
 }
 
-export function queueControllerFiles(paths: string[], streamId: number, deviceId: string): Promise<void> {
+export function queueControllerFiles(paths: string[], streamId: string, deviceId: string): Promise<void> {
+  if (!isU64Identity(streamId)) return Promise.reject(new Error("文件接收会话标识无效。"));
   return invoke<void>("queue_controller_files", { paths, streamId, deviceId });
 }
 
@@ -319,10 +327,12 @@ export function requestControllerKeyframe(): Promise<void> {
 }
 
 export function reportControllerRenderMetrics(metrics: ControllerRenderMetrics): Promise<void> {
+  if (!isU64Identity(metrics.streamId)) return Promise.reject(new Error("画面测量的会话标识无效。"));
   return invoke<void>("report_controller_render_metrics", { metrics });
 }
 
 export function reportControllerPlaybackPressure(pressure: ControllerPlaybackPressure): Promise<void> {
+  if (!isU64Identity(pressure.streamId)) return Promise.reject(new Error("画面背压的会话标识无效。"));
   return invoke<void>("report_controller_playback_pressure", { pressure });
 }
 

@@ -11,9 +11,9 @@ test("distinct input restrictions give actionable guidance and None clears the m
 });
 
 test("old restrictions cannot survive a disconnect or new stream generation", () => {
-  const connected = {state: "connected", streamId: 1} as ControllerRuntimeSummary;
+  const connected = {state: "connected", streamId: "1"} as ControllerRuntimeSummary;
   expect(restrictionAfterRuntime("blocked", connected, connected)).toBe("blocked");
-  expect(restrictionAfterRuntime("blocked", connected, {...connected, streamId: 2})).toBeNull();
+  expect(restrictionAfterRuntime("blocked", connected, {...connected, streamId: "2"})).toBeNull();
   expect(restrictionAfterRuntime("blocked", connected, {...connected, state: "reconnecting"})).toBeNull();
 });
 

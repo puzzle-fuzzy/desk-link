@@ -7,7 +7,7 @@ const configuredConnection = {
   relayAddress: "relay.example.com:4433",
   serverName: "relay.example.com",
   sessionId: "session",
-  streamId: 1,
+  streamId: "1",
   hasSavedKey: true,
 };
 

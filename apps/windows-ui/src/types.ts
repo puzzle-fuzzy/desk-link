@@ -4,7 +4,7 @@ export interface ConnectionSummary {
   relayAddress: string;
   serverName: string;
   sessionId: string;
-  streamId: number;
+  streamId: string;
   hasSavedKey: boolean;
 }
 
@@ -149,7 +149,7 @@ export interface ControllerRuntimeSummary {
   state: ControllerRuntimeState;
   title: string;
   detail: string;
-  streamId: number | null;
+  streamId: string | null;
 }
 
 export interface SavedControllerConnectionSummary {
@@ -227,12 +227,15 @@ export interface ControllerInput {
   modifiers?: number;
 }
 
-export interface StreamBoundControllerInput extends ControllerInput {
-  streamId: number;
+export interface RemoteInputContext {
+  readonly streamId: string;
+  readonly inputEpoch: string;
 }
 
+export interface StreamBoundControllerInput extends ControllerInput, RemoteInputContext {}
+
 export interface ControllerRenderMetrics {
-  streamId: number;
+  streamId: string;
   videoWidth: number;
   videoHeight: number;
   videoPath: "relay" | "directLan";
@@ -253,19 +256,20 @@ export interface ControllerRenderMetrics {
 }
 
 export interface ControllerPlaybackPressure {
-  streamId: number;
+  streamId: string;
   peakDecodeQueueSize: number;
   freshnessRecoveries: number;
 }
 
 export interface ControllerVideoPullInput {
-  streamId: number;
+  streamId: string;
   configVersion: number;
 }
 
 export interface ControllerVideoConfigSignal {
   kind: "videoConfig";
-  streamId: number;
+  streamId: string;
+  inputEpoch: string;
   configVersion: number;
   width: number;
   height: number;
@@ -299,7 +303,7 @@ export type ControllerSignal =
     }
   | {
       kind: "cursor";
-      streamId: number;
+      streamId: string;
       sequence: number;
       xMillionths: number;
       yMillionths: number;

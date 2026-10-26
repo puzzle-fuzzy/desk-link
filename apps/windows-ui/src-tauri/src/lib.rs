@@ -5,6 +5,8 @@ mod controller;
 mod device_directory;
 mod file_picker;
 mod host;
+#[path = "ipc-identity.rs"]
+mod ipc_identity;
 mod local_relay;
 mod updates;
 mod video_mailbox;
@@ -95,6 +97,7 @@ struct ConnectionSummary {
     relay_address: String,
     server_name: String,
     session_id: String,
+    #[serde(serialize_with = "ipc_identity::serialize")]
     stream_id: u64,
     has_saved_key: bool,
 }
@@ -564,9 +567,20 @@ async fn send_controller_input(
 async fn send_controller_text(
     manager: State<'_, ControllerManager>,
     text: String,
-    stream_id: Option<u64>,
+    stream_id: String,
+    input_epoch: String,
 ) -> Result<(), String> {
-    manager.send_text(text, stream_id).await
+    let stream_id = ipc_identity::parse(&stream_id)?;
+    let input_epoch = ipc_identity::parse(&input_epoch)?;
+    manager
+        .send_text(
+            text,
+            desklink_protocol::InputContext {
+                stream_id,
+                input_epoch,
+            },
+        )
+        .await
 }
 
 fn local_clipboard_error(result: desklink_protocol::TransferResult) -> String {
@@ -591,9 +605,20 @@ async fn read_local_clipboard_text() -> Result<String, String> {
 #[tauri::command]
 async fn paste_controller_clipboard_text(
     manager: State<'_, ControllerManager>,
+    stream_id: String,
+    input_epoch: String,
 ) -> Result<(), String> {
+    let stream_id = ipc_identity::parse(&stream_id)?;
+    let input_epoch = ipc_identity::parse(&input_epoch)?;
+    let context = desklink_protocol::InputContext {
+        stream_id,
+        input_epoch,
+    };
+    if !context.is_valid() {
+        return Err("远程输入缺少有效的画面上下文，请等待当前画面显示后重试。".to_owned());
+    }
     let text = read_local_clipboard_text().await?;
-    manager.paste_clipboard(text).await
+    manager.paste_clipboard(text, context).await
 }
 
 #[tauri::command]
@@ -646,9 +671,10 @@ async fn choose_and_send_controller_file(
 async fn queue_controller_files(
     manager: State<'_, ControllerManager>,
     paths: Vec<String>,
-    stream_id: u64,
+    stream_id: String,
     device_id: String,
 ) -> Result<(), String> {
+    let stream_id = ipc_identity::parse(&stream_id)?;
     let target = manager.file_drop_target(stream_id, &device_id)?;
     manager
         .send_files(paths.into_iter().map(PathBuf::from).collect(), target)

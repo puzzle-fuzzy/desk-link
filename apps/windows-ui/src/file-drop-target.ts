@@ -4,7 +4,7 @@ export interface NativeDropPosition {
 }
 
 export interface FileDropTarget {
-  streamId: number;
+  streamId: string;
   deviceId: string;
   generation: number;
 }

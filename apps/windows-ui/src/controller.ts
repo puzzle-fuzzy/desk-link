@@ -62,6 +62,7 @@ import type {
   ControllerSignal,
   ControllerSnapshot,
   ControllerVideoConfigSignal,
+  RemoteInputContext,
   H264ProfileFallbackReason,
   H264ProfileProbe,
   RemoteDisplaySummary,
@@ -119,6 +120,7 @@ import { fileQueueProtectionPresentation } from "./file-queue-protection";
 import { FileQueueView } from "./file-queue-view";
 import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
 import { REMOTE_SHORTCUTS, remoteShortcutInput } from "./remote-shortcuts";
+import { RemoteInputPresentation, sameInputContext, type PaintedInputFrame } from "./remote-input-context";
 import { remoteAudioControl } from "./remote-audio-control";
 import { inputRestrictionPresentation, restrictionAfterRuntime } from "./input-restriction";
 import type { InputRestrictionReason } from "./types";
@@ -281,13 +283,16 @@ let h264ProfileProbe: H264ProfileProbe = "notChecked";
 let h264ProfileProbeMs: number | null = null;
 let h264ProfileFallbackReason: H264ProfileFallbackReason | null = null;
 let remoteSurfaceState: ControllerRemoteSurfaceState = "empty";
+const inputPresentation = new RemoteInputPresentation();
+let inputActivationFrame: number | null = null;
+let inputSurfaceConfirmedVisible = false;
+let heldKeyboardContext: RemoteInputContext | null = null;
+let heldButtonContext: RemoteInputContext | null = null;
 let inputRestrictionReason: InputRestrictionReason | null = null;
 const inputDispatcher = new RemoteInputDispatcher(
-  (input, streamId) => sendControllerInput({ ...input, streamId }),
+  (input, context) => sendControllerInput({ ...input, streamId: context.streamId, inputEpoch: context.inputEpoch }),
   undefined,
-  (text, streamId) => snapshot?.runtime.state === "connected" && snapshot.runtime.streamId === streamId
-    ? sendControllerText(text, streamId)
-    : Promise.reject(new Error("Remote session changed")),
+  (text, context) => sendControllerText(text, context),
 );
 const remoteAudio = new RemoteAudioPlayer();
 let audioPlaybackPresentation = "";
@@ -344,9 +349,15 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
   void initializeNativeFileDrop();
   if (!fullscreenListenerInitialized) {
     window.addEventListener("resize", scheduleRemoteFullscreenSync);
+    window.addEventListener("resize", () => { suspendPresentedInput(); schedulePresentedInputActivation(); });
     window.addEventListener("blur", resetRemoteInputState);
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) resetRemoteInputState();
+      if (document.hidden) {
+        suspendPresentedInput();
+        resetRemoteInputState();
+      } else {
+        schedulePresentedInputActivation();
+      }
     });
     document.addEventListener("keydown", handleRemoteFullscreenEscape, true);
     document.addEventListener("pointermove", handleRemoteToolbarPointerMove, { passive: true });
@@ -392,6 +403,9 @@ export function prepareControllerRender(): void {
   const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
   if (queue) fileQueueView.capture(queue);
   resetRemoteInputState();
+  inputPresentation.clear();
+  inputSurfaceConfirmedVisible = false;
+  if (inputActivationFrame !== null) { window.cancelAnimationFrame(inputActivationFrame); inputActivationFrame = null; }
   remoteTextInput = null;
   inputDispatcher.discardPendingMoves();
   if (pointerFrame !== null) {
@@ -450,7 +464,7 @@ export function renderControllerView(): string {
 
 export function controllerSurfaceIdentity(): string | null {
   if (loading || (snapshot?.runtime.state !== "connected" && remoteSurfaceState !== "retaining")) return null;
-  const key = videoConfig ? videoConfigKey(videoConfig) : `${snapshot?.runtime.streamId}:waiting`;
+  const key = videoConfig ? `${videoConfig.streamId}:canvas` : `${snapshot?.runtime.streamId}:waiting`;
   return `${key}:${failedVideoConfig ?? "ready"}`;
 }
 
@@ -1566,6 +1580,8 @@ function handleSignal(signal: ControllerSignal): void {
       }
       remoteSurfaceState = nextSurfaceState;
       if (signal.runtime.state !== "connected") {
+        inputPresentation.clear();
+        inputSurfaceConfirmedVisible = false;
         fileDropTargetGate.clear();
         if (remoteFullscreenActive || remoteFullscreenDesired) {
           void setRemoteFullscreen(false, false);
@@ -1627,6 +1643,17 @@ function handleSignal(signal: ControllerSignal): void {
       break;
     }
     case "videoConfig": {
+      const inputChange = inputPresentation.announce(signal, channelGeneration);
+      if (inputChange.changed) {
+        inputSurfaceConfirmedVisible = false;
+        inputDispatcher.discardPendingMoves();
+        if (pointerFrame !== null) { window.cancelAnimationFrame(pointerFrame); pointerFrame = null; }
+        if (inputActivationFrame !== null) { window.cancelAnimationFrame(inputActivationFrame); inputActivationFrame = null; }
+      }
+      if (inputChange.contextChanged) {
+        inputDispatcher.discardAll();
+        resetRemoteInputState();
+      }
       const changed = !videoConfig || videoConfigKey(videoConfig) !== videoConfigKey(signal);
       if (changed) {
         videoSequenceHeader = Uint8Array.from(signal.sequenceHeader);
@@ -1638,9 +1665,13 @@ function handleSignal(signal: ControllerSignal): void {
         h264ProfileFallbackReason = null;
       }
       videoConfig = signal;
-      if (changed || !document.querySelector("[data-remote-canvas]")) {
+      const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
+      if (changed && canvas) {
+        setupRemoteDesktop(false);
+      } else if (!canvas) {
         requestRender();
       }
+      updateInputContextPresentation();
       break;
     }
     case "cursor":
@@ -2421,7 +2452,7 @@ function updateConnectionProgressClock(): void {
   guidance.classList.toggle("connection-progress-guidance--delayed", presentation.delayed);
 }
 
-function setupRemoteDesktop(): void {
+function setupRemoteDesktop(bindInputs = true): void {
   const viewport = document.querySelector<HTMLElement>("[data-remote-viewport]");
   const canvas = document.querySelector<HTMLCanvasElement>("[data-remote-canvas]");
   if (!viewport || !canvas || !videoConfig) {
@@ -2445,7 +2476,8 @@ function setupRemoteDesktop(): void {
     queueMicrotask(requestRender);
     return;
   }
-  setupRemoteGeometry(viewport, canvas);
+  inputPresentation.announce(config, channelGeneration);
+  if (bindInputs) setupRemoteGeometry(viewport, canvas);
   scheduleRemoteScaleLayout(viewport, canvas, remoteScaleMode === "actual");
   void startVideoDecoder(canvas, context, configKey, "hardware");
   videoPull.start(
@@ -2458,8 +2490,10 @@ function setupRemoteDesktop(): void {
     },
   );
   armVideoPlaybackPressureReporter(config.streamId);
-  bindRemoteInput(viewport, canvas);
-  focusRemoteKeyboard(viewport);
+  if (bindInputs) {
+    bindRemoteInput(viewport, canvas);
+    focusRemoteKeyboard(viewport);
+  }
 }
 
 function handleVideo(payload: ControllerVideoPayload): void {
@@ -2532,7 +2566,7 @@ function restartVideoDecoderForFreshness(
   void startVideoDecoder(canvas, context, configKey, preference);
 }
 
-function armVideoPlaybackPressureReporter(streamId: number): void {
+function armVideoPlaybackPressureReporter(streamId: string): void {
   if (videoPlaybackPressureTimer !== null) {
     return;
   }
@@ -2596,12 +2630,99 @@ function updateVideoStartingMessage(): void {
   }
 }
 
+function inputSurfaceVisible(canvas = remoteCanvasElement): boolean {
+  if (document.hidden || canvas === null || !canvas.isConnected) return false;
+  const bounds = canvas.getClientRects();
+  for (let index = 0; index < bounds.length; index += 1) {
+    if (bounds[index]!.width > 0 && bounds[index]!.height > 0) return true;
+  }
+  return false;
+}
+
+function suspendPresentedInput(): void {
+  inputSurfaceConfirmedVisible = false;
+  inputPresentation.suspend();
+}
+
+function currentInputContext(): RemoteInputContext | null {
+  if (snapshot?.runtime.state !== "connected" || document.hidden || !remoteCanvasElement?.isConnected || !inputSurfaceConfirmedVisible) {
+    suspendPresentedInput();
+    return null;
+  }
+  const context = inputPresentation.context;
+  return context?.streamId === snapshot.runtime.streamId ? context : null;
+}
+
+function updateInputContextPresentation(): void {
+  const viewport = remoteViewportElement;
+  if (!viewport) return;
+  const ready = currentInputContext() !== null;
+  viewport.dataset.inputReady = String(ready);
+  const hint = viewport.querySelector<HTMLElement>("[data-remote-focus-hint]");
+  if (hint) hint.textContent = !ready
+    ? "正在等待新画面显示，输入暂时暂停。"
+    : remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑"
+      : "点击画面开始控制 · Ctrl+V 粘贴本机短文本 · Ctrl+Alt+Delete 必须在主机本地操作";
+}
+
+function schedulePresentedInputActivation(frame: PaintedInputFrame | null = inputPresentation.painted): void {
+  if (!frame) return;
+  if (inputActivationFrame !== null) window.cancelAnimationFrame(inputActivationFrame);
+  inputActivationFrame = window.requestAnimationFrame(() => {
+    inputActivationFrame = null;
+    inputSurfaceConfirmedVisible = inputSurfaceVisible();
+    inputPresentation.activate(frame, channelGeneration,
+      snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null, inputSurfaceConfirmedVisible);
+    updateInputContextPresentation();
+  });
+}
+
+function paintRemoteVideoFrame(
+  frame: VideoFrame, canvas: HTMLCanvasElement, context: CanvasRenderingContext2D,
+  configuration: ControllerVideoConfigSignal, connectionGeneration: number, generation: number,
+  configKey: string, preference: "hardware" | "software",
+): void {
+  try {
+    if (generation !== decoderGeneration || connectionGeneration !== channelGeneration || !canvas.isConnected
+      || !videoConfig || videoConfigKey(videoConfig) !== configKey || videoConfig.inputEpoch !== configuration.inputEpoch) return;
+    if (canvas.width !== configuration.width || canvas.height !== configuration.height) {
+      canvas.width = configuration.width;
+      canvas.height = configuration.height;
+      remoteCanvasBounds = null;
+      remoteViewportBounds = null;
+      syncRemoteCanvasPixelSize(canvas);
+      if (remoteViewportElement) scheduleRemoteScaleLayout(remoteViewportElement, canvas, false);
+    }
+    if (frame.displayWidth === canvas.width && frame.displayHeight === canvas.height) context.drawImage(frame, 0, 0);
+    else context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    const painted = inputPresentation.drew(configuration, connectionGeneration, frame);
+    schedulePresentedInputActivation(painted);
+    if (decodedFrames === 0 && videoConfigReceivedAtMs !== null) firstFrameMs = Math.max(0, Date.now() - videoConfigReceivedAtMs);
+    decodedFrames += 1;
+    consecutiveDecoderStalls = 0;
+    if (decodedFrames === 1) {
+      const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
+      if (waiting) waiting.hidden = true;
+    }
+    videoRenderTiming.observe(performance.now());
+    if (decodedFrames === 1) reportRenderMetrics(true);
+  } catch {
+    suspendPresentedInput();
+    fallbackOrFailVideo(configKey, preference, "decoderError");
+  } finally {
+    frame.close();
+  }
+}
+
 async function startVideoDecoder(
   canvas: HTMLCanvasElement,
   context: CanvasRenderingContext2D,
   configKey: string,
   preference: "hardware" | "software",
 ): Promise<void> {
+  const configuration = videoConfig ? { ...videoConfig } : null;
+  if (!configuration || videoConfigKey(configuration) !== configKey) return;
+  const connectionGeneration = channelGeneration;
   releaseVideoDecoder();
   const generation = decoderGeneration;
   decoderPreference = preference;
@@ -2631,35 +2752,7 @@ async function startVideoDecoder(
               nextFrame?.close();
               return;
             }
-            try {
-              if (
-                nextFrame.displayWidth === canvas.width
-                && nextFrame.displayHeight === canvas.height
-              ) {
-                context.drawImage(nextFrame, 0, 0);
-              } else {
-                context.drawImage(nextFrame, 0, 0, canvas.width, canvas.height);
-              }
-              if (decodedFrames === 0 && videoConfigReceivedAtMs !== null) {
-                firstFrameMs = Math.max(0, Date.now() - videoConfigReceivedAtMs);
-              }
-              decodedFrames += 1;
-              consecutiveDecoderStalls = 0;
-              if (decodedFrames === 1) {
-                const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting]");
-                if (waiting) {
-                  waiting.hidden = true;
-                }
-              }
-              videoRenderTiming.observe(performance.now());
-              if (decodedFrames === 1) {
-                reportRenderMetrics(true);
-              }
-            } catch {
-              fallbackOrFailVideo(configKey, preference, "decoderError");
-            } finally {
-              nextFrame.close();
-            }
+            paintRemoteVideoFrame(nextFrame, canvas, context, configuration, connectionGeneration, generation, configKey, preference);
           });
         }
       },
@@ -2674,8 +2767,8 @@ async function startVideoDecoder(
     const h264Profile = h264ProfileFromCodec(codec);
     const decoderConfig = {
       codec,
-      codedWidth: videoConfig?.width ?? canvas.width,
-      codedHeight: videoConfig?.height ?? canvas.height,
+      codedWidth: configuration.width,
+      codedHeight: configuration.height,
       hardwareAcceleration: preference === "hardware" ? "prefer-hardware" : "prefer-software",
       optimizeForLatency: true,
     } as const;
@@ -3156,6 +3249,7 @@ function syncRemoteInteractionControls(): void {
       ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑"
       : "点击画面开始控制 · Ctrl+Alt+Delete 必须在主机本地操作";
   }
+  updateInputContextPresentation();
 }
 
 function scheduleRemoteScaleLayout(
@@ -3268,6 +3362,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     });
   }
   const pendingPoint = { x: 0, y: 0 };
+  let pendingPointContext: RemoteInputContext | null = null;
   let hasPendingPoint = false;
   let panDrag: (RemotePanOrigin & { pointerId: number }) | null = null;
   const sendPendingPoint = () => {
@@ -3276,8 +3371,11 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     }
     pointerFrame = null;
     if (hasPendingPoint) {
-      fireMouseMove(pendingPoint.x, pendingPoint.y);
+      if (pendingPointContext !== null && currentInputContext() === pendingPointContext) {
+        fireMouseMove(pendingPoint.x, pendingPoint.y, pendingPointContext);
+      }
       hasPendingPoint = false;
+      pendingPointContext = null;
     }
   };
   const discardPendingPoint = () => {
@@ -3286,6 +3384,7 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       pointerFrame = null;
     }
     hasPendingPoint = false;
+    pendingPointContext = null;
   };
   const finishPanDrag = () => {
     if (panDrag && viewport.hasPointerCapture(panDrag.pointerId)) {
@@ -3317,9 +3416,11 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       }
       return;
     }
-    if (!writePointerPosition(event, canvas, pendingPoint)) {
+    const inputContext = currentInputContext();
+    if (!inputContext || !writePointerPosition(event, canvas, pendingPoint)) {
       return;
     }
+    pendingPointContext = inputContext;
     hasPendingPoint = true;
     if (pointerFrame === null) {
       pointerFrame = window.requestAnimationFrame(sendPendingPoint);
@@ -3360,9 +3461,11 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     }
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
-    if (!writePointerPosition(event, canvas, pendingPoint)) {
+    const inputContext = currentInputContext();
+    if (!inputContext || !writePointerPosition(event, canvas, pendingPoint)) {
       return;
     }
+    pendingPointContext = inputContext;
     event.preventDefault();
     if (carrier) {
       const bounds = viewport.getBoundingClientRect();
@@ -3374,7 +3477,8 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
     hasPendingPoint = true;
     sendPendingPoint();
     pressedButtons.add(button);
-    fireInput({ kind: "mouseButton", button, pressed: true });
+    heldButtonContext = inputContext;
+    fireInput({ kind: "mouseButton", button, pressed: true }, inputContext);
   });
   viewport.addEventListener("pointerup", (event) => {
     if (panDrag?.pointerId === event.pointerId) {
@@ -3390,12 +3494,16 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       return;
     }
     event.preventDefault();
-    if (writePointerPosition(event, canvas, pendingPoint)) {
+    const inputContext = currentInputContext();
+    if (inputContext && writePointerPosition(event, canvas, pendingPoint)) {
       hasPendingPoint = true;
+      pendingPointContext = inputContext;
       sendPendingPoint();
     }
+    const releaseContext = pressedButtons.has(button) ? heldButtonContext : null;
     pressedButtons.delete(button);
-    fireInput({ kind: "mouseButton", button, pressed: false });
+    if (releaseContext) fireInput({ kind: "mouseButton", button, pressed: false }, releaseContext);
+    if (pressedButtons.size === 0) heldButtonContext = null;
   });
   const releaseCapturedInput = () => {
     finishPanDrag();
@@ -3411,11 +3519,13 @@ function bindRemoteInput(viewport: HTMLElement, canvas: HTMLCanvasElement): void
       return;
     }
     event.preventDefault();
+    const inputContext = currentInputContext();
+    if (!inputContext) { discardPendingPoint(); return; }
     sendPendingPoint();
     const deltaX = clampWheel(Math.round(event.deltaX));
     const deltaY = clampWheel(-Math.round(event.deltaY));
     if (deltaX !== 0 || deltaY !== 0) {
-      fireInput({ kind: "wheel", deltaX, deltaY });
+      fireInput({ kind: "wheel", deltaX, deltaY }, inputContext);
     }
   }, { passive: false });
   viewport.addEventListener("keydown", (event) => {
@@ -3464,8 +3574,8 @@ function focusRemoteKeyboard(viewport = remoteTextInput?.viewport): void {
 }
 
 function fireRemoteText(text: string): void {
-  const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
-  if (streamId !== null) void inputDispatcher.enqueueText(text, streamId).catch(() => {});
+  const inputContext = currentInputContext();
+  if (inputContext) void inputDispatcher.enqueueText(text, inputContext).catch(() => {});
 }
 
 function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
@@ -3479,6 +3589,8 @@ function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
   event.preventDefault();
   const physicalCode = event.code || key.key;
   if (pressed) {
+    const inputContext = currentInputContext();
+    if (!inputContext) return;
     const ownModifier = keyboardModifierMask(key.key);
     const input: ControllerKeyInput = {
       kind: "key",
@@ -3487,20 +3599,23 @@ function sendKeyboardEvent(event: KeyboardEvent, pressed: boolean): void {
       pressed: true,
       modifiers: keyboardModifiers(event, pressedKeys.modifierMask() | ownModifier),
     };
+    heldKeyboardContext = inputContext;
     for (const next of pressedKeys.press(physicalCode, input)) {
-      fireInput(next);
+      fireInput(next, inputContext);
     }
   } else {
     for (const next of pressedKeys.release(physicalCode)) {
-      fireInput(next);
+      if (heldKeyboardContext) fireInput(next, heldKeyboardContext);
     }
   }
 }
 
 function releaseKeyboardState(): void {
+  const inputContext = heldKeyboardContext;
   for (const input of pressedKeys.releaseAll()) {
-    fireInput(input);
+    if (inputContext) fireInput(input, inputContext);
   }
+  heldKeyboardContext = null;
 }
 
 function resetRemoteTextInput(): void {
@@ -3517,15 +3632,18 @@ function resetRemoteInputState(): void {
 function releaseInputState(): void {
   releaseKeyboardState();
   for (const button of pressedButtons) {
-    fireInput({ kind: "mouseButton", button, pressed: false });
+    if (heldButtonContext) fireInput({ kind: "mouseButton", button, pressed: false }, heldButtonContext);
   }
   pressedButtons.clear();
+  heldButtonContext = null;
 }
 
 async function pasteLocalClipboardText(): Promise<void> {
-  if (smartPasteBusy || snapshot?.runtime.state !== "connected") {
+  const inputContext = currentInputContext();
+  if (smartPasteBusy || !inputContext) {
     return;
   }
+  const generation = channelGeneration;
   smartPasteBusy = true;
   smartPastePending = true;
   clipboardTransfer = {
@@ -3539,8 +3657,10 @@ async function pasteLocalClipboardText(): Promise<void> {
   resetRemoteInputState();
   try {
     await inputDispatcher.drain();
-    await pasteControllerClipboardText();
+    if (!sameInputContext(currentInputContext(), inputContext)) throw new Error("画面已切换，请重新粘贴文字。");
+    await pasteControllerClipboardText(inputContext);
   } catch (error) {
+    if (generation !== channelGeneration) return;
     smartPasteBusy = false;
     smartPastePending = false;
     openTransferPanel();
@@ -3551,33 +3671,25 @@ async function pasteLocalClipboardText(): Promise<void> {
       message: normalizeError(error),
     };
   } finally {
-    updateTransferPanel({ ledger: false });
-    focusRemoteKeyboard();
+    if (generation === channelGeneration) {
+      updateTransferPanel({ ledger: false });
+      if (sameInputContext(currentInputContext(), inputContext)) focusRemoteKeyboard();
+    }
   }
 }
 
-function fireInput(input: ControllerInput): void {
-  const streamId = snapshot?.runtime.state === "connected"
-    ? snapshot.runtime.streamId
-    : null;
-  if (streamId !== null) {
-    inputDispatcher.enqueue(input, streamId);
-  }
+function fireInput(input: ControllerInput, inputContext: RemoteInputContext): void {
+  inputDispatcher.enqueue(input, inputContext);
 }
 
-function fireMouseMove(x: number, y: number): void {
-  const streamId = snapshot?.runtime.state === "connected"
-    ? snapshot.runtime.streamId
-    : null;
-  if (streamId !== null) {
-    inputDispatcher.enqueueMouseMove(x, y, streamId);
-  }
+function fireMouseMove(x: number, y: number, inputContext: RemoteInputContext): void {
+  inputDispatcher.enqueueMouseMove(x, y, inputContext);
 }
 
 async function sendRemoteShortcut(id: string): Promise<void> {
   const input = remoteShortcutInput(id);
-  const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
-  if (!input || streamId === null || remoteShortcutBusy || remoteTextInput?.state.isComposing) return;
+  const inputContext = currentInputContext();
+  if (!input || !inputContext || remoteShortcutBusy || remoteTextInput?.state.isComposing) return;
   const generation = channelGeneration;
   resetRemoteInputState();
   remoteShortcutBusy = true;
@@ -3586,13 +3698,13 @@ async function sendRemoteShortcut(id: string): Promise<void> {
   const buttons = document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]");
   buttons.forEach((button) => { button.disabled = true; });
   try {
-    await inputDispatcher.enqueueShortcut(input, streamId);
+    await inputDispatcher.enqueueShortcut(input, inputContext);
   } catch (error) {
-    if (channelGeneration === generation && snapshot?.runtime.streamId === streamId) showOperationError(error);
+    if (channelGeneration === generation && sameInputContext(currentInputContext(), inputContext)) showOperationError(error);
   } finally {
     remoteShortcutBusy = false;
     document.querySelectorAll<HTMLButtonElement>("[data-controller-shortcut]").forEach((button) => { button.disabled = false; });
-    if (channelGeneration === generation && snapshot?.runtime.streamId === streamId) focusRemoteKeyboard();
+    if (channelGeneration === generation && sameInputContext(currentInputContext(), inputContext)) focusRemoteKeyboard();
   }
 }
 
@@ -3616,10 +3728,10 @@ async function submitTextInput(event: SubmitEvent): Promise<void> {
     submit.setAttribute("aria-busy", "true");
   }
   try {
-    const streamId = snapshot?.runtime.state === "connected" ? snapshot.runtime.streamId : null;
-    if (streamId === null) return;
+    const inputContext = currentInputContext();
+    if (!inputContext) return;
     releaseKeyboardState();
-    await inputDispatcher.enqueueText(text, streamId);
+    await inputDispatcher.enqueueText(text, inputContext);
     input.value = "";
     closeTextInput();
   } catch (error) {
@@ -3694,12 +3806,14 @@ function setupRemoteGeometry(viewport: HTMLElement, canvas: HTMLCanvasElement): 
   remoteCanvasElement = canvas;
   remoteCursorElement = document.querySelector<HTMLElement>("[data-remote-cursor]");
   const refresh = () => {
+    suspendPresentedInput();
     syncRemoteCanvasPixelSize(canvas);
     remoteCanvasBounds = readRemoteCanvasBounds(canvas);
     remoteViewportBounds = viewport.getBoundingClientRect();
     remoteViewportScrollLeft = viewport.scrollLeft;
     remoteViewportScrollTop = viewport.scrollTop;
     syncRemoteCanvasFitState(viewport, canvas);
+    schedulePresentedInputActivation();
   };
   const handleScroll = () => {
     const nextScrollLeft = viewport.scrollLeft;

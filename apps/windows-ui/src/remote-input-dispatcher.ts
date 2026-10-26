@@ -1,15 +1,15 @@
-import type { ControllerInput } from "./types";
+import type { ControllerInput, RemoteInputContext } from "./types";
 import { MAX_WHEEL_DELTA } from "./input-contract.generated";
+import { validInputContext } from "./remote-input-context";
 
-type InputSender = (input: ControllerInput, streamId: number) => Promise<void>;
-type TextSender = (text: string, streamId: number) => Promise<void>;
+type InputSender = (input: ControllerInput, context: RemoteInputContext) => Promise<void>;
+type TextSender = (text: string, context: RemoteInputContext) => Promise<void>;
 
-interface QueuedInput {
+interface QueuedInput extends RemoteInputContext {
   input?: ControllerInput;
   text?: string;
   shortcut?: ControllerInput;
   shortcutGeneration?: number;
-  streamId: number;
   resolve?: () => void;
   reject?: (error: unknown) => void;
 }
@@ -27,7 +27,7 @@ export class RemoteInputDispatcher {
   private readonly queue: QueuedInput[] = [];
   private queueHead = 0;
   private pumping: Promise<void> | null = null;
-  private readonly pendingMouseMove = { x: 0, y: 0, streamId: 0 };
+  private readonly pendingMouseMove = { x: 0, y: 0, streamId: "", inputEpoch: "" };
   private hasPendingMouseMove = false;
   private generation = 0;
   private shortcutGeneration = 0;
@@ -38,7 +38,9 @@ export class RemoteInputDispatcher {
     private readonly textSender?: TextSender,
   ) {}
 
-  enqueue(input: ControllerInput, streamId: number): void {
+  enqueue(input: ControllerInput, context: RemoteInputContext): void {
+    if (!validInputContext(context)) { this.onError(); return; }
+    const { streamId, inputEpoch } = context;
     if (input.kind === "wheel" && (!Number.isSafeInteger(input.deltaX ?? 0) || !Number.isSafeInteger(input.deltaY ?? 0))) {
       this.onError();
       return;
@@ -47,11 +49,11 @@ export class RemoteInputDispatcher {
     const last = this.queue.length > this.queueHead
       ? this.queue[this.queue.length - 1]
       : undefined;
-    const queued = { input, streamId };
+    const queued = { input, streamId, inputEpoch };
     if (
       input.kind === "wheel"
       && last?.input?.kind === "wheel"
-      && last.streamId === streamId
+      && last.streamId === streamId && last.inputEpoch === inputEpoch
       && sameDirection(last.input.deltaX, input.deltaX)
       && sameDirection(last.input.deltaY, input.deltaY)
       && Number.isSafeInteger((last.input.deltaX ?? 0) + (input.deltaX ?? 0))
@@ -62,7 +64,7 @@ export class RemoteInputDispatcher {
     } else if (
       input.kind === "mouseMove"
       && last?.input?.kind === "mouseMove"
-      && last.streamId === streamId
+      && last.streamId === streamId && last.inputEpoch === inputEpoch
     ) {
       this.queue[this.queue.length - 1] = queued;
     } else {
@@ -71,27 +73,31 @@ export class RemoteInputDispatcher {
     this.startPump();
   }
 
-  enqueueText(text: string, streamId: number): Promise<void> {
+  enqueueText(text: string, context: RemoteInputContext): Promise<void> {
+    if (!validInputContext(context)) return Promise.reject(new Error("Invalid remote input context"));
+    const { streamId, inputEpoch } = context;
     this.flushPendingMouseMove();
     // The existing native text command accepts at most 256 Unicode scalars.
     const characters = Array.from(text);
     const pending: Promise<void>[] = [];
     for (let offset = 0; offset < characters.length; offset += 256) {
       pending.push(new Promise<void>((resolve, reject) => {
-        this.queue.push({ text: characters.slice(offset, offset + 256).join(""), streamId, resolve, reject });
+        this.queue.push({ text: characters.slice(offset, offset + 256).join(""), streamId, inputEpoch, resolve, reject });
       }));
     }
     this.startPump();
     return Promise.all(pending).then(() => {});
   }
 
-  enqueueShortcut(input: ControllerInput, streamId: number): Promise<void> {
+  enqueueShortcut(input: ControllerInput, context: RemoteInputContext): Promise<void> {
+    if (!validInputContext(context)) return Promise.reject(new Error("Invalid remote input context"));
+    const { streamId, inputEpoch } = context;
     if (input.kind !== "key" || !input.key || input.pressed !== true) {
       return Promise.reject(new Error("Invalid remote shortcut"));
     }
     this.flushPendingMouseMove();
     const pending = new Promise<void>((resolve, reject) => {
-      this.queue.push({ shortcut: { ...input }, shortcutGeneration: this.shortcutGeneration, streamId, resolve, reject });
+      this.queue.push({ shortcut: { ...input }, shortcutGeneration: this.shortcutGeneration, streamId, inputEpoch, resolve, reject });
     });
     this.startPump();
     return pending;
@@ -106,22 +112,25 @@ export class RemoteInputDispatcher {
    * hardware event while an IPC call is still in flight. Discrete input is
    * flushed ahead of button/key events so their original order is preserved.
    */
-  enqueueMouseMove(x: number, y: number, streamId: number): void {
+  enqueueMouseMove(x: number, y: number, context: RemoteInputContext): void {
+    if (!validInputContext(context)) { this.onError(); return; }
+    const { streamId, inputEpoch } = context;
     const last = this.queue.length > this.queueHead
       ? this.queue[this.queue.length - 1]
       : undefined;
-    if (last?.input?.kind === "mouseMove" && last.streamId === streamId) {
+    if (last?.input?.kind === "mouseMove" && last.streamId === streamId && last.inputEpoch === inputEpoch) {
       last.input.x = x;
       last.input.y = y;
     } else if (last) {
-      this.queue.push({ input: { kind: "mouseMove", x, y }, streamId });
-    } else if (this.hasPendingMouseMove && this.pendingMouseMove.streamId !== streamId) {
+      this.queue.push({ input: { kind: "mouseMove", x, y }, streamId, inputEpoch });
+    } else if (this.hasPendingMouseMove && (this.pendingMouseMove.streamId !== streamId || this.pendingMouseMove.inputEpoch !== inputEpoch)) {
       this.flushPendingMouseMove();
-      this.queue.push({ input: { kind: "mouseMove", x, y }, streamId });
+      this.queue.push({ input: { kind: "mouseMove", x, y }, streamId, inputEpoch });
     } else {
       this.pendingMouseMove.x = x;
       this.pendingMouseMove.y = y;
       this.pendingMouseMove.streamId = streamId;
+      this.pendingMouseMove.inputEpoch = inputEpoch;
       this.hasPendingMouseMove = true;
     }
     this.startPump();
@@ -174,6 +183,7 @@ export class RemoteInputDispatcher {
         if (!queued) {
           continue;
         }
+        const context = { streamId: queued.streamId, inputEpoch: queued.inputEpoch };
         try {
           if (queued.shortcut) {
             if (queued.shortcutGeneration !== this.shortcutGeneration) throw new Error("Remote shortcut was cancelled");
@@ -181,14 +191,14 @@ export class RemoteInputDispatcher {
             // Key-up uses the same mask, releasing the main key before modifiers.
             // Always attempt it after an uncertain IPC result or cancellation.
             try {
-              await this.sender(queued.shortcut, queued.streamId);
+              await this.sender(queued.shortcut, context);
               if (queued.shortcutGeneration !== this.shortcutGeneration) throw new Error("Remote shortcut was cancelled");
             } finally {
-              await this.sender({ ...queued.shortcut, pressed: false }, queued.streamId);
+              await this.sender({ ...queued.shortcut, pressed: false }, context);
             }
           } else if (queued.text !== undefined) {
             if (!this.textSender) throw new Error("Remote text sender is unavailable");
-            await this.textSender(queued.text, queued.streamId);
+            await this.textSender(queued.text, context);
           } else if (queued.input) {
             if (queued.input.kind === "wheel") {
               const generation = this.generation;
@@ -197,12 +207,12 @@ export class RemoteInputDispatcher {
               while ((x !== 0 || y !== 0) && generation === this.generation) {
                 const deltaX = Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, x));
                 const deltaY = Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, y));
-                await this.sender({ kind: "wheel", deltaX, deltaY }, queued.streamId);
+                await this.sender({ kind: "wheel", deltaX, deltaY }, context);
                 x -= deltaX;
                 y -= deltaY;
               }
             } else {
-              await this.sender(queued.input, queued.streamId);
+              await this.sender(queued.input, context);
             }
           }
           queued.resolve?.();
@@ -215,10 +225,10 @@ export class RemoteInputDispatcher {
       if (!this.hasPendingMouseMove) {
         return;
       }
-      const { x, y, streamId } = this.pendingMouseMove;
+      const { x, y, streamId, inputEpoch } = this.pendingMouseMove;
       this.hasPendingMouseMove = false;
       try {
-        await this.sender({ kind: "mouseMove", x, y }, streamId);
+        await this.sender({ kind: "mouseMove", x, y }, { streamId, inputEpoch });
       } catch {
         this.onError();
       }
@@ -236,6 +246,7 @@ export class RemoteInputDispatcher {
         y: this.pendingMouseMove.y,
       },
       streamId: this.pendingMouseMove.streamId,
+      inputEpoch: this.pendingMouseMove.inputEpoch,
     });
     this.hasPendingMouseMove = false;
   }
