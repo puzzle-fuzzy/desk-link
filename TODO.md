@@ -360,6 +360,8 @@
 - [x] **GUI 日志与报告接线（`fix(DL2-044): persist cursor diagnostics in desktop reports`）：** 普通Host与配对Host均注册typed observer，复用各worker的DiagnosticLog；既有后台有界dispatcher执行落盘，原stream保持为历史记录，不更新当前GUI状态。实际callback→临时日志/sync_data→sanitized history→生产合并/报告builder回归通过；同services `b1118ad465703493255123e23b6f522662c3d603` 原样fixture的4个case逐字段/类型比对通过（仅忽略动态timestamp，u64溢出仍是服务拒绝的negative）。Windows lib218通过/2忽略、管理库137通过/1签名资产忽略，两包lib+tests严格Clippy通过。云上传源码保持冻结基线，不吞事件；服务历史尚未合入本GUI分支，整体验签/存储另验。
 - [ ] 将已提交服务合同与GUI接线纳入最终整体候选并验证真实接收/存储；真实GUI导出操作、网络长稳与实际双机鼠标体验另验，不从localhost推定丢包率。
 
+- [x] **044/045共同u64精度修复（独立切片）：** 先以合法配置→actual日志→Rust原始body/hash/Ed25519 SignedRequest→固定旧服务validator复现：safe/zero-counter对照通过，2^53/2^53+1/MAX stream及MAX counter被400；原v1“overflow negative”只是旧服务拒绝现象，不代表合法u64本身非法。七事件18个真实u64键仅在诊断JSON边界改规范十进制string，typed observer仍u64；旧Rust日志按event+key精确无损规范化后重新序列化/hash/sign，不复用旧签名，不过滤。选中批次known非法值整批Encoding；unknown仍交服务固定schema。唯一producer fixture含6当前+6历史签名请求与实际字段表/source指纹。Windows `--lib`226通过/2忽略，管理库141通过/1忽略，两包lib+tests严格Clippy通过。细节与未验项见 `docs/windows-diagnostic-u64-contract.md`。
+
 ### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
 
 - [ ] 区分监听终态并使禁用原因可观测。
@@ -369,6 +371,8 @@
 - **验证：** Windows新增2项通过：真实认证双路径的活动Arc清理/IDR、已完成probe但尚未安装的迟到连接被关闭、诊断只一次与禁用后accept pending；固定日志字段测试。原有Some(Err)continue与真实endpoint.close→None边界另由probe回归证明，不冒称复现原本不存在的“握手错误禁用”缺陷。
 - [x] **GUI 日志与报告接线（`fix(DL2-045): retain listener termination in desktop reports`）：** 044已注册的普通/配对Host observer同时记录typed DirectListenerStopped，复用原日志与报告链；固定reason与retired_active两值均保留，不推断中继随后已恢复。新增同services `bf5d7eb27f3f41be59ac317b63d7e93d10f38066` 原样fixture四case→实际callback/临时日志/sync_data→生产合并/报告builder的七字段/类型回归；仅忽略动态timestamp，完整保留u64，overflow仍是服务negative。最终管理库`--lib`138通过/1签名资产忽略，两包lib+tests严格Clippy通过；044已验证的Windows`--lib`218通过/2忽略源码保持不变，不混同原joint的283/17（lib+integration范围）。原始日志与源码前后指纹见 `E:/desk-link/.worktrees/dl2-targets/windows-diagnostics/validation/`。
 - [ ] 将GUI接线与已提交服务合同纳入最终整体候选，验证真实验签/接收/存储及实际GUI导出；真实监听故障、设备与长稳另验。服务历史尚未合入此GUI分支，不把producer/报告builder自动证据当成整套验收。
+
+- [x] **共同u64数值精度切片：** 与044同一独立提交；DirectListenerStopped stream与所有同行Lifecycle/Controller u64字段都无损JSON字符串，GUI诊断报告不混淆相邻大stream。旧实际签名body保留，新日志与旧日志升级请求重算hash/sign；同一producer fixture供services消费，原生observer/原因/retired_active与输入wire未改。完整服务闭环尚未在本分支合入验收，不能以producer测试总体打勾。
 
 ### DL2-046 · P1 · 出站探测生命周期与活动直连仲裁
 

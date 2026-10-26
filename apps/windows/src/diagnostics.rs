@@ -186,6 +186,88 @@ pub enum DiagnosticEvent {
     },
 }
 
+/// Reads a canonical decimal u64 string or an exact integer from Rust JSON.
+/// Numeric compatibility is for original Rust logs, before any JavaScript parsing.
+pub fn diagnostic_u64(value: &serde_json::Value) -> Option<u64> {
+    if let Some(text) = value.as_str() {
+        let bytes = text.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > 20
+            || (bytes.len() > 1 && bytes[0] == b'0')
+            || !bytes.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        text.parse().ok()
+    } else {
+        value.as_u64()
+    }
+}
+
+pub(crate) fn diagnostic_u64_fields(event: &str) -> &'static [&'static str] {
+    match event {
+        "host_connecting"
+        | "host_available"
+        | "host_connected"
+        | "host_direct_listener_stopped" => &["stream_id"],
+        "host_cursor_send" => &["stream_id", "send_attempts", "send_errors"],
+        "controller_video_metrics" => &[
+            "stream_id",
+            "received_video_packets",
+            "dropped_video_packets",
+            "completed_frames",
+            "delivered_video_frames",
+            "video_ipc_overflow_drops",
+            "video_ipc_keyframe_replacements",
+            "input_backpressure_count",
+        ],
+        "controller_render_metrics" => &[
+            "stream_id",
+            "received_frames",
+            "submitted_frames",
+            "displayed_frames",
+            "malformed_frames",
+            "coalesced_frame_drops",
+            "first_frame_ms",
+            "max_frame_gap_ms",
+            "profile_probe_ms",
+        ],
+        _ => &[],
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("diagnostic u64 field is invalid")]
+pub(crate) struct InvalidDiagnosticU64;
+
+/// Validates known u64 fields before converting historical Rust JSON integers.
+/// Invalid known fields leave the entire event unchanged; other fields and
+/// unknown events remain available for service validation.
+pub(crate) fn normalize_u64_diagnostic_fields(
+    value: &mut serde_json::Value,
+) -> Result<(), InvalidDiagnosticU64> {
+    let Some(event) = value.get("event").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let fields = diagnostic_u64_fields(event);
+    for field in fields {
+        if let Some(value) = value.get(*field) {
+            let integer = diagnostic_u64(value).ok_or(InvalidDiagnosticU64)?;
+            if *field == "stream_id" && integer == 0 {
+                return Err(InvalidDiagnosticU64);
+            }
+        }
+    }
+    for field in fields {
+        if let Some(value) = value.get_mut(*field)
+            && let Some(integer) = value.as_u64()
+        {
+            *value = serde_json::Value::String(integer.to_string());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum DiagnosticLogError {
     #[error("diagnostic log storage path is unavailable")]
@@ -373,14 +455,14 @@ fn encode_event(event: &DiagnosticEvent) -> String {
         }
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Connecting { attempt, stream_id }) => {
             format!(
-                "\"level\":\"info\",\"event\":\"host_connecting\",\"attempt\":{attempt},\"stream_id\":{stream_id}"
+                "\"level\":\"info\",\"event\":\"host_connecting\",\"attempt\":{attempt},\"stream_id\":\"{stream_id}\""
             )
         }
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Available { stream_id }) => {
-            format!("\"level\":\"info\",\"event\":\"host_available\",\"stream_id\":{stream_id}")
+            format!("\"level\":\"info\",\"event\":\"host_available\",\"stream_id\":\"{stream_id}\"")
         }
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Connected { stream_id }) => {
-            format!("\"level\":\"info\",\"event\":\"host_connected\",\"stream_id\":{stream_id}")
+            format!("\"level\":\"info\",\"event\":\"host_connected\",\"stream_id\":\"{stream_id}\"")
         }
         DiagnosticEvent::Lifecycle(HostLifecycleEvent::Reconnecting {
             retry,
@@ -403,7 +485,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             disabled,
             reason,
         }) => format!(
-            "\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":{stream_id},\"send_attempts\":{send_attempts},\"send_errors\":{send_errors},\"disabled\":{disabled},\"reason\":\"{}\"",
+            "\"level\":\"warning\",\"event\":\"host_cursor_send\",\"stream_id\":\"{stream_id}\",\"send_attempts\":\"{send_attempts}\",\"send_errors\":\"{send_errors}\",\"disabled\":{disabled},\"reason\":\"{}\"",
             reason.as_str()
         ),
         DiagnosticEvent::HostMedia(HostMediaDiagnostic::DirectListenerStopped {
@@ -411,7 +493,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             retired_active,
             reason,
         }) => format!(
-            "\"level\":\"warning\",\"event\":\"host_direct_listener_stopped\",\"stream_id\":{stream_id},\"retired_active\":{retired_active},\"reason\":\"{}\"",
+            "\"level\":\"warning\",\"event\":\"host_direct_listener_stopped\",\"stream_id\":\"{stream_id}\",\"retired_active\":{retired_active},\"reason\":\"{}\"",
             reason.as_str()
         ),
         DiagnosticEvent::OperationSucceeded(operation) => format!(
@@ -462,7 +544,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             input_backpressure_count,
         } => {
             let stream_id =
-                stream_id.map_or_else(String::new, |value| format!(",\"stream_id\":{value}"));
+                stream_id.map_or_else(String::new, |value| format!(",\"stream_id\":\"{value}\""));
             let video_path = json_string(&bounded_redacted_text(video_path));
             let video_path_rtt_ms = video_path_rtt_ms.map_or_else(String::new, |value| {
                 format!(",\"video_path_rtt_ms\":{value}")
@@ -481,7 +563,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
                         )
                     });
             format!(
-                "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt}{stream_id},\"video_path\":{video_path}{video_path_rtt_ms}{video_path_loss_basis_points}{video_path_fallback_reason},\"received_video_packets\":{received_video_packets},\"dropped_video_packets\":{dropped_video_packets},\"completed_frames\":{completed_frames},\"delivered_video_frames\":{delivered_video_frames},\"video_ipc_overflow_drops\":{video_ipc_overflow_drops},\"video_ipc_keyframe_replacements\":{video_ipc_keyframe_replacements},\"input_backpressure_count\":{input_backpressure_count}"
+                "\"level\":\"info\",\"event\":\"controller_video_metrics\",\"attempt\":{attempt}{stream_id},\"video_path\":{video_path}{video_path_rtt_ms}{video_path_loss_basis_points}{video_path_fallback_reason},\"received_video_packets\":\"{received_video_packets}\",\"dropped_video_packets\":\"{dropped_video_packets}\",\"completed_frames\":\"{completed_frames}\",\"delivered_video_frames\":\"{delivered_video_frames}\",\"video_ipc_overflow_drops\":\"{video_ipc_overflow_drops}\",\"video_ipc_keyframe_replacements\":\"{video_ipc_keyframe_replacements}\",\"input_backpressure_count\":\"{input_backpressure_count}\""
             )
         }
         DiagnosticEvent::ControllerRenderMetrics {
@@ -504,13 +586,14 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             profile_probe_ms,
             profile_fallback_reason,
         } => {
-            let first_frame_ms = first_frame_ms
-                .map_or_else(String::new, |value| format!(",\"first_frame_ms\":{value}"));
+            let first_frame_ms = first_frame_ms.map_or_else(String::new, |value| {
+                format!(",\"first_frame_ms\":\"{value}\"")
+            });
             let displayed_fps_x100 = displayed_fps_x100.map_or_else(String::new, |value| {
                 format!(",\"displayed_fps_x100\":{value}")
             });
             let max_frame_gap_ms = max_frame_gap_ms.map_or_else(String::new, |value| {
-                format!(",\"max_frame_gap_ms\":{value}")
+                format!(",\"max_frame_gap_ms\":\"{value}\"")
             });
             let h264_profile = match h264_profile {
                 H264Profile::Main => "main",
@@ -519,7 +602,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
             let profile_probe =
                 format!(",\"profile_probe\":{}", json_string(profile_probe.as_str()));
             let profile_probe_ms = profile_probe_ms.map_or_else(String::new, |value| {
-                format!(",\"profile_probe_ms\":{value}")
+                format!(",\"profile_probe_ms\":\"{value}\"")
             });
             let profile_fallback_reason =
                 profile_fallback_reason
@@ -532,7 +615,7 @@ fn encode_event(event: &DiagnosticEvent) -> String {
                     });
             let video_path = json_string(&bounded_redacted_text(video_path));
             format!(
-                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":{stream_id},\"video_width\":{video_width},\"video_height\":{video_height},\"video_path\":{video_path},\"received_frames\":{received_frames},\"submitted_frames\":{submitted_frames},\"displayed_frames\":{displayed_frames},\"malformed_frames\":{malformed_frames},\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures},\"coalesced_frame_drops\":{coalesced_frame_drops},\"h264_profile\":\"{h264_profile}\"{profile_probe}{profile_probe_ms}{profile_fallback_reason}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
+                "\"level\":\"info\",\"event\":\"controller_render_metrics\",\"stream_id\":\"{stream_id}\",\"video_width\":{video_width},\"video_height\":{video_height},\"video_path\":{video_path},\"received_frames\":\"{received_frames}\",\"submitted_frames\":\"{submitted_frames}\",\"displayed_frames\":\"{displayed_frames}\",\"malformed_frames\":\"{malformed_frames}\",\"decoder_recoveries\":{decoder_recoveries},\"video_pull_failures\":{video_pull_failures},\"coalesced_frame_drops\":\"{coalesced_frame_drops}\",\"h264_profile\":\"{h264_profile}\"{profile_probe}{profile_probe_ms}{profile_fallback_reason}{first_frame_ms}{displayed_fps_x100}{max_frame_gap_ms}"
             )
         }
     };
@@ -713,6 +796,373 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    const U64_EVENT_FIELDS: &[(&str, &[&str])] = &[
+        ("host_connecting", &["stream_id"]),
+        ("host_available", &["stream_id"]),
+        ("host_connected", &["stream_id"]),
+        (
+            "host_cursor_send",
+            &["stream_id", "send_attempts", "send_errors"],
+        ),
+        ("host_direct_listener_stopped", &["stream_id"]),
+        (
+            "controller_video_metrics",
+            &[
+                "stream_id",
+                "received_video_packets",
+                "dropped_video_packets",
+                "completed_frames",
+                "delivered_video_frames",
+                "video_ipc_overflow_drops",
+                "video_ipc_keyframe_replacements",
+                "input_backpressure_count",
+            ],
+        ),
+        (
+            "controller_render_metrics",
+            &[
+                "stream_id",
+                "received_frames",
+                "submitted_frames",
+                "displayed_frames",
+                "malformed_frames",
+                "coalesced_frame_drops",
+                "first_frame_ms",
+                "max_frame_gap_ms",
+                "profile_probe_ms",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn diagnostic_u64_preserves_canonical_strings_and_original_rust_integer_boundaries() {
+        for value in [
+            0,
+            1,
+            (1_u64 << 53) - 1,
+            1_u64 << 53,
+            (1_u64 << 53) + 1,
+            u64::MAX,
+        ] {
+            let original: serde_json::Value = serde_json::from_str(&value.to_string()).unwrap();
+            assert_eq!(diagnostic_u64(&original), Some(value));
+            assert_eq!(
+                diagnostic_u64(&serde_json::Value::String(value.to_string())),
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_u64_rejects_noncanonical_strings_and_noninteger_json() {
+        for text in [
+            "",
+            "00",
+            "01",
+            "-0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "\t1",
+            "1\n",
+            "1.0",
+            "1e2",
+            "１",
+            "١",
+            "18446744073709551616",
+            "100000000000000000000",
+        ] {
+            assert_eq!(
+                diagnostic_u64(&serde_json::Value::from(text)),
+                None,
+                "{text:?}"
+            );
+        }
+        for json in [
+            "null",
+            "true",
+            "[]",
+            "{}",
+            "-1",
+            "-0",
+            "0.0",
+            "1.0",
+            "1e2",
+            "18446744073709551616",
+        ] {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(diagnostic_u64(&value), None, "{json}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_u64_field_table_covers_exactly_the_seven_product_events() {
+        let mut unique_fields = std::collections::BTreeSet::new();
+        for &(event, fields) in U64_EVENT_FIELDS {
+            assert_eq!(diagnostic_u64_fields(event), fields, "{event}");
+            unique_fields.extend(fields.iter().copied());
+        }
+        assert_eq!(unique_fields.len(), 18);
+        for event in [
+            "",
+            "host_stopped",
+            "controller_connected",
+            "future_event",
+            "HOST_CONNECTED",
+        ] {
+            assert!(diagnostic_u64_fields(event).is_empty(), "{event}");
+        }
+    }
+
+    fn diagnostic_events_with_u64(value: u64) -> [DiagnosticEvent; 7] {
+        let stream_id = value.max(1);
+        [
+            DiagnosticEvent::Lifecycle(HostLifecycleEvent::Connecting {
+                attempt: 7,
+                stream_id,
+            }),
+            DiagnosticEvent::Lifecycle(HostLifecycleEvent::Available { stream_id }),
+            DiagnosticEvent::Lifecycle(HostLifecycleEvent::Connected { stream_id }),
+            DiagnosticEvent::HostMedia(HostMediaDiagnostic::CursorSend {
+                stream_id,
+                send_attempts: value,
+                send_errors: value,
+                disabled: true,
+                reason: crate::runtime::CursorDisableReason::CapabilityOrSize,
+            }),
+            DiagnosticEvent::HostMedia(HostMediaDiagnostic::DirectListenerStopped {
+                stream_id,
+                retired_active: true,
+                reason: crate::runtime::DirectListenerStopReason::ListenerClosed,
+            }),
+            DiagnosticEvent::ControllerVideoMetrics {
+                attempt: 7,
+                stream_id: Some(stream_id),
+                video_path: "relay".to_owned(),
+                video_path_rtt_ms: Some(22),
+                video_path_loss_basis_points: Some(12),
+                video_path_fallback_reason: None,
+                received_video_packets: value,
+                dropped_video_packets: value,
+                completed_frames: value,
+                delivered_video_frames: value,
+                video_ipc_overflow_drops: value,
+                video_ipc_keyframe_replacements: value,
+                input_backpressure_count: value,
+            },
+            DiagnosticEvent::ControllerRenderMetrics {
+                stream_id,
+                video_width: 1920,
+                video_height: 1080,
+                video_path: "relay".to_owned(),
+                received_frames: value,
+                submitted_frames: value,
+                displayed_frames: value,
+                malformed_frames: value,
+                decoder_recoveries: 3,
+                video_pull_failures: 2,
+                first_frame_ms: Some(value),
+                displayed_fps_x100: Some(2970),
+                max_frame_gap_ms: Some(value),
+                coalesced_frame_drops: value,
+                h264_profile: H264Profile::Main,
+                profile_probe: H264ProfileProbe::Supported,
+                profile_probe_ms: Some(value),
+                profile_fallback_reason: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_product_u64_field_is_quoted_without_changing_smaller_numbers() {
+        for boundary in [
+            0,
+            1,
+            (1_u64 << 53) - 1,
+            1_u64 << 53,
+            (1_u64 << 53) + 1,
+            u64::MAX,
+        ] {
+            for (event, &(event_name, fields)) in diagnostic_events_with_u64(boundary)
+                .iter()
+                .zip(U64_EVENT_FIELDS)
+            {
+                let encoded = encode_event(event);
+                let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(value["event"], event_name);
+                for &field in fields {
+                    let expected = if field == "stream_id" {
+                        boundary.max(1)
+                    } else {
+                        boundary
+                    };
+                    assert_eq!(value[field], expected.to_string(), "{event_name}.{field}");
+                }
+                assert_eq!(value["schema"], 1);
+                assert!(value["timestamp_unix_ms"].as_u64().is_some());
+                for (field, expected) in [
+                    ("attempt", 7),
+                    ("video_path_rtt_ms", 22),
+                    ("video_path_loss_basis_points", 12),
+                    ("video_width", 1920),
+                    ("video_height", 1080),
+                    ("decoder_recoveries", 3),
+                    ("video_pull_failures", 2),
+                    ("displayed_fps_x100", 2970),
+                ] {
+                    if let Some(actual) = value.get(field) {
+                        assert_eq!(actual.as_u64(), Some(expected), "{event_name}.{field}");
+                    }
+                }
+            }
+        }
+        for event in [
+            DiagnosticEvent::Lifecycle(HostLifecycleEvent::Reconnecting {
+                retry: 1,
+                maximum_retries: 3,
+                delay: Duration::from_millis(500),
+                reason: "offline".to_owned(),
+            }),
+            DiagnosticEvent::ControllerConnection {
+                stage: ControllerDiagnosticStage::RetryScheduled,
+                attempt: 1,
+                retry: Some(1),
+                delay: Some(Duration::from_millis(500)),
+                reason: None,
+            },
+        ] {
+            let value: serde_json::Value = serde_json::from_str(&encode_event(&event)).unwrap();
+            assert_eq!(value["delay_ms"], 500);
+        }
+    }
+
+    #[test]
+    fn historical_normalization_changes_only_exact_event_and_field_pairs() {
+        let all_fields: std::collections::BTreeSet<_> = U64_EVENT_FIELDS
+            .iter()
+            .flat_map(|(_, fields)| fields.iter().copied())
+            .collect();
+        for &(event_name, fields) in U64_EVENT_FIELDS {
+            for boundary in [
+                0,
+                1,
+                (1_u64 << 53) - 1,
+                1_u64 << 53,
+                (1_u64 << 53) + 1,
+                u64::MAX,
+            ] {
+                let mut value = serde_json::json!({
+                    "event": event_name, "schema": 1, "timestamp_unix_ms": 123,
+                    "attempt": 2, "delay_ms": 500, "video_width": 1920,
+                    "decoder_recoveries": 3, "unknown_counter": u64::MAX,
+                    "nested": {"stream_id": u64::MAX},
+                });
+                for &field in &all_fields {
+                    value[field] = boundary.into();
+                }
+                value["stream_id"] = boundary.max(1).into();
+                let mut expected = value.clone();
+                for &field in fields {
+                    let integer = if field == "stream_id" {
+                        boundary.max(1)
+                    } else {
+                        boundary
+                    };
+                    expected[field] = integer.to_string().into();
+                }
+                assert_eq!(normalize_u64_diagnostic_fields(&mut value), Ok(()));
+                assert_eq!(value, expected, "{event_name} {boundary}");
+                assert_eq!(normalize_u64_diagnostic_fields(&mut value), Ok(()));
+                assert_eq!(value, expected, "normalization must be idempotent");
+            }
+        }
+    }
+
+    #[test]
+    fn historical_normalization_preserves_missing_unknown_and_canonical_values() {
+        let mut originals = vec![
+            serde_json::json!({"event": "host_connected"}),
+            serde_json::json!({"event": "future_event", "stream_id": u64::MAX}),
+            serde_json::json!({"event": "future_event", "stream_id": "01"}),
+            serde_json::json!({"event": 7, "stream_id": u64::MAX}),
+            serde_json::json!({"stream_id": u64::MAX}),
+            serde_json::json!([{"event": "host_connected", "stream_id": u64::MAX}]),
+            serde_json::Value::Null,
+        ];
+        for &(event_name, fields) in U64_EVENT_FIELDS {
+            for integer in [0_u64, 1, (1_u64 << 53) + 1, u64::MAX] {
+                let mut value = serde_json::json!({"event": event_name});
+                for &field in fields {
+                    let integer = if field == "stream_id" {
+                        integer.max(1)
+                    } else {
+                        integer
+                    };
+                    value[field] = integer.to_string().into();
+                }
+                value["unknown_counter"] = serde_json::json!(1.0);
+                originals.push(value);
+            }
+        }
+        for original in originals {
+            let mut value = original.clone();
+            assert_eq!(normalize_u64_diagnostic_fields(&mut value), Ok(()));
+            assert_eq!(value, original);
+        }
+    }
+
+    #[test]
+    fn historical_normalization_rejects_each_invalid_known_field_without_partial_changes() {
+        for &(event_name, fields) in U64_EVENT_FIELDS {
+            for &field in fields {
+                for invalid in [
+                    serde_json::json!(""),
+                    serde_json::json!("01"),
+                    serde_json::json!(" 1"),
+                    serde_json::json!("1 "),
+                    serde_json::json!("+1"),
+                    serde_json::json!("1e2"),
+                    serde_json::json!("18446744073709551616"),
+                    serde_json::json!("100000000000000000000"),
+                    serde_json::json!(-1),
+                    serde_json::json!(1.0),
+                    serde_json::json!(true),
+                    serde_json::Value::Null,
+                    serde_json::json!([]),
+                    serde_json::json!({}),
+                    serde_json::from_str("18446744073709551616").unwrap(),
+                ] {
+                    let mut original = serde_json::json!({"event": event_name});
+                    for &known_field in fields {
+                        original[known_field] = u64::MAX.into();
+                    }
+                    original[field] = invalid;
+                    let mut value = original.clone();
+                    assert_eq!(
+                        normalize_u64_diagnostic_fields(&mut value),
+                        Err(InvalidDiagnosticU64),
+                        "{event_name}.{field}"
+                    );
+                    assert_eq!(value, original, "failed normalization must be atomic");
+                }
+            }
+            for zero in [serde_json::json!(0), serde_json::json!("0")] {
+                let mut original = serde_json::json!({"event": event_name});
+                for &field in fields {
+                    original[field] = u64::MAX.into();
+                }
+                original["stream_id"] = zero;
+                let mut value = original.clone();
+                assert_eq!(
+                    normalize_u64_diagnostic_fields(&mut value),
+                    Err(InvalidDiagnosticU64)
+                );
+                assert_eq!(value, original);
+            }
+        }
+    }
+
     #[test]
     fn host_listener_terminal_diagnostic_has_only_fixed_reason_and_retirement_state() {
         let encoded = encode_event(&DiagnosticEvent::HostMedia(
@@ -724,6 +1174,7 @@ mod tests {
         ));
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["event"], "host_direct_listener_stopped");
+        assert_eq!(value["stream_id"], "7");
         assert_eq!(value["reason"], "listener_closed");
         assert_eq!(value["retired_active"], true);
         assert!(value.get("endpoint").is_none());
@@ -743,9 +1194,10 @@ mod tests {
         ));
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["event"], "host_cursor_send");
+        assert_eq!(value["stream_id"], "7");
         assert_eq!(value["reason"], "capability_or_size");
-        assert_eq!(value["send_attempts"], 2);
-        assert_eq!(value["send_errors"], 1);
+        assert_eq!(value["send_attempts"], "2");
+        assert_eq!(value["send_errors"], "1");
         assert_eq!(value["disabled"], true);
         assert!(value.get("total_drops").is_none());
         assert!(value.get("delivery_rate").is_none());
@@ -840,17 +1292,17 @@ mod tests {
 
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"event\":\"controller_video_metrics\""));
-        assert!(contents.contains("\"received_video_packets\":1200"));
-        assert!(contents.contains("\"dropped_video_packets\":4"));
-        assert!(contents.contains("\"completed_frames\":87"));
-        assert!(contents.contains("\"stream_id\":7"));
+        assert!(contents.contains("\"received_video_packets\":\"1200\""));
+        assert!(contents.contains("\"dropped_video_packets\":\"4\""));
+        assert!(contents.contains("\"completed_frames\":\"87\""));
+        assert!(contents.contains("\"stream_id\":\"7\""));
         assert!(contents.contains("\"video_path\":\"directLan\""));
         assert!(contents.contains("\"video_path_rtt_ms\":4"));
         assert!(contents.contains("\"video_path_loss_basis_points\":12"));
-        assert!(contents.contains("\"delivered_video_frames\":84"));
-        assert!(contents.contains("\"video_ipc_overflow_drops\":3"));
-        assert!(contents.contains("\"video_ipc_keyframe_replacements\":1"));
-        assert!(contents.contains("\"input_backpressure_count\":3"));
+        assert!(contents.contains("\"delivered_video_frames\":\"84\""));
+        assert!(contents.contains("\"video_ipc_overflow_drops\":\"3\""));
+        assert!(contents.contains("\"video_ipc_keyframe_replacements\":\"1\""));
+        assert!(contents.contains("\"input_backpressure_count\":\"3\""));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -883,16 +1335,16 @@ mod tests {
 
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"event\":\"controller_render_metrics\""));
-        assert!(contents.contains("\"stream_id\":7"));
-        assert!(contents.contains("\"displayed_frames\":82"));
+        assert!(contents.contains("\"stream_id\":\"7\""));
+        assert!(contents.contains("\"displayed_frames\":\"82\""));
         assert!(contents.contains("\"h264_profile\":\"high\""));
         assert!(contents.contains("\"profile_probe\":\"supported\""));
         assert!(contents.contains("\"decoder_recoveries\":2"));
         assert!(contents.contains("\"video_pull_failures\":2"));
-        assert!(contents.contains("\"first_frame_ms\":740"));
+        assert!(contents.contains("\"first_frame_ms\":\"740\""));
         assert!(contents.contains("\"displayed_fps_x100\":2970"));
-        assert!(contents.contains("\"max_frame_gap_ms\":167"));
-        assert!(contents.contains("\"coalesced_frame_drops\":4"));
+        assert!(contents.contains("\"max_frame_gap_ms\":\"167\""));
+        assert!(contents.contains("\"coalesced_frame_drops\":\"4\""));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

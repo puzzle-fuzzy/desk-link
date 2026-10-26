@@ -1,5 +1,13 @@
 # Windows Host media diagnostics
 
+The current full-width JSON format is defined in
+[`windows-diagnostic-u64-contract.md`](windows-diagnostic-u64-contract.md).
+All 18 typed diagnostic u64 fields now use canonical decimal strings; native
+observer types remain u64. The numeric fixtures and validation counts below
+describe the frozen `5069158` GUI-wiring slice. Its unsafe-number rejection was
+a contract defect for legal Rust u64 values, corrected by the new producer and
+old-log normalization slice; full-width strings are positive cases.
+
 `HostSupervisor::with_media_diagnostics_observer` and
 `HostRuntime::with_media_diagnostics_observer` accept a
 `HostMediaDiagnosticsObserver` (`Arc<dyn Fn(HostMediaDiagnostic) + Send + Sync>`).
