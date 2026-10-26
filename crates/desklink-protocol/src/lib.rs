@@ -1,4 +1,6 @@
 mod codec;
+mod transfer_v14;
+pub use transfer_v14::*;
 
 pub use codec::{
     ProtocolError, VideoReliableBatchBuilder, decode_audio_packet, decode_control,
@@ -15,11 +17,9 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
-/// Protocol 13 adds input restriction / recovery feedback and binds input to an
-/// explicit stream/epoch context using a tagged input wire format. The project has not shipped to
-/// end users, so development binaries move together instead of carrying a
-/// legacy protocol compatibility layer.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// Protocol 14 adds negotiated, bounded file tasks and durable block checkpoints.
+/// Input/Noise contracts remain unchanged. Protocol 13 peers are incompatible.
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_NOISE_HANDSHAKE_BYTES: usize = 4 * 1024;
 pub const MAX_VIDEO_CONFIG_BYTES: usize = 16 * 1024;
@@ -509,6 +509,7 @@ pub enum TransferMessage {
     Cancel {
         transfer_id: TransferId,
     },
+    FileTask(FileTaskMessage),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

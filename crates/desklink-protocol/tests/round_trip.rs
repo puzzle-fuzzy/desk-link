@@ -88,8 +88,8 @@ fn video_quality_commands_round_trip() {
 }
 
 #[test]
-fn input_state_requires_protocol_13() {
-    assert_eq!(PROTOCOL_VERSION, 13);
+fn input_state_requires_current_protocol() {
+    assert_eq!(PROTOCOL_VERSION, 14);
 }
 
 #[test]
