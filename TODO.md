@@ -187,6 +187,7 @@
 
 - [x] 共同协议合同切片（未端到端交付）：VideoConfig 在 stream_id 后发布非零 input_epoch:u64；InputEnvelope 在 timestamp_us 后携带非零 stream_id/input_epoch，InputContext 为不可变 Copy/Hash 标识。input codec 统一前缀 `[0, protocol_version:u16 LE]`，拒绝旧布局、截断、错版本、零上下文与尾字节；各 Postcard 解码边界采用 exact 解码，防旧功能键混淆为新鼠标输入。协议仍为 13。Rust protocol 49 项通过，`check --workspace --all-targets --locked` 通过。主题 `feat(DL2-013): bind input wire to explicit stream and geometry epochs`。
 - [x] Windows 共享 Rust API 来源切片 `feat(DL2-013): expose the captured-context runtime input bridge`：准确提取 Apple 已提交 `9ad7154b365de875d725188cfa091f5c21da0b5a` 的 ControllerRuntime::send_input_with_context(&self, InputContext, InputEvent)、必要 import、旧 send_input 明确拒绝及 encrypted controller_runtime 回归；未引入 C/Swift/worker 队列依赖。唯一必要前置为 `bc6c0a62` 的共享合同。`python scripts/run-windows-cargo.py test -p desklink-ffi --test controller_runtime --locked` 5 通过，包含真实加密输入传输；不表示主机/呈现/生产者整链已接通。
+- [x] 独立发送所有权切片 `feat(DL2-013): share an ordered input sender outside runtime event polling`：ControllerInputSender/input_sender 与 Runtime 共用同一发送实现及序号，输入专用锁覆盖完整 wire 写入；共享加密锁在网络等待前释放，热路径不逐包 clone Arc。FFI lib 12 通过、真实 encrypted controller_runtime 6 通过；36 帧含 32 并发 sender clone 严格 1..36，原 context 保留、零 context 不发包/不消耗序号。完整 FFI 尚有 2 个旧 Host 零 input_epoch 配置测试失败，保留为生产者未接通证据，不算全通过。
 - [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
 
 ## 4. 性能与数据通道
