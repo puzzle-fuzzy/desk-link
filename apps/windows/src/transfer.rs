@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -33,6 +34,60 @@ const MIN_FREE_SPACE_AFTER_RECEIVE: u64 = 64 * 1024 * 1024;
 pub const INCOMING_DISK_QUEUE_CAPACITY: usize = 2;
 const MAX_INCOMING_DISK_WORKERS: usize = 8;
 static ACTIVE_INCOMING_DISK_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static INCOMING_WRITERS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// The path remains owned until the file has been closed and all preserve or
+/// cancellation cleanup has completed, even after its async handle is dropped.
+struct IncomingWriterPermit(PathBuf);
+
+impl IncomingWriterPermit {
+    fn acquire(path: &Path) -> Result<Self, TransferResult> {
+        let parent = path.parent().ok_or(TransferResult::InvalidData)?;
+        let name = path.file_name().ok_or(TransferResult::InvalidData)?;
+        let canonical = fs::canonicalize(parent)
+            .map_err(|_| TransferResult::IoFailed)?
+            .join(name);
+        let mut writers = INCOMING_WRITERS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !writers.insert(canonical.clone()) {
+            return Err(TransferResult::Busy);
+        }
+        Ok(Self(canonical))
+    }
+}
+
+impl Drop for IncomingWriterPermit {
+    fn drop(&mut self) {
+        if let Some(writers) = INCOMING_WRITERS.get() {
+            writers
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&self.0);
+        }
+    }
+}
+
+fn incoming_write_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0);
+    }
+    options
+}
+
+fn incoming_open_error(error: std::io::Error) -> TransferResult {
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return TransferResult::Busy;
+    }
+    let _ = error;
+    TransferResult::IoFailed
+}
 
 struct IncomingDiskWorkerPermit;
 
@@ -457,6 +512,7 @@ pub struct IncomingFile {
     temporary_path: PathBuf,
     destination_directory: PathBuf,
     remove_on_drop: bool,
+    _writer: IncomingWriterPermit,
 }
 
 impl IncomingFile {
@@ -494,10 +550,10 @@ impl IncomingFile {
         }
         prepare_incoming_staging_directory(&directory)?;
         let temporary_path = incoming_temporary_path(&directory, transfer_id);
+        let writer = IncomingWriterPermit::acquire(&temporary_path)?;
         let mut hasher = Blake2s256::new();
-        let (file, written) = match OpenOptions::new()
+        let (file, written) = match incoming_write_options()
             .create_new(true)
-            .write(true)
             .open(&temporary_path)
         {
             Ok(file) => (file, 0),
@@ -507,16 +563,22 @@ impl IncomingFile {
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
                     return Err(TransferResult::IoFailed);
                 }
-                let written = metadata.len();
+                // Acquire exclusive writer ownership before reading metadata or
+                // hashing the prefix. The same handle then appends new data.
+                let mut file = incoming_write_options()
+                    .append(true)
+                    .read(true)
+                    .open(&temporary_path)
+                    .map_err(incoming_open_error)?;
+                let written = file.metadata().map_err(|_| TransferResult::IoFailed)?.len();
                 if written > expected_size {
+                    drop(file);
                     let _ = fs::remove_file(&temporary_path);
                     return Err(TransferResult::InvalidData);
                 }
-                let mut existing =
-                    File::open(&temporary_path).map_err(|_| TransferResult::IoFailed)?;
                 let mut buffer = vec![0_u8; MAX_TRANSFER_CHUNK_BYTES];
                 loop {
-                    let read = existing
+                    let read = file
                         .read(&mut buffer)
                         .map_err(|_| TransferResult::IoFailed)?;
                     if read == 0 {
@@ -524,14 +586,9 @@ impl IncomingFile {
                     }
                     hasher.update(&buffer[..read]);
                 }
-                drop(existing);
-                let file = OpenOptions::new()
-                    .append(true)
-                    .open(&temporary_path)
-                    .map_err(|_| TransferResult::IoFailed)?;
                 (file, written)
             }
-            Err(_) => return Err(TransferResult::IoFailed),
+            Err(error) => return Err(incoming_open_error(error)),
         };
         let remaining = expected_size.saturating_sub(written);
         if let Err(result) = ensure_receive_capacity(&directory, remaining) {
@@ -551,6 +608,7 @@ impl IncomingFile {
             temporary_path,
             destination_directory,
             remove_on_drop: true,
+            _writer: writer,
         })
     }
 
@@ -704,6 +762,7 @@ fn discard_incoming_resume_in(
         Err(_) => return Err(TransferResult::IoFailed),
     }
     let temporary_path = incoming_temporary_path(&directory, transfer_id);
+    let _writer = IncomingWriterPermit::acquire(&temporary_path)?;
     match fs::symlink_metadata(&temporary_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(TransferResult::IoFailed);
@@ -762,7 +821,9 @@ fn cleanup_stale_incoming_files(directory: &Path) {
         {
             continue;
         }
-        let _ = fs::remove_file(entry.path());
+        if let Ok(_writer) = IncomingWriterPermit::acquire(&entry.path()) {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -1213,6 +1274,202 @@ mod tests {
             worker.finish([0; 32]).await,
             Err(TransferResult::InvalidData)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_worker_keeps_writer_ownership_until_pending_write_and_preserve_finish() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let (root, staging, downloads) = roots("worker-reconnect-preserve");
+        let worker_staging = staging.clone();
+        let worker_downloads = downloads.clone();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    [26; 16],
+                    "race.bin".to_owned(),
+                    8,
+                    worker_staging,
+                    worker_downloads,
+                )
+            },
+            move || {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                let (lock, wake) = &*worker_gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        worker
+            .commands
+            .as_ref()
+            .unwrap()
+            .send(IncomingDiskCommand::Write {
+                offset: 0,
+                bytes: b"old!".to_vec().into_boxed_slice(),
+                reply,
+            })
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        drop(worker);
+        // A lexical alias must resolve to the same owned staging path.
+        assert!(matches!(
+            IncomingFile::create_in(
+                [26; 16],
+                "race.bin".to_owned(),
+                8,
+                staging.join("."),
+                downloads.clone()
+            ),
+            Err(TransferResult::Busy)
+        ));
+        assert!(!downloads.join("race.bin").exists());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
+        assert_eq!(response.await.unwrap(), Ok(()));
+        let mut resumed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match IncomingFile::create_in(
+                    [26; 16],
+                    "race.bin".to_owned(),
+                    8,
+                    staging.clone(),
+                    downloads.clone(),
+                ) {
+                    Ok(file) => break file,
+                    Err(TransferResult::Busy) => tokio::time::sleep(Duration::from_millis(2)).await,
+                    Err(error) => panic!("unexpected resume failure: {error:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(resumed.resume_offset(), 4);
+        assert_eq!(
+            resumed.resume_prefix_hash(),
+            Some(Blake2s256::digest(b"old!").into())
+        );
+        resumed.write_chunk(4, b"new!").unwrap();
+        let saved = resumed
+            .finish(Blake2s256::digest(b"old!new!").into())
+            .unwrap();
+        assert_eq!(fs::read(saved).unwrap(), b"old!new!");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_worker_cannot_delete_a_new_receiver_staging_file() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let (root, staging, downloads) = roots("worker-reconnect-cancel");
+        let worker_staging = staging.clone();
+        let worker_downloads = downloads.clone();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let worker = IncomingFileWorker::spawn_with(
+            move || {
+                IncomingFile::create_in(
+                    [27; 16],
+                    "cancel.bin".to_owned(),
+                    3,
+                    worker_staging,
+                    worker_downloads,
+                )
+            },
+            move || {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                let (lock, wake) = &*worker_gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        worker
+            .commands
+            .as_ref()
+            .unwrap()
+            .send(IncomingDiskCommand::Write {
+                offset: 0,
+                bytes: vec![0].into_boxed_slice(),
+                reply,
+            })
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        worker.cancel();
+        assert!(matches!(
+            IncomingFile::create_in(
+                [27; 16],
+                "cancel.bin".to_owned(),
+                3,
+                staging.clone(),
+                downloads.clone()
+            ),
+            Err(TransferResult::Busy)
+        ));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_one();
+        assert_eq!(response.await.unwrap(), Err(TransferResult::Cancelled));
+        let mut replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match IncomingFile::create_in(
+                    [27; 16],
+                    "cancel.bin".to_owned(),
+                    3,
+                    staging.clone(),
+                    downloads.clone(),
+                ) {
+                    Ok(file) => break file,
+                    Err(TransferResult::Busy | TransferResult::IoFailed) => {
+                        tokio::time::sleep(Duration::from_millis(2)).await
+                    }
+                    Err(error) => panic!("unexpected replacement failure: {error:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(replacement.resume_offset(), 0);
+        replacement.write_chunk(0, b"new").unwrap();
+        let saved = replacement
+            .finish(Blake2s256::digest(b"new").into())
+            .unwrap();
+        assert_eq!(fs::read(saved).unwrap(), b"new");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn incoming_writer_denies_bypassing_registry_with_another_windows_write_or_delete() {
+        let (root, staging, downloads) = roots("writer-sharing");
+        let partial = incoming_temporary_path(&staging, [28; 16]);
+        let mut file =
+            IncomingFile::create_in([28; 16], "locked.bin".to_owned(), 3, staging, downloads)
+                .unwrap();
+        assert!(File::options().write(true).open(&partial).is_err());
+        assert!(fs::remove_file(&partial).is_err());
+        file.write_chunk(0, b"one").unwrap();
+        file.preserve().unwrap();
+        File::options().append(true).open(&partial).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
