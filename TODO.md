@@ -235,6 +235,9 @@
 
 - [x] Controller worker 并发：clone sender 的 owned future 与持久栈 pin next_event 同时轮询，命令 / send 完成不会重建已取可靠消息且等待 crypto 的 reader；输入保持原 context，epoch 只过滤未首次 poll 的发送 / 未出队旧输入，已开始可靠写不截帧。ReleaseAll 有界 1024，溢出 fail-closed；取消独立于满队列，结果分支再检查用户取消，避免错误重连。Control 专用锁保证 seal / write 顺序，secure 锁不跨网络；包括自动关键帧 / Direct 回答在内的控制发送共用一秒预算，截止关闭原会话。6 项并发回归实跑通过（4 项真实 QUIC / Noise，2 项边界策略）：真实双跳背压时配置 / 帧继续、旧输入过滤且原在途帧完整、长 release 仍收媒体且取消有界、已 dequeue 可靠消息不丢、控制背压截止与连接关闭。测试端点使用明确 2 KiB flight 窗口，不靠无效 TLS config 参数或 mock 背压。主题 `fix(DL2-013): keep receiving media while ordered input writes are pending`。
 
+- [x] Mac Host 最后投递归属：每 capture attempt 独立 source / encoder，所有配置 / 帧 / 错误闭包绑定 immutable runtime / connection receipt / native media_generation / stream；native callback 同步退役 gate，主线程 receipt 校验后最终 scoped C admission。失败 / 取消的 stream 号不复用；新 start 等旧 start / stop cleanup barrier，旧 catch / stop 不能影响后继 encoder。捕获错误只退役自身并保留可重试告警，旧错误不全局停止新 Noise。新增 8 项 portable 合同通过；10 个合成 Swift 生命周期 / 调度用例未运行，不能代替实际 ScreenCaptureKit / VideoToolbox / 权限 / GPU 验收。主题 `fix(DL2-013): retire captured host resources before a successor can start`。
+- [x] 本地组合门禁：`test -p desklink-ffi --lib --tests --locked` 实跑 88 passed / 0 failed / 0 ignored；`python -m unittest discover -s scripts/tests -p "test_*.py"` 实跑 201 passed；双 C 头生成检查、fmt / diff 检查通过。日志在 `E:/desk-link/.worktrees/dl2-targets/apple-ffi/evidence/`，最终不可变 HEAD 与日志哈希由交接证据绑定。Windows 本分支 producer 的 epoch=0 隔离占位仍待整合 Windows 联合快照；不能将 FFI 套通过宣称整包可交付。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。
