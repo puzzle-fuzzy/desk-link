@@ -5,7 +5,7 @@ use apps_windows::{
     capture::CapturedFrame,
     encoder::{
         EncoderBackendPreference, EncoderError, H264Encoder, H264EncoderSettings, PixelOrder,
-        convert_to_nv12,
+        convert_to_nv12, convert_to_nv12_into,
     },
 };
 use serde_json::{Value, json};
@@ -45,6 +45,7 @@ fn main() {
     assert!((2..=2160).contains(&height) && height.is_multiple_of(2));
     assert!((1..=10_000).contains(&frames) && warmup <= 1_000);
     let encode = args.iter().any(|arg| arg == "--encode");
+    let reuse_conversion = args.iter().any(|arg| arg == "--reuse-conversion");
     let software = args.iter().any(|arg| arg == "--software");
     assert!(!software || encode, "--software requires --encode");
     let motion = args.iter().any(|arg| arg == "--motion");
@@ -82,6 +83,8 @@ fn main() {
     let mut completed = 0_u32;
     let mut nv12_written_bytes = 0_u64;
     let mut mf_input_copy_bytes = 0_u64;
+    let mut conversion_buffer_grows = 0_u64;
+    let mut scratch = Vec::new();
     let started = Instant::now();
     for frame_index in 0..frames + warmup {
         if motion {
@@ -116,25 +119,46 @@ fn main() {
                 residence_us.extend(sample.output_residence_us);
                 nv12_written_bytes += sample.nv12_written_bytes as u64;
                 mf_input_copy_bytes += sample.mf_input_copy_bytes as u64;
+                conversion_buffer_grows += u64::from(sample.nv12_buffer_grew);
             }
         } else {
+            if !reuse_conversion {
+                scratch = Vec::new();
+            }
             let convert_started = Instant::now();
-            let nv12 = convert_to_nv12(
-                &pixels,
-                width,
-                height,
-                width as usize * 4,
-                width,
-                height,
-                PixelOrder::Bgra,
-            )
-            .expect("BGRA conversion");
+            let previous_capacity = scratch.capacity();
+            if reuse_conversion {
+                convert_to_nv12_into(
+                    &mut scratch,
+                    &pixels,
+                    width,
+                    height,
+                    width as usize * 4,
+                    width,
+                    height,
+                    PixelOrder::Bgra,
+                )
+                .expect("BGRA conversion");
+            } else {
+                scratch = convert_to_nv12(
+                    &pixels,
+                    width,
+                    height,
+                    width as usize * 4,
+                    width,
+                    height,
+                    PixelOrder::Bgra,
+                )
+                .expect("BGRA conversion");
+            }
             let elapsed = micros(convert_started);
             if measured {
                 convert_us.push(elapsed);
-                nv12_written_bytes += nv12.len() as u64;
+                nv12_written_bytes += scratch.len() as u64;
+                conversion_buffer_grows +=
+                    u64::from(!reuse_conversion || scratch.capacity() > previous_capacity);
             }
-            black_box(nv12);
+            black_box(&scratch);
         }
     }
     println!(
@@ -154,6 +178,8 @@ fn main() {
             "completed_outputs": completed, "encoded_bytes": encoded_bytes,
             "known_nv12_written_bytes": nv12_written_bytes,
             "known_mf_input_copy_bytes": mf_input_copy_bytes,
+        "known_conversion_buffer_grows": conversion_buffer_grows,
+        "conversion_storage": if encode || reuse_conversion { "reused" } else { "allocated_each_frame" },
             "allocation_rate": Value::Null, "driver_copy_bytes": Value::Null,
             "capture_us": Value::Null, "transport_us": Value::Null,
             "decode_us": Value::Null, "display_us": Value::Null,

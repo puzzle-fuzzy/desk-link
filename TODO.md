@@ -218,7 +218,10 @@
 
 - [x] **已实现并自动验证（`perf(DL2-015): reuse owned staging textures for desktop readback`）：** 捕获进程持有staging/context缓存，以D3D device身份和完整texture布局失效；Map/复制/Unmap在ReleaseFrame前完成，不保留失效桌面surface。
 - **验证：** `test -p desklink-windows --lib --locked capture::` 10通过、2忽略；3个WARP合成用例验证复用后新像素、尺寸/device失效、row pitch/padding；显式dev WARP基准1通过、staging创建60→1。命令与release复跑规范见 `docs/windows-capture-readback-benchmark.md`。上述是软件D3D工具/正确性验证，不代表真实GPU收益；CPU回读字节不变。
-- [ ] **仍待实现/硬件验收：** GPU缩放/转色/NV12 surface编码链、CPU输出/转换buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照。
+- [ ] **仍待实现/硬件验收：** GPU缩放/转色/NV12 surface编码链、CPU捕获输出buffer池，以及1080p/1440p集显/独显/混合GPU时间/复制/分配/帧龄对照。
+
+- [x] **转换buffer切片（`perf(DL2-015): reuse encoder NV12 scratch buffers`）：** 生产编码器复用NV12 Vec，新增checked `convert_to_nv12_into`，保留原分配API；1:1转换不再为x/y索引建临时Vec。基线工具支持 `--reuse-buffer` 并记录增长次数，GPU与CPU输入复制未改变。
+- **验证：** 新buffer 3项、原encoder_contract 11项、backend 3项、percentile 1项通过，严格Clippy通过；显式release `--test encoder_buffers conversion_buffer_reuse_release_baseline -- --ignored --nocapture` 1通过。30样本/API、5次预热，同进程1080p分配/复用p50=4.8271/4.3698ms、p95=4.9710/4.4706ms、p99=5.0626/4.8022ms；1440p p50=8.6875/7.8823ms、p95=8.9543/8.0388ms、p99=9.0792/8.2324ms；预热后buffer增长0。仅为本机CPU转换API对照，非旧commit/真实GPU/端到端收益。
 
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 

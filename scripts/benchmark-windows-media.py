@@ -41,6 +41,7 @@ def main() -> int:
     parser.add_argument("--encode", action="store_true", help="opt in to local synthetic MFT encoding")
     parser.add_argument("--software", action="store_true", help="with --encode, explicitly select Microsoft software MFT")
     parser.add_argument("--motion", action="store_true")
+    parser.add_argument("--reuse-conversion", action="store_true", help="CPU conversion uses the reusable NV12 API")
     parser.add_argument("--profile", choices=["release", "dev"], default="release")
     parser.add_argument("--label", default="unspecified", help="non-sensitive hardware/test-condition label")
     parser.add_argument("--output", type=Path, default=ROOT / "dist/windows/media-baseline.json")
@@ -55,6 +56,8 @@ def main() -> int:
         command.append("--software")
     if args.motion:
         command.append("--motion")
+    if args.reuse_conversion:
+        command.append("--reuse-conversion")
     identity_before = source_identity(ROOT)
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
     if result.returncode != 0:

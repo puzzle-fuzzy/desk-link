@@ -83,6 +83,7 @@ pub struct EncoderPerformanceSample {
     pub output_residence_us: Option<u64>,
     pub pending_frames: usize,
     pub nv12_written_bytes: usize,
+    pub nv12_buffer_grew: bool,
     pub mf_input_copy_bytes: usize,
 }
 
@@ -113,6 +114,34 @@ mod backend_tests {
         assert!(!credits.take_output());
         credits.notify_output().unwrap();
         assert!(credits.take_output());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn software_submissions_reuse_nv12_storage_after_warmup() {
+        let mut encoder = H264Encoder::new_with_settings_and_backend(
+            64,
+            64,
+            H264EncoderSettings::default(),
+            EncoderBackendPreference::SoftwareOnly,
+        )
+        .unwrap();
+        let frame = |index: u64| CapturedFrame {
+            width: 64,
+            height: 64,
+            timestamp_us: index * 33_333,
+            pixels: vec![index as u8; 64 * 64 * 4],
+        };
+        encoder.encode(frame(1), true).unwrap();
+        assert!(encoder.last_performance_sample().unwrap().nv12_buffer_grew);
+        let pointer = encoder.nv12_buffer.as_ptr();
+        let capacity = encoder.nv12_buffer.capacity();
+        for index in 2..=4 {
+            encoder.encode(frame(index), false).unwrap();
+            assert!(!encoder.last_performance_sample().unwrap().nv12_buffer_grew);
+            assert_eq!(encoder.nv12_buffer.as_ptr(), pointer);
+            assert_eq!(encoder.nv12_buffer.capacity(), capacity);
+        }
     }
 
     #[cfg(windows)]
@@ -293,6 +322,33 @@ pub fn convert_to_nv12(
     target_height: u32,
     order: PixelOrder,
 ) -> Result<Vec<u8>, EncoderError> {
+    let mut nv12 = Vec::new();
+    convert_to_nv12_into(
+        &mut nv12,
+        pixels,
+        source_width,
+        source_height,
+        source_row_pitch,
+        target_width,
+        target_height,
+        order,
+    )?;
+    Ok(nv12)
+}
+
+/// Reuses the caller's allocation. Every active Y/UV byte is overwritten;
+/// validation errors leave the caller's previous buffer intact.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_to_nv12_into(
+    nv12: &mut Vec<u8>,
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    source_row_pitch: usize,
+    target_width: u32,
+    target_height: u32,
+    order: PixelOrder,
+) -> Result<(), EncoderError> {
     if source_width == 0
         || source_height == 0
         || target_width < 2
@@ -324,23 +380,17 @@ pub fn convert_to_nv12(
     let y_plane_len = target_width
         .checked_mul(target_height)
         .ok_or(EncoderError::FrameTooLarge)?;
-    let mut nv12 = vec![0_u8; y_plane_len + y_plane_len / 2];
-    // Mapping once per row/column removes millions of integer divisions from
-    // the common 1:1 path. When a high-DPI source must be resized, use
+    let nv12_len = y_plane_len
+        .checked_add(y_plane_len / 2)
+        .filter(|length| *length <= isize::MAX as usize)
+        .ok_or(EncoderError::FrameTooLarge)?;
+    nv12.resize(nv12_len, 0);
+    // The 1:1 path uses offsets directly, without coordinate lookup arrays or
+    // per-pixel division. When a high-DPI source must be resized, use
     // bilinear samples instead of nearest-neighbour picks: preserving the
     // coverage of thin glyphs is noticeably clearer than selecting one source
     // pixel for each output pixel.
     let needs_resample = source_width != target_width || source_height != target_height;
-    let source_x_offset_by_target = (!needs_resample).then(|| {
-        (0..target_width)
-            .map(|target_x| target_x * 4)
-            .collect::<Vec<_>>()
-    });
-    let source_y_offset_by_target = (!needs_resample).then(|| {
-        (0..target_height)
-            .map(|target_y| target_y * source_row_pitch)
-            .collect::<Vec<_>>()
-    });
     for target_y in (0..target_height).step_by(2) {
         for target_x in (0..target_width).step_by(2) {
             let samples = [
@@ -355,8 +405,6 @@ pub fn convert_to_nv12(
                     target_y,
                     order,
                     needs_resample,
-                    source_x_offset_by_target.as_deref(),
-                    source_y_offset_by_target.as_deref(),
                 ),
                 rgb_for_target(
                     pixels,
@@ -369,8 +417,6 @@ pub fn convert_to_nv12(
                     target_y,
                     order,
                     needs_resample,
-                    source_x_offset_by_target.as_deref(),
-                    source_y_offset_by_target.as_deref(),
                 ),
                 rgb_for_target(
                     pixels,
@@ -383,8 +429,6 @@ pub fn convert_to_nv12(
                     target_y + 1,
                     order,
                     needs_resample,
-                    source_x_offset_by_target.as_deref(),
-                    source_y_offset_by_target.as_deref(),
                 ),
                 rgb_for_target(
                     pixels,
@@ -397,8 +441,6 @@ pub fn convert_to_nv12(
                     target_y + 1,
                     order,
                     needs_resample,
-                    source_x_offset_by_target.as_deref(),
-                    source_y_offset_by_target.as_deref(),
                 ),
             ];
             let y_offset_0 = target_y * target_width + target_x;
@@ -423,7 +465,7 @@ pub fn convert_to_nv12(
             nv12[uv_offset + 1] = v;
         }
     }
-    Ok(nv12)
+    Ok(())
 }
 
 fn rgb_at_offset(pixels: &[u8], offset: usize, order: PixelOrder) -> (u8, u8, u8) {
@@ -446,13 +488,9 @@ fn rgb_for_target(
     target_y: usize,
     order: PixelOrder,
     needs_resample: bool,
-    source_x_offsets: Option<&[usize]>,
-    source_y_offsets: Option<&[usize]>,
 ) -> (u8, u8, u8) {
     if !needs_resample {
-        let x_offset = source_x_offsets.expect("1:1 source x offsets")[target_x];
-        let y_offset = source_y_offsets.expect("1:1 source y offsets")[target_y];
-        return rgb_at_offset(pixels, y_offset + x_offset, order);
+        return rgb_at_offset(pixels, target_y * source_row_pitch + target_x * 4, order);
     }
 
     let x_denominator = target_width.saturating_mul(2).max(1);
@@ -556,6 +594,7 @@ pub struct H264Encoder {
     config_version: u32,
     profile: H264Profile,
     backend_preference: EncoderBackendPreference,
+    nv12_buffer: Vec<u8>,
     last_performance_sample: Option<EncoderPerformanceSample>,
     #[cfg(windows)]
     pending_frames: std::collections::VecDeque<PendingFrame>,
@@ -649,6 +688,7 @@ impl H264Encoder {
                 config_version: 1,
                 profile,
                 backend_preference,
+                nv12_buffer: Vec::new(),
                 last_performance_sample: None,
                 pending_frames: std::collections::VecDeque::new(),
                 backend,
@@ -681,7 +721,9 @@ impl H264Encoder {
         #[cfg(windows)]
         {
             let submitted_at = std::time::Instant::now();
-            let nv12 = native::frame_to_nv12(&frame, self.width, self.height)?;
+            let previous_nv12_capacity = self.nv12_buffer.capacity();
+            native::frame_to_nv12_into(&frame, self.width, self.height, &mut self.nv12_buffer)?;
+            let nv12 = &self.nv12_buffer;
             let convert_us = elapsed_us(submitted_at);
             let next_frame_id = self.frame_id.wrapping_add(1).max(1);
             let request_keyframe = force_keyframe || next_frame_id == 1;
@@ -689,7 +731,7 @@ impl H264Encoder {
             let mut failed_input_copy_bytes = 0_usize;
             let output = match self
                 .backend
-                .encode(&nv12, frame.timestamp_us, request_keyframe)
+                .encode(nv12, frame.timestamp_us, request_keyframe)
             {
                 Ok(output) => output,
                 Err(_) if self.backend.is_hardware() => {
@@ -723,7 +765,7 @@ impl H264Encoder {
                     self.profile = profile;
                     self.config_version = self.config_version.wrapping_add(1).max(1);
                     self.pending_frames.clear();
-                    self.backend.encode(&nv12, frame.timestamp_us, true)?
+                    self.backend.encode(nv12, frame.timestamp_us, true)?
                 }
                 Err(error) => return Err(error),
             };
@@ -735,6 +777,7 @@ impl H264Encoder {
                 output_residence_us: None,
                 pending_frames: 0,
                 nv12_written_bytes: nv12.len(),
+                nv12_buffer_grew: self.nv12_buffer.capacity() > previous_nv12_capacity,
                 mf_input_copy_bytes: failed_input_copy_bytes
                     .saturating_add(self.backend.last_input_copy_bytes()),
             });
@@ -954,7 +997,7 @@ mod native {
 
     use super::{
         AsyncMftCredits, CapturedFrame, DEFAULT_VIDEO_BITRATE, EncoderBackendInfo,
-        EncoderBackendPreference, EncoderError, PixelOrder, convert_to_nv12,
+        EncoderBackendPreference, EncoderError, PixelOrder, convert_to_nv12_into,
     };
 
     const ASYNC_FRAME_BUDGET: Duration = Duration::from_millis(100);
@@ -1542,16 +1585,18 @@ mod native {
         incomplete: bool,
     }
 
-    pub fn frame_to_nv12(
+    pub fn frame_to_nv12_into(
         frame: &CapturedFrame,
         target_width: u32,
         target_height: u32,
-    ) -> Result<Vec<u8>, EncoderError> {
+        nv12: &mut Vec<u8>,
+    ) -> Result<(), EncoderError> {
         let row_pitch = usize::try_from(frame.width)
             .ok()
             .and_then(|width| width.checked_mul(4))
             .ok_or(EncoderError::FrameTooLarge)?;
-        convert_to_nv12(
+        convert_to_nv12_into(
+            nv12,
             &frame.pixels,
             frame.width,
             frame.height,
