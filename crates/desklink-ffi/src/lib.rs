@@ -114,6 +114,16 @@ pub enum DesklinkEventKind {
     ReleaseAll = 10,
     Transfer = 11,
     Audio = 12,
+    Capabilities = 13,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesklinkControllerCommand {
+    SelectDisplay = 1,
+    SetAudioEnabled = 2,
+    SetVideoQuality = 3,
+    SetVideoProfile = 4,
 }
 
 #[repr(u32)]
@@ -1206,6 +1216,99 @@ pub unsafe extern "C" fn desklink_release_all(handle: *mut DesklinkHandle) -> De
     runtime.release_all()
 }
 
+/// Queues a bounded controller command. command/value are validated before enqueue.
+/// Values: display ID; audio 0/1; quality automatic/smooth/balanced/sharp 0..3;
+/// profile Main/High 0/1. Success means queued, remote state arrives via Control.
+/// # Safety
+/// `handle` must be a live, exclusively accessed handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_controller_command(
+    handle: *mut DesklinkHandle,
+    command: u32,
+    value: u32,
+) -> DesklinkResult {
+    let message = match controller_control_message(command, value) {
+        Some(message) => message,
+        None => return DesklinkResult::InvalidArgument,
+    };
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let Some(worker) = &runtime.worker else {
+        return DesklinkResult::InvalidState;
+    };
+    if !worker.is_running() {
+        return DesklinkResult::InvalidState;
+    }
+    worker
+        .send(ControllerCommand::Control(message))
+        .map_or(DesklinkResult::InternalError, |_| DesklinkResult::Ok)
+}
+
+fn controller_control_message(command: u32, value: u32) -> Option<ControlMessage> {
+    use desklink_protocol::{H264Profile, VideoQualityPreference};
+    Some(match command {
+        1 => ControlMessage::SelectDisplay { display_id: value },
+        2 if value <= 1 => ControlMessage::SetAudioEnabled {
+            enabled: value != 0,
+        },
+        3 => ControlMessage::SetVideoQuality {
+            preference: match value {
+                0 => VideoQualityPreference::Automatic,
+                1 => VideoQualityPreference::Smooth,
+                2 => VideoQualityPreference::Balanced,
+                3 => VideoQualityPreference::Sharp,
+                _ => return None,
+            },
+        },
+        4 => ControlMessage::SetVideoProfile {
+            profile: match value {
+                0 => H264Profile::Main,
+                1 => H264Profile::High,
+                _ => return None,
+            },
+        },
+        _ => return None,
+    })
+}
+
+/// Copies and validates a protocol TransferMessage before bounded enqueue.
+/// Callback bytes are borrowed only during the callback; caller bytes only
+/// during this function. The queue owns the decoded message afterward.
+/// # Safety
+/// `handle` must be exclusively accessed; `bytes` must cover `bytes_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn desklink_controller_send_transfer(
+    handle: *mut DesklinkHandle,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> DesklinkResult {
+    if bytes.is_null()
+        || bytes_len == 0
+        || bytes_len > desklink_protocol::MAX_TRANSFER_MESSAGE_BYTES
+    {
+        return DesklinkResult::InvalidArgument;
+    }
+    let message = match desklink_protocol::decode_transfer(unsafe {
+        std::slice::from_raw_parts(bytes, bytes_len)
+    }) {
+        Ok(message) => message,
+        Err(_) => return DesklinkResult::InvalidArgument,
+    };
+    let Some(runtime) = (unsafe { runtime_mut(handle) }) else {
+        return DesklinkResult::InvalidArgument;
+    };
+    let Some(worker) = &runtime.worker else {
+        return DesklinkResult::InvalidState;
+    };
+    if !worker.is_running() {
+        return DesklinkResult::InvalidState;
+    }
+    worker
+        .send(ControllerCommand::Transfer(message))
+        .map_or(DesklinkResult::InternalError, |_| DesklinkResult::Ok)
+}
+
 /// Destroys a handle and releases all pressed input.
 ///
 /// # Safety
@@ -2109,6 +2212,44 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_commands_validate_values_and_preserve_typed_intent() {
+        assert_eq!(
+            controller_control_message(1, 42),
+            Some(ControlMessage::SelectDisplay { display_id: 42 })
+        );
+        assert_eq!(
+            controller_control_message(2, 0),
+            Some(ControlMessage::SetAudioEnabled { enabled: false })
+        );
+        assert_eq!(
+            controller_control_message(2, 1),
+            Some(ControlMessage::SetAudioEnabled { enabled: true })
+        );
+        assert!(controller_control_message(2, 2).is_none());
+        for value in 0..4 {
+            assert!(controller_control_message(3, value).is_some());
+        }
+        assert!(controller_control_message(3, 4).is_none());
+        assert!(controller_control_message(4, 2).is_none());
+        assert!(controller_control_message(0, 0).is_none());
+        assert!(controller_control_message(u32::MAX, u32::MAX).is_none());
+        unsafe {
+            assert_eq!(
+                desklink_controller_command(null_mut(), 1, 0),
+                DesklinkResult::InvalidArgument
+            );
+            assert_eq!(
+                desklink_controller_send_transfer(null_mut(), null(), 0),
+                DesklinkResult::InvalidArgument
+            );
+            assert_eq!(
+                desklink_controller_send_transfer(null_mut(), null(), usize::MAX),
+                DesklinkResult::InvalidArgument
+            );
+        }
+    }
 
     fn input(kind: DesklinkInputKind) -> DesklinkInput {
         DesklinkInput {

@@ -279,6 +279,9 @@
 - **方案：** 为所有命令、事件、结果、错误及 capability 建立唯一契约来源，生成/校验 C 与 Swift 声明；事件携带代数、版本、可恢复性。通过有界 worker 命令暴露现有 runtime 能力。
 - **验收：** 每个公开枚举、struct 布局、长度/所有权与命令均有 ABI 测试；新增事件不能无声落入 Swift default。此项是 DL2-026、027 和多个输入修复的共同前置。
 
+- [x] ABI 基础切片：Rust 公开枚举/struct/extern 签名生成两份字节一致 C 头；新增有界显示器/音频/画质/profile 命令及 transfer 消息入口，统一取消截止；认证能力事件含远端平台/尺寸/profile，Swift 显式接收 Control/Transfer/Audio/Capabilities。Rust 16 单元 + 2 ABI 布局回归通过（MSVC 实际编译所有公开 struct 的 sizeof/align/offset，与 Rust 对照）；Python 4 合同、生成检查通过。主题 `feat(DL2-025): generate ABI headers and expose bounded session commands`。
+- [ ] 其余 typed Swift 事件/能力消费及每种命令端到端回执；当前最新消息暂存不等于音频播放或文件工作流，事件所有权由生成头明确为仅回调期间借用。Swift/Xcode 目标布局与端到端调用尚待 Apple 环境。
+
 ### DL2-026 · P1 · 补齐 macOS → Windows 的会话功能闭环
 
 - [ ] 将已有底层功能真正接到 AppleCore 与 macOS 会话界面。

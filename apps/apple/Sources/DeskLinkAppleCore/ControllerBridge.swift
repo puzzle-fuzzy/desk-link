@@ -53,6 +53,12 @@ public final class ControllerBridge: ObservableObject {
     @Published public private(set) var videoSize: CGSize?
     @Published public private(set) var controllerVerifyKeyHex: String?
     @Published public private(set) var cursorOverlay: CursorOverlay?
+    @Published public private(set) var remotePlatform: RemotePlatform = .unknown
+    @Published public private(set) var capabilities: SessionCapabilities?
+    /// Consumers must explicitly handle these protocol events; bounded latest values.
+    @Published public private(set) var latestControlMessage: Data?
+    @Published public private(set) var latestTransferMessage: Data?
+    @Published public private(set) var latestAudioPacket: Data?
 
     public var userFacingError: String { lastError ?? "" }
 
@@ -248,6 +254,25 @@ public final class ControllerBridge: ObservableObject {
         if result != DESKLINK_OK { publishResultError("The video stream needs to recover.", result: result) }
     }
 
+    /// Returns queue admission only. Remote acknowledgements remain separate.
+    @discardableResult
+    public func sendSessionCommand(_ command: UInt32, value: UInt32) -> Bool {
+        guard case .connected = state, let handle = handleOwner.pointer else { return false }
+        let result = desklink_controller_command(handle, command, value)
+        if result != DESKLINK_OK { lastError = "操作暂未发送，请稍后重试。" }
+        return result == DESKLINK_OK
+    }
+
+    @discardableResult
+    public func sendTransferMessage(_ encoded: Data) -> Bool {
+        guard case .connected = state, let handle = handleOwner.pointer else { return false }
+        let result = encoded.withUnsafeBytes { bytes in
+            desklink_controller_send_transfer(handle, bytes.bindMemory(to: UInt8.self).baseAddress, encoded.count)
+        }
+        if result != DESKLINK_OK { lastError = "传输请求暂未发送，请稍后重试。" }
+        return result == DESKLINK_OK
+    }
+
     public func send(input command: RemoteInputCommand) {
         var input: DesklinkInput
         switch command {
@@ -369,6 +394,15 @@ public final class ControllerBridge: ObservableObject {
         case 8:
             guard streamID == activeStreamID, !data.isEmpty else { return }
             cursorOverlay = CursorOverlay(streamID: streamID, encodedUpdate: data)
+        case 4: latestControlMessage = data
+        case 11: latestTransferMessage = data
+        case 12:
+            guard streamID == activeStreamID else { return }
+            latestAudioPacket = data
+        case 13:
+            guard let value = SessionCapabilities(encoded: data) else { return }
+            capabilities = value
+            remotePlatform = value.platform
         default:
             break
         }
@@ -531,6 +565,11 @@ public final class ControllerBridge: ObservableObject {
     private func publishError(_ error: Error) { publishErrorMessage(error.localizedDescription) }
 
     private func resetDisplayedSessionState() {
+        capabilities = nil
+        remotePlatform = .unknown
+        latestControlMessage = nil
+        latestTransferMessage = nil
+        latestAudioPacket = nil
         decoder.reset()
         activeStreamID = 0
         highestStreamID = 0
@@ -587,6 +626,10 @@ public final class ControllerBridge: ObservableObject {
     }
 
 #if DEBUG
+    public func acceptCapabilitiesForTesting(platform: RemotePlatform) {
+        remotePlatform = platform
+    }
+
     public func acceptErrorForTesting(stateValue: Int, recoverable: Bool) {
         consume(eventKind: 2, data: Data("transport unavailable".utf8), streamID: 0,
                 frameID: 0, configVersion: 0, width: 0, height: 0,

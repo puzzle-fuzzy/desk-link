@@ -10,8 +10,8 @@ use std::{
 
 use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
 use desklink_protocol::{
-    InputEvent, Platform, encode_audio_packet, encode_control, encode_cursor_update,
-    encode_transfer,
+    ControlMessage, InputEvent, Platform, TransferMessage, encode_audio_packet, encode_control,
+    encode_cursor_update, encode_transfer,
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
@@ -72,6 +72,8 @@ pub(crate) enum ControllerCommand {
     SendInput(InputEvent),
     ReleaseAll,
     RequestKeyframe,
+    Control(ControlMessage),
+    Transfer(TransferMessage),
     Shutdown,
 }
 
@@ -339,6 +341,31 @@ async fn run_worker(
             }
         };
         phase.store(PHASE_RUNNING, Ordering::Release);
+        // Fixed, versioned ABI payload: version, platform (1 Windows, 2 Mac,
+        // 3 iOS), width/height little-endian, supported H264 profile bitmask.
+        let caps = controller.host_capabilities();
+        let mut payload = vec![
+            1,
+            match caps.platform {
+                Platform::Windows => 1,
+                Platform::MacOS => 2,
+                Platform::IOS => 3,
+            },
+        ];
+        payload.extend_from_slice(&caps.width.to_le_bytes());
+        payload.extend_from_slice(&caps.height.to_le_bytes());
+        payload.push(caps.h264_profiles.iter().fold(0, |bits, profile| {
+            bits | match profile {
+                desklink_protocol::H264Profile::Main => 1,
+                desklink_protocol::H264Profile::High => 2,
+            }
+        }));
+        callback.emit(
+            DesklinkEventKind::Capabilities,
+            &payload,
+            EventMeta::for_stream(0),
+            DesklinkState::NegotiatingCapabilities,
+        );
         callback.emit_state(DesklinkState::StartingVideo, 0);
         match run_connected(
             controller,
@@ -503,6 +530,16 @@ async fn run_connected(
                         };
                     }
                 }
+                Some(command @ (ControllerCommand::Control(_) | ControllerCommand::Transfer(_))) => {
+                    let result = match command {
+                        ControllerCommand::Control(message) => send_cancellable(cancellation, controller.send_controller_control(message)).await,
+                        ControllerCommand::Transfer(message) => send_cancellable(cancellation, controller.send_transfer(message)).await,
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = result {
+                        return ConnectedOutcome::Failed { failure: ConnectFailure::from_controller(error), stream_id: controller.active_stream_id().unwrap_or(0), stable };
+                    }
+                }
                 Some(ControllerCommand::Shutdown) | None => {
                     return ConnectedOutcome::Shutdown {
                         stream_id: controller.active_stream_id().unwrap_or(0),
@@ -657,7 +694,9 @@ async fn wait_for_retry(
                     }
                 }
                 Some(ControllerCommand::SendInput(_))
-                | Some(ControllerCommand::RequestKeyframe) => {}
+                | Some(ControllerCommand::RequestKeyframe)
+                | Some(ControllerCommand::Control(_))
+                | Some(ControllerCommand::Transfer(_)) => {}
                 Some(ControllerCommand::Shutdown) | None => return false,
             },
             changed = cancellation.changed() => {

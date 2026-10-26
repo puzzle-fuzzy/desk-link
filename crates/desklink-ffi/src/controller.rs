@@ -136,6 +136,7 @@ impl AtomicControllerMetrics {
 }
 
 pub struct ControllerRuntime {
+    host_capabilities: DeviceCapabilities,
     client: Arc<QuicClient>,
     secure: Arc<Mutex<SecureSession>>,
     input_sequence: Mutex<InputSequencer>,
@@ -202,7 +203,7 @@ impl ControllerRuntime {
             perform_noise_handshake(&client, identity, expected_host).await?,
         ));
         on_encrypted();
-        negotiate_host(&client, &secure, platform).await?;
+        let host_capabilities = negotiate_host(&client, &secure, platform).await?;
         let video_path_binding = secure.lock().await.video_path_binding();
         let mut video_path = DirectVideoPathMachine::new(video_path_binding);
         let direct_session = if platform == Platform::Windows {
@@ -242,6 +243,7 @@ impl ControllerRuntime {
             None
         };
         Ok(Self {
+            host_capabilities,
             client,
             secure,
             input_sequence: Mutex::new(InputSequencer::new()),
@@ -265,6 +267,17 @@ impl ControllerRuntime {
 
     pub fn video_path_state(&self) -> DirectVideoPathState {
         self.video_path.state().clone()
+    }
+
+    pub fn host_capabilities(&self) -> &DeviceCapabilities {
+        &self.host_capabilities
+    }
+
+    pub(crate) async fn send_controller_control(
+        &self,
+        message: ControlMessage,
+    ) -> Result<(), ControllerError> {
+        send_control(&self.client, &self.secure, &message).await
     }
 
     /// Reports the path currently carrying video datagrams. The authenticated
@@ -1026,7 +1039,7 @@ async fn negotiate_host(
     client: &QuicClient,
     secure: &Arc<Mutex<SecureSession>>,
     platform: Platform,
-) -> Result<(), ControllerError> {
+) -> Result<DeviceCapabilities, ControllerError> {
     send_control(
         client,
         secure,
@@ -1065,7 +1078,7 @@ async fn negotiate_host(
                         && capabilities.role == DeviceRole::Host
                         && capabilities.supports_h264_profile(H264Profile::Main) =>
                 {
-                    return Ok(());
+                    return Ok(capabilities);
                 }
                 ControlMessage::Capabilities(_) => {
                     return Err(ControllerError::InvalidHostCapabilities);

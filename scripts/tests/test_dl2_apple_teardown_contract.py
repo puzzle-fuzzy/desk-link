@@ -25,7 +25,7 @@ class TeardownContractTests(unittest.TestCase):
         connected = worker.split("async fn run_connected(", 1)[1].split("async fn send_cancellable", 1)[0]
         self.assertNotIn("controller.send_input(event).await", connected)
         self.assertNotIn("controller.request_keyframe().await", connected)
-        self.assertEqual(connected.count("send_cancellable("), 4)
+        self.assertEqual(connected.count("send_cancellable("), 6)
 
 
 if __name__ == "__main__":
