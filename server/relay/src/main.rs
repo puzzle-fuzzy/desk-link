@@ -2,15 +2,18 @@ use std::{
     env, error::Error, ffi::OsStr, io, net::SocketAddr, path::Path, sync::Arc, time::Duration,
 };
 
-use desklink_relay::{RelayConfig, RelayServer};
+use desklink_relay::{
+    DEFAULT_RELAY_BUFFER_BUDGET_BYTES, DEFAULT_RELAY_MAX_CONNECTIONS, DEFAULT_RELAY_MAX_SESSIONS,
+    RelayConfig, RelayMemoryObservation, RelayServer,
+};
 use quinn::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 const DEFAULT_SESSION_TTL_S: u64 = 86_400;
 const MIN_SESSION_TTL_S: u64 = 60;
 const MAX_SESSION_TTL_S: u64 = 2_592_000;
-const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
-const DEFAULT_MAX_SESSIONS: usize = 1_024;
+const DEFAULT_MAX_CONNECTIONS: usize = DEFAULT_RELAY_MAX_CONNECTIONS;
+const DEFAULT_MAX_SESSIONS: usize = DEFAULT_RELAY_MAX_SESSIONS;
 const MAX_CONFIGURED_LIMIT: usize = 100_000;
 const CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -100,12 +103,24 @@ fn relay_config() -> Result<RelayConfig, Box<dyn Error + Send + Sync>> {
         env::var("DESKLINK_RELAY_MAX_SESSIONS").ok().as_deref(),
         DEFAULT_MAX_SESSIONS,
     )?;
-    Ok(RelayConfig {
+    let buffer_budget_mib = bounded_limit(
+        "DESKLINK_RELAY_BUFFER_BUDGET_MIB",
+        env::var("DESKLINK_RELAY_BUFFER_BUDGET_MIB").ok().as_deref(),
+        (DEFAULT_RELAY_BUFFER_BUDGET_BYTES / (1024 * 1024)) as usize,
+    )?;
+    let config = RelayConfig {
         session_ttl: Duration::from_secs(session_ttl_s),
         max_connections,
         max_sessions,
+        buffer_budget_bytes: u64::try_from(buffer_budget_mib)?
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "relay buffer budget overflows")
+            })?,
         ..RelayConfig::default()
-    })
+    };
+    config.resource_budget()?;
+    Ok(config)
 }
 
 fn bounded_limit(
@@ -149,12 +164,17 @@ fn check_configuration() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("--resource-observation")) {
+        println!("{}", RelayMemoryObservation::read());
+        return Ok(());
+    }
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("--check-config")) {
         return check_configuration();
     }
     let address = relay_address()?;
     let relay = Arc::new(RelayServer::bind(address, server_config()?, relay_config()?).await?);
     eprintln!("DeskLink relay listening on {}", relay.local_addr()?);
+    eprintln!("relay_resource_budget {:?}", relay.resource_budget());
     let metrics_relay = relay.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CAPACITY_LOG_INTERVAL);
@@ -170,6 +190,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 snapshot.max_sessions,
                 snapshot.max_connections,
             );
+            eprintln!("relay_memory {}", RelayMemoryObservation::read());
         }
     });
     relay.run().await?;

@@ -24,9 +24,14 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 mod media_scheduler;
+mod resource_limits;
 
 use media_scheduler::{MediaIngress, media_queues};
 pub use media_scheduler::{RelayMediaLaneSnapshot, RelayMediaSnapshot};
+pub use resource_limits::{
+    DEFAULT_RELAY_BUFFER_BUDGET_BYTES, DEFAULT_RELAY_MAX_CONNECTIONS, DEFAULT_RELAY_MAX_SESSIONS,
+    RelayMemoryObservation, RelayResourceBudget,
+};
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -36,6 +41,7 @@ pub struct RelayConfig {
     pub dead_timeout: Duration,
     pub max_connections: usize,
     pub max_sessions: usize,
+    pub buffer_budget_bytes: u64,
 }
 
 impl Default for RelayConfig {
@@ -45,9 +51,16 @@ impl Default for RelayConfig {
             sweep_interval: Duration::from_secs(1),
             keep_alive: KEEPALIVE_INTERVAL,
             dead_timeout: DEAD_TIMEOUT,
-            max_connections: 1024,
-            max_sessions: 1024,
+            max_connections: DEFAULT_RELAY_MAX_CONNECTIONS,
+            max_sessions: DEFAULT_RELAY_MAX_SESSIONS,
+            buffer_budget_bytes: DEFAULT_RELAY_BUFFER_BUDGET_BYTES,
         }
+    }
+}
+
+impl RelayConfig {
+    pub fn resource_budget(&self) -> Result<RelayResourceBudget, RelayError> {
+        RelayResourceBudget::for_config(self)
     }
 }
 
@@ -862,10 +875,15 @@ impl RelayServer {
         let idle_timeout = quinn::IdleTimeout::try_from(config.dead_timeout)
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
         let mut transport = quinn::TransportConfig::default();
+        config.resource_budget()?.configure(&mut transport);
         transport
             .keep_alive_interval(Some(config.keep_alive))
             .max_idle_timeout(Some(idle_timeout));
-        server_config.transport_config(Arc::new(transport));
+        server_config
+            .transport_config(Arc::new(transport))
+            .max_incoming(resource_limits::MAX_PENDING_INCOMING)
+            .incoming_buffer_size(resource_limits::INCOMING_BUFFER_BYTES)
+            .incoming_buffer_size_total(resource_limits::TOTAL_INCOMING_BUFFER_BYTES);
         let endpoint = quinn::Endpoint::server(server_config, bind_addr)
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         let state = Arc::new(RelayState {
@@ -906,6 +924,12 @@ impl RelayServer {
 
     pub fn media_snapshot(&self) -> RelayMediaSnapshot {
         self.state.media_statistics.snapshot()
+    }
+
+    pub fn resource_budget(&self) -> RelayResourceBudget {
+        self.config
+            .resource_budget()
+            .expect("validated relay resource budget")
     }
 
     pub fn close(&self) {

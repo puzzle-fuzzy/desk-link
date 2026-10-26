@@ -398,6 +398,12 @@
 - **方案：** 以 received_at 建索引，按时间/数量分批回收，独立低频维护；保留接收原子性和去重；监测 WAL、磁盘及清理耗时。SQLite 文件是否缩小需实际维护策略，删除行不等于空间立刻归还 OS。
 - **验收：** 用真实规模合成历史记录验证 query plan、接收 p95、清理锁时间和磁盘上界；14 天保留语义不变，不为性能丢失批次原子性。
 
+### DL2-052 · P0 · 收紧 relay 未使用流与资源预算
+
+- [ ] 完成候选容器负载实测并核对峰值/OOM 事件；不把载荷模型当 RSS 保证。
+- [x] 核实锁定 quinn-proto 0.11.16 的 uni=100、单流 1250000 字节、连接 VarInt::MAX 等默认；代码禁用 uni，显式限制 bidi/stream/connection/datagram/crypto/incoming 额度。默认连接/session 改为 64，声明 160MiB 缓冲预算，包含 accepted/rejection/incoming 的默认模型为 152MiB；超预算配置启动拒绝，候选 Compose/Dockerfile 与 256MiB 容器限制对应。未部署。
+- [x] 本地真实 QUIC 资源夹具、最大可靠帧、慢接收端隔离通过；relay 共 38 项常规测试，Clippy all-targets `--locked -- -D warnings`、fmt/diff 检查通过。Linux RSS/cgroup 只读观测和 CLI 已加入；容器实际测量仍待做。主题 `fix(DL2-052): bound relay QUIC buffers and validate admission budgets`，细节见 [relay 资源边界](docs/relay-resource-bounds.md)。
+
 ## 7. 代码整理与验证体系
 
 ### DL2-040 · P1 · 按实际所有权拆分巨型控制模块
