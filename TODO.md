@@ -443,6 +443,8 @@
 
 - **044反证与逐条归因（`docs(DL2-042): correct cursor congestion evidence and observer limits`）：** 按Cargo.lock核对quinn0.11.11/proto0.11.16缓存与版本化API：send_datagram拥塞可淘汰旧包并Ok，公开错误无QueueFull，wait内部Blocked为Pending；原拥塞P1路径不成立。保留cursor真实错误?传播/可选通道分类降级的待验范围，observer只计尝试/返回错误不是真实丢包。能力矩阵逐条区分044/045反证、046取消树已修与仲裁待验、048P1证据不足；不延续全部确认。主目录草稿仍非本组写入、作者未知、保持未stage/覆盖；未改crypto/transport或其他编号状态。
 
+- **joint初始化保留缺陷与日志归因（`docs(DL2-042): record the joint partial-retention blocker and review limits`）：** 只读固定媒体89bd1e5确认021 create/open后ready发送失败直接return，绕过正常preserve并由remove_on_drop=true删除已有resume partial；确定源码链路不是已运行回归。媒体owner独立修复与确定性回归待joint复用，未改其WIP或021状态。协调方报告joint未提交/UU/测试未跟踪，不当stable；shared174通过1忽略为其日志更正，274笔误撤回，不冒充本工程测试或joint最终验收，其余review未见问题也不等于测试通过。
+
 ## 8. 扩展角色
 
 ### DL2-043 · P3 · 被控 Mac 的能力协商与实际编码一致

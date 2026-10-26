@@ -27,4 +27,14 @@ observer可独立计调用尝试、返回错误及白名单错误类别；Ok既�
 
 048后续有意义的验证应包括：消息3密文/密钥payload篡改被拒、跨会话/不同身份的握手拼接被拒、错误expected peer拒绝、随机源失败与派生策略的明确语义；将网络攻击者、恶意已授权端点和熵源失效分别建模。只有独立攻击路径/回归证据支持后才能调整缺陷严重性。
 
+## joint只读发现：DL2-021初始化窗口
+
+协调方独立review并复读确认了joint的保留缺陷。本工程仅查看固定媒体提交 `89bd1e5161653dd668d290a417bd5f6cc146290a` 的 `apps/windows/src/transfer.rs`，没有读取或修改joint未提交树，也没有运行该新增回归。
+
+`IncomingFileWorker::spawn_with` 的磁盘线程在create/open成功后取得metadata，约175～177行的 `ready.send(Ok(metadata)).is_err()` 直接return。若调用方future在 `opened.await` 期间因断连被drop，receiver已关闭；已有resume partial打开后仍带 `remove_on_drop=true`，线程return会触发IncomingFile::drop删除partial。约212～214行的正常commands关闭路径会preserve，但初始化早退没有进入该路径。IncomingFile::preserve关闭文件并置remove_on_drop=false；Drop在true时remove_file，形成完整源码因果链。
+
+该项分类为**源码确定的初始化保留缺口，修复/确定性回归待媒体owner交付**，不是已经跑失败的本工程测试。须用真实临时partial和可控初始化barrier覆盖“文件已打开、ready未交付→drop create future→释放磁盘线程”；断言原prefix内容/长度/hash与后续resume仍可用。正常handle-drop保留和显式cancel清理分别回归，不把两种语义合并。媒体独立021修复及结果必须先复用到joint，再取得最终revision与报告；不靠一次旧suite通过代替这个未覆盖窗口。
+
+协调方另报告joint仍未提交、索引有UU、测试文件未跟踪，不能当stable；本工程未自行检查该WIP。其shared日志汇总更正为174通过/1忽略，先前274是撤回的笔误；这些都是协调方日志信息，尚未绑定最终joint提交，不是本工程复跑结果，也不是联合验收已完成。
+
 052/053由网络组优先复核，054～058由服务组复核，其他项由媒体/产品/Apple按各自范围核验。未完成归属与成立性确认的项不加入本工程最终能力矩阵；主目录“新增全部确认”的总括应由原编辑者逐项更正，工程组不整份覆盖或stage该草稿。

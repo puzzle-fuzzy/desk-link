@@ -90,3 +90,9 @@ API桥接后的 `dist/verify/captured-context-bridge.json` 记录干净源码 `5
 | 048 | key经Noise message3 payload认证解密；未直接纳入Ed签名不足以证明已确认P1/网络替换或UKS路径 | 熵源/派生防御纵深与篡改/拼接测试待评估；不据此直接改crypto或背书新缺陷严重性 |
 
 上述分类没有新增真实远控/性能证明，也没有修改其他编号完成状态；其他新项继续按owner复核当前分支后逐项记录。
+
+## joint收口前仍有确定保留缺陷
+
+协调方joint只读审查与本工程固定媒体 `89bd1e5161653dd668d290a417bd5f6cc146290a` 源码核对确认DL2-021初始化缺口：打开已有resume partial后，ready发送失败直接return，未走preserve，IncomingFile的remove_on_drop=true导致partial被删。正常handle-drop的preserve分支不覆盖这个窗口。媒体owner负责独立021修复，joint最终提交前须复用并补确定性回归；本工程这里只做源码复核，未运行新回归，详细链路见[证据记录](second-stage-review-evidence.md)。
+
+协调方报告joint仍未提交/索引UU/测试未跟踪，因此未形成可整合的stable revision。其日志计数已更正为shared174通过/1忽略（原274笔误撤回），不是本工程实际测试，也不能替代最终jointSHA/报告。除此项之外“暂未见新确定缺陷”的只读review表述不等于测试通过。FFI Mac Host/Swift、实际WebView和双机仍独立；本工程原始失败报告继续按各自源码身份保留。
