@@ -6,11 +6,8 @@ use desklink_crypto::{
 use desklink_protocol::{
     Codec, ControlMessage, DeviceCapabilities, DeviceRole, FileTaskMessage,
     FileTransferCapabilities, H264Profile, InputEnvelope, InputEvent, Platform, TransferMessage,
-    TransferResult,
-    codec::{
-        decode_control, decode_input, decode_transfer, encode_control, encode_input,
-        encode_transfer,
-    },
+    TransferResult, decode_control, decode_input, decode_transfer, encode_control, encode_input,
+    encode_transfer,
 };
 use std::{
     fs,
