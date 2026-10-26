@@ -66,7 +66,8 @@ from the benchmark's purge timing. Receipt call measurements exclude HTTP/signat
 validation. The fixed-workload disk observations do not prove a production disk
 cap, a real two-machine latency result or a long-duration production soak.
 
-Measured on 2026-10-26 with Bun 1.3.14 / Windows / i7-13700KF;
+Measured for DL2-039 before the DL2-054 admission/usage-trigger additions on
+2026-10-26 with Bun 1.3.14 / Windows / i7-13700KF;
 full output is in `retention-benchmark-evidence.json`:
 
 | Measurement | Prior full delete | Indexed bounded maintenance |
@@ -87,3 +88,5 @@ page reuse for this workload. Indexes add about 8.9 MB at this high-water. Purge
 call maxima still include occasional SQLite commit/checkpoint or filesystem
 stalls; the evidence does not promise a hard millisecond deadline. These are
 one-run local measurements on a synthetic workload, not production percentiles.
+They are historical DL2-039 evidence; rerun the benchmark for current-revision
+performance after durable-quota trigger changes.

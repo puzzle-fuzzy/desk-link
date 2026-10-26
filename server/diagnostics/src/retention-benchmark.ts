@@ -53,7 +53,9 @@ function ingest(store: DiagnosticStore, index: number) {
 function run(baseline: boolean) {
   const path = join(directory, `${baseline ? "baseline" : "bounded"}.sqlite`);
   databases.push(path);
-  const store = new DiagnosticStore(path);
+  // This isolated benchmark intentionally sizes its local quota above its seed.
+  const store = new DiagnosticStore(path, { events: events * 4 + 10_000,
+    batches: events + 10_000, bytes: 2 * 1_024 * 1_024 * 1_024 });
   try {
     if (baseline) store.database.exec("DROP INDEX events_by_received_at; DROP INDEX batches_by_received_at;");
     seed(store, "retained", events, cutoff);
@@ -84,10 +86,13 @@ function run(baseline: boolean) {
       let deletedEvents = 0;
       let deletedBatches = 0;
       if (baseline) {
-        const result = timed(() => store.database.transaction(() => ({
-          events: store.database.query("DELETE FROM events WHERE received_at_unix_s < ?").run(cutoff).changes,
-          batches: store.database.query("DELETE FROM batches WHERE received_at_unix_s < ?").run(cutoff).changes,
-        }))());
+        const result = timed(() => store.database.transaction(() => {
+          store.database.query("DELETE FROM events WHERE received_at_unix_s < ?").run(cutoff);
+          const deletedEvents = (store.database.query("SELECT changes() AS count").get() as { count: number }).count;
+          store.database.query("DELETE FROM batches WHERE received_at_unix_s < ?").run(cutoff);
+          const deletedBatches = (store.database.query("SELECT changes() AS count").get() as { count: number }).count;
+          return { events: deletedEvents, batches: deletedBatches };
+        })());
         times.push(result.ms); deletedEvents = result.value.events; deletedBatches = result.value.batches;
       } else {
         for (;;) {

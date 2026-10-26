@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 
 import type { DiagnosticBatch, DiagnosticEvent } from "./validation";
+import { configureStorageQuota, DEFAULT_STORAGE_LIMITS, DiagnosticStorageFull, storageUsage, type StorageLimits } from "./storage-quota";
 
 export const RETENTION_SECONDS = 14 * 24 * 60 * 60;
 export const PURGE_BATCH_SIZE = 1_000;
@@ -21,7 +22,7 @@ export interface StoredBatchResult {
 export class DiagnosticStore {
   readonly database: Database;
 
-  constructor(private readonly path: string) {
+  constructor(private readonly path: string, limits: StorageLimits = DEFAULT_STORAGE_LIMITS) {
     this.database = new Database(path, { create: true, strict: true });
     this.database.exec("PRAGMA journal_mode = WAL");
     this.database.exec("PRAGMA synchronous = NORMAL");
@@ -60,6 +61,7 @@ export class DiagnosticStore {
       CREATE INDEX IF NOT EXISTS batches_by_received_at
         ON batches(received_at_unix_s);
     `);
+    configureStorageQuota(this.database, limits);
   }
 
   insert(
@@ -68,7 +70,7 @@ export class DiagnosticStore {
     remoteAddress: string,
     receivedAtUnixS = Math.floor(Date.now() / 1_000),
   ): StoredBatchResult {
-    return this.database.transaction((): StoredBatchResult => {
+    try { return this.database.transaction((): StoredBatchResult => {
       const insertBatch = this.database.query(`
         INSERT OR IGNORE INTO batches (
           batch_id, received_at_unix_s, installation_id, correlation_id,
@@ -116,8 +118,13 @@ export class DiagnosticStore {
       }
 
       return { duplicate: false, acceptedEvents };
-    })();
+    })(); } catch (error) {
+      if (error instanceof Error && error.message.includes("diagnostic_storage_quota")) throw new DiagnosticStorageFull();
+      throw error;
+    }
   }
+
+  usage() { return storageUsage(this.database); }
 
   // Each call holds the writer lock for at most two bounded deletes. Backlog is
   // drained by independent maintenance ticks, never by an ingestion transaction.
@@ -126,18 +133,25 @@ export class DiagnosticStore {
       throw new RangeError("diagnostic purge limit must be between 1 and 5000");
     }
     return this.database.transaction(() => {
-      const events = this.database.query(`DELETE FROM events WHERE rowid IN (
+      this.database.query(`DELETE FROM events WHERE rowid IN (
         SELECT rowid FROM events WHERE received_at_unix_s < ?
         ORDER BY received_at_unix_s LIMIT ?
-      )`).run(beforeUnixS, limit).changes;
+      )`).run(beforeUnixS, limit);
+      // Bun's run().changes includes trigger work. changes() is the top-level
+      // deleted-row count used to decide whether this bounded slice drained.
+      const events = (this.database.query("SELECT changes() AS count").get() as { count: number }).count;
       // All events of a batch have its receipt timestamp. Keep deduplication
       // markers until expired events have drained, so a bounded slice cannot
       // leave events pointing at an already-deleted batch. This also avoids a
       // correlated scan of every not-yet-drained batch on each maintenance tick.
-      const batches = events === limit ? 0 : this.database.query(`DELETE FROM batches WHERE rowid IN (
-        SELECT rowid FROM batches WHERE received_at_unix_s < ?
-        ORDER BY received_at_unix_s LIMIT ?
-      )`).run(beforeUnixS, limit).changes;
+      let batches = 0;
+      if (events < limit) {
+        this.database.query(`DELETE FROM batches WHERE rowid IN (
+          SELECT rowid FROM batches WHERE received_at_unix_s < ?
+          ORDER BY received_at_unix_s LIMIT ?
+        )`).run(beforeUnixS, limit);
+        batches = (this.database.query("SELECT changes() AS count").get() as { count: number }).count;
+      }
       return { events, batches, more: events === limit || batches === limit };
     })();
   }

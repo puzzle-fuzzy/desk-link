@@ -144,7 +144,7 @@ function validateBatch(value: unknown, publicKey: Uint8Array, nowUnixMs: number)
   if (value.schema !== 1 || value.platform !== "windows") {
     throw new BatchValidationError(400, "diagnostic batch schema or platform is unsupported");
   }
-  if (typeof value.app_version !== "string" || !APP_VERSION.test(value.app_version)) {
+  if (typeof value.app_version !== "string" || value.app_version.length > 96 || !APP_VERSION.test(value.app_version)) {
     throw new BatchValidationError(400, "diagnostic app version is invalid");
   }
   if (value.source !== "host" && value.source !== "controller") {
