@@ -1,6 +1,8 @@
 # DL2-024：认证 LAN 多通道传输切片
 
-本切片提供 `desklink_transport::LanDataPlane`，不改变现有视频、音频、文件、FFI 或业务消息格式。它尚未接入 Windows/FFI 生产 runtime，因此当前产品仍仅有视频直连；现有会话在公网 relay 断开后的恢复行为没有被本切片改变。公网 NAT 穿透、LAN 发现/本地配对、实机延迟及长稳仍待实施或验收。
+本切片提供 `desklink_transport::LanDataPlane`，传输组件本身不定义视频、音频、文件或 FFI 的业务消息格式。它尚未接入 Windows/FFI 生产 runtime，公网 NAT 穿透、LAN 发现/本地配对、实机延迟及长稳仍待实施或验收。
+
+当前分支已引入下文 DL2-013 编译过渡合同：生产输入/视频路径仍有零上下文占位，会被正式 codec 拒绝。因此此分支当前不能作为可用远控整包交付；本记录的 LAN/codec 夹具通过仅证明传输边界。后续必须复用 owner 的实际上下文生产、呈现放行和 Host 校验提交，不能通过默认值绕过。
 
 ## 接线契约
 
@@ -61,8 +63,18 @@ git diff --check
 
 `CHANNEL_COUNT=8` 是业务 `ChannelKind` 1～8 的数量，不是 `SecureLane::COUNT`；新增内部 probe lane 不增加业务队列或 QUIC event 槽。LAN 连接仍来自相同 probe API，本模块只追加 crate 内认证连接 getter。整合共享 API 时保留当前基线的静态捕获逻辑，仅接入 probe 调用与代数退出时的任务取消；没有把 LAN 数据面接入生产 Host，也未替换媒体组后续的输入快路径。
 
-DL2-013 的 `InputEnvelope {stream_id,input_epoch}` 和 `VideoConfig.input_epoch` 由 Apple/FFI 提供唯一契约，本切片没有定义另一版本。业务正文在 seal 前仅包裹 DLB1/token，admit 后逐字节剥除包装并返回，不读取或重写输入字段。可靠业务上限仍为 65491 字节，epoch 占用业务体自身预算。Host 输入消费者必须校验 epoch；收讫仅表示传输入队，不能代替输入执行或 epoch 合法性。待该契约提交后，再用真实编码器补直连/回退字段保留和旧 epoch 拒绝的运行时回归。
+DL2-013 的 `InputEnvelope {stream_id,input_epoch}` 和 `VideoConfig.input_epoch` 由 Apple/FFI 提供唯一契约，本切片没有定义另一版本。业务正文在 seal 前仅包裹 DLB1/token，admit 后逐字节剥除包装并返回，不读取或重写输入字段。可靠业务上限仍为 65491 字节，epoch 占用业务体自身预算。Host 输入消费者必须校验 epoch；收讫仅表示传输入队，不能代替输入执行或 epoch 合法性。正式合同的传输回归见下节；Host 旧 epoch 拒绝和业务接线仍待 owner 完成。
 
-本分支实际验证：crypto 36 项、transport 38 项单元 +16 项 localhost、relay 34 项常规、FFI 39 项以及 Windows `direct_video_tests` 2 项全部通过。手工性能 probe 本次未重跑，原记录仍对应此前测量基线；没有用此前延迟替代新接入的性能证据。crypto/transport/relay/FFI all-targets Clippy、Windows lib Clippy（均 `--locked -- -D warnings`）、五个 package 的 fmt 与最终 `git diff --check` 通过。
+以下是引入 DL2-013 合同之前的历史分支验证：crypto 36 项、transport 38 项单元 +16 项 localhost、relay 34 项常规、FFI 39 项以及 Windows `direct_video_tests` 2 项全部通过。它不能证明后续编译过渡合同下的 FFI/Windows 业务链路可用。手工性能 probe 本次未重跑，原记录仍对应此前测量基线；没有用此前延迟替代新接入的性能证据。该基线 crypto/transport/relay/FFI all-targets Clippy、Windows lib Clippy（均 `--locked -- -D warnings`）、五个 package 的 fmt 与 `git diff --check` 通过。
 
 本地依赖提交分别为 `958f6262a42bb74e493eb82987f089516a93e5a7` 与 `84fe28952ebe2bf7aaf5e63ce44174aa41562f37`，均记录原始来源。整合时引入的 runtime 行尾变化在本跟进提交纠正，最终相对整合前的 runtime 差异只剩共享探测调用与任务取消管理。主分支若已有原始两个依赖，不应重复引入本地依赖副本。
+
+## DL2-013 合同传输回归（2026-10-26）
+
+已复用独立合同 `bc6c0a62d3817fbe44759cddf5069c3dee117f4c`（本地副本 `8417c2cfd78868ef44aab4b13607a20a3c30bbe6`），依赖同一协议 13 基线。只通过 protocol 的 `encode_input` / `decode_session_input` 处理输入；transport 不手工拼版本前缀，也不尝试无上下文 fallback。业务 codec 会拒绝零 context、旧布局、尾字节与错版本。
+
+新增两个真实 LAN QUIC 回归。Host 夹具使用 `encode_video_config` 公布有效 stream/epoch，Controller 通过收到的 `decode_video_config` 结果捕获输入上下文，再调用 `encode_input`。覆盖最小非零值、`u64::MAX` 及组合边界、sequence/timestamp 边界，验证输入 wire（含开头零字节）完整保留。缺少收讫时观察到的 LAN 密文与 relay retry 逐字节相同，统一 ingress 解密后 `decode_session_input` 得到原上下文，相同 retry 不重复入队。夹具不会把发送时的“当前 epoch”覆盖到已捕获输入上。
+
+本分支实际通过：protocol 47 项；transport 43 项单元 +16 项 localhost（LAN 数据面现 13 项）；opaque relay 34 项常规。protocol/transport all-targets Clippy（`--locked -- -D warnings`）、transport fmt 和 `git diff --check` 通过。命令仍使用仓库 `scripts/run-windows-cargo.py` 和独立 target 目录。
+
+未验证/未交付：当前合同中 `HostVideoPipeline`、FFI host worker 的视频配置 epoch，以及 ControllerRuntime、FFI emit_input 的输入 context 仍为零占位，正式 codec 会拒绝它们。没有将此前 FFI/Windows 绿色结果沿用到此基线，也未运行这些占位路径来声称业务通过。真实 Host 分配/匹配 epoch、呈现后放行、旧 epoch 拒绝、跨端排队上下文捕获仍由相应 owner 接线；本次没有更改这些生产路径或补默认 `1`。DL2-024 主项保持未完成。

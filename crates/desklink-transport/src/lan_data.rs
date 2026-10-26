@@ -559,7 +559,10 @@ mod tests {
     use super::*;
     use crate::DirectLanEndpoint;
     use desklink_crypto::{DeviceIdentity, NoiseInitiator, NoiseResponder, SecureRole};
-    use desklink_protocol::DirectLanCandidate;
+    use desklink_protocol::{
+        Codec, DirectLanCandidate, InputContext, InputEnvelope, InputEvent, PROTOCOL_VERSION,
+        VideoConfig, decode_session_input, decode_video_config, encode_input, encode_video_config,
+    };
     use rand_core::SeedableRng;
     use std::sync::atomic::AtomicUsize;
 
@@ -643,6 +646,43 @@ mod tests {
                 a,
                 b,
             }
+        }
+
+        async fn publish_input_context(&self, offered: InputContext) -> InputContext {
+            offered.validate().unwrap();
+            // The fixture Host explicitly issues the context in a real
+            // VideoConfig. The Controller derives its input context from the
+            // received config rather than inventing a default epoch.
+            let config = VideoConfig {
+                protocol_version: PROTOCOL_VERSION,
+                stream_id: offered.stream_id,
+                input_epoch: offered.input_epoch,
+                config_version: 1,
+                codec: Codec::H264,
+                width: 1920,
+                height: 1080,
+                sequence_header: vec![0, 0, 0, 1, 0x67, 0x4d, 0, 0x1f],
+            };
+            let wire = encode_video_config(&config).unwrap();
+            let relay = OfflineRelay(AtomicUsize::new(0));
+            assert_eq!(
+                self.b
+                    .send(ChannelKind::VideoConfig, &wire, &relay)
+                    .await
+                    .unwrap(),
+                LanDataRoute::DirectLan,
+            );
+            let received = receive(&self.a, ChannelKind::VideoConfig).await;
+            assert_eq!(received.as_ref(), wire);
+            let decoded = decode_video_config(&received).unwrap();
+            assert_eq!(decoded, config);
+            let captured = InputContext {
+                stream_id: decoded.stream_id,
+                input_epoch: decoded.input_epoch,
+            };
+            assert_eq!(captured, offered);
+            assert_eq!(relay.0.load(Ordering::Relaxed), 0);
+            captured
         }
     }
 
@@ -1059,5 +1099,125 @@ mod tests {
         .await
         .expect("close must reclaim readers without waiting for the crypto lock");
         drop(crypto_guard);
+    }
+
+    #[tokio::test]
+    async fn typed_input_preserves_config_issued_context_u64_boundaries_and_leading_zero_over_lan()
+    {
+        let f = Fixture::new().await;
+        let relay = OfflineRelay(AtomicUsize::new(0));
+        for offered in [
+            InputContext {
+                stream_id: 1,
+                input_epoch: 1,
+            },
+            InputContext {
+                stream_id: u64::MAX,
+                input_epoch: u64::MAX,
+            },
+            InputContext {
+                stream_id: u64::MAX,
+                input_epoch: 1,
+            },
+            InputContext {
+                stream_id: 1,
+                input_epoch: u64::MAX,
+            },
+        ] {
+            let captured = f.publish_input_context(offered).await;
+            let input = InputEnvelope {
+                sequence: u64::MAX,
+                timestamp_us: u64::MAX,
+                stream_id: captured.stream_id,
+                input_epoch: captured.input_epoch,
+                event: InputEvent::MouseMove { x: 0, y: 1_000_000 },
+            };
+            let wire = encode_input(&input).unwrap();
+            assert_eq!(wire.first(), Some(&0));
+            assert_eq!(
+                f.a.send(ChannelKind::Input, &wire, &relay).await.unwrap(),
+                LanDataRoute::DirectLan,
+            );
+            let received = receive(&f.b, ChannelKind::Input).await;
+            assert_eq!(received.as_ref(), wire);
+            assert_eq!(received.first(), Some(&0));
+            // This is a transport/codec assertion, without wall-clock,
+            // active-epoch or OS input-injection decisions.
+            let decoded = decode_session_input(&received).unwrap();
+            assert_eq!(decoded, input);
+            assert_eq!(decoded.context(), captured);
+        }
+        assert_eq!(relay.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn typed_input_keeps_config_context_and_identical_ciphertext_on_relay_fallback() {
+        let f = Fixture::new().await;
+        let captured = f
+            .publish_input_context(InputContext {
+                stream_id: u64::MAX,
+                input_epoch: u64::MAX,
+            })
+            .await;
+        let input = InputEnvelope {
+            sequence: u64::MAX,
+            timestamp_us: u64::MAX,
+            stream_id: captured.stream_id,
+            input_epoch: captured.input_epoch,
+            event: InputEvent::MouseWheel {
+                delta_x: -1200,
+                delta_y: 1200,
+            },
+        };
+        let wire = encode_input(&input).unwrap();
+        assert_eq!(wire.first(), Some(&0));
+
+        f.b.tasks[0].abort();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !f.b.tasks[0].is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let peer = f.b.connection.clone();
+        let direct_attempt = tokio::spawn(async move {
+            let (mut response, mut request) = peer.accept_bi().await.unwrap();
+            let mut header = [0; HEADER_BYTES + 4];
+            request.read_exact(&mut header).await.unwrap();
+            assert_eq!(decode_header(&header).unwrap(), ChannelKind::Input);
+            let length = u32::from_be_bytes(header[HEADER_BYTES..].try_into().unwrap()) as usize;
+            let mut observed = vec![0; length];
+            request.read_exact(&mut observed).await.unwrap();
+            // Simulate a LAN endpoint that received the encrypted packet but
+            // cannot prove admission. The sender must retry those same bytes.
+            response.finish().unwrap();
+            observed
+        });
+        let relay = CaptureRelay::new();
+        assert_eq!(
+            f.a.send(ChannelKind::Input, &wire, &relay).await.unwrap(),
+            LanDataRoute::Relay,
+        );
+        let lan_ciphertext = direct_attempt.await.unwrap();
+        let (channel, retry) = relay.0.lock().await.pop().unwrap();
+        assert_eq!(channel, ChannelKind::Input);
+        assert_eq!(retry.as_ref(), lan_ciphertext);
+        f.b.accept_relay_ciphertext(channel, retry.clone())
+            .await
+            .unwrap();
+        let received = receive(&f.b, channel).await;
+        assert_eq!(received.as_ref(), wire);
+        assert_eq!(received.first(), Some(&0));
+        let decoded = decode_session_input(&received).unwrap();
+        assert_eq!(decoded, input);
+        assert_eq!(decoded.context(), captured);
+        f.b.accept_relay_ciphertext(channel, retry).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), f.b.recv(channel))
+                .await
+                .is_err()
+        );
+        assert!(relay.0.lock().await.is_empty());
     }
 }
