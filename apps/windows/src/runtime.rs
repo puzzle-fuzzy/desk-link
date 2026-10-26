@@ -9,7 +9,13 @@ mod adaptive_bitrate;
 #[cfg(test)]
 mod direct_arbitration_tests;
 mod direct_path_slot;
+mod lan_session;
+#[cfg(test)]
+mod lan_tests;
 use adaptive_bitrate::AdaptiveBitrate;
+use lan_session::{
+    HostDataGuard, HostLanSwitch, notify_local_control_ended_data, send_control_data,
+};
 mod configuration_queue;
 use configuration_queue::{
     ConfigurationAction, ConfigurationKind, ConfigurationOperation, ConfigurationQueue,
@@ -41,10 +47,12 @@ use desklink_protocol::{
 };
 use desklink_session::{DesktopRect, ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    DirectLanConnection, DirectLanSession, DirectLanVideoPath, JoinRejectCode, QuicClient,
-    QuicClientConfig, RelayDirectoryRegistration, RelayJoin, RelayVideoPath, TransportError,
-    VideoDatagramBackend, VideoDatagramRoute,
+    ChannelKind, DirectLanConnection, DirectLanSession, JoinRejectCode, NegotiatedLanData,
+    QuicClient, QuicClientConfig, QuicRelayBackend, RelayDirectoryRegistration, RelayJoin,
+    SessionDataError, SessionDataPlane, TransportError,
 };
+#[cfg(test)]
+use desklink_transport::{VideoDatagramBackend, VideoDatagramRoute};
 use desklink_video::{EncodedFrame as WireEncodedFrame, LatestFrameQueue, encode_video_frame};
 use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
@@ -389,6 +397,8 @@ pub enum HostRuntimeError {
     InconsistentVideoConfig,
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
+    #[error("session data error: {0}")]
+    SessionData(#[from] SessionDataError),
     #[error("encoder error: {0:?}")]
     Encoder(EncoderError),
     #[error("input injection error: {0:?}")]
@@ -713,7 +723,8 @@ impl HostSupervisor {
 pub fn host_error_is_retryable(error: &HostRuntimeError) -> bool {
     match error {
         HostRuntimeError::Transport(error) => transport_error_is_retryable(error),
-        HostRuntimeError::TransportClosed(_)
+        HostRuntimeError::SessionData(_)
+        | HostRuntimeError::TransportClosed(_)
         | HostRuntimeError::HandshakeTimeout
         | HostRuntimeError::NegotiationTimeout
         | HostRuntimeError::UntrustedController
@@ -792,6 +803,7 @@ fn host_error_rearms_on_connected_relay(error: &HostRuntimeError) -> bool {
     !matches!(
         error,
         HostRuntimeError::TransportClosed(_)
+            | HostRuntimeError::SessionData(SessionDataError::NoPath(_) | SessionDataError::Closed)
             | HostRuntimeError::LocalControlEndUnconfirmed
             | HostRuntimeError::Transport(
                 TransportError::Connection(_)
@@ -1233,7 +1245,7 @@ impl HostRuntime {
         // capture stack or sending anything back. This proves the approved
         // controller attempt is still the active peer and prevents late
         // approval from writing old ciphertext into a replacement connection.
-        let negotiated_profile = receive_controller_capabilities(
+        let controller_capabilities = receive_controller_capabilities(
             &client,
             &secure,
             peer_generation,
@@ -1241,15 +1253,12 @@ impl HostRuntime {
             stream_id,
         )
         .await?;
-        let direct_session = DirectLanSession::bind_for_client(
-            "0.0.0.0:0".parse().expect("valid wildcard bind address"),
-            &client,
-            next_direct_candidate_id(),
-            secure.lock().await.video_path_binding(),
-            now_unix_s(),
-        )
-        .ok()
-        .map(Arc::new);
+        let negotiated_profile = if controller_capabilities.supports_h264_profile(H264Profile::High)
+        {
+            H264Profile::High
+        } else {
+            H264Profile::Main
+        };
         let direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>> =
             Arc::new(AsyncMutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1306,31 +1315,61 @@ impl HostRuntime {
                 return Err(HostRuntimeError::CaptureWorkerStopped);
             }
         };
-        if let Err(error) = send_host_capabilities(
+        let local_capabilities = match send_host_bootstrap_capabilities(
             &client,
             &secure,
             peer_generation,
             ready.width,
             ready.height,
             ready.profile,
-            &ready.displays,
-            ready.active_display_id,
+            Some(lan_session::capabilities()),
         )
         .await
         {
-            let _ = capture_worker.shutdown_and_join();
-            return Err(error);
-        }
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                let _ = capture_worker.shutdown_and_join();
+                return Err(error);
+            }
+        };
+        let agreement = NegotiatedLanData::from_authenticated_caps(
+            &local_capabilities,
+            &controller_capabilities,
+            secure.lock().await.video_path_binding(),
+            peer_generation,
+        )?;
+        let relay = Arc::new(QuicRelayBackend::new(client.clone(), peer_generation)?);
+        let data = if let Some(agreement) = agreement {
+            SessionDataPlane::relay_only(agreement, secure.clone(), relay).await?
+        } else {
+            SessionDataPlane::legacy(secure.clone(), relay)
+        };
+        let _data_guard = HostDataGuard(data.clone());
+        send_display_list_data(&data, &ready.displays, ready.active_display_id).await?;
+        send_video_quality_state_data(
+            &data,
+            DEFAULT_VIDEO_QUALITY_PREFERENCE,
+            DEFAULT_VIDEO_QUALITY,
+        )
+        .await?;
+        // Start candidate expiry only after capture readiness and bootstrap.
+        let direct_session = DirectLanSession::bind_for_client(
+            "0.0.0.0:0".parse().expect("valid wildcard bind address"),
+            &client,
+            next_direct_candidate_id(),
+            secure.lock().await.video_path_binding(),
+            now_unix_s(),
+        )
+        .ok()
+        .map(Arc::new);
         if let Some(session) = direct_session.as_ref() {
-            let offer = encode_control(&ControlMessage::VideoPathCandidateOffer {
-                candidate: session.candidate().clone(),
-            })?;
-            client
-                .send_control_for_generation(
-                    peer_generation,
-                    seal(&secure, SecureLane::Control, &offer).await?,
-                )
-                .await?;
+            send_control_data(
+                &data,
+                &ControlMessage::VideoPathCandidateOffer {
+                    candidate: session.candidate().clone(),
+                },
+            )
+            .await?;
         }
         // Initial capabilities already contained this generation's display list.
         topology_receiver.borrow_and_update();
@@ -1374,27 +1413,22 @@ impl HostRuntime {
         let active_session = session_control.activate(stream_id);
         on_connected(stream_id);
 
-        let mut video = Box::pin(send_video_loop(
-            client.clone(),
-            secure.clone(),
-            peer_generation,
-            stream_id,
-            video_queue,
-            video_notify.clone(),
-            force_keyframe.clone(),
-            direct_connection.clone(),
+        let mut video = Box::pin(lan_session::optional_lane(
+            data.clone(),
+            send_video_loop(
+                data.clone(),
+                stream_id,
+                video_queue,
+                video_notify.clone(),
+                force_keyframe.clone(),
+            ),
         ));
         let (input_state_updates, input_state_receiver) = watch::channel(None);
-        let mut input_feedback = Box::pin(send_input_state_loop(
-            client.clone(),
-            secure.clone(),
-            peer_generation,
-            input_state_receiver,
-        ));
+        let mut input_feedback =
+            Box::pin(send_input_state_loop(data.clone(), input_state_receiver));
         let mut inbound = Box::pin(receive_input_and_control(
-            client.clone(),
+            data.clone(),
             secure.clone(),
-            peer_generation,
             stream_id,
             input.clone(),
             force_keyframe,
@@ -1414,28 +1448,24 @@ impl HostRuntime {
                 media_observer: media_observer.clone(),
             },
         ));
-        let mut cursor = Box::pin(send_cursor_loop(
-            client.clone(),
-            secure.clone(),
-            peer_generation,
-            stream_id,
-            selected_desktop,
-            media_observer,
+        let mut cursor = Box::pin(lan_session::optional_lane(
+            data.clone(),
+            send_cursor_loop(data.clone(), stream_id, selected_desktop, media_observer),
         ));
-        let mut transfer = Box::pin(receive_transfer_loop(
-            client.clone(),
-            secure.clone(),
-            peer_generation,
+        let mut transfer = Box::pin(lan_session::optional_lane(
+            data.clone(),
+            receive_transfer_loop(data.clone()),
         ));
-        let mut audio = Box::pin(send_audio_loop(
-            client.clone(),
-            secure.clone(),
-            peer_generation,
-            stream_id,
-            audio_queue,
-            audio_notify,
-            audio_state_receiver,
-            audio_enabled_receiver,
+        let mut audio = Box::pin(lan_session::optional_lane(
+            data.clone(),
+            send_audio_loop(
+                data.clone(),
+                stream_id,
+                audio_queue,
+                audio_notify,
+                audio_state_receiver,
+                audio_enabled_receiver,
+            ),
         ));
         let mut worker_receiver = Box::pin(worker_receiver);
 
@@ -1472,7 +1502,7 @@ impl HostRuntime {
             worker.shutdown_and_join();
         }
         if let Some(request) = end_request {
-            let notified = notify_local_control_ended(&client, &secure, peer_generation).await;
+            let notified = notify_local_control_ended_data(&data).await;
             request.complete(notified);
             return Err(if notified {
                 HostRuntimeError::LocalControlEnded
@@ -1486,7 +1516,7 @@ impl HostRuntime {
             // This message uses the already authenticated end-to-end encrypted control lane.
             // The controller can stop retrying and show an actionable local-backend failure
             // instead of misreporting the intentional host rearm as a network disconnect.
-            let _ = send_runtime_failure(&client, &secure, peer_generation, reason).await;
+            let _ = send_control_data(&data, &ControlMessage::AccessDenied { reason }).await;
         }
         outcome
     }
@@ -2225,7 +2255,7 @@ async fn receive_controller_capabilities(
     peer_generation: u64,
     force_keyframe: Arc<AtomicBool>,
     stream_id: u64,
-) -> Result<H264Profile, HostRuntimeError> {
+) -> Result<DeviceCapabilities, HostRuntimeError> {
     let negotiation = async {
         let mut received_controller_hello = false;
         loop {
@@ -2241,11 +2271,7 @@ async fn receive_controller_capabilities(
                         && capabilities.role == DeviceRole::Controller
                         && capabilities.supports_h264_profile(H264Profile::Main) =>
                 {
-                    return Ok(if capabilities.supports_h264_profile(H264Profile::High) {
-                        H264Profile::High
-                    } else {
-                        H264Profile::Main
-                    });
+                    return Ok(capabilities);
                 }
                 ControlMessage::Capabilities(_) => {
                     return Err(HostRuntimeError::InvalidControllerCapabilities);
@@ -2255,7 +2281,7 @@ async fn receive_controller_capabilities(
                 } if requested_stream == stream_id => {
                     force_keyframe.store(true, Ordering::Release);
                 }
-                ControlMessage::AccessDenied { .. } => {
+                ControlMessage::AccessDenied { .. } | ControlMessage::LanDataSwitch { .. } => {
                     return Err(HostRuntimeError::InvalidControllerCapabilities);
                 }
                 ControlMessage::Hello { .. }
@@ -2279,6 +2305,7 @@ async fn receive_controller_capabilities(
         .map_err(|_| HostRuntimeError::NegotiationTimeout)?
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn send_host_capabilities(
     client: &QuicClient,
@@ -2290,19 +2317,50 @@ async fn send_host_capabilities(
     displays: &[RemoteDisplay],
     active_display_id: u32,
 ) -> Result<(), HostRuntimeError> {
-    let width = u16::try_from(width).map_err(|_| HostRuntimeError::InvalidDimensions)?;
-    let height = u16::try_from(height).map_err(|_| HostRuntimeError::InvalidDimensions)?;
-    let hello = encode_control(&ControlMessage::Hello {
-        platform: Platform::Windows,
-        role: DeviceRole::Host,
+    send_host_bootstrap_capabilities(
+        client,
+        secure,
+        peer_generation,
+        width,
+        height,
+        profile,
+        None,
+    )
+    .await?;
+    let display = encode_control(&ControlMessage::DisplayList {
+        displays: displays.to_vec(),
+        active_display_id,
     })?;
     client
         .send_control_for_generation(
             peer_generation,
-            seal(secure, SecureLane::Control, &hello).await?,
+            seal(secure, SecureLane::Control, &display).await?,
         )
         .await?;
-    let capabilities = encode_control(&ControlMessage::Capabilities(DeviceCapabilities {
+    let quality = encode_control(&ControlMessage::VideoQualityState {
+        preference: DEFAULT_VIDEO_QUALITY_PREFERENCE,
+        preset: DEFAULT_VIDEO_QUALITY,
+    })?;
+    client
+        .send_control_for_generation(
+            peer_generation,
+            seal(secure, SecureLane::Control, &quality).await?,
+        )
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_host_bootstrap_capabilities(
+    client: &QuicClient,
+    secure: &SharedSecureSession,
+    peer_generation: u64,
+    width: u32,
+    height: u32,
+    profile: H264Profile,
+    lan_data: Option<desklink_protocol::LanDataCapabilities>,
+) -> Result<DeviceCapabilities, HostRuntimeError> {
+    let capabilities = DeviceCapabilities {
         platform: Platform::Windows,
         role: DeviceRole::Host,
         codecs: vec![Codec::H264],
@@ -2311,45 +2369,41 @@ async fn send_host_capabilities(
         } else {
             vec![H264Profile::Main]
         },
-        width,
-        height,
-    }))?;
-    client
-        .send_control_for_generation(
-            peer_generation,
-            seal(secure, SecureLane::Control, &capabilities).await?,
-        )
-        .await?;
-    send_display_list(client, secure, peer_generation, displays, active_display_id).await?;
-    send_video_quality_state(
-        client,
-        secure,
-        peer_generation,
-        DEFAULT_VIDEO_QUALITY_PREFERENCE,
-        DEFAULT_VIDEO_QUALITY,
-    )
-    .await?;
-    Ok(())
+        width: u16::try_from(width).map_err(|_| HostRuntimeError::InvalidDimensions)?,
+        height: u16::try_from(height).map_err(|_| HostRuntimeError::InvalidDimensions)?,
+        lan_data,
+    };
+    for message in [
+        ControlMessage::Hello {
+            platform: Platform::Windows,
+            role: DeviceRole::Host,
+        },
+        ControlMessage::Capabilities(capabilities.clone()),
+    ] {
+        let plaintext = encode_control(&message)?;
+        client
+            .send_control_for_generation(
+                peer_generation,
+                seal(secure, SecureLane::Control, &plaintext).await?,
+            )
+            .await?;
+    }
+    Ok(capabilities)
 }
 
-async fn send_display_list(
-    client: &QuicClient,
-    secure: &SharedSecureSession,
-    peer_generation: u64,
+async fn send_display_list_data(
+    data: &SessionDataPlane,
     displays: &[RemoteDisplay],
     active_display_id: u32,
 ) -> Result<(), HostRuntimeError> {
-    let message = encode_control(&ControlMessage::DisplayList {
-        displays: displays.to_vec(),
-        active_display_id,
-    })?;
-    client
-        .send_control_for_generation(
-            peer_generation,
-            seal(secure, SecureLane::Control, &message).await?,
-        )
-        .await?;
-    Ok(())
+    send_control_data(
+        data,
+        &ControlMessage::DisplayList {
+            displays: displays.to_vec(),
+            active_display_id,
+        },
+    )
+    .await
 }
 
 async fn send_host_unavailable(
@@ -2380,6 +2434,7 @@ fn host_runtime_denial_reason(error: &HostRuntimeError) -> Option<AccessDenialRe
     }
 }
 
+#[cfg(test)]
 async fn notify_local_control_ended(
     client: &QuicClient,
     secure: &SharedSecureSession,
@@ -2402,6 +2457,7 @@ async fn notify_local_control_ended(
     .is_ok_and(|result| result.is_ok())
 }
 
+#[cfg(test)]
 async fn wait_for_ended_controller_disconnect(
     client: &QuicClient,
     peer_generation: u64,
@@ -2415,6 +2471,7 @@ async fn wait_for_ended_controller_disconnect(
     }
 }
 
+#[cfg(test)]
 async fn send_runtime_failure(
     client: &QuicClient,
     secure: &SharedSecureSession,
@@ -2914,21 +2971,14 @@ fn initial_encoded_frame_deadline_expired(
 
 #[allow(clippy::too_many_arguments)]
 async fn send_video_loop(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+    data: Arc<SessionDataPlane>,
     stream_id: u64,
     queue: Arc<Mutex<LatestFrameQueue<EncodedDesktopFrame>>>,
     notify: Arc<Notify>,
     force_keyframe: Arc<AtomicBool>,
-    direct_connection: Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
 ) -> Result<(), HostRuntimeError> {
     let mut pipeline = HostVideoPipeline::new(stream_id);
-    let relay_video_path = RelayVideoPath::new(client.clone(), peer_generation);
     let mut consecutive_datagram_failures = 0_u8;
-    let mut reported_first_ready = false;
-    let mut reported_need_keyframe = false;
-    let mut reported_first_datagram_stage = false;
     loop {
         notify.notified().await;
         let next = lock_queue(&queue).take_newest();
@@ -2937,138 +2987,34 @@ async fn send_video_loop(
         };
         match pipeline.prepare(next.frame, next.width, next.height, next.input_epoch)? {
             PrepareVideo::NeedKeyframe => {
-                if !reported_need_keyframe {
-                    eprintln!(
-                        "DeskLink video pipeline is waiting for a keyframe (stream_id={stream_id})"
-                    );
-                    reported_need_keyframe = true;
-                }
                 force_keyframe.store(true, Ordering::Release);
             }
             PrepareVideo::Ready(prepared) => {
-                // Any keyframe is large enough to span many QUIC datagrams.
-                // Relay pacing or loss during recovery must not leave the
-                // controller without a decodable reference frame, so carry
-                // every relay keyframe over the bounded reliable batches.
-                // Direct-LAN peers stay on datagrams throughout.
+                // Preserve relay keyframe recovery and LAN datagram semantics.
+                // An attached socket is insufficient: the lane admission fence
+                // must have completed before health reports this lane DIRECT.
                 let reliable_relay_keyframe =
-                    prepared.keyframe && direct_connection.lock().await.is_none();
-                if !reported_first_ready {
-                    eprintln!(
-                        "DeskLink video pipeline prepared its first frame (stream_id={} datagrams={} config={})",
-                        stream_id,
-                        prepared.datagrams.len(),
-                        prepared.video_config.is_some(),
-                    );
-                    reported_first_ready = true;
-                }
+                    prepared.keyframe && !lan_session::video_is_direct(&data);
                 if let Some(config) = prepared.video_config {
-                    client
-                        .send_video_config_for_generation(
-                            peer_generation,
-                            seal(&secure, SecureLane::VideoConfig, &config).await?,
-                        )
-                        .await?;
+                    data.send(ChannelKind::VideoConfig, config.into()).await?;
                 }
                 if reliable_relay_keyframe {
-                    let batch_count = send_video_reliable_batches(
-                        &client,
-                        &secure,
-                        peer_generation,
-                        prepared.datagrams,
-                    )
-                    .await?;
-                    if !reported_first_datagram_stage {
-                        eprintln!(
-                            "DeskLink video reliable batch send returned (stream_id={} batches={} ok=true)",
-                            stream_id, batch_count,
-                        );
-                        reported_first_datagram_stage = true;
-                    }
+                    send_video_reliable_batches(&data, prepared.datagrams).await?;
                     consecutive_datagram_failures = 0;
                     continue;
                 }
                 for (index, datagram) in prepared.datagrams.into_iter().enumerate() {
-                    if !reported_first_datagram_stage {
-                        eprintln!(
-                            "DeskLink video datagram stage entered (stream_id={} plaintext_bytes={} index={})",
-                            stream_id,
-                            datagram.len(),
-                            index,
-                        );
-                    }
-                    let direct_snapshot = direct_connection.lock().await.clone();
-                    let mut direct_path = direct_snapshot.clone().map(DirectLanVideoPath::new);
-                    let send_result = if reliable_relay_keyframe && direct_path.is_none() {
-                        let ciphertext =
-                            seal(&secure, SecureLane::VideoReliable, &datagram).await?;
-                        if !reported_first_datagram_stage {
-                            eprintln!(
-                                "DeskLink video keyframe encrypted (stream_id={} lane=video_reliable ciphertext_bytes={})",
-                                stream_id,
-                                ciphertext.len(),
-                            );
-                        }
-                        client
-                            .send_video_reliable_for_generation(peer_generation, ciphertext)
-                            .await
-                            .map(|()| VideoDatagramRoute::Relay)
-                    } else {
-                        let ciphertext =
-                            seal(&secure, SecureLane::VideoDatagram, &datagram).await?;
-                        if !reported_first_datagram_stage {
-                            eprintln!(
-                                "DeskLink video datagram encrypted (stream_id={} lane=video_datagram ciphertext_bytes={})",
-                                stream_id,
-                                ciphertext.len(),
-                            );
-                        }
-                        send_video_datagram_with_fallback(
-                            &mut direct_path,
-                            &relay_video_path,
-                            ciphertext,
-                        )
-                        .await
-                    };
-                    if !reported_first_datagram_stage {
-                        eprintln!(
-                            "DeskLink video datagram send returned (stream_id={} route={:?} ok={})",
-                            stream_id,
-                            send_result.as_ref().ok(),
-                            send_result.is_ok(),
-                        );
-                        reported_first_datagram_stage = true;
-                    }
-                    if direct_path.is_none()
-                        && let Some(failed) = direct_snapshot.as_ref()
-                    {
-                        let retired = {
-                            let mut active = direct_connection.lock().await;
-                            direct_path_slot::retire_if_current(&mut active, failed)
-                        };
-                        if let Some(retired) = retired {
-                            retired.close(b"desklink direct egress failed");
-                        }
-                    }
-                    match send_result {
+                    match data.send(ChannelKind::VideoDatagram, datagram.into()).await {
                         Ok(_) => {
                             consecutive_datagram_failures = 0;
                         }
-                        Err(error @ TransportError::Datagram(_)) => {
-                            // QUIC datagrams are intentionally lossy. A
-                            // transient congestion/MTU drop must not tear
-                            // down the entire authenticated host runtime;
-                            // request a fresh keyframe and let the next
-                            // encoded frame recover the controller instead.
+                        Err(error) if lan_session::is_datagram_congestion(&error) => {
                             consecutive_datagram_failures =
                                 consecutive_datagram_failures.saturating_add(1);
                             force_keyframe.store(true, Ordering::Release);
                             if consecutive_datagram_failures
                                 >= MAX_CONSECUTIVE_VIDEO_DATAGRAM_FAILURES
                             {
-                                eprintln!(
-                                    "DeskLink video datagram path requires a peer rebuild after {consecutive_datagram_failures} consecutive send failures (stream_id={stream_id}): {error}"
-                                );
                                 return Err(error.into());
                             }
                             break;
@@ -3085,16 +3031,14 @@ async fn send_video_loop(
 }
 
 async fn send_video_reliable_batches(
-    client: &QuicClient,
-    secure: &SharedSecureSession,
-    peer_generation: u64,
+    data: &SessionDataPlane,
     datagrams: Vec<Vec<u8>>,
 ) -> Result<usize, HostRuntimeError> {
     let mut batches = 0_usize;
     let mut batch = VideoReliableBatchBuilder::new();
     for datagram in datagrams {
         if !batch.try_push(&datagram)? {
-            send_video_reliable_batch(client, secure, peer_generation, batch.bytes()).await?;
+            send_video_reliable_batch(data, batch.bytes()).await?;
             batches += 1;
             batch.clear();
             // Execute the push in release too; the debug assertion is only
@@ -3104,25 +3048,22 @@ async fn send_video_reliable_batches(
         }
     }
     if !batch.is_empty() {
-        send_video_reliable_batch(client, secure, peer_generation, batch.bytes()).await?;
+        send_video_reliable_batch(data, batch.bytes()).await?;
         batches += 1;
     }
     Ok(batches)
 }
 
 async fn send_video_reliable_batch(
-    client: &QuicClient,
-    secure: &SharedSecureSession,
-    peer_generation: u64,
+    data: &SessionDataPlane,
     plaintext: &[u8],
 ) -> Result<(), HostRuntimeError> {
-    let ciphertext = seal(secure, SecureLane::VideoReliable, plaintext).await?;
-    client
-        .send_video_reliable_for_generation(peer_generation, ciphertext)
+    data.send(ChannelKind::VideoReliable, plaintext.to_vec().into())
         .await?;
     Ok(())
 }
 
+#[cfg(test)]
 async fn send_video_datagram_with_fallback<D, R>(
     direct: &mut Option<D>,
     relay: &R,
@@ -3150,9 +3091,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn send_audio_loop(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+    data: Arc<SessionDataPlane>,
     stream_id: u64,
     queue: Arc<Mutex<AudioFrameQueue>>,
     notify: Arc<Notify>,
@@ -3165,7 +3104,7 @@ async fn send_audio_loop(
             // Audio is optional. A codec initialization failure must not tear
             // down the video, input, clipboard, or file-transfer session.
             let audio_enabled = *enabled.borrow();
-            let _ = send_audio_state(&client, &secure, peer_generation, false, audio_enabled).await;
+            let _ = send_audio_state(&data, false, audio_enabled).await;
             std::future::pending::<()>().await;
             unreachable!("pending audio codec fallback returned")
         }
@@ -3177,7 +3116,7 @@ async fn send_audio_loop(
         let is_enabled = *enabled.borrow();
         let current = (available, is_enabled);
         if announced != Some(current) {
-            send_audio_state(&client, &secure, peer_generation, available, is_enabled).await?;
+            send_audio_state(&data, available, is_enabled).await?;
             announced = Some(current);
         }
 
@@ -3237,18 +3176,15 @@ async fn send_audio_loop(
                 payload,
             };
             let plaintext = encode_audio_packet(&packet)?;
-            let send = client
-                .send_audio_datagram_for_generation(
-                    peer_generation,
-                    seal(&secure, SecureLane::AudioDatagram, &plaintext).await?,
-                )
+            let send = data
+                .send(ChannelKind::AudioDatagram, plaintext.into())
                 .await;
             match send {
-                Ok(()) => {}
+                Ok(_) => {}
                 // QUIC datagram congestion is an expected lossy boundary. Drop
                 // this sound packet instead of turning optional audio pressure
                 // into a remote-control reconnect.
-                Err(TransportError::Datagram(_)) => {}
+                Err(error) if lan_session::is_datagram_congestion(&error) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -3256,37 +3192,23 @@ async fn send_audio_loop(
 }
 
 async fn send_audio_state(
-    client: &QuicClient,
-    secure: &SharedSecureSession,
-    peer_generation: u64,
+    data: &SessionDataPlane,
     available: bool,
     enabled: bool,
 ) -> Result<(), HostRuntimeError> {
-    let plaintext = encode_control(&ControlMessage::AudioState { available, enabled })?;
-    client
-        .send_control_for_generation(
-            peer_generation,
-            seal(secure, SecureLane::Control, &plaintext).await?,
-        )
-        .await?;
-    Ok(())
+    send_control_data(data, &ControlMessage::AudioState { available, enabled }).await
 }
 
-async fn send_video_quality_state(
-    client: &QuicClient,
-    secure: &SharedSecureSession,
-    peer_generation: u64,
+async fn send_video_quality_state_data(
+    data: &SessionDataPlane,
     preference: VideoQualityPreference,
     preset: VideoQualityPreset,
 ) -> Result<(), HostRuntimeError> {
-    let plaintext = encode_control(&ControlMessage::VideoQualityState { preference, preset })?;
-    client
-        .send_control_for_generation(
-            peer_generation,
-            seal(secure, SecureLane::Control, &plaintext).await?,
-        )
-        .await?;
-    Ok(())
+    send_control_data(
+        data,
+        &ControlMessage::VideoQualityState { preference, preset },
+    )
+    .await
 }
 
 async fn apply_video_quality(
@@ -3415,9 +3337,8 @@ async fn next_configuration(
 
 #[allow(clippy::too_many_arguments)]
 async fn receive_input_and_control(
-    client: Arc<QuicClient>,
+    data: Arc<SessionDataPlane>,
     secure: SharedSecureSession,
-    peer_generation: u64,
     stream_id: u64,
     input: Arc<Mutex<InputInjector>>,
     force_keyframe: Arc<AtomicBool>,
@@ -3426,23 +3347,14 @@ async fn receive_input_and_control(
     let input_suspended = context.input_suspended.clone();
     run_inbound_lanes(
         receive_host_input(
-            client.clone(),
-            secure.clone(),
-            peer_generation,
+            data.clone(),
             stream_id,
             input,
             context.selected_desktop.clone(),
             context.input_state_updates.clone(),
             input_suspended.clone(),
         ),
-        receive_host_control(
-            client,
-            secure,
-            peer_generation,
-            stream_id,
-            force_keyframe,
-            context,
-        ),
+        receive_host_control(data, secure, stream_id, force_keyframe, context),
     )
     .await
 }
@@ -3493,12 +3405,10 @@ fn begin_desktop_selection<B: crate::input::InputBackend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn receive_host_input(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+async fn receive_host_input<B: crate::input::InputBackend>(
+    data: Arc<SessionDataPlane>,
     stream_id: u64,
-    input: Arc<Mutex<InputInjector>>,
+    input: Arc<Mutex<InputInjector<B>>>,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
     input_state_updates: watch::Sender<Option<InputRestrictionReason>>,
     input_suspended: Arc<AtomicBool>,
@@ -3511,25 +3421,20 @@ async fn receive_host_input(
     let mut policy = HostInboundPolicy::new(stream_id);
     let mut input_restriction = InputRestrictionTracker::default();
     loop {
-        tokio::select! {
-            biased;
-            reason = client.next_closed_reason() => {
-                return Err(HostRuntimeError::TransportClosed(reason));
-            }
-            result = client.next_input_for_generation(peer_generation) => {
-                let bytes = result?;
-                let plaintext = open(&secure, SecureLane::Input, &bytes).await?;
-                inject_desktop_input_with_feedback(
-                    &mut policy, &input, &plaintext, now_micros(),
-                    &selected_desktop, &input_suspended,
-                    |event, failure| {
-                        if let Some(reason) = input_restriction.observe(event, failure) {
-                            input_state_updates.send_replace(reason);
-                        }
-                    },
-                )?;
-            }
-        }
+        let plaintext = data.recv(ChannelKind::Input).await?;
+        inject_desktop_input_with_feedback(
+            &mut policy,
+            &input,
+            &plaintext,
+            now_micros(),
+            &selected_desktop,
+            &input_suspended,
+            |event, failure| {
+                if let Some(reason) = input_restriction.observe(event, failure) {
+                    input_state_updates.send_replace(reason);
+                }
+            },
+        )?;
     }
 }
 
@@ -3593,9 +3498,8 @@ fn inject_desktop_input_with_feedback<B: crate::input::InputBackend>(
 
 #[allow(clippy::too_many_arguments)]
 async fn receive_host_control(
-    client: Arc<QuicClient>,
+    data: Arc<SessionDataPlane>,
     secure: SharedSecureSession,
-    peer_generation: u64,
     stream_id: u64,
     force_keyframe: Arc<AtomicBool>,
     context: HostInboundContext,
@@ -3623,6 +3527,16 @@ async fn receive_host_control(
     let direct_enabled = Arc::new(AtomicBool::new(true));
     let mut configurations = ConfigurationQueue::default();
     let mut pending_configuration = None;
+    let mut lan_switch = HostLanSwitch::new(
+        &data,
+        direct_session
+            .as_ref()
+            .map(|session| session.candidate().clone()),
+    );
+    // Keep a partially accepted/authenticating probe owned across unrelated
+    // control/configuration readiness. Only this generation's exit cancels it.
+    let accepting_direct = accept_host_direct_connection(direct_session.clone(), secure.clone());
+    tokio::pin!(accepting_direct);
     loop {
         if pending_configuration.is_none()
             && let Some(operation) = configurations.pop_next()
@@ -3640,12 +3554,12 @@ async fn receive_host_control(
                                 lock_unpoisoned(&selected_desktop).selection_pending = false;
                             }
                             let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
-                            send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+                            send_display_list_data(&data, &displays, active_display_id).await?;
                         }
                         ConfigurationApplied::Quality(Some((actual, bitrate))) => {
                             video_quality.record_applied(actual);
                             bitrate_policy.reset_to_actual(actual, bitrate);
-                            send_video_quality_state(&client, &secure, peer_generation, video_quality.preference, actual).await?;
+                            send_video_quality_state_data(&data, video_quality.preference, actual).await?;
                         }
                         ConfigurationApplied::Profile(Some((actual, bitrate))) => {
                             bitrate_policy.reset_to_actual(video_quality.preset, bitrate);
@@ -3662,21 +3576,25 @@ async fn receive_host_control(
             updated = topology_updates.changed() => {
                 updated.map_err(|_| HostRuntimeError::CaptureWorkerStopped)?;
                 let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
-                send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+                send_display_list_data(&data, &displays, active_display_id).await?;
             }
             _ = direct_probes.join_next(), if !direct_probes.is_empty() => {}
-            direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
+            direct = &mut accepting_direct => {
                 if let Some(connection) = direct {
-                    install_direct_connection(&direct_connection, connection, &direct_enabled).await;
+                    if data.agreement().is_some() {
+                        lan_switch.probed(&data, (*connection).clone()).await?;
+                    } else {
+                        install_host_legacy_connection(&data, &direct_connection, connection, &direct_enabled).await?;
+                    }
                 } else {
                     direct_probes.abort_all();
                     stop_direct_listener(&mut direct_session, &direct_connection, &direct_enabled,
                         &force_keyframe, &media_observer, stream_id).await;
                 }
+                accepting_direct.set(accept_host_direct_connection(direct_session.clone(), secure.clone()));
             }
-            result = client.next_control_for_generation(peer_generation) => {
-                let bytes = result?;
-                let plaintext = open(&secure, SecureLane::Control, &bytes).await?;
+            result = data.recv(ChannelKind::Control) => {
+                let plaintext = result?;
                 if policy.handle_control(&plaintext)? {
                     force_keyframe.store(true, Ordering::Release);
                 }
@@ -3691,7 +3609,7 @@ async fn receive_host_control(
                             configurations.request(ConfigurationAction::SelectDisplay(display_id));
                         } else {
                             let (displays, active_display_id) = selected_display_list(&selected_desktop)?;
-                            send_display_list(&client, &secure, peer_generation, &displays, active_display_id).await?;
+                            send_display_list_data(&data, &displays, active_display_id).await?;
                         }
                     }
                     ControlMessage::SetAudioEnabled { enabled } => {
@@ -3729,6 +3647,7 @@ async fn receive_host_control(
                         }
                     }
                     ControlMessage::VideoPathCandidateOffer { candidate } => {
+                        if data.agreement().is_some() { return Err(SessionDataError::InvalidSwitch.into()); }
                         let has_active = direct_connection.lock().await.as_ref().is_some_and(|path| !path.is_closed());
                         let answer = if let Some(session) = direct_session.as_ref()
                             && !has_active
@@ -3743,6 +3662,7 @@ async fn receive_host_control(
                             let direct_connection_for_probe = direct_connection.clone();
                             let direct_enabled_for_probe = direct_enabled.clone();
                             let candidate_for_probe = candidate.clone();
+                            let data_for_probe = data.clone();
                             let accepted = if let Ok(permit) = direct_probe_slots
                                 .clone()
                                 .try_acquire_owned()
@@ -3760,7 +3680,7 @@ async fn receive_host_control(
                                         )
                                         .await;
                                     if let Ok((connection, _)) = result {
-                                        install_direct_connection(&direct_connection_for_probe, Arc::new(connection), &direct_enabled_for_probe).await;
+                                        let _ = install_host_legacy_connection(&data_for_probe, &direct_connection_for_probe, Arc::new(connection), &direct_enabled_for_probe).await;
                                     }
                                 });
                                 true
@@ -3779,19 +3699,13 @@ async fn receive_host_control(
                                 candidate: None,
                             }
                         };
-                        let answer = encode_control(&answer)?;
-                        client
-                            .send_control_for_generation(
-                                peer_generation,
-                                seal(&secure, SecureLane::Control, &answer).await?,
-                            )
-                            .await?;
+                        send_control_data(&data, &answer).await?;
+                    }
+                    message @ ControlMessage::LanDataSwitch { .. } => {
+                        lan_switch.receive(&data, &message).await?;
                     }
                     _ => {}
                 }
-            }
-            reason = client.next_closed_reason() => {
-                return Err(HostRuntimeError::TransportClosed(reason));
             }
         }
     }
@@ -3814,26 +3728,39 @@ fn apply_input_event<B: crate::input::InputBackend>(
 }
 
 async fn send_input_state_loop(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+    data: Arc<SessionDataPlane>,
     states: watch::Receiver<Option<InputRestrictionReason>>,
 ) -> Result<(), HostRuntimeError> {
     forward_latest_input_state(states, |reason| {
-        let client = client.clone();
-        let secure = secure.clone();
-        async move {
-            let plaintext = encode_control(&ControlMessage::InputState { reason })?;
-            client
-                .send_control_for_generation(
-                    peer_generation,
-                    seal(&secure, SecureLane::Control, &plaintext).await?,
-                )
-                .await?;
-            Ok(())
-        }
+        let data = data.clone();
+        async move { send_control_data(&data, &ControlMessage::InputState { reason }).await }
     })
     .await
+}
+
+async fn install_host_legacy_connection(
+    data: &SessionDataPlane,
+    slot: &Arc<AsyncMutex<Option<Arc<DirectLanConnection>>>>,
+    candidate: Arc<DirectLanConnection>,
+    enabled: &AtomicBool,
+) -> Result<(), HostRuntimeError> {
+    if install_direct_connection(slot, candidate.clone(), enabled).await
+        && data
+            .attach_legacy_video((*candidate).clone())
+            .await
+            .is_err()
+    {
+        // Listener teardown can race a successful probe. Retire only this
+        // allocation; a late failure cannot clear a newer winning path.
+        let retired = {
+            let mut active = slot.lock().await;
+            direct_path_slot::retire_if_current(&mut active, &candidate)
+        };
+        if let Some(retired) = retired {
+            retired.close(b"legacy LAN attachment failed");
+        }
+    }
+    Ok(())
 }
 
 async fn install_direct_connection(
@@ -3930,13 +3857,9 @@ async fn accept_host_direct_connection(
     }
 }
 
-async fn receive_transfer_loop(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
-) -> Result<(), HostRuntimeError> {
+async fn receive_transfer_loop(data: Arc<SessionDataPlane>) -> Result<(), HostRuntimeError> {
     let mut incoming = None;
-    let result = receive_transfer_loop_inner(client, secure, peer_generation, &mut incoming).await;
+    let result = receive_transfer_loop_inner(data, &mut incoming).await;
     if let Some(file) = incoming.take() {
         let _ = file.preserve().await;
     }
@@ -3944,16 +3867,14 @@ async fn receive_transfer_loop(
 }
 
 async fn receive_transfer_loop_inner(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+    data: Arc<SessionDataPlane>,
     incoming: &mut Option<IncomingFileWorker>,
 ) -> Result<(), HostRuntimeError> {
     let mut outgoing: Option<HostOutgoingTransfer> = None;
     let (outgoing_events, mut pending_outgoing_events) =
         mpsc::channel::<HostOutgoingEvent>(HOST_OUTGOING_EVENT_QUEUE_CAPACITY);
     loop {
-        let encrypted = tokio::select! {
+        let plaintext = tokio::select! {
             event = pending_outgoing_events.recv() => {
                 let Some(event) = event else {
                     continue;
@@ -3966,9 +3887,7 @@ async fn receive_transfer_loop_inner(
                         && result != TransferResult::Cancelled
                     {
                         let _ = send_transfer_response(
-                            &client,
-                            &secure,
-                            peer_generation,
+                            &data,
                             TransferMessage::FileResult {
                                 transfer_id: transfer.file.transfer_id,
                                 result,
@@ -3978,9 +3897,8 @@ async fn receive_transfer_loop_inner(
                 }
                 continue;
             }
-            encrypted = client.next_transfer_for_generation(peer_generation) => encrypted?,
+            plaintext = data.recv(ChannelKind::Transfer) => plaintext?,
         };
-        let plaintext = open(&secure, SecureLane::Transfer, &encrypted).await?;
         match decode_transfer(&plaintext)? {
             TransferMessage::ClipboardSet { request_id, text } => {
                 let result = tokio::task::spawn_blocking(move || write_clipboard_text(&text))
@@ -3989,9 +3907,7 @@ async fn receive_transfer_loop_inner(
                     .map(|_| TransferResult::Completed)
                     .unwrap_or_else(|error| error);
                 send_transfer_response(
-                    &client,
-                    &secure,
-                    peer_generation,
+                    &data,
                     TransferMessage::ClipboardResult { request_id, result },
                 )
                 .await?;
@@ -4004,14 +3920,12 @@ async fn receive_transfer_loop_inner(
                     Ok(text) => TransferMessage::ClipboardData { request_id, text },
                     Err(result) => TransferMessage::ClipboardResult { request_id, result },
                 };
-                send_transfer_response(&client, &secure, peer_generation, response).await?;
+                send_transfer_response(&data, response).await?;
             }
             TransferMessage::FileSelectionRequest { request_id, resume } => {
                 if incoming.is_some() || outgoing.is_some() {
                     send_transfer_response(
-                        &client,
-                        &secure,
-                        peer_generation,
+                        &data,
                         TransferMessage::FileSelectionResult {
                             request_id,
                             result: TransferResult::Busy,
@@ -4033,9 +3947,7 @@ async fn receive_transfer_loop_inner(
                     Ok(Some(file)) => file,
                     Ok(None) => {
                         send_transfer_response(
-                            &client,
-                            &secure,
-                            peer_generation,
+                            &data,
                             TransferMessage::FileSelectionResult {
                                 request_id,
                                 result: TransferResult::Cancelled,
@@ -4046,9 +3958,7 @@ async fn receive_transfer_loop_inner(
                     }
                     Err(result) => {
                         send_transfer_response(
-                            &client,
-                            &secure,
-                            peer_generation,
+                            &data,
                             TransferMessage::FileSelectionResult { request_id, result },
                         )
                         .await?;
@@ -4062,9 +3972,7 @@ async fn receive_transfer_loop_inner(
                     file.transfer_id = resume.expect("checked resume metadata").transfer_id;
                 }
                 send_transfer_response(
-                    &client,
-                    &secure,
-                    peer_generation,
+                    &data,
                     TransferMessage::FileOffer {
                         transfer_id: file.transfer_id,
                         request_id: Some(request_id),
@@ -4090,9 +3998,7 @@ async fn receive_transfer_loop_inner(
                     transfer.cancellation.store(true, Ordering::Release);
                 }
                 let _ = send_transfer_response(
-                    &client,
-                    &secure,
-                    peer_generation,
+                    &data,
                     TransferMessage::FileSelectionResult {
                         request_id,
                         result: TransferResult::Cancelled,
@@ -4131,9 +4037,7 @@ async fn receive_transfer_loop_inner(
                     }
                 };
                 send_transfer_response(
-                    &client,
-                    &secure,
-                    peer_generation,
+                    &data,
                     TransferMessage::FileDecision {
                         transfer_id,
                         result,
@@ -4168,14 +4072,11 @@ async fn receive_transfer_loop_inner(
                 transfer.phase = HostOutgoingPhase::Sending;
                 let file = transfer.file.clone();
                 let cancellation = transfer.cancellation.clone();
-                let client = client.clone();
-                let secure = secure.clone();
+                let data = data.clone();
                 let outgoing_events = outgoing_events.clone();
                 transfer.sender_task = Some(tokio::spawn(async move {
                     let result = stream_host_outgoing_file(
-                        client,
-                        secure,
-                        peer_generation,
+                        data,
                         file,
                         resume_offset,
                         resume_prefix_hash,
@@ -4207,9 +4108,7 @@ async fn receive_transfer_loop_inner(
                         file.cancel();
                     }
                     send_transfer_response(
-                        &client,
-                        &secure,
-                        peer_generation,
+                        &data,
                         TransferMessage::FileResult {
                             transfer_id,
                             result,
@@ -4236,9 +4135,7 @@ async fn receive_transfer_loop_inner(
                     Err(error) => error,
                 };
                 send_transfer_response(
-                    &client,
-                    &secure,
-                    peer_generation,
+                    &data,
                     TransferMessage::FileResult {
                         transfer_id,
                         result: transfer_result,
@@ -4262,9 +4159,7 @@ async fn receive_transfer_loop_inner(
                     transfer.cancellation.store(true, Ordering::Release);
                 }
                 send_transfer_response(
-                    &client,
-                    &secure,
-                    peer_generation,
+                    &data,
                     TransferMessage::FileResult {
                         transfer_id,
                         result: TransferResult::Cancelled,
@@ -4284,6 +4179,9 @@ async fn receive_transfer_loop_inner(
                     transfer.cancellation.store(true, Ordering::Release);
                 }
             }
+            // Task-state protocol 14 is a separate owner surface. This Host
+            // still implements the established request/decision/file flow.
+            TransferMessage::FileTask(_) => return Err(ProtocolError::InvalidTransfer.into()),
             TransferMessage::ClipboardData { .. }
             | TransferMessage::ClipboardResult { .. }
             | TransferMessage::FileSelectionResult { .. } => {
@@ -4331,9 +4229,7 @@ enum HostFileReadEvent {
 }
 
 async fn stream_host_outgoing_file(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+    data: Arc<SessionDataPlane>,
     file: OutgoingFile,
     resume_offset: u64,
     resume_prefix_hash: Option<[u8; 32]>,
@@ -4389,7 +4285,7 @@ async fn stream_host_outgoing_file(
         let complete = matches!(message, TransferMessage::FileComplete { .. });
         tokio::time::timeout(
             FILE_TRANSFER_SEND_TIMEOUT,
-            send_transfer_response(&client, &secure, peer_generation, message),
+            send_transfer_response(&data, message),
         )
         .await
         .map_err(|_| TransferResult::IoFailed)?
@@ -4402,23 +4298,16 @@ async fn stream_host_outgoing_file(
 }
 
 async fn send_transfer_response(
-    client: &QuicClient,
-    secure: &SharedSecureSession,
-    peer_generation: u64,
+    data: &SessionDataPlane,
     message: TransferMessage,
 ) -> Result<(), HostRuntimeError> {
     let plaintext = encode_transfer(&message)?;
-    let ciphertext = seal(secure, SecureLane::Transfer, &plaintext).await?;
-    client
-        .send_transfer_for_generation(peer_generation, ciphertext)
-        .await?;
+    data.send(ChannelKind::Transfer, plaintext.into()).await?;
     Ok(())
 }
 
 async fn send_cursor_loop(
-    client: Arc<QuicClient>,
-    secure: SharedSecureSession,
-    peer_generation: u64,
+    data: Arc<SessionDataPlane>,
     stream_id: u64,
     selected_desktop: Arc<Mutex<SelectedDesktop>>,
     observer: Option<HostMediaDiagnosticsObserver>,
@@ -4426,19 +4315,22 @@ async fn send_cursor_loop(
     send_cursor_samples(stream_id, observer, |sequence| {
         let desktop = lock_unpoisoned(&selected_desktop).desktop.rect;
         let cursor = sample_cursor(desktop, stream_id, sequence);
-        let client = &client;
-        let secure = &secure;
+        let data = &data;
         async move {
             let Some(cursor) = cursor else {
                 return Ok(None);
             };
             let plaintext = encode_cursor_update(&cursor)?;
-            let sent = client
-                .send_cursor_datagram_for_generation(
-                    peer_generation,
-                    seal(secure, SecureLane::CursorDatagram, &plaintext).await?,
-                )
+            let sent = data
+                .send(ChannelKind::CursorDatagram, plaintext.into())
                 .await;
+            let sent = match sent {
+                Ok(_) => Ok(()),
+                Err(error) if lan_session::is_datagram_congestion(&error) => {
+                    Err(TransportError::Datagram(error.to_string()))
+                }
+                Err(error) => return Err(error.into()),
+            };
             Ok(Some(sent))
         }
     })

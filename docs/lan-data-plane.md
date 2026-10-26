@@ -1,13 +1,13 @@
 # DL2-024：认证 LAN 多通道传输切片
 
-本切片提供 `desklink_transport::LanDataPlane`，传输组件本身不定义视频、音频、文件或 FFI 的业务消息格式。它尚未接入 Windows/FFI 生产 runtime，公网 NAT 穿透、LAN 发现/本地配对、实机延迟及长稳仍待实施或验收。
+本记录保留第一波 `desklink_transport::LanDataPlane` 组件及其验证。第二波已经通过 `SessionDataPlane` 接入 Windows Host、实际 ControllerRuntime 与 owned FFI worker；实现不定义另一份视频、音频、文件或输入格式。当前能力、唯一协议14来源和生产验证见 [生产接线记录](lan-runtime-integration.md)、[会话 transport 记录](lan-session-transport.md)。公网 NAT、LAN 发现/本地配对、真实双机延迟与长稳仍未验收。
 
 下文的零上下文说明对应第一波冻结分支 `4b15561` 的历史过渡状态。第二波 `codex/dl2-lan-runtime` 已完整整合 Windows joint `5782341` 与 Apple `f954a68`，保留真实上下文生产、捕获传递及 Host 校验；本地整合验证见 [生产 LAN 接线记录](lan-runtime-integration.md)。LAN/codec 夹具本身仍只证明传输边界，不能据此声称生产 LAN、实机呈现或真实注入已通过。
 
-## 接线契约
+## 第一波组件接线契约（历史）
 
 1. 两端先完成现有 Noise 会话授权和 DirectLan probe。构造器只接受该 probe 返回的 `DirectLanConnection`，不能从任意未认证的 `quinn::Connection` 构造数据面。必须传入同一个 Noise 会话的 `Arc<Mutex<SecureSession>>`。
-2. 两端在现有认证控制通道明确协商 DLD1 能力及切换边界后才能构造本数据面。当前协议未增加该能力声明；不允许仅因 probe 成功便向旧 peer 发新帧头。一个连接只能交给一个 reader，本数据面不得与旧 `recv_datagram` 视频 reader 同时消费同一连接。
+2. 两端在现有认证控制通道明确协商 DLD1 能力及切换边界后才能构造本数据面。第一波尚未增加该声明；第二波已复用唯一协议14来源并接通真实能力交集，不允许仅因 probe 成功便向旧 peer 发新帧头。一个连接只能交给一个 reader，本数据面不得与旧 `recv_datagram` 视频 reader 同时消费同一连接。
 3. 切换后本对象负责所有八个通道的 seal/open；runtime 消费 `recv(channel)` 返回的已解密业务内容，不得再次 open。每个通道独立消费，不能在单一 select 分支中等待慢文件消费者而阻塞其他通道。
 4. relay adapter 实现 `LanRelayBackend`：把收到的**相同密文**发送到现有、相同代数的对应 relay 通道，不能重新 seal。每个可靠通道保序。对端 relay reader 逐条 await `accept_relay_ciphertext`，再读取同通道下一条密文，不得绕过本数据面的统一解密和去重入口。adapter 要遵守会话代数，不能跨重连转发旧密文。
 5. 输入通道中断、取消或总截止时间耗尽后，该可靠通道被标记不可继续。runtime 必须按既有安全生命周期 ReleaseAll 并重新建立授权会话，不能继续发送后续 keyUp，也不能重放被取消的 keyDown。调用 `close()` 会及时唤醒发送、lane-lock 等待与接收等待；对象销毁会关闭直连并 abort 自己的 reader 任务。
@@ -39,7 +39,7 @@ LAN 可靠收讫默认最多等 250ms；整个 send（包括通道锁等待与 r
 
 LAN 收讫丢失或发送结果不确定时，relay 回退重用同一密文（含相同 DLB1/token）。接收端每个可靠 lane 保存最后一个实际成功入队的密文和 token，完全相同的重试只回送同一 token、不再入队；其他密文交给原有 AEAD/replay-window 判断。不能把所有 `ReplayRejected` 都当作已投递，因为它也可能指从未到达、但已落后超过 128 包窗口的消息。队列位置先 reserve、再 open，防止取消时只推进 crypto replay window 却未交付消息。旧 runtime 不认识 DLB1，relay reader 必须接入本模块剥除信封后才能消费业务内容。
 
-## 自动验证与剩余工作
+## 第一波自动验证与当时剩余工作
 
 本地 QUIC 夹具覆盖所有八个通道双向传输且 relay backend 离线、文件队列满时输入/音频独立、逐 lane 回退、LAN/relay 同密文只入队一次、错会话/错 lane 拒绝、未投递旧序号不被误判成功、关闭唤醒队列/接收、总超时阻止后续输入越过不确定消息、媒体上限及断开直连后的回退。
 
@@ -77,4 +77,4 @@ DL2-013 的 `InputEnvelope {stream_id,input_epoch}` 和 `VideoConfig.input_epoch
 
 本分支实际通过：protocol 47 项；transport 43 项单元 +16 项 localhost（LAN 数据面现 13 项）；opaque relay 34 项常规。protocol/transport all-targets Clippy（`--locked -- -D warnings`）、transport fmt 和 `git diff --check` 通过。命令仍使用仓库 `scripts/run-windows-cargo.py` 和独立 target 目录。
 
-未验证/未交付：当前合同中 `HostVideoPipeline`、FFI host worker 的视频配置 epoch，以及 ControllerRuntime、FFI emit_input 的输入 context 仍为零占位，正式 codec 会拒绝它们。没有将此前 FFI/Windows 绿色结果沿用到此基线，也未运行这些占位路径来声称业务通过。真实 Host 分配/匹配 epoch、呈现后放行、旧 epoch 拒绝、跨端排队上下文捕获仍由相应 owner 接线；本次没有更改这些生产路径或补默认 `1`。DL2-024 主项保持未完成。
+第一波当时未验证/未交付：该过渡合同的 `HostVideoPipeline`、FFI host worker epoch 与 ControllerRuntime/FFI emit_input context 曾为零占位，正式 codec 会拒绝。第二波已完整合入 owner 的实际上下文来源，不补默认 `1`；上文历史测试并未沿用作新生产证明。当前的实际验证、未运行平台及 DL2-024 主项剩余边界见生产接线记录。

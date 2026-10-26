@@ -11,10 +11,11 @@ use desklink_ffi::{
     HostRuntime, HostState,
 };
 use desklink_protocol::{
-    Codec, ControlMessage, DeviceCapabilities, DeviceRole, H264Profile, InputContext,
-    InputEnvelope, InputEvent, KeyCode, Modifiers, MouseButton, NoiseHandshake, NoiseHandshakeStep,
-    PROTOCOL_VERSION, Platform, VideoConfig, decode_video_config, encode_control, encode_input,
-    encode_noise_handshake,
+    Codec, ControlMessage, DeviceCapabilities, DeviceRole, FileTaskMessage,
+    FileTransferCapabilities, H264Profile, InputContext, InputEnvelope, InputEvent, KeyCode,
+    LAN_DATA_CHANNEL_INPUT, LanDataSwitchPhase, Modifiers, MouseButton, NoiseHandshake,
+    NoiseHandshakeStep, PROTOCOL_VERSION, Platform, TransferMessage, VideoConfig, decode_control,
+    decode_video_config, encode_control, encode_input, encode_noise_handshake, encode_transfer,
 };
 use desklink_relay::{RelayConfig, RelayServer};
 use desklink_transport::{QuicClient, QuicClientConfig, RelayJoin};
@@ -394,6 +395,7 @@ impl RawController {
                 h264_profiles: vec![H264Profile::Main],
                 width: 1920,
                 height: 1080,
+                lan_data: None,
             }))
             .await;
         })
@@ -508,6 +510,27 @@ impl RawController {
             .await
             .expect("raw control/negotiation send timed out")
             .unwrap();
+    }
+
+    async fn receive_control(&mut self) -> ControlMessage {
+        let ciphertext = tokio::time::timeout(Duration::from_secs(3), self.client.next_control())
+            .await
+            .expect("raw control receive timed out")
+            .unwrap();
+        let plaintext = self.secure.open(SecureLane::Control, &ciphertext).unwrap();
+        decode_control(&plaintext).unwrap()
+    }
+
+    async fn send_transfer(&mut self, message: TransferMessage) {
+        let plaintext = encode_transfer(&message).unwrap();
+        let ciphertext = self.secure.seal(SecureLane::Transfer, &plaintext).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            self.client.send_transfer(ciphertext),
+        )
+        .await
+        .expect("raw transfer send timed out")
+        .unwrap();
     }
 }
 
@@ -1350,6 +1373,95 @@ async fn host_rejects_controller_originated_video_lanes() {
             "lane: {lane:?}"
         );
         host.destroy();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ffi_host_does_not_advertise_or_accept_lan_data_switching() {
+    for negotiated in [false, true] {
+        let fixture = HostTestFixture::new().await;
+        let host = fixture.start_host_only().await;
+        let mut controller = RawController::pair(&fixture).await;
+        assert!(matches!(
+            fixture.next_event(&host).await,
+            HostEvent::ApprovalRequested { .. }
+        ));
+        fixture.approve(&host).await;
+        assert!(matches!(
+            controller.receive_control().await,
+            ControlMessage::Hello {
+                role: DeviceRole::Host,
+                ..
+            }
+        ));
+        let ControlMessage::Capabilities(capabilities) = controller.receive_control().await else {
+            panic!("host did not publish capabilities");
+        };
+        assert_eq!(capabilities.lan_data, None);
+        if negotiated {
+            controller.negotiate().await;
+            next_connected_state(&host).await;
+        }
+        controller
+            .send_control(ControlMessage::LanDataSwitch {
+                candidate_id: 1,
+                generation: 1,
+                channels: LAN_DATA_CHANNEL_INPUT,
+                phase: LanDataSwitchPhase::Offer,
+            })
+            .await;
+        let events = terminal_events(&host).await;
+        assert!(
+            matches!(events.as_slice(), [
+                HostEvent::ReleaseAll,
+                HostEvent::Error(HostError::Protocol(message)),
+                HostEvent::State(HostState::Closed),
+            ] if message == "LAN data switching is unsupported by the FFI host"),
+            "negotiated={negotiated}, events={events:?}"
+        );
+        host.destroy();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ffi_host_rejects_file_tasks_without_a_file_task_service() {
+    for outbound in [false, true] {
+        for message in [
+            FileTaskMessage::Capabilities(FileTransferCapabilities::WINDOWS),
+            FileTaskMessage::SelectionRequest {
+                request_id: 1,
+                directory: true,
+            },
+            FileTaskMessage::Offer {
+                task_id: [1; 16],
+                request_id: None,
+                name: "unsupported-directory".into(),
+                directory: true,
+            },
+        ] {
+            let fixture = HostTestFixture::new().await;
+            let (host, mut controller) = start_approved_raw(&fixture).await;
+            if outbound {
+                host.send(HostCommand::SendTransfer(TransferMessage::FileTask(
+                    message,
+                )))
+                .unwrap();
+            } else {
+                controller
+                    .send_transfer(TransferMessage::FileTask(message))
+                    .await;
+            }
+            let events = terminal_events(&host).await;
+            assert!(
+                matches!(events.as_slice(), [
+                    HostEvent::ReleaseAll,
+                    HostEvent::Error(HostError::Protocol(message)),
+                    HostEvent::State(HostState::Closed),
+                ] if message == "file task service is unsupported by the FFI host"),
+                "outbound={outbound}, events={events:?}"
+            );
+            host.destroy();
+        }
     }
 }
 

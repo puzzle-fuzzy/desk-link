@@ -307,6 +307,8 @@ async fn connected_fixture(backpressure: bool) -> DirectFixture {
         direct_peer: peer.clone(),
     };
     let runtime = ControllerRuntime {
+        data_plane: None,
+        lan: None,
         host_capabilities: DeviceCapabilities {
             platform: Platform::Windows,
             role: DeviceRole::Host,
@@ -314,6 +316,7 @@ async fn connected_fixture(backpressure: bool) -> DirectFixture {
             h264_profiles: vec![H264Profile::Main],
             width: 16,
             height: 16,
+            lan_data: None,
         },
         client,
         secure,

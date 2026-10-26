@@ -47,8 +47,9 @@ use desklink_protocol::{
 };
 use desklink_session::{ReconnectDecision, ReconnectPolicy, ReconnectSchedule};
 use desklink_transport::{
-    DirectVideoPathFallbackReason, JoinRejectCode, QuicClient, RelayDirectoryLookup, RelayJoin,
-    TransportError, VideoPathKind, VideoPathQuality,
+    ChannelKind, DirectVideoPathFallbackReason, JoinRejectCode, LanDataError, QuicClient,
+    RelayDirectoryLookup, RelayJoin, SessionDataError, TransportError, VideoPathKind,
+    VideoPathQuality,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -859,6 +860,92 @@ struct IncomingTransfer {
     size: u64,
     transferred: u64,
     last_activity: Instant,
+}
+
+const TRANSFER_UNAVAILABLE_MESSAGE: &str =
+    "当前会话的文件和剪贴板通道不可用，已停止相关操作；画面和键鼠仍可使用。重新连接后可手动重试。";
+
+fn optional_transfer_unavailable(error: &ControllerError) -> bool {
+    matches!(
+        error,
+        ControllerError::SessionData(
+            SessionDataError::NoPath(ChannelKind::Transfer)
+                | SessionDataError::Interrupted(ChannelKind::Transfer)
+        )
+    )
+}
+
+#[derive(Default)]
+struct FileSendTask(Option<tauri::async_runtime::JoinHandle<()>>);
+
+impl FileSendTask {
+    fn replace(&mut self, task: tauri::async_runtime::JoinHandle<()>) {
+        self.abort();
+        self.0 = Some(task);
+    }
+
+    fn abort(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for FileSendTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+fn retire_transfer_operations(
+    outgoing: &mut Option<OutgoingTransfer>,
+    incoming: &mut Option<IncomingTransfer>,
+    remote_request: &mut Option<PendingRemoteFileRequest>,
+    clipboard: &mut Option<PendingClipboardOperation>,
+    attempted_clipboard: Option<&'static str>,
+    task: &mut FileSendTask,
+    signals: &Channel<ControllerSignal>,
+) {
+    task.abort();
+    let pending = clipboard.take();
+    let _ = signals.send(ControllerSignal::Clipboard {
+        state: "failed",
+        operation: pending.map_or(attempted_clipboard.unwrap_or("send"), |pending| {
+            pending.operation.signal_name()
+        }),
+        message: TRANSFER_UNAVAILABLE_MESSAGE.to_owned(),
+    });
+    if let Some(transfer) = outgoing.take() {
+        transfer.cancellation.store(true, Ordering::Release);
+        let _ = signals.send(ControllerSignal::FileTransfer {
+            state: "failed",
+            direction: "upload",
+            name: transfer.file.name,
+            transferred: 0,
+            total: transfer.file.size,
+            message: TRANSFER_UNAVAILABLE_MESSAGE.to_owned(),
+        });
+    }
+    if let Some(transfer) = incoming.take() {
+        transfer.file.cancel();
+        let _ = signals.send(ControllerSignal::FileTransfer {
+            state: "failed",
+            direction: "download",
+            name: transfer.name,
+            transferred: transfer.transferred,
+            total: transfer.size,
+            message: TRANSFER_UNAVAILABLE_MESSAGE.to_owned(),
+        });
+    }
+    *remote_request = None;
+    let _ = signals.send(ControllerSignal::FileTransfer {
+        state: "failed",
+        direction: "download",
+        name: "文件传输".to_owned(),
+        transferred: 0,
+        total: 0,
+        message: TRANSFER_UNAVAILABLE_MESSAGE.to_owned(),
+    });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2752,6 +2839,10 @@ async fn run_controller(
             mpsc::channel::<IncomingFileEvent>(INCOMING_EVENT_CAPACITY);
         let mut pending_remote_file_request: Option<PendingRemoteFileRequest> = None;
         let mut pending_clipboard: Option<PendingClipboardOperation> = None;
+        let transfer_unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut transfer_retired = false;
+        let mut attempted_clipboard = None;
+        let mut outgoing_file_task = FileSendTask::default();
         // The writer is moved into one owned future and returned on completion.
         // The existing bounded command queue supplies backpressure; no second
         // queue or per-event sender/manager Arc clone is needed.
@@ -2776,7 +2867,50 @@ async fn run_controller(
             &queued_files,
             file_queue_paused,
         );
-        let failure = loop {
+        macro_rules! send_transfer {
+            ($target:lifetime, $message:expr) => {
+                if transfer_unavailable.load(Ordering::Acquire) {
+                    continue $target;
+                }
+                if let Err(error) = runtime.send_transfer($message).await {
+                    if optional_transfer_unavailable(&error) {
+                        transfer_unavailable.store(true, Ordering::Release);
+                        continue $target;
+                    }
+                    break $target ConnectFailure::from_controller(error);
+                }
+            };
+            (best_effort, $message:expr) => {
+                if !transfer_unavailable.load(Ordering::Acquire)
+                    && let Err(error) = runtime.send_transfer($message).await
+                    && optional_transfer_unavailable(&error)
+                {
+                    transfer_unavailable.store(true, Ordering::Release);
+                }
+            };
+        }
+        let failure = 'session: loop {
+            if transfer_unavailable.load(Ordering::Acquire) && !transfer_retired {
+                transfer_retired = true;
+                pending_paste = None;
+                retire_transfer_operations(
+                    &mut outgoing,
+                    &mut incoming,
+                    &mut pending_remote_file_request,
+                    &mut pending_clipboard,
+                    attempted_clipboard.take(),
+                    &mut outgoing_file_task,
+                    &signals,
+                );
+                file_queue_paused = !queued_files.is_empty();
+                publish_file_queue(
+                    &manager,
+                    host_device_id,
+                    &signals,
+                    &queued_files,
+                    file_queue_paused,
+                );
+            }
             if active_input.is_none()
                 && let Some((request_id, context)) = pending_paste.take()
             {
@@ -2787,6 +2921,7 @@ async fn run_controller(
                 ));
             }
             if outgoing.is_none()
+                && !transfer_retired
                 && incoming.is_none()
                 && pending_remote_file_request.is_none()
                 && !file_queue_paused
@@ -2828,6 +2963,10 @@ async fn run_controller(
                 };
                 if let Err(error) = runtime.send_transfer(offer).await {
                     queued_files.push_front(file);
+                    if optional_transfer_unavailable(&error) {
+                        transfer_unavailable.store(true, Ordering::Release);
+                        continue 'session;
+                    }
                     break ConnectFailure::from_controller(error);
                 }
                 let _ = signals.send(ControllerSignal::FileTransfer {
@@ -2880,12 +3019,41 @@ async fn run_controller(
                                 }); },
                                 Err(error) => break ConnectFailure::from_controller(error),
                             }
+                        } else if let Err(error) = result {
+                            // A retired clipboard service cannot hide an error
+                            // from a shortcut already writing the core Input lane.
+                            break ConnectFailure::from_controller(error);
                         }
                     } else if let Err(error) = result {
                         break ConnectFailure::from_controller(error);
                     }
                 }
                 command = commands.recv(), if active_input.is_none() => match command {
+                    Some(command @ (ControllerCommand::SendClipboard(_)
+                        | ControllerCommand::PasteClipboard { .. }
+                        | ControllerCommand::RequestClipboard)) if transfer_retired => {
+                        let operation = match command {
+                            ControllerCommand::PasteClipboard { .. } => "paste",
+                            ControllerCommand::RequestClipboard => "receive",
+                            _ => "send",
+                        };
+                        let _ = signals.send(ControllerSignal::Clipboard {
+                            state: "failed", operation,
+                            message: TRANSFER_UNAVAILABLE_MESSAGE.to_owned(),
+                        });
+                    }
+                    Some(ControllerCommand::SendFiles { .. }
+                        | ControllerCommand::RetryFile(_)
+                        | ControllerCommand::RequestRemoteFile(_)) if transfer_retired => {
+                        let _ = signals.send(ControllerSignal::FileTransfer {
+                            state: "failed", direction: "upload", name: "文件传输".to_owned(),
+                            transferred: 0, total: 0,
+                            message: TRANSFER_UNAVAILABLE_MESSAGE.to_owned(),
+                        });
+                    }
+                    Some(ControllerCommand::ResumeFileQueue { reply }) if transfer_retired => {
+                        let _ = reply.send(Err(TRANSFER_UNAVAILABLE_MESSAGE.to_owned()));
+                    }
                     Some(ControllerCommand::Input { context, event }) => {
                         if !manager.accepts_input_context(context) {
                             continue;
@@ -2944,17 +3112,17 @@ async fn run_controller(
                             operation: "send",
                             message: "正在发送本机剪贴板…".to_owned(),
                         });
-                        if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardSet {
+                        attempted_clipboard = Some("send");
+                        send_transfer!('session, TransferMessage::ClipboardSet {
                             request_id,
                             text,
-                        }).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        });
                         pending_clipboard = Some(PendingClipboardOperation::new(
                             request_id,
                             ClipboardOperation::Send,
                             Instant::now(),
                         ));
+                        attempted_clipboard = None;
                     }
                     Some(ControllerCommand::PasteClipboard { context, text }) => {
                         if !manager.accepts_input_context(context) { continue; }
@@ -2973,13 +3141,13 @@ async fn run_controller(
                             operation: "paste",
                             message: "正在将本机剪贴板写入远端并粘贴…".to_owned(),
                         });
-                        if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardSet {
+                        attempted_clipboard = Some("paste");
+                        send_transfer!('session, TransferMessage::ClipboardSet {
                             request_id,
                             text,
-                        }).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        });
                         pending_clipboard = Some(PendingClipboardOperation::paste(request_id, context, Instant::now()));
+                        attempted_clipboard = None;
                     }
                     Some(ControllerCommand::RequestClipboard) => {
                         if pending_clipboard.is_some() {
@@ -2997,16 +3165,16 @@ async fn run_controller(
                             operation: "receive",
                             message: "正在读取远端剪贴板…".to_owned(),
                         });
-                        if let Err(error) = runtime.send_transfer(TransferMessage::ClipboardRequest {
+                        attempted_clipboard = Some("receive");
+                        send_transfer!('session, TransferMessage::ClipboardRequest {
                             request_id,
-                        }).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                        });
                         pending_clipboard = Some(PendingClipboardOperation::new(
                             request_id,
                             ClipboardOperation::Receive,
                             Instant::now(),
                         ));
+                        attempted_clipboard = None;
                     }
                     Some(ControllerCommand::SendFiles { target, files }) => {
                         // Preparation and IPC can outlive both a session switch and
@@ -3174,14 +3342,10 @@ async fn run_controller(
                         ));
                         let request_id = next_transfer_request_id;
                         next_transfer_request_id = next_transfer_request_id.wrapping_add(1).max(1);
-                        if let Err(error) = runtime.send_transfer(
-                            TransferMessage::FileSelectionRequest {
+                        send_transfer!('session, TransferMessage::FileSelectionRequest {
                                 request_id,
                                 resume,
-                            },
-                        ).await {
-                            break ConnectFailure::from_controller(error);
-                        }
+                            });
                         pending_remote_file_request = Some(PendingRemoteFileRequest::new(
                             request_id,
                             Instant::now(),
@@ -3198,9 +3362,9 @@ async fn run_controller(
                     Some(ControllerCommand::CancelFile) => {
                         if let Some(transfer) = outgoing.take() {
                             transfer.cancellation.store(true, Ordering::Release);
-                            let _ = runtime.send_transfer(TransferMessage::Cancel {
+                            send_transfer!(best_effort, TransferMessage::Cancel {
                                 transfer_id: transfer.file.transfer_id,
-                            }).await;
+                            });
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "cancelled",
                                 direction: "upload",
@@ -3222,9 +3386,9 @@ async fn run_controller(
                         } else if let Some(transfer) = incoming.take() {
                             let transfer_id = transfer.file.transfer_id();
                             transfer.file.cancel();
-                            let _ = runtime.send_transfer(TransferMessage::Cancel {
+                            send_transfer!(best_effort, TransferMessage::Cancel {
                                 transfer_id,
-                            }).await;
+                            });
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "cancelled",
                                 direction: "download",
@@ -3234,11 +3398,9 @@ async fn run_controller(
                                 message: "文件接收已取消；进行中的磁盘操作返回后会清理临时文件。".to_owned(),
                             });
                         } else if let Some(request) = pending_remote_file_request.take() {
-                            let _ = runtime.send_transfer(
-                                TransferMessage::FileSelectionCancel {
+                            send_transfer!(best_effort, TransferMessage::FileSelectionCancel {
                                     request_id: request.request_id,
-                                },
-                            ).await;
+                                });
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "cancelled",
                                 direction: "download",
@@ -3273,10 +3435,10 @@ async fn run_controller(
                             transfer.transferred = offset;
                             transfer.last_activity = Instant::now();
                             let transfer_id = transfer.file.transfer_id();
-                            if let Err(error) = runtime.send_transfer(TransferMessage::FileDecision {
+                            send_transfer!('session, TransferMessage::FileDecision {
                                 transfer_id, result: TransferResult::Completed,
                                 resume_offset: offset, resume_prefix_hash: prefix_hash,
-                            }).await { break ConnectFailure::from_controller(error); }
+                            });
                             let _ = manager.remember_last_file_action(LastFileAction::download(host_device_id, Some(FileResumeHint {
                                 transfer_id, name: transfer.name.clone(), size: transfer.size,
                             })));
@@ -3302,9 +3464,9 @@ async fn run_controller(
                             let transfer = incoming.take().expect("matched incoming ticket");
                             let transfer_id = transfer.file.transfer_id();
                             tauri::async_runtime::spawn_blocking(move || apps_windows::transfer::notify_file_received(&path));
-                            if let Err(error) = runtime.send_transfer(TransferMessage::FileResult {
+                            send_transfer!('session, TransferMessage::FileResult {
                                 transfer_id, result: TransferResult::Completed,
-                            }).await { break ConnectFailure::from_controller(error); }
+                            });
                             manager.clear_last_file_action();
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "completed", direction: "download", name: transfer.name,
@@ -3321,7 +3483,7 @@ async fn run_controller(
                                 TransferMessage::FileDecision { transfer_id, result, resume_offset: 0, resume_prefix_hash: None }
                             };
                             transfer.file.cancel();
-                            if let Err(error) = runtime.send_transfer(response).await { break ConnectFailure::from_controller(error); }
+                            send_transfer!('session, response);
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "failed", direction: "download", name: transfer.name,
                                 transferred: transfer.transferred, total: transfer.size,
@@ -3330,7 +3492,7 @@ async fn run_controller(
                         }
                     }
                 }
-                event = runtime.next_event_with_transfer(incoming.as_ref().is_none_or(|transfer| transfer.file.can_receive())) => match event {
+                event = runtime.next_event_with_transfer(!transfer_retired && incoming.as_ref().is_none_or(|transfer| transfer.file.can_receive())) => match event {
                     Ok(ControllerEvent::VideoConfig(config)) => {
                         if !manager.set_video_input_context_if_current(generation, &config) { continue; }
                         if !stable {
@@ -3575,16 +3737,12 @@ async fn run_controller(
                                 } else {
                                     TransferResult::Rejected
                                 };
-                                if let Err(error) = runtime.send_transfer(
-                                    TransferMessage::FileDecision {
+                                send_transfer!('session, TransferMessage::FileDecision {
                                         transfer_id,
                                         result,
                                         resume_offset: 0,
                                         resume_prefix_hash: None,
-                                    },
-                                ).await {
-                                    break ConnectFailure::from_controller(error);
-                                }
+                                    });
                                 continue;
                             }
                             let ticket = next_incoming_ticket;
@@ -3618,9 +3776,7 @@ async fn run_controller(
                                     });
                                 }
                                 if let Some(transfer) = failed { transfer.file.cancel(); }
-                                if let Err(error) = runtime.send_transfer(TransferMessage::FileResult { transfer_id, result }).await {
-                                    break ConnectFailure::from_controller(error);
-                                }
+                                send_transfer!('session, TransferMessage::FileResult { transfer_id, result });
                             }
                         }
                         TransferMessage::FileComplete { transfer_id, content_hash } => {
@@ -3648,9 +3804,7 @@ async fn run_controller(
                                     });
                                     transfer.file.cancel();
                                 }
-                                if let Err(error) = runtime.send_transfer(TransferMessage::FileResult { transfer_id, result }).await {
-                                    break ConnectFailure::from_controller(error);
-                                }
+                                send_transfer!('session, TransferMessage::FileResult { transfer_id, result });
                             }
                         }
                         TransferMessage::FileDecision {
@@ -3705,7 +3859,8 @@ async fn run_controller(
                             let cancellation = transfer.cancellation.clone();
                             let file = transfer.file.clone();
                             let outgoing_file_events = outgoing_file_events.clone();
-                            tauri::async_runtime::spawn(async move {
+                            let unavailable = transfer_unavailable.clone();
+                            outgoing_file_task.replace(tauri::async_runtime::spawn(async move {
                                 let event = match send_outgoing_file(
                                     sender,
                                     file,
@@ -3713,6 +3868,7 @@ async fn run_controller(
                                     resume_prefix_hash,
                                     cancellation,
                                     signals,
+                                    unavailable,
                                 ).await {
                                     Ok(()) => OutgoingFileEvent::AwaitingResult { transfer_id },
                                     Err(message) => OutgoingFileEvent::Failed {
@@ -3721,7 +3877,7 @@ async fn run_controller(
                                     },
                                 };
                                 let _ = outgoing_file_events.send(event).await;
-                            });
+                            }));
                         }
                         TransferMessage::FileResult { transfer_id, result } => {
                             if outgoing.as_ref().is_some_and(|transfer| {
@@ -3809,6 +3965,14 @@ async fn run_controller(
                                 });
                             }
                         }
+                        TransferMessage::FileTask(_) => {
+                            break ConnectFailure::with_reason(
+                                false,
+                                "当前控制端尚未接入文件任务服务，此会话已停止。",
+                                "file_task_unsupported",
+                                "protocol-14 FileTask received without a connected file task service",
+                            );
+                        }
                         TransferMessage::ClipboardSet { .. }
                         | TransferMessage::ClipboardRequest { .. }
                         | TransferMessage::FileSelectionRequest { .. }
@@ -3839,9 +4003,9 @@ async fn run_controller(
                             }
                             let transfer = outgoing.take().expect("checked outgoing transfer");
                             transfer.cancellation.store(true, Ordering::Release);
-                            let _ = runtime.send_transfer(TransferMessage::Cancel {
+                            send_transfer!(best_effort, TransferMessage::Cancel {
                                 transfer_id: transfer.file.transfer_id,
-                            }).await;
+                            });
                             let _ = signals.send(ControllerSignal::FileTransfer {
                                 state: "failed",
                                 direction: "upload",
@@ -3881,9 +4045,9 @@ async fn run_controller(
                         let pending = pending_remote_file_request
                             .take()
                             .expect("checked remote file request deadline");
-                        let _ = runtime.send_transfer(TransferMessage::FileSelectionCancel {
+                        send_transfer!(best_effort, TransferMessage::FileSelectionCancel {
                             request_id: pending.request_id,
-                        }).await;
+                        });
                         let _ = signals.send(ControllerSignal::FileTransfer {
                             state: "failed",
                             direction: "download",
@@ -3900,9 +4064,9 @@ async fn run_controller(
                         let transfer = incoming.take().expect("checked incoming file deadline");
                         let transfer_id = transfer.file.transfer_id();
                         transfer.file.cancel();
-                        let _ = runtime.send_transfer(TransferMessage::Cancel {
+                        send_transfer!(best_effort, TransferMessage::Cancel {
                             transfer_id,
-                        }).await;
+                        });
                         let _ = signals.send(ControllerSignal::FileTransfer {
                             state: "failed",
                             direction: "download",
@@ -3919,9 +4083,9 @@ async fn run_controller(
                     }) {
                         let transfer = outgoing.take().expect("checked outgoing file deadline");
                         transfer.cancellation.store(true, Ordering::Release);
-                        let _ = runtime.send_transfer(TransferMessage::Cancel {
+                        send_transfer!(best_effort, TransferMessage::Cancel {
                             transfer_id: transfer.file.transfer_id,
-                        }).await;
+                        });
                         let (transferred, message) = match transfer.phase {
                             OutgoingTransferPhase::AwaitingDecision => (
                                 0,
@@ -4008,6 +4172,7 @@ async fn run_controller(
                 last_metrics = Instant::now();
             }
         };
+        outgoing_file_task.abort();
         drop(active_input.take());
         record_controller_video_metrics(
             diagnostics.as_ref(),
@@ -4112,6 +4277,7 @@ async fn send_outgoing_file(
     resume_prefix_hash: Option<[u8; 32]>,
     cancellation: Arc<std::sync::atomic::AtomicBool>,
     signals: Channel<ControllerSignal>,
+    transfer_unavailable: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     let transfer_id = file.transfer_id;
     let path = file.path;
@@ -4201,7 +4367,12 @@ async fn send_outgoing_file(
                 )
                 .await
                 .map_err(|_| "连续 30 秒无法发送新的文件数据，已停止本次传输。".to_owned())?
-                .map_err(|_| "发送文件时连接中断。".to_owned())?;
+                .map_err(|error| {
+                    if optional_transfer_unavailable(&error) {
+                        transfer_unavailable.store(true, Ordering::Release);
+                    }
+                    "发送文件时连接中断。".to_owned()
+                })?;
                 let _ = signals.send(ControllerSignal::FileTransfer {
                     state: "sending",
                     direction: "upload",
@@ -4221,7 +4392,12 @@ async fn send_outgoing_file(
                 )
                 .await
                 .map_err(|_| "发送完成信息超时，已停止等待远端校验。".to_owned())?
-                .map_err(|_| "发送完成确认时连接中断。".to_owned())?;
+                .map_err(|error| {
+                    if optional_transfer_unavailable(&error) {
+                        transfer_unavailable.store(true, Ordering::Release);
+                    }
+                    "发送完成确认时连接中断。".to_owned()
+                })?;
                 let _ = signals.send(ControllerSignal::FileTransfer {
                     state: "verifying",
                     direction: "upload",
@@ -4533,6 +4709,22 @@ impl ConnectFailure {
 
     fn from_controller(error: ControllerError) -> Self {
         let technical_reason = error.to_string();
+        if let ControllerError::SessionData(error) = error {
+            return match error {
+                SessionDataError::Transport(error)
+                | SessionDataError::Lan(LanDataError::Transport(error)) => {
+                    Self::from_transport(error, false)
+                }
+                SessionDataError::Closed
+                | SessionDataError::Timeout
+                | SessionDataError::Lan(LanDataError::Closed | LanDataError::Timeout)
+                | SessionDataError::NoPath(ChannelKind::Control | ChannelKind::Input)
+                | SessionDataError::Interrupted(ChannelKind::Control | ChannelKind::Input) => {
+                    Self::retryable(technical_reason)
+                }
+                _ => Self::permanent(technical_reason),
+            };
+        }
         if matches!(&error, ControllerError::HandshakeTimeout) {
             return Self::with_reason(
                 true,
@@ -5180,14 +5372,16 @@ mod tests {
         COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
         ControllerCommand, ControllerFileTarget, ControllerInput, ControllerManager,
         ControllerPlaybackPressure, ControllerRenderMetrics, ControllerRuntimeSummary,
-        ControllerVideoPullInput, ControllerWorker, CurrentTransportWait, H264ProfileProbe,
-        LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
-        PendingRemoteFileRequest, PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
+        ControllerVideoPullInput, ControllerWorker, CurrentTransportWait, FileSendTask,
+        H264ProfileProbe, LastFileAction, MAX_BUFFERED_POINTER_MOVES, OutgoingTransfer,
+        OutgoingTransferPhase, PendingClipboardOperation, PendingRemoteFileRequest,
+        PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
         directory_transport_error_is_retryable, directory_transport_error_message,
-        file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
-        revalidate_queued_file, session_earned_fresh_retry_budget,
-        should_drop_buffered_pointer_move, transfer_result_message, transfer_result_state,
-        validate_text_input, wait_for_file_queue_command, wait_for_retry_deadline,
+        file_offer_matches_request, optional_transfer_unavailable, parse_input, parse_transfer_id,
+        remote_paste_shortcut_events, retire_transfer_operations, revalidate_queued_file,
+        session_earned_fresh_retry_budget, should_drop_buffered_pointer_move,
+        transfer_result_message, transfer_result_state, validate_text_input,
+        wait_for_file_queue_command, wait_for_retry_deadline,
     };
     use apps_windows::{
         audio::RemoteAudioEncoder, transfer::OutgoingFile,
@@ -5200,7 +5394,9 @@ mod tests {
         MouseButton, PROTOCOL_VERSION, ProtocolError, TransferResult,
     };
     use desklink_session::{ReconnectPolicy, ReconnectSchedule};
-    use desklink_transport::{JoinRejectCode, TransportError};
+    use desklink_transport::{
+        ChannelKind, JoinRejectCode, LanDataError, SessionDataError, TransportError,
+    };
 
     use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
 
@@ -6413,6 +6609,167 @@ mod tests {
         assert!(failure.detail.contains("中继服务器或主机"));
         assert_eq!(failure.kind, "transport_unavailable");
         assert!(failure.technical_reason.contains("timed out"));
+    }
+
+    #[test]
+    fn session_data_transport_failures_keep_the_existing_transport_classification() {
+        let errors: [fn() -> TransportError; 5] = [
+            || TransportError::Connection("synthetic offline".into()),
+            || TransportError::ConnectionLimit,
+            || TransportError::JoinRejected(JoinRejectCode::AuthenticationMismatch),
+            || TransportError::DirectoryProtocolMismatch {
+                controller: Some(13),
+                host: Some(PROTOCOL_VERSION),
+            },
+            || TransportError::MessageTooLarge {
+                actual: 2,
+                maximum: 1,
+            },
+        ];
+        for error in errors {
+            for nested_lan_error in [false, true] {
+                let expected = ConnectFailure::from_transport(error(), false);
+                let session_error = if nested_lan_error {
+                    SessionDataError::Lan(LanDataError::Transport(error()))
+                } else {
+                    SessionDataError::Transport(error())
+                };
+                let actual =
+                    ConnectFailure::from_controller(ControllerError::SessionData(session_error));
+                assert_eq!(actual.retryable, expected.retryable);
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.detail, expected.detail);
+                assert_eq!(actual.technical_reason, expected.technical_reason);
+            }
+        }
+    }
+
+    #[test]
+    fn session_data_core_path_loss_retries_without_retrying_optional_or_auth_failures() {
+        for (error, retryable) in [
+            (SessionDataError::NoPath(ChannelKind::Control), true),
+            (SessionDataError::Interrupted(ChannelKind::Input), true),
+            (SessionDataError::NoPath(ChannelKind::Transfer), false),
+            (
+                SessionDataError::Interrupted(ChannelKind::VideoReliable),
+                false,
+            ),
+            (SessionDataError::Timeout, true),
+            (SessionDataError::Closed, true),
+            (SessionDataError::Lan(LanDataError::Timeout), true),
+            (SessionDataError::InvalidNegotiation, false),
+            (SessionDataError::InvalidSwitch, false),
+            (SessionDataError::AlreadyAttached, false),
+            (
+                SessionDataError::Crypto(desklink_crypto::CryptoError::AuthenticationFailed),
+                false,
+            ),
+            (
+                SessionDataError::Lan(LanDataError::Crypto(
+                    desklink_crypto::CryptoError::AuthenticationFailed,
+                )),
+                false,
+            ),
+            (SessionDataError::Lan(LanDataError::Malformed), false),
+        ] {
+            let reason = error.to_string();
+            let failure = ConnectFailure::from_controller(ControllerError::SessionData(error));
+            assert_eq!(failure.retryable, retryable, "{reason}");
+        }
+        for reason in [
+            AccessDenialReason::ApprovalRejected,
+            AccessDenialReason::ApprovalExpired,
+        ] {
+            assert!(
+                !ConnectFailure::from_controller(ControllerError::AccessDenied(reason)).retryable
+            );
+        }
+    }
+
+    #[test]
+    fn only_explicit_transfer_path_loss_disables_the_optional_service() {
+        for (error, optional) in [
+            (SessionDataError::NoPath(ChannelKind::Transfer), true),
+            (SessionDataError::Interrupted(ChannelKind::Transfer), true),
+            (SessionDataError::NoPath(ChannelKind::Control), false),
+            (SessionDataError::Interrupted(ChannelKind::Input), false),
+            (SessionDataError::Timeout, false),
+            (SessionDataError::Closed, false),
+            (
+                SessionDataError::Crypto(desklink_crypto::CryptoError::AuthenticationFailed),
+                false,
+            ),
+            (SessionDataError::InvalidSwitch, false),
+        ] {
+            let error = ControllerError::SessionData(error);
+            assert_eq!(optional_transfer_unavailable(&error), optional, "{error}");
+        }
+        assert!(!optional_transfer_unavailable(&ControllerError::Protocol(
+            ProtocolError::UnsupportedVersion(13)
+        )));
+    }
+
+    #[tokio::test]
+    async fn transfer_retirement_reclaims_its_sender_and_pending_operations() {
+        struct CompletedOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for CompletedOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finished, dropped) = tokio::sync::oneshot::channel();
+        let mut task = FileSendTask::default();
+        task.replace(tauri::async_runtime::spawn(async move {
+            let _completed = CompletedOnDrop(Some(finished));
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+        }));
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut outgoing = Some(OutgoingTransfer {
+            file: OutgoingFile {
+                transfer_id: [7; 16],
+                path: std::env::temp_dir().join("synthetic-no-io.bin"),
+                name: "synthetic-no-io.bin".into(),
+                size: 12,
+                modified_at_unix_ns: 0,
+            },
+            cancellation: cancellation.clone(),
+            phase: OutgoingTransferPhase::Sending,
+            deadline: None,
+        });
+        let mut incoming = None;
+        let mut remote = Some(PendingRemoteFileRequest::new(1, Instant::now()));
+        let mut clipboard = Some(PendingClipboardOperation::new(
+            2,
+            ClipboardOperation::Receive,
+            Instant::now(),
+        ));
+        let signals = tauri::ipc::Channel::new(|_| Ok(()));
+        retire_transfer_operations(
+            &mut outgoing,
+            &mut incoming,
+            &mut remote,
+            &mut clipboard,
+            None,
+            &mut task,
+            &signals,
+        );
+        assert!(
+            outgoing.is_none() && incoming.is_none() && remote.is_none() && clipboard.is_none()
+        );
+        assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
+        assert!(task.0.is_none());
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

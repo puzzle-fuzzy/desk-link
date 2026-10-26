@@ -215,6 +215,196 @@ def verify_static_windows_assets() -> dict[str, dict[str, object]]:
     return verified
 
 
+def rust_code_mask(text: str) -> str:
+    """Preserve offsets/delimiters while hiding Rust comments and literals."""
+    masked = list(text)
+    raw_pattern = re.compile(r'(?:br|cr|r)(#*)"')
+    char_pattern = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+    i = 0
+    while i < len(text):
+        start = i
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        elif text.startswith("/*", i):
+            depth = 1
+            i += 2
+            while i < len(text) and depth:
+                if text.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+        elif text[i] in "rbc" and (raw := raw_pattern.match(text, i)) and (
+            i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        ):
+            terminator = '"' + raw.group(1)
+            end = text.find(terminator, raw.end())
+            i = len(text) if end < 0 else end + len(terminator)
+        elif text[i] == '"':
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+        elif text[i] == "'" and (char := char_pattern.match(text, i)):
+            i = char.end()
+        else:
+            i += 1
+            continue
+        masked[start:i] = ["\n" if c == "\n" else " " for c in text[start:i]]
+    return "".join(masked)
+
+
+def rust_delimiters(code: str) -> dict[int, int]:
+    stack: list[tuple[str, int]] = []
+    pairs: dict[int, int] = {}
+    for index, character in enumerate(code):
+        if character in "([{":
+            stack.append((character, index))
+        elif character in ")]}":
+            if not stack or {"(": ")", "[": "]", "{": "}"}[stack[-1][0]] != character:
+                # Invalid/unsupported source must not authorize an exclusion.
+                return {}
+            _, start = stack.pop()
+            pairs[start] = index
+    return pairs if not stack else {}
+
+
+def rust_test_regions(text: str) -> tuple[str, list[tuple[int, int]], dict[int, str | None]]:
+    """Exclude only the complete next item of an exact #[cfg(test)].
+
+    This is a deliberately small lexical scanner, not a Rust cfg evaluator.
+    Unknown cfg forms and unrecognized item syntax remain subject to the gate.
+    """
+    code = rust_code_mask(text)
+    pairs = rust_delimiters(code)
+    regions: list[tuple[int, int]] = []
+    paths: dict[int, str | None] = {}
+    processed = 0
+    for attribute in re.finditer(r"#\s*\[", code):
+        if attribute.start() < processed:
+            continue
+        cursor = attribute.start()
+        test_only = False
+        explicit_path = None
+        has_path = False
+        while match := re.match(r"#\s*\[", code[cursor:]):
+            opening = cursor + match.end() - 1
+            if opening not in pairs:
+                break
+            end = pairs[opening]
+            test_only |= re.fullmatch(r"\s*cfg\s*\(\s*test\s*\)\s*", code[opening + 1:end]) is not None
+            path = re.fullmatch(r'\s*path\s*=\s*(.*?)\s*', text[opening + 1:end], re.DOTALL)
+            if path:
+                has_path = True
+                try:
+                    explicit_path = json.loads(path.group(1))
+                except ValueError:
+                    raw_path = re.fullmatch(r'r(#*)"(.*)"\1', path.group(1), re.DOTALL)
+                    explicit_path = raw_path.group(2) if raw_path else None
+                if not isinstance(explicit_path, str):
+                    explicit_path = None
+            cursor = end + 1
+            while cursor < len(code) and code[cursor].isspace():
+                cursor += 1
+        processed = cursor
+        visibility = r"(?:pub(?:\([^)]*\))?\s+)?"
+        item = re.match(visibility + r"(?:(?:async|unsafe|const|extern)\s+)*(fn)\b|" + visibility + r"(mod|struct|enum|impl|trait|use|type|static|const|extern|macro_rules)\b", code[cursor:])
+        if not item:
+            continue
+        if has_path:
+            paths[cursor] = explicit_path
+        if not test_only:
+            continue
+        position = cursor + item.end()
+        while position < len(code):
+            token = code[position]
+            if token == ";":
+                regions.append((attribute.start(), position + 1))
+                break
+            if token in "([{":
+                if position not in pairs:
+                    break
+                end = pairs[position] + 1
+                if token == "{" and (item.group(1) or item.group(2)) not in {"use", "type", "static", "const"}:
+                    regions.append((attribute.start(), end))
+                    break
+                position = end
+            else:
+                position += 1
+    return code, regions, paths
+
+
+def production_rust_sources(files: dict[Path, str]) -> dict[Path, str]:
+    """Resolve test-only module reachability; shared production bindings win."""
+    scans = {path: rust_test_regions(text) for path, text in files.items()}
+    edges: dict[Path, list[tuple[Path, bool]]] = {path: [] for path in files}
+    incoming: set[Path] = set()
+    for path, (code, regions, paths) in scans.items():
+        pairs = rust_delimiters(code)
+        modules = list(re.finditer(r"\bmod\s+([A-Za-z_][A-Za-z_0-9]*)\s*([;{])", code))
+        def module_path(module: re.Match[str]) -> tuple[bool, str | None]:
+            for start, value in paths.items():
+                if start <= module.start() and re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?", code[start:module.start()]):
+                    return True, value
+            return False, None
+        for module in modules:
+            if module.group(2) != ";":
+                continue
+            base = path.parent if path.name in {"lib.rs", "main.rs", "mod.rs"} else path.parent / path.stem
+            ancestors = [parent for parent in modules if parent.group(2) == "{" and parent.end() - 1 in pairs
+                         and parent.end() <= module.start() < pairs[parent.end() - 1]]
+            if any(module_path(parent)[0] for parent in ancestors):
+                # Inline #[path] resolution has additional Rust-specific base
+                # rules. Leave those files scanned instead of guessing a target.
+                continue
+            for parent in ancestors:
+                base /= parent.group(1)
+            has_path, explicit = module_path(module)
+            if has_path and explicit is None:
+                continue
+            if has_path:
+                candidates = [(base if ancestors else path.parent) / explicit]
+            else:
+                candidates = [base / (module.group(1) + ".rs"), base / module.group(1) / "mod.rs"]
+            targets = [candidate.resolve() for candidate in candidates if candidate.resolve() in files]
+            if len(targets) != 1:
+                continue
+            target = targets[0]
+            conditional = any(start <= module.start() < end for start, end in regions)
+            edges[path].append((target, conditional))
+            incoming.add(target)
+    roots = set(files) - incoming
+    reachable: set[tuple[Path, bool]] = set()
+    pending = [(path, False) for path in roots]
+    while pending:
+        path, test_only = pending.pop()
+        if (path, test_only) in reachable:
+            continue
+        reachable.add((path, test_only))
+        pending.extend((target, test_only or conditional) for target, conditional in edges[path])
+    test_only_files = {path for path, conditional in reachable if conditional} - {
+        path for path, conditional in reachable if not conditional
+    }
+    production = {}
+    for path, (code, regions, _) in scans.items():
+        if path in test_only_files:
+            continue
+        masked = list(code)
+        for start, end in regions:
+            masked[start:end] = " " * (end - start)
+        production[path] = "".join(masked)
+    return production
+
+
 def verify_production_backpressure(
     source_roots: tuple[Path, ...] = PRODUCTION_RUST_SOURCE_ROOTS,
 ) -> dict[str, object]:
@@ -227,28 +417,28 @@ def verify_production_backpressure(
         # is aliased. Bounded Tokio channels always carry an explicit capacity.
         ("unbounded mpsc::channel", re.compile(r"\bmpsc::channel\s*\(\s*\)")),
     )
-    checked_files = 0
+    files: dict[Path, str] = {}
     violations: list[str] = []
     for source_root in source_roots:
         if not source_root.is_dir():
             raise SystemExit(f"Windows production Rust source directory is missing: {source_root}")
         for path in sorted(source_root.rglob("*.rs")):
-            checked_files += 1
-            text = path.read_text(encoding="utf-8")
-            for label, pattern in forbidden:
-                if pattern.search(text):
-                    try:
-                        display_path = path.relative_to(ROOT)
-                    except ValueError:
-                        display_path = path
-                    violations.append(f"{display_path} ({label})")
+            files[path.resolve()] = path.read_text(encoding="utf-8")
+    for path, code in production_rust_sources(files).items():
+        for label, pattern in forbidden:
+            if pattern.search(code):
+                try:
+                    display_path = path.relative_to(ROOT)
+                except ValueError:
+                    display_path = path
+                violations.append(f"{display_path} ({label})")
     if violations:
         detail = ", ".join(violations)
         raise SystemExit(
             "Windows production Rust contains an unbounded channel; use a bounded "
             f"queue with explicit backpressure: {detail}"
         )
-    return {"checked_files": checked_files, "unbounded_channels": 0}
+    return {"checked_files": len(files), "unbounded_channels": 0}
 
 
 def verify_frontend_assets() -> list[str]:

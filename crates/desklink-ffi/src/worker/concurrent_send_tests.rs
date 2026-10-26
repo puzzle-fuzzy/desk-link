@@ -417,6 +417,7 @@ async fn standalone_control_backpressure_has_one_second_budget_and_closes_sessio
 #[tokio::test]
 async fn only_an_unpolled_old_input_may_be_discarded() {
     let mut send = Some(OwnedConnectedSend {
+        transfer: false,
         context: Some(context(11)),
         started: false,
         future: Box::pin(std::future::pending()),
@@ -424,6 +425,7 @@ async fn only_an_unpolled_old_input_may_be_discarded() {
     discard_unstarted_input(&mut send, context(22));
     assert!(send.is_none());
     send = Some(OwnedConnectedSend {
+        transfer: false,
         context: Some(context(11)),
         started: false,
         future: Box::pin(std::future::pending()),

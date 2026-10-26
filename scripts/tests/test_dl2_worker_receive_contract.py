@@ -1,5 +1,6 @@
 """Portable scheduling contracts; real flow-control coverage lives in Rust."""
 from pathlib import Path
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -13,11 +14,15 @@ class WorkerReceiveContracts(unittest.TestCase):
     def test_reader_is_pinned_across_commands_and_send_completion(self):
         worker = source("crates/desklink-ffi/src/worker.rs")
         connected = worker.split("async fn run_connected(", 1)[1].split("/// Every owned reliable operation", 1)[0]
-        self.assertEqual(connected.count("controller.next_event()"), 1)
+        self.assertEqual(connected.count("controller.next_event_with_transfer(transfer_available)"), 1)
+        self.assertNotIn("controller.next_event()", connected)
         self.assertLess(connected.index("tokio::pin!(next_event)"), connected.index("let event = loop"))
         self.assertIn("event = &mut next_event", connected)
         self.assertIn("ConnectedWork::Sent(result)", connected)
         self.assertIn("ConnectedWork::Command(command)", connected)
+        inner = connected.split("let event = loop {", 1)[1].split("match event {", 1)[0]
+        self.assertNotIn("controller.next_event", inner)
+        self.assertNotIn("drop(next_event)", connected)
         self.assertNotIn("controller.send_", connected)
         fair = connected.split("work = async {", 1)[1].split("} => work", 1)[0]
         self.assertNotIn("biased;", fair)
@@ -55,17 +60,25 @@ class WorkerReceiveContracts(unittest.TestCase):
         self.assertLess(client.index("limits.apply_to(&mut transport)"), client.index(".keep_alive_interval("))
         self.assertLess(client.index("limits.apply_to(&mut transport)"), client.index("endpoint.set_default_client_config(client_config)"))
         relay = source("server/relay/src/lib.rs")
-        ordinary = relay.split("pub async fn bind(", 1)[1].split("pub async fn bind_with_transport", 1)[0]
-        self.assertIn("quinn::TransportConfig::default()", ordinary)
-        explicit = relay.split("pub async fn bind_with_transport", 1)[1].split("pub fn local_addr", 1)[0]
-        self.assertNotIn("TransportConfig::default()", explicit)
-        self.assertIn("server_config.transport_config(Arc::new(transport))", explicit)
-        self.assertIn("quinn::Endpoint::server(server_config, bind_addr)", explicit)
+        ordinary = relay.split("pub async fn bind(", 1)[1].split("pub async fn bind_with_flow_control_limits", 1)[0]
+        self.assertIn("Self::bind_with_optional_flow_limits(bind_addr, server_config, config, None)", ordinary)
+        explicit = relay.split("pub async fn bind_with_flow_control_limits", 1)[1].split("async fn bind_with_optional_flow_limits", 1)[0]
+        self.assertIn("limits: desklink_transport::QuicFlowControlLimits", explicit)
+        self.assertIn("config, Some(limits)", explicit)
+        common = relay.split("async fn bind_with_optional_flow_limits", 1)[1].split("pub fn local_addr", 1)[0]
+        self.assertLess(common.index("config.resource_budget()?"), common.index("budget.configure(&mut transport)"))
+        self.assertIn("quinn::TransportConfig::default()", common)
+        self.assertIn("if !limits.fits_within(maximum)", common)
+        self.assertLess(common.index("if !limits.fits_within(maximum)"), common.index("limits.apply_to(&mut transport)"))
+        self.assertLess(common.index("limits.apply_to(&mut transport)"), common.index(".keep_alive_interval("))
+        compact = re.sub(r"\s+", "", common)
+        self.assertIn("server_config.transport_config(Arc::new(transport))", compact)
+        self.assertIn("quinn::Endpoint::server(server_config,bind_addr)", compact)
         fixture = source("crates/desklink-ffi/src/controller/direct_silence_tests.rs")
         self.assertIn("with_flow_control_limits(fixture_flow_control_limits())", fixture)
-        self.assertIn("fixture_flow_control_limits().apply_to(&mut transport)", fixture)
         self.assertIn("QuicFlowControlLimits::new(2048, 16384, 2048)", fixture)
-        self.assertIn("RelayServer::bind_with_transport", fixture)
+        self.assertIn("RelayServer::bind_with_flow_control_limits", fixture)
+        self.assertIn("fixture_flow_control_limits(),", fixture)
 
     def test_owned_control_and_runtime_recovery_share_wire_order_without_crypto_io_lock(self):
         controller = source("crates/desklink-ffi/src/controller.rs")
