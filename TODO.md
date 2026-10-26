@@ -379,6 +379,14 @@
 - **验收：** 用真实规模合成历史记录验证 query plan、接收 p95、清理锁时间和磁盘上界；14 天保留语义不变，不为性能丢失批次原子性。
 - **完成 / 验证（2026-10-26，`fix(DL2-039)`）：** 时间索引、独立维护（每片 1000 行）、批次标记延后至过期事件排空、关闭释放及白名单存储指标。Bun 1.3.14：17 测试 / 73 断言及 typecheck 通过，覆盖真实文件锁恢复、旧 schema 索引升级、接收失败全回滚和去重。25 万保留事件 + 两轮各 25 万过期事件的文件库：计划由 SCAN 改为时间索引；store 接收 p95 341.436ms → 0.331ms，清理分片 p95 29.236 / 34.205ms、max 137.687ms（完整事务调用作为锁时间保守上界），WAL 高水位 176,303,072 → 7,815,672B；第二轮主文件仅长 4KiB，证明该固定负载页复用。原始证据、命令及索引升级/物理空间边界见 `server/diagnostics/RETENTION.md` 和 `retention-benchmark-evidence.json`；本机合成不含 HTTP/签名、生产长稳或任意输入磁盘硬上限。
 
+#### DL2-044 · 服务端诊断契约切片（整体仍由媒体 / 产品验收）
+
+- [x] 核实 producer `a599246535b73f57e0425cbbfd18c7156e050bba` 的 `DiagnosticEvent::HostMedia(CursorSend)`；仅为 `host_cursor_send` 接受精确 9 字段、host source / warning / 固定 `capability_or_size` reason，三个新增字段不向其他事件开放。无需存储迁移。
+- [x] `fix(DL2-044)` 服务切片：保留完整 payload / 批次原子性与去重；分析仅生成一次可选光标通道停用 warning，保留独立视频健康证据，不累加跨 peer 快照、不把 send_errors 转为真实丢包/送达率或主机停止。
+- [x] 实际 rustc 1.97.1 经仓库 Cargo wrapper、producer 锁版本 `--locked --offline` 编译原 encoder 生成四组 JSONL fixture；六份输入 blob / SHA-256 已复核，独立重跑除 timestamp 外一致。Bun 1.3.14：54 测试 / 665 断言及 typecheck 通过，包含原 Rust JSONL → Ed25519 签名批次 → 验签/schema → app/store → analysis、混合批次、去重、错误字段/类型/source/reason/签名和 safe integer / u64 边界。
+- [ ] GUI observer 绑定 / 导出、真实硬件与媒体链路整体验收由产品 / 媒体工作面继续；本项不能关闭整个 044。045 listener_closed 等待其真实 producer SHA，不预先扩 schema；桌面上传器对永久 400 的重试生命周期也不由本地 server 回归证明。
+- **契约 / 证据：** `server/diagnostics/HOST_MEDIA.md`、`fixtures/host-media-cursor-producer.json`、`scripts/generate-host-media-contract.py`。仅运行隔离编码 harness 和本地签名 / 数据库测试，未编造 GUI 已接通或远端送达证据。
+
 ### DL2-054 · P2 · 诊断接收在验签前限额，持久配额限制留存增长
 
 - [x] 在读 body / 验签前按 socket / 显式可信代理 IP 和全局预算准入，有界键状态；为事件、批次、全部可变 TEXT 字节设事务持久配额。

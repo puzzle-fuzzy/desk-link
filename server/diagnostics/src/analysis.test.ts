@@ -252,6 +252,73 @@ describe("correlated diagnostic analysis", () => {
     expect(report.uncorrelated_rows).toBe(1);
   });
 
+  test("a disabled optional cursor lane preserves healthy video evidence and never becomes packet loss or a stopped host", () => {
+    const videoRows = [
+      event("controller_connected", 0),
+      event("controller_video_metrics", 10_000, {
+        attempt: 1, received_video_packets: 200, dropped_video_packets: 0,
+        completed_frames: 80, delivered_video_frames: 80,
+      }),
+      event("controller_render_metrics", 10_100, {
+        stream_id: 7, received_frames: 80, submitted_frames: 80, displayed_frames: 80,
+      }),
+    ];
+    const baseline = analyzeDiagnosticRows(videoRows, 24, NOW).sessions[0]!;
+    const session = analyzeDiagnosticRows([...videoRows, cursorEvent({ send_attempts: 50_000, send_errors: 40_000 })], 24, NOW).sessions[0]!;
+    expect(session.video).toEqual(baseline.video);
+    expect(session.render).toEqual(baseline.render);
+    expect(session.video.loss_percent).toBe(0);
+    expect(session.connected_count).toBe(1);
+    expect(session.stop_reason_kinds).toEqual([]);
+    expect(session.outcome).toBe("warning");
+    expect(session.findings.map(finding => finding.code)).toEqual(["healthy_video", "cursor_lane_disabled"]);
+    expect(session.findings.find(finding => finding.code === "cursor_lane_disabled")?.severity).toBe("warning");
+  });
+
+  test("repeated cursor snapshots or shared stream IDs produce one categorical finding without invented peer totals", () => {
+    const report = analyzeDiagnosticRows([
+      cursorEvent(), cursorEvent(),
+      cursorEvent({ send_attempts: 100, send_errors: 1 }, 1),
+      cursorEvent({ stream_id: 7, send_attempts: 1, send_errors: 1 }, 2),
+      cursorEvent({ stream_id: 8, send_attempts: 20, send_errors: 1 }, 3),
+    ], 24, NOW);
+    const session = report.sessions[0]!;
+    expect(session.findings.map(finding => finding.code)).toEqual(["cursor_lane_disabled"]);
+    expect(report.summary.finding_counts.cursor_lane_disabled).toBe(1);
+    expect(session.outcome).toBe("warning");
+    expect(session.connected_count).toBe(0);
+    expect(session.stop_reason_kinds).toEqual([]);
+    expect(session.video).toEqual({ received_packets: 0, dropped_packets: 0, completed_frames: 0,
+      delivered_frames: 0, video_ipc_overflow_drops: 0, video_ipc_keyframe_replacements: 0,
+      loss_percent: null, input_backpressure_count: 0 });
+    expect(session).not.toHaveProperty("cursor_loss_percent");
+    expect(session).not.toHaveProperty("cursor_delivery_rate");
+    expect(session.findings[0]?.detail).not.toContain("100");
+  });
+
+  test("false, mismatched or malformed historical cursor payloads cannot produce a disabled-lane warning", () => {
+    const invalidRows = [
+      cursorEvent({ disabled: false }), cursorEvent({ disabled: "true" }), cursorEvent({ disabled: 1 }),
+      cursorEvent({ reason: "connection_lost" }), cursorEvent({ reason: "capability_or_size: raw driver text" }),
+      cursorEvent({ reason: null }), cursorEvent({ event: "host_stopped" }),
+      { ...cursorEvent(), source: "controller" as const },
+      { ...cursorEvent(), event: "controller_video_metrics" },
+      { ...cursorEvent(), payload_json: "not JSON" },
+      { ...cursorEvent(), payload_json: "[]" },
+      ...["send_attempts", "send_errors", "stream_id"].flatMap(field => [
+        cursorEvent({ [field]: "1" }), cursorEvent({ [field]: true }), cursorEvent({ [field]: null }), cursorEvent({ [field]: undefined }),
+        cursorEvent({ [field]: -1 }), cursorEvent({ [field]: 1.5 }),
+        cursorEvent({ [field]: Number.MAX_SAFE_INTEGER + 1 }), cursorEvent({ [field]: 0 }),
+      ]),
+      cursorEvent({ send_attempts: 1, send_errors: 2 }),
+    ];
+    for (const row of invalidRows) {
+      const session = analyzeDiagnosticRows([row], 24, NOW).sessions[0]!;
+      expect(session.findings.map(finding => finding.code)).not.toContain("cursor_lane_disabled");
+      expect(session.findings.map(finding => finding.code)).not.toContain("host_stopped");
+    }
+  });
+
   test("raises attention for any error or three warning sessions", () => {
     const errorAnalysis = analyzeDiagnosticRows([
       event("controller_stopped", 0, { reason: "host_unavailable: capture failed" }),
@@ -276,6 +343,14 @@ describe("correlated diagnostic analysis", () => {
     expect(warningHealth.requires_attention).toBeTrue();
   });
 });
+
+function cursorEvent(payload: Record<string, unknown> = {}, offsetMs = 10_200): AnalysisEventRow {
+  return { ...event("host_cursor_send", offsetMs, {
+    level: "warning",
+    stream_id: 7, send_attempts: 2, send_errors: 1, disabled: true,
+    reason: "capability_or_size", ...payload,
+  }, "a".repeat(32), "host"), level: "warning" };
+}
 
 function event(
   name: string,

@@ -28,6 +28,7 @@ export interface SessionFinding {
     | "video_pull_instability"
     | "input_backpressure"
     | "slow_first_frame"
+    | "cursor_lane_disabled"
     | "incomplete_evidence";
   severity: FindingSeverity;
   title: string;
@@ -375,6 +376,16 @@ function analyzeSession(
       detail: `已完成 ${video.completed} 帧，未发现停止、振荡或高丢包。`,
     });
   }
+  if (events.some(isDisabledCursorLane)) {
+    // A stream ID does not identify a peer. Keep one categorical observation,
+    // without summing snapshots or interpreting local send errors as loss.
+    findings.push({
+      code: "cursor_lane_disabled",
+      severity: "warning",
+      title: "可选光标通道已停用",
+      detail: "主机因本地能力或大小限制停用了可选光标通道；该事件不表示视频、输入或远程连接已中断。",
+    });
+  }
   if (findings.length === 0) {
     findings.push({
       code: "incomplete_evidence",
@@ -425,6 +436,17 @@ function analyzeSession(
     outcome,
     findings,
   };
+}
+
+function isDisabledCursorLane(event: ParsedEvent): boolean {
+  if (event.source !== "host" || event.event !== "host_cursor_send"
+    || event.payload.event !== "host_cursor_send" || event.payload.disabled !== true
+    || event.payload.reason !== "capability_or_size") return false;
+  const streamId = safeInteger(event.payload.stream_id);
+  const attempts = safeInteger(event.payload.send_attempts);
+  const errors = safeInteger(event.payload.send_errors);
+  return streamId !== null && streamId > 0 && attempts !== null
+    && errors !== null && errors > 0 && errors <= attempts;
 }
 
 function videoByAttempt(events: ParsedEvent[]): Map<number, VideoAttempt> {

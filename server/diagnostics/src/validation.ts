@@ -51,6 +51,12 @@ const ALLOWED_EVENT_FIELDS = new Set([
   "profile_probe_ms",
   "profile_fallback_reason",
 ]);
+// Pinned to the product encoder in a599246. These fields are deliberately
+// scoped to this event, rather than becoming part of every event's schema.
+const CURSOR_SEND_FIELDS = new Set([
+  "schema", "timestamp_unix_ms", "level", "event", "stream_id",
+  "send_attempts", "send_errors", "disabled", "reason",
+]);
 
 export interface DiagnosticEvent {
   schema: 1;
@@ -160,7 +166,7 @@ function validateBatch(value: unknown, publicKey: Uint8Array, nowUnixMs: number)
   if (!Array.isArray(value.events) || value.events.length === 0 || value.events.length > 100) {
     throw new BatchValidationError(400, "diagnostic event count is invalid");
   }
-  const events = value.events.map((event) => validateEvent(event, nowUnixMs));
+  const events = value.events.map((event) => validateEvent(event, nowUnixMs, value.source as DiagnosticBatch["source"]));
   return {
     schema: 1,
     app_version: value.app_version,
@@ -172,8 +178,13 @@ function validateBatch(value: unknown, publicKey: Uint8Array, nowUnixMs: number)
   };
 }
 
-function validateEvent(value: unknown, nowUnixMs: number): DiagnosticEvent {
-  if (!isObject(value) || Object.keys(value).some((key) => !ALLOWED_EVENT_FIELDS.has(key))) {
+function validateEvent(value: unknown, nowUnixMs: number, source: DiagnosticBatch["source"]): DiagnosticEvent {
+  if (!isObject(value)) {
+    throw new BatchValidationError(400, "diagnostic event must be an object");
+  }
+  const cursorSend = value.event === "host_cursor_send";
+  const allowedFields = cursorSend ? CURSOR_SEND_FIELDS : ALLOWED_EVENT_FIELDS;
+  if (Object.keys(value).some((key) => !allowedFields.has(key))) {
     throw new BatchValidationError(400, "diagnostic event contains unsupported fields");
   }
   if (value.schema !== 1 || !Number.isSafeInteger(value.timestamp_unix_ms)) {
@@ -188,6 +199,17 @@ function validateEvent(value: unknown, nowUnixMs: number): DiagnosticEvent {
   }
   if (typeof value.event !== "string" || !EVENT_NAME.test(value.event)) {
     throw new BatchValidationError(400, "diagnostic event name is invalid");
+  }
+  if (cursorSend && (
+    Object.keys(value).length !== CURSOR_SEND_FIELDS.size
+    || source !== "host" || value.level !== "warning"
+    || !Number.isSafeInteger(value.stream_id) || Number(value.stream_id) <= 0
+    || !Number.isSafeInteger(value.send_attempts) || Number(value.send_attempts) < 0
+    || !Number.isSafeInteger(value.send_errors) || Number(value.send_errors) < 0
+    || Number(value.send_errors) > Number(value.send_attempts)
+    || typeof value.disabled !== "boolean" || value.reason !== "capability_or_size"
+  )) {
+    throw new BatchValidationError(400, "host cursor send fields are invalid");
   }
   for (const [key, field] of Object.entries(value)) {
     if (typeof field === "number" && (!Number.isSafeInteger(field) || field < 0)) {
