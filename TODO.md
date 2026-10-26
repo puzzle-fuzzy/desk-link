@@ -212,6 +212,13 @@
 - [x] Windows 共享 Rust API 来源切片 `feat(DL2-013): expose the captured-context runtime input bridge`：准确提取 Apple 已提交 `9ad7154b365de875d725188cfa091f5c21da0b5a` 的 ControllerRuntime::send_input_with_context(&self, InputContext, InputEvent)、必要 import、旧 send_input 明确拒绝及 encrypted controller_runtime 回归；未引入 C/Swift/worker 队列依赖。唯一必要前置为 `bc6c0a62` 的共享合同。`python scripts/run-windows-cargo.py test -p desklink-ffi --test controller_runtime --locked` 5 通过，包含真实加密输入传输；不表示主机/呈现/生产者整链已接通。
 - [ ] 主机分配/锁/匹配校验、各生产者事件捕获与真实首帧呈现后放行尚在接线。合同阶段未接入的生产路径显式使用无效零 context/epoch，被 codec 拒绝；这不是当前 epoch 兜底，亦不是可交付远控版本，不得整体关闭 013。
 
+### DL2-045 · P1 · DirectLan accept 分类复核与终态诊断
+
+- [ ] 区分监听终态并使禁用原因可观测。
+- **源码复核修正：** a905b88与本分支 `DirectLanEndpoint::accept` 都返回Option<Result>；握手失败/超时是Some(Err)，Host已continue。`endpoint.accept().await?`只传播None监听终态，不能把“任何Err永久禁用”当作已确认缺陷；实际剩余缺项是None后的明确降级诊断。
+- [x] **已有正确行为的真实回归（`test(DL2-045): distinguish transient direct handshakes from listener shutdown`）：** 空truststore触发真实127.0.0.1 QUIC证书握手失败，确认Some(Err)，同一listener随后使用生产配置+Noise会话成功认证probe并收发datagram；显式endpoint关闭才在100ms内返回None（重复等待一致）。probe 14项通过，transport lib+tests严格Clippy通过。
+- [ ] 终态禁用的稳定原因/诊断接通与真实监听故障状态验收；本提交未把原有continue实现冒称新修复。
+
 ## 4. 性能与数据通道
 
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
