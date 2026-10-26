@@ -16,3 +16,7 @@ python scripts/benchmark-windows-media.py --encode --width 1920 --height 1080 --
 硬件报告可能实际选择软件；应先读取 `backend.kind` 和 `fallback_reason`，不能把命令参数当作硬件已启用的证据。当前自动回归使用软件 MFT 加合成故障验证 config/IDR/同帧重试，不捕获桌面、不打开远控会话；Intel/AMD/NVIDIA、混合 GPU、D3D surface、设备丢失、驱动参数差异和性能/功耗矩阵仍须真实设备运行。
 
 依据：[MFTEnumEx 的类别与资源释放](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mftenumex)、[异步 MFT 的事件与 unlock 契约](https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts)。
+
+DL2-023 的 `H264Encoder::try_set_bitrate` 单独调整 ICodecAPI MeanBitRate/MaxBitRate。两项均必须可修改且能读取 uint32 值；升码率先升峰值，降码率先降均值，写入后精确回读才更新 `bitrate()`。拒绝、部分写入、驱动钳制或回读失败后尝试还原两项，并再次验证。`Ok(false)` 表示未写入的不支持，或已经验证恢复原值；无法确认回滚时返回错误，调用方必须用旧设置重建并请求 IDR。成功不会重建编码器、增加 config_version、清空参考队列或改变尺寸/帧率/profile。
+
+自动测试用可注入属性模拟部分写入、钳制、回读失败及回滚失败，并用本机软件 MFT 的 64×64 合成帧验证拒绝后的输出与代数连续。本轮软件 MFT 返回 `accepted=false`，因此没有把它记为真实动态调码率成功；硬件设备上成功调整及其带宽/质量收益仍未验证。

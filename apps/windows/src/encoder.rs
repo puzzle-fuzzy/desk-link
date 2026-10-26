@@ -1,6 +1,8 @@
 use crate::capture::CapturedFrame;
 use desklink_protocol::H264Profile;
 
+mod bitrate;
+
 const MAX_ENCODE_WIDTH: u32 = 2560;
 const MAX_ENCODE_HEIGHT: u32 = 1440;
 pub const EXPERIMENTAL_4K_WIDTH: u32 = 3840;
@@ -114,6 +116,57 @@ mod backend_tests {
         assert!(!credits.take_output());
         credits.notify_output().unwrap();
         assert!(credits.take_output());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn software_bitrate_change_preserves_stream_metadata_and_reference_state() {
+        let mut encoder = H264Encoder::new_with_settings_and_backend(
+            64,
+            64,
+            H264EncoderSettings::default(),
+            EncoderBackendPreference::SoftwareOnly,
+        )
+        .unwrap();
+        let frame = |index: u64| CapturedFrame {
+            width: 64,
+            height: 64,
+            timestamp_us: index * 33_333,
+            pixels: vec![index as u8; 64 * 64 * 4],
+        };
+        let first = encoder.encode(frame(1), true).unwrap();
+        let config = encoder.config_version;
+        let fps = encoder.fps;
+        let profile = encoder.profile;
+        let previous_bitrate = encoder.bitrate();
+        let pending = encoder.pending_frames.len();
+        let accepted = encoder
+            .try_set_bitrate(previous_bitrate / 2)
+            .expect("either accepted or safely unsupported");
+        assert_eq!(
+            encoder.bitrate(),
+            if accepted {
+                previous_bitrate / 2
+            } else {
+                previous_bitrate
+            }
+        );
+        assert_eq!(encoder.config_version, config);
+        assert_eq!(encoder.dimensions(), (64, 64));
+        assert_eq!(encoder.fps, fps);
+        assert_eq!(encoder.profile, profile);
+        assert_eq!(encoder.pending_frames.len(), pending);
+        let stable_bitrate = encoder.bitrate();
+        assert_eq!(
+            encoder.try_set_bitrate(0),
+            Err(EncoderError::InvalidDimensions)
+        );
+        assert_eq!(encoder.bitrate(), stable_bitrate);
+        let second = encoder.encode(frame(2), false).unwrap();
+        assert_eq!(second.config_version, first.config_version);
+        assert_eq!(second.frame_id, first.frame_id + 1);
+        assert!(!second.access_unit.is_empty());
+        println!("software MFT dynamic bitrate accepted={accepted}; stream generation preserved");
     }
 
     #[cfg(windows)]
@@ -933,6 +986,31 @@ impl H264Encoder {
         self.profile
     }
 
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate
+    }
+
+    /// Updates native rate control without resetting reference pictures. False
+    /// means unsupported without writes, or rejection with both previous values
+    /// restored and verified. Failed rollback requires rebuilding old settings.
+    pub fn try_set_bitrate(&mut self, bitrate: u32) -> Result<bool, EncoderError> {
+        if bitrate == 0 {
+            return Err(EncoderError::InvalidDimensions);
+        }
+        #[cfg(windows)]
+        {
+            if self.backend.try_set_bitrate(bitrate)? {
+                self.bitrate = bitrate;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(false)
+        }
+    }
+
     pub fn last_performance_sample(&self) -> Option<EncoderPerformanceSample> {
         self.last_performance_sample
     }
@@ -990,7 +1068,9 @@ mod native {
                 CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
                 CoTaskMemFree, CoUninitialize,
             },
-            System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4},
+            System::Variant::{
+                VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4, VariantClear,
+            },
         },
         core::Interface,
     };
@@ -1002,6 +1082,56 @@ mod native {
 
     const ASYNC_FRAME_BUDGET: Duration = Duration::from_millis(100);
     const MAX_HARDWARE_CANDIDATES: usize = 16;
+
+    struct NativeBitrateProperties<'a>(&'a ICodecAPI);
+
+    impl super::bitrate::BitrateProperties for NativeBitrateProperties<'_> {
+        fn can_modify(&self) -> bool {
+            // S_FALSE is a successful HRESULT but explicitly means not
+            // modifiable here, so .is_ok() would be incorrect.
+            unsafe {
+                self.0.IsModifiable(&CODECAPI_AVEncCommonMeanBitRate).0 == 0
+                    && self.0.IsModifiable(&CODECAPI_AVEncCommonMaxBitRate).0 == 0
+            }
+        }
+
+        fn read(&self) -> Result<(u32, u32), EncoderError> {
+            Ok((
+                read_codec_u32(self.0, &CODECAPI_AVEncCommonMeanBitRate)?,
+                read_codec_u32(self.0, &CODECAPI_AVEncCommonMaxBitRate)?,
+            ))
+        }
+
+        fn set_mean(&mut self, value: u32) -> Result<(), EncoderError> {
+            unsafe {
+                self.0
+                    .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &u32_variant(value))
+            }
+            .map_err(|error| native_error("set dynamic mean bitrate", error))
+        }
+
+        fn set_max(&mut self, value: u32) -> Result<(), EncoderError> {
+            unsafe {
+                self.0
+                    .SetValue(&CODECAPI_AVEncCommonMaxBitRate, &u32_variant(value))
+            }
+            .map_err(|error| native_error("set dynamic peak bitrate", error))
+        }
+    }
+
+    fn read_codec_u32(codec: &ICodecAPI, key: &windows::core::GUID) -> Result<u32, EncoderError> {
+        let mut value = unsafe { codec.GetValue(key) }
+            .map_err(|error| native_error("read codec bitrate", error))?;
+        let result = if unsafe { value.Anonymous.Anonymous.vt } == VT_UI4 {
+            Ok(unsafe { value.Anonymous.Anonymous.Anonymous.ulVal })
+        } else {
+            Err(EncoderError::Native(
+                "codec bitrate is not a uint32 property".into(),
+            ))
+        };
+        let _ = unsafe { VariantClear(&mut value) };
+        result
+    }
 
     fn hardware_candidates() -> Result<Vec<IMFActivate>, EncoderError> {
         let input = MFT_REGISTER_TYPE_INFO {
@@ -1352,6 +1482,13 @@ mod native {
 
         pub fn info(&self) -> &EncoderBackendInfo {
             &self.info
+        }
+
+        pub fn try_set_bitrate(&mut self, bitrate: u32) -> Result<bool, EncoderError> {
+            let Some(codec) = &self.codec_api else {
+                return Ok(false);
+            };
+            super::bitrate::try_apply(&mut NativeBitrateProperties(codec), bitrate)
         }
 
         pub fn last_input_copy_bytes(&self) -> usize {
