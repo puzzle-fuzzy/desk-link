@@ -4,7 +4,9 @@
 
 ## 源码身份与版本
 
-本矩阵的实现基线是 `main@a905b8807c83677f6f962c18f8fd1593f0d4ca32`，工程入口切片是 `codex/dl2-engineering@44a2a997834d01157ae27a08bc810804422a0f72`。其他分支修复单列，尚未合入该 main；不能把它们当成本工程分支已经测试过的实现。
+本矩阵的功能实现基线是 `main@a905b8807c83677f6f962c18f8fd1593f0d4ca32`，初始工程入口切片是 `44a2a997834d01157ae27a08bc810804422a0f72`。后续工程 probe 接入源码快照为 `673ec15a50afdffa06f9d65462a568ad2bb8f440`：只复用协议13契约、shared-probe 和独立 probe lane，尚不包含其他产品/Apple/媒体修复，也不是 main 已整合。下面的功能矩阵仍按 main 基线逐项说明；当前工程 checkout 的协议版本单列。
+
+复用来源：协议 `9979c6424cf99f704feb212c7700833fce466dae` → 本分支 `e0d8df8a10fecab5818e04b999fbd424b12b933f`；shared-probe `3277c2a41af0ac923e1daa1c5cab5d952b355b9b` → `9c4119581508fc08c895aa8e3b24063ad03e657e`；probe lane `0836a8b311a858bf12f0d0b4427961c35f5986a7` → `673ec15a50afdffa06f9d65462a568ad2bb8f440`。shared-probe 的合并仅保留探测接线，排除依赖未引入 DL2-010 的两处 snapshot 格式调整；未为此引入整个媒体分支。接入测试另有带源码身份的报告，不用来源提交的测试结果替代。
 
 版本从 manifest/配置读取，命令只读，不构建、不访问设备或网络：
 
@@ -12,16 +14,17 @@
 python scripts/verify-windows-release.py --versions-only
 ```
 
-| 项目 | 本基线快照 | 权威来源 |
+| 项目 | 核对值 | 权威来源 |
 | --- | --- | --- |
 | Windows 应用 | `0.1.93` | `apps/windows/Cargo.toml`、`apps/windows-ui/package.json`、`apps/windows-ui/src-tauri/Cargo.toml`、`tauri.conf.json`、`tools/windows-installer/Cargo.toml`，脚本要求五者一致 |
-| 业务协议 | `12` | `crates/desklink-protocol/src/lib.rs::PROTOCOL_VERSION`，不是应用版本，也不是 relay JOIN 信封版本 |
+| 业务协议 | `13` | 当前工程 checkout 的 `crates/desklink-protocol/src/lib.rs::PROTOCOL_VERSION`；未发布开发线，已复用 InputState 契约，不是应用版本或 relay JOIN 信封版本 |
+| main 基线业务协议 | `12` | `main@a905b88`；不能把工程接入分支当作 main 已集成 |
 | Bun | `1.3.14` | 三个 Bun 项目的 `packageManager`；本地入口检查实际可执行版本 |
 | Rust toolchain | `1.97.1` | `rust-toolchain.toml`；workspace `rust-version=1.88` 是最低版本要求 |
 
 Windows 0.1.93 是公开测试构建，测试更新清单有独立签名；尚无 Windows Authenticode 正式发布验收。历史 0.1.91/0.1.92 的协议与安装记录保留原日期和范围，不能替代本阶段验收。
 
-产品分支在 `9979c6424cf99f704feb212c7700833fce466dae` 建立了 **协议 13** 的 `InputState { reason }` 契约，原因是 Blocked / UnsupportedKey / InvalidInput，`None` 表示恢复；仅末尾追加 postcard variant，relay JOIN 信封不变。该提交尚未集成到上述基线，因此本表仍为 12；输入反馈/UI/旧端静默握手恢复也不能仅凭契约提交算完成。
+产品分支在 `9979c6424cf99f704feb212c7700833fce466dae` 建立了 **协议 13** 的 `InputState { reason }` 契约，原因是 Blocked / UnsupportedKey / InvalidInput，`None` 表示恢复；仅末尾追加 postcard variant，relay JOIN 信封不变。本工程已为 probe 接入复用该独立契约，main 基线仍为 12；输入反馈/UI/旧端静默握手恢复不能仅凭契约提交算完成。DL2-013 的非零 input_epoch/stream 上下文尚待 Apple/FFI owner 独立交付，当前工程不具备严格端到端几何绑定。
 
 ## 方向与功能矩阵
 
