@@ -620,6 +620,8 @@ impl DesklinkRuntime {
         let envelope = InputEnvelope {
             sequence: self.input_sequence.next_sequence(),
             timestamp_us: now_micros(),
+            stream_id: 0,
+            input_epoch: 0,
             event,
         };
         if let Ok(bytes) = encode_input(&envelope) {
