@@ -179,3 +179,53 @@ python scripts/benchmark-windows-gpu.py --mode benchmark --encode --width 1920 -
 - [Tracked sample allocation](https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nf-mfidl-imftrackedsample-setallocator): callback after other sample references are released.
 - [VideoProcessorBlt](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11videocontext-videoprocessorblt): GPU output and query limits below feature level 11.
 - [Rate conversion capabilities](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_video_processor_rate_conversion_caps): history for optimal processing.
+
+## Recorded local matrix
+
+Measured runtime/tool source: `6a60f451ec79e599817f666980811cb81994010b`,
+clean before/after every run, common complete-file fingerprint
+`8333f7f842a11a85b391de724a646dba268414a04c12f24a26915be61f9354f1`.
+RTX 4070 Ti SUPER / NVIDIA driver 610.88, release profile, deterministic desktop
+motion. Six cases each use three independent runs with 3 warmup and 30 measured
+calls; 18 benchmark processes and one capability process all exit 0.
+
+Each cell below is the min–max of the **three run quantiles**, in milliseconds,
+not a pooled 90-sample percentile. This processing call includes color conversion
+and MFT call/wait; GPU BGRA ownership copy, CPU fixture clone and fixture updates
+are reported separately in raw JSON. It is CPU wall time, not pure GPU execution
+or end-to-end latency. Both inputs actually use NVIDIA encoding, with different
+surface/system-memory input modes; quality equivalence is not established.
+
+| Dimensions / input | processing p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|
+| 1920×1080 GPU | 4.160–4.220 | 4.699–5.209 | 4.865–6.173 |
+| 1920×1080 CPU | 9.408–9.533 | 10.048–10.152 | 10.052–10.275 |
+| 2560×1440 GPU | 5.920–6.170 | 6.709–7.063 | 7.685–8.273 |
+| 2560×1440 CPU | 15.170–15.463 | 16.029–16.435 | 16.335–16.641 |
+| 3840×2160 GPU | 14.957–15.121 | 15.700–15.888 | 17.350–18.265 |
+| 3840×2160 CPU | 35.744–36.005 | 38.685–41.155 | 45.529–66.095 |
+
+1080p/1440p are Main/18 Mbps; explicit 4K is High/40.5 Mbps and experimental.
+All actual dimensions/settings match requests. Per 30 measured calls, GPU BGRA
+copy bytes are 248832000 / 442368000 / 995328000; GPU NV12 output bytes are
+93312000 / 165888000 / 373248000. GPU normal readback and CPU NV12/MF input
+copies are zero. The normal path creates 60 queries and 30 of each VP view;
+its existing textures are reused. Motion fixture uploads create another 30
+textures and copy the corresponding BGRA bytes from CPU, separately recorded.
+CPU-input samples write and copy the corresponding NV12 byte totals once each,
+with a separate owned BGRA fixture clone. Driver copies/heap totals remain null.
+
+Each measured call set returns 30 outputs with final pending=0 on this adapter;
+counts still use the documented no-drain scope and do not establish real-time
+FPS or a general input-cohort guarantee. GPU manager/active=true, 33 surface
+inputs/outputs including warmup, and zero fallbacks are checked per run.
+
+Raw evidence is outside Git at:
+`E:\desk-link\.worktrees\dl2-targets\windows-gpu\validation\matrix-6a60f45`.
+`verification-summary.json` SHA256:
+`8a84a34628e7d5e583caf3109ffbac2d980fe8e60e4fe68669fc41495a005b63`.
+`sha256-manifest.json` (69 files, including native stdout/stderr) SHA256:
+`884b33b187c0b331de0d54c94846049a7fd590936249627d428270c905605bbf`.
+The owning agent and root both checked file byte lengths and SHA256s. Metadata
+recording after this run does not change the measured executable sources; final
+handoff identifies matrix source and subsequent documentation commits separately.

@@ -285,7 +285,8 @@
 - **验证：** GPU模块8项（含本机合成live lease/incomplete query→End完成后的安全回收）及真实TrackedSample外部COM引用跨encoder/guard销毁仍占用的寿命回归通过，严格lib/tests Clippy通过。resident统计是逻辑槽/图像字节，不是实测VRAM。
 
 - [x] **可复跑GPU计量工具（`perf(DL2-015): add source-bound synthetic GPU stage probes`）：** 新gpu_media_probe及benchmark-windows-gpu.py，分capability/benchmark、显式adapter/input-path/experimental4k；CPU输入不假定软件backend。确定性desktop glyph-like/gradient/panels及滚动，tiles专用于两phase颜色/方向/UV参考；报告requested/actual尺寸/profile/bitrate、真实MFT/active状态、sample ID、pending未drain范围。区分GPU copy/VP输出、CPU读回、fixture上传/clone、texture/query/view创建；GPU时间/driver copy/heap分配未知为null。wrapper逐run及跨repeat绑定完整源码hash/HEAD/clean状态，fallback或不稳定源不作GPU比较依据。4项示例测试、严格example Clippy及Python编译通过。
-- [ ] **正式阶段矩阵：** 工具冻结后记录1080p/1440p/显式4K、desktop-motion、CPU/GPU输入路径各3×30样本；报告仅本机阶段数据，质量等效、真实桌面/多GPU/双机/长稳另验，不预先承诺收益。
+- [x] **正式本机阶段矩阵（`docs(DL2-015): record the frozen synthetic GPU stage matrix`）：** 固定6a60f45、clean、同一files_sha256，desktop-motion的1080p/1440p/显式4K两输入路径各3×30样本/3预热，18benchmark+1capability native进程全部exit0；实际尺寸、Main18M/4K High40.5M匹配。GPU均NVIDIA surface后端、fallback0、normalCPU读回/NV12 CPU写入/MF输入copy=0；CPU实际同NVIDIA system-memory后端。每run正常GPU query60/views各30，motion fixture另建纹理30，非零分配/零拷贝。数据表和原始JSON/hash路径见docs/windows-gpu-media.md；严格不将返回30输出/lastpending0当drained cohort或FPS。
+- [ ] **性能外推仍待：** GPU实际执行时间/driver内部copy/heap分配、质量等效、真实桌面/多GPU/双机/帧龄/功耗/长稳；本机CPU墙钟分阶段数据不外推端到端收益。
 
 ### DL2-016 · P1 · 显式选择硬件编码器并完善降级
 
