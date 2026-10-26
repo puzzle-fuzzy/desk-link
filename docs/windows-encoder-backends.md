@@ -21,6 +21,8 @@ python scripts/benchmark-windows-media.py --encode --width 1920 --height 1080 --
 
 事件顺序回归覆盖 NeedInput→输入1→NeedInput→输入2→HaveOutput（输入1时间戳），以及先到输出、新输入不丢失、持续无输出、输入/事件洪泛和等待截止边界；使用可注入单调时间验证有界性，没有把这些夹具当作真实硬件编码验收。[INCOMPLETE 的官方语义](https://learn.microsoft.com/en-us/windows/win32/api/mftransform/ne-mftransform-_mft_output_data_buffer_flags)说明仍可产生更多输出。
 
+实际产生输出后，时间戳必须属于本次输入或某个待输出输入。未知时间戳返回稳定的 `encoder_output_timestamp_unmatched` 错误，不再当作尚无输出的 NeedMoreInput，也不消耗其他帧的 metadata。硬件缺失时间戳使用 `encoder_output_timestamp_missing`；两者均进入现有同帧软件重试、新 config_version/IDR 和 SoftwareOnly 锁定，避免恢复时重新选择相同的异常硬件。仅软件后端保留无时间戳时的旧 FIFO 语义；软件返回未知的明确时间戳仍产生可恢复错误，交由既有重建路径处理。自动回归通过软件 MFT 加输出时间戳故障注入验证这些分支，不代表真实硬件异常已经实测。
+
 DL2-023 的 `H264Encoder::try_set_bitrate` 单独调整 ICodecAPI MeanBitRate/MaxBitRate。两项均必须可修改且能读取 uint32 值；升码率先升峰值，降码率先降均值，写入后精确回读才更新 `bitrate()`。拒绝、部分写入、驱动钳制或回读失败后尝试还原两项，并再次验证。`Ok(false)` 表示未写入的不支持，或已经验证恢复原值；无法确认回滚时返回错误，调用方必须用旧设置重建并请求 IDR。成功不会重建编码器、增加 config_version、清空参考队列或改变尺寸/帧率/profile。
 
 自动测试用可注入属性模拟部分写入、钳制、回读失败及回滚失败，并用本机软件 MFT 的 64×64 合成帧验证拒绝后的输出与代数连续。本轮软件 MFT 返回 `accepted=false`，因此没有把它记为真实动态调码率成功；硬件设备上成功调整及其带宽/质量收益仍未验证。

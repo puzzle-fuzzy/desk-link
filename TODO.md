@@ -258,6 +258,9 @@
 - [x] **异步缓冲跟进（`fix(DL2-016): pump asynchronous MFT events across buffered inputs`）：** 合法NeedInput→输入1→NeedInput可返回等待下一输入，不再强求每输入100ms内必有输出；先排空旧输出、接收本次输入再交付旧帧，保留各时间戳/IDR元数据，不因INCOMPLETE把不同sample合为一帧。128 credit、16 pending、8MiB输出和100ms无事件/跨调用1秒无输出预算保持有界。
 - **验证：** encoder 14项通过（新增6个事件序列/容量/截止回归），lib严格Clippy通过；此为注入事件状态机验证，未代替真实硬件MFT事件执行与恢复矩阵。
 
+- [x] **输出时间戳跟进（`fix(DL2-016): reject unmatched encoder output timestamps`）：** 硬件缺失/未知输出时间戳在既有错误边界重试同一输入为软件IDR并锁定软件；软件未知明确时间戳产生可恢复错误，保留pending元数据，不再假装NeedMoreInput。软件未提供时间戳时保留FIFO契约。
+- **验证：** encoder 18项通过，新增当前/旧/未知/缺失时间戳矩阵及合成硬件损坏输出的同帧软件恢复；lib严格Clippy通过。真实厂商时间戳差异继续保留矩阵验收。
+
 ### DL2-017 · P2 · 将 Windows 音频播放移出高频 UI 节点调度
 
 - [ ] 用 AudioWorklet 或经测量更合适的原生播放路径，替代逐包节点创建。

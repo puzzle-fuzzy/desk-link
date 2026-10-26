@@ -118,9 +118,165 @@ fn match_pending_output(
     }
 }
 
+#[cfg(any(windows, test))]
+fn validate_output_timestamp(
+    output_timestamp_us: Option<u64>,
+    current_input_timestamp_us: u64,
+    pending: &std::collections::VecDeque<PendingFrame>,
+    hardware: bool,
+) -> Result<(), EncoderError> {
+    match output_timestamp_us {
+        Some(timestamp)
+            if timestamp != current_input_timestamp_us
+                && !pending.iter().any(|frame| frame.timestamp_us == timestamp) =>
+        {
+            Err(EncoderError::Native(
+                "encoder_output_timestamp_unmatched".into(),
+            ))
+        }
+        None if hardware => Err(EncoderError::Native(
+            "encoder_output_timestamp_missing".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod backend_tests {
     use super::*;
+
+    #[test]
+    fn produced_timestamps_must_match_current_or_pending_input_without_consuming_metadata() {
+        let pending = std::collections::VecDeque::from([PendingFrame {
+            frame_id: 7,
+            config_version: 3,
+            timestamp_us: 7_000,
+            submitted_at: std::time::Instant::now(),
+        }]);
+        assert_eq!(
+            validate_output_timestamp(Some(7_000), 8_000, &pending, true),
+            Ok(())
+        );
+        assert_eq!(
+            validate_output_timestamp(Some(8_000), 8_000, &pending, true),
+            Ok(())
+        );
+        for hardware in [false, true] {
+            assert_eq!(
+                validate_output_timestamp(Some(99_000), 8_000, &pending, hardware),
+                Err(EncoderError::Native(
+                    "encoder_output_timestamp_unmatched".into()
+                ))
+            );
+        }
+        assert_eq!(
+            validate_output_timestamp(None, 8_000, &pending, true),
+            Err(EncoderError::Native(
+                "encoder_output_timestamp_missing".into()
+            ))
+        );
+        assert_eq!(
+            validate_output_timestamp(None, 8_000, &pending, false),
+            Ok(())
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.front().unwrap().frame_id, 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_hardware_output_timestamp_retries_same_input_in_software() {
+        for corrupt_timestamp in [Some(999_000), None] {
+            let mut encoder = H264Encoder::new_with_settings_and_backend(
+                64,
+                64,
+                H264EncoderSettings::default(),
+                EncoderBackendPreference::SoftwareOnly,
+            )
+            .unwrap();
+            let previous_config = encoder.config_version;
+            encoder.backend_preference = EncoderBackendPreference::PreferHardware;
+            encoder
+                .backend
+                .inject_output_timestamp(corrupt_timestamp, true);
+            let output = encoder
+                .encode(
+                    CapturedFrame {
+                        width: 64,
+                        height: 64,
+                        timestamp_us: 123_000,
+                        pixels: vec![0; 64 * 64 * 4],
+                    },
+                    false,
+                )
+                .unwrap();
+            assert!(output.keyframe);
+            assert_eq!(output.timestamp_us, 123_000);
+            assert_ne!(output.config_version, previous_config);
+            assert_eq!(
+                encoder.backend_preference,
+                EncoderBackendPreference::SoftwareOnly
+            );
+            assert_eq!(
+                encoder.backend_info().unwrap().kind,
+                "microsoft_software_mft"
+            );
+            assert_eq!(
+                encoder.backend_info().unwrap().fallback_reason,
+                Some("hardware_runtime_failure")
+            );
+            assert!(encoder.pending_frames.is_empty());
+            assert_eq!(
+                encoder
+                    .last_performance_sample()
+                    .unwrap()
+                    .mf_input_copy_bytes,
+                2 * 64 * 64 * 3 / 2
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unknown_software_timestamp_is_an_error_but_legacy_missing_timestamp_uses_fifo() {
+        let mut encoder = H264Encoder::new_with_settings_and_backend(
+            64,
+            64,
+            H264EncoderSettings::default(),
+            EncoderBackendPreference::SoftwareOnly,
+        )
+        .unwrap();
+        encoder.pending_frames.push_back(PendingFrame {
+            frame_id: 77,
+            config_version: encoder.config_version,
+            timestamp_us: 42_000,
+            submitted_at: std::time::Instant::now(),
+        });
+        encoder
+            .backend
+            .inject_output_timestamp(Some(999_000), false);
+        let frame = |timestamp_us| CapturedFrame {
+            width: 64,
+            height: 64,
+            timestamp_us,
+            pixels: vec![0; 64 * 64 * 4],
+        };
+        assert_eq!(
+            encoder.encode(frame(123_000), false),
+            Err(EncoderError::Native(
+                "encoder_output_timestamp_unmatched".into()
+            ))
+        );
+        assert_eq!(encoder.pending_frames.len(), 1);
+        assert_eq!(encoder.pending_frames.front().unwrap().frame_id, 77);
+        encoder.rebuild(64, 64).unwrap();
+        encoder.backend.inject_output_timestamp(None, false);
+        let config = encoder.config_version;
+        let output = encoder.encode(frame(156_000), true).unwrap();
+        assert_eq!(output.timestamp_us, 156_000);
+        assert_eq!(output.config_version, config);
+        assert!(encoder.pending_frames.is_empty());
+    }
 
     #[test]
     fn buffered_output_performance_keeps_distinct_input_and_output_ids() {
@@ -857,10 +1013,22 @@ impl H264Encoder {
             let request_keyframe = force_keyframe || next_frame_id == 1;
             let mft_started = std::time::Instant::now();
             let mut failed_input_copy_bytes = 0_usize;
-            let output = match self
+            let hardware = self.backend.is_hardware();
+            let encoded = self
                 .backend
                 .encode(nv12, frame.timestamp_us, request_keyframe)
-            {
+                .and_then(|output| {
+                    if let Some(output) = &output {
+                        validate_output_timestamp(
+                            output.timestamp_us,
+                            frame.timestamp_us,
+                            &self.pending_frames,
+                            hardware,
+                        )?;
+                    }
+                    Ok(output)
+                });
+            let output = match encoded {
                 Ok(output) => output,
                 Err(_) if self.backend.is_hardware() => {
                     failed_input_copy_bytes = self.backend.last_input_copy_bytes();
@@ -893,7 +1061,16 @@ impl H264Encoder {
                     self.profile = profile;
                     self.config_version = self.config_version.wrapping_add(1).max(1);
                     self.pending_frames.clear();
-                    self.backend.encode(nv12, frame.timestamp_us, true)?
+                    let output = self.backend.encode(nv12, frame.timestamp_us, true)?;
+                    if let Some(output) = &output {
+                        validate_output_timestamp(
+                            output.timestamp_us,
+                            frame.timestamp_us,
+                            &self.pending_frames,
+                            false,
+                        )?;
+                    }
+                    output
                 }
                 Err(error) => return Err(error),
             };
@@ -931,7 +1108,9 @@ impl H264Encoder {
             };
             let pending = match_pending_output(&mut self.pending_frames, output.timestamp_us);
             let Some(pending) = pending else {
-                return Err(EncoderError::NeedMoreInput);
+                return Err(EncoderError::Native(
+                    "encoder_output_without_pending_input".into(),
+                ));
             };
             if let Some(sample) = &mut self.last_performance_sample {
                 sample.pending_frames = self.pending_frames.len();
@@ -1311,6 +1490,8 @@ mod native {
         last_input_copy_bytes: usize,
         #[cfg(test)]
         simulated_hardware_failure: bool,
+        #[cfg(test)]
+        simulated_output_timestamp: Option<(Option<u64>, bool)>,
         _runtime: NativeRuntime,
     }
 
@@ -1495,6 +1676,8 @@ mod native {
                 last_input_copy_bytes: 0,
                 #[cfg(test)]
                 simulated_hardware_failure: false,
+                #[cfg(test)]
+                simulated_output_timestamp: None,
                 _runtime: runtime,
             })
         }
@@ -1537,7 +1720,7 @@ mod native {
             if self.events.is_some() {
                 return self.encode_async(&sample);
             }
-            match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+            let result = match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
                 Ok(()) => self.take_output(),
                 Err(error) if error.code() == MF_E_NOTACCEPTING => {
                     let queued_output = self.take_output()?;
@@ -1551,7 +1734,17 @@ mod native {
                     }
                 }
                 Err(error) => Err(native_error("submit NV12 sample", error)),
+            };
+            #[cfg(test)]
+            if let Some((timestamp, _)) = self.simulated_output_timestamp {
+                return result.map(|output| {
+                    output.map(|mut output| {
+                        output.timestamp_us = timestamp;
+                        output
+                    })
+                });
             }
+            result
         }
 
         pub fn info(&self) -> &EncoderBackendInfo {
@@ -1574,12 +1767,24 @@ mod native {
             if self.simulated_hardware_failure {
                 return true;
             }
+            #[cfg(test)]
+            if self
+                .simulated_output_timestamp
+                .is_some_and(|(_, hardware)| hardware)
+            {
+                return true;
+            }
             self.events.is_some()
         }
 
         #[cfg(test)]
         pub fn inject_hardware_failure(&mut self) {
             self.simulated_hardware_failure = true;
+        }
+
+        #[cfg(test)]
+        pub fn inject_output_timestamp(&mut self, timestamp: Option<u64>, hardware: bool) {
+            self.simulated_output_timestamp = Some((timestamp, hardware));
         }
 
         pub fn record_runtime_fallback(&mut self, previous: EncoderBackendInfo) {
