@@ -164,6 +164,10 @@
 - **方案：** 短锁生成/验证探测消息，网络 I/O 在锁外执行；必要时派生专用探测上下文，仍绑定已认证会话；停止时取消任务并释放连接。
 - **验收：** relay 正常而候选黑洞、慢响应、半包时，测锁持有时间、输入及画面 p95/p99；不能出现由探测锁造成的秒级停顿，探测失败正常回退。
 
+- [x] **已实现并自动验证（`fix(DL2-011): release shared crypto lock during direct probes`）：** transport增加shared探测接口，原有独占接口复用同一状态机；seal/open短锁，连接/开流/读写无锁；Windows出入站均切换，出站任务由JoinSet随peer代数退出取消。
+- **验证：** `test -p desklink-transport --lib direct_probe::tests --locked` 8通过；新回环在已建TLS但未响应探测时100ms内仍取得crypto锁并成功加解密Control；入站无流时30ms取消后锁可取得。`test -p desklink-windows --lib direct_video_tests --locked` 2通过（经scripts/run-windows-cargo.py）。
+- [ ] **仍待双机测量：** 黑洞、慢响应、半包期间的输入/画面p95/p99和锁持有分布。原实现有阶段超时；入站原select可取消，此修复不把它描述为无限死锁。
+
 ### DL2-012 · P1 · 编码器重配与显示切换不能阻塞输入消费
 
 - [ ] 将慢控制编排与输入快路径分开。

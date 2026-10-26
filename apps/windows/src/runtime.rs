@@ -1991,11 +1991,12 @@ fn capture_encode_loop(
                 }
                 // DXGI reports only changes. Recover a decoder using a fresh
                 // owned snapshot, without copying every normal captured frame.
-                if static_recovery.snapshot_due(
-                    force_keyframe.load(Ordering::Acquire),
-                    Instant::now(),
-                ) {
-                    capture.snapshot_frame().map_err(HostRuntimeError::Capture)?
+                if static_recovery
+                    .snapshot_due(force_keyframe.load(Ordering::Acquire), Instant::now())
+                {
+                    capture
+                        .snapshot_frame()
+                        .map_err(HostRuntimeError::Capture)?
                 } else {
                     continue;
                 }
@@ -2095,9 +2096,9 @@ struct StaticKeyframeRecovery {
 impl StaticKeyframeRecovery {
     fn snapshot_due(&mut self, requested: bool, now: Instant) -> bool {
         if !requested
-            || self.last_snapshot.is_some_and(|last| {
-                now.saturating_duration_since(last) < STATIC_KEYFRAME_INTERVAL
-            })
+            || self
+                .last_snapshot
+                .is_some_and(|last| now.saturating_duration_since(last) < STATIC_KEYFRAME_INTERVAL)
         {
             return false;
         }
@@ -2555,8 +2556,10 @@ async fn receive_input_and_control(
     let mut policy = HostInboundPolicy::new(stream_id);
     let mut video_quality = AdaptiveVideoQuality::new();
     let direct_probe_slots = Arc::new(Semaphore::new(DIRECT_PROBE_TASK_CAPACITY));
+    let mut direct_probes = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            _ = direct_probes.join_next(), if !direct_probes.is_empty() => {}
             direct = accept_host_direct_connection(direct_session.clone(), secure.clone()) => {
                 if let Some(connection) = direct {
                     *direct_connection.lock().await = Some(connection);
@@ -2677,19 +2680,18 @@ async fn receive_input_and_control(
                                 .clone()
                                 .try_acquire_owned()
                             {
-                                tokio::spawn(async move {
+                                // JoinSet aborts pending probes when this peer
+                                // generation exits; no task can publish an old path.
+                                direct_probes.spawn(async move {
                                     let _permit = permit;
-                                    let result = {
-                                        let mut secure = secure_for_probe.lock().await;
-                                        endpoint
-                                            .connect(
-                                                &candidate_for_probe,
-                                                &expected_binding,
-                                                &mut secure,
-                                                now_unix_s(),
-                                            )
-                                            .await
-                                    };
+                                    let result = endpoint
+                                        .connect_shared(
+                                            &candidate_for_probe,
+                                            &expected_binding,
+                                            &secure_for_probe,
+                                            now_unix_s(),
+                                        )
+                                        .await;
                                     if let Ok((connection, _)) = result {
                                         *direct_connection_for_probe.lock().await =
                                             Some(Arc::new(connection));
@@ -2768,18 +2770,15 @@ async fn accept_host_direct_connection(
         let Ok(connection) = incoming else {
             continue;
         };
-        let accepted = {
-            let mut secure = secure.lock().await;
-            endpoint
-                .accept_probe_connection(
-                    connection,
-                    expected_candidate_id,
-                    &expected_binding,
-                    &mut secure,
-                    now_unix_s(),
-                )
-                .await
-        };
+        let accepted = endpoint
+            .accept_probe_connection_shared(
+                connection,
+                expected_candidate_id,
+                &expected_binding,
+                &secure,
+                now_unix_s(),
+            )
+            .await;
         if let Ok((connection, _)) = accepted {
             return Some(Arc::new(connection));
         }
