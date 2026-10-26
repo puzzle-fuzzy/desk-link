@@ -1,15 +1,16 @@
 # DeskLink 当前架构契约
 
-更新日期：2026-08-13
+更新日期：2026-10-26
 状态：当前实现与发布边界
 
 本文是 DeskLink 当前版本的产品、架构和发布验收契约。实现细节以当前源码、测试和[Windows 发布运行手册](windows-release-runbook.md)为准；[早期详细设计](Windows_macOS_iOS_个人远程桌面软件详细设计与开发文档.md)保留为设计输入和历史决策记录，不再单独定义当前版本的验收范围。
 
 ## 1. 产品边界
 
-- Windows 10/11 x64 是当前唯一正式发布目标；当前候选版本为 `0.1.91`，应用协议版本为 `12`。
+- Windows 10/11 x64 是当前唯一正式发布目标；本次基线为 `0.1.93` 公开测试构建、业务协议 `12`。应用/协议/工具链以 `python scripts/verify-windows-release.py --versions-only` 读取；[能力与证据矩阵](current-capabilities.md)保留基线身份。产品分支的协议 13 独立契约尚未集成到该 main 基线。
 - Windows 支持不登录账号的本地模式。可选账号只用于邮箱验证、账号会话和安装实例可见性，不替代设备配对、主机批准或端到端加密认证。
 - macOS Apple Silicon 同时保留 controller/host 开发与验收能力；iOS 16+ 只作为 controller，不对外宣称能托管或控制 iOS 系统。
+- 用户已确认 Windows→Windows、macOS→Windows 基础远控良好。Mac 的 IME、音频、剪贴板、文件、多屏、特殊恢复与真实权限分别核验；ScreenCaptureKit/VideoToolbox host 已有实现，不能写成未来空白计划，也不能用已有 Rust API 代替 Apple UI/桥接闭环。
 - relay 只负责会话匹配和转发业务密文；它不能读取远程桌面、键鼠、剪贴板或文件内容。
 - DirectLan 是有认证、短生命周期、会话绑定的视频数据面优化，只传视频，失败时必须无感回退到 relay，不能结束控制会话。
 
@@ -19,7 +20,7 @@
 
 | 平台 | 角色 | 当前职责 | 发布状态 |
 | --- | --- | --- | --- |
-| Windows | controller/host | 正式远程连接、屏幕采集与编码、输入注入、剪贴板/文件、批准和本地诊断 | `0.1.91` 候选版 |
+| Windows | controller/host | 远程连接、屏幕采集与编码、输入注入、剪贴板/文件、批准和本地诊断 | `0.1.93` 公开测试版；正式签名/发布独立验收 |
 | macOS Apple Silicon | controller/host | ScreenCaptureKit、VideoToolbox、输入和批准桥接 | 独立开发与真实权限验收 |
 | iOS 16+ | controller | 连接、批准状态、视频解码和触控输入模型 | 独立开发与真实设备验收 |
 | relay | 中继 | 配对后的会话匹配和密文转发 | 已有运行探针；HA 仍需独立建设 |
@@ -69,8 +70,8 @@ Rust 共享层拥有协议、设备身份、配对邀请、Noise 会话、业务
 
 ## 6. 发布门禁
 
-自动化门禁包括 Rust format/Clippy/workspace tests、Windows UI test/build、发布版本与清单哈希、安装器负载校验、Apple 构建/测试和 managed relay 双向探针。它们证明代码和受控环境满足约束，但不能替代真实设备验收。
+本地验证统一使用 `scripts/verify.py` 的 fast/integration/native/perf，覆盖 Rust、三个 Bun 项目和 Python；工具、源码、命令和 skipped 语义见[本地验证说明](local-verification.md)。Windows 发布另有版本/清单哈希与安装器负载门禁；Apple 构建/测试及 managed relay 双向探针是独立显式入口，不因本地通过而视为已执行。它们均不能替代真实设备验收。
 
-`0.1.91` 只有在以下条件全部具备时才能称为正式 Windows 发布：干净且可复现的源代码 commit、已验证并签名的安装器、两台真实 Windows 设备上的配对/批准/视频/输入/剪贴板/文件/断线恢复与睡眠唤醒记录、长时间运行结果，以及对应的回滚证据。缺少签名、真实设备记录或 managed diagnostics 报告时，状态只能写作 candidate，不创建正式 release tag。
+当前候选只有在以下条件全部具备时才能称为正式 Windows 发布：干净且可复现的源代码 commit、已验证并签名的安装器、两台真实 Windows 设备上的配对/批准/视频/输入/剪贴板/文件/断线恢复与睡眠唤醒记录、长时间运行结果，以及对应的回滚证据。缺少签名、真实设备记录或 managed diagnostics 报告时，状态只能写作公开测试/candidate，不创建正式 release tag；这些门禁缺项不否定用户已确认的基础远控路径。
 
 relay 探针通过只说明当前 relay 能够工作；account DNS、HTTPS、容器、数据库、邮箱和 smoke test 必须按独立服务清单另行验证。

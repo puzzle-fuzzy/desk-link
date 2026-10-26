@@ -399,11 +399,13 @@
 
 ### DL2-042 · P2 · 统一当前能力、版本与阶段记录
 
-- [ ] 更新产品能力矩阵和当前架构契约，明确用户确认、源码能力与本次验证的边界。
+- [x] 更新产品能力矩阵和当前架构契约，明确用户确认、源码能力与本次验证的边界。
 - **证据 / 类型：文档缺陷。** `docs/current-architecture-contract.md:10,22,74` 仍以 0.1.91 为当前候选；package/README 已为 0.1.93。原 TODO 把 macOS VideoToolbox 当未来项，但 `apps/macos/Sources/DeskLinkApp/Capture/MacH264Encoder.swift` 已有实现；原“下一阶段”还停留在 Windows 首发冻结。
 - **方案：** 以 Windows→Windows、macOS→Windows 为核心矩阵，逐项列输入/IME/音频/剪贴板/文件/多屏/权限/恢复；被控 Mac 和 iOS 单列。版本由 manifest/配置读取，历史发布验收与新阶段开发任务分离。
 - **验收：** README、PRODUCT、DESIGN、架构契约及验证脚本的能力描述一致；用户确认的正常控制不再被标为未实现，尚未接通的 Mac 功能也不能因 Rust 方法存在而打勾；旧检查记录保留日期和原始范围。
 - **体验约束：** 维持连接/共享两主入口、原生平台习惯和清楚的下一步；本次不把既有视觉取舍、没有装饰或旧阶段未签名一概判成远控功能缺陷。
+- **完成（`docs(DL2-042): align current capabilities and manifest version evidence`）：** 新增 `docs/current-capabilities.md`，以 main `a905b88` / 工程切片 `44a2a99` 为基线，逐方向列基础控制、IME、音频、剪贴板、文件、多屏、权限和恢复；同步 README、PRODUCT、DESIGN、架构契约，保留历史记录日期。明确用户已确认两条基础远控、Mac VideoToolbox 已实现、未接通 Apple UI 不能因底层方法存在而勾选；其他分支只列固定提交证据，035 三笔链和 009 协议 13 契约不冒充已合入 main/完整反馈功能。
+- **实际验证：** 只读 `python scripts/verify-windows-release.py --versions-only` 输出 manifest 的 0.1.93 / 协议 12 / Bun 1.3.14 / Rust 1.97.1；5 项新增元数据/版本漂移回归通过，空 PATH 的真实 CLI 不调用构建/原生准备，文档版本表与 README 动态对照 manifest。统一入口 `--task python-tests --report dist/verify/dl2-042-python.json` 全套 132 项通过；6 份相关文档的本地链接全部可解析，`git diff --check` 通过。源码验证为 `44a2a99` 加本切片（dirty=true）；本次未新增真机、发布或性能结论。
 
 ## 8. 扩展角色
 
