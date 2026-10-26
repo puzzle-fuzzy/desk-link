@@ -813,18 +813,15 @@ impl ControllerRuntime {
                     let Ok(connection) = incoming else {
                         continue;
                     };
-                    let accepted = {
-                        let mut secure = self.secure.lock().await;
-                        endpoint
-                            .accept_probe_connection(
+                    let accepted = endpoint
+                            .accept_probe_connection_shared(
                                 connection,
                                 expected_candidate_id,
                                 &expected_binding,
-                                &mut secure,
+                                &self.secure,
                                 now_unix_s(),
                             )
-                            .await
-                    };
+                            .await;
                     if let Ok((connection, result)) = accepted {
                         self.direct_connection = Some(Arc::new(connection));
                         let actions = self.video_path.apply(DirectVideoPathEvent::ProbeSucceeded {
@@ -977,13 +974,12 @@ async fn connect_or_accept_direct(
         let Ok(connection) = incoming else {
             continue;
         };
-        let mut secure = secure.lock().await;
         match endpoint
-            .accept_probe_connection(
+            .accept_probe_connection_shared(
                 connection,
                 own_candidate_id,
                 &binding,
-                &mut secure,
+                &secure,
                 now_unix_s(),
             )
             .await
@@ -993,9 +989,8 @@ async fn connect_or_accept_direct(
         }
     }
 
-    let mut secure = secure.lock().await;
     endpoint
-        .connect(&candidate, &binding, &mut secure, now_unix_s())
+        .connect_shared(&candidate, &binding, &secure, now_unix_s())
         .await
         .map_err(|_| ())
 }

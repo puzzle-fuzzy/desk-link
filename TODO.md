@@ -301,6 +301,8 @@
 
 - [x] 契约同步补充：复用产品组协议 13 独立提交 `9979c6424cf99f704feb212c7700833fce466dae`（本分支 cherry-pick `da44ff2`），生成 C/Swift 版本常量并对齐光标 fixture；修正生成 C uint32_t 的 Swift 参数类型、显式测试 C 模块依赖；已知 Host Transfer 不再落入终态错误。Python FFI 6 + 光标 6 合同、Rust 光标 fixture/InputState/版本边界 5 项通过。主题 `fix(DL2-025): align generated Swift and protocol 13 contracts`。
 
+- [x] FFI 直连发送与入站探测改用已提交共享锁接口，网络 await 不再持加密锁。复用媒体组 `3277c2a41af0ac923e1daa1c5cab5d952b355b9b`，本分支依赖提交 `3b4923f`（排除与基线无关的 DL2-010 纯格式冲突片段）。Rust FFI 全套 48、transport shared 探测 2 项通过，FFI all-targets Clippy `-D warnings` 通过；Python 全部 155 项通过。主题 `fix(DL2-025): reuse cancellable shared-crypto direct probes`。
+
 ### DL2-026 · P1 · 补齐 macOS → Windows 的会话功能闭环
 
 - [ ] 将已有底层功能真正接到 AppleCore 与 macOS 会话界面。

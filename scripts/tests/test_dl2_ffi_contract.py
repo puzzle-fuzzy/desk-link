@@ -45,6 +45,13 @@ class FFIContractTests(unittest.TestCase):
         self.assertIn("case DESKLINK_HOST_EVENT_TRANSFER: .transfer", host)
         self.assertIn("default: .unknown", host)
 
+    def test_ffi_direct_probes_never_use_the_exclusive_crypto_api(self):
+        controller = (ROOT / "crates/desklink-ffi/src/controller.rs").read_text(encoding="utf-8")
+        production = controller.split("#[cfg(test)]", 1)[0]
+        self.assertNotIn(".accept_probe_connection(", production)
+        self.assertIn(".accept_probe_connection_shared(", production)
+        self.assertIn(".connect_shared(&candidate, &binding, &secure, now_unix_s())", production)
+
 
 if __name__ == "__main__":
     unittest.main()
