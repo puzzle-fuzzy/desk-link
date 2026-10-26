@@ -552,4 +552,233 @@ mod tests {
             "cancelled create must not announce readiness or progress"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_create_reports_only_the_failure_even_with_buffered_write_and_finish() {
+        let (events, mut receive) = mpsc::channel(INCOMING_EVENT_CAPACITY);
+        let pipeline = IncomingFilePipeline::spawn::<ControlledFile>(
+            [5; 16],
+            21,
+            std::future::ready(Err(TransferResult::Busy)),
+            events,
+        );
+        // These commands can race a native create. They must not manufacture
+        // readiness, progress or completion after the real worker rejects it.
+        pipeline.write_chunk(0, vec![1]).unwrap();
+        pipeline.finish([9; 32]).unwrap();
+        let rejected = tokio::time::timeout(Duration::from_secs(1), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.ticket, 21);
+        assert!(matches!(
+            rejected.kind,
+            IncomingFileEventKind::Failed(TransferResult::Busy)
+        ));
+        assert!(receive.recv().await.is_none());
+        assert!(!pipeline.can_receive());
+    }
+
+    struct ExclusiveState {
+        writer: Arc<tokio::sync::Semaphore>,
+        cleanup_gate: Arc<tokio::sync::Semaphore>,
+        write_gate: Arc<tokio::sync::Semaphore>,
+        write_started: AtomicBool,
+        cleanup_started: AtomicBool,
+        active_writers: std::sync::atomic::AtomicUsize,
+        max_writers: std::sync::atomic::AtomicUsize,
+        preserved: std::sync::atomic::AtomicUsize,
+        deleted: std::sync::atomic::AtomicUsize,
+        bytes: Mutex<Vec<u8>>,
+    }
+
+    impl Default for ExclusiveState {
+        fn default() -> Self {
+            Self {
+                writer: Arc::new(tokio::sync::Semaphore::new(1)),
+                cleanup_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                write_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                write_started: AtomicBool::new(false),
+                cleanup_started: AtomicBool::new(false),
+                active_writers: std::sync::atomic::AtomicUsize::new(0),
+                max_writers: std::sync::atomic::AtomicUsize::new(0),
+                preserved: std::sync::atomic::AtomicUsize::new(0),
+                deleted: std::sync::atomic::AtomicUsize::new(0),
+                bytes: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    // Model the media worker's RAII boundary: dropping the async handle starts
+    // cleanup, while the simulated disk worker retains its writer permit until
+    // the blocked operation and preserve/delete work have actually returned.
+    // Physical path/Windows sharing behavior is tested in transfer.rs.
+    struct ExclusiveFile {
+        state: Arc<ExclusiveState>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        cancelled: bool,
+        finished: bool,
+    }
+
+    impl ExclusiveFile {
+        fn create(state: Arc<ExclusiveState>) -> Result<Self, TransferResult> {
+            let permit = state
+                .writer
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| TransferResult::Busy)?;
+            let active = state.active_writers.fetch_add(1, Ordering::AcqRel) + 1;
+            state.max_writers.fetch_max(active, Ordering::AcqRel);
+            Ok(Self {
+                state,
+                permit: Some(permit),
+                cancelled: false,
+                finished: false,
+            })
+        }
+    }
+
+    impl Drop for ExclusiveFile {
+        fn drop(&mut self) {
+            let permit = self.permit.take().unwrap();
+            if self.finished {
+                self.state.active_writers.fetch_sub(1, Ordering::AcqRel);
+                drop(permit);
+                return;
+            }
+            let state = self.state.clone();
+            let cancelled = self.cancelled;
+            tokio::spawn(async move {
+                state.cleanup_started.store(true, Ordering::Release);
+                state.cleanup_gate.acquire().await.unwrap().forget();
+                if cancelled {
+                    state.bytes.lock().unwrap().clear();
+                    state.deleted.fetch_add(1, Ordering::AcqRel);
+                } else {
+                    state.preserved.fetch_add(1, Ordering::AcqRel);
+                }
+                state.active_writers.fetch_sub(1, Ordering::AcqRel);
+                drop(permit);
+            });
+        }
+    }
+
+    impl ReceiveFile for ExclusiveFile {
+        fn resume_offset(&self) -> u64 {
+            self.state.bytes.lock().unwrap().len() as u64
+        }
+        fn resume_prefix_hash(&self) -> Option<[u8; 32]> {
+            None
+        }
+        async fn write_chunk(&mut self, offset: u64, bytes: Vec<u8>) -> Result<(), TransferResult> {
+            self.state.write_started.store(true, Ordering::Release);
+            self.state.write_gate.acquire().await.unwrap().forget();
+            let mut staged = self.state.bytes.lock().unwrap();
+            if offset != staged.len() as u64 {
+                return Err(TransferResult::InvalidData);
+            }
+            staged.extend_from_slice(&bytes);
+            Ok(())
+        }
+        async fn finish(mut self, _: [u8; 32]) -> Result<PathBuf, TransferResult> {
+            self.finished = true;
+            Ok(PathBuf::from("exclusive-synthetic.bin"))
+        }
+        fn cancel(mut self) {
+            self.cancelled = true;
+        }
+    }
+
+    async fn retry_waits_for_cleanup(cancel: bool) {
+        let state = Arc::new(ExclusiveState {
+            writer: Arc::new(tokio::sync::Semaphore::new(1)),
+            cleanup_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            write_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            ..Default::default()
+        });
+        let (events, mut receive) = mpsc::channel(INCOMING_EVENT_CAPACITY);
+        let create = |state| async move { ExclusiveFile::create(state) };
+        let original =
+            IncomingFilePipeline::spawn([5; 16], 31, create(state.clone()), events.clone());
+        assert!(matches!(
+            receive.recv().await.unwrap().kind,
+            IncomingFileEventKind::Opened { .. }
+        ));
+        original.write_chunk(0, b"old".to_vec()).unwrap();
+        until_true(&state.write_started).await;
+        if cancel {
+            original.cancel();
+        } else {
+            drop(original);
+        }
+        until_true(&state.cleanup_started).await;
+        assert_eq!(state.active_writers.load(Ordering::Acquire), 1);
+        assert_eq!(state.writer.available_permits(), 0);
+
+        let rejected =
+            IncomingFilePipeline::spawn([5; 16], 32, create(state.clone()), events.clone());
+        let busy = receive.recv().await.unwrap();
+        assert_eq!(busy.ticket, 32);
+        assert!(matches!(
+            busy.kind,
+            IncomingFileEventKind::Failed(TransferResult::Busy)
+        ));
+        assert!(
+            receive.try_recv().is_err(),
+            "Busy must not publish Opened/progress/completion"
+        );
+        assert!(state.bytes.lock().unwrap().is_empty());
+        assert_eq!(state.max_writers.load(Ordering::Acquire), 1);
+        assert!(!rejected.can_receive());
+
+        state.cleanup_gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.writer.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.preserved.load(Ordering::Acquire),
+            usize::from(!cancel)
+        );
+        assert_eq!(state.deleted.load(Ordering::Acquire), usize::from(cancel));
+        let retried = IncomingFilePipeline::spawn([5; 16], 33, create(state.clone()), events);
+        let opened = receive.recv().await.unwrap();
+        assert_eq!(opened.ticket, 33);
+        assert!(matches!(
+            opened.kind,
+            IncomingFileEventKind::Opened { offset: 0, .. }
+        ));
+        retried.write_chunk(0, b"new".to_vec()).unwrap();
+        state.write_gate.add_permits(1);
+        let written = receive.recv().await.unwrap();
+        assert_eq!(written.ticket, 33);
+        assert!(matches!(
+            written.kind,
+            IncomingFileEventKind::Written { transferred: 3 }
+        ));
+        retried.finish([9; 32]).unwrap();
+        let finished = receive.recv().await.unwrap();
+        assert_eq!(finished.ticket, 33);
+        assert!(matches!(
+            finished.kind,
+            IncomingFileEventKind::Finished { .. }
+        ));
+        assert!(receive.try_recv().is_err());
+        assert_eq!(*state.bytes.lock().unwrap(), b"new");
+        assert_eq!(state.max_writers.load(Ordering::Acquire), 1);
+        assert_eq!(state.active_writers.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_retry_is_busy_until_the_old_worker_finishes_preserving() {
+        retry_waits_for_cleanup(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_worker_cleanup_cannot_overlap_or_delete_the_retried_download() {
+        retry_waits_for_cleanup(true).await;
+    }
 }
