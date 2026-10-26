@@ -52,6 +52,21 @@ Windows 的 persistent 会话、临时邀请、host 服务和单次 controller a
 
 后续应先得到可重复的集成 revision，按协议/错误合同→取消与资源生命周期→平台 adapter→UI ownership 逐切片迁移；每个切片单独提交并保留关联 DL2 编号。禁止以整份分支 TODO 覆盖其他进度。
 
+### 追加所有权：输入 epoch 与探测 lane
+
+2026-10-26 的协调决定：**Apple/FFI 组是严格输入上下文的唯一共享契约 owner**，在尚未发布的协议 13 开发线追加 `VideoConfig.input_epoch` 与 `InputEnvelope { stream_id, input_epoch }`，同步 codec/ABI/Apple 声明；媒体 host 与 Windows 产品组随后分别接线。本文核对时尚无该契约独立提交，本工程源码仍无这些字段，不能自行分配另一套字段或版本。已有媒体拓扑协调切片 `631cb3258d1cc3b53977611a0603f17d685b850c` 不等于端到端绑定完成。
+
+| 唯一 owner | 必须交付的边界 | 不能替代它的近似 |
+| --- | --- | --- |
+| Apple/FFI：共享 wire/ABI | 视频配置和每个输入/远端 release 都带同一明确 stream/epoch 上下文；跨层传递保留该值 | sequence、wallclock、仅 config_version、源码中出现字段名 |
+| 媒体：host 注入/映射 | 原子清键、推进 epoch 与映射发布；在同一映射锁语义内核对当前 stream/epoch 再注入，避免检查到使用间切屏；拒绝旧输入和旧 release | 仅稳定显示器 ID、本机拓扑代数、切换期间短暂停输入，或无条件保留旧 release |
+| 产品：实际呈现与入队 | 匹配新上下文的首帧实际呈现后再启用坐标输入；事件入队即固定 context，不能出队时贴成新 epoch | 仅收到 VideoConfig、解码完成但未呈现、把排队旧事件重新标成当前上下文 |
+| runtime：取消与本机收回 | 用户取消/Host 本地收回独立于远端输入上下文和普通队列容量生效 | 用输入 epoch 过期或输入队列满阻止取消/本机清键 |
+
+合同、host 和呈现/入队三段尚未全部接通并在同一 revision 通过前，DL2-013 的严格绑定保持 `[ ]`；特别验证新 epoch 持键后收到旧 key-up/ReleaseAll 不影响新持键，而当前用户取消仍能清理退出。工程组只维护这些门禁，不提前重写活跃的 runtime/controller/FFI。
+
+DL2-011 的独立 lane 已有提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`，经源码核对仅追加 `SecureLane::DirectProbe = 8` 并同步 COUNT/ALL，所有 Exclusive/Shared probe 的 seal/open 迁移；现有 lane 0～7、JOIN 版本与 QUIC 事件槽数量保持原义。慢 probe 必须不被视频重放窗推进挤出，同时继续拒绝重放和跨 lane 解密；复用该独立提交及所需 shared-probe 前置，不另造探测加密路径。分支提交和其报告的 79 项测试不是本工程接入或 main 整合证明，接入验证须另记源码身份；双机/候选黑洞性能条件继续未完成。
+
 合并后用[统一入口](local-verification.md)验证共享 unit/contract、transport/FFI localhost、媒体恢复和平台 native；特别补背压中停止、迟到回调/代数、持续输入受限与恢复、普通 shell 更新存活、慢盘/网络黑洞。Apple Swift/Xcode、真实权限和设备缺条件时明确 skipped；代码移动或模块行数下降不能作为性能收益。
 
 本切片只完成现状核对和合同整理。先前工程 `verified-local.json` 已验证基线的 Rust/三个 Bun/Python，`dl2-042-python.json` 为文档元数据回归；二者都不是各组整合后的回归。巨型模块拆分、生产策略唯一所有者、Windows/Apple 同语义和 DL2-014 前后比较继续保持未完成。

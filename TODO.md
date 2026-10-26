@@ -387,6 +387,7 @@
 - [x] **不冲突的公共合同整理（`docs(DL2-040): define boundary ownership and integration gates`）：** 新增 `docs/second-stage-boundary-contracts.md`，经 CodeGraph 查询/调用影响和本 worktree 源码逐项确认 SessionMachine、ReconnectSchedule、三处 transport 分类、两套 controller ConnectFailure、同步 join 和 ABI/Swift 映射。保留 persistent/临时邀请、host 服务/单次 controller 的语义差异，明确命令接纳/完成/终态、取消/资源/callback 所有权和稳定错误类别，记录已提交跨组接口与固定 SHA。
 - **本切片验证：** 文档本地链接、10 处相关源码路径和 12 个完整提交身份可解析，独立只读复核无阻塞事实错误，`git diff --check` 通过；未修改 crates/apps/server 业务源码。既有 Windows 全栈验证保留原始源码身份，不冒称各组集成验证或新增性能结果。
 - [ ] **仍依赖集成：** 009 协议13、Apple 003/004/025、网络024、媒体011/012/021与产品002等提交须在统一 revision 收口，再逐切片消除重复 owner；DL2-014 同硬件前后比较、Swift/Xcode、真实资源/取消/权限场景仍缺。当前只完成整理，主项继续未完成，不在本分支提前重写 controller/runtime/FFI。
+- [x] **追加协调合同（`docs(DL2-040): record input epoch ownership and probe lane gates`）：** 明确 Apple/FFI 单一 owner 发布 `VideoConfig.input_epoch` / `InputEnvelope{stream_id,input_epoch}`，媒体 host 原子清键/推进/映射锁校验，产品实际首帧呈现后启用并在入队固定 context；旧输入/旧 release 必须隔离，取消与本机收回独立有效，不以 seq/wallclock/config_version 替代。013 严格绑定仍未完成。已核对媒体独立 probe lane 提交 `0836a8b311a858bf12f0d0b4427961c35f5986a7`；合同、调用方及接入验证须分别交付。文档链接、固定提交身份与 diff 检查通过，未改活跃模块。
 
 ### DL2-041 · P1 · 验证入口覆盖全栈与真实跨层边界
 
