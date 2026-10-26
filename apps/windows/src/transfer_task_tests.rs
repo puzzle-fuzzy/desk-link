@@ -20,6 +20,758 @@ use tokio::time::{Instant, sleep, timeout};
 mod fixture;
 use fixture::*;
 
+async fn retry_fixture_task(
+    handle: &crate::transfer_task::FileTaskHandle,
+    task: desklink_protocol::TransferId,
+    item: Option<u64>,
+) {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match handle.retry(task, item) {
+                Ok(()) => break,
+                Err(TransferResult::Busy) => sleep(Duration::from_millis(2)).await,
+                Err(error) => panic!("fixture retry rejected: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn fixture_task_cache(
+    fixture: &Fixture,
+    a: bool,
+    task: desklink_protocol::TransferId,
+) -> std::path::PathBuf {
+    let options = fixture.options(a, true);
+    options
+        .cache_root
+        .join(options.peer_key)
+        .join(crate::transfer_task::id_text(task))
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn scan_sharing_failure_persists_partial_then_restart_retry_preserves_success_identity_and_bytes()
+ {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let folder = fixture.path("scan-file-partial");
+    fs::create_dir(&folder).unwrap();
+    let blocked = folder.join("blocked.bin");
+    let recovery_bytes = sample(2);
+    fs::write(&blocked, &recovery_bytes).unwrap();
+    fs::write(folder.join("good.bin"), b"successful sibling").unwrap();
+    let owner = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&blocked)
+        .unwrap();
+    let task = [67; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (1, 1));
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    let good_id = partial
+        .items
+        .iter()
+        .find(|item| item.path == "good.bin")
+        .unwrap()
+        .id
+        .clone();
+    let failed_id = partial
+        .items
+        .iter()
+        .find(|item| item.path == "blocked.bin")
+        .unwrap()
+        .id
+        .parse()
+        .unwrap();
+    let manifest =
+        fs::read_to_string(fixture_task_cache(&fixture, true, task).join("manifest.jsonl"))
+            .unwrap();
+    let records = manifest
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert!(records[0].get("source_path").is_some());
+    assert_eq!(records[1]["scan_failure"], true);
+    // Skipped scan failures do not reserve any destination identity or ledger.
+    assert!(
+        !fixture_task_cache(&fixture, false, task)
+            .join(format!("{failed_id}.received.json"))
+            .exists()
+    );
+    assert!(!fixture.received(false, task, "blocked.bin").exists());
+    assert_eq!(
+        peers.stats.lock().unwrap().transferred_bytes,
+        b"successful sibling".len() as u64
+    );
+    peers.close().await;
+    drop(owner);
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    retry_fixture_task(&peers.a, task, Some(failed_id)).await;
+    wait_for_offer(&peers, 0).await;
+    let complete = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(complete.state, "completed", "{complete:?}");
+    assert_eq!((complete.completed_items, complete.failed_items), (2, 0));
+    assert_eq!(
+        complete
+            .items
+            .iter()
+            .find(|item| item.path == "good.bin")
+            .unwrap()
+            .id,
+        good_id
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        peers.stats.lock().unwrap().transferred_bytes,
+        recovery_bytes.len() as u64
+    );
+    assert_eq!(
+        fs::read(fixture.received(false, task, "blocked.bin")).unwrap(),
+        recovery_bytes
+    );
+    assert_eq!(fs::read(blocked).unwrap(), recovery_bytes);
+    peers.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn scan_denied_subtree_recovers_after_receiver_restart_without_resending_its_sibling() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    let fixture = Fixture::new();
+    let folder = fixture.path("scan-subtree-partial");
+    let blocked = folder.join("blocked");
+    fs::create_dir_all(blocked.join("empty")).unwrap();
+    fs::write(blocked.join("child.bin"), b"recovered subtree content").unwrap();
+    fs::write(folder.join("good.bin"), b"retained sibling").unwrap();
+    let owner = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(&blocked)
+        .unwrap();
+    let task = [68; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (1, 1));
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    let good_id = partial
+        .items
+        .iter()
+        .find(|item| item.path == "good.bin")
+        .unwrap()
+        .id
+        .clone();
+    peers.close().await;
+    drop(owner);
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    retry_fixture_task(&peers.b, task, None).await;
+    wait_for_offer(&peers, 0).await;
+    let complete = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(complete.state, "completed", "{complete:?}");
+    assert_eq!(
+        complete
+            .items
+            .iter()
+            .find(|item| item.path == "good.bin")
+            .unwrap()
+            .id,
+        good_id
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(fixture.source_resume_consents(), 1);
+    assert_eq!(
+        peers.stats.lock().unwrap().transferred_bytes,
+        b"recovered subtree content".len() as u64
+    );
+    assert!(fixture.received(false, task, "blocked/empty").is_dir());
+    assert_eq!(
+        fs::read(fixture.received(false, task, "blocked/child.bin")).unwrap(),
+        b"recovered subtree content"
+    );
+    peers.close().await;
+}
+
+#[tokio::test]
+async fn scan_entry_budget_keeps_valid_prefix_and_retry_resolves_marker_at_exact_budget() {
+    let fixture = Fixture::new();
+    let folder = fixture.path("scan-budget-partial");
+    fs::create_dir(&folder).unwrap();
+    let names = ["a.bin", "b.bin", "c.bin", "d.bin"];
+    for name in names {
+        fs::write(folder.join(name), b"four").unwrap();
+    }
+    let hook: BridgeHook = Arc::new(|message| {
+        if let FileTaskMessage::Capabilities(capabilities) = message {
+            capabilities.max_entries = 3;
+        }
+    });
+    let task = [69; 16];
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, hook).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (2, 1));
+    assert_eq!(partial.scanned_items, 3);
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    let retained = partial
+        .items
+        .iter()
+        .filter(|item| item.state == "completed")
+        .map(|item| (item.path.clone(), item.id.clone()))
+        .collect::<Vec<_>>();
+    let missing = names
+        .iter()
+        .filter(|name| !retained.iter().any(|(path, _)| path == *name))
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 2);
+    fs::remove_file(folder.join(missing[0])).unwrap();
+    let before = peers.stats.lock().unwrap().transferred_bytes;
+    let offers = peers.stats.lock().unwrap().offers;
+    retry_fixture_task(&peers.a, task, None).await;
+    wait_for_offer(&peers, offers).await;
+    let complete = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(complete.state, "completed", "{complete:?}");
+    assert_eq!((complete.completed_items, complete.failed_items), (3, 0));
+    for (path, id) in retained {
+        assert_eq!(
+            complete
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .unwrap()
+                .id,
+            id
+        );
+    }
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes - before, 4);
+    assert_eq!(
+        fs::read(fixture.received(false, task, missing[1])).unwrap(),
+        b"four"
+    );
+    peers.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn tampered_scan_failure_cannot_retry_a_successful_sibling_and_become_completed() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let folder = fixture.path("scan-scope-tamper");
+    fs::create_dir(&folder).unwrap();
+    let blocked = folder.join("blocked.bin");
+    fs::write(&blocked, b"still needs explicit recovery").unwrap();
+    fs::write(folder.join("good.bin"), b"already saved").unwrap();
+    let owner = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&blocked)
+        .unwrap();
+    let task = [70; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial");
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    peers.close().await;
+    drop(owner);
+    let manifest_path = fixture_task_cache(&fixture, true, task).join("manifest.jsonl");
+    let mut records = fs::read_to_string(&manifest_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let failure = records
+        .iter_mut()
+        .find(|record| record.get("scan_failure").is_some())
+        .unwrap();
+    failure["failure"]["retry_relative_path"] = "good.bin".into();
+    let encoded = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap() + "\n")
+        .collect::<String>();
+    fs::write(&manifest_path, encoded.as_bytes()).unwrap();
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    retry_fixture_task(&peers.a, task, None).await;
+    wait_for_offer(&peers, 0).await;
+    let failed = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(failed.state, "failed", "{failed:?}");
+    assert_eq!(
+        failed.message.as_deref(),
+        Some("内容或断点校验失败，请重试。")
+    );
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 0);
+    assert_eq!(fs::read(&manifest_path).unwrap(), encoded.as_bytes());
+    assert_eq!(
+        fs::read(fixture.received(false, task, "good.bin")).unwrap(),
+        b"already saved"
+    );
+    assert!(!fixture.received(false, task, "blocked.bin").exists());
+    peers.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn scan_junction_is_partial_and_repair_retry_never_reads_or_publishes_its_target() {
+    let fixture = Fixture::new();
+    let folder = fixture.path("scan-junction-source");
+    let outside = fixture.path("outside-authorized-source");
+    fs::create_dir(&folder).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(folder.join("good.bin"), b"safe sibling").unwrap();
+    fs::write(
+        outside.join("private.bin"),
+        b"outside canary remains unchanged",
+    )
+    .unwrap();
+    let link = folder.join("blocked");
+    let created = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&outside)
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let task = [71; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (1, 1));
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    assert!(
+        !fixture
+            .received(false, task, "blocked/private.bin")
+            .exists()
+    );
+    assert_eq!(
+        peers.stats.lock().unwrap().transferred_bytes,
+        b"safe sibling".len() as u64
+    );
+    let failed_id = partial
+        .items
+        .iter()
+        .find(|item| item.path == "blocked")
+        .unwrap()
+        .id
+        .parse()
+        .unwrap();
+    peers.close().await;
+    // Remove only our direct generated junction, then repair it as a real dir.
+    fs::remove_dir(&link).unwrap();
+    fs::create_dir(&link).unwrap();
+    fs::write(link.join("repaired.bin"), b"new explicitly retried subtree").unwrap();
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    retry_fixture_task(&peers.a, task, Some(failed_id)).await;
+    wait_for_offer(&peers, 0).await;
+    let complete = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(complete.state, "completed", "{complete:?}");
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        peers.stats.lock().unwrap().transferred_bytes,
+        b"new explicitly retried subtree".len() as u64
+    );
+    assert_eq!(
+        fs::read(fixture.received(false, task, "blocked/repaired.bin")).unwrap(),
+        b"new explicitly retried subtree"
+    );
+    assert!(
+        !fixture
+            .received(false, task, "blocked/private.bin")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(outside.join("private.bin")).unwrap(),
+        b"outside canary remains unchanged"
+    );
+    peers.close().await;
+}
+
+#[tokio::test]
+async fn replay_rejects_changed_directory_kind_including_an_empty_selected_root() {
+    let fixture = Fixture::new();
+    let folder = fixture.path("kind-replay-source");
+    fs::create_dir_all(folder.join("child")).unwrap();
+    let task = [72; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &folder, task).await;
+    assert_eq!(
+        terminal(&mut peers.a_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    peers.close().await;
+    fs::remove_dir(folder.join("child")).unwrap();
+    fs::write(folder.join("child"), b"changed kind must not be adopted").unwrap();
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    retry_fixture_task(&peers.a, task, None).await;
+    wait_for_offer(&peers, 0).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (0, 1));
+    assert_eq!(
+        partial.items.front().unwrap().message.as_deref(),
+        Some("源文件已变化，请重新选择后发送。")
+    );
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    assert!(fixture.received(false, task, "child").is_dir());
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 0);
+    peers.close().await;
+
+    let empty = fixture.path("empty-selected-root");
+    fs::create_dir(&empty).unwrap();
+    let task = [73; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &empty, task).await;
+    assert_eq!(
+        terminal(&mut peers.a_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    peers.close().await;
+    fs::remove_dir(&empty).unwrap();
+    fs::write(&empty, b"replacement root file").unwrap();
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    retry_fixture_task(&peers.a, task, None).await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if peers
+                .a_progress
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.state == "failed")
+            {
+                break;
+            }
+            peers.a_progress.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        peers
+            .a_progress
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .message
+            .as_deref(),
+        Some("源文件已变化，请重新选择后发送。")
+    );
+    assert_eq!(peers.stats.lock().unwrap().offers, 0);
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 0);
+    assert_eq!(fs::read(empty).unwrap(), b"replacement root file");
+    peers.close().await;
+}
+
+#[tokio::test]
+async fn enumeration_retry_prunes_replacement_directory_children_and_keeps_original_item_identity()
+{
+    let fixture = Fixture::new();
+    let folder = fixture.path("kind-dedupe-source");
+    fs::create_dir(&folder).unwrap();
+    let names = ["a.bin", "b.bin", "c.bin"];
+    for name in names {
+        fs::write(folder.join(name), b"four").unwrap();
+    }
+    let hook: BridgeHook = Arc::new(|message| {
+        if let FileTaskMessage::Capabilities(capabilities) = message {
+            capabilities.max_entries = 2;
+        }
+    });
+    let task = [74; 16];
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, hook.clone()).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (1, 1));
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    let original = partial
+        .items
+        .iter()
+        .find(|item| item.state == "completed")
+        .unwrap();
+    let original_path = original.path.clone();
+    let original_id = original.id.clone();
+    peers.close().await;
+    let missing = names
+        .iter()
+        .filter(|name| **name != original_path)
+        .collect::<Vec<_>>();
+    fs::remove_file(folder.join(missing[0])).unwrap();
+    fs::remove_file(folder.join(&original_path)).unwrap();
+    fs::create_dir(folder.join(&original_path)).unwrap();
+    fs::write(
+        folder.join(&original_path).join("must-not-adopt.bin"),
+        b"replacement directory child",
+    )
+    .unwrap();
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, hook).await;
+    retry_fixture_task(&peers.a, task, None).await;
+    wait_for_offer(&peers, 0).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    let original = partial
+        .items
+        .iter()
+        .find(|item| item.path == original_path)
+        .unwrap();
+    assert_eq!(original.id, original_id);
+    assert_eq!(original.state, "failed");
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    assert_eq!(
+        fs::read(fixture.received(false, task, &original_path)).unwrap(),
+        b"four"
+    );
+    let manifest =
+        fs::read_to_string(fixture_task_cache(&fixture, true, task).join("manifest.jsonl"))
+            .unwrap();
+    assert!(!manifest.contains("must-not-adopt.bin"));
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 4);
+    assert_eq!(
+        fs::read(folder.join(&original_path).join("must-not-adopt.bin")).unwrap(),
+        b"replacement directory child"
+    );
+    peers.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn completed_publication_has_a_verified_index_before_ack_and_retry_opens_without_payload_reread()
+ {
+    let fixture = Fixture::new();
+    let source = fixture.path("published-cache-source.bin");
+    let bytes = sample(3);
+    fs::write(&source, &bytes).unwrap();
+    let task = [75; 16];
+    let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
+    start(&peers.a, &source, task).await;
+    assert_eq!(
+        terminal(&mut peers.a_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    let target = fixture.received(false, task, "published-cache-source.bin");
+    let index_path = fixture_task_cache(&fixture, false, task).join("1.published.index");
+    assert!(
+        index_path.is_file(),
+        "NTFS fixture must have exported the verified proof records before completed acknowledgement"
+    );
+    let mut checked_payload = 0;
+    let index = SourceIndex::open_from_file_with_control(
+        fs::File::open(&target).unwrap(),
+        &index_path,
+        &AtomicBool::new(false),
+        |checked| checked_payload += checked,
+    )
+    .unwrap();
+    assert_eq!(index.size(), bytes.len() as u64);
+    assert_eq!(
+        checked_payload, 0,
+        "first retry index opening reread completed file payload"
+    );
+    drop(index);
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+    let offers = peers.stats.lock().unwrap().offers;
+    let before = peers.stats.lock().unwrap().transferred_bytes;
+    retry_fixture_task(&peers.a, task, None).await;
+    wait_for_offer(&peers, offers).await;
+    assert_eq!(
+        terminal(&mut peers.a_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, before);
+    assert_eq!(fs::read(target).unwrap(), bytes);
+    peers.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn receiver_empty_directory_is_pinned_during_entry_complete_and_cannot_be_replaced() {
+    let fixture = Fixture::new();
+    let folder = fixture.path("guarded-receive-source");
+    fs::create_dir_all(folder.join("empty")).unwrap();
+    let task = [76; 16];
+    let destination = fixture.received(false, task, "empty");
+    let attempted = Arc::new(AtomicBool::new(false));
+    let observed = attempted.clone();
+    let hook: BridgeHook = Arc::new(move |message| {
+        if matches!(message, FileTaskMessage::EntryComplete { task_id, item_id: 1, content_root } if *task_id == task && *content_root == [0; 32])
+        {
+            assert!(destination.is_dir());
+            assert!(
+                fs::remove_dir(&destination).is_err(),
+                "destination leaf was not pinned while awaiting completion"
+            );
+            assert!(fs::write(&destination, b"replacement must never appear").is_err());
+            observed.store(true, Ordering::Release);
+        }
+    });
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, hook).await;
+    start(&peers.a, &folder, task).await;
+    assert_eq!(
+        terminal(&mut peers.a_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert!(attempted.load(Ordering::Acquire));
+    assert!(fixture.received(false, task, "empty").is_dir());
+    assert_eq!(
+        fs::read_dir(fixture.received(false, task, "empty"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 0);
+    peers.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn overlapping_failed_file_and_scan_limit_do_not_starve_a_recovered_sibling_at_the_entry_cap()
+{
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let folder = fixture.path("overlapping-scan-failures");
+    fs::create_dir(&folder).unwrap();
+    for index in 0..5 {
+        fs::write(folder.join(format!("file-{index}.bin")), b"four").unwrap();
+    }
+    // Use this unchanged directory's observed order to guarantee that a
+    // specific failed entry precedes the later discovery-limit marker.
+    let observed = fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    let blocked = observed[1].clone();
+    let blocked_name = blocked.file_name().unwrap().to_str().unwrap().to_owned();
+    let owner = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&blocked)
+        .unwrap();
+    let cap_hook: BridgeHook = Arc::new(|message| {
+        if let FileTaskMessage::Capabilities(capabilities) = message {
+            capabilities.max_entries = 4;
+        }
+    });
+    let task = [77; 16];
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, cap_hook.clone()).await;
+    start(&peers.a, &folder, task).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!((partial.completed_items, partial.failed_items), (2, 2));
+    assert!(
+        partial
+            .items
+            .iter()
+            .any(|item| item.path == blocked_name && item.state == "failed")
+    );
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    let retained = partial
+        .items
+        .iter()
+        .filter(|item| item.state == "completed")
+        .map(|item| (item.path.clone(), item.id.clone()))
+        .collect::<Vec<_>>();
+    peers.close().await;
+    let omitted = observed
+        .iter()
+        .filter(|path| {
+            *path != &blocked
+                && !retained
+                    .iter()
+                    .any(|(name, _)| path.file_name().unwrap() == name.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(omitted.len(), 2);
+    fs::remove_file(omitted[0]).unwrap();
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, cap_hook.clone()).await;
+    retry_fixture_task(&peers.a, task, None).await;
+    wait_for_offer(&peers, 0).await;
+    let partial = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(partial.state, "partial", "{partial:?}");
+    assert_eq!(
+        (partial.completed_items, partial.failed_items),
+        (3, 1),
+        "duplicate failure scopes consumed the valid sibling's slot"
+    );
+    assert_eq!(partial.scanned_items, 4);
+    assert_eq!(terminal(&mut peers.b_progress, task).await.state, "partial");
+    for (path, id) in retained {
+        assert_eq!(
+            partial
+                .items
+                .iter()
+                .find(|item| item.path == path)
+                .unwrap()
+                .id,
+            id
+        );
+    }
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 4);
+    let failure = partial
+        .items
+        .iter()
+        .find(|item| item.state == "failed")
+        .unwrap();
+    assert_eq!(failure.path, blocked_name);
+    let failed_id = failure.id.parse().unwrap();
+    peers.close().await;
+    drop(owner);
+    let mut peers = Peers::with_hook(&fixture, true, Duration::ZERO, cap_hook).await;
+    retry_fixture_task(&peers.a, task, Some(failed_id)).await;
+    wait_for_offer(&peers, 0).await;
+    let complete = terminal(&mut peers.a_progress, task).await;
+    assert_eq!(complete.state, "completed", "{complete:?}");
+    assert_eq!((complete.completed_items, complete.failed_items), (4, 0));
+    assert_eq!(
+        terminal(&mut peers.b_progress, task).await.state,
+        "completed"
+    );
+    assert_eq!(peers.stats.lock().unwrap().transferred_bytes, 4);
+    assert_eq!(fs::read(blocked).unwrap(), b"four");
+    peers.close().await;
+}
+
 #[tokio::test]
 async fn encrypted_actors_transfer_real_file_and_directory_in_both_directions() {
     let fixture = Fixture::new();
@@ -117,17 +869,18 @@ async fn encrypted_actor_disconnect_and_recreation_resume_from_durable_ack() {
         terminal(&mut peers.b_progress, task).await.state,
         "completed"
     );
-    let stats = peers.stats.lock().unwrap();
-    let resumed = stats.resumes.iter().find(|(id, _)| *id == task).unwrap().1;
-    assert!(resumed >= u64::from(FILE_BLOCK_BYTES) * 2, "{stats:?}");
-    assert!(
-        stats
-            .blocks
-            .iter()
-            .filter(|(id, _)| *id == task)
-            .all(|(_, offset)| *offset >= resumed)
-    );
-    drop(stats);
+    {
+        let stats = peers.stats.lock().unwrap();
+        let resumed = stats.resumes.iter().find(|(id, _)| *id == task).unwrap().1;
+        assert!(resumed >= u64::from(FILE_BLOCK_BYTES) * 2, "{stats:?}");
+        assert!(
+            stats
+                .blocks
+                .iter()
+                .filter(|(id, _)| *id == task)
+                .all(|(_, offset)| *offset >= resumed)
+        );
+    }
     assert_eq!(
         fs::read(fixture.received(false, task, "restart.bin")).unwrap(),
         bytes
@@ -214,13 +967,34 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
             budget: FileTransferCapabilities::WINDOWS,
         })
         .unwrap();
-    assert!(matches!(
-        timeout(Duration::from_secs(5), service.outgoing.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        FileTaskMessage::Entry { .. }
-    ));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match service.outgoing.recv().await.unwrap() {
+                FileTaskMessage::Entry { task_id, entry } => {
+                    assert_eq!((task_id, entry.item_id), (task, 1));
+                    break;
+                }
+                FileTaskMessage::Activity {
+                    task_id,
+                    phase: desklink_protocol::FileTaskPhase::Scanning,
+                    item_id: None,
+                    completed,
+                    total: 0,
+                } => {
+                    assert_eq!(task_id, task);
+                    assert!(
+                        completed > 0
+                            && completed
+                                <= desklink_protocol::MAX_FILE_TASK_SCAN_WORK_PASSES
+                                    * FileTransferCapabilities::WINDOWS.max_entries
+                    );
+                }
+                message => panic!("unexpected source preparation response: {message:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
     service
         .handle
         .ingest(FileTaskMessage::EntryDecision {
@@ -234,7 +1008,7 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
         })
         .unwrap();
     timeout(Duration::from_secs(5), async {
-        while service.outgoing.len() < 1 {
+        while service.outgoing.is_empty() {
             sleep(Duration::from_millis(1)).await;
         }
     })
@@ -660,16 +1434,17 @@ async fn encrypted_receiver_can_request_retry_after_both_actors_are_recreated() 
         terminal(&mut peers.a_progress, task).await.state,
         "completed"
     );
-    let stats = peers.stats.lock().unwrap();
-    assert!(
-        stats
-            .resumes
-            .iter()
-            .any(|(id, offset)| *id == task && *offset >= u64::from(FILE_BLOCK_BYTES) * 2),
-        "{stats:?}"
-    );
-    assert!(stats.transferred_bytes < bytes.len() as u64);
-    drop(stats);
+    {
+        let stats = peers.stats.lock().unwrap();
+        assert!(
+            stats
+                .resumes
+                .iter()
+                .any(|(id, offset)| *id == task && *offset >= u64::from(FILE_BLOCK_BYTES) * 2),
+            "{stats:?}"
+        );
+        assert!(stats.transferred_bytes < bytes.len() as u64);
+    }
     assert_eq!(
         fs::read(fixture.received(false, task, "receiver-retry.bin")).unwrap(),
         bytes

@@ -104,7 +104,9 @@ async fn active_direct_datagrams_do_not_time_out_while_relay_cursor_arrives() {
     let mut relay_events = 0;
     while started.elapsed() < duration {
         let event =
-            match tokio::time::timeout_at(deadline, fixture.runtime.next_transport_event(true)).await {
+            match tokio::time::timeout_at(deadline, fixture.runtime.next_transport_event(true))
+                .await
+            {
                 Ok(event) => event.unwrap(),
                 Err(_) => break,
             };

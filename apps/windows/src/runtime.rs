@@ -4029,11 +4029,10 @@ async fn receive_transfer_loop_inner(
         match decode_transfer(&plaintext)? {
             TransferMessage::FileTask(message) => {
                 if let Some(service) = file_tasks.as_ref() {
-                    if service.ingest(message.clone()).is_err() {
-                        if let Some(task_id) = message.task_id() {
-                            let _ =
-                                service.action(task_id, desklink_protocol::FileTaskAction::Cancel);
-                        }
+                    if service.ingest(message.clone()).is_err()
+                        && let Some(task_id) = message.task_id()
+                    {
+                        let _ = service.action(task_id, desklink_protocol::FileTaskAction::Cancel);
                     }
                 } else if let desklink_protocol::FileTaskMessage::Offer { task_id, .. } = message {
                     send_transfer_response(

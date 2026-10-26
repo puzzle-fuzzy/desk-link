@@ -550,7 +550,7 @@ pub enum ControllerSignal {
     FileTask {
         peer_id: String,
         #[serde(flatten)]
-        progress: FileTaskProgress,
+        progress: Box<FileTaskProgress>,
     },
     FileCapabilities {
         peer_id: String,
@@ -1051,6 +1051,8 @@ struct FileTaskEndpoint {
     capabilities_negotiated: bool,
 }
 
+type FileTaskQueueAdmission = Arc<Mutex<Option<(u64, [u8; 16], OutgoingFile)>>>;
+
 #[derive(Clone)]
 pub struct ControllerManager {
     status: Arc<Mutex<ControllerRuntimeSummary>>,
@@ -1060,7 +1062,7 @@ pub struct ControllerManager {
     file_task_endpoint: Arc<Mutex<Option<FileTaskEndpoint>>>,
     next_file_task_request: Arc<AtomicU64>,
     local_file_picker_active: Arc<AtomicBool>,
-    file_task_queue_admission: Arc<Mutex<Option<(u64, [u8; 16], OutgoingFile)>>>,
+    file_task_queue_admission: FileTaskQueueAdmission,
     file_queue_persistence: Arc<Mutex<Option<Arc<QueuePersistence>>>>,
     file_queue_persistence_epoch: Arc<AtomicU64>,
     file_queue_submission_revision: Arc<AtomicU64>,
@@ -3234,7 +3236,7 @@ async fn run_controller(
                             if matches!(progress.state,"completed"|"partial"|"failed"|"cancelled") {
                                 *manager.file_task_queue_admission.lock().unwrap_or_else(|p|p.into_inner())=None;
                                 if let Some(file)=queued_task_source.take() {queued_files.push_front(file);}
-                                if progress.state!="completed" {file_queue_paused=!queued_files.is_empty();}
+                                if progress.state!="completed" {file_queue_paused = !queued_files.is_empty();}
                                 queued_task_active=None;
                                 publish_file_queue(&manager,host_device_id,&signals,&queued_files,file_queue_paused);
                             }
@@ -3243,7 +3245,7 @@ async fn run_controller(
                             let count=queued_files.len();queued_files.retain(|file|file.transfer_id!=id);
                             if queued_files.len()!=count {publish_file_queue(&manager,host_device_id,&signals,&queued_files,file_queue_paused);}
                         }
-                        let _=signals.send(ControllerSignal::FileTask {peer_id:file_peer_id.clone(),progress});
+                        let _=signals.send(ControllerSignal::FileTask {peer_id:file_peer_id.clone(),progress:Box::new(progress)});
                     } else {file_task_progress=None;}
                 }
                 command = commands.recv(), if active_input.is_none() => match command {
@@ -4394,13 +4396,12 @@ async fn run_controller(
             .file_task_queue_admission
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
-        if let Some(file) = queued_task_source.take() {
-            if !queued_files
+        if let Some(file) = queued_task_source.take()
+            && !queued_files
                 .iter()
                 .any(|f| f.transfer_id == file.transfer_id)
-            {
-                queued_files.push_front(file);
-            }
+        {
+            queued_files.push_front(file);
         }
         if queued_task_active.is_some() {
             file_queue_paused = !queued_files.is_empty();
@@ -7467,7 +7468,7 @@ async fn next_file_task_progress(
 
 struct FileTaskRegistration {
     endpoint: Arc<Mutex<Option<FileTaskEndpoint>>>,
-    admission: Arc<Mutex<Option<(u64, [u8; 16], OutgoingFile)>>>,
+    admission: FileTaskQueueAdmission,
     generation: u64,
 }
 impl Drop for FileTaskRegistration {

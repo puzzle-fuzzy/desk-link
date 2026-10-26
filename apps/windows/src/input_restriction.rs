@@ -251,12 +251,12 @@ mod tests {
     #[tokio::test]
     async fn slow_feedback_send_coalesces_latest_state_and_cancels_with_the_session() {
         let (states, receiver) = tokio::sync::watch::channel(None);
-        let (sent, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let (sent, mut observed) = tokio::sync::mpsc::channel(64);
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let mut forward = Box::pin(forward_latest_input_state(receiver, {
             let gate = gate.clone();
             move |reason| {
-                sent.send(reason).unwrap();
+                sent.try_send(reason).unwrap();
                 let gate = gate.clone();
                 async move {
                     gate.notified().await;

@@ -340,29 +340,26 @@ fn open_file_path_inner(path: &Path, write: bool, create: bool) -> Result<File, 
     Ok(file)
 }
 
-pub(crate) fn rename_path(
-    source: &Path,
+/// Publish this exact, still-owned writer object. Reopening a temporary path
+/// after its writer closes would allow a replacement object to be published.
+pub(crate) fn rename_file_path(
+    file: &File,
     destination: &Path,
     replace: bool,
 ) -> Result<(), TransferResult> {
-    let source = absolute(source)?;
+    let metadata = file.metadata().map_err(super::io_result)?;
+    if !metadata.is_file() || super::is_link_or_reparse(&metadata) {
+        return Err(TransferResult::PermissionDenied);
+    }
     let destination = absolute(destination)?;
-    let source_pins = pin_chain(source.parent().ok_or(TransferResult::InvalidData)?)?;
     let target_pins = pin_chain(destination.parent().ok_or(TransferResult::InvalidData)?)?;
-    let source_file = open_file(
-        source_pins.last().ok_or(TransferResult::InvalidData)?,
-        source.file_name().ok_or(TransferResult::InvalidData)?,
-        true,
-    )?;
-    check_chain(&source_pins)?;
     check_chain(&target_pins)?;
     rename(
-        &source_file,
+        file,
         target_pins.last().ok_or(TransferResult::InvalidData)?,
         destination.file_name().ok_or(TransferResult::InvalidData)?,
         replace,
     )?;
-    check_chain(&source_pins)?;
     check_chain(&target_pins)
 }
 

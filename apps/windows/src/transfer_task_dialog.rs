@@ -94,7 +94,7 @@ enum ActiveDialog {
 thread_local! {
     static ACTIVE: RefCell<Option<ActiveDialog>> = const { RefCell::new(None) };
     #[cfg(test)]
-    static MODAL_STARTED: RefCell<Option<std::sync::mpsc::Sender<()>>> = const { RefCell::new(None) };
+    static MODAL_STARTED: RefCell<Option<std::sync::mpsc::SyncSender<()>>> = const { RefCell::new(None) };
     #[cfg(test)]
     static MODAL_INITIAL_FOLDER: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
@@ -444,8 +444,8 @@ mod tests {
             } else {
                 token.cancelled.clone()
             };
-            let (send, receive) = mpsc::channel();
-            let (opened, modal) = mpsc::channel();
+            let (send, receive) = mpsc::sync_channel(1);
+            let (opened, modal) = mpsc::sync_channel(1);
             let started = Instant::now();
             let worker = std::thread::spawn(move || {
                 MODAL_STARTED.with(|slot| *slot.borrow_mut() = Some(opened));
@@ -475,8 +475,8 @@ mod tests {
             } else {
                 token.cancelled.clone()
             };
-            let (send, receive) = mpsc::channel();
-            let (opened, modal) = mpsc::channel();
+            let (send, receive) = mpsc::sync_channel(1);
+            let (opened, modal) = mpsc::sync_channel(1);
             let worker = std::thread::spawn(move || {
                 MODAL_STARTED.with(|slot| *slot.borrow_mut() = Some(opened));
                 let approved = confirm_sta(
@@ -519,7 +519,7 @@ mod tests {
         assert!(matches!(ModalPermit::acquire(), Err(TransferResult::Busy)));
         let token = token();
         let stop = token.stopped.clone();
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = mpsc::sync_channel(1);
         let queued = std::thread::spawn(move || {
             let _permit = queued_permit;
             let result = wait_modal(&token).map(|_| ());

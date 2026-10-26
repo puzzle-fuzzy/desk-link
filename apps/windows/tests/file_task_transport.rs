@@ -28,7 +28,6 @@ use tokio::{
 
 pub use apps_windows::{transfer_checkpoint, transfer_task};
 #[path = "../test-support/file-task-fixture.rs"]
-#[allow(dead_code)]
 mod fixture;
 use fixture::{Fixture, start, terminal};
 

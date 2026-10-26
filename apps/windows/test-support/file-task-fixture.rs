@@ -272,7 +272,7 @@ impl Peers {
             &b.handle,
             &stats,
             Duration::ZERO,
-            None,
+            hook.as_ref(),
         )
         .await;
         forward(
@@ -282,7 +282,7 @@ impl Peers {
             &a.handle,
             &stats,
             Duration::ZERO,
-            None,
+            hook.as_ref(),
         )
         .await;
         let (a_handle, b_handle) = (a.handle.clone(), b.handle.clone());
@@ -339,18 +339,17 @@ pub(super) async fn terminal(
 ) -> FileTaskProgress {
     timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(snapshot) = progress.borrow().clone() {
-                if snapshot.task_id == id_text(task)
-                    && matches!(
-                        snapshot.state,
-                        "completed" | "partial" | "failed" | "cancelled"
-                    )
-                {
-                    if std::env::var_os("DESKLINK_FILE_TEST_TRACE").is_some() {
-                        eprintln!("file-terminal {snapshot:?}");
-                    }
-                    return snapshot;
+            if let Some(snapshot) = progress.borrow().clone()
+                && snapshot.task_id == id_text(task)
+                && matches!(
+                    snapshot.state,
+                    "completed" | "partial" | "failed" | "cancelled"
+                )
+            {
+                if std::env::var_os("DESKLINK_FILE_TEST_TRACE").is_some() {
+                    eprintln!("file-terminal {snapshot:?}");
                 }
+                return snapshot;
             }
             progress
                 .changed()

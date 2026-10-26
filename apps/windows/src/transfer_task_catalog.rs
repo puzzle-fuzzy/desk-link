@@ -357,10 +357,10 @@ impl TaskCatalog {
         #[cfg(windows)]
         {
             let pins = native::prepare_chain(&path)?;
-            return Ok(TaskDirectoryGuard {
+            Ok(TaskDirectoryGuard {
                 path,
                 _directory_pins: pins,
-            });
+            })
         }
         #[cfg(not(windows))]
         {
@@ -536,7 +536,7 @@ fn replace_json(path: &Path, value: &impl Serialize, maximum: u64) -> Result<(),
 fn open_metadata_file(path: &Path) -> Result<File, TransferResult> {
     #[cfg(windows)]
     {
-        return native::open_file_path(path, false);
+        native::open_file_path(path, false)
     }
     #[cfg(not(windows))]
     {
@@ -568,7 +568,7 @@ fn open_metadata_file(path: &Path) -> Result<File, TransferResult> {
 fn prepare_directory_chain(path: &Path) -> Result<Vec<File>, TransferResult> {
     #[cfg(windows)]
     {
-        return native::prepare_chain(path);
+        native::prepare_chain(path)
     }
     #[cfg(not(windows))]
     {
@@ -603,9 +603,9 @@ fn prepare_directory_chain(path: &Path) -> Result<Vec<File>, TransferResult> {
 fn open_directory_pin(path: &Path) -> Result<File, TransferResult> {
     #[cfg(windows)]
     {
-        return native::pin_chain(path)?
+        native::pin_chain(path)?
             .pop()
-            .ok_or(TransferResult::InvalidData);
+            .ok_or(TransferResult::InvalidData)
     }
     #[cfg(not(windows))]
     {

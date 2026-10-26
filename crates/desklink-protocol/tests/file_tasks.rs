@@ -137,3 +137,70 @@ fn negotiation_takes_minimum_resources_without_inventing_support() {
         .is_err()
     );
 }
+
+#[test]
+fn manifest_work_heartbeat_allows_bounded_real_passes_without_expanding_item_budget() {
+    let limit = MAX_FILE_TASK_ENTRIES * MAX_FILE_TASK_SCAN_WORK_PASSES;
+    let activity = |completed, item_id, total| FileTaskMessage::Activity {
+        task_id: [14; 16],
+        item_id,
+        phase: FileTaskPhase::Scanning,
+        completed,
+        total,
+    };
+    round_trip(activity(limit, None, 0));
+    for malformed in [
+        activity(limit + 1, None, 0),
+        activity(u64::MAX, None, 0),
+        activity(1, Some(1), 0),
+        activity(1, None, 1),
+    ] {
+        assert!(!malformed.is_valid());
+        let value = TransferMessage::FileTask(malformed);
+        assert!(encode_transfer(&value).is_err());
+        assert!(decode_transfer(&postcard::to_allocvec(&value).unwrap()).is_err());
+    }
+    let mut capabilities = FileTransferCapabilities::WINDOWS;
+    capabilities.max_entries = MAX_FILE_TASK_ENTRIES + 1;
+    assert!(!capabilities.is_valid());
+}
+
+#[test]
+fn proof_index_activity_has_an_independent_bounded_record_budget_and_appended_wire_tag() {
+    assert_eq!(
+        postcard::to_allocvec(&FileTaskPhase::Scanning).unwrap(),
+        [0]
+    );
+    assert_eq!(postcard::to_allocvec(&FileTaskPhase::Hashing).unwrap(), [1]);
+    assert_eq!(
+        postcard::to_allocvec(&FileTaskPhase::Verifying).unwrap(),
+        [2]
+    );
+    assert_eq!(
+        postcard::to_allocvec(&FileTaskPhase::Indexing).unwrap(),
+        [3]
+    );
+    let activity = |completed, total, item_id| FileTaskMessage::Activity {
+        task_id: [14; 16],
+        item_id,
+        phase: FileTaskPhase::Indexing,
+        completed,
+        total,
+    };
+    round_trip(activity(
+        MAX_FILE_TASK_INDEX_RECORDS,
+        MAX_FILE_TASK_INDEX_RECORDS,
+        Some(1),
+    ));
+    for bad in [
+        activity(1, MAX_FILE_TASK_INDEX_RECORDS + 1, Some(1)),
+        activity(2, 1, Some(1)),
+        activity(1, 1, None),
+        activity(1, 1, Some(0)),
+    ] {
+        assert!(!bad.is_valid());
+        let message = TransferMessage::FileTask(bad);
+        assert!(encode_transfer(&message).is_err());
+        assert!(decode_transfer(&postcard::to_allocvec(&message).unwrap()).is_err());
+    }
+}

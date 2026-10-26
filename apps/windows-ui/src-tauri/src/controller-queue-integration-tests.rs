@@ -165,7 +165,7 @@ async fn explicit_discard_epoch_prevents_a_real_queued_manager_job_from_resurrec
     assert_eq!(store.load().unwrap().unwrap().files().len(), 1);
     let (ready, entered) = tokio::sync::oneshot::channel();
     let mut ready = Some(ready);
-    let (release, released) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::sync_channel(1);
     let worker = QueuePersistence::spawn_with_before_persist(move || {
         ready.take().unwrap().send(()).unwrap();
         released.recv_timeout(Duration::from_secs(5)).unwrap();

@@ -7,6 +7,14 @@ use crate::{MAX_TRANSFER_CHUNK_BYTES, TransferId, TransferResult};
 pub const MAX_LARGE_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 pub const MAX_FILE_TASK_BYTES: u64 = 16 * MAX_LARGE_FILE_BYTES;
 pub const MAX_FILE_TASK_ENTRIES: u64 = 1_000_000;
+/// Actual manifest-record work: validate, copy, discover, compact at most two
+/// passes of temporary failure slots, and read the final manifest. This is
+/// independent from the item budget and never describes a transfer percentage.
+pub const MAX_FILE_TASK_SCAN_WORK_PASSES: u64 = 6;
+/// Indexing activity counts copied block-proof records, independently of data
+/// bytes already verified and durably received.
+pub const MAX_FILE_TASK_INDEX_RECORDS: u64 =
+    MAX_LARGE_FILE_BYTES.div_ceil(MAX_TRANSFER_CHUNK_BYTES as u64);
 pub const MAX_TRANSFER_RELATIVE_PATH_BYTES: usize = 4096;
 pub const MAX_TRANSFER_DIRECTORY_DEPTH: usize = 64;
 pub const BLOCK_ROOT_DOMAIN: &[u8] = b"DeskLink blocks v14\0";
@@ -95,6 +103,8 @@ pub enum FileTaskPhase {
     Scanning,
     Hashing,
     Verifying,
+    /// Actual block-proof records copied into the published-file index.
+    Indexing,
 }
 
 /// Only one entry is admitted at a time. A sender must wait for EntryDecision,
@@ -246,13 +256,12 @@ pub fn is_valid_transfer_path_segment(name: &str) -> bool {
     if let Some(suffix) = stem
         .strip_prefix("COM")
         .or_else(|| stem.strip_prefix("LPT"))
-    {
-        if matches!(
+        && matches!(
             suffix,
             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-        ) {
-            return false;
-        }
+        )
+    {
+        return false;
     }
     true
 }
@@ -309,7 +318,14 @@ impl FileTaskMessage {
                 ..
             } => match phase {
                 FileTaskPhase::Scanning => {
-                    item_id.is_none() && *completed <= MAX_FILE_TASK_ENTRIES && *total == 0
+                    item_id.is_none()
+                        && *completed <= MAX_FILE_TASK_ENTRIES * MAX_FILE_TASK_SCAN_WORK_PASSES
+                        && *total == 0
+                }
+                FileTaskPhase::Indexing => {
+                    item_id.is_some_and(|id| id > 0 && id <= MAX_FILE_TASK_ENTRIES)
+                        && *completed <= *total
+                        && *total <= MAX_FILE_TASK_INDEX_RECORDS
                 }
                 FileTaskPhase::Hashing | FileTaskPhase::Verifying => {
                     item_id.is_some_and(|id| id > 0 && id <= MAX_FILE_TASK_ENTRIES)

@@ -170,6 +170,10 @@ impl DirectoryEntry {
             .parent()
             .ok_or(TransferResult::InvalidData)?;
         let pins = pin_directory_chain(parent)?;
+        let metadata = fs::symlink_metadata(&self.source_path).map_err(io_result)?;
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(TransferResult::SourceChanged);
+        }
         let file = open_source_file(&self.source_path)?;
         let metadata = file.metadata().map_err(io_result)?;
         if is_link_or_reparse(&metadata)
@@ -182,6 +186,49 @@ impl DirectoryEntry {
             file,
             _directory_pins: pins,
         })
+    }
+
+    /// Pin an observed directory through its send handshake. Child repairs can
+    /// change directory times, so only its actual kind/location is checked.
+    pub fn verify_directory_source(&self) -> Result<GuardedSourceDirectory, TransferResult> {
+        if self.kind != TransferEntryKind::Directory {
+            return Err(TransferResult::InvalidData);
+        }
+        GuardedSourceDirectory::open(&self.source_path)
+    }
+}
+
+pub struct GuardedSourceDirectory {
+    _directory_pins: Vec<File>,
+}
+
+impl GuardedSourceDirectory {
+    /// Also guard the selected source root when its manifest has no entries.
+    pub fn open(path: &Path) -> Result<Self, TransferResult> {
+        let path = absolute_path(path)?;
+        let mut pins = match path.parent() {
+            Some(parent) => pin_directory_chain(parent)?,
+            None => Vec::new(),
+        };
+        let metadata = fs::symlink_metadata(&path).map_err(io_result)?;
+        if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(TransferResult::SourceChanged);
+        }
+        pins.push(open_directory_pin(&path)?);
+        Ok(Self {
+            _directory_pins: pins,
+        })
+    }
+
+    pub fn verify_location(&self) -> Result<(), TransferResult> {
+        #[cfg(windows)]
+        {
+            native::check_chain(&self._directory_pins)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
     }
 }
 
@@ -203,10 +250,78 @@ impl GuardedSourceFile {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DirectoryScanFailureScope {
+    Entry,
+    Subtree,
+    /// An already yielded directory could not enumerate one or more children.
+    Enumeration,
+    /// Cancellation or a global discovery limit ended the remaining scan.
+    Task,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryScanFailure {
+    /// Present only when the observed entry has a valid transfer path.
     pub relative_path: Option<String>,
     pub result: TransferResult,
+    pub scope: DirectoryScanFailureScope,
+    pub kind: Option<TransferEntryKind>,
+    /// Observed size, including files that exceed the negotiated byte limits.
+    /// This is local recovery metadata, not an admitted wire byte count.
+    pub size: Option<u64>,
+    pub terminal: bool,
+    /// Valid relative prefix. An empty prefix means the selected source root.
+    /// Enumeration retries omit this directory itself; entry/subtree retries
+    /// include it. Never construct an absolute retry path from display text.
+    pub retry_relative_path: Option<String>,
+}
+
+impl DirectoryScanFailure {
+    fn task(result: TransferResult) -> Self {
+        Self {
+            relative_path: None,
+            result,
+            scope: DirectoryScanFailureScope::Task,
+            kind: None,
+            size: None,
+            terminal: true,
+            retry_relative_path: None,
+        }
+    }
+
+    fn entry(
+        relative_path: String,
+        result: TransferResult,
+        kind: Option<TransferEntryKind>,
+        size: Option<u64>,
+    ) -> Self {
+        Self {
+            relative_path: Some(relative_path.clone()),
+            result,
+            scope: if kind == Some(TransferEntryKind::Directory) {
+                DirectoryScanFailureScope::Subtree
+            } else {
+                DirectoryScanFailureScope::Entry
+            },
+            kind,
+            size,
+            terminal: false,
+            retry_relative_path: Some(relative_path),
+        }
+    }
+
+    fn enumeration(relative_path: String, result: TransferResult) -> Self {
+        Self {
+            relative_path: (!relative_path.is_empty()).then(|| relative_path.clone()),
+            result,
+            scope: DirectoryScanFailureScope::Enumeration,
+            kind: Some(TransferEntryKind::Directory),
+            size: Some(0),
+            terminal: false,
+            retry_relative_path: Some(relative_path),
+        }
+    }
 }
 
 struct DirectoryFrame {
@@ -226,6 +341,8 @@ pub struct DirectoryScanner {
     scanned_entries: u64,
     total_bytes: u64,
     terminal: bool,
+    pending_entry: Option<DirectoryEntry>,
+    last_yielded_directory: Option<String>,
 }
 
 impl DirectoryScanner {
@@ -254,7 +371,116 @@ impl DirectoryScanner {
             scanned_entries: 0,
             total_bytes: 0,
             terminal: false,
+            pending_entry: None,
+            last_yielded_directory: None,
         })
+    }
+
+    /// Re-scan one failed entry/subtree without discovering unrelated siblings.
+    /// Prefixes and depth remain relative to the originally authorized root.
+    /// The caller assigns durable task/item IDs when merging these outcomes.
+    pub fn open_subtree_with_limits(
+        root: &Path,
+        relative_prefix: &str,
+        include_root: bool,
+        cancellation: Arc<AtomicBool>,
+        limits: DirectoryScanLimits,
+    ) -> Result<Self, TransferResult> {
+        let limits = limits.validate()?;
+        if relative_prefix.is_empty() {
+            return if include_root {
+                Err(TransferResult::InvalidData)
+            } else {
+                Self::open_with_limits(root, cancellation, limits)
+            };
+        }
+        if !is_valid_relative_path_with_limits(
+            relative_prefix,
+            limits.max_depth,
+            limits.max_relative_path_bytes,
+        ) {
+            return Err(TransferResult::InvalidData);
+        }
+        check_cancelled(&cancellation)?;
+        let root = absolute_path(root)?;
+        let mut pins = pin_directory_chain(&root)?;
+        let target = relative_prefix
+            .split('/')
+            .fold(root, |path, part| path.join(part));
+        let parent = target.parent().ok_or(TransferResult::InvalidData)?;
+        // Keep the original root and every newly traversed ancestor pinned.
+        pins.extend(pin_directory_chain(parent)?);
+        let metadata = fs::symlink_metadata(&target).map_err(io_result)?;
+        if is_link_or_reparse(&metadata) {
+            return Err(TransferResult::Unsupported);
+        }
+        let (kind, size, identity, frames) = if metadata.is_dir() {
+            let pin = open_directory_pin(&target)?;
+            let entries = fs::read_dir(&target).map_err(io_result)?;
+            (
+                TransferEntryKind::Directory,
+                0,
+                SourceIdentity::from_metadata(&metadata),
+                vec![DirectoryFrame {
+                    path: target.clone(),
+                    relative_path: relative_prefix.to_owned(),
+                    entries,
+                    _pin: pin,
+                }],
+            )
+        } else if metadata.is_file() && include_root {
+            let file = open_source_file(&target)?;
+            let identity = SourceIdentity::from_file(&file)?;
+            if identity.size != metadata.len()
+                || identity.modified_at_unix_ns != modified_at_unix_ns(&metadata)
+            {
+                return Err(TransferResult::SourceChanged);
+            }
+            if identity.size > limits.max_file_bytes || identity.size > limits.max_total_bytes {
+                return Err(TransferResult::TooLarge);
+            }
+            (TransferEntryKind::File, identity.size, identity, Vec::new())
+        } else {
+            return Err(TransferResult::Unsupported);
+        };
+        let pending_entry = include_root.then(|| DirectoryEntry {
+            item_id: 1,
+            relative_path: relative_prefix.to_owned(),
+            kind,
+            size,
+            modified_at_unix_ns: identity.modified_at_unix_ns,
+            source_path: target,
+            identity,
+        });
+        Ok(Self {
+            frames,
+            _root_ancestor_pins: pins,
+            cancellation,
+            limits,
+            next_item_id: if include_root { 2 } else { 1 },
+            scanned_entries: u64::from(include_root),
+            total_bytes: size,
+            terminal: false,
+            pending_entry,
+            last_yielded_directory: None,
+        })
+    }
+
+    /// Prune only the directory just yielded by this iterator. The caller uses
+    /// this when a retry observes a directory where an immutable file entry was
+    /// already admitted; its new children must not become phantom task items.
+    pub fn skip_current_subtree(&mut self, relative_prefix: &str) -> Result<(), TransferResult> {
+        if self.last_yielded_directory.as_deref() != Some(relative_prefix)
+            || self
+                .frames
+                .last()
+                .is_none_or(|frame| frame.relative_path != relative_prefix)
+        {
+            return Err(TransferResult::InvalidData);
+        }
+        self.frames.pop();
+        self.last_yielded_directory = None;
+        Ok(())
     }
 
     pub fn scanned_entries(&self) -> u64 {
@@ -271,19 +497,15 @@ impl DirectoryScanner {
 
     fn failure(
         &mut self,
-        relative_path: Option<String>,
-        result: TransferResult,
-        terminal: bool,
+        failure: DirectoryScanFailure,
     ) -> Option<Result<DirectoryEntry, DirectoryScanFailure>> {
-        self.terminal = terminal;
-        if terminal {
+        self.terminal = failure.terminal;
+        if failure.terminal {
             self.frames.clear();
             self._root_ancestor_pins.clear();
+            self.pending_entry = None;
         }
-        Some(Err(DirectoryScanFailure {
-            relative_path,
-            result,
-        }))
+        Some(Err(failure))
     }
 }
 
@@ -294,9 +516,16 @@ impl Iterator for DirectoryScanner {
         if self.terminal {
             return None;
         }
+        self.last_yielded_directory = None;
         loop {
             if check_cancelled(&self.cancellation).is_err() {
-                return self.failure(None, TransferResult::Cancelled, true);
+                return self.failure(DirectoryScanFailure::task(TransferResult::Cancelled));
+            }
+            if let Some(entry) = self.pending_entry.take() {
+                if entry.kind == TransferEntryKind::Directory {
+                    self.last_yielded_directory = Some(entry.relative_path.clone());
+                }
+                return Some(Ok(entry));
             }
             let frame = self.frames.last_mut()?;
             let entry = match frame.entries.next() {
@@ -304,11 +533,10 @@ impl Iterator for DirectoryScanner {
                 Some(Err(error)) => {
                     self.scanned_entries += 1;
                     if self.scanned_entries > self.limits.max_entries {
-                        return self.failure(None, TransferResult::TooLarge, true);
+                        return self.failure(DirectoryScanFailure::task(TransferResult::TooLarge));
                     }
-                    let path =
-                        (!frame.relative_path.is_empty()).then(|| frame.relative_path.clone());
-                    return self.failure(path, io_result(error), false);
+                    let path = frame.relative_path.clone();
+                    return self.failure(DirectoryScanFailure::enumeration(path, io_result(error)));
                 }
                 None => {
                     self.frames.pop();
@@ -318,10 +546,14 @@ impl Iterator for DirectoryScanner {
             // Count failures too: hostile entries cannot evade the scan budget.
             self.scanned_entries += 1;
             if self.scanned_entries > self.limits.max_entries {
-                return self.failure(None, TransferResult::TooLarge, true);
+                return self.failure(DirectoryScanFailure::task(TransferResult::TooLarge));
             }
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                return self.failure(None, TransferResult::InvalidData, false);
+                let path = frame.relative_path.clone();
+                return self.failure(DirectoryScanFailure::enumeration(
+                    path,
+                    TransferResult::InvalidData,
+                ));
             };
             let relative_path = if frame.relative_path.is_empty() {
                 name
@@ -333,28 +565,70 @@ impl Iterator for DirectoryScanner {
                 self.limits.max_depth,
                 self.limits.max_relative_path_bytes,
             ) {
-                return self.failure(Some(relative_path), TransferResult::InvalidData, false);
+                // An unsafe name cannot be put on the wire or used as a retry
+                // path. Retry its safe parent to discover a repaired name.
+                let path = frame.relative_path.clone();
+                return self.failure(DirectoryScanFailure::enumeration(
+                    path,
+                    TransferResult::InvalidData,
+                ));
             }
             let source_path = frame.path.join(entry.file_name());
             let metadata = match fs::symlink_metadata(&source_path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    return self.failure(Some(relative_path), io_result(error), false);
+                    return self.failure(DirectoryScanFailure::entry(
+                        relative_path,
+                        io_result(error),
+                        None,
+                        None,
+                    ));
                 }
             };
             if is_link_or_reparse(&metadata) {
-                return self.failure(Some(relative_path), TransferResult::Unsupported, false);
+                let kind = if metadata.is_dir() {
+                    Some(TransferEntryKind::Directory)
+                } else if metadata.is_file() {
+                    Some(TransferEntryKind::File)
+                } else {
+                    None
+                };
+                let size = kind.map(|kind| {
+                    if kind == TransferEntryKind::File {
+                        metadata.len()
+                    } else {
+                        0
+                    }
+                });
+                return self.failure(DirectoryScanFailure::entry(
+                    relative_path,
+                    TransferResult::Unsupported,
+                    kind,
+                    size,
+                ));
             }
             let (kind, size) = if metadata.is_dir() {
                 // Yield the directory even when empty, before its children.
                 let pin = match open_directory_pin(&source_path) {
                     Ok(pin) => pin,
-                    Err(error) => return self.failure(Some(relative_path), error, false),
+                    Err(error) => {
+                        return self.failure(DirectoryScanFailure::entry(
+                            relative_path,
+                            error,
+                            Some(TransferEntryKind::Directory),
+                            Some(0),
+                        ));
+                    }
                 };
                 let entries = match fs::read_dir(&source_path) {
                     Ok(entries) => entries,
                     Err(error) => {
-                        return self.failure(Some(relative_path), io_result(error), false);
+                        return self.failure(DirectoryScanFailure::entry(
+                            relative_path,
+                            io_result(error),
+                            Some(TransferEntryKind::Directory),
+                            Some(0),
+                        ));
                     }
                 };
                 self.frames.push(DirectoryFrame {
@@ -366,25 +640,51 @@ impl Iterator for DirectoryScanner {
                 (TransferEntryKind::Directory, 0)
             } else if metadata.is_file() {
                 if metadata.len() > self.limits.max_file_bytes {
-                    return self.failure(Some(relative_path), TransferResult::TooLarge, false);
+                    return self.failure(DirectoryScanFailure::entry(
+                        relative_path,
+                        TransferResult::TooLarge,
+                        Some(TransferEntryKind::File),
+                        Some(metadata.len()),
+                    ));
                 }
                 let Some(total_bytes) = self.total_bytes.checked_add(metadata.len()) else {
-                    return self.failure(Some(relative_path), TransferResult::TooLarge, true);
+                    return self.failure(DirectoryScanFailure::entry(
+                        relative_path,
+                        TransferResult::TooLarge,
+                        Some(TransferEntryKind::File),
+                        Some(metadata.len()),
+                    ));
                 };
                 if total_bytes > self.limits.max_total_bytes {
-                    return self.failure(Some(relative_path), TransferResult::TooLarge, true);
+                    return self.failure(DirectoryScanFailure::entry(
+                        relative_path,
+                        TransferResult::TooLarge,
+                        Some(TransferEntryKind::File),
+                        Some(metadata.len()),
+                    ));
                 }
-                self.total_bytes = total_bytes;
                 (TransferEntryKind::File, metadata.len())
             } else {
-                return self.failure(Some(relative_path), TransferResult::Unsupported, false);
+                return self.failure(DirectoryScanFailure::entry(
+                    relative_path,
+                    TransferResult::Unsupported,
+                    None,
+                    None,
+                ));
             };
             let item_id = self.next_item_id;
             self.next_item_id += 1;
             let identity = if kind == TransferEntryKind::File {
                 let file = match open_source_file(&source_path) {
                     Ok(file) => file,
-                    Err(error) => return self.failure(Some(relative_path), error, false),
+                    Err(error) => {
+                        return self.failure(DirectoryScanFailure::entry(
+                            relative_path,
+                            error,
+                            Some(kind),
+                            Some(size),
+                        ));
+                    }
                 };
                 match SourceIdentity::from_file(&file) {
                     Ok(identity)
@@ -394,17 +694,31 @@ impl Iterator for DirectoryScanner {
                         identity
                     }
                     Ok(_) => {
-                        return self.failure(
-                            Some(relative_path),
+                        return self.failure(DirectoryScanFailure::entry(
+                            relative_path,
                             TransferResult::SourceChanged,
-                            false,
-                        );
+                            Some(kind),
+                            Some(size),
+                        ));
                     }
-                    Err(error) => return self.failure(Some(relative_path), error, false),
+                    Err(error) => {
+                        return self.failure(DirectoryScanFailure::entry(
+                            relative_path,
+                            error,
+                            Some(kind),
+                            Some(size),
+                        ));
+                    }
                 }
             } else {
                 SourceIdentity::from_metadata(&metadata)
             };
+            // Failed opens and identity checks do not consume the admitted byte
+            // budget and cannot prevent a later, smaller sibling from fitting.
+            self.total_bytes += size;
+            if kind == TransferEntryKind::Directory {
+                self.last_yielded_directory = Some(relative_path.clone());
+            }
             return Some(Ok(DirectoryEntry {
                 item_id,
                 relative_path,
@@ -437,10 +751,7 @@ pub fn spawn_directory_scanner(
                 match DirectoryScanner::open_with_limits(&root, cancellation.clone(), limits) {
                     Ok(scanner) => scanner,
                     Err(result) => {
-                        let _ = sender.blocking_send(Err(DirectoryScanFailure {
-                            relative_path: None,
-                            result,
-                        }));
+                        let _ = sender.blocking_send(Err(DirectoryScanFailure::task(result)));
                         return;
                     }
                 };
@@ -771,7 +1082,17 @@ impl GuardedDestinationFile {
     /// The checkpoint worker must validate the complete content root first.
     /// Publication flushes data and creates the final path without replacement.
     /// Windows renames the owned handle relative to its pinned parent.
-    pub fn publish(mut self) -> Result<PathBuf, TransferResult> {
+    pub fn publish(self) -> Result<PathBuf, TransferResult> {
+        self.publish_with(|_| Ok(()))
+    }
+
+    /// Runs after publication while the original writer handle is still owned.
+    /// A verified checkpoint can persist its source index using the final file
+    /// identity. Callback failure preserves the published data for recovery.
+    pub fn publish_with(
+        mut self,
+        after_publish: impl FnOnce(&File) -> Result<(), TransferResult>,
+    ) -> Result<PathBuf, TransferResult> {
         self.file_mut()?.sync_all().map_err(io_result)?;
         let parent = self
             .destination_path
@@ -795,15 +1116,16 @@ impl GuardedDestinationFile {
                 false,
             )?;
             check_destination_pins(&self._directory_pins)?;
-            self.file.take();
         }
         #[cfg(not(windows))]
         {
-            self.file.take();
             fs::hard_link(&self.staging_path, &self.destination_path).map_err(io_result)?;
             fs::remove_file(&self.staging_path).map_err(io_result)?;
         }
         self.remove_on_drop = false;
+        after_publish(self.file.as_ref().ok_or(TransferResult::InvalidData)?)?;
+        check_destination_pins(&self._directory_pins)?;
+        self.file.take();
         Ok(self.destination_path.clone())
     }
 
@@ -1115,21 +1437,32 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    struct Fixture(PathBuf);
+    struct Fixture(PathBuf, PathBuf);
 
     impl Fixture {
         fn new() -> Self {
             let mut id = [0; 16];
             OsRng.fill_bytes(&mut id);
-            let path = std::env::temp_dir().join(format!("desklink-directory-{}", hex_id(&id)));
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .unwrap()
+                .join(".build/directory-fixtures");
+            fs::create_dir_all(&base).unwrap();
+            let base = fs::canonicalize(base).unwrap();
+            let path = base.join(format!("desklink-directory-{}", hex_id(&id)));
             fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(path, base)
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).unwrap();
+            let metadata = fs::symlink_metadata(&self.0).unwrap();
+            assert!(!is_link_or_reparse(&metadata));
+            let target = fs::canonicalize(&self.0).unwrap();
+            assert_eq!(target.parent(), Some(self.1.as_path()));
+            fs::remove_dir_all(target).unwrap();
         }
     }
 
@@ -1293,10 +1626,12 @@ mod tests {
             assert!(scanner.next().unwrap().is_ok());
             assert_eq!(scanner.active_directory_handles(), 1);
         }
-        assert_eq!(
-            scanner.next().unwrap().unwrap_err().result,
-            TransferResult::TooLarge
-        );
+        let failure = scanner.next().unwrap().unwrap_err();
+        assert_eq!(failure.result, TransferResult::TooLarge);
+        assert_eq!(failure.scope, DirectoryScanFailureScope::Task);
+        assert!(failure.terminal);
+        assert!(failure.relative_path.is_none());
+        assert!(failure.retry_relative_path.is_none());
         assert!(scanner.next().is_none());
         assert_eq!(scanner.active_directory_handles(), 0);
     }
@@ -1322,6 +1657,279 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert_eq!(failure.result, TransferResult::TooLarge);
+        assert_eq!(failure.scope, DirectoryScanFailureScope::Entry);
+        assert_eq!(failure.kind, Some(TransferEntryKind::File));
+        assert_eq!(failure.size, Some(size));
+        assert!(!failure.terminal);
+    }
+
+    #[test]
+    fn cumulative_byte_budget_skips_one_file_and_keeps_fitting_siblings() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("large-a"), [1; 4]).unwrap();
+        fs::write(fixture.0.join("large-b"), [2; 4]).unwrap();
+        fs::write(fixture.0.join("small"), [3; 1]).unwrap();
+        let mut budget = limits();
+        budget.max_file_bytes = 4;
+        budget.max_total_bytes = 5;
+        let mut scanner = DirectoryScanner::open_with_limits(
+            &fixture.0,
+            Arc::new(AtomicBool::new(false)),
+            budget,
+        )
+        .unwrap();
+        let mut success_bytes = 0;
+        let mut successes = 0;
+        let mut failures = 0;
+        for outcome in scanner.by_ref() {
+            match outcome {
+                Ok(entry) => {
+                    success_bytes += entry.size;
+                    successes += 1;
+                }
+                Err(failure) => {
+                    failures += 1;
+                    assert_eq!(failure.scope, DirectoryScanFailureScope::Entry);
+                    assert_eq!(failure.result, TransferResult::TooLarge);
+                    assert_eq!(failure.kind, Some(TransferEntryKind::File));
+                    assert_eq!(failure.size, Some(4));
+                    assert!(!failure.terminal);
+                    assert_eq!(failure.relative_path, failure.retry_relative_path);
+                }
+            }
+        }
+        assert_eq!((successes, failures, success_bytes), (2, 1, 5));
+        assert_eq!(scanner.total_bytes(), success_bytes);
+        assert_eq!(scanner.scanned_entries(), 3);
+    }
+
+    #[test]
+    fn subtree_retry_preserves_original_prefix_and_excludes_siblings() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.0.join("资料/失败子树/空目录")).unwrap();
+        fs::write(fixture.0.join("资料/失败子树/文件.txt"), "恢复内容").unwrap();
+        fs::write(fixture.0.join("资料/不要重发.txt"), "不相关").unwrap();
+        let entries = DirectoryScanner::open_subtree_with_limits(
+            &fixture.0,
+            "资料/失败子树",
+            true,
+            Arc::new(AtomicBool::new(false)),
+            limits(),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].relative_path, "资料/失败子树");
+        assert_eq!(entries[0].kind, TransferEntryKind::Directory);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.relative_path == "资料/失败子树"
+                    || entry.relative_path.starts_with("资料/失败子树/"))
+        );
+        let file = entries
+            .iter()
+            .find(|entry| entry.kind == TransferEntryKind::File)
+            .unwrap();
+        let mut source = file.open_verified_source().unwrap();
+        let mut contents = String::new();
+        source.file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "恢复内容");
+        source.verify_location().unwrap();
+    }
+
+    #[test]
+    fn enumeration_retry_omits_parent_and_retains_original_depth_limit() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.0.join("a/b/c")).unwrap();
+        fs::write(fixture.0.join("a/sibling"), []).unwrap();
+        let mut budget = limits();
+        budget.max_depth = 2;
+        let outcomes = DirectoryScanner::open_subtree_with_limits(
+            &fixture.0,
+            "a",
+            false,
+            Arc::new(AtomicBool::new(false)),
+            budget,
+        )
+        .unwrap()
+        .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|entry| entry.relative_path == "a/sibling")
+        }));
+        assert!(!outcomes.iter().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|entry| entry.relative_path == "a")
+        }));
+        let failure = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap();
+        assert_eq!(failure.scope, DirectoryScanFailureScope::Enumeration);
+        assert_eq!(failure.relative_path.as_deref(), Some("a/b"));
+        assert_eq!(failure.retry_relative_path.as_deref(), Some("a/b"));
+        assert_eq!(failure.kind, Some(TransferEntryKind::Directory));
+        assert_eq!(failure.size, Some(0));
+        assert!(!failure.terminal);
+        let encoded = serde_json::to_vec(failure).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DirectoryScanFailure>(&encoded).unwrap(),
+            *failure
+        );
+    }
+
+    #[test]
+    fn subtree_retry_rejects_traversal_and_cancels_before_yielding_root() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.0.join("child")).unwrap();
+        for prefix in [
+            "../outside",
+            "C:/outside",
+            "/outside",
+            "child/../outside",
+            "child\\outside",
+            "NUL",
+            "child:stream",
+        ] {
+            assert!(
+                matches!(
+                    DirectoryScanner::open_subtree_with_limits(
+                        &fixture.0,
+                        prefix,
+                        true,
+                        Arc::new(AtomicBool::new(false)),
+                        limits()
+                    ),
+                    Err(TransferResult::InvalidData)
+                ),
+                "{prefix}"
+            );
+        }
+        assert!(matches!(
+            DirectoryScanner::open_subtree_with_limits(
+                &fixture.0,
+                "",
+                true,
+                Arc::new(AtomicBool::new(false)),
+                limits()
+            ),
+            Err(TransferResult::InvalidData)
+        ));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut scanner = DirectoryScanner::open_subtree_with_limits(
+            &fixture.0,
+            "child",
+            true,
+            cancellation.clone(),
+            limits(),
+        )
+        .unwrap();
+        cancellation.store(true, Ordering::Release);
+        let failure = scanner.next().unwrap().unwrap_err();
+        assert!(failure.terminal);
+        assert_eq!(failure.scope, DirectoryScanFailureScope::Task);
+        assert_eq!(failure.result, TransferResult::Cancelled);
+        assert!(failure.retry_relative_path.is_none());
+        assert_eq!(scanner.active_directory_handles(), 0);
+        assert!(scanner.next().is_none());
+    }
+
+    #[test]
+    fn retry_can_prune_only_the_just_yielded_directory() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.0.join("changed-kind")).unwrap();
+        fs::write(fixture.0.join("changed-kind/not-admitted"), []).unwrap();
+        fs::write(fixture.0.join("sibling"), []).unwrap();
+        let mut scanner = scan(&fixture.0);
+        let mut yielded = Vec::new();
+        while let Some(outcome) = scanner.next() {
+            let entry = outcome.unwrap();
+            yielded.push(entry.relative_path.clone());
+            if entry.kind == TransferEntryKind::Directory {
+                assert_eq!(
+                    scanner.skip_current_subtree("unrelated"),
+                    Err(TransferResult::InvalidData)
+                );
+                scanner.skip_current_subtree(&entry.relative_path).unwrap();
+                assert_eq!(
+                    scanner.skip_current_subtree(&entry.relative_path),
+                    Err(TransferResult::InvalidData)
+                );
+            }
+        }
+        assert!(yielded.iter().any(|path| path == "changed-kind"));
+        assert!(yielded.iter().any(|path| path == "sibling"));
+        assert!(!yielded.iter().any(|path| path.ends_with("not-admitted")));
+
+        let mut scanner = DirectoryScanner::open_subtree_with_limits(
+            &fixture.0,
+            "changed-kind",
+            true,
+            Arc::new(AtomicBool::new(false)),
+            limits(),
+        )
+        .unwrap();
+        let parent = scanner.next().unwrap().unwrap();
+        let child = scanner.next().unwrap().unwrap();
+        assert_eq!(parent.kind, TransferEntryKind::Directory);
+        assert_eq!(child.kind, TransferEntryKind::File);
+        assert_eq!(
+            scanner.skip_current_subtree(&parent.relative_path),
+            Err(TransferResult::InvalidData)
+        );
+    }
+
+    #[test]
+    fn directory_send_guard_allows_child_repairs_and_rejects_kind_replacement() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("directory");
+        fs::create_dir(&directory).unwrap();
+        let entry = scan(&fixture.0).next().unwrap().unwrap();
+        fs::write(directory.join("repaired-child"), b"new child").unwrap();
+        let guard = entry.verify_directory_source().unwrap();
+        guard.verify_location().unwrap();
+        #[cfg(windows)]
+        assert!(fs::rename(&directory, fixture.0.join("moved")).is_err());
+        drop(guard);
+        fs::remove_file(directory.join("repaired-child")).unwrap();
+        fs::remove_dir(&directory).unwrap();
+        fs::write(&directory, b"now a file").unwrap();
+        assert!(matches!(
+            entry.verify_directory_source(),
+            Err(TransferResult::SourceChanged)
+        ));
+
+        let file_entry = DirectoryEntry::single_file(&directory).unwrap();
+        fs::remove_file(&directory).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            file_entry.open_verified_source(),
+            Err(TransferResult::SourceChanged)
+        ));
+    }
+
+    #[test]
+    fn empty_source_root_guard_rejects_replacement_before_zero_entry_replay() {
+        let fixture = Fixture::new();
+        assert!(scan(&fixture.0).next().is_none());
+        let guard = GuardedSourceDirectory::open(&fixture.0).unwrap();
+        guard.verify_location().unwrap();
+        let saved = fixture.0.with_extension("saved");
+        assert_eq!(saved.parent(), Some(fixture.1.as_path()));
+        #[cfg(windows)]
+        assert!(fs::rename(&fixture.0, &saved).is_err());
+        drop(guard);
+        fs::rename(&fixture.0, &saved).unwrap();
+        fs::write(&fixture.0, b"replacement file").unwrap();
+        let replacement = GuardedSourceDirectory::open(&fixture.0);
+        fs::remove_file(&fixture.0).unwrap();
+        fs::rename(&saved, &fixture.0).unwrap();
+        assert!(matches!(replacement, Err(TransferResult::SourceChanged)));
     }
 
     #[test]
@@ -1391,6 +1999,115 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn busy_source_file_keeps_siblings_and_can_be_retried_alone() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let blocked = fixture.0.join("暂时占用.bin");
+        fs::write(&blocked, b"held").unwrap();
+        fs::write(fixture.0.join("有效.bin"), b"good").unwrap();
+        let owner = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&blocked)
+            .unwrap();
+        let mut budget = limits();
+        budget.max_file_bytes = 8;
+        budget.max_total_bytes = 8;
+        let mut scanner = DirectoryScanner::open_with_limits(
+            &fixture.0,
+            Arc::new(AtomicBool::new(false)),
+            budget,
+        )
+        .unwrap();
+        let outcomes = scanner.by_ref().collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 2);
+        let failure = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap();
+        assert_eq!(failure.result, TransferResult::Busy);
+        assert_eq!(failure.scope, DirectoryScanFailureScope::Entry);
+        assert_eq!(failure.kind, Some(TransferEntryKind::File));
+        assert_eq!(failure.size, Some(4));
+        assert_eq!(failure.relative_path.as_deref(), Some("暂时占用.bin"));
+        assert!(!failure.terminal);
+        assert_eq!(scanner.total_bytes(), 4);
+        assert!(outcomes.iter().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|entry| entry.relative_path == "有效.bin")
+        }));
+        drop(scanner);
+        drop(owner);
+        let retried = DirectoryScanner::open_subtree_with_limits(
+            &fixture.0,
+            failure.retry_relative_path.as_deref().unwrap(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+            budget,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].relative_path, "暂时占用.bin");
+        let mut guarded = retried[0].open_verified_source().unwrap();
+        let mut contents = Vec::new();
+        guarded.file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"held");
+        guarded.verify_location().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn busy_subtree_keeps_siblings_and_retry_discovers_only_its_children() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        let fixture = Fixture::new();
+        let blocked = fixture.0.join("暂时占用目录");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("恢复.txt"), b"child").unwrap();
+        fs::write(fixture.0.join("有效.txt"), b"sibling").unwrap();
+        let owner = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(&blocked)
+            .unwrap();
+        let outcomes = scan(&fixture.0).collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 2);
+        let failure = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap();
+        assert_eq!(failure.result, TransferResult::Busy);
+        assert_eq!(failure.scope, DirectoryScanFailureScope::Subtree);
+        assert_eq!(failure.kind, Some(TransferEntryKind::Directory));
+        assert_eq!(failure.size, Some(0));
+        assert!(!failure.terminal);
+        assert!(outcomes.iter().any(|outcome| {
+            outcome
+                .as_ref()
+                .is_ok_and(|entry| entry.relative_path == "有效.txt")
+        }));
+        drop(owner);
+        let retried = DirectoryScanner::open_subtree_with_limits(
+            &fixture.0,
+            failure.retry_relative_path.as_deref().unwrap(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+            limits(),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(retried.len(), 2);
+        assert_eq!(retried[0].relative_path, "暂时占用目录");
+        assert_eq!(retried[1].relative_path, "暂时占用目录/恢复.txt");
+    }
+
     #[test]
     fn destination_stages_flushes_publishes_and_preserves_empty_directory() {
         let fixture = Fixture::new();
@@ -1414,6 +2131,61 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn publish_callback_owns_writer_until_after_rename_and_failure_preserves_data() {
+        let fixture = Fixture::new();
+        let mut destination =
+            DirectoryDestination::create_new(&fixture.0, "receive", limits()).unwrap();
+        let mut staged = destination.create_file("final.bin").unwrap();
+        staged.file_mut().unwrap().write_all(b"verified").unwrap();
+        let temporary = staged.staging_path().to_owned();
+        let final_path = staged.destination_path().to_owned();
+        let result = staged.publish_with(|file| {
+            assert!(!temporary.exists());
+            assert!(final_path.exists());
+            assert_eq!(file.metadata().unwrap().len(), 8);
+            #[cfg(windows)]
+            assert!(matches!(
+                native::open_file_path(&final_path, false),
+                Err(TransferResult::Busy)
+            ));
+            Err(TransferResult::IoFailed)
+        });
+        assert_eq!(result, Err(TransferResult::IoFailed));
+        assert_eq!(fs::read(&final_path).unwrap(), b"verified");
+        assert!(!temporary.exists());
+        #[cfg(windows)]
+        assert!(native::open_file_path(&final_path, false).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_cache_rename_keeps_identity_after_its_old_name_is_reused() {
+        let fixture = Fixture::new();
+        let temporary = fixture.0.join("temporary");
+        let first = fixture.0.join("first");
+        let final_path = fixture.0.join("final");
+        let existing = fixture.0.join("existing");
+        fs::write(&existing, b"do not overwrite").unwrap();
+        let mut file = native::create_file_path(&temporary).unwrap();
+        file.write_all(b"owned metadata").unwrap();
+        file.sync_all().unwrap();
+        assert!(fs::remove_file(&temporary).is_err());
+        native::rename_file_path(&file, &first, false).unwrap();
+        assert!(!temporary.exists());
+        fs::write(&temporary, b"replacement object").unwrap();
+        assert_eq!(
+            native::rename_file_path(&file, &existing, false),
+            Err(TransferResult::Busy)
+        );
+        native::rename_file_path(&file, &final_path, false).unwrap();
+        assert!(!first.exists());
+        drop(file);
+        assert_eq!(fs::read(&final_path).unwrap(), b"owned metadata");
+        assert_eq!(fs::read(&temporary).unwrap(), b"replacement object");
+        assert_eq!(fs::read(&existing).unwrap(), b"do not overwrite");
     }
 
     #[test]
@@ -1653,11 +2425,31 @@ mod tests {
             "junction fixture creation failed: {:?}",
             output
         );
-        let result = (|| {
+        {
             assert_eq!(
                 scan(&fixture.0).next().unwrap().unwrap_err().result,
                 TransferResult::Unsupported
             );
+            assert!(matches!(
+                DirectoryScanner::open_subtree_with_limits(
+                    &fixture.0,
+                    "junction",
+                    true,
+                    Arc::new(AtomicBool::new(false)),
+                    limits()
+                ),
+                Err(TransferResult::Unsupported)
+            ));
+            assert!(matches!(
+                DirectoryScanner::open_subtree_with_limits(
+                    &fixture.0,
+                    "junction/private",
+                    true,
+                    Arc::new(AtomicBool::new(false)),
+                    limits()
+                ),
+                Err(TransferResult::PermissionDenied)
+            ));
             assert!(matches!(
                 DirectoryDestination::create_new(&link, "escape", limits()),
                 Err(TransferResult::PermissionDenied)
@@ -1682,9 +2474,8 @@ mod tests {
             ));
             assert_eq!(fs::read(outside.0.join("private")).unwrap(), b"untouched");
             fs::remove_dir(&destination_link).unwrap();
-        })();
+        }
         fs::remove_dir(&link).unwrap();
-        result
     }
 
     #[cfg(windows)]

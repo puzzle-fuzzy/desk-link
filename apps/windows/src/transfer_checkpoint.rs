@@ -9,7 +9,7 @@
 use std::fs::OpenOptions;
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::UNIX_EPOCH,
@@ -224,6 +224,101 @@ fn file_change_token(file: &File) -> Result<Option<i64>, TransferResult> {
     {
         let _ = file;
         Ok(None)
+    }
+}
+
+/// Finalize pending write/rename journal reasons before recording a stamp from
+/// a still-exclusive writer. Without this operation NTFS may advance the USN
+/// on the last writer close, immediately invalidating an exported index.
+fn seal_change_token(file: &File) -> Result<bool, TransferResult> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            System::{IO::DeviceIoControl, Ioctl::FSCTL_WRITE_USN_CLOSE_RECORD},
+        };
+        let mut token = 0_i64;
+        let mut returned = 0_u32;
+        let result = unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_WRITE_USN_CLOSE_RECORD,
+                None,
+                0,
+                Some((&mut token as *mut i64).cast()),
+                8,
+                Some(&mut returned),
+                None,
+            )
+        };
+        Ok(result.is_ok() && returned == 8 && token > 0 && file_change_token(file)? == Some(token))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(false)
+    }
+}
+
+fn file_object_identity(file: &File) -> Result<[u8; 32], TransferResult> {
+    let mut identity = Blake2s256::new();
+    identity.update(b"DeskLink verified file object v14\0");
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(|_| TransferResult::IoFailed)?;
+        identity.update(info.dwVolumeSerialNumber.to_le_bytes());
+        identity.update(info.nFileIndexHigh.to_le_bytes());
+        identity.update(info.nFileIndexLow.to_le_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().map_err(io_failed)?;
+        identity.update(metadata.dev().to_le_bytes());
+        identity.update(metadata.ino().to_le_bytes());
+    }
+    #[cfg(not(any(windows, unix)))]
+    return Err(TransferResult::Unsupported);
+    Ok(identity.finalize().into())
+}
+
+fn file_volume(file: &File) -> Result<u64, TransferResult> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx},
+        };
+        let mut info = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        }
+        .map_err(|_| TransferResult::IoFailed)?;
+        Ok(info.VolumeSerialNumber)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata().map_err(io_failed)?.dev())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        Err(TransferResult::Unsupported)
     }
 }
 
@@ -714,6 +809,7 @@ pub struct CheckpointLedger {
     root: [u8; 32],
     offset: u64,
     proof: Blake2s256,
+    verified_file: Option<[u8; 32]>,
 }
 
 impl CheckpointLedger {
@@ -800,6 +896,7 @@ impl CheckpointLedger {
             root,
             offset,
             proof,
+            verified_file: None,
         })
     }
 
@@ -819,6 +916,12 @@ impl CheckpointLedger {
     pub fn remaining_journal_bytes(&self) -> Result<u64, TransferResult> {
         Ok(checkpoint_ledger_bytes(self.size)?
             .saturating_sub(self.journal.metadata().map_err(io_failed)?.len()))
+    }
+
+    /// Compare the actual opened objects, avoiding a path/volume lookup race
+    /// when reserving payload and proof-cache growth on separate disks.
+    pub fn cache_shares_volume(&self, part: &File) -> Result<bool, TransferResult> {
+        Ok(file_volume(&self.journal)? == file_volume(part)?)
     }
 
     pub fn write_block(
@@ -859,6 +962,7 @@ impl CheckpointLedger {
             return Err(TransferResult::InvalidData);
         }
         part.seek(SeekFrom::Start(offset)).map_err(io_failed)?;
+        self.verified_file = None;
         part.write_all(bytes).map_err(io_failed)?;
         part.sync_data().map_err(io_failed)?;
         after_data_sync();
@@ -885,6 +989,7 @@ impl CheckpointLedger {
         cancellation: &AtomicBool,
         mut progress: impl FnMut(u64),
     ) -> Result<(), TransferResult> {
+        self.verified_file = None;
         cancelled(cancellation)?;
         if self.offset != self.size || part.metadata().map_err(io_failed)?.len() != self.size {
             return Err(TransferResult::InvalidData);
@@ -915,7 +1020,111 @@ impl CheckpointLedger {
         }
         cancelled(cancellation)?;
         part.sync_all().map_err(io_failed)?;
+        self.verified_file = Some(file_object_identity(part)?);
         Ok(())
+    }
+
+    /// Export the already-verified block records without reading file data.
+    /// Call only after publication renamed the SAME exclusively held writer,
+    /// before that writer is closed or any content is changed. The caller must
+    /// retain its writer permit and pinned directories throughout this call.
+    ///
+    /// Returns false without creating an index when the filesystem cannot seal
+    /// its pending USN close record. The next retry then uses the usual full
+    /// source-index build; unsupported change tokens never bypass validation.
+    /// Existing index paths are never overwritten.
+    /// `progress` reports logical payload bytes covered by exported proof
+    /// records, not data reads. Divide rounded-up by FILE_BLOCK_BYTES to obtain
+    /// the exact copied record count for a separate indexing activity scope.
+    pub fn export_verified_source_index(
+        &mut self,
+        published: &File,
+        index_path: &Path,
+        cancellation: &AtomicBool,
+        progress: impl FnMut(u64),
+    ) -> Result<bool, TransferResult> {
+        self.export_with_sealer(
+            published,
+            index_path,
+            cancellation,
+            progress,
+            seal_change_token,
+        )
+    }
+
+    fn export_with_sealer(
+        &mut self,
+        published: &File,
+        index_path: &Path,
+        cancellation: &AtomicBool,
+        mut progress: impl FnMut(u64),
+        seal: fn(&File) -> Result<bool, TransferResult>,
+    ) -> Result<bool, TransferResult> {
+        cancelled(cancellation)?;
+        if self.offset != self.size
+            || self.verified_file != Some(file_object_identity(published)?)
+            || published.metadata().map_err(io_failed)?.len() != self.size
+            || self.journal.metadata().map_err(io_failed)?.len()
+                != checkpoint_ledger_bytes(self.size)?
+        {
+            return Err(TransferResult::InvalidData);
+        }
+        published.sync_all().map_err(io_failed)?;
+        if !seal(published)? {
+            return Ok(false);
+        }
+        let (size, stamp) = source_stamp(published)?;
+        crate::transfer::ensure_receive_capacity(
+            index_path.parent().ok_or(TransferResult::InvalidData)?,
+            source_index_bytes(size)?,
+        )?;
+        let mut index = create_cache_file(index_path)?;
+        let result = (|| {
+            index.write_all(INDEX_MAGIC).map_err(io_failed)?;
+            index
+                .write_all(&FILE_BLOCK_BYTES.to_le_bytes())
+                .map_err(io_failed)?;
+            index.write_all(&[0; 4]).map_err(io_failed)?;
+            index.write_all(&size.to_le_bytes()).map_err(io_failed)?;
+            index.write_all(&stamp).map_err(io_failed)?;
+            index.write_all(&self.root).map_err(io_failed)?;
+            self.journal
+                .seek(SeekFrom::Start(LEDGER_HEADER_BYTES))
+                .map_err(io_failed)?;
+            let mut proof = root_hasher(size);
+            {
+                // Only sidecar records are read. Fixed buffers avoid one seek
+                // and several tiny syscalls for every block of a large file.
+                let mut records = BufReader::with_capacity(64 * 1024, &mut self.journal);
+                let mut output = BufWriter::with_capacity(64 * 1024, &mut index);
+                for number in 0..blocks(size) {
+                    cancelled(cancellation)?;
+                    let mut record = [0_u8; RECORD_BYTES as usize];
+                    records.read_exact(&mut record).map_err(io_failed)?;
+                    proof.update(&record[..32]);
+                    if digest(&proof).as_slice() != &record[32..] {
+                        return Err(TransferResult::InvalidData);
+                    }
+                    output.write_all(&record).map_err(io_failed)?;
+                    progress(((number + 1) * u64::from(FILE_BLOCK_BYTES)).min(size));
+                }
+                output.flush().map_err(io_failed)?;
+            }
+            cancelled(cancellation)?;
+            if digest(&proof) != self.root || source_stamp(published)? != (size, stamp) {
+                return Err(TransferResult::SourceChanged);
+            }
+            index.sync_all().map_err(io_failed)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            #[cfg(windows)]
+            let _ = crate::transfer_directory::native::delete_file(&index);
+            drop(index);
+            #[cfg(not(windows))]
+            let _ = fs::remove_file(index_path);
+        }
+        result
     }
 }
 
@@ -970,6 +1179,210 @@ mod tests {
         (0..FILE_BLOCK_BYTES as usize * 3 + 17)
             .map(|index| (index % 251) as u8)
             .collect()
+    }
+
+    #[cfg(windows)]
+    fn verified_destination(
+        fixture: &Fixture,
+    ) -> (
+        crate::transfer_directory::DirectoryDestination,
+        crate::transfer_directory::GuardedDestinationFile,
+        CheckpointLedger,
+        Vec<u8>,
+    ) {
+        use crate::transfer_directory::{DirectoryDestination, DirectoryScanLimits};
+        let mut destination = DirectoryDestination::create_new(
+            &fixture.0,
+            "received",
+            DirectoryScanLimits {
+                max_entries: 10,
+                max_total_bytes: 1024 * 1024,
+                max_file_bytes: 1024 * 1024,
+                max_depth: 10,
+                max_relative_path_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let bytes = sample();
+        let mut root = root_hasher(bytes.len() as u64);
+        for block in bytes.chunks(FILE_BLOCK_BYTES as usize) {
+            root.update(block_digest(block));
+        }
+        let mut part = destination.create_file("data.bin").unwrap();
+        let mut ledger = CheckpointLedger::open_or_create(
+            &fixture.path("receive.ledger"),
+            part.file_mut().unwrap(),
+            bytes.len() as u64,
+            digest(&root),
+        )
+        .unwrap();
+        for (number, block) in bytes.chunks(FILE_BLOCK_BYTES as usize).enumerate() {
+            ledger
+                .write_block(
+                    part.file_mut().unwrap(),
+                    number as u64 * u64::from(FILE_BLOCK_BYTES),
+                    block,
+                    block_digest(block),
+                )
+                .unwrap();
+        }
+        ledger
+            .verify_all(part.file_mut().unwrap(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        (destination, part, ledger, bytes)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn published_proofs_export_without_data_reads_survives_final_writer_close() {
+        let fixture = Fixture::new();
+        let (destination, part, mut ledger, bytes) = verified_destination(&fixture);
+        let index_path = fixture.path("published.index");
+        let mut copied = 0;
+        let mut sealed_stamp = None;
+        let published = part
+            .publish_with(|file| {
+                assert!(
+                    OpenOptions::new()
+                        .write(true)
+                        .open(destination.root().join("data.bin"))
+                        .is_err()
+                );
+                let mut same_handle = file;
+                same_handle.seek(SeekFrom::Start(123)).unwrap();
+                assert!(ledger.export_verified_source_index(
+                    file,
+                    &index_path,
+                    &AtomicBool::new(false),
+                    |count| copied = count
+                )?);
+                assert_eq!(
+                    same_handle.stream_position().unwrap(),
+                    123,
+                    "export must not read published file data"
+                );
+                sealed_stamp = Some(source_stamp(file)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(copied, bytes.len() as u64);
+        let stable = open_stable_source(&published).unwrap();
+        assert_eq!(
+            source_stamp(&stable).unwrap(),
+            sealed_stamp.unwrap(),
+            "last writer close invalidated exported cache"
+        );
+        let mut revalidated = 0;
+        let mut index = SourceIndex::open_from_file_with_control(
+            stable,
+            &index_path,
+            &AtomicBool::new(false),
+            |count| revalidated = count,
+        )
+        .unwrap();
+        assert_eq!(
+            revalidated, 0,
+            "unchanged NTFS publication must reuse proofs without a full data scan"
+        );
+        assert_eq!(index.content_root(), ledger.content_root());
+        assert_eq!(
+            index.resume_proof(bytes.len() as u64).unwrap(),
+            ledger.resume_proof()
+        );
+        assert_eq!(
+            index.read_block(0).unwrap().unwrap().bytes,
+            bytes[..FILE_BLOCK_BYTES as usize]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn proof_export_rejects_unverified_or_different_file_and_preserves_unsupported_fallback() {
+        let fixture = Fixture::new();
+        let (_destination, mut part, mut ledger, bytes) = verified_destination(&fixture);
+        let other = fixture.path("other.bin");
+        fs::write(&other, &bytes).unwrap();
+        let other = File::open(other).unwrap();
+        let index_path = fixture.path("published.index");
+        assert_eq!(
+            ledger.export_verified_source_index(
+                &other,
+                &index_path,
+                &AtomicBool::new(false),
+                |_| {}
+            ),
+            Err(TransferResult::InvalidData)
+        );
+        ledger.verified_file = None;
+        assert_eq!(
+            ledger.export_verified_source_index(
+                part.file_mut().unwrap(),
+                &index_path,
+                &AtomicBool::new(false),
+                |_| {}
+            ),
+            Err(TransferResult::InvalidData)
+        );
+        ledger
+            .verify_all(part.file_mut().unwrap(), &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert!(
+            !ledger
+                .export_with_sealer(
+                    part.file_mut().unwrap(),
+                    &index_path,
+                    &AtomicBool::new(false),
+                    |_| {},
+                    |_| Ok(false)
+                )
+                .unwrap()
+        );
+        assert!(
+            !index_path.exists(),
+            "unsupported sealing must retain the full-validation path"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_export_removes_only_its_new_index_and_keeps_published_data() {
+        let fixture = Fixture::new();
+        let (_destination, part, mut ledger, bytes) = verified_destination(&fixture);
+        let final_path = part.destination_path().to_owned();
+        let index_path = fixture.path("cancelled.index");
+        let cancellation = AtomicBool::new(false);
+        assert_eq!(
+            part.publish_with(|file| ledger
+                .export_verified_source_index(file, &index_path, &cancellation, |_| cancellation
+                    .store(true, Ordering::Release))
+                .map(|_| ())),
+            Err(TransferResult::Cancelled)
+        );
+        assert_eq!(fs::read(final_path).unwrap(), bytes);
+        assert!(!index_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_proof_export_refuses_index_without_removing_published_data() {
+        let fixture = Fixture::new();
+        let (_destination, part, mut ledger, bytes) = verified_destination(&fixture);
+        let final_path = part.destination_path().to_owned();
+        ledger
+            .journal
+            .seek(SeekFrom::Start(LEDGER_HEADER_BYTES))
+            .unwrap();
+        ledger.journal.write_all(&[0xff]).unwrap();
+        ledger.journal.sync_all().unwrap();
+        let index_path = fixture.path("bad.index");
+        assert_eq!(
+            part.publish_with(|file| ledger
+                .export_verified_source_index(file, &index_path, &AtomicBool::new(false), |_| {})
+                .map(|_| ())),
+            Err(TransferResult::InvalidData)
+        );
+        assert_eq!(fs::read(final_path).unwrap(), bytes);
+        assert!(!index_path.exists());
     }
 
     #[test]
@@ -1207,7 +1620,7 @@ mod tests {
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = cancellation.clone();
         let (ready, entered) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             let result = ledger.write_block_with_sync_hook(
                 &mut part,
@@ -1605,6 +2018,7 @@ mod tests {
             digest(&root),
         )
         .unwrap();
+        assert!(receive.cache_shares_volume(&part).unwrap());
         assert_eq!(
             source_index_bytes(bytes.len() as u64).unwrap(),
             INDEX_HEADER_BYTES + 2 * RECORD_BYTES

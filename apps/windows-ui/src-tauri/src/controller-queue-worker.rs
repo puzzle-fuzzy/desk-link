@@ -249,7 +249,7 @@ mod tests {
         let worker_seen = seen.clone();
         let (ready, entered) = tokio::sync::oneshot::channel();
         let mut ready = Some(ready);
-        let (release, released) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::sync_channel(1);
         let worker = LatestWorker::spawn(move |payload: Payload| {
             if payload.value == 1 {
                 ready.take().unwrap().send(()).unwrap();
@@ -347,7 +347,7 @@ mod tests {
     async fn dropping_handle_finishes_active_store_and_last_pending_snapshot_before_exit() {
         let (ready, entered) = tokio::sync::oneshot::channel();
         let mut ready = Some(ready);
-        let (release, released) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::sync_channel(1);
         let processed = Arc::new(Mutex::new(Vec::new()));
         let worker_processed = processed.clone();
         let worker = LatestWorker::spawn(move |value: u64| {
@@ -374,12 +374,7 @@ mod tests {
         );
         release.send(()).unwrap();
         timeout(Duration::from_secs(2), async {
-            loop {
-                match updates.changed().await {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-            }
+            while updates.changed().await.is_ok() {}
         })
         .await
         .unwrap();
@@ -431,7 +426,7 @@ mod tests {
         }
         let (ready, entered) = tokio::sync::oneshot::channel();
         let mut ready = Some(ready);
-        let (release, released) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::sync_channel(1);
         let worker = LatestWorker::spawn(move |owner: Arc<Owner>| {
             ready.take().unwrap().send(()).unwrap();
             released.recv_timeout(Duration::from_secs(5)).unwrap();
