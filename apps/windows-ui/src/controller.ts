@@ -117,6 +117,7 @@ import {
 } from "./file-transfer-recovery";
 import { fileQueueProtectionPresentation } from "./file-queue-protection";
 import { FileQueueView } from "./file-queue-view";
+import { FileDropTargetGate, nativeFileDropHitsSurface, type FileDropTarget } from "./file-drop-target";
 import {
   FileQueueActionGate,
   type FileQueueActionKind,
@@ -257,6 +258,7 @@ let discardFileRecoveryBusy = false;
 let discardFileQueueRecoveryBusy = false;
 const fileQueueActions = new FileQueueActionGate();
 const fileQueueView = new FileQueueView();
+const fileDropTargetGate = new FileDropTargetGate();
 let downloadsFolderBusy = false;
 let downloadsFolderMessage = "";
 let fileDropInitialized = false;
@@ -372,6 +374,8 @@ export async function initializeController(renderer: RenderRequest): Promise<voi
 }
 
 export function prepareControllerRender(): void {
+  fileDropTargetGate.clear();
+  setFileDragActive(false);
   const queue = document.querySelector<HTMLElement>("[data-controller-file-queue]");
   if (queue) fileQueueView.capture(queue);
   resetRemoteInputState();
@@ -1015,7 +1019,7 @@ function renderRemoteDesktop(): string {
           </div>
         <div class="remote-focus-hint" data-remote-focus-hint>${remotePanMode ? "浏览模式：拖动画面或滚轮查看，不会操作远程电脑" : "点击画面开始控制 · Ctrl+V 粘贴本机短文本 · Ctrl+Alt+Delete 必须在主机本地操作"}</div>
         <div class="remote-file-drop-overlay" data-controller-file-drop-overlay ${fileDragActive ? "" : "hidden"} aria-hidden="true">
-          ${icon("file-up")}<strong>松开鼠标，将文件加入发送队列</strong><span>文件会按顺序发送，不会打断画面和输入。</span>
+          ${icon("file-up")}<strong>松开鼠标，发送到设备 ${escapeHtml(attemptTarget || deviceIdDraft)}</strong><span>文件会加入等待队列，按顺序发送。</span>
         </div>
       </div>
     </section>
@@ -1504,6 +1508,7 @@ function handleSignal(signal: ControllerSignal): void {
       }
       remoteSurfaceState = nextSurfaceState;
       if (signal.runtime.state !== "connected") {
+        fileDropTargetGate.clear();
         if (remoteFullscreenActive || remoteFullscreenDesired) {
           void setRemoteFullscreen(false, false);
         }
@@ -2062,14 +2067,16 @@ async function chooseFileForTransfer(): Promise<void> {
   }
 }
 
-async function enqueueDroppedFiles(paths: string[]): Promise<void> {
+async function enqueueDroppedFiles(paths: string[], target: FileDropTarget): Promise<void> {
   if (paths.length === 0 || filePickerBusy || discardFileRecoveryBusy || discardFileQueueRecoveryBusy || fileQueueActions.busy) return;
   openTransferPanel();
   updateTransferPanel();
   try {
-    await queueControllerFiles(paths);
+    await queueControllerFiles(paths, target.streamId, target.deviceId);
   } catch (error) {
-    showFileQueueError(error);
+    if (channelGeneration === target.generation && snapshot?.runtime.streamId === target.streamId) {
+      showFileQueueError(error);
+    }
   }
 }
 
@@ -2157,18 +2164,25 @@ async function initializeNativeFileDrop(): Promise<void> {
   fileDropInitialized = true;
   try {
     await getCurrentWebview().onDragDropEvent((event) => {
-      const connected = snapshot?.runtime.state === "connected";
-      if (!connected) {
+      const payload = event.payload;
+      if (payload.type === "leave") {
+        fileDropTargetGate.clear();
         setFileDragActive(false);
         return;
       }
-      if (event.payload.type === "enter" || event.payload.type === "over") {
-        setFileDragActive(true);
-      } else if (event.payload.type === "leave") {
+      const runtime = snapshot?.runtime;
+      const target = runtime?.state === "connected" && runtime.streamId !== null
+        ? { streamId: runtime.streamId, deviceId: attemptTarget || deviceIdDraft, generation: channelGeneration }
+        : null;
+      if (payload.type === "enter") fileDropTargetGate.enter(target);
+      const accepted = fileDropTargetGate.accept(target,
+        nativeFileDropHitsSurface(payload.position, window.devicePixelRatio, document));
+      if (payload.type === "drop") {
+        fileDropTargetGate.clear();
         setFileDragActive(false);
-      } else if (event.payload.type === "drop") {
-        setFileDragActive(false);
-        void enqueueDroppedFiles(event.payload.paths);
+        if (accepted) void enqueueDroppedFiles(payload.paths, accepted);
+      } else {
+        setFileDragActive(accepted !== null);
       }
     });
   } catch {

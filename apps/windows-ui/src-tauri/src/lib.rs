@@ -608,19 +608,23 @@ async fn request_controller_clipboard(manager: State<'_, ControllerManager>) -> 
 async fn choose_and_send_controller_file(
     manager: State<'_, ControllerManager>,
 ) -> Result<(), String> {
+    let target = manager.capture_file_target()?;
     let paths = tauri::async_runtime::spawn_blocking(file_picker::pick_files)
         .await
         .map_err(|_| "DeskLink 无法打开 Windows 文件选择器。".to_owned())??;
-    manager.send_files(paths).await
+    manager.send_files(paths, target).await
 }
 
 #[tauri::command]
 async fn queue_controller_files(
     manager: State<'_, ControllerManager>,
     paths: Vec<String>,
+    stream_id: u64,
+    device_id: String,
 ) -> Result<(), String> {
+    let target = manager.file_drop_target(stream_id, &device_id)?;
     manager
-        .send_files(paths.into_iter().map(PathBuf::from).collect())
+        .send_files(paths.into_iter().map(PathBuf::from).collect(), target)
         .await
 }
 

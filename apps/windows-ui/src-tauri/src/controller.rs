@@ -597,6 +597,21 @@ struct PlaybackPressureSample {
     freshness_recoveries: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerFileTarget {
+    generation: u64,
+    stream_id: u64,
+    host_device_id: [u8; 16],
+}
+
+impl ControllerFileTarget {
+    fn matches(self, generation: u64, stream_id: Option<u64>, host_device_id: [u8; 16]) -> bool {
+        self.generation == generation
+            && Some(self.stream_id) == stream_id
+            && self.host_device_id == host_device_id
+    }
+}
+
 enum ControllerCommand {
     Input {
         stream_id: u64,
@@ -614,7 +629,10 @@ enum ControllerCommand {
     SendClipboard(String),
     PasteClipboard(String),
     RequestClipboard,
-    SendFiles(Vec<OutgoingFile>),
+    SendFiles {
+        target: ControllerFileTarget,
+        files: Vec<OutgoingFile>,
+    },
     RetryFile(OutgoingFile),
     RemoveQueuedFile {
         transfer_id: TransferId,
@@ -878,6 +896,7 @@ enum OutgoingFileEvent {
 }
 
 struct ControllerWorker {
+    generation: u64,
     host_device_id: [u8; 16],
     commands: mpsc::Sender<ControllerCommand>,
     cancellation: watch::Sender<bool>,
@@ -1630,6 +1649,7 @@ impl ControllerManager {
             .lock()
             .map_err(|_| "DeskLink 无法启动控制端任务。".to_owned())?;
         *worker = Some(ControllerWorker {
+            generation,
             host_device_id,
             commands,
             cancellation,
@@ -1709,27 +1729,95 @@ impl ControllerManager {
         self.send(ControllerCommand::RequestClipboard).await
     }
 
-    pub async fn send_files(&self, paths: Vec<PathBuf>) -> Result<(), String> {
+    pub fn capture_file_target(&self) -> Result<ControllerFileTarget, String> {
+        let _operation = self
+            .operation_guard
+            .lock()
+            .map_err(|_| "DeskLink 无法读取当前文件接收设备。".to_owned())?;
+        let runtime = self.snapshot();
+        let stream_id = runtime
+            .stream_id
+            .filter(|stream_id| *stream_id != 0)
+            .filter(|_| runtime.state == "connected")
+            .ok_or_else(|| "请先连接文件接收设备。".to_owned())?;
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| "DeskLink 无法读取当前文件接收设备。".to_owned())?;
+        let worker = worker
+            .as_ref()
+            .filter(|worker| self.is_current(worker.generation))
+            .ok_or_else(|| "当前远程控制会话已经结束。".to_owned())?;
+        Ok(ControllerFileTarget {
+            generation: worker.generation,
+            stream_id,
+            host_device_id: worker.host_device_id,
+        })
+    }
+
+    pub fn file_drop_target(
+        &self,
+        stream_id: u64,
+        device_id: &str,
+    ) -> Result<ControllerFileTarget, String> {
+        let target = self.capture_file_target()?;
+        let device_id =
+            crate::device_directory::parse_device_id(device_id).map_err(str::to_owned)?;
+        if target.stream_id != stream_id
+            || crate::device_directory::public_device_id(target.host_device_id) != device_id
+        {
+            return Err("文件接收会话已变化，请重新拖入文件。".to_owned());
+        }
+        Ok(target)
+    }
+
+    fn ensure_file_target(&self, target: ControllerFileTarget) -> Result<(), String> {
+        if self.capture_file_target()? == target {
+            Ok(())
+        } else {
+            Err("文件接收会话已变化，请重新选择或拖入文件。".to_owned())
+        }
+    }
+
+    pub async fn send_files(
+        &self,
+        paths: Vec<PathBuf>,
+        target: ControllerFileTarget,
+    ) -> Result<(), String> {
         if paths.is_empty() {
             return Ok(());
         }
         if paths.len() > MAX_FILE_QUEUE_ITEMS {
             return Err(format!("一次最多添加 {MAX_FILE_QUEUE_ITEMS} 个文件。"));
         }
-        let prepared = tauri::async_runtime::spawn_blocking(move || {
-            let mut files = Vec::with_capacity(paths.len());
-            for path in paths {
-                if files.iter().any(|file: &OutgoingFile| file.path == path) {
-                    continue;
+        let preparation = async {
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut files = Vec::with_capacity(paths.len());
+                for path in paths {
+                    if files.iter().any(|file: &OutgoingFile| file.path == path) {
+                        continue;
+                    }
+                    files.push(prepare_outgoing_file(path)?);
                 }
-                files.push(prepare_outgoing_file(path)?);
-            }
-            Ok::<_, TransferResult>(files)
-        })
-        .await
-        .map_err(|_| "DeskLink 无法读取所选文件。".to_owned())?
-        .map_err(|result| prepare_file_error_message(result).to_owned())?;
-        self.send(ControllerCommand::SendFiles(prepared)).await
+                Ok::<_, TransferResult>(files)
+            })
+            .await
+            .map_err(|_| "DeskLink 无法读取所选文件。".to_owned())?
+            .map_err(|result| prepare_file_error_message(result).to_owned())
+        };
+        self.send_files_after_preparation(target, preparation).await
+    }
+
+    async fn send_files_after_preparation(
+        &self,
+        target: ControllerFileTarget,
+        preparation: impl std::future::Future<Output = Result<Vec<OutgoingFile>, String>>,
+    ) -> Result<(), String> {
+        self.ensure_file_target(target)?;
+        let files = preparation.await?;
+        self.ensure_file_target(target)?;
+        self.send(ControllerCommand::SendFiles { target, files })
+            .await
     }
 
     pub async fn request_remote_file(&self) -> Result<(), String> {
@@ -2399,7 +2487,7 @@ async fn run_controller(
                     | Some(ControllerCommand::SendClipboard(_))
                     | Some(ControllerCommand::PasteClipboard(_))
                     | Some(ControllerCommand::RequestClipboard)
-                    | Some(ControllerCommand::SendFiles(_))
+                    | Some(ControllerCommand::SendFiles { .. })
                     | Some(ControllerCommand::RetryFile(_))
                     | Some(ControllerCommand::RemoveQueuedFile { .. })
                     | Some(ControllerCommand::ClearFileQueue { .. })
@@ -2716,7 +2804,14 @@ async fn run_controller(
                             Instant::now(),
                         ));
                     }
-                    Some(ControllerCommand::SendFiles(files)) => {
+                    Some(ControllerCommand::SendFiles { target, files }) => {
+                        // Preparation and IPC can outlive both a session switch and
+                        // an in-place reconnect. Never attach old files to either.
+                        if !manager.is_current(generation)
+                            || !target.matches(generation, manager.active_stream_id(), host_device_id)
+                        {
+                            continue;
+                        }
                         let occupied = queued_files.len() + usize::from(outgoing.is_some());
                         if files.is_empty() {
                             continue;
@@ -4834,16 +4929,16 @@ mod tests {
 
     use super::{
         COMMAND_CAPACITY, ClipboardOperation, ConnectFailure, ControllerAudioDecoder,
-        ControllerCommand, ControllerInput, ControllerManager, ControllerPlaybackPressure,
-        ControllerRenderMetrics, ControllerRuntimeSummary, ControllerVideoPullInput,
-        CurrentTransportWait, H264ProfileProbe, LastFileAction, MAX_BUFFERED_POINTER_MOVES,
-        PendingClipboardOperation, PendingRemoteFileRequest, PlaybackPressureSample,
-        RetryWaitOutcome, deadline_expired, directory_transport_error_is_retryable,
-        directory_transport_error_message, file_offer_matches_request, parse_input,
-        parse_transfer_id, remote_paste_shortcut_events, revalidate_queued_file,
-        session_earned_fresh_retry_budget, should_drop_buffered_pointer_move,
-        transfer_result_message, transfer_result_state, validate_text_input,
-        wait_for_file_queue_command, wait_for_retry_deadline,
+        ControllerCommand, ControllerFileTarget, ControllerInput, ControllerManager,
+        ControllerPlaybackPressure, ControllerRenderMetrics, ControllerRuntimeSummary,
+        ControllerVideoPullInput, ControllerWorker, CurrentTransportWait, H264ProfileProbe,
+        LastFileAction, MAX_BUFFERED_POINTER_MOVES, PendingClipboardOperation,
+        PendingRemoteFileRequest, PlaybackPressureSample, RetryWaitOutcome, deadline_expired,
+        directory_transport_error_is_retryable, directory_transport_error_message,
+        file_offer_matches_request, parse_input, parse_transfer_id, remote_paste_shortcut_events,
+        revalidate_queued_file, session_earned_fresh_retry_budget,
+        should_drop_buffered_pointer_move, transfer_result_message, transfer_result_state,
+        validate_text_input, wait_for_file_queue_command, wait_for_retry_deadline,
     };
     use apps_windows::{
         audio::RemoteAudioEncoder, transfer::OutgoingFile,
@@ -4859,6 +4954,94 @@ mod tests {
     use desklink_transport::{JoinRejectCode, TransportError};
 
     use crate::video_mailbox::{VideoDeliveryFrame, VideoMailboxKey, VideoMailboxOffer};
+
+    fn file_target_fixture() -> (
+        ControllerManager,
+        tokio::sync::mpsc::Receiver<ControllerCommand>,
+    ) {
+        let manager = ControllerManager::default();
+        manager
+            .operation_generation
+            .store(4, std::sync::atomic::Ordering::Release);
+        manager.set_status(ControllerRuntimeSummary::connected(9));
+        let (commands, receiver) = tokio::sync::mpsc::channel(4);
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        *manager.worker.lock().unwrap() = Some(ControllerWorker {
+            generation: 4,
+            host_device_id: [7; 16],
+            commands,
+            cancellation,
+            task: tauri::async_runtime::spawn(async {}),
+        });
+        (manager, receiver)
+    }
+
+    #[tokio::test]
+    async fn file_drop_requires_the_current_stream_and_device() {
+        let (manager, _) = file_target_fixture();
+        let device_id = crate::device_directory::format_device_id(
+            crate::device_directory::public_device_id([7; 16]),
+        );
+        assert!(manager.file_drop_target(9, &device_id).is_ok());
+        assert!(manager.file_drop_target(10, &device_id).is_err());
+        assert!(manager.file_drop_target(9, "123 456 789").is_err());
+        manager
+            .operation_generation
+            .store(5, std::sync::atomic::Ordering::Release);
+        assert!(manager.capture_file_target().is_err());
+    }
+
+    #[tokio::test]
+    async fn file_preparation_cannot_cross_a_stream_or_operation_change() {
+        for change_generation in [false, true] {
+            let (manager, mut receiver) = file_target_fixture();
+            let target = manager.capture_file_target().unwrap();
+            let result = manager
+                .send_files_after_preparation(target, async {
+                    // Model the session changing while blocking file hashing or a
+                    // native picker is in flight, without reading any user files.
+                    tokio::task::yield_now().await;
+                    if change_generation {
+                        manager
+                            .operation_generation
+                            .store(5, std::sync::atomic::Ordering::Release);
+                    } else {
+                        manager.set_status(ControllerRuntimeSummary::connected(10));
+                    }
+                    Ok(Vec::new())
+                })
+                .await;
+            assert!(result.is_err());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_files_keep_the_captured_target_in_the_native_command() {
+        let (manager, mut receiver) = file_target_fixture();
+        let target = manager.capture_file_target().unwrap();
+        manager
+            .send_files_after_preparation(target, std::future::ready(Ok(Vec::new())))
+            .await
+            .unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap(), ControllerCommand::SendFiles { target: actual, .. } if actual == target)
+        );
+    }
+
+    #[test]
+    fn queued_file_target_rejects_stale_commands_at_consumption() {
+        let target = ControllerFileTarget {
+            generation: 4,
+            stream_id: 9,
+            host_device_id: [7; 16],
+        };
+        assert!(target.matches(4, Some(9), [7; 16]));
+        assert!(!target.matches(5, Some(9), [7; 16]));
+        assert!(!target.matches(4, Some(10), [7; 16]));
+        assert!(!target.matches(4, None, [7; 16]));
+        assert!(!target.matches(4, Some(9), [8; 16]));
+    }
 
     #[tokio::test]
     async fn controller_video_mailbox_returns_only_the_exact_stream_configuration() {
@@ -5447,6 +5630,7 @@ mod tests {
         let (commands, mut receiver) = mpsc::channel(2);
         let (cancellation, _cancellation_receiver) = watch::channel(false);
         *manager.worker.lock().unwrap() = Some(super::ControllerWorker {
+            generation: 0,
             host_device_id: [1; 16],
             commands,
             cancellation,

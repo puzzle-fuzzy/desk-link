@@ -258,8 +258,8 @@ export function chooseAndSendControllerFile(): Promise<void> {
   return invoke<void>("choose_and_send_controller_file");
 }
 
-export function queueControllerFiles(paths: string[]): Promise<void> {
-  return invoke<void>("queue_controller_files", { paths });
+export function queueControllerFiles(paths: string[], streamId: number, deviceId: string): Promise<void> {
+  return invoke<void>("queue_controller_files", { paths, streamId, deviceId });
 }
 
 export function removeControllerQueuedFile(transferId: string): Promise<void> {
