@@ -910,6 +910,20 @@ async fn a_new_noise_session_never_reuses_the_same_stream_and_geometry_context()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_cannot_publish_a_new_epoch_with_an_old_frame_configuration_version() {
+    let fixture = HostTestFixture::new().await;
+    let (host, mut controller) = start_approved_raw(&fixture).await;
+    publish_raw_config(&host, &mut controller, 9, 1, 640, 360).await;
+    host.send(HostCommand::SendVideoConfig { stream_id: 9, version: 1, width: 800,
+        height: 600, bytes: vec![0, 0, 0, 1, 0x67, 0x4d] }).unwrap();
+    wait_for_state(&host, HostState::Closed).await;
+    let events = terminal_events(&host).await;
+    assert!(matches!(events.first(), Some(HostEvent::ReleaseAll)));
+    assert!(events.iter().any(|event| matches!(event, HostEvent::Error(HostError::Protocol(message)) if message.contains("configuration version"))));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_rejects_input_until_it_has_published_a_video_context() {
     let fixture = HostTestFixture::new().await;
     let (host, mut controller) = start_approved_raw(&fixture).await;

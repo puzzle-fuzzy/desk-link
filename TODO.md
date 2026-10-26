@@ -222,6 +222,8 @@
 
 - [x] 新认证会话与熵源补充：每个新 Noise 即使 stream/尺寸复用也取得不同随机起点序列中的 context；RNG 使用 try_fill_bytes，错误/零值/MAX 初始化失败均明确拒绝并缓存，无panic/回落1。新增合成熵源边界与真实 relay generation 切换回归；修复夹具无截止等待后新Noise回环0.70s通过，本分支完整FFI 62项通过。主题 `fix(DL2-013): fail closed on epoch entropy errors and verify reconnect identity`。
 
+- [x] FFI Host 发布前也校验同 stream 的尺寸变化必须提高真实 config_version；不在 Rust 层重写 Swift 帧版本。无效旧版本几何配置明确终止并保留清键，Controller原有same-version变化拒绝保持。新增本地回环与几何policy回归各1项通过。主题 `fix(DL2-013): require new frame versions for changed host geometry`。
+
 ### DL2-014 · P1 · 建立第二阶段统一性能基线
 
 - [ ] 先记录真实性能，再按阶段预算优化，保留前后同条件对照。

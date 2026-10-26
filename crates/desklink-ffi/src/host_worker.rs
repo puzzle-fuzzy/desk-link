@@ -951,6 +951,17 @@ impl VideoState {
         self.config.map(|config| config.context)
     }
 
+    fn validate_geometry_version(&self, stream_id: u64, version: u32, width: u16, height: u16) -> Result<(), HostError> {
+        if let Some(current) = self.config
+            && current.context.stream_id == stream_id
+            && (current.width, current.height) != (width, height)
+            && version <= current.version
+        {
+            return Err(HostError::Protocol("input geometry requires a new video configuration version".into()));
+        }
+        Ok(())
+    }
+
     fn context_for_geometry(
         &self,
         stream_id: u64,
@@ -991,6 +1002,7 @@ async fn handle_command(
             height,
             bytes,
         } => {
+            video.validate_geometry_version(stream_id, version, width, height)?;
             let context = video.context_for_geometry(stream_id, width, height)?;
             let config = VideoConfig {
                 protocol_version: PROTOCOL_VERSION,
@@ -1271,6 +1283,12 @@ mod tests {
         });
         assert_eq!(state.context_for_geometry(7, 640, 360).unwrap(), context);
         state.config.as_mut().unwrap().version = 2;
+        assert!(state.validate_geometry_version(7, 2, 800, 600).is_err());
+        assert!(state.validate_geometry_version(7, 1, 800, 600).is_err());
+        assert!(state.validate_geometry_version(7, 3, 800, 600).is_ok());
+        assert!(state.validate_geometry_version(7, 2, 640, 360).is_ok());
+        // A new stream is a distinct (stream, config_version) frame namespace.
+        assert!(state.validate_geometry_version(8, 1, 800, 600).is_ok());
         assert_eq!(state.context_for_geometry(7, 640, 360).unwrap(), context);
         assert_ne!(state.context_for_geometry(7, 800, 600).unwrap(), context);
         assert_ne!(state.context_for_geometry(8, 640, 360).unwrap(), context);
