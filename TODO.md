@@ -1169,7 +1169,7 @@
 - [ ] **MVP-00 本清单落稿**：本节写入 TODO.md 并提交。
   验收：git 历史可见本节首次提交。
 
-- [ ] **MVP-01 文档：合并架构决策记录**。2026-10-27 大合并引入的关键决策散在提交信息里：回调事件枚举重编号（Capabilities=13，Session/Clipboard/AudioPcm/File=14..17）、双输入路径（CapturedInputContext 显式上下文 + 会话门控派生上下文）、统一重连语义（可恢复错误保 runtime；显式重连边界退休输入并要求新握手）、固定密码 BLAKE2 派生目录码、会话命令经 SessionIo 走有序发送通道。写入 `docs/apple/merge-architecture-2026-10.md`，供后续开发对照。
+- [x] **MVP-01 文档：合并架构决策记录**。2026-10-27 大合并引入的关键决策散在提交信息里：回调事件枚举重编号（Capabilities=13，Session/Clipboard/AudioPcm/File=14..17）、双输入路径（CapturedInputContext 显式上下文 + 会话门控派生上下文）、统一重连语义（可恢复错误保 runtime；显式重连边界退休输入并要求新握手）、固定密码 BLAKE2 派生目录码、会话命令经 SessionIo 走有序发送通道。写入 `docs/apple/merge-architecture-2026-10.md`，供后续开发对照。
   验收：文档存在且内容与 `crates/desklink-ffi`、`ControllerBridge.swift` 当前实现一致（关键 file:line 抽查）。
 
 - [ ] **MVP-02 运维：单域名迁移阶段 2（已批准方案）**。中继身份收敛到 `p2p.yxswy.com`：Apple 端默认 `relayURL=quic://p2p.yxswy.com:4433`、serverName 同步；Windows `product-config.ts` 的 `MANAGED_RELAY_SERVER_NAME` 同步；部署文档与探针脚本参数更新。服务端保持双 SAN 证书过渡，旧保存记录（serverName=turn.p2p）继续可用；全部设备重新配对后再执行阶段 4（证书收缩 + 删 turn.p2p DNS），阶段 4 不在本轮。
