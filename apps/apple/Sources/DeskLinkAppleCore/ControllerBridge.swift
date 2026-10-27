@@ -1234,6 +1234,12 @@ public final class ControllerBridge: ObservableObject {
         remotePlatform = platform
     }
 
+    /// Drives the real terminal-error path: raw message → redaction →
+    /// user-facing mapping → `.failed` state.
+    public func publishErrorForTesting(_ message: String) {
+        publishErrorMessage(message)
+    }
+
     public func acceptErrorForTesting(stateValue: Int, recoverable: Bool) {
         consume(eventKind: 2, data: Data("transport unavailable".utf8), streamID: 0,
                 frameID: 0, configVersion: 0, width: 0, height: 0,
