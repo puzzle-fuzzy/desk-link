@@ -52,13 +52,13 @@ struct ControllerHomeView: View {
 
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: 20) {
-                        ConnectView(bridge: bridge, draft: draft)
+                        ConnectView(bridge: bridge, draft: draft, hasSavedHosts: !savedHosts.isEmpty)
                             .frame(minWidth: 330, maxWidth: .infinity, alignment: .top)
                         savedHostsPane
                             .frame(minWidth: 330, maxWidth: .infinity, alignment: .top)
                     }
                     VStack(alignment: .leading, spacing: 20) {
-                        ConnectView(bridge: bridge, draft: draft)
+                        ConnectView(bridge: bridge, draft: draft, hasSavedHosts: !savedHosts.isEmpty)
                         savedHostsPane
                     }
                 }

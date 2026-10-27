@@ -155,12 +155,68 @@ func deskLinkConnectionElapsed(_ interval: TimeInterval) -> String {
     return "已等待 \(seconds / 60) 分 \(seconds % 60) 秒"
 }
 
+/// First-use guidance shown only while no recent device exists: the three
+/// steps from a fresh install to a working session.
+struct DeskLinkFirstUseGuide: View {
+    var body: some View {
+        DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("开始使用 DeskLink", systemImage: "lightbulb")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(DeskLinkPalette.ink)
+                VStack(alignment: .leading, spacing: 8) {
+                    DeskLinkFirstUseGuideStep(number: 1, title: "在主机上开启共享",
+                        detail: "在要被控制的电脑上打开 DeskLink，进入“共享此设备”，点“开始共享”。")
+                    DeskLinkFirstUseGuideStep(number: 2, title: "记下设备 ID 和密码",
+                        detail: "主机页面会显示 12 位设备 ID，以及临时密码或你设置的固定密码。")
+                    DeskLinkFirstUseGuideStep(number: 3, title: "在此输入并连接",
+                        detail: "在下方输入设备 ID 和密码，点“连接设备”；主机批准后即可远控。")
+                }
+            }
+        }
+        .accessibilityIdentifier("first-use-guide")
+    }
+}
+
+struct DeskLinkFirstUseGuideStep: View {
+    let number: Int
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(DeskLinkPalette.primary))
+                .accessibilityLabel("第 \(number) 步")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskLinkPalette.secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 struct ConnectView: View {
     @ObservedObject var bridge: ControllerBridge
     @ObservedObject var draft: DeskLinkConnectionDraft
+    /// Hides the first-use guide as soon as one saved host exists.
+    var hasSavedHosts = false
+
+    /// The guide is a first-run affordance: one saved host permanently
+    /// replaces it with the regular connect panel flow.
+    var firstUseGuideVisible: Bool { !hasSavedHosts }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if firstUseGuideVisible {
+                DeskLinkFirstUseGuide()
+            }
             DeskLinkPanel(background: DeskLinkPalette.infoSurface) {
                 VStack(alignment: .leading, spacing: 16) {
                     Label("使用设备 ID 和密码连接", systemImage: "desktopcomputer.and.arrow.right")
