@@ -1285,61 +1285,67 @@ async fn accept_join(
     state: Arc<RelayState>,
     connection_id: u64,
 ) -> Option<(RelayJoin, ParticipantGuard)> {
-    let Ok((mut join_send, mut join_receive)) = connection.accept_bi().await else {
-        return None;
-    };
-    let request = match read_request(&mut join_receive).await {
-        Ok(request) => request,
-        Err(error) => {
-            log_connection_event("request_rejected", connection_id, join_reject_label(error));
-            if join_send
-                .write_all(&[join_error_code(&error)])
-                .await
-                .is_ok()
-            {
-                let _ = join_send.finish();
+    // A connection may serve any number of directory lookups before its
+    // joining request; controllers reuse the lookup connection for the
+    // session join instead of paying a second handshake. Lookup-only clients
+    // simply close, which fails the next accept and ends this handler exactly
+    // like the previous single-request behavior.
+    let (join, mut join_send) = loop {
+        let Ok((mut join_send, mut join_receive)) = connection.accept_bi().await else {
+            return None;
+        };
+        let request = match read_request(&mut join_receive).await {
+            Ok(request) => request,
+            Err(error) => {
+                log_connection_event("request_rejected", connection_id, join_reject_label(error));
+                if join_send
+                    .write_all(&[join_error_code(&error)])
+                    .await
+                    .is_ok()
+                {
+                    let _ = join_send.finish();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                return None;
+            }
+        };
+        match request {
+            RelayRequest::Join(join) => break (join, join_send),
+            RelayRequest::DirectoryLookup(lookup) => {
+                let response = state.lookup_directory(connection.remote_address().ip(), &lookup);
+                match response {
+                    Ok(mut invitation) => {
+                        log_connection_event("directory_lookup", connection_id, "found");
+                        let length = invitation.len() as u16;
+                        let sent = join_send.write_all(&[DIRECTORY_LOOKUP_FOUND]).await.is_ok()
+                            && join_send.write_all(&length.to_be_bytes()).await.is_ok()
+                            && join_send.write_all(&invitation).await.is_ok();
+                        invitation.fill(0);
+                        if sent {
+                            let _ = join_send.finish();
+                        }
+                    }
+                    Err((status, host_protocol_version)) => {
+                        log_connection_event(
+                            "directory_lookup",
+                            connection_id,
+                            directory_status_label(status),
+                        );
+                        let sent = join_send.write_all(&[status]).await.is_ok()
+                            && (status != DIRECTORY_LOOKUP_PROTOCOL_MISMATCH
+                                || join_send
+                                    .write_all(&host_protocol_version.unwrap_or(0).to_be_bytes())
+                                    .await
+                                    .is_ok());
+                        if sent {
+                            let _ = join_send.finish();
+                        }
+                    }
+                }
+                // Give the peer time to consume the completed response stream
+                // before this handler keeps the connection for reuse.
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            return None;
-        }
-    };
-    let join = match request {
-        RelayRequest::Join(join) => join,
-        RelayRequest::DirectoryLookup(lookup) => {
-            let response = state.lookup_directory(connection.remote_address().ip(), &lookup);
-            match response {
-                Ok(mut invitation) => {
-                    log_connection_event("directory_lookup", connection_id, "found");
-                    let length = invitation.len() as u16;
-                    let sent = join_send.write_all(&[DIRECTORY_LOOKUP_FOUND]).await.is_ok()
-                        && join_send.write_all(&length.to_be_bytes()).await.is_ok()
-                        && join_send.write_all(&invitation).await.is_ok();
-                    invitation.fill(0);
-                    if sent {
-                        let _ = join_send.finish();
-                    }
-                }
-                Err((status, host_protocol_version)) => {
-                    log_connection_event(
-                        "directory_lookup",
-                        connection_id,
-                        directory_status_label(status),
-                    );
-                    let sent = join_send.write_all(&[status]).await.is_ok()
-                        && (status != DIRECTORY_LOOKUP_PROTOCOL_MISMATCH
-                            || join_send
-                                .write_all(&host_protocol_version.unwrap_or(0).to_be_bytes())
-                                .await
-                                .is_ok());
-                    if sent {
-                        let _ = join_send.finish();
-                    }
-                }
-            }
-            // Keep the QUIC connection alive briefly so the peer can consume the completed
-            // response stream before this handler releases its final connection handle.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            return None;
         }
     };
     let replaced = match state.attach_participant(&join, connection_id, connection.clone()) {

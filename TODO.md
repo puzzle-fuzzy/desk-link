@@ -1175,7 +1175,7 @@
 - [x] **MVP-02 运维：单域名迁移阶段 2（已批准方案）**。中继身份收敛到 `p2p.yxswy.com`：Apple 端默认 `relayURL=quic://p2p.yxswy.com:4433`、serverName 同步；Windows `product-config.ts` 的 `MANAGED_RELAY_SERVER_NAME` 同步；部署文档与探针脚本参数更新。服务端保持双 SAN 证书过渡，旧保存记录（serverName=turn.p2p）继续可用；全部设备重新配对后再执行阶段 4（证书收缩 + 删 turn.p2p DNS），阶段 4 不在本轮。
   验收：三端测试引用新默认值通过；探针对 `p2p.yxswy.com:4433`（IP 直连验证 DNS 同值）握手成功；旧保存记录连接路径测试仍绿。
 
-- [ ] **MVP-03 连接速度：目录连接复用**。`connect_controller` 目录分支先用独立连接做 lookup、再新建连接入会话，每次新鲜目录连接多付一次完整 QUIC+TLS 握手（中继路径约 2-3 个 RTT）。改为 lookup 后在同一连接上直接 `join_relay` 入会话。
+- [x] **MVP-03 连接速度：目录连接复用**。`connect_controller` 目录分支先用独立连接做 lookup、再新建连接入会话，每次新鲜目录连接多付一次完整 QUIC+TLS 握手（中继路径约 2-3 个 RTT）。改为 lookup 后在同一连接上直接 `join_relay` 入会话。
   验收：Rust 测试证明目录路径只建立一次中继连接（连接计数或 observer）；现有 host_runtime/controller_runtime 全绿；实际连接建立时间对比记录在提交信息。
 
 - [x] **MVP-04 连接速度：初始静音移出关键路径**。`run_connected` 目前在进入事件循环前阻塞等待 `set_audio_enabled(false)`（最长 5 秒超时），视频首帧被这一 RTT 串行阻塞。改为把静音作为进入循环后的首个有序 owned send，与事件接收并行。

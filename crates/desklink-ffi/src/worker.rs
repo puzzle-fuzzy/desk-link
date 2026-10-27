@@ -1283,8 +1283,21 @@ async fn connect_controller(
     let relay_addr = resolve_relay(relay_url).map_err(ConnectFailure::permanent)?;
     let transport_config = QuicClientConfig::new(relay_addr, config.server_name.clone())
         .map_err(ConnectFailure::from_transport)?;
+    connect_controller_with_transport(transport_config, platform, config, callback).await
+}
+
+async fn connect_controller_with_transport(
+    transport_config: QuicClientConfig,
+    platform: Platform,
+    config: &SecureConnectionConfigOwned,
+    callback: CallbackTarget,
+) -> Result<ResolvedControllerConnection, ConnectFailure> {
+    let mut session_client: Option<QuicClient> = None;
     let (session_id, relay_authentication, host_verify_key, expires_at_unix_s) =
         if let Some(directory) = &config.directory {
+            // One connection serves both the directory lookup and the session
+            // join; a second QUIC/TLS handshake per fresh connect is pure
+            // connection-setup latency with no isolation benefit.
             let lookup_client = connect_relay(transport_config.clone())
                 .await
                 .map_err(ConnectFailure::from_transport)?;
@@ -1317,7 +1330,9 @@ async fn connect_controller(
                     ))
                 });
             invitation.zeroize();
-            result?
+            let material = result?;
+            session_client = Some(lookup_client);
+            material
         } else {
             (
                 config.session_id,
@@ -1326,19 +1341,27 @@ async fn connect_controller(
                 config.expires_at_unix_s,
             )
         };
-    let client = connect_relay(transport_config)
-        .await
-        .map_err(ConnectFailure::from_transport)?;
-    join_relay(
-        &client,
-        RelayJoin::controller_with_participant(
-            SessionId::from_bytes(session_id),
-            relay_authentication,
-            config.controller_device_id,
-        ),
-    )
-    .await
-    .map_err(ConnectFailure::from_transport)?;
+    let join = RelayJoin::controller_with_participant(
+        SessionId::from_bytes(session_id),
+        relay_authentication,
+        config.controller_device_id,
+    );
+    let client = 'session: {
+        if let Some(reused) = session_client
+            && join_relay(&reused, join.clone()).await.is_ok()
+        {
+            break 'session reused;
+            // Older relays close the connection after answering a lookup;
+            // fall back to a dedicated join connection below.
+        }
+        let client = connect_relay(transport_config)
+            .await
+            .map_err(ConnectFailure::from_transport)?;
+        join_relay(&client, join)
+            .await
+            .map_err(ConnectFailure::from_transport)?;
+        client
+    };
     callback.emit_state(DesklinkState::SecureHandshake, 0);
     let identity =
         DeviceIdentity::from_secret_key(config.controller_device_id, &config.controller_secret_key);
@@ -1947,3 +1970,146 @@ mod tests {
 #[cfg(test)]
 #[path = "worker/concurrent_send_tests.rs"]
 mod concurrent_send_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_connect_reuses_its_lookup_connection_for_the_session() {
+    use desklink_crypto::{DeviceIdentity, PairingInvite, SessionId};
+    use desklink_relay::{RelayConfig, RelayServer};
+    use desklink_transport::{QuicClient, QuicClientConfig, RelayDirectoryRegistration};
+    use rand_core::{OsRng, RngCore};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let der = certificate.cert.der().to_vec();
+    let server_config = quinn::ServerConfig::with_single_cert(
+        vec![rustls::pki_types::CertificateDer::from(der.clone())],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
+    )
+    .unwrap();
+    let relay = Arc::new(
+        RelayServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_config,
+            RelayConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let address = relay.local_addr().unwrap();
+    let relay_task = {
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            let _ = relay.run().await;
+        })
+    };
+    let der_for_closure = der.clone();
+    let client_config = move || {
+        let mut roots = rustls::RootCertStore::empty();
+        let _ = roots.add(rustls::pki_types::CertificateDer::from(
+            der_for_closure.clone(),
+        ));
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        QuicClientConfig::with_client_config(
+            address,
+            "localhost",
+            quinn::ClientConfig::new(Arc::new(quic_tls)),
+        )
+    };
+
+    // Host side: register one directory entry from its own connection.
+    let host_identity = DeviceIdentity::from_secret_key([7; 16], &[8; 32]);
+    let password: [u8; 8] = *b"ABCDEFGH";
+    let code = desklink_crypto::PairingCode::derive_from_password(&password).unwrap();
+    let mut session_id = [0u8; 16];
+    let mut authentication = [0u8; 32];
+    OsRng.fill_bytes(&mut session_id);
+    OsRng.fill_bytes(&mut authentication);
+    let invite = PairingInvite::for_persistent_connection(
+        &host_identity,
+        SessionId::from_bytes(session_id),
+        authentication,
+    )
+    .encode()
+    .unwrap();
+    let registration = RelayDirectoryRegistration::new(
+        crate::host_directory::public_host_device_id(host_identity.device_id),
+        *code.as_bytes(),
+        invite.as_bytes().to_vec(),
+        0,
+    )
+    .unwrap();
+    let registrar = QuicClient::connect(client_config()).await.unwrap();
+    let host_join = RelayJoin::host_with_participant(
+        SessionId::from_bytes(session_id),
+        authentication,
+        host_identity.device_id,
+    )
+    .with_directory_registration(registration)
+    .unwrap();
+    registrar.join(host_join).await.unwrap();
+    let connections_after_registration = relay.capacity_snapshot().accepted_connections;
+    assert_eq!(connections_after_registration, 1);
+
+    // Controller side: the worker's directory connect must finish with
+    // exactly one additional relay connection (lookup + join on it).
+    let controller_secret = [10u8; 32];
+    let controller_identity = DeviceIdentity::from_secret_key([9; 16], &controller_secret);
+    let config = SecureConnectionConfigOwned {
+        server_name: "localhost".to_owned(),
+        session_id: [0; 16],
+        relay_authentication: [0; 32],
+        controller_device_id: controller_identity.device_id,
+        controller_secret_key: controller_secret,
+        host_verify_key: [0; 32],
+        expires_at_unix_s: None,
+        authorization_type: 0,
+        directory: Some(DirectoryConnectionConfigOwned {
+            device_id: crate::host_directory::public_host_device_id(host_identity.device_id),
+            access_code: *code.as_bytes(),
+        }),
+    };
+    // The lookup and the session join run first; the connect then parks in
+    // the Noise handshake waiting for a host responder this test never
+    // provides. Parking there proves lookup+join already completed, and
+    // the relay must have accepted exactly one controller connection.
+    let mut roots = rustls::RootCertStore::empty();
+    let _ = roots.add(rustls::pki_types::CertificateDer::from(der.clone()));
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let transport = QuicClientConfig::with_client_config(
+        address,
+        "localhost",
+        quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )),
+    );
+    let parked = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_controller_with_transport(
+            transport,
+            Platform::MacOS,
+            &config,
+            CallbackTarget {
+                callback: None,
+                context: 0,
+            },
+        ),
+    )
+    .await;
+    match parked {
+        Err(_) => {}
+        Ok(Err(failure)) => panic!("connect failed early: {}", failure.message),
+        Ok(Ok(_)) => panic!("connect unexpectedly completed without a host responder"),
+    }
+    assert_eq!(
+        relay.capacity_snapshot().accepted_connections,
+        connections_after_registration + 1,
+        "directory lookup and session join must share one connection"
+    );
+    registrar.close(b"test complete");
+    relay_task.abort();
+}

@@ -1502,3 +1502,46 @@ async fn malformed_datagram_channel_is_closed_without_payload_inspection() {
         .await
         .expect("relay did not close malformed datagram");
 }
+
+#[tokio::test]
+async fn directory_lookup_connection_can_reuse_itself_for_the_session_join() {
+    let relay = spawn_test_relay().await;
+    let device_id = 143_456_789_012;
+    let access_code = *b"AB2DEF3G";
+    let invitation = b"reusable connection invitation".to_vec();
+    let registration =
+        RelayDirectoryRegistration::new(device_id, access_code, invitation, 60).unwrap();
+    let host_client = QuicClient::connect(config(&relay)).await.unwrap();
+    host_client
+        .join(
+            RelayJoin::host_with_participant(session(43), [4; 32], [7; 16])
+                .with_directory_registration(registration)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // One controller connection performs the lookup and then joins the
+    // looked-up session; the relay must keep serving it after the lookup.
+    let controller = QuicClient::connect(config(&relay)).await.unwrap();
+    assert_eq!(
+        controller
+            .lookup_directory(RelayDirectoryLookup::new(device_id, access_code).unwrap())
+            .await
+            .unwrap(),
+        b"reusable connection invitation".to_vec()
+    );
+    controller
+        .join(RelayJoin::controller_with_participant(
+            session(43),
+            [4; 32],
+            [8; 16],
+        ))
+        .await
+        .unwrap();
+    let snapshot = relay.server.capacity_snapshot();
+    assert_eq!(snapshot.accepted_connections, 2);
+    assert_eq!(snapshot.attached_participants, 2);
+    controller.close(b"reuse complete");
+    host_client.close(b"test complete");
+}
