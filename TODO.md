@@ -1161,6 +1161,44 @@
 - [x] Windows 实跑：4 项纯策略测试和 3 项真实 QUIC / Noise 本地回环覆盖正负 10 分钟、双端时钟跳变、重复序号、旧 context 极值、u64 边界；整套 `python scripts/run-windows-cargo.py test -p desklink-ffi --lib --tests --locked` 共 71 项通过。
 - [ ] Apple 真机：Mac Host 与真实 Windows / iOS controller 的时钟偏差、系统校时及输入恢复仍需设备验收；本地回环不代表系统事件注入或硬件证明。
 
+## MVP 后产品优化（第三阶段，2026-10-28 起）
+
+> 背景：Windows/macOS/iOS 三端 MVP 已可用并完成合并（`23ba00d`）、固定密码放开（`a4d80d0`）。本阶段目标：连接速度、界面简洁、用户体验、代码完备、测试程度五条线的可验证改进。
+> 纪律沿用本文件既有约定：完成一项并通过对应验证后立即独立 commit，同时勾选该项；每项写明验收标准。编号 MVP-xx。不考虑时间与人力成本，但每项必须有可复现的验证手段。
+
+- [ ] **MVP-00 本清单落稿**：本节写入 TODO.md 并提交。
+  验收：git 历史可见本节首次提交。
+
+- [ ] **MVP-01 文档：合并架构决策记录**。2026-10-27 大合并引入的关键决策散在提交信息里：回调事件枚举重编号（Capabilities=13，Session/Clipboard/AudioPcm/File=14..17）、双输入路径（CapturedInputContext 显式上下文 + 会话门控派生上下文）、统一重连语义（可恢复错误保 runtime；显式重连边界退休输入并要求新握手）、固定密码 BLAKE2 派生目录码、会话命令经 SessionIo 走有序发送通道。写入 `docs/apple/merge-architecture-2026-10.md`，供后续开发对照。
+  验收：文档存在且内容与 `crates/desklink-ffi`、`ControllerBridge.swift` 当前实现一致（关键 file:line 抽查）。
+
+- [ ] **MVP-02 运维：单域名迁移阶段 2（已批准方案）**。中继身份收敛到 `p2p.yxswy.com`：Apple 端默认 `relayURL=quic://p2p.yxswy.com:4433`、serverName 同步；Windows `product-config.ts` 的 `MANAGED_RELAY_SERVER_NAME` 同步；部署文档与探针脚本参数更新。服务端保持双 SAN 证书过渡，旧保存记录（serverName=turn.p2p）继续可用；全部设备重新配对后再执行阶段 4（证书收缩 + 删 turn.p2p DNS），阶段 4 不在本轮。
+  验收：三端测试引用新默认值通过；探针对 `p2p.yxswy.com:4433`（IP 直连验证 DNS 同值）握手成功；旧保存记录连接路径测试仍绿。
+
+- [ ] **MVP-03 连接速度：目录连接复用**。`connect_controller` 目录分支先用独立连接做 lookup、再新建连接入会话，每次新鲜目录连接多付一次完整 QUIC+TLS 握手（中继路径约 2-3 个 RTT）。改为 lookup 后在同一连接上直接 `join_relay` 入会话。
+  验收：Rust 测试证明目录路径只建立一次中继连接（连接计数或 observer）；现有 host_runtime/controller_runtime 全绿；实际连接建立时间对比记录在提交信息。
+
+- [ ] **MVP-04 连接速度：初始静音移出关键路径**。`run_connected` 目前在进入事件循环前阻塞等待 `set_audio_enabled(false)`（最长 5 秒超时），视频首帧被这一 RTT 串行阻塞。改为把静音作为进入循环后的首个有序 owned send，与事件接收并行。
+  验收：worker 测试断言"新控制器先静音"仍成立且顺序在任何用户音频命令之前；事件循环不再被静音 RTT 阻塞（测试：静音未完成时 VideoConfig 事件可被处理）。
+
+- [ ] **MVP-05 体验：macOS 首次使用引导**。无最近设备时连接页给三步引导（对端开共享 → 输入 12 位设备号与密码 → 点击连接），消除首次使用空窗。
+  验收：SwiftUI 测试/快照断言空状态渲染引导且在出现最近设备后隐藏；macOS 测试套全绿。
+
+- [ ] **MVP-06 体验：会话终态失败一键重连**。核查 SessionView 在 `.failed` 终态是否保留原目标的一键重连入口；缺失则补（沿用连接页失败重试的原目标保留语义）。
+  验收：视图测试覆盖 failed → 点击重连 → 回到连接流程且原目标保留；macOS 测试套全绿。
+
+- [ ] **MVP-07 完备：FFI 诊断日志**。`DesklinkConfig.log_level` 目前是死参数，现场排障（如 DNS/中继故障）无任何日志。实现 `DESKLINK_LOG` 环境变量开启的结构化 stderr 日志：连接阶段推进、重连调度（次数/延迟/原因分类）、目录查找失败码、终态错误。默认关闭零开销。
+  验收：环境变量开关下端到端测试捕获到阶段日志；关闭时无输出；clippy/fmt 全绿。
+
+- [ ] **MVP-08 完备：修复 transfer_task 测试在 macOS 的失败**。`desklink-windows` 的 transfer_task_catalog/transfer_task_tests 共约 22 项在 macOS 失败（main 已有），按目录项语义差异（目录 kind/替换/重扫）逐项修复或按平台显式跳过并注明原因，不得静默删除。
+  验收：`cargo test -p desklink-windows` 在 macOS 全绿（或显式 skip 带理由），并在 Windows CI 配置上不受影响。
+
+- [ ] **MVP-09 测试：Apple/Rust macOS CI**。新增 GitHub Actions macOS workflow：cargo fmt --check、clippy -D warnings、workspace 测试（除显式 skip）、`apps/apple` 与 `apps/macos` swift test（先安装 cmake 供 opus-head-sys）。当前仓库无任何 macOS Swift CI。
+  验收：workflow 在本仓库跑通一次全绿；提交状态徽记可用。
+
+- [ ] **MVP-10 测试：固定密码保存材料端到端重连**。Rust e2e：固定密码目录连接成功 → 保存材料 → 断开 → 用保存材料重连（不再输密码）成功且身份一致；覆盖派生码路径。
+  验收：新 e2e 测试通过并纳入 verify-macos-runtime 门禁链。
+
 ## 10. 第一阶段历史记录
 
 以下原文按本次审查前状态保留，仅供追溯。里面的“当前”“未验收”“下一阶段”、旧版本、线上探针结果和勾选项均属于原记录日期；第二阶段以本文前九节为准。尚未完成的签名、安装或设备组合验收可以继续引用，但不能用来否定用户本次已确认的两条远控路径。
