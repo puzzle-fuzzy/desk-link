@@ -35,12 +35,13 @@ impl HostDirectorySession {
     pub(crate) fn prepare(
         identity: &DeviceIdentity,
         mode: HostAccessMode,
-        access_code: [u8; 8],
+        password: &[u8],
         now_unix_s: u64,
     ) -> Result<(Self, PairingInvite, HostDirectoryCredentials), HostError> {
-        // PairingCode owns and zeroes the validated secret when preparation ends.
-        let code =
-            PairingCode::from_bytes(access_code).map_err(|_| HostError::InvalidAccessCode)?;
+        // Any password bytes of sufficient length are accepted; the directory
+        // code is derived so the controller typing the same password matches.
+        let code = PairingCode::derive_from_password(password)
+            .map_err(|_| HostError::InvalidAccessCode)?;
         let invite = match mode {
             HostAccessMode::Temporary => {
                 PairingInvite::new(identity, now_unix_s, MAX_PAIRING_TTL_S)
@@ -131,13 +132,9 @@ mod tests {
     #[test]
     fn temporary_registration_reconnect_never_extends_signed_invitation_lifetime() {
         let identity = DeviceIdentity::from_secret_key([7; 16], &[8; 32]);
-        let (directory, invite, credentials) = HostDirectorySession::prepare(
-            &identity,
-            HostAccessMode::Temporary,
-            *b"ABCDEFGH",
-            1_000,
-        )
-        .unwrap();
+        let (directory, invite, credentials) =
+            HostDirectorySession::prepare(&identity, HostAccessMode::Temporary, b"ABCDEFGH", 1_000)
+                .unwrap();
         assert_eq!(credentials.expires_at_unix_s, 1_600);
         let join = || {
             RelayJoin::host_with_participant(
@@ -166,17 +163,22 @@ mod tests {
     fn fixed_registration_lives_only_on_its_connection_and_new_start_rotates_invitation() {
         let identity = DeviceIdentity::from_secret_key([7; 16], &[8; 32]);
         let (directory, first, credentials) =
-            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, *b"ABCDEFGH", 1_000)
+            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, b"ABCDEFGH", 1_000)
                 .unwrap();
         assert_eq!(credentials.expires_at_unix_s, 0);
         assert_eq!(directory.registration.ttl_s(), 0);
         let (_, next, _) =
-            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, *b"ABCDEFGH", 1_001)
+            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, b"ABCDEFGH", 1_001)
                 .unwrap();
         assert_ne!(first.session_id(), next.session_id());
         assert_ne!(first.relay_authentication(), next.relay_authentication());
+        // Any characters are accepted now; only insufficient length fails.
+        assert!(
+            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, b"p@55w0rd!", 1_000)
+                .is_ok()
+        );
         assert!(matches!(
-            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, *b"ABCD0FGH", 1_000),
+            HostDirectorySession::prepare(&identity, HostAccessMode::Fixed, b"short", 1_000),
             Err(HostError::InvalidAccessCode)
         ));
     }

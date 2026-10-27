@@ -7,10 +7,13 @@ final class HostAccessPresentationTests: XCTestCase {
         screenRecordingSettingsURL: MacPermissions.screenRecordingSettingsURL,
         accessibilitySettingsURL: MacPermissions.accessibilitySettingsURL)
 
-    func testPasswordConfirmationUsesWindowsNormalization() {
-        XCTAssertNil(HostFixedPasswordValidation.message(password: "abcd-2345", confirmation: "ABCD 2345"))
+    func testPasswordConfirmationRequiresExactMatchAndSufficientLength() {
+        // Passwords are verbatim: case and separators matter on both peers.
+        XCTAssertNil(HostFixedPasswordValidation.message(password: "abcd-2345", confirmation: "abcd-2345"))
+        XCTAssertNil(HostFixedPasswordValidation.message(password: "correct horse:电池 🐎!", confirmation: "correct horse:电池 🐎!"))
+        XCTAssertNotNil(HostFixedPasswordValidation.message(password: "abcd-2345", confirmation: "ABCD 2345"))
         XCTAssertNotNil(HostFixedPasswordValidation.message(password: "ABCD2345", confirmation: "ABCD2346"))
-        XCTAssertNotNil(HostFixedPasswordValidation.message(password: "ABCD2340", confirmation: "ABCD2340"))
+        XCTAssertNotNil(HostFixedPasswordValidation.message(password: "ABCD2340", confirmation: "short"))
     }
 
     func testRelayReadyIsNotDescribedAsConnecting() {

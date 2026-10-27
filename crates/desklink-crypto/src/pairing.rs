@@ -8,6 +8,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_CODE_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+/// User-chosen access passwords may use any characters; only their UTF-8
+/// length is bounded. Both peers derive the same 8-byte directory code from
+/// the exact password bytes, so any normalization difference is a mismatch.
+pub const MIN_ACCESS_PASSWORD_BYTES: usize = 8;
+pub const MAX_ACCESS_PASSWORD_BYTES: usize = 64;
+const ACCESS_PASSWORD_DERIVATION_DOMAIN: &[u8] = b"desklink-directory-access-v1";
 const PAIRING_INVITE_MAGIC: &[u8; 4] = b"DLPI";
 const PAIRING_INVITE_VERSION: u8 = 1;
 const PAIRING_INVITE_SIGNED_BYTES: usize = 117;
@@ -47,6 +53,37 @@ impl PairingCode {
 
     pub fn as_bytes(&self) -> &[u8; PAIRING_CODE_LENGTH] {
         &self.bytes
+    }
+
+    /// Derives the directory code from a user-chosen password of any
+    /// characters. The 8-byte BLAKE2b digest keeps the wire format unchanged
+    /// while removing the display-alphabet restriction from typed passwords.
+    pub fn derive_from_password(password: &[u8]) -> Result<Self, PairingError> {
+        use blake2::digest::consts::U8;
+        use blake2::{Blake2b, Digest};
+
+        if !(MIN_ACCESS_PASSWORD_BYTES..=MAX_ACCESS_PASSWORD_BYTES).contains(&password.len()) {
+            return Err(PairingError::InvalidCode);
+        }
+        type Blake2b64 = Blake2b<U8>;
+        let digest = Blake2b64::new()
+            .chain_update(ACCESS_PASSWORD_DERIVATION_DOMAIN)
+            .chain_update(password)
+            .finalize();
+        let mut bytes = [0u8; PAIRING_CODE_LENGTH];
+        bytes.copy_from_slice(&digest);
+        Ok(Self { bytes })
+    }
+
+    /// Trusted constructor for codes that are already directory-final bytes
+    /// (derived earlier, or relayed through saved connection material). The
+    /// display alphabet only exists for generated codes, never as a security
+    /// property, so arbitrary byte values are accepted here.
+    pub fn from_directory_code(bytes: [u8; PAIRING_CODE_LENGTH]) -> Result<Self, PairingError> {
+        if bytes == [0; PAIRING_CODE_LENGTH] {
+            return Err(PairingError::InvalidCode);
+        }
+        Ok(Self { bytes })
     }
 
     pub fn from_bytes(bytes: [u8; PAIRING_CODE_LENGTH]) -> Result<Self, PairingError> {

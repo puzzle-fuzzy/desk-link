@@ -33,17 +33,19 @@ final class HostAccessCredentialsTests: XCTestCase {
         }
     }
 
-    func testPasswordInputNormalizationMatchesWindowsAndStoredBytesStayStrict() throws {
-        XCTAssertEqual(try HostAccessPassword("ab cd-efgh").revealed, "ABCDEFGH")
-        XCTAssertEqual(try HostAccessPassword("abcd-efgh"), try HostAccessPassword(bytes: Array("ABCDEFGH".utf8)))
-        // Windows uses Unicode uppercase expansion before its ASCII alphabet check.
-        XCTAssertEqual(try HostAccessPassword("ßABCDEF").revealed, "SSABCDEF")
-        for value in ["ABCDEFG", "ABCDEFGHJ", "ABCD0FGH", "ABCD1FGH", "ABCDIFGH", "ABCDOFGH", "ABCD\tEFGH", "ABCD\nEFGH", "ＡＢＣＤＥＦＧＨ", "ABCD😀FGH"] {
+    func testPasswordAcceptsAnyCharactersWithSufficientLength() throws {
+        // Any characters are valid; only the byte length is bounded, and
+        // surrounding whitespace is trimmed while inner bytes stay verbatim.
+        XCTAssertEqual(try HostAccessPassword(" ABCDEFGH ").revealed, "ABCDEFGH")
+        XCTAssertEqual(try HostAccessPassword("correct horse:电池 🐎!").revealed,
+                       "correct horse:电池 🐎!")
+        XCTAssertEqual(try HostAccessPassword("p@ssw0rd").bytes, Array("p@ssw0rd".utf8))
+        for value in ["", "  ", "short", "1234567", String(repeating: "x", count: 65)] {
             XCTAssertThrowsError(try HostAccessPassword(value)) {
                 XCTAssertEqual($0 as? HostAccessCredentialsError, .invalidPassword)
             }
         }
-        XCTAssertThrowsError(try HostAccessPassword(bytes: Array("abcdefgh".utf8)))
+        XCTAssertThrowsError(try HostAccessPassword(bytes: Array("abcdefgh".utf8).dropLast()))
     }
 
     func testPasswordDescriptionsAndReflectionDoNotExposeValue() throws {
@@ -72,7 +74,7 @@ final class HostAccessCredentialsTests: XCTestCase {
         let first = try HostAccessPassword("ABCDEFGH")
         try store.save(first)
         XCTAssertEqual(try store.load(), first)
-        let second = try HostAccessPassword("23456789")
+        let second = try HostAccessPassword("correct horse:电池 staple!")
         try store.save(second)
         XCTAssertEqual(try store.load(), second)
         try store.clear()
@@ -81,15 +83,16 @@ final class HostAccessCredentialsTests: XCTestCase {
         XCTAssertEqual(try keychain.read(service: "unrelated", account: "other"), Data([99]))
     }
 
-    func testFixedRecordRejectsWrongVersionLengthAndNoncanonicalPassword() throws {
+    func testFixedRecordRejectsWrongVersionAndNoncanonicalPassword() throws {
         let valid = HostFixedAccessStore.encode(try HostAccessPassword("ABCDEFGH"))
-        XCTAssertEqual(valid.count, HostFixedAccessStore.recordLength)
+        XCTAssertEqual(valid, Data([1]) + Data("ABCDEFGH".utf8))
         XCTAssertEqual(valid.first, HostFixedAccessStore.formatVersion)
         for invalid in [
-            Data(), Data(valid.dropLast()), valid + Data([0]),
+            Data(), Data(valid.dropLast()),
             Data([2]) + Data(valid.dropFirst()),
-            Data([1]) + Data("abcdefgh".utf8),
-            Data([1]) + Data("ABCD0FGH".utf8),
+            Data([1]),
+            Data([1]) + Data("short".utf8),
+            Data([1]) + Data(String(repeating: "x", count: 65).utf8),
         ] {
             XCTAssertThrowsError(try HostFixedAccessStore.decode(invalid)) {
                 XCTAssertEqual($0 as? HostAccessCredentialsError, .malformedRecord)

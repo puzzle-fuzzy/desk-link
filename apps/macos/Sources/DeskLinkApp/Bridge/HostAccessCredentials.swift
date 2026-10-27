@@ -15,7 +15,7 @@ enum HostAccessCredentialsError: Error, Equatable, LocalizedError {
         case .invalidDeviceID:
             "本机设备身份无效，请重新启动 DeskLink。"
         case .invalidPassword:
-            "访问密码应为 8 位字母或数字，不支持 0、1、I、O。"
+            "访问密码需为 8 到 64 个字符，可以使用任意字符。"
         case .malformedRecord:
             "受保护的固定密码已损坏，请重新设置。"
         case .keychain, .storageUnavailable:
@@ -54,28 +54,33 @@ enum HostPublicDeviceID {
 struct HostAccessPassword: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible,
     CustomReflectable
 {
-    static let length = 8
+    /// Access passwords accept any characters; only the byte length is
+    /// bounded. Both DeskLink peers derive the directory code from the exact
+    /// same password bytes, so the value is stored and transmitted verbatim.
+    static let minimumLength = 8
+    static let maximumLength = 64
+    private static let generatedLength = 8
     private static let alphabet = Array("23456789ABCDEFGHJKLMNPQRSTUVWXYZ".utf8)
     let bytes: [UInt8]
 
     init(_ userInput: String) throws {
-        let normalized = userInput.unicodeScalars.filter { $0 != " " && $0 != "-" }
-        try self.init(bytes: Array(String(String.UnicodeScalarView(normalized)).uppercased().utf8))
+        try self.init(bytes: Array(
+            userInput.trimmingCharacters(in: .whitespacesAndNewlines).utf8))
     }
 
     /// Stored values and values received from the core must already be canonical.
     init(bytes: [UInt8]) throws {
-        guard bytes.count == Self.length, bytes.allSatisfy(Self.alphabet.contains) else {
+        guard (Self.minimumLength...Self.maximumLength).contains(bytes.count) else {
             throw HostAccessCredentialsError.invalidPassword
         }
         self.bytes = bytes
     }
 
     static func generate() throws -> HostAccessPassword {
-        var random = [UInt8](repeating: 0, count: length)
+        var random = [UInt8](repeating: 0, count: generatedLength)
         defer { _ = random.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
         let status = random.withUnsafeMutableBytes {
-            SecRandomCopyBytes(kSecRandomDefault, Self.length, $0.baseAddress!)
+            SecRandomCopyBytes(kSecRandomDefault, generatedLength, $0.baseAddress!)
         }
         guard status == errSecSuccess else { throw HostAccessCredentialsError.randomGeneration(status) }
         // There are exactly 32 allowed symbols, so masking has no modulo bias.
@@ -100,7 +105,6 @@ struct HostFixedAccessStore: HostFixedAccessStoring {
     static let service = "com.desklink.host-fixed-access"
     static let account = "primary-host"
     static let formatVersion: UInt8 = 1
-    static let recordLength = 1 + HostAccessPassword.length
 
     private let keychain: any KeychainStore
 
@@ -140,7 +144,9 @@ struct HostFixedAccessStore: HostFixedAccessStoring {
     }
 
     static func decode(_ record: Data) throws -> HostAccessPassword {
-        guard record.count == recordLength, record.first == formatVersion else {
+        // The version byte is followed by the variable-length password bytes;
+        // legacy fixed-length records decode through the same path.
+        guard record.count > 1, record.first == formatVersion else {
             throw HostAccessCredentialsError.malformedRecord
         }
         do {

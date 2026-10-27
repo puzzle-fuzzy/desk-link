@@ -102,12 +102,13 @@ fn host_directory_abi_derives_public_id_and_rejects_invalid_credentials_before_n
     );
     assert_eq!(id, 0);
     let mut invite = [0; desklink_crypto::PAIRING_INVITE_BYTES];
+    let oversized = [b'x'; desklink_crypto::MAX_ACCESS_PASSWORD_BYTES + 1];
     for (mode, code, length, capacity) in [
-        (0, *b"ABCDEFGH", 8, 181),
-        (3, *b"ABCDEFGH", 8, 181),
-        (1, *b"ABCDEFGH", 7, 181),
-        (2, *b"ABCD0FGH", 8, 181),
-        (1, *b"ABCDEFGH", 8, 180),
+        (0u32, b"ABCDEFGH".to_vec(), 8, 181),
+        (3, b"ABCDEFGH".to_vec(), 8, 181),
+        (1, b"ABCDEFGH".to_vec(), 7, 181),
+        (1, oversized.to_vec(), oversized.len(), 181),
+        (1, b"ABCDEFGH".to_vec(), 8, 180),
     ] {
         let mut invite_len = 99;
         let mut expiry = 99;

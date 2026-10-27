@@ -352,15 +352,17 @@ public final class ControllerBridge: ObservableObject {
     /// temporary/fixed password that the Windows controller accepts.
     public func connect(deviceID: String, temporaryPassword: String) {
         let normalizedDeviceID = deviceID.filter(\.isNumber)
-        let normalizedPassword = temporaryPassword
-            .uppercased()
-            .filter { "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains($0) }
+        // Access passwords accept any characters; surrounding whitespace is
+        // trimmed but the typed bytes are otherwise used verbatim because both
+        // peers derive the directory code from the exact same password.
+        let passwordBytes = Array(
+            temporaryPassword.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
 
         guard normalizedDeviceID.count == 12,
               let publicDeviceID = UInt64(normalizedDeviceID),
-              normalizedPassword.count == Int(DESKLINK_DIRECTORY_ACCESS_CODE_BYTES)
+              (8...64).contains(passwordBytes.count)
         else {
-            publishErrorMessage("设备 ID 或访问密码格式无效。")
+            publishErrorMessage("设备 ID 无效，或访问密码长度需在 8 到 64 个字符之间。")
             return
         }
 
@@ -376,26 +378,29 @@ public final class ControllerBridge: ObservableObject {
             var config = DesklinkDirectoryConnectionConfig(
                 server_name: nil,
                 device_id: publicDeviceID,
-                access_code: (0, 0, 0, 0, 0, 0, 0, 0),
+                access_code: nil,
+                access_code_len: 0,
                 controller_device_id: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
                 controller_secret_key: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             )
-            withUnsafeMutableBytes(of: &config.access_code) {
-                $0.copyBytes(from: normalizedPassword.utf8)
-            }
-            withUnsafeMutableBytes(of: &config.controller_device_id) {
-                $0.copyBytes(from: identity.deviceID)
-            }
-            withUnsafeMutableBytes(of: &config.controller_secret_key) {
-                $0.copyBytes(from: identity.secretKey)
-            }
-            let result = relayServerName.withCString { serverName in
-                config.server_name = serverName
-                return desklink_connect_directory(handle, &config)
-            }
-            guard result == DESKLINK_OK else {
-                publishResultError("无法使用设备 ID 和访问密码连接。", result: result)
-                return
+            let password = passwordBytes
+            password.withUnsafeBufferPointer { passwordBuffer in
+                config.access_code = passwordBuffer.baseAddress
+                config.access_code_len = password.count
+                withUnsafeMutableBytes(of: &config.controller_device_id) {
+                    $0.copyBytes(from: identity.deviceID)
+                }
+                withUnsafeMutableBytes(of: &config.controller_secret_key) {
+                    $0.copyBytes(from: identity.secretKey)
+                }
+                let result = relayServerName.withCString { serverName in
+                    config.server_name = serverName
+                    return desklink_connect_directory(handle, &config)
+                }
+                guard result == DESKLINK_OK else {
+                    publishResultError("无法使用设备 ID 和访问密码连接。", result: result)
+                    return
+                }
             }
             // The directory lookup resolves the same signed host material as
             // a QR invite, but it is only available inside the Rust worker.

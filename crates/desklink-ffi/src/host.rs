@@ -260,12 +260,12 @@ impl HostRuntime {
         reconnect_config: QuicClientConfig,
         identity: HostIdentity,
         mode: HostAccessMode,
-        access_code: [u8; 8],
+        password: &[u8],
         now_unix_s: u64,
     ) -> Result<(Self, HostDirectoryCredentials), HostError> {
         let identity = identity.into_device_identity();
         let (directory, invite, credentials) =
-            HostDirectorySession::prepare(&identity, mode, access_code, now_unix_s)?;
+            HostDirectorySession::prepare(&identity, mode, password, now_unix_s)?;
         let (events, receiver) = mpsc::channel(HOST_EVENT_CAPACITY);
         let worker = HostWorker::start_from_config(
             reconnect_config,

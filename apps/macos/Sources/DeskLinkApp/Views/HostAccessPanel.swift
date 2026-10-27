@@ -204,7 +204,7 @@ private struct HostFixedPasswordEditor: View {
         VStack(alignment: .leading, spacing: 18) {
             Text(bridge.hasFixedPassword ? "更改固定密码" : "设置固定密码")
                 .font(.system(size: 20, weight: .semibold))
-            Text("请输入 8 位字母或数字，不支持 0、1、I、O；字母不区分大小写。")
+            Text("请输入 8 到 64 个字符，可以使用任意字符；两端输入完全一致的密码才能连接。")
                 .font(.system(size: 13)).foregroundStyle(DeskLinkPalette.secondaryInk)
                 .fixedSize(horizontal: false, vertical: true)
             SecureField("新密码", text: $password)

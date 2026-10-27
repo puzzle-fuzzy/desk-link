@@ -124,14 +124,14 @@ impl HostTestFixture {
         )
     }
 
-    fn start_directory(&mut self, mode: HostAccessMode, code: [u8; 8]) -> HostRuntime {
-        self.start_directory_at(mode, code, now_micros() / 1_000_000)
+    fn start_directory(&mut self, mode: HostAccessMode, password: &[u8]) -> HostRuntime {
+        self.start_directory_at(mode, password, now_micros() / 1_000_000)
     }
 
     fn start_directory_at(
         &mut self,
         mode: HostAccessMode,
-        code: [u8; 8],
+        password: &[u8],
         created_at: u64,
     ) -> HostRuntime {
         let identity = self.host_identity.with_secret_key_bytes(|secret| {
@@ -141,7 +141,7 @@ impl HostTestFixture {
             self.transport_config(),
             identity,
             mode,
-            code,
+            password,
             created_at,
         )
         .unwrap();
@@ -157,13 +157,14 @@ impl HostTestFixture {
         host
     }
 
-    async fn lookup(&self, code: [u8; 8]) -> Result<Vec<u8>, TransportError> {
+    async fn lookup(&self, password: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let code = desklink_crypto::PairingCode::derive_from_password(password).unwrap();
         let client = QuicClient::connect(self.transport_config()).await.unwrap();
         let result = client
             .lookup_directory(
                 RelayDirectoryLookup::new(
                     public_host_device_id(self.host_identity.device_id),
-                    code,
+                    *code.as_bytes(),
                 )
                 .unwrap(),
             )
@@ -745,14 +746,33 @@ async fn directory_temporary_password_reaches_encrypted_approval_and_stop_revoke
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arbitrary_character_fixed_passwords_register_and_lookup_by_derivation() {
+    let mut fixture = HostTestFixture::new().await;
+    // Any characters: lowercase, symbols, spaces and non-ASCII are all valid
+    // as long as the length is sufficient; both sides derive the same code.
+    let password = "correct horse:电池 🐎 staple!";
+    let host = fixture.start_directory(HostAccessMode::Fixed, password.as_bytes());
+    let bytes = fixture.lookup(password.as_bytes()).await.unwrap();
+    PairingInvite::decode(&bytes, now_micros() / 1_000_000).unwrap();
+    // The same bytes with different case do not match (no case folding).
+    assert!(matches!(
+        fixture
+            .lookup("Correct horse:电池 🐎 staple!".as_bytes())
+            .await,
+        Err(TransportError::DirectoryNotFound)
+    ));
+    host.destroy();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn directory_fixed_password_reaches_encrypted_approval_and_stop_revokes_lookup() {
     directory_requires_approval_and_revokes(HostAccessMode::Fixed).await;
 }
 
 async fn directory_requires_approval_and_revokes(mode: HostAccessMode) {
     let mut fixture = HostTestFixture::new().await;
-    let host = fixture.start_directory(mode, *b"ABCDEFGH");
-    let bytes = fixture.lookup(*b"ABCDEFGH").await.unwrap();
+    let host = fixture.start_directory(mode, b"ABCDEFGH");
+    let bytes = fixture.lookup(b"ABCDEFGH").await.unwrap();
     let resolved = PairingInvite::decode(&bytes, now_micros() / 1_000_000).unwrap();
     assert_eq!(resolved.session_id(), fixture.session_id);
     assert_eq!(
@@ -760,7 +780,7 @@ async fn directory_requires_approval_and_revokes(mode: HostAccessMode) {
         fixture.host_identity.verify_key()
     );
     assert!(matches!(
-        fixture.lookup(*b"ABCDEFGJ").await,
+        fixture.lookup(b"ABCDEFGJ").await,
         Err(TransportError::DirectoryNotFound)
     ));
     let mut controller = RawController::pair(&fixture).await;
@@ -791,7 +811,7 @@ async fn directory_requires_approval_and_revokes(mode: HostAccessMode) {
     host.destroy();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
-        fixture.lookup(*b"ABCDEFGH").await,
+        fixture.lookup(b"ABCDEFGH").await,
         Err(TransportError::DirectoryNotFound)
     ));
 }
@@ -801,7 +821,7 @@ async fn temporary_expiry_closes_unapproved_host_and_removes_directory_entry() {
     let mut fixture = HostTestFixture::new().await;
     let host = fixture.start_directory_at(
         HostAccessMode::Temporary,
-        *b"ABCDEFGH",
+        b"ABCDEFGH",
         now_micros() / 1_000_000 - 598,
     );
     let events = tokio::time::timeout(Duration::from_secs(5), terminal_events(&host))
@@ -810,7 +830,7 @@ async fn temporary_expiry_closes_unapproved_host_and_removes_directory_entry() {
     assert!(events.contains(&HostEvent::Error(HostError::AccessExpired)));
     assert_eq!(host.state(), HostState::Closed);
     assert!(matches!(
-        fixture.lookup(*b"ABCDEFGH").await,
+        fixture.lookup(b"ABCDEFGH").await,
         Err(TransportError::DirectoryNotFound)
     ));
     host.destroy();
@@ -821,7 +841,7 @@ async fn temporary_expiry_preserves_already_approved_connection_but_revokes_new_
     let mut fixture = HostTestFixture::new().await;
     let host = fixture.start_directory_at(
         HostAccessMode::Temporary,
-        *b"ABCDEFGH",
+        b"ABCDEFGH",
         now_micros() / 1_000_000 - 598,
     );
     let mut controller = RawController::pair(&fixture).await;
@@ -842,7 +862,7 @@ async fn temporary_expiry_preserves_already_approved_connection_but_revokes_new_
         }
     }
     assert!(matches!(
-        fixture.lookup(*b"ABCDEFGH").await,
+        fixture.lookup(b"ABCDEFGH").await,
         Err(TransportError::DirectoryNotFound)
     ));
     host.destroy();
@@ -852,18 +872,18 @@ async fn temporary_expiry_preserves_already_approved_connection_but_revokes_new_
 async fn rotating_directory_password_replaces_code_invitation_and_session_and_does_not_cache_approval()
  {
     let mut fixture = HostTestFixture::new().await;
-    let first = fixture.start_directory(HostAccessMode::Temporary, *b"ABCDEFGH");
-    let first_invitation = fixture.lookup(*b"ABCDEFGH").await.unwrap();
+    let first = fixture.start_directory(HostAccessMode::Temporary, b"ABCDEFGH");
+    let first_invitation = fixture.lookup(b"ABCDEFGH").await.unwrap();
     let first_session = fixture.session_id;
     let first_auth = fixture.relay_authentication;
     first.destroy();
-    let second = fixture.start_directory(HostAccessMode::Fixed, *b"BCDEFGHJ");
-    let second_invitation = fixture.lookup(*b"BCDEFGHJ").await.unwrap();
+    let second = fixture.start_directory(HostAccessMode::Fixed, b"BCDEFGHJ");
+    let second_invitation = fixture.lookup(b"BCDEFGHJ").await.unwrap();
     assert_ne!(first_invitation, second_invitation);
     assert_ne!(first_session, fixture.session_id);
     assert_ne!(first_auth, fixture.relay_authentication);
     assert!(matches!(
-        fixture.lookup(*b"ABCDEFGH").await,
+        fixture.lookup(b"ABCDEFGH").await,
         Err(TransportError::DirectoryNotFound)
     ));
     let _controller = RawController::pair(&fixture).await;
@@ -875,7 +895,7 @@ async fn rotating_directory_password_replaces_code_invitation_and_session_and_do
     second.destroy();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
-        fixture.lookup(*b"BCDEFGHJ").await,
+        fixture.lookup(b"BCDEFGHJ").await,
         Err(TransportError::DirectoryNotFound)
     ));
 }
@@ -897,8 +917,8 @@ async fn approval_emits_connected_state_for_capture_start() {
 async fn directory_reconnect_republishes_same_invitation_without_approving_a_different_controller()
 {
     let mut fixture = HostTestFixture::new().await;
-    let host = fixture.start_directory(HostAccessMode::Fixed, *b"ABCDEFGH");
-    let invitation = fixture.lookup(*b"ABCDEFGH").await.unwrap();
+    let host = fixture.start_directory(HostAccessMode::Fixed, b"ABCDEFGH");
+    let invitation = fixture.lookup(b"ABCDEFGH").await.unwrap();
     let mut first = RawController::pair(&fixture).await;
     assert!(matches!(
         fixture.next_event(&host).await,
@@ -921,7 +941,7 @@ async fn directory_reconnect_republishes_same_invitation_without_approving_a_dif
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(fixture.lookup(*b"ABCDEFGH").await.unwrap(), invitation);
+    assert_eq!(fixture.lookup(b"ABCDEFGH").await.unwrap(), invitation);
     fixture.controller_identity = DeviceIdentity::from_secret_key([51; 16], &[52; 32]);
     let _second = RawController::pair(&fixture).await;
     assert!(

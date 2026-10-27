@@ -10,8 +10,8 @@ pub use noise::{
     SecureLane, SecureRole, SecureSession, SessionKey, TransportCipher,
 };
 pub use pairing::{
-    EncodedPairingInvite, MAX_PAIRING_TTL_S, PAIRING_INVITE_BYTES, PairingCode, PairingError,
-    PairingInvite, PairingOffer, SessionId,
+    EncodedPairingInvite, MAX_ACCESS_PASSWORD_BYTES, MAX_PAIRING_TTL_S, MIN_ACCESS_PASSWORD_BYTES,
+    PAIRING_INVITE_BYTES, PairingCode, PairingError, PairingInvite, PairingOffer, SessionId,
 };
 
 pub const PACKAGE_NAME: &str = "desklink-crypto";

@@ -277,8 +277,7 @@ struct ConnectView: View {
 
     private var directoryCredentialsAreComplete: Bool {
         draft.deviceID.filter(\.isNumber).count == 12
-            && draft.accessPassword.uppercased().filter {
-                "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains($0)
-            }.count == Int(DESKLINK_DIRECTORY_ACCESS_CODE_BYTES)
+            && (8...64).contains(
+                draft.accessPassword.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count)
     }
 }

@@ -823,9 +823,12 @@ pub enum TransportError {
     },
 }
 
+/// Directory codes are derived from user-chosen passwords (any characters),
+/// so arbitrary byte values are valid. Only the all-zero code is rejected to
+/// keep an unset sentinel distinguishable. The 32-symbol display alphabet
+/// still governs generated temporary passwords in the UI layer.
 fn valid_directory_access_code(code: &[u8; DIRECTORY_ACCESS_CODE_BYTES]) -> bool {
-    code.iter()
-        .all(|byte| b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains(byte))
+    code != &[0; DIRECTORY_ACCESS_CODE_BYTES]
 }
 
 #[cfg(test)]

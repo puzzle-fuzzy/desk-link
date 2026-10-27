@@ -191,7 +191,10 @@ typedef struct DesklinkPairingInviteConnectionConfig {
 typedef struct DesklinkDirectoryConnectionConfig {
     const char * server_name;
     uint64_t device_id;
-    uint8_t access_code[8];
+    /* Access password bytes: any characters, 8..=64 UTF-8 bytes. The
+     * directory code is derived internally; callers never pass final codes. */
+    const uint8_t * access_code;
+    size_t access_code_len;
     uint8_t controller_device_id[16];
     uint8_t controller_secret_key[32];
 } DesklinkDirectoryConnectionConfig;
@@ -369,7 +372,9 @@ DesklinkResult desklink_host_start_pairing(DesklinkHostHandle * handle, uint8_t 
 DesklinkResult desklink_host_public_device_id(DesklinkHostHandle * handle, uint64_t * out_device_id);
 
 /* mode: 1 temporary (600s), 2 fixed (live connection, expiry output zero).
- * access_code: exactly 8 bytes from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ.
+ * access_code: password bytes with any characters, 8..=64 UTF-8 bytes
+ * (minimum length enforced; the directory code is derived internally so both
+ * peers only need to type the same password).
  * Outputs are populated only after the relay accepted the directory entry.
  * Blocking bounded network call: invoke off the UI thread. Wait for return
  * before stop/destroy; do not destroy the handle concurrently with startup.

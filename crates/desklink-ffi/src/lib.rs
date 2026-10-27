@@ -220,7 +220,10 @@ pub struct DesklinkPairingInviteConnectionConfig {
 pub struct DesklinkDirectoryConnectionConfig {
     pub server_name: *const c_char,
     pub device_id: u64,
-    pub access_code: [u8; 8],
+    /// Access password bytes (any characters, 8..=64 UTF-8 bytes). The
+    /// directory code is derived internally; callers never pass final codes.
+    pub access_code: *const u8,
+    pub access_code_len: usize,
     pub controller_device_id: [u8; 16],
     pub controller_secret_key: [u8; 32],
 }
@@ -1132,6 +1135,21 @@ pub unsafe extern "C" fn desklink_connect_directory(
         Ok(_) => return DesklinkResult::InvalidArgument,
         Err(_) => return DesklinkResult::InvalidUtf8,
     };
+    if config.access_code.is_null()
+        || !(desklink_crypto::MIN_ACCESS_PASSWORD_BYTES
+            ..=desklink_crypto::MAX_ACCESS_PASSWORD_BYTES)
+            .contains(&config.access_code_len)
+    {
+        return DesklinkResult::InvalidArgument;
+    }
+    let password =
+        unsafe { std::slice::from_raw_parts(config.access_code, config.access_code_len) };
+    // Typed passwords derive the directory code; saved material stores the
+    // final code and reaches the worker through the secure-connect path.
+    let code = match desklink_crypto::PairingCode::derive_from_password(password) {
+        Ok(code) => code,
+        Err(_) => return DesklinkResult::InvalidArgument,
+    };
     start_secure_worker(
         runtime,
         SecureConnectionConfigOwned {
@@ -1145,7 +1163,7 @@ pub unsafe extern "C" fn desklink_connect_directory(
             authorization_type: 0,
             directory: Some(DirectoryConnectionConfigOwned {
                 device_id: config.device_id,
-                access_code: config.access_code,
+                access_code: *code.as_bytes(),
             }),
         },
     )
@@ -2106,7 +2124,12 @@ pub unsafe extern "C" fn desklink_host_start_directory(
     let Some(handle) = host_handle_ref(handle) else {
         return DesklinkResult::InvalidArgument;
     };
-    if invite_out.is_null() || invite_capacity < PAIRING_INVITE_BYTES || access_code_len != 8 {
+    if invite_out.is_null()
+        || invite_capacity < PAIRING_INVITE_BYTES
+        || !(desklink_crypto::MIN_ACCESS_PASSWORD_BYTES
+            ..=desklink_crypto::MAX_ACCESS_PASSWORD_BYTES)
+            .contains(&access_code_len)
+    {
         return DesklinkResult::InvalidArgument;
     }
     let mode = match mode {
@@ -2114,13 +2137,11 @@ pub unsafe extern "C" fn desklink_host_start_directory(
         2 => HostAccessMode::Fixed,
         _ => return DesklinkResult::InvalidArgument,
     };
-    let Some(code) = copy_fixed::<8>(access_code) else {
-        return DesklinkResult::InvalidArgument;
+    let mut password = Zeroizing::new([0u8; desklink_crypto::MAX_ACCESS_PASSWORD_BYTES]);
+    let password = unsafe {
+        std::ptr::copy_nonoverlapping(access_code, password.as_mut().as_mut_ptr(), access_code_len);
+        &password[..access_code_len]
     };
-    let code = Zeroizing::new(code);
-    if desklink_crypto::PairingCode::from_bytes(*code).is_err() {
-        return DesklinkResult::InvalidArgument;
-    }
     if let Err(error) = reserve_host_start(handle) {
         return error;
     }
@@ -2130,9 +2151,14 @@ pub unsafe extern "C" fn desklink_host_start_directory(
             handle.config.host_device_id,
             &handle.config.host_secret_key,
         );
-        let (runtime, credentials) =
-            HostRuntime::start_directory_from_config(config, identity, mode, *code, now_unix_s())
-                .map_err(|_| DesklinkResult::InternalError)?;
+        let (runtime, credentials) = HostRuntime::start_directory_from_config(
+            config,
+            identity,
+            mode,
+            password,
+            now_unix_s(),
+        )
+        .map_err(|_| DesklinkResult::InternalError)?;
         let result = install_host_runtime(handle, Arc::new(runtime));
         if result != DesklinkResult::Ok {
             return Err(result);
