@@ -800,7 +800,6 @@ async fn run_connected(
         );
     }
     let mut releases = initial.into_iter();
-    let mut sending: Option<OwnedConnectedSend> = None;
     let mut transfer_available = true;
     // Queued file actions fail as stale whenever this connection ends.
     let _file_gate_reset = GateReset(file_gate.clone());
@@ -809,17 +808,14 @@ async fn run_connected(
     let mut maintenance = tokio::time::interval(Duration::from_millis(100));
     // Windows capture defaults to enabled. Each authenticated controller
     // connection starts muted until its user explicitly enables playback.
-    let initial_mute = tokio::select! {
-        _ = cancellation.changed() => return ConnectedOutcome::Shutdown { stream_id: 0 },
-        result = tokio::time::timeout(Duration::from_secs(5), controller.set_audio_enabled(false)) => result,
-    };
-    if let Err(error) = initial_mute.unwrap_or_else(|_| {
-        Err(ControllerError::Transport(TransportError::Connection(
-            "initial audio mute timed out".into(),
-        )))
-    }) {
-        return fail_connected(&senders, error, input_context, stable);
-    }
+    // The mute rides the ordered control lane as the first owned send, so
+    // media events are not blocked on its round trip; every later command
+    // still queues behind it through the single-owned-send discipline.
+    let mut sending = Some(start_connected_send(
+        senders.clone(),
+        cancellation.clone(),
+        ConnectedSend::Control(ControlMessage::SetAudioEnabled { enabled: false }),
+    ));
     loop {
         // This stack-pinned reader survives every send completion and command.
         // Dropping next_event after it dequeued a reliable message but before

@@ -1178,7 +1178,7 @@
 - [ ] **MVP-03 连接速度：目录连接复用**。`connect_controller` 目录分支先用独立连接做 lookup、再新建连接入会话，每次新鲜目录连接多付一次完整 QUIC+TLS 握手（中继路径约 2-3 个 RTT）。改为 lookup 后在同一连接上直接 `join_relay` 入会话。
   验收：Rust 测试证明目录路径只建立一次中继连接（连接计数或 observer）；现有 host_runtime/controller_runtime 全绿；实际连接建立时间对比记录在提交信息。
 
-- [ ] **MVP-04 连接速度：初始静音移出关键路径**。`run_connected` 目前在进入事件循环前阻塞等待 `set_audio_enabled(false)`（最长 5 秒超时），视频首帧被这一 RTT 串行阻塞。改为把静音作为进入循环后的首个有序 owned send，与事件接收并行。
+- [x] **MVP-04 连接速度：初始静音移出关键路径**。`run_connected` 目前在进入事件循环前阻塞等待 `set_audio_enabled(false)`（最长 5 秒超时），视频首帧被这一 RTT 串行阻塞。改为把静音作为进入循环后的首个有序 owned send，与事件接收并行。
   验收：worker 测试断言"新控制器先静音"仍成立且顺序在任何用户音频命令之前；事件循环不再被静音 RTT 阻塞（测试：静音未完成时 VideoConfig 事件可被处理）。
 
 - [ ] **MVP-05 体验：macOS 首次使用引导**。无最近设备时连接页给三步引导（对端开共享 → 输入 12 位设备号与密码 → 点击连接），消除首次使用空窗。

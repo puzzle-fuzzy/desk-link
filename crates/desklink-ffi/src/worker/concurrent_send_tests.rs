@@ -466,3 +466,27 @@ fn release_aggregation_is_bounded_and_preserves_original_contexts() {
     assert_eq!(batch.len(), MAX_RELEASE_EVENTS);
     assert!(batch.iter().all(|input| input.context == context(11)));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_events_flow_while_the_initial_mute_send_is_still_pending() {
+    // The host deliberately does not read the control lane, so the initial
+    // mute owned-send cannot complete. Media events must still be admitted:
+    // the loop runs concurrently with the mute instead of behind it.
+    let fixture = connected_flow_control_fixture().await;
+    let mut driver = Driver::start(fixture.runtime);
+    config(&fixture.host, &fixture.host_secure, 1, 1).await;
+
+    let observed = tokio::time::timeout(Duration::from_millis(2_000), async {
+        loop {
+            let event = driver.events.recv().await.expect("worker callback ended");
+            if event.kind == DesklinkEventKind::VideoConfig {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("video config was not admitted while the mute send was pending");
+
+    assert_eq!(observed.epoch, 1);
+    let _ = driver.stop().await;
+}
