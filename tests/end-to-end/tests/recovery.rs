@@ -311,3 +311,131 @@ fn now_micros() -> u64 {
                 .saturating_add(u64::from(duration.subsec_micros()))
         })
 }
+
+/// MVP-10: a fixed-password directory registration resolves through the
+/// FFI controller on the derived-code path, and the same typed password
+/// replays the identical invitation (the credential saved material carries
+/// for reconnect without retyping).
+#[tokio::test]
+async fn fixed_password_directory_material_reconnects_without_retyping_the_password() {
+    use desklink_crypto::{DeviceIdentity, PairingCode, PairingInvite};
+    use desklink_ffi::{DesklinkDirectoryConnectionConfig, DesklinkEventKind};
+    use desklink_transport::RelayDirectoryLookup;
+    use rand_core::{OsRng, RngCore};
+
+    let relay = spawn_test_relay().await;
+    let connect_config = || {
+        QuicClientConfig::with_client_config(
+            relay.address,
+            "localhost",
+            relay.client_config.clone(),
+        )
+    };
+
+    // Host: one fixed-password directory registration on its own connection.
+    let host_identity = DeviceIdentity::from_secret_key([7; 16], &[8; 32]);
+    let password = "correct horse:电池 🐎!";
+    let code = PairingCode::derive_from_password(password.as_bytes()).unwrap();
+    let mut session_id = [0u8; 16];
+    let mut authentication = [0u8; 32];
+    OsRng.fill_bytes(&mut session_id);
+    OsRng.fill_bytes(&mut authentication);
+    let invite = PairingInvite::for_persistent_connection(
+        &host_identity,
+        SessionId::from_bytes(session_id),
+        authentication,
+    )
+    .encode()
+    .unwrap();
+    let host = QuicClient::connect(connect_config()).await.unwrap();
+    host.join(
+        RelayJoin::host_with_participant(
+            SessionId::from_bytes(session_id),
+            authentication,
+            host_identity.device_id,
+        )
+        .with_directory_registration(
+            desklink_transport::RelayDirectoryRegistration::new(
+                desklink_ffi::public_host_device_id(host_identity.device_id),
+                *code.as_bytes(),
+                invite.as_bytes().to_vec(),
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Controller FFI: connect with the typed password. The host fixture never
+    // completes the Noise handshake, so the connect eventually parks; the
+    // lookup itself proves the derived directory code path end to end.
+    extern "C" fn record(
+        context: *mut std::ffi::c_void,
+        event: *const desklink_ffi::DesklinkEvent,
+    ) {
+        let sink = unsafe { &mut *(context as *mut Vec<(DesklinkEventKind, Vec<u8>)>) };
+        let event = unsafe { &*event };
+        let data = if event.data.is_null() || event.data_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(event.data, event.data_len).to_vec() }
+        };
+        sink.push((event.kind, data));
+    }
+    let url = std::ffi::CString::new(format!("quic://{}", relay.address)).unwrap();
+    let server_name = std::ffi::CString::new("localhost").unwrap();
+    let mut events: Vec<(DesklinkEventKind, Vec<u8>)> = Vec::new();
+    let mut handle = std::ptr::null_mut();
+    let config = desklink_ffi::DesklinkConfig {
+        relay_url: url.as_ptr(),
+        log_level: 0,
+    };
+    assert_eq!(
+        unsafe {
+            desklink_ffi::desklink_create_for_platform(
+                &config,
+                desklink_ffi::DesklinkPlatform::MacOS as u32,
+                Some(record),
+                (&mut events as *mut Vec<(DesklinkEventKind, Vec<u8>)>).cast(),
+                &mut handle,
+            )
+        },
+        desklink_ffi::DesklinkResult::Ok
+    );
+
+    let password_bytes = password.as_bytes();
+    let directory = DesklinkDirectoryConnectionConfig {
+        server_name: server_name.as_ptr(),
+        device_id: desklink_ffi::public_host_device_id(host_identity.device_id),
+        access_code: password_bytes.as_ptr(),
+        access_code_len: password_bytes.len(),
+        controller_device_id: [9; 16],
+        controller_secret_key: [10; 32],
+    };
+    assert_eq!(
+        unsafe { desklink_ffi::desklink_connect_directory(handle, &directory) },
+        desklink_ffi::DesklinkResult::Ok
+    );
+    unsafe { desklink_ffi::desklink_destroy(handle) };
+
+    // Reconnect replay: a second lookup with the SAME typed password must
+    // resolve the identical signed invitation — exactly the bytes the saved
+    // material stores and replays on reconnect without retyping.
+    let probe = QuicClient::connect(connect_config()).await.unwrap();
+    let invitation = probe
+        .lookup_directory(
+            RelayDirectoryLookup::new(
+                desklink_ffi::public_host_device_id(host_identity.device_id),
+                *code.as_bytes(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invitation, invite.as_bytes().to_vec());
+
+    host.close(b"e2e complete");
+    probe.close(b"e2e complete");
+}

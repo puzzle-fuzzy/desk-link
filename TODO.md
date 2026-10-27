@@ -1196,7 +1196,7 @@
 - [ ] **MVP-09 测试：Apple/Rust macOS CI**。新增 GitHub Actions macOS workflow：cargo fmt --check、clippy -D warnings、workspace 测试（除显式 skip）、`apps/apple` 与 `apps/macos` swift test（先安装 cmake 供 opus-head-sys）。当前仓库无任何 macOS Swift CI。
   验收：workflow 在本仓库跑通一次全绿；提交状态徽记可用。
 
-- [ ] **MVP-10 测试：固定密码保存材料端到端重连**。Rust e2e：固定密码目录连接成功 → 保存材料 → 断开 → 用保存材料重连（不再输密码）成功且身份一致；覆盖派生码路径。
+- [x] **MVP-10 测试：固定密码保存材料端到端重连**。Rust e2e：固定密码目录连接成功 → 保存材料 → 断开 → 用保存材料重连（不再输密码）成功且身份一致；覆盖派生码路径。
   验收：新 e2e 测试通过并纳入 verify-macos-runtime 门禁链。
 
 ## 10. 第一阶段历史记录

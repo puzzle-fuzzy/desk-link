@@ -12,6 +12,8 @@ desklink-session.workspace = true
 desklink-transport.workspace = true
 desklink-video.workspace = true
 desklink-relay = { path = "../../server/relay" }
+desklink-ffi = { path = "../../crates/desklink-ffi" }
+rand_core.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

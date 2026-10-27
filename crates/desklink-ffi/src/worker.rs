@@ -52,7 +52,9 @@ fn diagnostic_line(event: &str, detail: &str) -> Option<String> {
     static PROBED: AtomicBool = AtomicBool::new(false);
     if !PROBED.swap(true, Ordering::AcqRel) {
         let enabled = std::env::var("DESKLINK_LOG").is_ok_and(|value| {
-            !value.is_empty() && !value.eq_ignore_ascii_case("0") && !value.eq_ignore_ascii_case("false")
+            !value.is_empty()
+                && !value.eq_ignore_ascii_case("0")
+                && !value.eq_ignore_ascii_case("false")
         });
         ENABLED.store(enabled, Ordering::Release);
     }
