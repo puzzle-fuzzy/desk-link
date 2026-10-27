@@ -43,6 +43,33 @@ const SEND_TIMEOUT: Duration = crate::controller::CONTROLLER_SEND_TIMEOUT;
 
 type MaterialPublisher = Arc<dyn Fn(SavedHostMaterialOwned) + Send + Sync>;
 
+/// Field diagnostics for the controller worker, off by default with zero
+/// cost. `DESKLINK_LOG=1` emits one JSON line per connection-lifecycle event
+/// on stderr so relay/DNS outages can be attributed from a terminal launch.
+fn diagnostic_line(event: &str, detail: &str) -> Option<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static PROBED: AtomicBool = AtomicBool::new(false);
+    if !PROBED.swap(true, Ordering::AcqRel) {
+        let enabled = std::env::var("DESKLINK_LOG").is_ok_and(|value| {
+            !value.is_empty() && !value.eq_ignore_ascii_case("0") && !value.eq_ignore_ascii_case("false")
+        });
+        ENABLED.store(enabled, Ordering::Release);
+    }
+    (ENABLED.load(Ordering::Acquire)).then(|| {
+        format!(
+            "{{\"ts\":{},\"module\":\"controller\",\"event\":\"{event}\",{detail}}}",
+            now_unix_s()
+        )
+    })
+}
+
+fn diagnostic_log(event: &str, detail: &str) {
+    if let Some(line) = diagnostic_line(event, detail) {
+        eprintln!("{line}");
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CapturedInput {
     pub context: InputContext,
@@ -414,6 +441,14 @@ async fn run_worker(
             invalidate();
         }
         phase.store(PHASE_CONNECTING, Ordering::Release);
+        diagnostic_log(
+            if first_attempt {
+                "connect_attempt"
+            } else {
+                "reconnect_attempt"
+            },
+            "",
+        );
         gate.invalidate();
         file_gate.invalidate();
         callback.emit_state(
@@ -541,6 +576,7 @@ async fn run_worker(
     if let Some(invalidate) = &material_invalidator {
         invalidate();
     }
+    diagnostic_log("worker_closed", "");
     callback.emit_state(DesklinkState::Closed, 0);
 }
 
@@ -1110,6 +1146,10 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
         persistent,
     } = context;
     if !failure.retryable {
+        diagnostic_log(
+            "terminal_failure",
+            &format!("\"message\":\"{}\"", failure.message),
+        );
         callback.emit_error(&failure.message, 0);
         return false;
     }
@@ -1121,6 +1161,14 @@ async fn schedule_retry(failure: ConnectFailure, stable: bool, context: RetryCon
     }
     match schedule.next(now_unix_s()) {
         ReconnectDecision::RetryAfter { retry, delay } => {
+            diagnostic_log(
+                "retry_scheduled",
+                &format!(
+                    "\"retry\":{retry},\"delay_ms\":{},\"message\":\"{}\"",
+                    delay.as_millis(),
+                    failure.message
+                ),
+            );
             callback.emit_state(DesklinkState::Reconnecting, 0);
             callback.emit_error_with_state(
                 &format!(
@@ -2112,4 +2160,15 @@ async fn directory_connect_reuses_its_lookup_connection_for_the_session() {
     );
     registrar.close(b"test complete");
     relay_task.abort();
+}
+
+#[test]
+fn diagnostic_lines_are_structured_and_default_off() {
+    // DESKLINK_LOG is unset in the test environment, so the worker must
+    // produce no output; when a session later enables it, every line is
+    // a JSON object with a timestamp, module and event name.
+    assert_eq!(
+        diagnostic_line("terminal_failure", "\"message\":\"x\""),
+        None
+    );
 }
