@@ -16,7 +16,7 @@ mod windows {
     use rand_core::{OsRng, RngCore};
 
     const RELAY_ADDRESS: &str = "101.35.246.159:4433";
-    const RELAY_SERVER_NAME: &str = "turn.p2p.yxswy.com";
+    const RELAY_SERVER_NAME: &str = "p2p.yxswy.com";
 
     struct ExpectedController(VerifyingKey);
 

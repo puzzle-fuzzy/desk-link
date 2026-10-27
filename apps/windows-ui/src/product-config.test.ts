@@ -9,7 +9,7 @@ import {
 describe("managed relay profile", () => {
   test("uses the deployed DeskLink relay", () => {
     expect(MANAGED_RELAY_ADDRESS).toBe("101.35.246.159:4433");
-    expect(MANAGED_RELAY_SERVER_NAME).toBe("turn.p2p.yxswy.com");
+    expect(MANAGED_RELAY_SERVER_NAME).toBe("p2p.yxswy.com");
   });
 
   test("matches normalized server names without accepting another endpoint", () => {

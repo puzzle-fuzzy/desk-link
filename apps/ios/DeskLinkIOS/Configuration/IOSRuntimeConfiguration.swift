@@ -2,8 +2,8 @@ import DeskLinkAppleCore
 import Foundation
 
 enum IOSRuntimeConfiguration {
-    private static let managedRelayURL = "quic://turn.p2p.yxswy.com:4433"
-    private static let managedRelayServerName = "turn.p2p.yxswy.com"
+    private static let managedRelayURL = "quic://p2p.yxswy.com:4433"
+    private static let managedRelayServerName = "p2p.yxswy.com"
 
     static var production: DeskLinkRuntimeConfiguration {
         DeskLinkRuntimeConfiguration(

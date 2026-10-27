@@ -23,6 +23,8 @@ install -m 0440 -o 65534 -g 65534 "$lineage/fullchain.pem" "$staged/fullchain.pe
 install -m 0400 -o 65534 -g 65534 "$lineage/privkey.pem" "$staged/privkey.pem"
 
 # OpenSSL 3.0 may return success for a hostname mismatch. Check the positive text.
+# TODO(MVP-02 阶段4): 证书收缩为单域名 p2p.yxswy.com 后，把下面的 checkhost 与服务器上
+# /etc/letsencrypt/renewal-hooks/deploy/desklink-relay-tls 同步改为 p2p.yxswy.com。
 hostname_check=$(openssl x509 -in "$staged/fullchain.pem" -noout -checkhost turn.p2p.yxswy.com)
 if [ "$hostname_check" != 'Hostname turn.p2p.yxswy.com does match certificate' ]; then
     echo 'DeskLink certificate hostname does not match; active files are unchanged.' >&2

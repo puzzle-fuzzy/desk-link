@@ -8,7 +8,7 @@ use desklink_transport::{QuicClient, QuicClientConfig, TransportError};
 use serde::Serialize;
 
 pub const MANAGED_RELAY_ADDRESS: &str = "101.35.246.159:4433";
-pub const MANAGED_RELAY_SERVER_NAME: &str = "turn.p2p.yxswy.com";
+pub const MANAGED_RELAY_SERVER_NAME: &str = "p2p.yxswy.com";
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize)]

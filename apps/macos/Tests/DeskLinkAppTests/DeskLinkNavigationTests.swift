@@ -29,8 +29,8 @@ final class DeskLinkNavigationTests: XCTestCase {
         guard ProcessInfo.processInfo.environment["DESKLINK_RELAY_URL"] == nil,
               ProcessInfo.processInfo.environment["DESKLINK_RELAY_SERVER_NAME"] == nil
         else { return }
-        XCTAssertEqual(DeskLinkRuntimeConfiguration.macOSDefaults.relayURL, "quic://turn.p2p.yxswy.com:4433")
-        XCTAssertEqual(DeskLinkRuntimeConfiguration.macOSDefaults.relayServerName, "turn.p2p.yxswy.com")
+        XCTAssertEqual(DeskLinkRuntimeConfiguration.macOSDefaults.relayURL, "quic://p2p.yxswy.com:4433")
+        XCTAssertEqual(DeskLinkRuntimeConfiguration.macOSDefaults.relayServerName, "p2p.yxswy.com")
     }
 
     func testRelayFailureDoesNotLookLikeASecurityValidationFailure() {

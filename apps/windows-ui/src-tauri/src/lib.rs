@@ -2084,7 +2084,7 @@ mod tests {
         };
         let connection = ConnectionSummary {
             relay_address: "101.35.246.159:4433".to_owned(),
-            server_name: "turn.p2p.yxswy.com".to_owned(),
+            server_name: "p2p.yxswy.com".to_owned(),
             session_id: "0123456789abcdef0123456789abcdef".to_owned(),
             stream_id: 9,
             has_saved_key: true,
