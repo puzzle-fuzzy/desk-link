@@ -51,7 +51,10 @@ pub fn parse_access_code(value: &str) -> Result<[u8; DIRECTORY_ACCESS_CODE_BYTES
         .flat_map(char::to_uppercase)
         .collect::<String>();
     let password_bytes = if normalized.len() == DIRECTORY_ACCESS_CODE_BYTES
-        && normalized.as_bytes().iter().all(|byte| ACCESS_CODE_ALPHABET.contains(byte))
+        && normalized
+            .as_bytes()
+            .iter()
+            .all(|byte| ACCESS_CODE_ALPHABET.contains(byte))
     {
         normalized.as_bytes()
     } else {
@@ -75,7 +78,10 @@ pub fn fixed_password_conflicts_with_temporary_normalization(value: &str) -> boo
         .flat_map(char::to_uppercase)
         .collect::<String>();
     normalized.len() == DIRECTORY_ACCESS_CODE_BYTES
-        && normalized.as_bytes().iter().all(|byte| ACCESS_CODE_ALPHABET.contains(byte))
+        && normalized
+            .as_bytes()
+            .iter()
+            .all(|byte| ACCESS_CODE_ALPHABET.contains(byte))
         && normalized.as_bytes() != trimmed.as_bytes()
 }
 
@@ -104,11 +110,13 @@ mod tests {
     fn access_codes_accept_user_chosen_passwords_and_derive_the_wire_code() {
         let expected =
             desklink_crypto::PairingCode::derive_from_password(b"My0Passw0rd-2026!").unwrap();
-        assert_eq!(parse_access_code("My0Passw0rd-2026!"), Ok(*expected.as_bytes()));
+        assert_eq!(
+            parse_access_code("My0Passw0rd-2026!"),
+            Ok(*expected.as_bytes())
+        );
         // Confusable characters are ordinary password characters now.
         assert_eq!(parse_access_code("ABCD0FG1"), {
-            let code =
-                desklink_crypto::PairingCode::derive_from_password(b"ABCD0FG1").unwrap();
+            let code = desklink_crypto::PairingCode::derive_from_password(b"ABCD0FG1").unwrap();
             Ok(*code.as_bytes())
         });
         // Non-ASCII passwords derive exactly like the Apple implementation.
@@ -120,7 +128,10 @@ mod tests {
             Ok(*code.as_bytes())
         });
         // Custom passwords are case sensitive; only temporary codes uppercase.
-        assert_ne!(parse_access_code("MyPassword2026"), parse_access_code("mypassword2026"));
+        assert_ne!(
+            parse_access_code("MyPassword2026"),
+            parse_access_code("mypassword2026")
+        );
         // Length bounds follow the shared crypto rule (8..=64 bytes).
         assert!(parse_access_code("short").is_err());
         assert!(parse_access_code(&"a".repeat(65)).is_err());
@@ -129,11 +140,19 @@ mod tests {
     #[test]
     fn fixed_passwords_that_normalize_like_temporary_codes_are_flagged() {
         // An already-canonical temporary-shaped password is used verbatim.
-        assert!(!fixed_password_conflicts_with_temporary_normalization("AB2DEF3G"));
-        assert!(!fixed_password_conflicts_with_temporary_normalization("My0Passw0rd-2026!"));
+        assert!(!fixed_password_conflicts_with_temporary_normalization(
+            "AB2DEF3G"
+        ));
+        assert!(!fixed_password_conflicts_with_temporary_normalization(
+            "My0Passw0rd-2026!"
+        ));
         // Lowercase or separated variants would be reinterpreted and are
         // rejected when the user picks them as fixed passwords.
-        assert!(fixed_password_conflicts_with_temporary_normalization("ab2def3g"));
-        assert!(fixed_password_conflicts_with_temporary_normalization("ab2-def3g"));
+        assert!(fixed_password_conflicts_with_temporary_normalization(
+            "ab2def3g"
+        ));
+        assert!(fixed_password_conflicts_with_temporary_normalization(
+            "ab2-def3g"
+        ));
     }
 }

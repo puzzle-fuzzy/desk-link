@@ -103,9 +103,8 @@ impl WindowsFixedAccessStore {
         fs::create_dir_all(parent)?;
         let mut plaintext = Vec::with_capacity(FIXED_ACCESS_MAGIC_V2.len() + 1 + password.len());
         plaintext.extend_from_slice(FIXED_ACCESS_MAGIC_V2);
-        plaintext.push(
-            u8::try_from(password.len()).map_err(|_| WindowsFixedAccessError::CorruptStore)?,
-        );
+        plaintext
+            .push(u8::try_from(password.len()).map_err(|_| WindowsFixedAccessError::CorruptStore)?);
         plaintext.extend_from_slice(password);
         let protected = protect(&plaintext)?;
         plaintext.zeroize();
@@ -141,8 +140,8 @@ fn decode(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, WindowsFixedAccessError> {
         let legacy = bytes[FIXED_ACCESS_MAGIC_V1.len()..]
             .try_into()
             .map_err(|_| WindowsFixedAccessError::CorruptStore)?;
-        let code = PairingCode::from_bytes(legacy)
-            .map_err(|_| WindowsFixedAccessError::CorruptStore)?;
+        let code =
+            PairingCode::from_bytes(legacy).map_err(|_| WindowsFixedAccessError::CorruptStore)?;
         return Ok(Zeroizing::new(code.as_bytes().to_vec()));
     }
     if &bytes[..FIXED_ACCESS_MAGIC_V2.len()] != FIXED_ACCESS_MAGIC_V2 {
@@ -273,7 +272,10 @@ mod tests {
                 .windows(8)
                 .any(|window| window == password.as_slice())
         );
-        assert_eq!(store.load().unwrap().unwrap().as_slice(), password.as_slice());
+        assert_eq!(
+            store.load().unwrap().unwrap().as_slice(),
+            password.as_slice()
+        );
         assert!(store.clear().unwrap());
         assert!(store.load().unwrap().is_none());
         let _ = fs::remove_dir_all(directory);
@@ -293,10 +295,7 @@ mod tests {
         let store = WindowsFixedAccessStore::new(&path);
         let custom = "My0Passw0rd-电池!";
         store.save_custom(custom.as_bytes()).unwrap();
-        assert_eq!(
-            store.load().unwrap().unwrap().as_slice(),
-            custom.as_bytes()
-        );
+        assert_eq!(store.load().unwrap().unwrap().as_slice(), custom.as_bytes());
         // Under-length and over-length passwords are rejected.
         assert!(store.save_custom(b"short").is_err());
         assert!(store.save_custom(&[b'a'; 65]).is_err());

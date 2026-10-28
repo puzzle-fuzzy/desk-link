@@ -991,11 +991,10 @@ async fn set_custom_fixed_access_password(
                 .to_owned(),
         );
     }
-    let summary = tauri::async_runtime::spawn_blocking(move || {
-        save_custom_fixed_access_password(trimmed)
-    })
-    .await
-    .map_err(|_| "DeskLink 无法保存固定密码，请重试。".to_owned())??;
+    let summary =
+        tauri::async_runtime::spawn_blocking(move || save_custom_fixed_access_password(trimmed))
+            .await
+            .map_err(|_| "DeskLink 无法保存固定密码，请重试。".to_owned())??;
     manager.restart(app).await;
     Ok(summary)
 }
@@ -1278,9 +1277,7 @@ fn build_diagnostic_checks(
     vec![configuration, trust, fixed_access, relay_check, host_check]
 }
 
-fn fixed_access_summary(
-    password: Zeroizing<Vec<u8>>,
-) -> Result<FixedAccessSummary, String> {
+fn fixed_access_summary(password: Zeroizing<Vec<u8>>) -> Result<FixedAccessSummary, String> {
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| "当前 Windows 账户无法使用主机身份。".to_owned())?
         .load_or_create(&mut OsRng)
