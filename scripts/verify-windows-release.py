@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
+import posixpath
 import re
 import struct
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 SCRIPTS_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPTS_DIRECTORY) not in sys.path:
@@ -463,33 +466,95 @@ def verify_production_backpressure(
 
 
 def verify_frontend_assets() -> list[str]:
-    index = WINDOWS_UI / "dist" / "index.html"
+    distribution = WINDOWS_UI / "dist"
+    index = distribution / "index.html"
     if not index.is_file():
         raise SystemExit("Windows UI dist/index.html was not produced")
-    text = index.read_text(encoding="utf-8")
     assets = sorted(
-        path.relative_to(WINDOWS_UI / "dist").as_posix()
-        for path in (WINDOWS_UI / "dist" / "assets").glob("*")
+        path.relative_to(distribution).as_posix()
+        for path in distribution.rglob("*")
         if path.is_file() and path.suffix in {".css", ".js"}
     )
     if not assets or not any(path.endswith(".js") for path in assets):
         raise SystemExit("Windows UI production assets were not produced")
-    for asset in assets:
-        if f"/{asset}" not in text:
-            raise SystemExit(f"Production index.html does not reference {asset}")
     forbidden_urls = (
         "http://localhost",
         "https://localhost",
         "http://127.0.0.1",
         "https://127.0.0.1",
     )
+    sources = {}
     for relative_path in ["index.html", *assets]:
-        source = (WINDOWS_UI / "dist" / relative_path).read_text(encoding="utf-8")
+        source = (distribution / relative_path).read_text(encoding="utf-8")
+        sources[relative_path] = source
         found = next((url for url in forbidden_urls if url in source), None)
         if found:
             raise SystemExit(
                 f"Production asset {relative_path} contains development URL {found}"
             )
+
+    def local_asset(reference: str, owner: str) -> str | None:
+        url = urlsplit(reference.replace("\\/", "/"))
+        if url.scheme or url.netloc:
+            return None
+        path = unquote(url.path)
+        if (
+            not path.endswith((".js", ".css"))
+            or posixpath.basename(path) in {".js", ".css"}
+            or "${" in path
+        ):
+            return None
+        relative = posixpath.normpath(
+            path.lstrip("/") if path.startswith("/")
+            else posixpath.join(posixpath.dirname(owner), path)
+        )
+        if relative.startswith("../") or relative not in sources:
+            raise SystemExit(f"Production asset {owner} references missing local asset {reference}")
+        return relative
+
+    class IndexReferences(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.assets: set[str] = set()
+            self.scripts: set[str] = set()
+
+        def handle_starttag(self, tag: str, attributes: list[tuple[str, str | None]]) -> None:
+            attribute = "src" if tag == "script" else "href" if tag == "link" else None
+            if attribute is None:
+                return
+            reference = dict(attributes).get(attribute)
+            dependency = local_asset(reference, "index.html") if reference else None
+            if dependency is not None:
+                self.assets.add(dependency)
+                if tag == "script" and dependency.endswith(".js"):
+                    self.scripts.add(dependency)
+
+    entries = IndexReferences()
+    entries.feed(sources["index.html"])
+    if not entries.scripts:
+        raise SystemExit("Production index.html has no local JavaScript entry")
+
+    # Vite emits imports, CSS URLs and ?url worklet loaders as static strings.
+    # Follow those strings transitively rather than requiring every chunk in HTML.
+    quoted_url = re.compile(r'''(["'`])([^"'`\r\n]*)\1''')
+    css_url = re.compile(r"url\(\s*([^\s'\"()]+)\s*\)", re.IGNORECASE)
+    pending = list(entries.assets)
+    reachable: set[str] = set()
+    while pending:
+        owner = pending.pop()
+        if owner in reachable:
+            continue
+        reachable.add(owner)
+        references = [match.group(2) for match in quoted_url.finditer(sources[owner])]
+        if owner.endswith(".css"):
+            references.extend(match.group(1) for match in css_url.finditer(sources[owner]))
+        for reference in references:
+            dependency = local_asset(reference, owner)
+            if dependency is not None and dependency not in reachable:
+                pending.append(dependency)
+    unreachable = sorted(set(assets) - reachable)
+    if unreachable:
+        raise SystemExit(f"Production assets are not reachable from index.html: {', '.join(unreachable)}")
     return assets
 
 
