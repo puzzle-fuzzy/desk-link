@@ -4,7 +4,7 @@ use crate::{
     transfer_task::FileTaskService,
 };
 use desklink_protocol::{
-    FileTaskAction, FileTaskMessage, FileTransferCapabilities, ResumeCheckpoint, TransferResult,
+    FileTaskAction, FileTaskMessage, FileTransferCapabilities, TransferResult,
 };
 use std::{
     fs,
@@ -15,7 +15,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{sleep, timeout};
 #[path = "../test-support/file-task-fixture.rs"]
 mod fixture;
 use fixture::*;

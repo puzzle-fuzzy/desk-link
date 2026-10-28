@@ -898,6 +898,7 @@ impl DirectoryDestination {
         )?;
         #[cfg(not(windows))]
         let file = options.open(&staging_path).map_err(io_result)?;
+        #[allow(clippy::question_mark)] // windows cleanup must run before returning
         if let Err(error) = check_destination_pins(&pins) {
             #[cfg(windows)]
             let _ = native::delete_owned(&file);
