@@ -701,7 +701,12 @@ mod tests {
         fn new() -> Self {
             let mut id = [0; 16];
             OsRng.fill_bytes(&mut id);
-            let path = std::env::temp_dir().join(format!("desklink-catalog-{}", id_text(id)));
+            // Canonicalize so macOS' /var symlink prefix cannot trip the
+            // catalog's reparse-point rejection; the pinned chain itself
+            // still refuses symlinks inside the catalog.
+            let path = fs::canonicalize(std::env::temp_dir())
+                .unwrap_or_else(|_| std::env::temp_dir())
+                .join(format!("desklink-catalog-{}", id_text(id)));
             fs::create_dir(&path).unwrap();
             Self(path)
         }

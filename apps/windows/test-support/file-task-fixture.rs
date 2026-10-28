@@ -32,12 +32,25 @@ use crate::{
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
-pub(super) struct Fixture(pub(super) PathBuf, PathBuf, bool, Arc<AtomicUsize>);
+/// Each fixture spins real QUIC/Noise actor runtimes; running them in
+/// parallel starves their timers on constrained machines and fails the
+/// suite spuriously. Holding this lock for the fixture's lifetime
+/// serializes exactly these tests, with no effect on other modules.
+static ACTOR_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) struct Fixture(
+    pub(super) PathBuf,
+    PathBuf,
+    bool,
+    Arc<AtomicUsize>,
+    pub(super) Option<std::sync::MutexGuard<'static, ()>>,
+);
 impl Fixture {
     pub(super) fn new() -> Self {
         Self::new_in(&std::env::temp_dir())
     }
     pub(super) fn new_in(base: &Path) -> Self {
+        let serializer = ACTOR_SERIALIZER.lock().ok();
         let base = fs::canonicalize(base).unwrap();
         assert!(base.is_absolute());
         let root = base.join(format!(
@@ -52,7 +65,7 @@ impl Fixture {
         for name in ["receive-a", "receive-b"] {
             fs::create_dir(root.join(name)).unwrap();
         }
-        Self(root, base, false, Arc::new(AtomicUsize::new(0)))
+        Self(root, base, false, Arc::new(AtomicUsize::new(0)), serializer)
     }
     pub(super) fn preserve(&mut self) {
         self.2 = true;

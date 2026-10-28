@@ -1326,10 +1326,14 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "desklink-transfer-{test}-{}-{nonce}",
-            std::process::id()
-        ));
+        // Canonicalize so macOS' /var symlink prefix cannot leak into paths
+        // that downstream catalog pinning must treat as reparse points.
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!(
+                "desklink-transfer-{test}-{}-{nonce}",
+                std::process::id()
+            ));
         let staging = root.join("staging");
         let downloads = root.join("downloads");
         (root, staging, downloads)
