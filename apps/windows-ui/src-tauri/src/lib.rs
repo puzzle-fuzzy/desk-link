@@ -979,6 +979,28 @@ async fn regenerate_fixed_access_password(
 }
 
 #[tauri::command]
+async fn set_custom_fixed_access_password(
+    app: AppHandle,
+    manager: State<'_, HostManager>,
+    password: String,
+) -> Result<FixedAccessSummary, String> {
+    let trimmed = password.trim().to_owned();
+    if device_directory::fixed_password_conflicts_with_temporary_normalization(&trimmed) {
+        return Err(
+            "这个密码会被当作临时密码格式自动归一化（去分隔符并转大写），请换一个包含符号或其他字符的固定密码。"
+                .to_owned(),
+        );
+    }
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        save_custom_fixed_access_password(trimmed)
+    })
+    .await
+    .map_err(|_| "DeskLink 无法保存固定密码，请重试。".to_owned())??;
+    manager.restart(app).await;
+    Ok(summary)
+}
+
+#[tauri::command]
 async fn disable_fixed_access_password(
     app: AppHandle,
     manager: State<'_, HostManager>,
@@ -1257,17 +1279,19 @@ fn build_diagnostic_checks(
 }
 
 fn fixed_access_summary(
-    password: desklink_crypto::PairingCode,
+    password: Zeroizing<Vec<u8>>,
 ) -> Result<FixedAccessSummary, String> {
     let identity = WindowsIdentityStore::for_current_user()
         .map_err(|_| "当前 Windows 账户无法使用主机身份。".to_owned())?
         .load_or_create(&mut OsRng)
         .map_err(|_| "无法打开当前账户受保护的主机身份。".to_owned())?;
+    let password = String::from_utf8(password.as_slice().to_vec())
+        .map_err(|_| "受保护的固定密码已损坏，请重新设置。".to_owned())?;
     Ok(FixedAccessSummary {
         device_id: device_directory::format_device_id(device_directory::public_device_id(
             identity.device_id,
         )),
-        password: password.to_string(),
+        password,
     })
 }
 
@@ -1286,6 +1310,18 @@ fn create_fixed_access_password() -> Result<FixedAccessSummary, String> {
         .generate_and_save(&mut OsRng)
         .map_err(|_| "DeskLink 无法加密保存固定密码。".to_owned())?;
     fixed_access_summary(password)
+}
+
+fn save_custom_fixed_access_password(password: String) -> Result<FixedAccessSummary, String> {
+    let bytes = Zeroizing::new(password.into_bytes());
+    if desklink_crypto::PairingCode::derive_from_password(bytes.as_slice()).is_err() {
+        return Err("固定密码需为 8 到 64 个字符，可以使用任意字符。".to_owned());
+    }
+    WindowsFixedAccessStore::for_current_user()
+        .map_err(|_| "当前 Windows 账户无法使用固定密码存储。".to_owned())?
+        .save_custom(bytes.as_slice())
+        .map_err(|_| "DeskLink 无法加密保存固定密码。".to_owned())?;
+    fixed_access_summary(bytes)
 }
 
 fn clear_fixed_access_password() -> Result<(), String> {
@@ -1849,6 +1885,7 @@ pub fn run() {
             cancel_pairing_session,
             get_fixed_access_password,
             regenerate_fixed_access_password,
+            set_custom_fixed_access_password,
             disable_fixed_access_password,
             revoke_trusted_controller,
             probe_relay,

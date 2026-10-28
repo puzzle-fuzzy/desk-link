@@ -1,7 +1,10 @@
 //! Actual Host adapter / ControllerRuntime loopback. Synthetic encoded media
 //! and a recording input backend exercise transport without capture, decoder
 //! presentation, clipboard access, file dialogs or native input injection.
+// The disk-actor gate is held across await points by design so real LAN
+// worker tests cannot compete with the serialized actor families.
 #![cfg(windows)]
+#![allow(clippy::await_holding_lock)]
 use super::*;
 use crate::{
     audio::CapturedAudioFrame,
@@ -770,7 +773,7 @@ async fn real_files_with_blocked_disk(
 ) {
     // Existing disk tests deliberately use all eight production worker slots.
     // The same test-only gate prevents this real LAN worker competing with them.
-    let _disk_gate = crate::transfer::lock_disk_worker_tests().await;
+    let _disk_gate = crate::transfer::lock_disk_worker_tests();
     let temporary = TemporaryFiles::new();
     let payload: Vec<u8> = (0..(desklink_protocol::MAX_TRANSFER_CHUNK_BYTES * 7 + 23))
         .map(|i| (i % 251) as u8)
@@ -1142,7 +1145,7 @@ async fn file_actor_stopped(
 
 #[tokio::test]
 async fn native_file_tasks_use_lan_for_directory_and_large_offset_after_eight_lane_barrier() {
-    let _disk_gate = crate::transfer::lock_disk_worker_tests().await;
+    let _disk_gate = crate::transfer::lock_disk_worker_tests();
     tokio::time::timeout(LIMIT, async {
         let mut fixture = Fixture::new().await;
         let (_, sender, mut events, drive) = connect_lan(&mut fixture).await;
@@ -1308,7 +1311,7 @@ async fn native_file_tasks_use_lan_for_directory_and_large_offset_after_eight_la
 #[tokio::test]
 async fn optional_transfer_loss_stops_native_actor_and_persists_real_pause_while_input_control_work()
  {
-    let _disk_gate = crate::transfer::lock_disk_worker_tests().await;
+    let _disk_gate = crate::transfer::lock_disk_worker_tests();
     tokio::time::timeout(LIMIT, async {
         // Transfer deliberately stays on relay; the other seven negotiated
         // business lanes complete real LAN admission. No format changes later.

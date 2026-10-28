@@ -316,7 +316,7 @@ fn decode_entry_fields(
     offset: &mut usize,
 ) -> Result<(u64, PairingCode, bool, u64), WindowsRecentAccessError> {
     let device_id = u64::from_be_bytes(read_array(bytes, offset)?);
-    let password = PairingCode::from_bytes(read_array(bytes, offset)?)
+    let password = PairingCode::from_directory_code(read_array(bytes, offset)?)
         .map_err(|_| WindowsRecentAccessError::CorruptStore)?;
     let persistent = match read_array::<1>(bytes, offset)?[0] {
         0 => false,

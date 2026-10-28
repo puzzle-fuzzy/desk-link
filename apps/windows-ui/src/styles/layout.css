@@ -136,6 +136,8 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 .pairing-card:has(.pairing-qr-layout) .pairing-credentials { grid-template-columns: 1fr; }
 .pairing-card:has(.pairing-qr-layout) .pairing-card-actions, .pairing-card:has(.pairing-qr-layout) .secret-note { grid-column: 1 / -1; margin: 0; }
 .fixed-access-confirmation { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px; width: 100%; }
+.fixed-access-custom { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px 0 0; width: 100%; }
+.fixed-access-custom input { flex: 1; min-width: 220px; }
 .fixed-access-confirmation strong { flex: 100%; }
 
 /* Settings, identity and diagnostics are compact rows. */

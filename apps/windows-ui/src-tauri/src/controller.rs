@@ -1679,7 +1679,7 @@ impl ControllerManager {
             crate::device_directory::parse_device_id(&input.device_id).map_err(str::to_owned)?;
         let access_code = crate::device_directory::parse_access_code(&input.temporary_password)
             .map_err(str::to_owned)?;
-        let password = PairingCode::from_bytes(access_code)
+        let password = PairingCode::from_directory_code(access_code)
             .map_err(|_| "设备 ID 或访问密码格式无效。".to_owned())?;
         self.connect_device_credentials(
             device_id,

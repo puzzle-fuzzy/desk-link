@@ -46,7 +46,6 @@ import type { ControllerChannels, ControllerVideoPayload } from "./api";
 import {
   deviceCredentialsAreValid,
   formatDeviceId,
-  normalizeTemporaryPassword,
 } from "./device-credentials";
 import { escapeHtml } from "./html";
 import {
@@ -516,9 +515,10 @@ export function bindControllerInteractions(): void {
     updateDeviceSubmitState();
   });
   document.querySelector<HTMLInputElement>("[data-controller-password]")?.addEventListener("input", (event) => {
+    // Temporary codes are normalized in Rust when parsing; custom fixed
+    // passwords must keep the exact typed bytes, so the draft stays raw.
     const input = event.currentTarget as HTMLInputElement;
-    temporaryPasswordDraft = normalizeTemporaryPassword(input.value);
-    input.value = temporaryPasswordDraft;
+    temporaryPasswordDraft = input.value;
     updateDeviceSubmitState();
   });
   document.querySelectorAll<HTMLButtonElement>("[data-controller-saved-device-connect]").forEach((button) => {
@@ -825,7 +825,7 @@ function renderConnectionPanel(): string {
             </label>
             <label class="field device-credential-field">
               <span>访问密码</span>
-              <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="8" placeholder="8 位访问密码" required autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" ${isWorking ? "disabled" : ""}>
+              <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="64" placeholder="访问密码（临时密码或 8-64 位固定密码）" required autocomplete="one-time-code" spellcheck="false" ${isWorking ? "disabled" : ""}>
             </label>
             <div class="controller-form-actions">
               <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
@@ -1317,7 +1317,7 @@ async function submitDevice(event: SubmitEvent): Promise<void> {
   const form = event.currentTarget as HTMLFormElement;
   const data = new FormData(form);
   deviceIdDraft = formatDeviceId(String(data.get("deviceId") ?? ""));
-  temporaryPasswordDraft = normalizeTemporaryPassword(String(data.get("temporaryPassword") ?? ""));
+  temporaryPasswordDraft = String(data.get("temporaryPassword") ?? "").trim();
   if (!deviceCredentialsAreValid(deviceIdDraft, temporaryPasswordDraft)) {
     feedback = { tone: "error", message: "请输入完整的 12 位设备 ID 和 8 位访问密码。" };
     requestRender();

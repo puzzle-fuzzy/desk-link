@@ -18,7 +18,7 @@ mod windows {
         },
         window::PendingController,
     };
-    use desklink_crypto::{DeviceIdentity, PairingInvite, PeerIdentity, SessionId};
+    use desklink_crypto::{DeviceIdentity, PairingCode, PairingInvite, PeerIdentity, SessionId};
     use desklink_ffi::{ControllerEvent, ControllerRuntime};
     use desklink_relay::{RelayConfig, RelayServer};
     use desklink_session::ReconnectPolicy;
@@ -661,7 +661,9 @@ mod windows {
                 host = host.with_directory_registration(
                     RelayDirectoryRegistration::new(
                         directory_id,
-                        *password.as_bytes(),
+                        *PairingCode::derive_from_password(password.as_slice())
+                            .unwrap()
+                            .as_bytes(),
                         invite.encode().unwrap().as_bytes().to_vec(),
                         0,
                     )
@@ -686,7 +688,7 @@ mod windows {
         let (host_task, events) = start_host();
         wait_for_available(&events, 0).await;
         let invitation =
-            lookup_fixed_password(&tls, relay.address, directory_id, *original.as_bytes())
+            lookup_fixed_password(&tls, relay.address, directory_id, *PairingCode::derive_from_password(original.as_slice()).unwrap().as_bytes())
                 .await
                 .unwrap();
         assert_eq!(invitation.host_verify_key(), host_key);
@@ -694,7 +696,7 @@ mod windows {
         let mut previous_stream = 0;
         for _ in 0..2 {
             let resolved =
-                lookup_fixed_password(&tls, relay.address, directory_id, *original.as_bytes())
+                lookup_fixed_password(&tls, relay.address, directory_id, *PairingCode::derive_from_password(original.as_slice()).unwrap().as_bytes())
                     .await
                     .unwrap();
             let mut controller = connect_controller(
@@ -729,11 +731,11 @@ mod windows {
         let (host_task, events) = start_host();
         wait_for_available(&events, 0).await;
         assert!(matches!(
-            lookup_fixed_password(&tls, relay.address, directory_id, *original.as_bytes()).await,
+            lookup_fixed_password(&tls, relay.address, directory_id, *PairingCode::derive_from_password(original.as_slice()).unwrap().as_bytes()).await,
             Err(TransportError::DirectoryNotFound),
         ));
         let resolved =
-            lookup_fixed_password(&tls, relay.address, directory_id, *replacement.as_bytes())
+            lookup_fixed_password(&tls, relay.address, directory_id, *PairingCode::derive_from_password(replacement.as_slice()).unwrap().as_bytes())
                 .await
                 .unwrap();
         let mut controller = connect_controller(
@@ -762,7 +764,7 @@ mod windows {
         let (host_task, events) = start_host();
         wait_for_available(&events, 0).await;
         assert!(matches!(
-            lookup_fixed_password(&tls, relay.address, directory_id, *replacement.as_bytes()).await,
+            lookup_fixed_password(&tls, relay.address, directory_id, *PairingCode::derive_from_password(replacement.as_slice()).unwrap().as_bytes()).await,
             Err(TransportError::DirectoryNotFound),
         ));
         let unknown = QuicClient::connect(tls.client_config(relay.address))

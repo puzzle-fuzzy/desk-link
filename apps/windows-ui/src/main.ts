@@ -29,6 +29,7 @@ import {
   openGithubRepository,
   quitDeskLink,
   regenerateFixedAccessPassword,
+  setCustomFixedAccessPassword,
   respondHostApproval,
   restartHost,
   pauseHostSharing,
@@ -1189,6 +1190,15 @@ function renderPairing(state: HostSnapshot): string {
   `;
 }
 
+function renderFixedAccessCustomForm(disabled: boolean): string {
+  return `
+    <form class="fixed-access-custom" data-fixed-access-custom-form>
+      <label class="sr-only" for="fixed-access-custom-password">自定义固定密码</label>
+      <input id="fixed-access-custom-password" name="customPassword" type="text" autocomplete="off" spellcheck="false" maxlength="64" placeholder="自定义密码：8-64 位，可使用任意字符" ${disabled ? "disabled" : ""}>
+      <button class="button button--secondary button--compact" type="submit" ${disabled ? "disabled" : ""}>设为固定密码</button>
+    </form>`;
+}
+
 function renderFixedAccess(state: HostSnapshot): string {
   const enabled = state.fixedPasswordEnabled;
   const canEnable = Boolean(state.connection) && !state.fixedPasswordError;
@@ -1235,6 +1245,7 @@ function renderFixedAccess(state: HostSnapshot): string {
                     : `<button class="button button--secondary" type="button" data-regenerate-fixed-access ${fixedAccessBusy ? "disabled" : ""}>${fixedAccessBusy ? "正在更换…" : "更换固定密码"}</button>
                        <button class="button button--danger-quiet" type="button" data-disable-fixed-access ${fixedAccessBusy ? "disabled" : ""}>关闭固定密码</button>`}
                 </div>
+                ${renderFixedAccessCustomForm(fixedAccessBusy || fixedAccessConfirmation !== null)}
               </section>
             `
             : `<section class="pairing-card pairing-card--unavailable" role="status">${fixedAccessBusy ? "<h2>正在读取固定密码…</h2>" : '<button class="button button--primary" type="button" data-load-fixed-access>重试</button>'}</section>`
@@ -1244,6 +1255,7 @@ function renderFixedAccess(state: HostSnapshot): string {
               <div class="pairing-card-actions">
                 <button class="button button--primary" type="button" data-regenerate-fixed-access ${!canEnable || fixedAccessBusy ? "disabled" : ""}>${fixedAccessBusy ? "正在启用…" : "启用固定密码"}</button>
               </div>
+              ${renderFixedAccessCustomForm(!canEnable || fixedAccessBusy)}
             </section>
           `}
 
@@ -1589,6 +1601,49 @@ async function regenerateFixedAccess(): Promise<void> {
   }
 }
 
+async function setCustomFixedAccess(password: string): Promise<void> {
+  if (!snapshot?.connection || fixedAccessBusy || !password) {
+    return;
+  }
+  fixedAccessBusy = true;
+  fixedAccessConfirmation = null;
+  feedback = { tone: "info", message: snapshot.fixedPasswordEnabled ? "正在设置自定义固定密码…" : "正在启用固定密码…" };
+  clearFixedAccessSecrets();
+  const request = fixedAccessRequests.begin();
+  let reloadOnReturn = false;
+  render();
+  try {
+    const nextAccess = await setCustomFixedAccessPassword(password);
+    if (fixedAccessRequests.isCurrent(request) && activeView === "fixedAccess" && !accountBusy
+      && canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
+      fixedAccess = nextAccess;
+      feedback = { tone: "success", message: "固定密码已更新。" };
+    } else {
+      nextAccess.password = "";
+      reloadOnReturn = true;
+    }
+    if (canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) {
+      snapshotRequests.begin();
+      if (snapshot) {
+        snapshot.fixedPasswordEnabled = true;
+        snapshot.fixedPasswordError = null;
+      }
+      await refreshSnapshot(false);
+    }
+  } catch (error) {
+    if (fixedAccessRequests.isCurrent(request) && activeView === "fixedAccess") {
+      feedback = { tone: "error", message: normalizeError(error) };
+    }
+  } finally {
+    fixedAccessBusy = false;
+    if (activeView === "fixedAccess") {
+      render();
+      if (reloadOnReturn && snapshot?.fixedPasswordEnabled && !accountBusy
+        && canRecoverWorkspaceSnapshot(account.signedIn, accountLocalMode)) void loadFixedAccess();
+    }
+  }
+}
+
 async function disableFixedAccess(): Promise<void> {
   if (!snapshot?.fixedPasswordEnabled || fixedAccessBusy) {
     return;
@@ -1902,6 +1957,15 @@ function bindInteractions(preservedController = false): void {
     } else {
       void regenerateFixedAccess();
     }
+  });
+  document.querySelector<HTMLFormElement>("[data-fixed-access-custom-form]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const password = String(new FormData(form).get("customPassword") ?? "").trim();
+    if (!password) {
+      return;
+    }
+    void setCustomFixedAccess(password);
   });
   document.querySelector<HTMLButtonElement>("[data-disable-fixed-access]")?.addEventListener("click", () => {
     fixedAccessConfirmation = "disable";

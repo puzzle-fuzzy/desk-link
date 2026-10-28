@@ -175,6 +175,10 @@ export function regenerateFixedAccessPassword(): Promise<FixedAccessSummary> {
   return invoke<FixedAccessSummary>("regenerate_fixed_access_password");
 }
 
+export function setCustomFixedAccessPassword(password: string): Promise<FixedAccessSummary> {
+  return invoke<FixedAccessSummary>("set_custom_fixed_access_password", { password });
+}
+
 export function disableFixedAccessPassword(): Promise<HostSnapshot> {
   return invoke<HostSnapshot>("disable_fixed_access_password");
 }

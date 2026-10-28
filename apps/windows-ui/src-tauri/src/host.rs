@@ -1042,9 +1042,13 @@ fn prepare_host(
         let encoded = invite
             .encode()
             .map_err(|_| HostPreparationFailure::FixedAccessStorage)?;
+        // Both peers derive the directory code from the verbatim password
+        // bytes, so generated and user-chosen fixed passwords behave alike.
+        let directory_code = PairingCode::derive_from_password(password.as_slice())
+            .map_err(|_| HostPreparationFailure::FixedAccessStorage)?;
         let registration = RelayDirectoryRegistration::new(
             crate::device_directory::public_device_id(identity.device_id),
-            *password.as_bytes(),
+            *directory_code.as_bytes(),
             encoded.as_bytes().to_vec(),
             0,
         )
@@ -1141,9 +1145,13 @@ fn prepare_pairing(
         .build();
     let device_id = crate::device_directory::public_device_id(identity.device_id);
     let access_code = PairingCode::generate(&mut OsRng);
+    // The pairing screen shows the generated code; controllers that type it
+    // derive the same directory code from the identical password bytes.
+    let directory_code = PairingCode::derive_from_password(access_code.as_bytes())
+        .map_err(|_| HostPreparationFailure::Pairing)?;
     let directory_registration = RelayDirectoryRegistration::new(
         device_id,
-        *access_code.as_bytes(),
+        *directory_code.as_bytes(),
         encoded.as_bytes().to_vec(),
         MAX_PAIRING_TTL_S
             .try_into()
