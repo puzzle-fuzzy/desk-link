@@ -1195,8 +1195,8 @@
 > **T-1 跟踪项（源自 MVP-08）**：`transfer_task_tests::cancelled_active_part_retries_from_zero_with_a_fresh_staging_file` 在取消上传后 `retry()` 被接受但重发 Offer 有时永不到达（跨 2 核 CI / 10 核本地、串行/并行、任意等待上限均复现）。怀疑 retry 准入与 actor 终态清理之间存在竞态（`transfer_task.rs` Command::Retry → send_task 的 Offer 发送条件）。该测试已 `#[ignore]` 并注明原因；修复后移除 ignore 并恢复运行。。`desklink-windows` 的 transfer_task_catalog/transfer_task_tests 共约 22 项在 macOS 失败（main 已有），按目录项语义差异（目录 kind/替换/重扫）逐项修复或按平台显式跳过并注明原因，不得静默删除。
   验收：根因为 macOS 的 /var 符号链接前缀触发目录钉住链的 reparse 拒绝（catalog 夹具与 transfer.rs 临时目录改为规范化路径），以及加密 actor 测试在默认并行度下的资源竞争（fixture 持全局串行锁，与既有 DISK_WORKER_TEST_GATE 模式一致）。`cargo test -p desklink-windows --lib` 在 macOS 连续两轮 280 项全绿；Windows 路径行为未改动。
 
-- [ ] **MVP-09 测试：Apple/Rust macOS CI**。新增 GitHub Actions macOS workflow：cargo fmt --check、clippy -D warnings、workspace 测试（除显式 skip）、`apps/apple` 与 `apps/macos` swift test（先安装 cmake 供 opus-head-sys）。当前仓库无任何 macOS Swift CI。
-  验收：workflow 在本仓库跑通一次全绿；提交状态徽记可用。
+- [x] **MVP-09 测试：Apple/Rust macOS CI**。新增 GitHub Actions macOS workflow：cargo fmt --check、clippy -D warnings、workspace 测试（除显式 skip）、`apps/apple` 与 `apps/macos` swift test（先安装 cmake 供 opus-head-sys）。当前仓库无任何 macOS Swift CI。
+  验收：workflow 在本仓库跑通一次全绿（run 40620646111，含 fmt、workspace clippy -D warnings、Rust 全量、Apple 核心、macOS 应用、iOS 模拟器测试）；GitHub Actions 原处于禁用状态已开启。注：runner 上 Rust 测试限两线程（与核心数匹配），iOS 测试前需构建 xcframework，均已写入 workflow。
 
 - [x] **MVP-10 测试：固定密码保存材料端到端重连**。Rust e2e：固定密码目录连接成功 → 保存材料 → 断开 → 用保存材料重连（不再输密码）成功且身份一致；覆盖派生码路径。
   验收：新 e2e 测试通过并纳入 verify-macos-runtime 门禁链。
