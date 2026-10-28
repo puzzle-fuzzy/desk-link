@@ -7,11 +7,11 @@ use crate::{
     transfer_checkpoint::{FILE_BLOCK_BYTES, SourceIndex},
     transfer_task::FileTaskService,
 };
+#[cfg(windows)]
+use desklink_protocol::ResumeCheckpoint;
 use desklink_protocol::{
     FileTaskAction, FileTaskMessage, FileTransferCapabilities, TransferResult,
 };
-#[cfg(windows)]
-use desklink_protocol::ResumeCheckpoint;
 #[cfg(windows)]
 use std::time::Instant;
 use std::{
