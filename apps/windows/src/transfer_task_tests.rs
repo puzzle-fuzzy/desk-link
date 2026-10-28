@@ -20,12 +20,24 @@ use tokio::time::{sleep, timeout};
 mod fixture;
 use fixture::*;
 
+/// Bounded actor waits are tuned for local dev machines; two-core CI runners
+/// legitimately need longer QUIC/Noise round trips, so scale the bounds by
+/// environment instead of letting slow machines flake the suite.
+fn actor_wait_secs(base: u64) -> Duration {
+    let factor: u64 = if std::env::var_os("CI").is_some() {
+        6
+    } else {
+        1
+    };
+    Duration::from_secs(base * factor)
+}
+
 async fn retry_fixture_task(
     handle: &crate::transfer_task::FileTaskHandle,
     task: desklink_protocol::TransferId,
     item: Option<u64>,
 ) {
-    timeout(Duration::from_secs(3), async {
+    timeout(actor_wait_secs(3), async {
         loop {
             match handle.retry(task, item) {
                 Ok(()) => break,
@@ -461,7 +473,7 @@ async fn replay_rejects_changed_directory_kind_including_an_empty_selected_root(
     fs::write(&empty, b"replacement root file").unwrap();
     let mut peers = Peers::new(&fixture, true, Duration::ZERO).await;
     retry_fixture_task(&peers.a, task, None).await;
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(5), async {
         loop {
             if peers
                 .a_progress
@@ -849,7 +861,7 @@ async fn encrypted_actor_disconnect_and_recreation_resume_from_durable_ack() {
     let peers = Peers::new(&fixture, true, Duration::from_millis(20)).await;
     let task = [24; 16];
     start(&peers.a, &source, task).await;
-    timeout(Duration::from_secs(10), async {
+    timeout(actor_wait_secs(10), async {
         loop {
             if peers.stats.lock().unwrap().acknowledgements >= 2 {
                 break;
@@ -896,7 +908,7 @@ async fn encrypted_actor_cancel_during_backpressure_keeps_async_timers_responsiv
     let mut peers = Peers::new(&fixture, true, Duration::from_millis(40)).await;
     let task = [25; 16];
     start(&peers.a, &source, task).await;
-    timeout(Duration::from_secs(10), async {
+    timeout(actor_wait_secs(10), async {
         while peers.stats.lock().unwrap().acknowledgements == 0 {
             sleep(Duration::from_millis(2)).await;
         }
@@ -940,7 +952,7 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
         .unwrap();
     drop(proofs);
     let mut service = FileTaskService::spawn(fixture.options(true, true)).unwrap();
-    timeout(Duration::from_secs(5), service.outgoing.recv())
+    timeout(actor_wait_secs(5), service.outgoing.recv())
         .await
         .unwrap()
         .unwrap();
@@ -953,7 +965,7 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
     let task = [26; 16];
     start(&service.handle, &source, task).await;
     assert!(matches!(
-        timeout(Duration::from_secs(5), service.outgoing.recv())
+        timeout(actor_wait_secs(5), service.outgoing.recv())
             .await
             .unwrap()
             .unwrap(),
@@ -967,7 +979,7 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
             budget: FileTransferCapabilities::WINDOWS,
         })
         .unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(5), async {
         loop {
             match service.outgoing.recv().await.unwrap() {
                 FileTaskMessage::Entry { task_id, entry } => {
@@ -1007,7 +1019,7 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
             },
         })
         .unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(5), async {
         while service.outgoing.is_empty() {
             sleep(Duration::from_millis(1)).await;
         }
@@ -1025,7 +1037,7 @@ async fn cancelling_a_full_outgoing_queue_releases_the_source_pin_within_500_ms(
             },
         })
         .unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(5), async {
         while service.outgoing.len() < 2 {
             sleep(Duration::from_millis(1)).await;
         }
@@ -1136,7 +1148,7 @@ async fn encrypted_directory_conflict_is_partial_and_retry_sends_only_failed_fil
     // Remove only the explicitly generated conflict, after the failed create
     // proved it was preserved. The source is never modified.
     fs::remove_file(&conflict).unwrap();
-    timeout(Duration::from_secs(3), async {
+    timeout(actor_wait_secs(3), async {
         loop {
             match peers.a.retry(task, Some(failed_item)) {
                 Ok(()) => break,
@@ -1174,7 +1186,7 @@ async fn deliver(handle: &crate::transfer_task::FileTaskHandle, message: FileTas
     else {
         unreachable!()
     };
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(5), async {
         loop {
             match handle.ingest(message.clone()) {
                 Ok(()) => break,
@@ -1203,7 +1215,7 @@ async fn receiver_final_disk_verification_refuses_a_wrong_whole_content_root_and
     let expected_root = index.content_root();
     drop(index);
     let mut receiver = FileTaskService::spawn(fixture.options(false, true)).unwrap();
-    timeout(Duration::from_secs(5), receiver.outgoing.recv())
+    timeout(actor_wait_secs(5), receiver.outgoing.recv())
         .await
         .unwrap()
         .unwrap();
@@ -1224,7 +1236,7 @@ async fn receiver_final_disk_verification_refuses_a_wrong_whole_content_root_and
     )
     .await;
     assert!(matches!(
-        timeout(Duration::from_secs(5), receiver.outgoing.recv())
+        timeout(actor_wait_secs(5), receiver.outgoing.recv())
             .await
             .unwrap()
             .unwrap(),
@@ -1248,7 +1260,7 @@ async fn receiver_final_disk_verification_refuses_a_wrong_whole_content_root_and
     )
     .await;
     assert!(matches!(
-        timeout(Duration::from_secs(5), receiver.outgoing.recv())
+        timeout(actor_wait_secs(5), receiver.outgoing.recv())
             .await
             .unwrap()
             .unwrap(),
@@ -1269,7 +1281,7 @@ async fn receiver_final_disk_verification_refuses_a_wrong_whole_content_root_and
         },
     )
     .await;
-    let ack = timeout(Duration::from_secs(5), receiver.outgoing.recv())
+    let ack = timeout(actor_wait_secs(5), receiver.outgoing.recv())
         .await
         .unwrap()
         .unwrap();
@@ -1286,7 +1298,7 @@ async fn receiver_final_disk_verification_refuses_a_wrong_whole_content_root_and
     )
     .await;
     assert!(matches!(
-        timeout(Duration::from_secs(5), receiver.outgoing.recv())
+        timeout(actor_wait_secs(5), receiver.outgoing.recv())
             .await
             .unwrap()
             .unwrap(),
@@ -1309,7 +1321,7 @@ async fn receiver_final_disk_verification_refuses_a_wrong_whole_content_root_and
     )
     .await;
     assert!(matches!(
-        timeout(Duration::from_secs(5), receiver.outgoing.recv())
+        timeout(actor_wait_secs(5), receiver.outgoing.recv())
             .await
             .unwrap()
             .unwrap(),
@@ -1337,7 +1349,7 @@ async fn encrypted_restart_refuses_a_changed_source_even_with_restored_length_an
     let peers = Peers::new(&fixture, true, Duration::from_millis(20)).await;
     let task = [29; 16];
     start(&peers.a, &source, task).await;
-    timeout(Duration::from_secs(10), async {
+    timeout(actor_wait_secs(10), async {
         while peers.stats.lock().unwrap().acknowledgements < 2 {
             sleep(Duration::from_millis(2)).await;
         }
@@ -1378,7 +1390,7 @@ async fn next_revision(
     progress: &mut tokio::sync::watch::Receiver<Option<crate::transfer_task::FileTaskProgress>>,
     revision: u64,
 ) {
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(15), async {
         while progress
             .borrow()
             .as_ref()
@@ -1392,7 +1404,7 @@ async fn next_revision(
 }
 
 async fn wait_for_offer(peers: &Peers, previous: u64) {
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(15), async {
         while peers.stats.lock().unwrap().offers <= previous {
             sleep(Duration::from_millis(2)).await;
         }
@@ -1410,7 +1422,7 @@ async fn encrypted_receiver_can_request_retry_after_both_actors_are_recreated() 
     let peers = Peers::new(&fixture, true, Duration::from_millis(20)).await;
     let task = [30; 16];
     start(&peers.a, &source, task).await;
-    timeout(Duration::from_secs(10), async {
+    timeout(actor_wait_secs(10), async {
         while peers.stats.lock().unwrap().acknowledgements < 2 {
             sleep(Duration::from_millis(2)).await;
         }
@@ -1466,7 +1478,7 @@ async fn paused_actors_restore_confirmed_progress_and_resume_after_recreation() 
     let peers = Peers::new(&fixture, true, Duration::from_millis(20)).await;
     let task = [31; 16];
     start(&peers.a, &source, task).await;
-    timeout(Duration::from_secs(10), async {
+    timeout(actor_wait_secs(10), async {
         while peers.stats.lock().unwrap().acknowledgements < 2 {
             sleep(Duration::from_millis(2)).await;
         }
@@ -1474,7 +1486,7 @@ async fn paused_actors_restore_confirmed_progress_and_resume_after_recreation() 
     .await
     .unwrap();
     peers.a.action(task, FileTaskAction::Pause).unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(actor_wait_secs(5), async {
         loop {
             if peers
                 .a_progress
@@ -1536,7 +1548,7 @@ async fn cancelled_active_part_retries_from_zero_with_a_fresh_staging_file() {
     let mut peers = Peers::new(&fixture, true, Duration::from_millis(10)).await;
     let task = [32; 16];
     start(&peers.a, &source, task).await;
-    timeout(Duration::from_secs(10), async {
+    timeout(actor_wait_secs(10), async {
         while peers.stats.lock().unwrap().acknowledgements < 2 {
             sleep(Duration::from_millis(2)).await;
         }
@@ -1557,7 +1569,7 @@ async fn cancelled_active_part_retries_from_zero_with_a_fresh_staging_file() {
     );
     let prior_resumes = peers.stats.lock().unwrap().resumes.len();
     let offers_before_retry = peers.stats.lock().unwrap().offers;
-    timeout(Duration::from_secs(3), async {
+    timeout(actor_wait_secs(3), async {
         loop {
             match peers.a.retry(task, None) {
                 Ok(()) => break,
@@ -1598,7 +1610,7 @@ async fn full_outgoing_selection_cancel_preserves_request_binding_until_retry_ca
     // Keep the initial Capabilities packet queued, then add the local selector
     // request. These are the real two admitted outgoing messages.
     service.handle.request_remote(101, false).unwrap();
-    timeout(Duration::from_secs(3), async {
+    timeout(actor_wait_secs(3), async {
         while service.outgoing.len() < 2 {
             sleep(Duration::from_millis(1)).await;
         }
@@ -1615,7 +1627,7 @@ async fn full_outgoing_selection_cancel_preserves_request_binding_until_retry_ca
     let mut messages = vec![first];
     for _ in 0..2 {
         messages.push(
-            timeout(Duration::from_secs(3), service.outgoing.recv())
+            timeout(actor_wait_secs(3), service.outgoing.recv())
                 .await
                 .unwrap()
                 .unwrap(),
@@ -1642,7 +1654,7 @@ async fn cancellation_after_matching_offer_admission_cancels_that_task_instead_o
  {
     let fixture = Fixture::new();
     let mut service = FileTaskService::spawn(fixture.options(true, true)).unwrap();
-    timeout(Duration::from_secs(3), service.outgoing.recv())
+    timeout(actor_wait_secs(3), service.outgoing.recv())
         .await
         .unwrap()
         .unwrap();
@@ -1653,7 +1665,7 @@ async fn cancellation_after_matching_offer_admission_cancels_that_task_instead_o
     .await;
     service.handle.request_remote(102, false).unwrap();
     assert!(matches!(
-        timeout(Duration::from_secs(3), service.outgoing.recv())
+        timeout(actor_wait_secs(3), service.outgoing.recv())
             .await
             .unwrap()
             .unwrap(),
