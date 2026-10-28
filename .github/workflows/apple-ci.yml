@@ -1,0 +1,70 @@
+name: Apple CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin
+
+      - name: Install cmake for opus-head-sys
+        run: brew install cmake
+
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy across the workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build the macOS FFI library for Swift linking
+        run: |
+          MACOSX_DEPLOYMENT_TARGET=13.0 \
+            cargo build --release -p desklink-ffi --target aarch64-apple-darwin
+
+      - name: Rust workspace tests
+        run: cargo test --workspace
+
+      - name: Apple shared core tests
+        working-directory: apps/apple
+        run: swift test --arch arm64
+
+      - name: macOS app tests
+        working-directory: apps/macos
+        run: swift test --arch arm64
+
+      - name: iOS simulator tests
+        run: |
+          SIMULATOR_ID=$(xcrun simctl list devices available | sed -nE 's/.*\(([0-9A-F-]{36})\).*/\1/p' | head -n 1)
+          if [ -z "$SIMULATOR_ID" ]; then
+            echo "error: no available iOS Simulator device" >&2
+            exit 1
+          fi
+          xcodebuild \
+            -project apps/ios/DeskLinkIOS.xcodeproj \
+            -scheme DeskLinkIOS \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            test
