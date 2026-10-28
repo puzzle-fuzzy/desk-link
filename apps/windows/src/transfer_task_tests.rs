@@ -8,8 +8,12 @@ use crate::{
     transfer_task::FileTaskService,
 };
 use desklink_protocol::{
-    FileTaskAction, FileTaskMessage, FileTransferCapabilities, ResumeCheckpoint, TransferResult,
+    FileTaskAction, FileTaskMessage, FileTransferCapabilities, TransferResult,
 };
+#[cfg(windows)]
+use desklink_protocol::ResumeCheckpoint;
+#[cfg(windows)]
+use std::time::Instant;
 use std::{
     fs,
     fs::OpenOptions,
@@ -17,7 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::time::{sleep, timeout};
 #[path = "../test-support/file-task-fixture.rs"]
