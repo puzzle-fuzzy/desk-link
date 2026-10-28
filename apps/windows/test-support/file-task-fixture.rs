@@ -36,7 +36,7 @@ static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 /// parallel starves their timers on constrained machines and fails the
 /// suite spuriously. Holding this lock for the fixture's lifetime
 /// serializes exactly these tests, with no effect on other modules.
-static ACTOR_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static ACTOR_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) struct Fixture(
     pub(super) PathBuf,

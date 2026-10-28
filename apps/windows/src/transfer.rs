@@ -1294,12 +1294,15 @@ fn human_size(bytes: u64) -> String {
 }
 
 #[cfg(test)]
-pub(crate) async fn lock_disk_worker_tests() -> tokio::sync::MutexGuard<'static, ()> {
-    tests::DISK_WORKER_TEST_GATE.lock().await
+pub(crate) fn lock_disk_worker_tests() -> std::sync::MutexGuard<'static, ()> {
+    tests::DISK_WORKER_TEST_GATE.lock().unwrap()
 }
 
 #[cfg(test)]
 mod tests {
+    // The disk-worker gate is held across await points by design (see the
+    // actor gate comment in transfer_task_tests.rs).
+    #![allow(clippy::await_holding_lock)]
     use super::{
         INCOMING_DISK_QUEUE_CAPACITY, IncomingDiskCommand, IncomingFile, IncomingFileWorker,
         MIN_FREE_SPACE_AFTER_RECEIVE, OutgoingFileReader, STALE_INCOMING_FILE_AGE,
@@ -1316,10 +1319,9 @@ mod tests {
     };
 
     // Worker tests share the production process-wide eight-thread admission
-    // budget. Serialize these fixtures while unrelated library tests stay
-    // parallel, so resource contention is not mistaken for an IO failure.
-    pub(super) static DISK_WORKER_TEST_GATE: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
+    // budget. These fixtures join the crate-wide actor/disk gate so QUIC
+    // actor families cannot starve them (and vice versa) on small runners.
+    pub(super) use crate::transfer_task_tests::ACTOR_SERIALIZER as DISK_WORKER_TEST_GATE;
 
     fn roots(test: &str) -> (PathBuf, PathBuf, PathBuf) {
         let nonce = SystemTime::now()
@@ -1441,7 +1443,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_creation_preserves_verified_prefix_and_releases_worker_and_path_ownership() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("cancel-create-resume");
         let transfer_id = [29; 16];
         let partial = incoming_temporary_path(&staging, transfer_id);
@@ -1497,7 +1499,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_empty_creation_preserves_an_empty_part_but_explicit_cancel_still_removes_it()
     {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("cancel-create-empty");
         let transfer_id = [30; 16];
         let partial = incoming_temporary_path(&staging, transfer_id);
@@ -1531,7 +1533,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn initialization_failure_reports_its_error_without_deleting_a_staged_prefix() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("create-failed");
         let transfer_id = [31; 16];
         let partial = incoming_temporary_path(&staging, transfer_id);
@@ -1571,7 +1573,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_flush_failure_is_reported_without_publishing_completion() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("preserve-flush-failed");
         let published = downloads.join("not-published.bin");
         let (before_write, exited) = disk_thread_exit_notice();
@@ -1736,7 +1738,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_orders_chunks_and_only_acknowledges_verified_publication() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("worker-publish");
         let target = downloads.join("worker.bin");
         let mut worker = IncomingFileWorker::spawn_with(
@@ -1762,7 +1764,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_disk_worker_does_not_block_async_timers() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-slow");
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1804,7 +1806,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_preserve_then_resume_keeps_only_acknowledged_prefix() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("worker-resume");
         let worker_staging = staging.clone();
         let worker_downloads = downloads.clone();
@@ -1843,7 +1845,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_queue_has_a_fixed_chunk_budget_and_cancel_discards_pending_work() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-budget");
         let partial = incoming_temporary_path(&staging, [24; 16]);
@@ -1902,7 +1904,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disk_worker_rejects_oversized_chunks_and_invalid_hashes() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         let (root, staging, downloads) = roots("worker-invalid");
         let mut worker = IncomingFileWorker::spawn_with(
             move || {
@@ -1928,7 +1930,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dropped_worker_keeps_writer_ownership_until_pending_write_and_preserve_finish() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-reconnect-preserve");
         let worker_staging = staging.clone();
@@ -2021,7 +2023,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_worker_cannot_delete_a_new_receiver_staging_file() {
-        let _test = DISK_WORKER_TEST_GATE.lock().await;
+        let _test = DISK_WORKER_TEST_GATE.lock().unwrap();
         use std::sync::{Arc, Condvar, Mutex};
         let (root, staging, downloads) = roots("worker-reconnect-cancel");
         let worker_staging = staging.clone();

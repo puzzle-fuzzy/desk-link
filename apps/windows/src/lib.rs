@@ -43,7 +43,7 @@ pub mod transfer_task_dialog;
 pub mod transfer_task_native;
 pub mod transfer_task_recovery;
 #[cfg(test)]
-mod transfer_task_tests;
+pub(crate) mod transfer_task_tests;
 pub mod tray;
 #[cfg(windows)]
 pub mod trusted;

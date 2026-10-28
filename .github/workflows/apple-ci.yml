@@ -44,6 +44,10 @@ jobs:
             cargo build --release -p desklink-ffi --target aarch64-apple-darwin
 
       - name: Rust workspace tests
+        env:
+          # Two-core runners oversubscribe the default test parallelism; the
+          # encrypted actor suites are timing-bounded and serialize anyway.
+          RUST_TEST_THREADS: "2"
         run: cargo test --workspace
 
       - name: Apple shared core tests

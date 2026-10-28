@@ -1,4 +1,8 @@
 //! Actor integration through real protocol codec and authenticated packet encryption.
+// The shared serialization gate is held across await points by design: each
+// current-thread test keeps it for its whole body so actor families cannot
+// starve each other's worker budget on small machines.
+#![allow(clippy::await_holding_lock)]
 use crate::{
     transfer_checkpoint::{FILE_BLOCK_BYTES, SourceIndex},
     transfer_task::FileTaskService,
@@ -18,6 +22,7 @@ use std::{
 use tokio::time::{sleep, timeout};
 #[path = "../test-support/file-task-fixture.rs"]
 mod fixture;
+pub(crate) use fixture::ACTOR_SERIALIZER;
 use fixture::*;
 
 /// Bounded actor waits are tuned for local dev machines; two-core CI runners
