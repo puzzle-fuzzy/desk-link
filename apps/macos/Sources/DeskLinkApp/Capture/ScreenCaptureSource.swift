@@ -12,7 +12,7 @@ private final class CapturedPixelBuffer: @unchecked Sendable {
     }
 }
 
-private final class LatestFrameDelivery: @unchecked Sendable {
+final class LatestFrameDelivery: @unchecked Sendable {
     typealias Handler = @Sendable (CVPixelBuffer, UInt64) -> Void
 
     private let queue = DispatchQueue(label: "com.desklink.capture.delivery", qos: .userInitiated)
@@ -20,39 +20,67 @@ private final class LatestFrameDelivery: @unchecked Sendable {
     private var streamIdentifier: ObjectIdentifier?
     private var nextFrameID: UInt64 = 0
     private var pending: (CapturedPixelBuffer, UInt64)?
+    private var lastFrame: CapturedPixelBuffer?
     private var draining = false
     private var handler: Handler?
 
-    func begin(stream: SCStream, handler: @escaping Handler) {
+    func begin(stream: ObjectIdentifier, handler: @escaping Handler) {
         lock.lock()
-        streamIdentifier = ObjectIdentifier(stream)
+        streamIdentifier = stream
         nextFrameID = 0
         pending = nil
+        lastFrame = nil
         self.handler = handler
         lock.unlock()
     }
 
-    func end(stream: SCStream? = nil) {
+    func end(stream: ObjectIdentifier? = nil) {
         lock.lock()
-        let matchesStream = stream.map { streamIdentifier == ObjectIdentifier($0) } ?? true
+        let matchesStream = stream.map { streamIdentifier == $0 } ?? true
         if matchesStream {
             streamIdentifier = nil
             nextFrameID = 0
             pending = nil
+            lastFrame = nil
             handler = nil
         }
         lock.unlock()
     }
 
-    func submit(stream: SCStream, buffer: CVPixelBuffer) {
+    func submit(stream: ObjectIdentifier, buffer: CVPixelBuffer) {
         let shouldSchedule: Bool
         lock.lock()
-        guard streamIdentifier == ObjectIdentifier(stream), handler != nil else {
+        guard streamIdentifier == stream, handler != nil else {
             lock.unlock()
             return
         }
         nextFrameID &+= 1
-        pending = (CapturedPixelBuffer(buffer), nextFrameID)
+        let captured = CapturedPixelBuffer(buffer)
+        pending = (captured, nextFrameID)
+        lastFrame = captured
+        shouldSchedule = !draining
+        draining = true
+        lock.unlock()
+        if shouldSchedule {
+            queue.async { [weak self] in self?.drain() }
+        }
+    }
+
+    /// Re-delivers the most recently captured frame with a fresh frame ID.
+    /// Keyframe requests must stay answerable while ScreenCaptureKit stops
+    /// delivering frames on a static desktop; without a re-issued frame the
+    /// pending force-keyframe flag is never consumed and a controller that
+    /// lost its reference chain cannot recover.
+    func reissueLastFrame(stream: ObjectIdentifier? = nil) {
+        let shouldSchedule: Bool
+        lock.lock()
+        let matchesStream = stream.map { streamIdentifier == $0 } ?? true
+        guard matchesStream, handler != nil, let lastFrame else {
+            lock.unlock()
+            return
+        }
+        nextFrameID &+= 1
+        pending = (lastFrame, nextFrameID)
         shouldSchedule = !draining
         draining = true
         lock.unlock()
@@ -169,12 +197,12 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             capturedDisplayFrame = display.frame
             capturedVideoSize = CGSize(width: dimensions.width, height: dimensions.height)
             stopHandler = onStop
-            delivery.begin(stream: stream, handler: onFrame)
+            delivery.begin(stream: ObjectIdentifier(stream), handler: onFrame)
             try await stream.startCapture()
             try Task.checkCancellation()
             guard generation == lifecycleGeneration else { throw CancellationError() }
         } catch {
-            delivery.end(stream: stream)
+            delivery.end(stream: stream.map { ObjectIdentifier($0) })
             try? await stream.stopCapture()
             if self.stream.map({ ObjectIdentifier($0) }) == ObjectIdentifier(stream) {
                 self.stream = nil
@@ -192,6 +220,12 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         await stopCurrent()
     }
 
+    /// Re-encodes and re-delivers the most recently captured frame so a
+    /// keyframe request produces an IDR even while the desktop is static.
+    func reissueLastFrame() {
+        delivery.reissueLastFrame(stream: stream.map { ObjectIdentifier($0) })
+    }
+
     private func stopCurrent() async {
         let stream = self.stream
         self.stream = nil
@@ -199,7 +233,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
         capturedDisplayFrame = .zero
         capturedVideoSize = .zero
         stopHandler = nil
-        delivery.end(stream: stream)
+        delivery.end(stream: stream.map { ObjectIdentifier($0) })
         if let stream { try? await stream.stopCapture() }
     }
 
@@ -212,7 +246,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
               CMSampleBufferIsValid(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
-        delivery.submit(stream: stream, buffer: pixelBuffer)
+        delivery.submit(stream: ObjectIdentifier(stream), buffer: pixelBuffer)
     }
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -229,7 +263,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             self.capturedDisplayFrame = .zero
             self.capturedVideoSize = .zero
             self.stopHandler = nil
-            self.delivery.end(stream: currentStream)
+            self.delivery.end(stream: currentStream.map { ObjectIdentifier($0) })
             handler?(ScreenCaptureSourceError.streamStopped(message))
         }
     }

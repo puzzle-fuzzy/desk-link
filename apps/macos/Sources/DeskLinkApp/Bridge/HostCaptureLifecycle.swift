@@ -232,7 +232,13 @@ final class NativeHostCaptureSession: HostCaptureSession {
         encoder.stop()
     }
 
-    func requestKeyframe() { encoder.requestKeyframe() }
+    func requestKeyframe() {
+        encoder.requestKeyframe()
+        // Answer the request even while the desktop is static: ScreenCaptureKit
+        // delivers nothing new, so re-encode the most recent frame to consume
+        // the force-keyframe flag and emit an IDR right away.
+        source.reissueLastFrame()
+    }
 }
 
 @MainActor

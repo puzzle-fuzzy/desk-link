@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 修复 Windows 控制 Mac 时桌面静止后画面永久冻结：关键帧请求现在会立即重编码并发送最近一帧（ScreenCaptureKit 静止不再阻断 IDR），新增 LatestFrameDelivery 重发语义单元测试。
 - Windows 端支持用户自选固定密码：设置固定密码时可输入 8–64 位任意字符（含 `0`、`1`、`I`、`O` 及中文等），控制端连接输入同步放宽；目录访问码由双方按同一密码派生，中继 wire 格式不变。与 0.1.97 前的 macOS 实现语义一致（a4d80d0 引入的派生契约）。
 - Windows 固定密码本地存储升级为长度前缀格式（旧 8 字符记录仍可读取），更换、关闭与重启行为保持不变。
 - 修复远程拉取带来的 `desklink-windows` 测试目标编译不一致（`lock_disk_worker_tests` 同步化与 `ResumeCheckpoint` 引用）。
