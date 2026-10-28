@@ -196,7 +196,6 @@ let pendingVideoFrame: VideoFrame | null = null;
 let videoPaintFrame: number | null = null;
 let receivedVideoFrames = 0;
 let submittedVideoFrames = 0;
-let transportCompletedFrames = 0;
 let transportReceivedVideoPackets = 0;
 let transportDroppedVideoPackets = 0;
 let activeVideoPath: VideoPathKind = "relay";
@@ -342,7 +341,6 @@ function resetVideoTelemetry(): void {
   pendingVideoKeyframe = null;
   receivedVideoFrames = 0;
   submittedVideoFrames = 0;
-  transportCompletedFrames = 0;
   transportReceivedVideoPackets = 0;
   transportDroppedVideoPackets = 0;
   activeVideoPath = "relay";
@@ -825,7 +823,7 @@ function renderConnectionPanel(): string {
             </label>
             <label class="field device-credential-field">
               <span>访问密码</span>
-              <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="64" placeholder="访问密码（临时密码或 8-64 位固定密码）" required autocomplete="one-time-code" spellcheck="false" ${isWorking ? "disabled" : ""}>
+              <input class="temporary-password-input" name="temporaryPassword" data-controller-password value="${escapeHtml(temporaryPasswordDraft)}" maxlength="64" placeholder="临时密码或固定密码" required autocomplete="one-time-code" spellcheck="false" ${isWorking ? "disabled" : ""}>
             </label>
             <div class="controller-form-actions">
               <button class="button button--primary" type="submit" data-controller-device-submit ${isWorking || !credentialsReady ? "disabled" : ""} ${isWorking ? 'aria-busy="true"' : ""}>
@@ -924,10 +922,15 @@ function renderSavedDevice(
         ${saved.alias ? `<small class="saved-device-public-id">${escapeHtml(formatDeviceId(saved.deviceId))}</small>` : ""}
       </div>
       <div class="saved-device-actions">
-        <button class="button button--primary" type="button" ${approved ? "data-controller-reconnect" : `data-controller-saved-device-connect="${escapeHtml(saved.deviceId)}"`} ${isWorking ? "disabled" : ""}>连接</button>
-        <button class="button button--secondary" type="button" data-controller-saved-device-rename="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>重命名</button>
-        <button class="button button--secondary" type="button" data-controller-saved-device-update="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>更新密码</button>
-        <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
+        <button class="button button--secondary saved-device-connect" type="button" ${approved ? "data-controller-reconnect" : `data-controller-saved-device-connect="${escapeHtml(saved.deviceId)}"`} ${isWorking ? "disabled" : ""}>连接</button>
+        <details class="saved-device-options">
+          <summary class="saved-device-options-toggle" title="管理设备">${icon("ellipsis")}<span class="sr-only">管理设备 ${escapeHtml(displayName)}</span></summary>
+          <div class="saved-device-options-actions">
+            <button class="button button--secondary" type="button" data-controller-saved-device-rename="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>重命名</button>
+            <button class="button button--secondary" type="button" data-controller-saved-device-update="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>更新密码</button>
+            <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
+          </div>
+        </details>
       </div>
       ${renderRenameEditor(saved)}
       ${renderForgetConfirmation(saved.deviceId)}
@@ -957,8 +960,13 @@ function renderApprovedConnection(saved: SavedControllerConnectionSummary, isWor
         <span class="saved-device-kind saved-device-kind--approved">已批准</span>
       </div>
       <div class="saved-device-actions">
-        <button class="button button--primary" type="button" data-controller-reconnect ${isWorking ? "disabled" : ""}>连接</button>
-        <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
+        <button class="button button--secondary saved-device-connect" type="button" data-controller-reconnect ${isWorking ? "disabled" : ""}>连接</button>
+        <details class="saved-device-options">
+          <summary class="saved-device-options-toggle" title="管理设备">${icon("ellipsis")}<span class="sr-only">管理设备 ${escapeHtml(formatDeviceId(saved.deviceId))}</span></summary>
+          <div class="saved-device-options-actions">
+            <button class="saved-device-remove" type="button" data-controller-request-forget="${escapeHtml(saved.deviceId)}" ${isWorking ? "disabled" : ""}>移除</button>
+          </div>
+        </details>
       </div>
       ${renderForgetConfirmation(saved.deviceId)}
     </article>
@@ -1099,8 +1107,8 @@ function renderRemoteDesktop(): string {
         ${videoFailed
           ? '<div class="remote-waiting remote-waiting--error"><strong>远程画面暂时无法解码</strong><p>请更新 WebView2，或点击“刷新画面”再试一次。</p></div>'
           : config
-            ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><div class="remote-video-starting" data-remote-video-starting>${icon("loader-circle", "controller-spinner")}<strong>正在启动远程画面</strong><p>正在接收并解码第一个加密视频帧。</p></div><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden>${icon("mouse-pointer-2")}</span>`
-            : `<div class="remote-waiting">${icon("loader-circle", "controller-spinner")}<strong>正在准备远程画面</strong><p>DeskLink 协商视频流时，请保持此窗口打开。</p></div>`}
+            ? `<canvas class="remote-canvas" data-remote-canvas width="${config.width}" height="${config.height}"></canvas><div class="remote-video-starting" data-remote-video-starting>${icon("loader-circle", "controller-spinner")}<strong>正在启动远程画面</strong><p hidden></p></div><span class="remote-cursor" data-remote-cursor aria-hidden="true" hidden>${icon("mouse-pointer-2")}</span>`
+            : `<div class="remote-waiting">${icon("loader-circle", "controller-spinner")}<strong>正在准备远程画面</strong></div>`}
           <div class="remote-reconnect-overlay" data-controller-reconnect-overlay ${reconnecting ? "" : "hidden"} role="status" aria-live="polite">
             ${icon("refresh-cw", "remote-reconnect-overlay__icon")}
             <strong>连接暂时中断，画面保持不变</strong>
@@ -1764,13 +1772,11 @@ function handleSignal(signal: ControllerSignal): void {
       break;
     }
     case "metrics": {
-      transportCompletedFrames = signal.completedFrames;
       activeVideoPath = signal.videoPath;
       transportReceivedVideoPackets = signal.receivedVideoPackets;
       transportDroppedVideoPackets = signal.droppedVideoPackets;
       updateRemoteVideoPathBadge();
       updateRemoteQualityBadge();
-      updateVideoStartingMessage();
       reportRenderMetrics();
       break;
     }
@@ -2841,6 +2847,7 @@ function handleVideoDeliveryError(error: unknown): void {
   malformedVideoFrames += 1;
   const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting] p");
   if (waiting) {
+    waiting.hidden = false;
     waiting.textContent = "检测到异常视频帧，正在请求新的关键帧恢复画面。";
   }
   if (malformedVideoFrames === 1) {
@@ -2848,25 +2855,6 @@ function handleVideoDeliveryError(error: unknown): void {
   }
   if (malformedVideoFrames === 1 || malformedVideoFrames % 60 === 0) {
     console.error("DeskLink video delivery error", error);
-  }
-}
-
-function updateVideoStartingMessage(): void {
-  if (decodedFrames > 0) {
-    return;
-  }
-  const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting] p");
-  if (!waiting) {
-    return;
-  }
-  if (transportCompletedFrames > 0 && receivedVideoFrames === 0) {
-    waiting.textContent = "中继已收到远程画面，正在交付给本机显示组件。";
-  } else if (receivedVideoFrames > 0 && submittedVideoFrames === 0) {
-    waiting.textContent = "本机已收到视频，正在等待可解码的关键帧。";
-  } else if (submittedVideoFrames > 0) {
-    waiting.textContent = decoderPreference === "hardware"
-      ? "视频已进入硬件解码器，正在生成第一帧画面。"
-      : "视频已进入兼容解码器，正在生成第一帧画面。";
   }
 }
 
@@ -3044,9 +3032,8 @@ async function startVideoDecoder(
   }
   const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting] p");
   if (waiting) {
-    waiting.textContent = preference === "hardware"
-      ? "正在接收并解码第一个加密视频帧。"
-      : "正在使用兼容解码模式恢复远程画面。";
+    waiting.hidden = preference === "hardware";
+    waiting.textContent = preference === "software" ? "正在使用兼容解码模式恢复远程画面。" : "";
   }
   if (pendingVideoKeyframe) {
     const pending = pendingVideoKeyframe;
@@ -3094,6 +3081,7 @@ async function requestMainProfileFallback(
   h264ProfileFallbackReason = reason;
   const waiting = document.querySelector<HTMLElement>("[data-remote-video-starting] p");
   if (waiting) {
+    waiting.hidden = false;
     waiting.textContent = "当前解码器不支持高画质视频，正在切换兼容模式。";
   }
   try {

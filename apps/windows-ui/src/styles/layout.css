@@ -39,6 +39,7 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 .control-workspace, .controller-stack, .page-layout, .loading-layout { width: min(100%, 1040px); margin: 0 auto; }
 .control-workspace, .controller-stack, .page-layout { display: flex; flex-direction: column; gap: 28px; }
 .control-workspace-main { min-width: 0; }
+[data-controller-feedback]:empty { display: none; }
 .controller-heading, .page-heading, .section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
 .controller-heading { flex: none; }
 .controller-heading h1, .page-heading h1 { margin: 0; }
@@ -64,19 +65,26 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 .controller-form-actions .button { width: 100%; min-height: 44px; }
 .field small { display: block; margin-top: 1px; }
 .field--wide { grid-column: 1 / -1; }
-.saved-devices-panel { min-width: 0; padding-left: 32px; }
+.saved-devices-panel { min-width: 0; }
 .saved-devices-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 22px; margin-bottom: 12px; }
 .saved-devices-heading h2 { margin: 0; }
 .saved-device-list { display: grid; }
-.saved-device-row { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 12px; min-width: 0; padding: 18px 0; }
+.saved-device-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px 18px; min-width: 0; padding: 18px 0; }
 .saved-device-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 10px; min-width: 0; }
 .saved-device-identity strong, .saved-device-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.saved-device-identity strong { min-width: 0; max-width: calc(100% - 76px); }
+.saved-device-identity strong { min-width: 0; max-width: 100%; }
 .saved-device-kind { flex: none; }
 .saved-device-identity small { flex: 100%; }
 .saved-device-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.saved-device-actions .button, .saved-device-remove { padding: 6px 8px; min-height: 30px; }
-.saved-device-actions .button--primary { margin-right: 4px; }
+.saved-device-actions .button, .saved-device-remove { padding: 6px 8px; min-height: 32px; }
+.saved-device-options { min-width: 0; }
+.saved-device-options-toggle { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; cursor: pointer; list-style: none; }
+.saved-device-options-toggle::-webkit-details-marker { display: none; }
+.saved-device-options-toggle .app-icon { width: 16px; height: 16px; }
+.saved-device-actions:has(.saved-device-options[open]) { grid-column: 1 / -1; align-items: flex-start; }
+.saved-device-options[open] { flex: 1; }
+.saved-device-options[open] > summary { margin-left: auto; }
+.saved-device-options-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; padding-top: 8px; }
 .saved-devices-empty { margin: 24px 0; }
 .saved-device-rename { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding-top: 12px; }
 .saved-device-rename label { grid-column: 1 / -1; }
@@ -110,12 +118,10 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 .secret-toggle { flex: none; padding: 0 10px; }
 .form-actions { padding-top: 4px; }
 .back-button { margin-bottom: 10px; }
-.page-heading--pairing { align-items: center; }
+.page-heading--pairing { align-items: flex-end; }
 .page-layout--pairing { max-width: 760px; margin-left: 0; }
 .pairing-state { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; }
-.pairing-card { padding: 24px; }
-.pairing-card-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 24px; }
-.pairing-card-heading h2 { margin: 0; }
+.pairing-card { padding: 8px 0; }
 .pairing-credentials { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 .pairing-credential { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-width: 0; }
 .pairing-credential > span { flex: 100%; }
@@ -131,7 +137,6 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 .pairing-qr { width: 168px; height: 168px; flex: none; padding: 8px; }
 .pairing-qr svg { display: block; width: 100%; height: 100%; }
 .pairing-card:has(.pairing-qr-layout) { display: grid; grid-template-columns: 168px minmax(0, 1fr); gap: 24px 28px; }
-.pairing-card:has(.pairing-qr-layout) .pairing-card-heading { grid-column: 1 / -1; margin: 0; }
 .pairing-card:has(.pairing-qr-layout) .pairing-qr-layout { flex-direction: column; align-items: flex-start; gap: 10px; margin: 0; }
 .pairing-card:has(.pairing-qr-layout) .pairing-credentials { grid-template-columns: 1fr; }
 .pairing-card:has(.pairing-qr-layout) .pairing-card-actions, .pairing-card:has(.pairing-qr-layout) .secret-note { grid-column: 1 / -1; margin: 0; }
@@ -143,13 +148,13 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 /* Settings, identity and diagnostics are compact rows. */
 .page-layout--settings { gap: 24px; max-width: 880px; margin-left: 0; }
 .settings-group-heading { padding-bottom: 10px; }
-.settings-group-heading h2, .settings-row-copy p, .settings-exit h2, .settings-exit p { margin: 0; }
+.settings-group-heading h2, .settings-row-copy p { margin: 0; }
 .settings-row, .settings-inline-action, .settings-exit { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 16px 0; }
 .settings-row-copy { min-width: 0; }
-.settings-row-copy p, .settings-inline-action p, .settings-exit p { margin: 5px 0 0; max-width: 65ch; }
+.settings-row-copy p, .settings-inline-action p { margin: 5px 0 0; max-width: 65ch; }
 .settings-row--diagnostics { align-items: start; }
 .settings-value { flex: none; }
-.switch-control { display: inline-flex; flex: none; align-items: center; gap: 7px; min-height: 24px; cursor: pointer; }
+.switch-control { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 7px; min-width: 32px; min-height: 32px; cursor: pointer; }
 .switch-control input[type=checkbox] { width: 17px; height: 17px; margin: 0; }
 .switch-control b { min-width: 42px; }
 .settings-details, .about-details { margin: 0; }
@@ -246,7 +251,6 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 @media (width <= 1100px) {
   .workspace { padding: 32px 28px 40px; }
   .controller-connect-layout { grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); gap: 28px; }
-  .saved-devices-panel { padding-left: 24px; }
 }
 @media (width <= 940px) {
   .app-shell { grid-template-columns: 160px minmax(0, 1fr); }
@@ -256,7 +260,6 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
 @media (width <= 800px) {
   .controller-connect-layout { grid-template-columns: 1fr; gap: 36px; max-width: 540px; }
   .controller-connect-column { max-width: 380px; }
-  .saved-devices-panel { padding-left: 0; }
   .pairing-credentials { grid-template-columns: 1fr; }
   .connection-progress-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -279,7 +282,6 @@ html[data-remote-fullscreen=true] .windows-update-banner { position: fixed; z-in
   .settings-row, .settings-inline-action, .settings-exit { align-items: flex-start; flex-direction: column; gap: 12px; }
   .section-heading, .page-heading { flex-wrap: wrap; gap: 12px; }
   .page-heading--pairing { align-items: flex-start; }
-  .pairing-card { padding: 20px; }
   .share-device-identity > strong { flex: 100%; }
   .settings-details > div, .about-details > div { grid-template-columns: 80px minmax(0, 1fr); }
   .diagnostic-check { grid-template-columns: 8px minmax(0, 1fr) auto; }

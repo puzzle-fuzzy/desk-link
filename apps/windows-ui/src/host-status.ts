@@ -15,7 +15,7 @@ export function hostStatusSummary(snapshot: HostSnapshot): HostStatusSummary {
   if (snapshot.connectionError || snapshot.trustedError || snapshot.fixedPasswordError) {
     return {
       title: "需要处理",
-      detail: "打开设置 / 诊断处理本机共享问题",
+      detail: "打开设置处理本机共享问题",
       tone: "attention",
     };
   }
@@ -44,7 +44,7 @@ export function hostStatusSummary(snapshot: HostSnapshot): HostStatusSummary {
   if (snapshot.readiness === "attention") {
     return {
       title: "需要处理",
-      detail: "打开设置 / 诊断检查本机共享状态",
+      detail: "打开设置检查本机共享状态",
       tone: "attention",
     };
   }

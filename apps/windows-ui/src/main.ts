@@ -655,8 +655,8 @@ function renderSidebar(): string {
         `).join("")}
       </nav>
       <div class="sidebar-bottom">
-        <button class="sidebar-nav-item sidebar-nav-item--secondary ${activeNavigationView === "settings" ? "sidebar-nav-item--active" : ""}" type="button" data-view="settings" aria-label="设置与诊断" aria-current="${activeNavigationView === "settings" ? "page" : "false"}">
-          ${icon("settings-2")}<span class="sidebar-settings-label">设置与诊断</span>
+        <button class="sidebar-nav-item sidebar-nav-item--secondary ${activeNavigationView === "settings" ? "sidebar-nav-item--active" : ""}" type="button" data-view="settings" aria-label="设置" aria-current="${activeNavigationView === "settings" ? "page" : "false"}">
+          ${icon("settings-2")}<span class="sidebar-settings-label">设置</span>
         </button>
       </div>
     </aside>
@@ -672,7 +672,7 @@ function renderWorkspaceTopbar(): string {
       <div class="workspace-topbar-actions">
         ${snapshot ? renderHostSharingActions(snapshot) : ""}
         ${account.user ? `<span class="account-session-email" title="当前登录账号">${escapeHtml(account.user.email)}</span><button class="topbar-account-button" type="button" data-account-logout ${accountBusy ? "disabled" : ""}>退出登录</button>` : ""}
-        <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-haspopup="menu" aria-expanded="${utilityMenuOpen}" aria-controls="utility-menu" title="更多功能">${icon("ellipsis")}<span>更多</span></button>
+        <button class="topbar-menu-toggle ${utilityMenuOpen ? "topbar-menu-toggle--active" : ""}" type="button" data-toggle-utility-menu aria-label="更多功能" aria-haspopup="menu" aria-expanded="${utilityMenuOpen}" aria-controls="utility-menu" title="更多功能">${icon("ellipsis")}</button>
         ${renderUtilityMenu()}
       </div>
     </header>
@@ -710,7 +710,7 @@ function renderUtilityMenu(): string {
 function renderHostStatusChip(state: HostSnapshot): string {
   const status = hostStatusSummary(state);
   const action = status.tone === "attention" ? "data-open-overview" : "data-open-connection";
-  const destination = status.tone === "attention" ? "设置 / 诊断" : "共享此设备";
+  const destination = status.tone === "attention" ? "设置" : "共享此设备";
   return `<button class="host-status-chip host-status-chip--${status.tone}" type="button" ${action} aria-label="${escapeHtml(status.title)}，${escapeHtml(status.detail)}，打开${destination}">${escapeHtml(status.title)}</button>`;
 }
 
@@ -902,9 +902,8 @@ function renderConnection(state: HostSnapshot): string {
 
       <section class="share-device-card" aria-label="本机连接信息">
         ${state.connection
-          ? `<div class="pairing-credential share-device-identity"><span>本机 ID</span><strong id="host-access-heading">${escapeHtml(state.deviceId ? formatDeviceId(state.deviceId) : "暂时无法读取")}</strong>${state.deviceId ? '<button class="button button--secondary button--compact" type="button" data-copy-host-id>复制 ID</button>' : ""}</div>
+          ? `<div class="pairing-credential share-device-identity"><span>本机 ID</span><strong id="host-access-heading">${escapeHtml(state.deviceId ? formatDeviceId(state.deviceId) : "暂时无法读取")}</strong>${state.deviceId ? '<button class="button button--secondary button--compact" type="button" data-copy-host-id aria-label="复制本机设备 ID">复制</button>' : ""}</div>
              <div class="page-actions share-device-actions">
-               ${renderHostSharingActions(state)}
                ${renderPairingAction(state, "primary")}
                <button class="button button--secondary" type="button" data-open-fixed-access>${state.fixedPasswordEnabled ? "查看固定密码" : "设置固定密码"}</button>
              </div>`
@@ -981,7 +980,6 @@ function renderConnection(state: HostSnapshot): string {
                 />
                 <button type="button" class="secret-toggle" data-toggle-secret aria-label="显示中继密钥">显示</button>
               </div>
-              ${state.connection?.hasSavedKey ? "<small>留空保留现有密钥。</small>" : ""}
             </div>
 
             <div class="field field--compact">
@@ -1024,9 +1022,7 @@ function renderDevices(state: HostSnapshot): string {
         <div>
           <h1>已批准设备</h1>
         </div>
-        <div class="page-actions">
-          ${renderPairingAction(state, "primary")}
-        </div>
+        ${state.trustedControllers.length > 0 ? `<div class="page-actions">${renderPairingAction(state, "primary")}</div>` : ""}
       </header>
 
       ${state.trustedError ? renderStateWarnings(state) : ""}
@@ -1060,11 +1056,10 @@ function renderDevice(device: TrustedControllerSummary): string {
       <div class="device-record-heading">
         ${icon("monitor", "device-avatar")}
         <div>
-          <h2>已批准电脑 ${escapeHtml(compactIdentifier(device.deviceId))}</h2>
+          <h2>电脑 ${escapeHtml(compactIdentifier(device.deviceId))}</h2>
           <p>批准于 ${formatDate(device.approvedAtUnixS)}</p>
         </div>
         <div class="device-actions">
-          <span class="trusted-badge">已批准</span>
           <button
             class="button button--danger-quiet button--compact"
             type="button"
@@ -1127,39 +1122,32 @@ function renderPairing(state: HostSnapshot): string {
       <header class="page-heading page-heading--pairing">
         <div>
           <button class="back-button" type="button" data-open-connection aria-label="返回共享此设备">${icon("arrow-left")}共享此设备</button>
-          <h1>临时连接</h1>
+          <h1 id="pairing-heading">临时连接</h1>
         </div>
         <span class="pairing-state ${active ? "pairing-state--active" : ""}">
-          <span aria-hidden="true"></span>${active ? "临时密码有效" : "临时密码已失效"}
+          ${session ? `<strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>` : active ? "临时密码有效" : "临时密码已失效"}
         </span>
       </header>
 
       ${
         session
           ? `
-            <section class="pairing-card" aria-labelledby="pairing-credentials-heading">
-              <div class="pairing-card-heading">
-                <h2 id="pairing-credentials-heading">连接信息</h2>
-                <strong data-pairing-countdown>${formatPairingRemaining(session.expiresAtUnixS)}</strong>
-              </div>
+            <section class="pairing-card" aria-labelledby="pairing-heading">
               <div class="pairing-qr-layout">
                 <div class="pairing-qr" aria-label="DeskLink 连接二维码">
                   ${session.qrSvg}
-                </div>
-                <div class="pairing-qr-copy">
-                  <strong>扫码连接</strong>
                 </div>
               </div>
               <div class="pairing-credentials">
                 <div class="pairing-credential">
                   <span>设备 ID</span>
                   <strong id="pairing-device-id">${escapeHtml(formatDeviceId(session.deviceId))}</strong>
-                  <button class="button button--secondary button--compact" type="button" data-copy-device-id ${pairingBusy ? "disabled" : ""}>复制设备 ID</button>
+                  <button class="button button--secondary button--compact" type="button" data-copy-device-id aria-label="复制设备 ID" ${pairingBusy ? "disabled" : ""}>复制</button>
                 </div>
                 <div class="pairing-credential pairing-credential--password">
                   <span>临时密码</span>
                   <strong id="pairing-temporary-password">${escapeHtml(session.temporaryPassword)}</strong>
-                  <button class="button button--secondary button--compact" type="button" data-copy-temporary-password ${pairingBusy ? "disabled" : ""}>复制临时密码</button>
+                  <button class="button button--secondary button--compact" type="button" data-copy-temporary-password aria-label="复制临时密码" ${pairingBusy ? "disabled" : ""}>复制</button>
                 </div>
               </div>
               <div class="pairing-card-actions">
@@ -1207,7 +1195,7 @@ function renderFixedAccess(state: HostSnapshot): string {
       <header class="page-heading page-heading--pairing">
         <div>
           <button class="back-button" type="button" data-open-connection aria-label="返回共享此设备">${icon("arrow-left")}共享此设备</button>
-          <h1>固定访问密码</h1>
+          <h1 id="fixed-access-heading">固定访问密码</h1>
         </div>
         <span class="pairing-state ${enabled ? "pairing-state--active" : ""}">
           <span aria-hidden="true"></span>${enabled ? "固定密码已启用" : "固定密码未启用"}
@@ -1220,19 +1208,16 @@ function renderFixedAccess(state: HostSnapshot): string {
           ? fixedAccess
             ? `
               <section class="pairing-card" aria-labelledby="fixed-access-heading">
-                <div class="pairing-card-heading">
-                  <h2 id="fixed-access-heading">连接信息</h2>
-                </div>
                 <div class="pairing-credentials">
                   <div class="pairing-credential">
                     <span>设备 ID</span>
                     <strong id="fixed-access-device-id">${escapeHtml(formatDeviceId(fixedAccess.deviceId))}</strong>
-                    <button class="button button--secondary button--compact" type="button" data-copy-fixed-device-id>复制设备 ID</button>
+                    <button class="button button--secondary button--compact" type="button" data-copy-fixed-device-id aria-label="复制设备 ID">复制</button>
                   </div>
                   <div class="pairing-credential pairing-credential--password">
                     <span>固定密码</span>
                     <strong id="fixed-access-password">${escapeHtml(fixedAccess.password)}</strong>
-                    <button class="button button--secondary button--compact" type="button" data-copy-fixed-password>复制固定密码</button>
+                    <button class="button button--secondary button--compact" type="button" data-copy-fixed-password aria-label="复制固定密码">复制</button>
                   </div>
                 </div>
                 <div class="pairing-card-actions">
@@ -1269,7 +1254,7 @@ function renderSettings(): string {
     <div class="page-layout page-layout--settings">
       <header class="page-heading">
         <div>
-          <h1>设置 / 诊断</h1>
+          <h1>设置</h1>
         </div>
       </header>
 
@@ -1302,16 +1287,14 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
         </div>
         <label class="switch-control">
           <input type="checkbox" aria-label="登录 Windows 后自动启动" data-launch-at-login ${settings.launchAtLogin ? "checked" : ""} ${launchAtLoginBusy ? "disabled" : ""}>
-          <span aria-hidden="true"></span>
-          <b>${launchAtLoginBusy ? "正在保存" : settings.launchAtLogin ? "已开启" : "已关闭"}</b>
+          ${launchAtLoginBusy ? '<b role="status">正在保存</b>' : ""}
         </label>
       </div>
       <div class="settings-row">
         <div class="settings-row-copy">
-          <strong>关闭窗口后继续运行</strong>
-          <p>关闭窗口后仍可被连接。</p>
+          <strong>关闭窗口后</strong>
         </div>
-        <span class="settings-value">${settings.closeToTray ? "系统托盘" : "直接退出"}</span>
+        <span class="settings-value">${settings.closeToTray ? "在托盘中继续运行" : "退出 DeskLink"}</span>
       </div>
     </section>
 
@@ -1326,8 +1309,7 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
         </div>
         <label class="switch-control">
           <input type="checkbox" aria-label="共享脱敏诊断" data-diagnostics-sharing ${settings.diagnosticsSharingEnabled ? "checked" : ""} ${diagnosticsSharingBusy ? "disabled" : ""}>
-          <span aria-hidden="true"></span>
-          <b>${diagnosticsSharingBusy ? "正在保存" : settings.diagnosticsSharingEnabled ? "已开启" : "已关闭"}</b>
+          ${diagnosticsSharingBusy ? '<b role="status">正在保存</b>' : ""}
         </label>
       </div>
       ${settings.diagnosticsSharingEnabled
@@ -1346,10 +1328,7 @@ function renderPreferences(settings: WindowsPreferencesSummary): string {
       ${renderWindowsUpdate(settings.version)}
     </section>
 
-    <section class="settings-exit" aria-labelledby="exit-settings-heading">
-      <div>
-        <h2 id="exit-settings-heading">退出</h2>
-      </div>
+    <section class="settings-exit" aria-label="退出 DeskLink">
       ${quitConfirming
         ? `<div class="settings-exit-confirm" role="group" aria-label="确认退出 DeskLink">
             <strong>退出后本机将离线，直到再次启动。</strong>

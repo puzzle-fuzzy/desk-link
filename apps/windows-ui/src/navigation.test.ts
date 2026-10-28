@@ -9,9 +9,9 @@ import {
 
 test("uses remote tasks as the shared desktop navigation", () => {
   expect(DESKTOP_NAV_ITEMS.map((item) => item.label)).toEqual([
-    "连接设备",
-    "共享此设备",
-    "设置与诊断",
+    "连接",
+    "共享",
+    "设置",
   ]);
 });
 

@@ -1,9 +1,9 @@
 export type DeskLinkView = "controller" | "connection" | "devices" | "pairing" | "fixedAccess" | "settings" | "about";
 
 export const DESKTOP_NAV_ITEMS: ReadonlyArray<{ id: DeskLinkView; label: string }> = [
-  { id: "controller", label: "连接设备" },
-  { id: "connection", label: "共享此设备" },
-  { id: "settings", label: "设置与诊断" },
+  { id: "controller", label: "连接" },
+  { id: "connection", label: "共享" },
+  { id: "settings", label: "设置" },
 ];
 
 export function navigationViewFor(view: DeskLinkView): DeskLinkView {
