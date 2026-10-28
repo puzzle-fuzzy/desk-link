@@ -153,7 +153,7 @@ impl Drop for FileTransfers {
 #[derive(Clone)]
 enum Transport {
     Real(ControllerTransferSender),
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Test(mpsc::UnboundedSender<TransferMessage>),
 }
 impl Transport {
@@ -166,7 +166,7 @@ impl Transport {
                     Err(_) => Err("timeout"),
                 }
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             Self::Test(sender) => sender.send(message).map_err(|_| "transport_error"),
         }
     }

@@ -13,7 +13,10 @@ describe("managed relay profile", () => {
   });
 
   test("matches normalized server names without accepting another endpoint", () => {
-    expect(isManagedRelay(` ${MANAGED_RELAY_ADDRESS} `, "TURN.P2P.YXSWY.COM")).toBe(true);
+    expect(isManagedRelay(` ${MANAGED_RELAY_ADDRESS} `, "P2P.YXSWY.COM")).toBe(true);
+    // The retired TURN subdomain is a different endpoint since MVP-02
+    // converged the relay identity on p2p.yxswy.com.
+    expect(isManagedRelay(MANAGED_RELAY_ADDRESS, "TURN.P2P.YXSWY.COM")).toBe(false);
     expect(isManagedRelay("127.0.0.1:4433", MANAGED_RELAY_SERVER_NAME)).toBe(false);
   });
 });

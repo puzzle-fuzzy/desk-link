@@ -1,6 +1,8 @@
 //! The checked-in Apple header must describe the Rust library being linked.
 //! Compare every exported enum and compile C layout assertions against Rust's
 //! actual size/alignment/offset values, rather than comparing two stale headers.
+// Only the unix-only C layout assertions reference the Rust ABI types.
+#[cfg(unix)]
 use desklink_ffi::*;
 
 const RUST: &str = include_str!("../src/lib.rs");
