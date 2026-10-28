@@ -58,6 +58,11 @@ jobs:
         working-directory: apps/macos
         run: swift test --arch arm64
 
+      - name: Build the iOS FFI xcframework
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          ./scripts/build-apple-rust.sh
+
       - name: iOS simulator tests
         run: |
           SIMULATOR_ID=$(xcrun simctl list devices available | sed -nE 's/.*\(([0-9A-F-]{36})\).*/\1/p' | head -n 1)
