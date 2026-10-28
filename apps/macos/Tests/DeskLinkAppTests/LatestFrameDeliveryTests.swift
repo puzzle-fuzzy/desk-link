@@ -6,6 +6,25 @@ import XCTest
 /// able to re-send the most recent captured frame; these tests pin that
 /// contract without touching ScreenCaptureKit or the encoder.
 final class LatestFrameDeliveryTests: XCTestCase {
+    /// The delivery handler is @Sendable and runs on the delivery queue, so
+    /// recorded results need their own lock instead of captured locals.
+    private final class RecordedFrames: @unchecked Sendable {
+        private let lock = NSLock()
+        private var frameIDs: [UInt64] = []
+
+        func append(_ frameID: UInt64) {
+            lock.lock()
+            frameIDs.append(frameID)
+            lock.unlock()
+        }
+
+        var snapshot: [UInt64] {
+            lock.lock()
+            defer { lock.unlock() }
+            return frameIDs
+        }
+    }
+
     private func makeBuffer() -> CVPixelBuffer {
         var buffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
@@ -23,18 +42,14 @@ final class LatestFrameDeliveryTests: XCTestCase {
     func testReissueDeliversTheMostRecentFrameWithAFreshFrameID() {
         let delivery = LatestFrameDelivery()
         let token = ObjectIdentifier(NSObject())
+        let recorded = RecordedFrames()
         let first = expectation(description: "captured frame delivered")
         let reissued = expectation(description: "re-issued frame delivered")
-        let lock = NSLock()
-        var deliveredFrameIDs: [UInt64] = []
         delivery.begin(stream: token) { _, frameID in
-            lock.lock()
-            deliveredFrameIDs.append(frameID)
-            let count = deliveredFrameIDs.count
-            lock.unlock()
-            if count == 1 {
+            recorded.append(frameID)
+            if frameID == 1 {
                 first.fulfill()
-            } else if count == 2 {
+            } else if frameID == 2 {
                 reissued.fulfill()
             }
         }
@@ -42,9 +57,7 @@ final class LatestFrameDeliveryTests: XCTestCase {
         wait(for: [first], timeout: 2)
         delivery.reissueLastFrame(stream: token)
         wait(for: [reissued], timeout: 2)
-        lock.lock()
-        XCTAssertEqual(deliveredFrameIDs, [1, 2])
-        lock.unlock()
+        XCTAssertEqual(recorded.snapshot, [1, 2])
     }
 
     func testReissueWithoutACapturedFrameDeliversNothing() {
