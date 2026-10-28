@@ -202,7 +202,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate, @un
             try Task.checkCancellation()
             guard generation == lifecycleGeneration else { throw CancellationError() }
         } catch {
-            delivery.end(stream: stream.map { ObjectIdentifier($0) })
+            delivery.end(stream: ObjectIdentifier(stream))
             try? await stream.stopCapture()
             if self.stream.map({ ObjectIdentifier($0) }) == ObjectIdentifier(stream) {
                 self.stream = nil
