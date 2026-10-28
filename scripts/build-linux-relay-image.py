@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import ssl
 import subprocess
@@ -136,11 +137,20 @@ def build_static_binary() -> Path:
             ),
             ]
         )
+        # Mirror overrides keep the toolchain download working from networks
+        # where static.rust-lang.org is unreachable (e.g. RUSTUP_DIST_URL).
+        mirror_env = [
+            argument
+            for name in ("RUSTUP_DIST_URL", "RUSTUP_UPDATE_ROOT", "RUSTUP_SERVER")
+            if name in os.environ
+            for argument in ("-e", f"{name}={os.environ[name]}")
+        ]
         run(
             [
                 "docker",
                 "run",
                 "--rm",
+                *mirror_env,
                 "--user",
                 "0:0",
                 "--mount",
@@ -192,9 +202,9 @@ def import_minimal_image(binary: Path, image: str, revision: str) -> str:
                 "--change",
                 "ENV DESKLINK_RELAY_SESSION_TTL_S=86400",
                 "--change",
-                "ENV DESKLINK_RELAY_MAX_CONNECTIONS=512",
+                "ENV DESKLINK_RELAY_MAX_CONNECTIONS=64",
                 "--change",
-                "ENV DESKLINK_RELAY_MAX_SESSIONS=256",
+                "ENV DESKLINK_RELAY_MAX_SESSIONS=32",
                 "--change",
                 "EXPOSE 4433/udp",
                 "--change",
