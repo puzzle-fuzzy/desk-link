@@ -1607,7 +1607,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     type AbiEvents = Mutex<Vec<(DesklinkEventKind, u64, Vec<u8>)>>;
+    #[cfg(unix)]
     extern "C" fn record_abi(context: *mut std::ffi::c_void, event: *const DesklinkEvent) {
         let event = unsafe { &*event };
         let bytes = if event.data_len == 0 {
@@ -1621,6 +1623,10 @@ mod tests {
             .push((event.kind, event.stream_id, bytes));
     }
 
+    // File actions are an Apple-controller API: the non-unix Directory
+    // adapter deliberately reports Unsupported, so the file half of this
+    // probe can only round-trip where the unix adapter exists.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn c_audio_and_file_actions_cross_worker_and_encrypted_peer_boundaries() {
         use crate::{
@@ -1682,7 +1688,7 @@ mod tests {
             let path=source.to_str().unwrap();let transfer_id=[17;16];
             gate.invalidate(); // A same-stream display transition releases input.
             assert_eq!(unsafe { desklink_send_file(handle,8,transfer_id.as_ptr(),path.as_ptr(),path.len()) },DesklinkResult::InvalidState);
-            assert_eq!(unsafe { desklink_send_file(handle,9,transfer_id.as_ptr(),path.as_ptr(),path.len()) },DesklinkResult::Ok);
+            assert_eq!(unsafe { desklink_send_file(handle,9,transfer_id.as_ptr(),path.as_ptr(),path.len()) }, DesklinkResult::Ok);
             let bytes=secure.open(SecureLane::Transfer,&host.next_transfer().await.unwrap()).unwrap();
             assert_eq!(decode_transfer(&bytes).unwrap(),TransferMessage::FileOffer{transfer_id,request_id:None,name:"中文😀.bin".into(),size:20});
             let bytes=encode_transfer(&TransferMessage::FileDecision{transfer_id,result:TransferResult::Completed,resume_offset:0,resume_prefix_hash:None}).unwrap();
