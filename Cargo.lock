@@ -2093,7 +2093,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2921,9 +2921,9 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "opus-head-sys"
-version = "0.3.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df99c7905445bdbb5c3e74161d4808625af15dd59a52427c7eeaed70c5c1c7f4"
+checksum = "0685be088443086e3ef1625850263b3b3e745ff6266f6cb3cc0b0ca260bcfaf0"
 dependencies = [
  "cmake",
 ]
